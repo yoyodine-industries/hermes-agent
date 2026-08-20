@@ -754,18 +754,19 @@ def _get_real_hermes_home() -> str | None:
     return _real_hermes_home_cached
 
 
-def _protected_instruction_config() -> tuple[bool, list[str]]:
+def _protected_instruction_config() -> tuple[bool, list[str], list[str]]:
     """Read the protected-instruction-files gate config.
 
-    Returns ``(enabled, extra_patterns)``. Defaults to enabled with no extra
-    patterns; config read failures keep the gate ON (fail-safe for a
-    security boundary).
+    Returns ``(enabled, extra_patterns, allowlist_dirs)``. Defaults to enabled
+    with no extra patterns and no allowlisted dirs; config read failures keep
+    the gate ON (fail-safe for a security boundary).
 
     Config keys (config.yaml)::
 
         security:
-          protected_instruction_files: true       # default
-          protected_instruction_extra_patterns: []  # fnmatch on basename
+          protected_instruction_files: true         # default
+          protected_instruction_extra_patterns: []   # fnmatch on basename
+          protected_instruction_allowlist_dirs: []   # abs dir prefixes exempt from the gate
     """
     try:
         from hermes_cli.config import load_config, cfg_get
@@ -774,18 +775,24 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
                           default=True)
         extra = cfg_get(cfg, "security", "protected_instruction_extra_patterns",
                         default=[])
+        allow = cfg_get(cfg, "security", "protected_instruction_allowlist_dirs",
+                        default=[])
     except Exception:
-        return True, []
+        return True, [], []
     if not isinstance(enabled, bool):
         enabled = True
     if not isinstance(extra, list):
         extra = []
-    return enabled, [str(p) for p in extra if p]
+    if not isinstance(allow, list):
+        allow = []
+    return (enabled, [str(p) for p in extra if p],
+            [str(d) for d in allow if d])
 
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
-                                  extra_patterns: list[str] | None = None) -> str | None:
+                                  extra_patterns: list[str] | None = None,
+                                  allowlist_dirs: list[str] | None = None) -> str | None:
     """Return a short label when ``filepath`` targets a protected
     agent-instruction file, else ``None``.
 
@@ -794,8 +801,8 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     name that is itself a symlink escapes the gate. ``..`` traversal is
     neutralized by normpath/realpath before the basename compare.
     """
-    if enabled is None or extra_patterns is None:
-        enabled, extra_patterns = _protected_instruction_config()
+    if enabled is None or extra_patterns is None or allowlist_dirs is None:
+        enabled, extra_patterns, allowlist_dirs = _protected_instruction_config()
     if not enabled:
         return None
 
@@ -814,6 +821,14 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     if real_home and (resolved == real_home
                       or resolved.startswith(real_home + os.sep)):
         return None
+
+    # Operator-declared allowlist: trusted project trees (e.g. /opt/hermes_prod,
+    # /opt/hermes_sandbox) where instruction-file edits are expected and do NOT
+    # require the always-ask gate. Realpath'd so a symlinked dir can't evade it.
+    for d in allowlist_dirs:
+        real_d = os.path.realpath(os.path.normpath(_expand_tilde(d)))
+        if real_d and (resolved == real_d or resolved.startswith(real_d + os.sep)):
+            return None
 
     import fnmatch
     for candidate in (normalized, resolved):
@@ -945,13 +960,14 @@ def _check_protected_instruction_write(paths: list[str],
     files) — partial application of an approved-in-part patch would be
     more surprising than an atomic all-or-nothing outcome.
     """
-    enabled, extra = _protected_instruction_config()
+    enabled, extra, allow = _protected_instruction_config()
     if not enabled:
         return None
     reasons: list[str] = []
     for p in paths:
         reason = _protected_instruction_reason(
-            p, task_id, enabled=enabled, extra_patterns=extra)
+            p, task_id, enabled=enabled, extra_patterns=extra,
+            allowlist_dirs=allow)
         if reason:
             reasons.append(reason)
     if not reasons:

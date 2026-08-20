@@ -2373,6 +2373,7 @@ DEFAULT_CONFIG = {
         # fnmatch globs matched against the basename (e.g. "*.mdc").
         "protected_instruction_files": True,
         "protected_instruction_extra_patterns": [],
+        "protected_instruction_allowlist_dirs": [],
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
