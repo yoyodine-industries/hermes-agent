@@ -141,6 +141,10 @@ DEFAULT_EXCLUDES = [
     # OS junk
     ".DS_Store",
     "Thumbs.db",
+    # Native runtime artifacts (libiomp5 — created in the CWD of any OpenMP
+    # process such as llama-server, often owned by another user, so `git add -A`
+    # would otherwise fail with "Permission denied").
+    "__KMP_REGISTERED_LIB_*",
     # Logs
     "*.log",
 ]
@@ -911,8 +915,8 @@ class CheckpointManager:
 
         abs_dir = str(_normalize_path(working_dir))
 
-        # Skip root, home, and other overly broad directories
-        if abs_dir in {"/", str(Path.home())}:
+        # Skip root, home, /tmp, and other overly broad directories
+        if abs_dir in {"/", str(Path.home()), "/tmp", "/private/tmp"}:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 
