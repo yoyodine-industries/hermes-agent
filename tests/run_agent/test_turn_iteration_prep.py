@@ -59,7 +59,15 @@ def _apply(agent, _retry, restart_count: int):
 
 
 def _make_agent(max_retries: int) -> SimpleNamespace:
-    return SimpleNamespace(iteration_budget=_RefundBudget(), _api_max_retries=max_retries)
+    return SimpleNamespace(
+        iteration_budget=_RefundBudget(),
+        _api_max_retries=max_retries,
+        # upstream added a drain/steer handback before the redirect cap trips;
+        # provide no-op stand-ins so the behavior contract (bound, not refund
+        # forever) stays the focus of these tests.
+        _drain_pending_redirect=lambda: None,
+        steer=lambda text: True,
+    )
 
 
 def _drive_repeated_restart(agent, arm):
