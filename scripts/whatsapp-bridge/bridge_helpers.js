@@ -18,6 +18,43 @@ export function normalizeWhatsAppId(value) {
   return String(value).replace(':', '@');
 }
 
+// Loopback hosts the bridge accepts by default. Matches the DNS-rebinding
+// guard in bridge.js (GHSA-ppp5-vxwm-4cf7).
+const LOOPBACK_HOST_VALUES = ['localhost', '127.0.0.1', '[::1]', '::1'];
+
+/**
+ * Normalize a single Host value to a bare hostname for allowlist lookup:
+ * trim, strip a trailing :port, strip IPv6 brackets, lowercase. Mirrors the
+ * bridge's Host-header handling so header and env values compare identically.
+ */
+export function normalizeHostValue(value) {
+  if (!value) return '';
+  const trimmed = String(value).trim();
+  if (!trimmed) return '';
+  return (trimmed.includes(':')
+    ? trimmed.substring(0, trimmed.lastIndexOf(':'))
+    : trimmed
+  ).replace(/^\[|\]$/g, '').toLowerCase();
+}
+
+/**
+ * Build the accepted-Host set: the loopback base plus any extra hosts named in
+ * a comma-separated env value (HERMES_BRIDGE_EXTRA_HOSTS). Wildcard/glob
+ * entries ('*', '?', '[') are hard-rejected so a configured '*' can never open
+ * an all-hosts bypass. An unset/empty env returns the loopback-only set.
+ */
+export function buildAcceptedHostValues(extraHostsEnv) {
+  const accepted = new Set(LOOPBACK_HOST_VALUES);
+  if (!extraHostsEnv) return accepted;
+  for (const entry of String(extraHostsEnv).split(',')) {
+    const host = normalizeHostValue(entry);
+    if (!host) continue;
+    if (host.includes('*') || host.includes('?') || host.includes('[')) continue;
+    accepted.add(host);
+  }
+  return accepted;
+}
+
 export function getMessageContent(msg) {
   const content = msg?.message || {};
   if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
