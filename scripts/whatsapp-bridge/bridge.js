@@ -34,6 +34,7 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
+  buildAcceptedHostValues,
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
@@ -44,6 +45,7 @@ import {
   inboundReadReceiptKeys,
   inferMediaType,
   mediaPayloadForFile,
+  normalizeHostValue,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
@@ -788,23 +790,19 @@ app.use(express.json());
 // hostname that TTL-flips to 127.0.0.1. Reject any request whose Host
 // header doesn't resolve to a loopback alias.
 // See GHSA-ppp5-vxwm-4cf7.
-const _ACCEPTED_HOST_VALUES = new Set([
-  'localhost',
-  '127.0.0.1',
-  '[::1]',
-  '::1',
-]);
+// Additional hosts (e.g. a Tailscale tailnet name) are opt-in via the
+// HERMES_BRIDGE_EXTRA_HOSTS env var (comma-separated); wildcards are
+// rejected so the default loopback-only posture is never weakened.
+const _ACCEPTED_HOST_VALUES = buildAcceptedHostValues(
+  process.env.HERMES_BRIDGE_EXTRA_HOSTS,
+);
 
 app.use((req, res, next) => {
   const raw = (req.headers.host || '').trim();
   if (!raw) {
     return res.status(400).json({ error: 'Missing Host header' });
   }
-  // Strip port suffix: "localhost:3000" → "localhost"
-  const hostOnly = (raw.includes(':')
-    ? raw.substring(0, raw.lastIndexOf(':'))
-    : raw
-  ).replace(/^\[|\]$/g, '').toLowerCase();
+  const hostOnly = normalizeHostValue(raw);
   if (!_ACCEPTED_HOST_VALUES.has(hostOnly)) {
     return res.status(400).json({
       error: 'Invalid Host header. Bridge accepts loopback hosts only.',
