@@ -207,25 +207,30 @@ def _cmd_boards_move(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_move
 
     try:
-        res = kanban_move.move_task(args.task_id, args.to_slug, source_slug=args.from_slug)
+        res = kanban_move.move_task(
+            args.task_id, args.to_slug, source_slug=args.from_slug,
+            with_links=getattr(args, "with_links", False),
+        )
     except (OSError, ValueError) as exc:
         return _err(f"kanban boards move: {exc}")
     if _json_out(args, res):
         return 0
     c = res["counts"]
     print(
-        f"Moved {res['from_task_id']} → {res['to_task_id']} "
-        f"({res['from_board']!r} → {res['to_board']!r})."
+        f"Moved {res['from_task_id']} ({res['from_board']!r} → {res['to_board']!r}) "
+        f"— {c['tasks']} card(s), ids preserved."
     )
     print(
         f"  Carried: {c['comments']} comments, {c['events']} events, "
         f"{c['runs']} runs, {c['attachments']} attachments"
     )
-    if res["severed_links"]:
+    if res["link_count"]:
         print(
-            f"  Note: {res['severed_links']} parent/child link(s) were NOT carried; "
-            f"children on the source board were re-gated."
+            f"  Links carried: {res['link_count']} parent/child link(s) — "
+            f"the whole link-closed set moved together."
         )
+    if len(res["moved_task_ids"]) > 1:
+        print(f"  Moved cards: {', '.join(res['moved_task_ids'])}")
     for warning in res["warnings"]:
         print(f"  Note: {warning}")
     for label in ("source", "target"):

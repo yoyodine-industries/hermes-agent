@@ -136,14 +136,26 @@ _BOARD_SPECS = [
         _arg("task_id", help="Task id to move to another board"),
         _arg("--to", dest="to_slug", required=True, help="Destination board slug"),
         _arg("--from", dest="from_slug", help="Source board (default: the current board)"),
+        _arg("--with-links", "--link-closed", dest="with_links", action="store_true",
+             help="Move the card's whole link-closed set (it and every card linked to it)"),
         _json_flag(),
-    ], help="Move a card to another board, carrying comments, events, runs and attachments",
+    ], help="Move a card (and, with --with-links, its whole link component) to another board",
        description=(
         "Copy a card to another board and remove it from its current one. Comments, events, "
-        "runs and file attachments move with it. Parent/child links are NOT carried across "
-        "boards — the card lands unlinked. Machine-local state (claims, worker PIDs, chat "
-        "subscriptions, workspace paths) is stripped. Refuses while the card is running; "
-        "reclaim or archive it first. Both boards are backed up before anything is written."
+        "runs and file attachments move with it. Ids are preserved. Machine-local state "
+        "(claims, worker PIDs, chat subscriptions, workspace paths) is stripped, and both "
+        "boards are backed up before anything is written.\n"
+        "\n"
+        "Dependencies are never severed: parent/child links are NOT dropped on the way across. "
+        "If the card is linked to other cards, the move is refused (naming how many, and "
+        "pointing at --with-links) unless you pass --with-links (alias --link-closed), which "
+        "moves the card's whole link-closed set — every card reachable through parent/child "
+        "links — as one unit, carrying all of the set's internal links. Unlink the card first "
+        "if you really meant to move it alone.\n"
+        "\n"
+        "Refuses while any card in the set is running or holds a live claim/run; reclaim or "
+        "archive it first. Because ids are preserved, a move interrupted between the target "
+        "commit and the source delete is completed by simply re-running the same command."
     )),
 ]
 
