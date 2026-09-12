@@ -31,6 +31,7 @@ if str(_WORKTREE) not in sys.path:
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_move
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +344,132 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
+
+
+# ---------------------------------------------------------------------------
+# Per-card move across boards (``hermes kanban boards move``)
+# ---------------------------------------------------------------------------
+
+class TestBoardMove:
+    def _seed(self, src: str = "src", dst: str = "dst") -> None:
+        kb.create_board(src)
+        kb.create_board(dst)
+        # Give the target a DB + one pre-existing task so a target backup exists.
+        with kbc.connect(board=dst) as conn:
+            kb.create_task(conn, title="dst-existing", assignee="dev")
+
+
+    def test_move_carries_relations_and_audits(self, fresh_home, tmp_path):
+        self._seed()
+        with kbc.connect(board="src") as conn:
+            tid = kb.create_task(conn, title="move me", assignee="dev")
+            kb.add_comment(conn, tid, "alice", "first comment")
+            blob = tmp_path / "note.txt"
+            blob.write_text("hello", encoding="utf-8")
+            kb.add_attachment(
+                conn, tid, filename="note.txt", stored_path=str(blob),
+                content_type="text/plain", size=blob.stat().st_size, uploaded_by="tester",
+            )
+        res = kanban_move.move_task(tid, "dst", source_slug="src")
+        new_id = res["to_task_id"]
+        assert res["from_board"] == "src" and res["to_board"] == "dst"
+        assert res["counts"]["comments"] == 1
+        assert res["counts"]["attachments"] == 1
+        # source is emptied; tombstone moved_out remains on the gone id.
+        with kbc.connect(board="src") as conn:
+            assert kb.get_task(conn, tid) is None
+            assert kb.list_tasks(conn) == []
+            kinds = [r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
+            assert "moved_out" in kinds
+        # destination has the card + relations + moved_in audit.
+        with kbc.connect(board="dst") as conn:
+            moved = kb.get_task(conn, new_id)
+            assert moved is not None and moved.title == "move me"
+            assert [c.body for c in kb.list_comments(conn, new_id)] == ["first comment"]
+            atts = kb.list_attachments(conn, new_id)
+            assert [a.filename for a in atts] == ["note.txt"]
+            assert Path(atts[0].stored_path).is_file()
+            assert Path(atts[0].stored_path).read_text(encoding="utf-8") == "hello"
+            kinds = [r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (new_id,))]
+            assert "moved_in" in kinds
+        assert res["backups"]["source"] and Path(res["backups"]["source"]).is_file()
+        assert res["backups"]["target"] and Path(res["backups"]["target"]).is_file()
+
+
+    def test_move_preserves_id_when_free(self, fresh_home):
+        self._seed()
+        with kbc.connect(board="src") as conn:
+            tid = kb.create_task(conn, title="keep", assignee="dev")
+        res = kanban_move.move_task(tid, "dst", source_slug="src")
+        assert res["to_task_id"] == tid
+
+
+    def test_move_reassigns_id_on_collision(self, fresh_home):
+        kb.create_board("src")
+        kb.create_board("dst")
+        with kbc.connect(board="src") as conn:
+            tid = kb.create_task(conn, title="orig", assignee="dev")
+        with kbc.connect(board="dst") as conn:
+            other = kb.create_task(conn, title="occupant", assignee="dev")
+            with kbc.write_txn(conn):
+                conn.execute("UPDATE tasks SET id = ? WHERE id = ?", (tid, other))
+        res = kanban_move.move_task(tid, "dst", source_slug="src")
+        assert res["to_task_id"] != tid
+        with kbc.connect(board="dst") as conn:
+            ids = {t.id for t in kb.list_tasks(conn)}
+            assert len(ids) == 2
+            assert tid in ids and res["to_task_id"] in ids
+
+
+    def test_move_refuses_running(self, fresh_home):
+        self._seed()
+        with kbc.connect(board="src") as conn:
+            tid = kb.create_task(conn, title="busy", assignee="dev")
+            assert kb.claim_task(conn, tid) is not None
+        with pytest.raises(ValueError, match="running"):
+            kanban_move.move_task(tid, "dst", source_slug="src")
+        # card still on source, untouched
+        with kbc.connect(board="src") as conn:
+            assert kb.get_task(conn, tid) is not None
+
+
+    def test_move_severs_links_and_regates_child(self, fresh_home):
+        self._seed()
+        with kbc.connect(board="src") as conn:
+            parent = kb.create_task(conn, title="parent", assignee="dev")
+            child = kb.create_task(conn, title="child", assignee="dev")
+            kb.link_tasks(conn, parent, child)
+            assert (c := kb.get_task(conn, child)) is not None and c.status == "todo"
+        res = kanban_move.move_task(parent, "dst", source_slug="src")
+        assert res["severed_links"] == 1
+        with kbc.connect(board="src") as conn:
+            assert kb.get_task(conn, parent) is None
+            assert (c := kb.get_task(conn, child)) is not None and c.status == "ready"
+            assert conn.execute("SELECT * FROM task_links").fetchall() == []
+        with kbc.connect(board="dst") as conn:
+            assert (m := kb.get_task(conn, res["to_task_id"])) is not None and m.title == "parent"
+            assert conn.execute("SELECT * FROM task_links").fetchall() == []
+
+
+    def test_move_via_cli(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "src"], env_extra=env).returncode == 0
+        assert _cli(["boards", "create", "dst"], env_extra=env).returncode == 0
+        r = _cli(["--board", "src", "create", "Move Me", "--assignee", "dev"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        tid = json.loads(_cli(["--board", "src", "list", "--json"], env_extra=env).stdout)[0]["id"]
+        r = _cli(["boards", "move", tid, "--from", "src", "--to", "dst", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        data = json.loads(r.stdout)
+        assert data["from_task_id"] == tid
+        assert data["to_board"] == "dst"
+        src_list = json.loads(_cli(["--board", "src", "list", "--json"], env_extra=env).stdout)
+        dst_list = json.loads(_cli(["--board", "dst", "list", "--json"], env_extra=env).stdout)
+        assert src_list == []
+        assert [t["title"] for t in dst_list] == ["Move Me"]
+
 
 
 

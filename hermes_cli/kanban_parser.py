@@ -132,6 +132,19 @@ _BOARD_SPECS = [
         "NEW board — the slug gains a numeric suffix if it is already taken — so an import can "
         "never overwrite or merge into a board you already have."
     )),
+    _cmd("move", [
+        _arg("task_id", help="Task id to move to another board"),
+        _arg("--to", dest="to_slug", required=True, help="Destination board slug"),
+        _arg("--from", dest="from_slug", help="Source board (default: the current board)"),
+        _json_flag(),
+    ], help="Move a card to another board, carrying comments, events, runs and attachments",
+       description=(
+        "Copy a card to another board and remove it from its current one. Comments, events, "
+        "runs and file attachments move with it. Parent/child links are NOT carried across "
+        "boards — the card lands unlinked. Machine-local state (claims, worker PIDs, chat "
+        "subscriptions, workspace paths) is stripped. Refuses while the card is running; "
+        "reclaim or archive it first. Both boards are backed up before anything is written."
+    )),
 ]
 
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.

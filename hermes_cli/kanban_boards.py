@@ -1,6 +1,8 @@
 """``hermes kanban boards …`` — board directories, the ``current`` pointer and ``board.json``.
-Filesystem-only, so every action works before ``kanban init`` and must ignore the shared
-``--board`` task-routing override.
+
+Mostly filesystem-only, so those actions work before ``kanban init`` and must ignore the
+shared ``--board`` task-routing override. The three data-level actions (``export``,
+``import``, ``move``) read/write board DBs and require ``kanban init``.
 """
 
 from __future__ import annotations
@@ -201,6 +203,37 @@ def _cmd_boards_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_move(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_move
+
+    try:
+        res = kanban_move.move_task(args.task_id, args.to_slug, source_slug=args.from_slug)
+    except (OSError, ValueError) as exc:
+        return _err(f"kanban boards move: {exc}")
+    if _json_out(args, res):
+        return 0
+    c = res["counts"]
+    print(
+        f"Moved {res['from_task_id']} → {res['to_task_id']} "
+        f"({res['from_board']!r} → {res['to_board']!r})."
+    )
+    print(
+        f"  Carried: {c['comments']} comments, {c['events']} events, "
+        f"{c['runs']} runs, {c['attachments']} attachments"
+    )
+    if res["severed_links"]:
+        print(
+            f"  Note: {res['severed_links']} parent/child link(s) were NOT carried; "
+            f"children on the source board were re-gated."
+        )
+    for warning in res["warnings"]:
+        print(f"  Note: {warning}")
+    for label in ("source", "target"):
+        if res["backups"][label]:
+            print(f"  Backup ({label}): {res['backups'][label]}")
+    return 0
+
+
 _BOARD_HANDLERS = {
     "list": _cmd_boards_list, "ls": _cmd_boards_list,
     "create": _cmd_boards_create, "new": _cmd_boards_create,
@@ -211,4 +244,5 @@ _BOARD_HANDLERS = {
     "set-default-workdir": _cmd_boards_set_default_workdir,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
+    "move": _cmd_boards_move,
 }
