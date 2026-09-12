@@ -30,9 +30,12 @@ from __future__ import annotations
 
 import re
 
-#: How far back from the end of the body to look. A truncation marker is the LAST thing
-#: written, so a short window is always enough; anything older is quotation.
-TAIL_WINDOW = 64
+#: How far back from the end of the body to look. The window has to cover the bracketed token
+#: ITSELF, because a marker can carry an annotation naming what was dropped — measured 80 chars
+#: for ``[truncated: 8 of 19 nodes shown, full table at /opt/.../table.md]``, which a 64-char
+#: window missed entirely (the opening bracket fell outside it). Shortness is NOT what excludes
+#: quotation here: the end-anchor plus the required bracket do that. Do not tighten.
+TAIL_WINDOW = 256
 
 #: How far back from the end of a content payload to look. Deliberately generous: a content
 #: argument is routinely cut inside a docstring or a long prose paragraph, and a few residual
@@ -49,10 +52,14 @@ CONTENT_ARG_FIELDS = ("content", "file_content", "new_string")
 
 #: End-anchored, bracketed truncation marker. Covers the forms seen in the wild and those
 #: written by harnesses: ``[truncated]``, ``[...truncated]``, ``[truncated 4096 chars]``,
-#: ``<truncated>``, ``(truncated)``, ``…[truncated]``, ``... [TRUNCATED]``. The bracket or
-#: angle/paren wrapper is REQUIRED so ordinary prose is never refused.
+#: ``<truncated>``, ``(truncated)``, ``…[truncated]``, ``... [TRUNCATED]``, and annotated forms
+#: such as ``[truncated: 8 of 19 nodes shown, full table at /opt/.../table.md]``. The bracket or
+#: angle/paren wrapper is REQUIRED, and the token must START with the marker word — prose that
+#: merely mentions truncation inside a bracket (``[the truncated log]``) is not a marker. The
+#: annotation is bounded only to keep the scan local; a bracketed tail that starts with the
+#: marker word IS the cut, however it is annotated.
 _MARKER_RE = re.compile(
-    r"(?:\.{2,}|…)?\s*[\[\(<]\s*(?:\.{2,}\s*)?truncat\w*(?:\s[^\]\)>]{0,40})?[\]\)>]\s*$",
+    r"(?:\.{2,}|…)?\s*[\[\(<]\s*(?:\.{2,}\s*)?truncat\w*[^\]\)>]{0,200}[\]\)>]\s*$",
     re.IGNORECASE,
 )
 
@@ -91,6 +98,33 @@ def truncation_refusal(body: str) -> str | None:
         "the full text: lead with the conclusion, and if the content is long, write it to a "
         "file and send the path instead of pasting it."
     )
+
+
+class TruncatedBodyRefusal(ValueError):
+    """A body already cut was handed to an admission seam that must not accept it.
+
+    Distinct from the seat's other ``ValueError``s so a caller can tell "this argument is
+    malformed" from "this body is a fragment": the first wants a different call, the second
+    wants the SAME message re-sent with its tail attached. Carries the refusal text.
+    """
+
+    def __init__(self, refusal: str) -> None:
+        super().__init__(refusal)
+        self.refusal = refusal
+
+
+def refuse_truncated_body(body: str) -> None:
+    """Raise ``TruncatedBodyRefusal`` when ``body``'s tail is a truncation marker.
+
+    For admission seams that take a caller-supplied body — ``deliver_to_live_owner`` is fed by
+    the relay-envelope path and by cron delivery, not only by the ``message_agent`` tool — so
+    covering the tool and CLI entry points is not enough. Raising (rather than returning a
+    string) makes the seam fail closed for every caller, including ones that would ignore a
+    return value, and the refusal text reaches the sender intact.
+    """
+    refusal = truncation_refusal(body)
+    if refusal:
+        raise TruncatedBodyRefusal(refusal)
 
 
 def content_refusal(field: str, value: str) -> str | None:
