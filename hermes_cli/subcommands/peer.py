@@ -591,6 +591,17 @@ def _peer_run_ctl(args, action: str, peer_name: str, profile: str | None, base: 
     return 0
 
 
+def _turn_body(message: str, *, message_key: str, **extra) -> dict:
+    """Request body for one turn. ``author`` is added only when a dispatcher set HERMES_TURN_AUTHOR."""
+    from agent.turn_author import turn_author_from_env
+
+    body = {message_key: message, **extra}
+    author = turn_author_from_env()
+    if author is not None:
+        body["author"] = author
+    return body
+
+
 def _peer_run(args, message: str, peer_name: str, profile: str | None, base: str, key: str) -> int:
     sender_profile = _sender_profile()
     wait_seconds = _resolve_wait_seconds(args)
@@ -606,7 +617,7 @@ def _peer_run(args, message: str, peer_name: str, profile: str | None, base: str
             session_id=session_id, message=message)
         result = _request(
             f"{base}/v1/runs", key, method="POST",
-            body={"input": message, "session_id": session_id},
+            body=_turn_body(message, message_key="input", session_id=session_id),
             headers=_delivery_headers(idempotency_key, sender_profile, wait_seconds))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -658,7 +669,7 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
     try:
         result = _deliver_with_replay(
             f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat", key,
-            body={"message": message}, timeout=wait_seconds + _DM_TIMEOUT_SLACK_S,
+            body=_turn_body(message, message_key="message"), timeout=wait_seconds + _DM_TIMEOUT_SLACK_S,
             headers=headers, idempotency_key=idempotency_key)
     except urllib.error.HTTPError as exc:
         return _peer_refusal(peer_name, exc)
