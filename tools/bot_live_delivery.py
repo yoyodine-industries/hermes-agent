@@ -131,6 +131,14 @@ def deliver_to_live_owner(
     pinned = _owner(profile_home, owner)
     if not isinstance(message, str):
         raise ValueError("message must be a string")
+    # A body cut before it reached this seam is a fragment, not a message: refuse it here, before
+    # anything is staged, so no consumer can replay a partial body. Guarding the tool and CLI
+    # entry points is not enough — the relay-envelope path and cron delivery hand this function a
+    # caller-supplied body, and a cut on a host that does not carry the guard would otherwise land
+    # unmarked. Imported inside the function to match this module's other cross-tool imports.
+    from tools.dm_body_guard import refuse_truncated_body
+
+    refuse_truncated_body(message)
     key = _delivery_id(delivery_id if delivery_id is not None else uuid.uuid4().hex)
     with _locked(profile_home) as root:
         path = root / f"{key}.json"

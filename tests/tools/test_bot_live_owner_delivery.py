@@ -93,3 +93,25 @@ def test_only_canonical_capable_owner_receives_across_compression(tmp_path, capa
     finally:
         lease.release()
         db.close()
+
+
+def test_admission_refuses_a_body_cut_before_the_seam(tmp_path):
+    """The relay-envelope and cron paths hand this function a caller-supplied body.
+
+    Guarding the tool and CLI entry points is not enough: a body cut on a host that does not
+    carry this module still reaches admission, so the seam itself refuses it — fail-closed,
+    before anything is staged for a consumer to replay.
+    """
+    from tools import bot_live_delivery as mailbox
+    from tools.dm_body_guard import TruncatedBodyRefusal
+
+    owner = dict(profile_home=str(tmp_path.resolve()), session_id="chat",
+                 lease_id="lease", live_session_id="live")
+    with pytest.raises(TruncatedBodyRefusal) as caught:
+        mailbox.deliver_to_live_owner(tmp_path, owner, "recap of the pass follows.\n[truncated]")
+    assert "REFUSED" in caught.value.refusal
+
+    staging = tmp_path / "runtime" / mailbox.DELIVERY_DIR_NAME
+    assert not staging.exists() or list(staging.iterdir()) == []
+    # The seam stays usable for every intact body.
+    assert mailbox.deliver_to_live_owner(tmp_path, owner, "recap follows.")["status"] == "queued"

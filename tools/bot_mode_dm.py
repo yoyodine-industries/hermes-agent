@@ -482,8 +482,17 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
     if not stdin_file:
         home = profile_home or _local_delivery_home(argv)
         if home is not None or Path(dm_file + ".live.json").exists():
+            from tools.dm_body_guard import TruncatedBodyRefusal
+
             try:
                 record = _admit_live_dm(home, dm_file)
+            except TruncatedBodyRefusal as exc:
+                # Nothing was queued, so "Do not resend" — the ambiguous path's advice — would be
+                # wrong here: the refusal itself says what to do, which is to re-send the full text.
+                print(json.dumps({"status": "refused", "delivery_id": hashlib.sha256(
+                    str(Path(dm_file).resolve()).encode()).hexdigest(),
+                    "error": str(exc), "evidence_file": dm_file}))
+                return 1
             except Exception as exc:
                 print(json.dumps({"status": "ambiguous", "delivery_id": hashlib.sha256(
                     str(Path(dm_file).resolve()).encode()).hexdigest(),
@@ -524,8 +533,16 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
     """Create a DM file and transfer its cleanup ownership to the runner."""
     dm_file = _write_dm_file(content)
     if profile_home is not None:
+        # Imported here rather than at module scope: this module runs as a script too, where the
+        # package path is not importable — the convention its other cross-tool imports follow.
+        from tools.dm_body_guard import TruncatedBodyRefusal
+
         try:
             record = _admit_live_dm(profile_home, dm_file)
+        except TruncatedBodyRefusal as exc:
+            return json.dumps({"status": "refused", "delivery_id": hashlib.sha256(
+                str(Path(dm_file).resolve()).encode()).hexdigest(),
+                "error": str(exc), "evidence_file": dm_file})
         except Exception as exc:
             return json.dumps({"status": "ambiguous", "delivery_id": hashlib.sha256(
                 str(Path(dm_file).resolve()).encode()).hexdigest(),
