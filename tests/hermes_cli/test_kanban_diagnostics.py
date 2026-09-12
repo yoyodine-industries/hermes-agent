@@ -225,3 +225,44 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# Operator-hint verbs must resolve in the parser
+#
+# Every `hermes kanban <verb>` operator hint must name a real subcommand. Hints
+# are built through `_kanban_cmd`, which validates the verb against the parser
+# and raises otherwise — so a hint can never again point at a verb the parser
+# doesn't define (regression: the old `hermes kanban events` hint).
+# ---------------------------------------------------------------------------
+
+
+def test_kanban_hint_cmd_accepts_exactly_parser_verbs():
+    from hermes_cli import kanban_parser as kp
+    # The helper accepts every real top-level verb...
+    for verb in kp.top_level_verbs():
+        assert kd._kanban_cmd(verb, "t_x") == f"hermes kanban {verb} t_x"
+    # ...and rejects the verb that caused the original bug.
+    with pytest.raises(ValueError):
+        kd._kanban_cmd("events", "t_x")
+
+
+def test_block_unblock_cycling_hint_names_real_verb():
+    now = int(time.time())
+    task = _task(id="t_cycle1")
+    # 3 blocked-after-unblocked cycles (4 blocked + 3 unblocked) trips the
+    # default threshold.
+    events = [
+        _event("blocked", ts=now),
+        _event("unblocked", ts=now + 1),
+        _event("blocked", ts=now + 2),
+        _event("unblocked", ts=now + 3),
+        _event("blocked", ts=now + 4),
+        _event("unblocked", ts=now + 5),
+        _event("blocked", ts=now + 6),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    cycling = [d for d in diags if d.kind == "block_unblock_cycling"]
+    assert len(cycling) == 1
+    commands = [a.payload["command"] for a in cycling[0].actions if a.kind == "cli_hint"]
+    assert commands == ["hermes kanban show t_cycle1"]

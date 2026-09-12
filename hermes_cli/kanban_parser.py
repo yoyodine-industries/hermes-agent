@@ -427,6 +427,16 @@ _SPECS = [
 ]
 
 
+def top_level_verbs() -> frozenset[str]:
+    """Every top-level ``hermes kanban <verb>`` subcommand name.
+
+    Single source of truth for callers that must guarantee a verb resolves — e.g.
+    the diagnostics operator-hint builder, which raises on any verb outside this
+    set so a hint can never name a non-existent subcommand.
+    """
+    return frozenset(name for name, _, _, _ in _SPECS)
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree; returns the ``kanban`` parser."""
     kanban_parser = parent_subparsers.add_parser(

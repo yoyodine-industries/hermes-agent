@@ -117,8 +117,19 @@ def _cli_hint(label: str, command: str, *, suggested: bool = False) -> Diagnosti
                             suggested=suggested)
 
 
+def _kanban_cmd(verb: str, *args: str) -> str:
+    """Build a ``hermes kanban <verb> [args]`` operator hint, raising if ``verb``
+    is not a real top-level subcommand. Every kanban hint must route through here
+    so a hint can never name a non-existent verb (regression: the old
+    ``hermes kanban events`` hint pointed at a verb the parser never defined)."""
+    from hermes_cli import kanban_parser as _kp
+    if verb not in _kp.top_level_verbs():
+        raise ValueError(f"operator hint names unknown `hermes kanban` subcommand: {verb!r}")
+    return " ".join(("hermes", "kanban", verb, *args))
+
+
 def _log_hint_action(task_id: str) -> DiagnosticAction:
-    cmd = f"hermes kanban log {task_id}"
+    cmd = _kanban_cmd("log", task_id)
     return _cli_hint(f"Check logs: {cmd}", cmd, suggested=True)
 
 
@@ -312,7 +323,7 @@ def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnosti
             f"Or configure fallback {fallback_slot}", f"hermes config set {fallback_slot}.provider auto",
         ))
     if not auto_decompose:
-        cmd = f"hermes kanban specify {task_id}"
+        cmd = _kanban_cmd("specify", task_id)
         actions.append(_cli_hint(f"Specify manually: {cmd}", cmd))
 
     return [Diagnostic(
@@ -511,12 +522,12 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     actions: list[DiagnosticAction] = []
     if task_id:
         actions.append(_cli_hint(
-            "Complete the finished implementation phase", f"hermes kanban complete {task_id}",
+            "Complete the finished implementation phase", _kanban_cmd("complete", task_id),
             suggested=True,
         ))
     if task_id and child_ids:
         actions.append(_cli_hint(
-            "Or unlink the incorrectly gated reviewer", f"hermes kanban unlink {task_id} {child_ids[0]}",
+            "Or unlink the incorrectly gated reviewer", _kanban_cmd("unlink", task_id, child_ids[0]),
         ))
 
     blocked_at = _event_ts(latest_block) or now
@@ -604,7 +615,7 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     task_id = _task_field(task, "id")
     actions: list[DiagnosticAction] = []
     if task_id:
-        cmd = f"hermes kanban events {task_id}"
+        cmd = _kanban_cmd("show", task_id)
         actions.append(_cli_hint(f"Check block reasons: {cmd}", cmd, suggested=True))
     return [Diagnostic(
         kind="block_unblock_cycling", severity="warning",
@@ -662,7 +673,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     actions = [
         DiagnosticAction(kind="reassign", label="Reassign to a different worker",
                          payload={"current_assignee": assignee}),
-        _cli_hint("Check dispatcher status", "hermes kanban diagnostics"),
+        _cli_hint("Check dispatcher status", _kanban_cmd("diagnostics")),
     ]
     return [Diagnostic(
         kind="stranded_in_ready", severity=severity,
