@@ -20,6 +20,7 @@ from pathlib import Path
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
+from tools.dm_body_guard import guard_tool_content_arguments
 from tools.file_operations import (
     ShellFileOperations, normalize_read_pagination, normalize_search_pagination)
 from tools.file_operations_common import DEFAULT_READ_LIMIT
@@ -1200,6 +1201,11 @@ def _handle_write_file(args, **kw):
             f"write_file: 'content' must be a string, got "
             f"{type(args['content']).__name__}."
         )
+    # Fail closed on a content payload whose tail is a truncation marker: the cut happened
+    # where the call was authored, so the bytes are a partial file. Refused BEFORE
+    # write_file_tool runs any guard or resolves a path, so nothing is created or modified.
+    if (refusal := guard_tool_content_arguments(args)) is not None:
+        return tool_error(refusal)
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
@@ -1209,6 +1215,10 @@ def _handle_write_file(args, **kw):
 
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
+    # Same rule as write_file, on the text patch WRITES. old_string is deliberately not
+    # gated: it is a search pattern, and a cut there fails to match loudly on its own.
+    if (refusal := guard_tool_content_arguments(args)) is not None:
+        return tool_error(refusal)
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
