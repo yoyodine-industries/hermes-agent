@@ -1437,6 +1437,10 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    The tick observer and the hourly terminal-worktree sweep both fire AFTER
+    the lock is released: neither may extend a lock hold that stalls a sibling
+    dispatcher's tick.
     """
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
@@ -1454,11 +1458,21 @@ def dispatch_once(
             reconcile_orphans=reconcile_orphans,
         )
 
+    def _post_lock_hygiene() -> None:
+        # Strictly outside the single-writer critical section, next to the tick
+        # observer: the sweep shells out to git (up to its own ``limit`` of
+        # worktree removals), so it must never extend the lock hold and stall a
+        # sibling dispatcher's tick. Skipped on a dry-run tick, which must not
+        # mutate anything.
+        if not dry_run:
+            _maybe_sweep_terminal_worktrees(conn, board=board)
+
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
         # Must not lose the tick — fall through to an unguarded dispatch.
         result = _locked_tick()
+        _post_lock_hygiene()
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
@@ -1470,6 +1484,7 @@ def dispatch_once(
             _kbc._maybe_checkpoint_wal(conn, db_path)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
+    _post_lock_hygiene()
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 
@@ -1744,9 +1759,63 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
-# The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
-# critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
-# lock hold and stall a sibling dispatcher's tick.
+# The dispatch lock has been released here. The tick observer and the terminal-worktree sweep are both
+# fired strictly OUTSIDE the single-writer critical section (#56066 sweeper finding / #64231
+# disposition): a slow subscriber, or a sweep shelling out to git, must never extend the lock hold and
+# stall a sibling dispatcher's tick.
+
+
+# --- Terminal-worktree residue sweep ----------------------------------------
+# Residue sweep for card worktrees whose completion/archive hook never ran (a
+# card that ended by any other path leaks its tree; ``worktree prune``
+# deliberately skips ``t_*`` trees). The dispatcher tick is the PERIODIC caller,
+# ``hermes kanban gc`` the manual one. Gated to at most once per hour PER BOARD,
+# memoized on the resolved board DB path — ``dispatch_once`` is per-board, so a
+# process-global stamp would sweep only whichever board ticked first each hour
+# and starve every sibling board's residue forever. No thread, no state to lose.
+_TERMINAL_WORKTREE_SWEEP_INTERVAL_SECONDS = 3600.0
+_LAST_TERMINAL_WORKTREE_SWEEP: dict[str, float] = {}
+
+
+def _terminal_worktree_sweep_key(board: Optional[str]) -> str:
+    """Memo key naming one board: its resolved ``kanban.db`` path.
+
+    The tick lock is keyed on the resolved DB path, so the hourly gate must be
+    too. Falls back to a board-name key when the path cannot be resolved —
+    still per-board, never process-global.
+    """
+    try:
+        return str(_kb.kanban_db_path(board=board).resolve())
+    except Exception:
+        return f"board:{board}"
+
+
+def _maybe_sweep_terminal_worktrees(
+    conn: sqlite3.Connection, *, board: Optional[str] = None
+) -> None:
+    """Run :func:`_kbw.sweep_terminal_worktree_workspaces` at most hourly per board.
+
+    Pure hygiene: never raises, never blocks a tick on git or the filesystem.
+    Callers invoke this OUTSIDE the single-writer dispatch lock — a sweep shells
+    out to git up to ``limit`` times and must never extend the lock hold.
+    """
+    key = _terminal_worktree_sweep_key(board)
+    now = time.monotonic()
+    last = _LAST_TERMINAL_WORKTREE_SWEEP.get(key, 0.0)
+    if last and (now - last) < _TERMINAL_WORKTREE_SWEEP_INTERVAL_SECONDS:
+        return
+    _LAST_TERMINAL_WORKTREE_SWEEP[key] = now
+    try:
+        summary = _kbw.sweep_terminal_worktree_workspaces(conn)
+        if summary["removed"] or summary["preserved"]:
+            _kb._log.info(
+                "kanban terminal worktree sweep: %s reaped, %s preserved, %s skipped",
+                len(summary["removed"]), len(summary["preserved"]), summary["skipped"],
+            )
+    except Exception as exc:
+        _kb._log.debug("kanban terminal worktree sweep skipped: %s", exc)
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
