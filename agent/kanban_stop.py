@@ -7,19 +7,38 @@ Policy-only: return a bounded synthetic nudge so the loop continues instead of e
 from __future__ import annotations
 
 import os
+import sqlite3
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+# A lane handoff (`kanban_request_review` / `kanban_request_changes`) closes the
+# dispatcher run for this session, so it is a terminal state, not a violation.
+_TERMINAL_KANBAN_TOOLS = frozenset(
+    {"kanban_complete", "kanban_block", "kanban_request_review", "kanban_request_changes"}
+)
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
 
 def kanban_stop_nudge_enabled() -> bool:
-    """On when ``HERMES_KANBAN_TASK`` is set, unless ``HERMES_KANBAN_STOP_NUDGE`` disables it."""
+    """On when ``HERMES_KANBAN_TASK`` is set, unless ``HERMES_KANBAN_STOP_NUDGE`` disables it.
+
+    The env var alone is not identity: a cron job fired in-process inside a worker,
+    or a delegate child, inherits ``HERMES_KANBAN_*`` without owning the card, so
+    the guard also requires ``is_dispatcher_owned_worker_context()`` — the single
+    predicate every ``HERMES_KANBAN_*`` identity gate uses.
+    """
     if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
         return False
-    return bool((os.environ.get("HERMES_KANBAN_TASK") or "").strip())
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    try:
+        from agent import delegation_context  # module, so patching/test ContextVars both work
+
+        return bool(delegation_context.is_dispatcher_owned_worker_context())
+    except Exception:
+        # Fail-safe: a broken import or ContextVar read must never disarm the guard.
+        return True
 
 
 def _tool_call_name(tc: Any) -> str:
@@ -44,6 +63,43 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def _board_card_live_run(task_id: str) -> Optional[int]:
+    """``tasks.current_run_id`` for ``task_id``, read straight from the board.
+
+    ``None`` when the card has no live run or the board cannot be read; the caller
+    then keeps the guard's pre-existing behaviour. Read-only by construction
+    (``mode=ro``, no schema init/migration) so a turn-end check can never create
+    the board. Mirrors ``kanban_db_notify``'s read-only open.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+
+        board = (os.environ.get("HERMES_KANBAN_BOARD") or "").strip() or None
+        path = kb.kanban_db_path(board=board)
+        if not path.exists():
+            return None
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
+    except Exception:
+        return None
+
+
+def _own_run_id() -> Optional[int]:
+    """This session's dispatcher run id (``HERMES_KANBAN_RUN_ID``); None if unset/unparseable."""
+    try:
+        return int((os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -60,7 +116,12 @@ def build_kanban_stop_nudge(
     ):
         return None
 
-    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    live_run_id = _board_card_live_run(tid) if tid else None
+    if live_run_id is not None and live_run_id != _own_run_id():
+        return None  # the card's live run belongs to another lane's session
+    tid = tid or "this task"
+
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
@@ -70,7 +131,9 @@ def build_kanban_stop_nudge(
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "is done, OR `kanban_block(reason=...)` if you are blocked, OR "
+        "`kanban_request_review` / `kanban_request_changes` when you are "
+        "handing the card to the other lane.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )
