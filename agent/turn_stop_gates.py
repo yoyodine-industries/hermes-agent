@@ -165,7 +165,7 @@ def apply_stop_gates(
         )
         agent._emit_status(
             "⚠️ Kanban worker tried to exit without "
-            "kanban_complete/kanban_block — nudging to finish"
+            "a terminal board tool — nudging to finish"
         )
         return verdict
     return StopGateVerdict(
