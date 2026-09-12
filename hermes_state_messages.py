@@ -13,6 +13,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKE
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
+from hermes_message_flags import is_ephemeral_scaffolding
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
     _legacy_reset_child_sql, _placeholders, _sql_json_extract)
@@ -476,10 +477,17 @@ class SessionMessagesMixin:
 
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``.
-        Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows."""
+        Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows.
+
+        Ephemeral recovery scaffolding (``hermes_message_flags``) is refused here: this is the ONE insert
+        shape every writer funnels through, and the in-place compaction commit (``archive_and_compact``)
+        used to persist the kanban stop-guard nudge that the loop flush deliberately withholds, leaving
+        the same body as two simultaneously-active rows in one live view."""
         now_ts = time.time()
         inserted = tool_calls_total = 0
         for msg in messages:
+            if is_ephemeral_scaffolding(msg):
+                continue
             role = msg.get("role", "unknown")
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)

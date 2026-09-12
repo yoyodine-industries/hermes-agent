@@ -21,21 +21,16 @@ from agent.memory_manager import sanitize_context
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
 from agent.transcript_repair import sync_flushed_message_markers
+from hermes_message_flags import EPHEMERAL_SCAFFOLDING_FLAGS, is_ephemeral_scaffolding
 
 
 logger = logging.getLogger("run_agent")  # origin module's name: log records / caplog filters unchanged
 
 # Flags marking ephemeral recovery scaffolding the loop pops before appending the real response.
 # Persistence must skip them or a resumed session replays synthetic turns / breaks prefix-cache reuse.
-_EPHEMERAL_SCAFFOLDING_FLAGS = (
-    "_empty_recovery_synthetic",
-    "_empty_terminal_sentinel",
-    "_thinking_prefill",
-    "_verification_stop_synthetic",  # verify-on-stop nudge; the assistant candidate itself is NOT synthetic
-    "_pre_verify_synthetic",
-    "_kanban_stop_synthetic",  # kanban worker stop-guard
-    "_dropped_toolcall_nudge",  # internal retry instruction; must not replay as user context
-)
+# ONE definition, shared with the SQLite insert boundary (hermes_state_messages) — a second copy of
+# this tuple is how the kanban stop-guard flag got missed by the in-place compaction commit.
+_EPHEMERAL_SCAFFOLDING_FLAGS = EPHEMERAL_SCAFFOLDING_FLAGS
 
 _IMAGE_PART_TYPES = {"image", "image_url", "input_image"}
 # Reasoning/codex fields are role-gated (assistant-only) inside _insert_message_rows.
@@ -44,7 +39,7 @@ _ROW_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details", "c
 
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
     """True when ``msg`` is internal recovery scaffolding that must never reach the durable transcript."""
-    return isinstance(msg, dict) and any(msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS)
+    return is_ephemeral_scaffolding(msg)
 
 
 # `_DB_PERSISTED_MARKER` (agent.context_compressor) is the intrinsic "already written to SQLite" marker: an
