@@ -490,3 +490,377 @@ class TestBoardMove:
         dst_list = json.loads(_cli(["--board", "dst", "list", "--json"], env_extra=env).stdout)
         assert {t["title"] for t in src_list} == {"A", "B"}
         assert dst_list == []
+
+
+# ---------------------------------------------------------------------------
+# Declared, audited severance (``--sever-edge PARENT:CHILD`` / ``--sever-reason``)
+#
+# The invariant stays: no move severs an edge on its own. But the live ops case
+# is real — a whole initiative component whose only remaining tie is a gating
+# edge pointing at a card that has to stay on the ops board — so severance is
+# available *only* where the operator declares it, edge by edge, with a recorded
+# reason, and only when the cut cannot auto-promote a card sitting in a
+# dispatcher pool lane (``todo`` / ``ready`` / ``triage``). That is exactly the
+# gate ``~/.hermes/kanban/migrations/migrate_apr25.py`` applies before it cuts.
+# ---------------------------------------------------------------------------
+
+_SEVER_REASON = "the gating card stays behind on the source board"
+
+
+def _seed_boards() -> None:
+    """``src`` + ``dst``, the target pre-seeded so a target backup exists."""
+    kb.create_board("src")
+    kb.create_board("dst")
+    with kbc.connect(board="dst") as conn:
+        kb.create_task(conn, title="dst-existing", assignee="dev")
+
+
+def _card(title: str, *, status: str | None = None) -> str:
+    """A ``src`` card, optionally forced into a column (synthetic ids only)."""
+    with kbc.connect(board="src") as conn:
+        tid = kb.create_task(conn, title=title, assignee="dev")
+        if status is not None:
+            with kbc.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+    return tid
+
+
+def _link(parent_id: str, child_id: str) -> None:
+    with kbc.connect(board="src") as conn:
+        kb.link_tasks(conn, parent_id, child_id)
+
+
+def _status(task_id: str) -> str | None:
+    with kbc.connect(board="src") as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row["status"] if row else None
+
+
+def _payloads(conn, task_id: str, kind: str) -> list[dict]:
+    """Decoded payloads of every ``kind`` event on a card, in event order."""
+    return [
+        json.loads(r["payload"]) if r["payload"] else {}
+        for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
+            (task_id, kind),
+        )
+    ]
+
+
+def _assert_untouched(a: str, b: str, *extra: str) -> None:
+    """Nothing moved, nothing severed: both cards and their edge are intact."""
+    with kbc.connect(board="src") as conn:
+        assert {t.id for t in kb.list_tasks(conn)} == {a, b, *extra}
+        assert _links(conn) == {(a, b)} if not extra else _links(conn)
+    with kbc.connect(board="dst") as conn:
+        assert [t.title for t in kb.list_tasks(conn)] == ["dst-existing"]
+        assert _links(conn) == set()
+
+
+class TestBoardMoveSeverance:
+    """``--sever-edge`` is the only path that may cut an edge."""
+
+    def test_sever_without_a_reason_refuses(self, fresh_home):
+        """Severance is never silent: no reason, no cut."""
+        _seed_boards()
+        a = _card("A")
+        b = _card("B")
+        _link(a, b)
+
+        with pytest.raises(ValueError, match="--sever-reason"):
+            kanban_move.move_task(a, "dst", source_slug="src", sever_edges=[(a, b)])
+
+        with kbc.connect(board="src") as conn:
+            assert {t.id for t in kb.list_tasks(conn)} == {a, b}
+            assert _links(conn) == {(a, b)}
+        with kbc.connect(board="dst") as conn:
+            assert [t.title for t in kb.list_tasks(conn)] == ["dst-existing"]
+
+    def test_sever_refuses_an_undeclared_leaving_edge(self, fresh_home):
+        """Every edge the move would leave behind has to be declared."""
+        _seed_boards()
+        a = _card("A")
+        b = _card("B")
+        c = _card("C")
+        _link(a, b)
+        _link(b, c)
+
+        with pytest.raises(ValueError) as excinfo:
+            kanban_move.move_task(
+                a, "dst", source_slug="src",
+                sever_edges=[(b, c)], sever_reason=_SEVER_REASON,
+            )
+        msg = str(excinfo.value)
+        assert f"{a} -> {b}" in msg, msg
+        assert f"--sever-edge {a}:{b}" in msg, msg  # the exact fix
+
+        with kbc.connect(board="src") as conn:
+            assert {t.id for t in kb.list_tasks(conn)} == {a, b, c}
+            assert _links(conn) == {(a, b), (b, c)}
+        with kbc.connect(board="dst") as conn:
+            assert [t.title for t in kb.list_tasks(conn)] == ["dst-existing"]
+            assert _links(conn) == set()
+
+    def test_sever_refuses_a_declared_edge_that_is_not_a_link(self, fresh_home):
+        """A typo'd edge is refused by name, not waved through."""
+        _seed_boards()
+        a = _card("A")
+        b = _card("B")
+        c = _card("C")
+        _link(a, b)
+
+        with pytest.raises(ValueError) as excinfo:
+            kanban_move.move_task(
+                a, "dst", source_slug="src",
+                sever_edges=[(a, b), (b, c)], sever_reason=_SEVER_REASON,
+            )
+        msg = str(excinfo.value)
+        assert f"{b} -> {c}" in msg, msg
+        assert "not a" in msg, msg
+        with kbc.connect(board="src") as conn:
+            assert _links(conn) == {(a, b)}
+
+    def test_sever_refuses_a_declared_edge_that_travels_with_the_set(self, fresh_home):
+        """A redundant path keeps both ends inside the set — nothing is severed."""
+        _seed_boards()
+        a = _card("A")
+        b = _card("B")
+        c = _card("C")
+        d = _card("D")
+        _link(a, b)
+        _link(a, c)
+        _link(b, d)
+        _link(c, d)
+
+        with pytest.raises(ValueError) as excinfo:
+            kanban_move.move_task(
+                a, "dst", source_slug="src", with_links=True,
+                sever_edges=[(c, d)], sever_reason=_SEVER_REASON,
+            )
+        msg = str(excinfo.value)
+        assert f"{c} -> {d}" in msg, msg
+        assert "travel" in msg or "move set" in msg, msg
+        with kbc.connect(board="src") as conn:
+            assert _links(conn) == {(a, b), (a, c), (b, d), (c, d)}
+
+    def test_sever_refuses_when_the_leaving_child_is_in_a_pool_lane(self, fresh_home):
+        """Cutting a parent's edge can satisfy a child's deps -> auto-promotion."""
+        _seed_boards()
+        p = _card("P")
+        child = _card("Child")
+        _link(p, child)  # a non-done parent parks the child in ``todo``
+        assert _status(child) == "todo"
+
+        with pytest.raises(ValueError) as excinfo:
+            kanban_move.move_task(
+                p, "dst", source_slug="src",
+                sever_edges=[(p, child)], sever_reason=_SEVER_REASON,
+            )
+        msg = str(excinfo.value)
+        assert child in msg and "todo" in msg, msg
+        assert "auto-promot" in msg, msg
+
+        with kbc.connect(board="src") as conn:
+            assert {t.id for t in kb.list_tasks(conn)} == {p, child}
+            assert _links(conn) == {(p, child)}
+
+    def test_sever_refuses_when_the_moved_child_would_land_parentless(self, fresh_home):
+        """The mirror hazard: the moved child loses its parent on the target."""
+        _seed_boards()
+        p = _card("P")
+        child = _card("Child")
+        _link(p, child)
+        assert _status(child) == "todo"
+
+        with pytest.raises(ValueError) as excinfo:
+            kanban_move.move_task(
+                child, "dst", source_slug="src",
+                sever_edges=[(p, child)], sever_reason=_SEVER_REASON,
+            )
+        msg = str(excinfo.value)
+        assert child in msg and "auto-promot" in msg, msg
+
+        with kbc.connect(board="src") as conn:
+            assert {t.id for t in kb.list_tasks(conn)} == {p, child}
+            assert _links(conn) == {(p, child)}
+
+    def test_sever_moves_the_card_and_audits_both_boards(self, fresh_home):
+        """One declared cut: the card moves, the edge goes, both sides audited."""
+        _seed_boards()
+        p = _card("P")
+        keep = _card("Keep", status="done")  # out of every pool lane
+        _link(p, keep)
+
+        res = kanban_move.move_task(
+            p, "dst", source_slug="src",
+            sever_edges=[(p, keep)], sever_reason=_SEVER_REASON,
+        )
+
+        assert res["moved_task_ids"] == [p]
+        assert res["to_task_id"] == p
+        assert res["link_count"] == 0
+        assert res["severed_links"] == [[p, keep]]
+
+        with kbc.connect(board="src") as conn:
+            assert kb.get_task(conn, p) is None  # moved out
+            assert _links(conn) == set()  # no dangling link row left behind
+            assert kb.get_task(conn, keep) is not None  # stays put
+            (cut,) = _payloads(conn, keep, "link_severed")
+            # The source event describes the card that stays behind.
+            assert cut["role"] == "child"
+            assert cut["moved_task_id"] == p
+            assert cut["moved_to_board"] == "dst"
+            assert cut["reason"] == _SEVER_REASON
+        with kbc.connect(board="dst") as conn:
+            assert kb.get_task(conn, p) is not None
+            assert _links(conn) == set()
+            (cut,) = _payloads(conn, p, "link_severed")
+            # The target event describes the card that arrived.
+            assert cut["role"] == "parent"
+            assert cut["outside_task_id"] == keep
+            assert cut["from_board"] == "src"
+            assert cut["reason"] == _SEVER_REASON
+
+    def test_sever_with_links_cuts_the_set_at_the_declared_edge(self, fresh_home):
+        """``--with-links`` plus a declared cut moves the near side only."""
+        _seed_boards()
+        a = _card("A")
+        b = _card("B")
+        c = _card("C")
+        keep = _card("Keep", status="done")
+        _link(a, b)
+        _link(b, c)
+        _link(c, keep)
+
+        res = kanban_move.move_task(
+            a, "dst", source_slug="src", with_links=True,
+            sever_edges=[(c, keep)], sever_reason=_SEVER_REASON,
+        )
+
+        assert sorted(res["moved_task_ids"]) == sorted([a, b, c])
+        assert res["link_count"] == 2
+        assert res["severed_links"] == [[c, keep]]
+
+        with kbc.connect(board="dst") as conn:
+            assert _links(conn) == {(a, b), (b, c)}
+            for tid in (a, b, c):
+                assert "moved_in" in _kinds(conn, tid)
+            assert kb.get_task(conn, keep) is None
+        with kbc.connect(board="src") as conn:
+            assert {t.id for t in kb.list_tasks(conn)} == {keep}
+            assert _links(conn) == set()
+            (cut,) = _payloads(conn, keep, "link_severed")
+            assert cut["moved_task_id"] == c
+            assert cut["moved_to_board"] == "dst"
+
+    # -- CLI surface ------------------------------------------------------
+
+    def test_sever_via_cli_records_and_reports(self, tmp_path, monkeypatch):
+        env, a, b = _cli_seeded(tmp_path, monkeypatch)
+
+        r = _cli(
+            [
+                "boards", "move", a, "--from", "src", "--to", "dst",
+                "--sever-edge", f"{a}:{b}",
+                "--sever-reason", _SEVER_REASON,
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert r.returncode == 0, r.stderr
+
+        data = json.loads(r.stdout)
+        assert data["moved_task_ids"] == [a]
+        assert data["severed_links"] == [[a, b]]
+        assert data["link_count"] == 0
+
+        src_titles = {
+            t["title"]
+            for t in json.loads(_cli(["--board", "src", "list", "--json"], env_extra=env).stdout)
+        }
+        dst_titles = {
+            t["title"]
+            for t in json.loads(_cli(["--board", "dst", "list", "--json"], env_extra=env).stdout)
+        }
+        assert src_titles == {"B"}
+        assert dst_titles == {"A"}
+
+    def test_sever_via_cli_requires_reason(self, tmp_path, monkeypatch):
+        env, a, b = _cli_seeded(tmp_path, monkeypatch)
+
+        r = _cli(
+            ["boards", "move", a, "--from", "src", "--to", "dst", "--sever-edge", f"{a}:{b}"],
+            env_extra=env,
+        )
+        assert r.returncode != 0
+        assert "--sever-reason" in (r.stderr + r.stdout)
+
+        src_titles = {
+            t["title"]
+            for t in json.loads(_cli(["--board", "src", "list", "--json"], env_extra=env).stdout)
+        }
+        assert src_titles == {"A", "B"}
+
+    def test_sever_via_cli_rejects_a_malformed_edge_spec(self, tmp_path, monkeypatch):
+        env, a, _b = _cli_seeded(tmp_path, monkeypatch)
+
+        r = _cli(
+            [
+                "boards", "move", a, "--from", "src", "--to", "dst",
+                "--sever-edge", "not-an-edge",
+                "--sever-reason", _SEVER_REASON,
+            ],
+            env_extra=env,
+        )
+        assert r.returncode != 0
+        assert "--sever-edge" in (r.stderr + r.stdout)
+        assert "PARENT:CHILD" in (r.stderr + r.stdout)
+
+    def test_move_still_reports_no_severance_when_none_was_declared(self, fresh_home):
+        """The key is absent unless a cut happened (unchanged callers)."""
+        _seed_boards()
+        lone = _card("Lone")
+
+        res = kanban_move.move_task(lone, "dst", source_slug="src")
+
+        assert "severed_links" not in res
+
+
+def _cli_seeded(tmp_path, monkeypatch) -> tuple[dict, str, str]:
+    """CLI-built ``src``/``dst`` with an ``A -> B`` link.
+
+    ``B`` is parked at ``done`` (via the same store the CLI writes) so the
+    declared cut cannot auto-promote it: the pool-lane gate would otherwise
+    refuse, which is the point of that gate.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for var in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_BOARD",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        import hermes_constants
+        hermes_constants._cached_default_hermes_root = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    kb._INITIALIZED_PATHS.clear()
+
+    env = {"HERMES_HOME": str(tmp_path)}
+    assert _cli(["boards", "create", "src"], env_extra=env).returncode == 0
+    assert _cli(["boards", "create", "dst"], env_extra=env).returncode == 0
+    for title in ("A", "B"):
+        r = _cli(["--board", "src", "create", title, "--assignee", "dev"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+    ids = {
+        t["title"]: t["id"]
+        for t in json.loads(_cli(["--board", "src", "list", "--json"], env_extra=env).stdout)
+    }
+    a, b = ids["A"], ids["B"]
+    assert _cli(["--board", "src", "link", a, b], env_extra=env).returncode == 0
+    with kbc.connect(board="src") as conn:
+        with kbc.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (b,))
+    return env, a, b

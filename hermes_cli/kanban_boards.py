@@ -206,10 +206,13 @@ def _cmd_boards_import(args: argparse.Namespace) -> int:
 def _cmd_boards_move(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_move
 
+    raw_edges = list(getattr(args, "sever_edge", None) or [])
     try:
         res = kanban_move.move_task(
             args.task_id, args.to_slug, source_slug=args.from_slug,
             with_links=getattr(args, "with_links", False),
+            sever_edges=[kanban_move.parse_edge_spec(spec) for spec in raw_edges],
+            sever_reason=getattr(args, "sever_reason", None),
         )
     except (OSError, ValueError) as exc:
         return _err(f"kanban boards move: {exc}")
@@ -229,6 +232,13 @@ def _cmd_boards_move(args: argparse.Namespace) -> int:
             f"  Links carried: {res['link_count']} parent/child link(s) — "
             f"the whole link-closed set moved together."
         )
+    if res.get("severed_links"):
+        print(
+            f"  Severed (declared, audited with link_severed on both boards): "
+            f"{len(res['severed_links'])} edge(s)"
+        )
+        for parent_id, child_id in res["severed_links"]:
+            print(f"    {parent_id} -> {child_id}")
     if len(res["moved_task_ids"]) > 1:
         print(f"  Moved cards: {', '.join(res['moved_task_ids'])}")
     for warning in res["warnings"]:
