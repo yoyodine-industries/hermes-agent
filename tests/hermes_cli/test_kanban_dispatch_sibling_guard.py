@@ -29,6 +29,43 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 
 
+def _live_kbd():
+    """The dispatcher module the CLI reads *at call time*.
+
+    ``test_kanban_cli_dispatch_passthrough.py`` purges every ``hermes_cli*``
+    module from ``sys.modules`` to scope ``HERMES_HOME`` and never restores
+    them. In a whole-directory run the CLI then imports a *fresh* dispatcher
+    module while a module-level ``import ... as kbd`` still points at the
+    stranded copy: patching that copy is a silent no-op and the CLI runs the
+    real dispatcher. Resolve the seam per call instead of at collection.
+    """
+    import importlib
+
+    return importlib.import_module("hermes_cli.kanban_db_dispatch")
+
+
+@pytest.fixture
+def sibling_module_purge():
+    """Reproduce the sibling file's ``sys.modules`` purge, then restore it.
+
+    Deterministic stand-in for the ordering hazard: once
+    ``test_kanban_cli_dispatch_passthrough.py`` has run, every ``hermes_cli*``
+    module is gone from ``sys.modules`` mid-suite. Restoring the mapping in
+    teardown keeps this fixture from becoming a polluter in its own right.
+    """
+    saved = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if name.startswith(("hermes_cli", "hermes_state")) or name == "hermes_constants"
+    }
+    for name in saved:
+        del sys.modules[name]
+    try:
+        yield
+    finally:
+        sys.modules.update(saved)
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -282,10 +319,11 @@ def test_cli_dispatch_prints_guard_deferral(kanban_home, monkeypatch, capsys):
 
     from hermes_cli import kanban as kanban_cli
 
+    live = _live_kbd()
     monkeypatch.setattr(
-        kbd,
+        live,
         "dispatch_once",
-        lambda conn, **kw: kbd.DispatchResult(
+        lambda conn, **kw: live.DispatchResult(
             respawn_guarded=[("t_abc", "sibling_live")],
         ),
     )
@@ -307,10 +345,11 @@ def test_cli_dispatch_json_carries_guard_reason(kanban_home, monkeypatch, capsys
 
     from hermes_cli import kanban as kanban_cli
 
+    live = _live_kbd()
     monkeypatch.setattr(
-        kbd,
+        live,
         "dispatch_once",
-        lambda conn, **kw: kbd.DispatchResult(
+        lambda conn, **kw: live.DispatchResult(
             respawn_guarded=[("t_abc", "sibling_live")],
         ),
     )
@@ -323,3 +362,41 @@ def test_cli_dispatch_json_carries_guard_reason(kanban_home, monkeypatch, capsys
     assert payload["respawn_guarded"] == [
         {"task_id": "t_abc", "reason": "sibling_live"},
     ]
+
+
+def test_cli_dispatch_guard_reason_survives_sibling_module_purge(
+    kanban_home, monkeypatch, capsys, sibling_module_purge,
+):
+    """The CLI guard surface must survive a sibling file's ``sys.modules`` purge.
+
+    Both CLI tests above patch ``kanban_db_dispatch.dispatch_once``. When an
+    earlier file drops ``hermes_cli*`` from ``sys.modules`` — which
+    ``test_kanban_cli_dispatch_passthrough.py`` does on every run — a
+    collection-time ``import ... as kbd`` is stranded and the patch becomes a
+    no-op: the CLI prints the real dispatcher's zero-summary and the operator
+    never learns why a ready card was held. The seam is a call-time lookup, so
+    the test must resolve it the same way.
+    """
+    import argparse
+    import importlib
+
+    kanban_cli = importlib.import_module("hermes_cli.kanban")
+    kbd_live = _live_kbd()
+    assert kbd_live is importlib.import_module("hermes_cli.kanban_db_dispatch")
+
+    monkeypatch.setattr(
+        kbd_live,
+        "dispatch_once",
+        lambda conn, **kw: kbd_live.DispatchResult(
+            respawn_guarded=[("t_abc", "sibling_live")],
+        ),
+    )
+
+    rc = kanban_cli._cmd_dispatch(
+        argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=False)
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "t_abc" in out
+    assert "sibling_live" in out
