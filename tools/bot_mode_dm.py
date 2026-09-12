@@ -203,11 +203,15 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _err(msg, roster=teammates, peers=peers)
 
     body = str(message or "").strip()
-    if not body:
-        return _err("message is required — compose what you want to say to that agent.")
-    if len(body) > MESSAGE_MAX_CHARS:
-        return _err(f"message too long ({len(body)} chars > {MESSAGE_MAX_CHARS}). "
-                    "Send the essentials; share large content as a file path instead.")
+    # Sender-side truncation guard (2026-09-12). Imported lazily because this module also
+    # runs as a script, where the package path is not importable — the same convention the
+    # bot_relay imports above follow. The length cap stays authoritative here; the guard
+    # owns the truncation rule so this tool and the `hermes peer` CLI cannot drift apart.
+    from tools.dm_body_guard import guard_outbound_body
+
+    refusal = guard_outbound_body(body, max_chars=MESSAGE_MAX_CHARS)
+    if refusal:
+        return _err(refusal)
 
     raw_target = str(target or "").strip().lstrip("@")
     if not raw_target:

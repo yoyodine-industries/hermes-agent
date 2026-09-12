@@ -376,6 +376,16 @@ def cmd_peer(args) -> int:
     if not message:
         print("Message required (argument or stdin).", file=sys.stderr)
         return 2
+    # Sender-side truncation guard (2026-09-12): a body cut before it reached this CLI must
+    # fail here, loudly, instead of crossing to the peer as a partial instruction the
+    # recipient cannot detect. Placed before any request so nothing is created or queued.
+    # Covers `peer dm` and `peer run` — the body is the same body either way.
+    from tools.dm_body_guard import truncation_refusal
+
+    refusal = truncation_refusal(message)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     handler = _peer_run if action == "run" else _peer_dm
     return handler(args, message, peer_name, profile, base, key)
 
