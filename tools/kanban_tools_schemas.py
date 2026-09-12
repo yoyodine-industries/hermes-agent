@@ -10,11 +10,12 @@ _DESC_TASK_ID_DEFAULT = (
 
 _DESC_BOARD = (
     "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: HERMES_KANBAN_DB env → "
-    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "active board the usual way: an explicit board argument → "
+    "HERMES_KANBAN_BOARD env → the board whose store HERMES_KANBAN_DB "
+    "pins → the 'current' file under the kanban home → 'default'. The "
+    "HERMES_KANBAN_DB pin answers only for the board it belongs to, so "
+    "pass an explicit slug to reach another board from inside a "
+    "dispatched worker."
 )
 
 
