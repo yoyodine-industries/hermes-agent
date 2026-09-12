@@ -105,6 +105,80 @@ def _release_db(db) -> None:
         release_or_close(db)
 
 
+def _find_session_owner_home(target: str, launch_db) -> str | None:
+    """Resolve the profile home that OWNS ``target`` when the caller passed no profile.
+
+    A bot's canonical "Bot Chat" lives in the BOT's profile store. A multiplexed launch
+    profile (the desktop/dashboard, running under the DEFAULT home) that opens it by id
+    WITHOUT an explicit ``profile`` otherwise binds to its own home, forks the chat there,
+    and registers the live-delivery consumer lease in the wrong store (see the fork that
+    split ``api_…`` across the default and bot homes). Scan sibling profile stores for
+    ``target`` and return the owning home — or ``None`` when the id is already in the launch
+    home, absent everywhere, or ambiguous across siblings (fail closed: never guess between
+    two owners).
+
+    Self-contained on purpose: split-module bodies are rebound onto server.py's globals by
+    ``bind_module``, so this helper uses only in-function imports and its two arguments.
+    """
+    if launch_db is not None:
+        try:
+            if launch_db.get_session(target) is not None:
+                return None
+        except Exception:
+            pass
+    from pathlib import Path
+    from hermes_cli import profiles as profiles_mod
+    from hermes_constants import get_hermes_home
+    from hermes_state_registry import acquire as _acquire
+    try:
+        launch_home = str(get_hermes_home()).rstrip("/")
+    except Exception:
+        launch_home = None
+    try:
+        names = profiles_mod.list_profile_names()
+    except Exception:
+        return None
+    owner: str | None = None
+    for name in names:
+        try:
+            home = str(profiles_mod.get_profile_dir(name)).rstrip("/")
+        except Exception:
+            continue
+        if launch_home and home == launch_home:
+            continue
+        db = None
+        try:
+            db = _acquire(Path(home) / "state.db")
+            if db.get_session(target) is not None:
+                if owner is not None and owner != home:
+                    return None  # ambiguous across siblings — fail closed
+                owner = home
+        except Exception:
+            continue
+        finally:
+            if db is not None:
+                with contextlib.suppress(Exception):
+                    db.close()
+    return owner
+
+
+def _create_owner_home(profile_home: str | None, requested_id: str | None, launch_db) -> str | None:
+    """Resolve the profile home for ``session.create``.
+
+    An explicit ``profile`` wins outright (it already names the home). Otherwise, when a profile-less
+    create carries a KNOWN session id — a bot's canonical "Bot Chat" the caller is re-materializing
+    because its list lookup missed the hidden row — resolve the OWNING home so the session is born in
+    the bot's profile store, not forked into the launch (default) home. Mirrors ``session.resume``:
+    bind only when the id lives in exactly one sibling store, never rebind a genuinely new id (absent),
+    and fail closed when it is ambiguous across siblings.
+    """
+    if profile_home is not None:
+        return profile_home
+    if requested_id:
+        return _find_session_owner_home(requested_id, launch_db)
+    return None
+
+
 def _branch_title(db, parent_key: str) -> str:
     """Next title in the parent's lineage (mirrors the TUI /branch naming)."""
     current = db.get_session_title(parent_key) or "branch"
@@ -336,6 +410,10 @@ def _(rid, params: dict) -> dict:
     _enable_gateway_prompts()
     # ``profile`` (app-global remote mode): stored so the build and every turn re-bind HERMES_HOME.
     profile_home = _profile_home(profile := (params.get("profile") or "").strip() or None)
+    # A bot's canonical "Bot Chat" lives in the BOT's profile store. A profile-less create that carries
+    # a known session id (the canonical chat re-materialized because the list lookup missed the hidden
+    # row) must resolve that owner's home instead of forking the id into the launch (default) home.
+    profile_home = _create_owner_home(profile_home, _str_param(params, "session_id") or None, _get_db())
     session_model_override, create_reasoning_override, create_service_tier_override = _create_overrides(params)
     now = time.time()
     with _sessions_lock:
@@ -832,6 +910,15 @@ def _(rid, params: dict) -> dict:
     try:
         if ctx.db is None:
             return _db_unavailable_error(rid, code=5000)
+        # A bot's canonical chat lives in the BOT's profile store. When the caller resumes it by
+        # id WITHOUT a profile, the launch (default) home would fork it (and the live-delivery
+        # consumer lease would land in the wrong store). Resolve the owning home before locate so
+        # the session, lease, and consumer all bind to the bot's home.
+        if ctx.profile_home is None and (owner_home := _find_session_owner_home(ctx.target, ctx.db)) is not None:
+            ctx.profile_home = owner_home
+            ctx.db, ctx.owns_db = _profile_session_db(owner_home)
+            if ctx.db is None:
+                return _db_unavailable_error(rid, code=5000)
         if (resp := _resume_locate(ctx)) is not None:
             return resp
         _resume_follow_tip(ctx)
