@@ -71,6 +71,13 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# How long a card is deferred because its previous worker process is still
+# alive (reason ``sibling_live``). Past this the spawn record is treated as
+# stale and the next tick spawns anyway: a genuinely wedged worker is the
+# reclaim passes' problem, and a leaked long-lived pid must never park a card
+# forever. A worker turn is minutes, so two hours is generous.
+_SIBLING_LIVE_WINDOW_SECONDS = 2 * 3600  # 2 hours
+
 
 @dataclass
 class DispatchResult:
@@ -119,9 +126,12 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
-    """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
-    (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    """``(task_id, reason)`` skipped by the respawn guard: ``"sibling_live"``
+    (previous run closed without a durable handoff and its worker process is
+    still alive — spawning now would race two workers on one card),
+    ``"rate_limit_cooldown"``, ``"blocker_auth"`` (quota/auth error — also
+    auto-blocked), ``"recent_success"`` (completed run within guard window),
+    ``"active_pr"`` (GitHub PR URL in a recent comment)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1098,13 +1108,28 @@ def _record_task_failure(
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
+    """Record the spawned child's pid + emit a ``spawned`` event carrying it.
+
+    The event also carries the child's process create-time. It is the ONLY
+    record of a live worker that outlives the run: ``block_task`` and
+    ``_end_run`` both NULL the ``worker_pid`` columns (tasks and task_runs), so
+    once a card is re-queued out from under a still-working process nothing else
+    remembers which pid owns it. ``_live_sibling_worker`` reads this event; the
+    create-time is what lets it tell that worker apart from an unrelated later
+    process that happened to reuse the pid.
+    """
+    from hermes_cli.process_identity import _process_create_time
+
+    payload: dict[str, Any] = {"pid": int(pid)}
+    create_time = _process_create_time(int(pid))
+    if create_time is not None:
+        payload["create_time"] = float(create_time)
     with _kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _kb._append_event(conn, task_id, "spawned", payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1122,12 +1147,88 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _live_sibling_worker(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
+    """Describe a worker that already lost this card but may still be running.
+
+    Returns ``{"pid", "run_id", "spawned_at"}``, or ``None`` when no sibling is
+    live. The claim, the failure counter and both ``worker_pid`` columns are all
+    cleared on block/reclaim/timeout, while the worker PROCESS keeps going —
+    ``kanban_block`` is normally called by the worker itself, mid-turn, and it
+    cannot sign its own process off without truncating the handoff it just
+    wrote. Everything the dispatcher reads therefore says "nobody is running
+    this", and it spawns a second worker over the first: two agents burning
+    tokens on one card and racing the same files. (Their ``kanban_heartbeat``
+    calls are refused once the claim is gone — the duplicated work is not.)
+
+    Evidence is the ``spawned`` event written by :func:`_set_worker_pid`: the
+    only spawn record that survives both null-outs, carrying the child's process
+    create-time so a reused pid is not mistaken for this worker (``_pid_alive``
+    alone cannot tell them apart). The newest spawn event is used regardless of
+    which run owns it — if that pid is alive, a worker of this card is.
+    A run that ended ``completed`` is ignored: its handoff is durable and
+    re-running the card is the designed path (``recent_success`` owns it).
+    """
+    latest_run = conn.execute(
+        "SELECT id, outcome FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest_run is None or latest_run["outcome"] == "completed":
+        return None
+
+    spawn = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'spawned' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if spawn is None:
+        return None
+    spawned_at = int(_kb._row_get(spawn, "created_at") or 0)
+    if spawned_at and (time.time() - spawned_at) > _SIBLING_LIVE_WINDOW_SECONDS:
+        # Stale record — see the constant for why this bound exists.
+        return None
+    payload = _kb._json_dict(_kb._row_get(spawn, "payload"))
+    raw_pid = payload.get("pid")
+    if raw_pid is None:
+        return None
+    try:
+        pid = int(raw_pid)
+    except (TypeError, ValueError):
+        return None
+    create_time = payload.get("create_time")
+    if create_time is not None:
+        try:
+            create_time = float(create_time)
+        except (TypeError, ValueError):
+            create_time = None
+    if pid <= 0 or pid == os.getpid():
+        # Our own dispatch process is never a sibling worker.
+        return None
+
+    from hermes_cli.process_identity import _pid_alive_matches
+
+    alive = _pid_alive_matches(pid, create_time)   # None when psutil can't say
+    if alive is None:
+        # No psutil: fall back to the zombie-aware existence check. A pid that
+        # was reused inside the window then defers the card — the safe way to
+        # be wrong, and bounded by _SIBLING_LIVE_WINDOW_SECONDS.
+        alive = _pid_alive(pid)
+    if not alive:
+        return None
+    return {"pid": pid, "run_id": _kb._row_get(latest_run, "id"), "spawned_at": spawned_at}
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready/review row before any claim attempt. Priority order:
+    ``"sibling_live"`` (the last run closed without a durable handoff and its
+    worker process is still alive — two workers on one card can never be
+    reconciled, so this outranks everything below, the review lane included),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
@@ -1147,6 +1248,13 @@ def check_respawn_guard(
         return None
 
     now = int(time.time())
+
+    # 0. Live sibling worker — outranks every reason below, INCLUDING the
+    #    review-lane early return: a review worker is still a worker, and a run
+    #    that ended without a durable handoff while its process lives means that
+    #    process may still be mid-turn (see _live_sibling_worker).
+    if _live_sibling_worker(conn, task_id) is not None:
+        return "sibling_live"
 
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.

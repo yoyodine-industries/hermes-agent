@@ -105,6 +105,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason} for (tid, reason) in res.respawn_guarded
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -136,6 +139,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    # Guard deferrals are the one bucket an operator must see: the card looks
+    # ready and simply never spawns. Not a failure (the next tick re-checks).
+    if res.respawn_guarded:
+        print(f"Guarded:      {len(res.respawn_guarded)}")
+        for tid, reason in res.respawn_guarded:
+            print(f"  - {tid}  ({reason})")
     return 0
 
 
@@ -196,8 +205,14 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return False
 
     def _on_tick(res):
+        # A guard deferral is an EXPLAINED non-spawn (the ``guarded=`` count in the
+        # verbose line names the task and reason). Letting it age into the
+        # "dispatcher stuck — check profile health/credentials" warning would point
+        # the operator at the wrong subsystem while a sibling worker is simply
+        # still finishing.
+        explained = bool(res.respawn_guarded)
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
+        if ready_pending and not res.spawned and not explained:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
@@ -218,16 +233,18 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
-            or res.spawned or res.auto_blocked or res.stale
+            or res.spawned or res.auto_blocked or res.stale or res.respawn_guarded
         )
         if did_work:
             print(
                 f"[{_fmt_ts(int(time.time()))}] reclaimed={res.reclaimed} "
                 f"crashed={len(res.crashed)} timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
-                f"auto_blocked={len(res.auto_blocked)}",
+                f"auto_blocked={len(res.auto_blocked)} guarded={len(res.respawn_guarded)}",
                 flush=True,
             )
+            for _tid, _reason in res.respawn_guarded:
+                print(f"[{_fmt_ts(int(time.time()))}]   guarded {_tid}: {_reason}", flush=True)
 
     try:
         kbd.run_daemon(
