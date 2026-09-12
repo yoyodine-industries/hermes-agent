@@ -16,6 +16,13 @@ legitimate — and the bare word "truncated" in prose is not a marker. A cut wit
 all has no detectable signature and is not guessed at here: a heuristic over "looks cut" would
 refuse good messages, and a guard that cries wolf gets bypassed.
 
+The SAME rule covers content-bearing tool arguments on the write path (``content``,
+``file_content``, ``new_string``), where a cut at authoring time lands as a partial FILE and a
+success status: a skill write shipped a 167-byte fragment ending ``message:t...[truncated]``,
+and upstream NousResearch/hermes-agent#83714 writes the literal marker into the target file for
+multi-line ``new_string``. ``content_refusal`` / ``guard_tool_content_arguments`` are that half;
+both halves share ``find_truncation_marker`` so one rule cannot drift from the other.
+
 Pure stdlib, no import-time side effects (see ``yaan-import-side-effects``).
 """
 
@@ -27,6 +34,19 @@ import re
 #: written, so a short window is always enough; anything older is quotation.
 TAIL_WINDOW = 64
 
+#: How far back from the end of a content payload to look. Deliberately generous: a content
+#: argument is routinely cut inside a docstring or a long prose paragraph, and a few residual
+#: lines can follow the marker, so the window has to cover far more than the marker itself.
+#: Do not tighten — this window is the only thing between a cut payload and a partial write.
+CONTENT_TAIL_WINDOW = 400
+
+#: Tool-argument names that carry AUTHORED CONTENT — bytes destined for a file — and so are
+#: refused when their tail is a truncation marker. ``new_string`` is written into the file by
+#: ``patch``. ``old_string`` is deliberately ABSENT: it is a search pattern, so a cut there
+#: simply fails to match and the patch errors loudly on its own — gating it would only add
+#: false refusals.
+CONTENT_ARG_FIELDS = ("content", "file_content", "new_string")
+
 #: End-anchored, bracketed truncation marker. Covers the forms seen in the wild and those
 #: written by harnesses: ``[truncated]``, ``[...truncated]``, ``[truncated 4096 chars]``,
 #: ``<truncated>``, ``(truncated)``, ``…[truncated]``, ``... [TRUNCATED]``. The bracket or
@@ -37,13 +57,15 @@ _MARKER_RE = re.compile(
 )
 
 
-def find_truncation_marker(body: str) -> str | None:
+def find_truncation_marker(body: str, *, window: int = TAIL_WINDOW) -> str | None:
     """Return the end-of-body truncation marker (e.g. ``"[truncated]"``), else ``None``.
 
     Only an end-anchored, bracketed marker counts: truncation loses the tail, so a marker
-    in the middle of a body is a quotation, not evidence of a cut.
+    in the middle of a body is a quotation, not evidence of a cut. ``window`` is the number
+    of trailing characters searched; a content payload passes the wider
+    ``CONTENT_TAIL_WINDOW``.
     """
-    tail = str(body or "")[-TAIL_WINDOW:]
+    tail = str(body or "")[-window:]
     match = _MARKER_RE.search(tail)
     if not match:
         return None
@@ -69,6 +91,56 @@ def truncation_refusal(body: str) -> str | None:
         "the full text: lead with the conclusion, and if the content is long, write it to a "
         "file and send the path instead of pasting it."
     )
+
+
+def content_refusal(field: str, value: str) -> str | None:
+    """Return the refusal for a content-bearing tool argument cut at authoring time, else ``None``.
+
+    The marker is LITERAL TEXT in the argument, so what arrived is a partial payload, not a
+    deliberately small one — and the marker leaves the serialized JSON valid, so no downstream
+    check can catch it. Writing it would ship the corruption with a success status, so the
+    refusal lands before anything touches the filesystem. Callers pass the argument's own name
+    so the message points at the field that arrived cut.
+    """
+    text = str(value or "")
+    marker = find_truncation_marker(text, window=CONTENT_TAIL_WINDOW)
+    if not marker:
+        return None
+    length = len(text.strip())
+    return (
+        f"REFUSED: the {field!r} argument ends in a truncation marker {marker!r} ({length} chars). "
+        "This is a PARTIAL payload cut where the tool call was AUTHORED, not a size limit — nothing "
+        "rejected it for length, its tail is simply missing. NOTHING was written: no file was created "
+        "and no file was modified. Re-send the full content. If it is long, create the file first with "
+        "a short chunk and append the rest with patch instead of one oversized argument. Notify "
+        "yoyodine-majordomo that a tool argument arrived truncated."
+    )
+
+
+def guard_tool_content_arguments(args) -> str | None:
+    """Return the first refusal for a truncation-marked content argument in ``args``, else ``None``.
+
+    The single entry point every content-writing handler calls before its first side effect.
+    Walks dicts and lists of dicts (``skill_manage`` takes an ``operations`` array) and checks
+    every key in ``CONTENT_ARG_FIELDS`` whose value is a ``str``; anything else is ignored, so
+    an op's non-content fields never trip it.
+    """
+    if isinstance(args, dict):
+        for key, value in args.items():
+            if key in CONTENT_ARG_FIELDS and isinstance(value, str):
+                refusal = content_refusal(key, value)
+                if refusal is not None:
+                    return refusal
+            if isinstance(value, (dict, list, tuple)):
+                refusal = guard_tool_content_arguments(value)
+                if refusal is not None:
+                    return refusal
+    elif isinstance(args, (list, tuple)):
+        for item in args:
+            refusal = guard_tool_content_arguments(item)
+            if refusal is not None:
+                return refusal
+    return None
 
 
 def guard_outbound_body(body: str, *, max_chars: int | None = None) -> str | None:
