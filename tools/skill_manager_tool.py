@@ -31,6 +31,7 @@ from tools.skill_manager_guards import (
     _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
     _containing_skills_root, _curator_consolidation_delete_guard, _maybe_auto_propose_org_edit,
     _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
+from tools.dm_body_guard import guard_tool_content_arguments
 from tools.skill_manager_batch import _skill_manage_batch
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
 
@@ -739,6 +740,14 @@ def skill_manage(
     session_id: str = None, operations=None) -> str:
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
+    # Fail closed on a skill payload cut at authoring time: the marker is literal text in the
+    # argument, so what arrived is a partial SKILL.md / support file, and staging it would ship
+    # the corruption with a success status. Covers the flat fields AND the `operations` array,
+    # and runs before the write gate, ledger capture, or any staging side effect.
+    if (refusal := guard_tool_content_arguments({
+            "content": content, "file_content": file_content, "new_string": new_string,
+            "operations": operations})) is not None:
+        return tool_error(refusal, success=False)
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
