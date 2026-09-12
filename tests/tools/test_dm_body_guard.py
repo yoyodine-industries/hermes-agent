@@ -50,6 +50,12 @@ def test_refusal_names_the_marker_and_what_happened():
     assert "NOTHING was sent" in refusal
 
 
+def test_refusal_tells_the_sender_to_report_the_cut():
+    refusal = truncation_refusal("analysis follows. [truncated]")
+    assert refusal is not None
+    assert "yoyodine-majordomo" in refusal
+
+
 def test_complete_body_is_not_refused():
     assert truncation_refusal("all five anchors matched; the patch is clean") is None
 

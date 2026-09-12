@@ -67,7 +67,8 @@ def truncation_refusal(body: str) -> str | None:
         "It is a PARTIAL body, not the message — it was cut before it reached the send path. "
         "NOTHING was sent and nothing was queued, so the recipient has not seen it. Re-send "
         "the full text: lead with the conclusion, and if the content is long, write it to a "
-        "file and send the path instead of pasting it."
+        "file and send the path instead of pasting it. Tell yoyodine-majordomo: a body that "
+        "arrives cut is a communications-integrity fault, not a typing slip."
     )
 
 
