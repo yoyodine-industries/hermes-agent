@@ -194,6 +194,115 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _own_claim_lock() -> Optional[str]:
+    """This process's ``host:pid`` claim id (what ``tasks.claim_lock`` records);
+    ``None`` when the board layer cannot be imported."""
+    try:
+        from hermes_cli import kanban_db as kb
+        return kb._claimer_id()
+    except Exception:  # pragma: no cover - defensive (no board layer)
+        return None
+
+
+def _owns_run(task, task_id: str) -> bool:
+    """Whether THIS process owns the run of ``task_id``.
+
+    Ownership is provenance, never the caller's own say-so: the dispatcher exports
+    ``HERMES_KANBAN_TASK`` into the worker it spawned, ``tasks.claim_lock`` names the
+    process that took the card, and ``tasks.worker_pid`` names the process spawned for
+    this run. A caller matching none of the three owns no run. That is what a
+    delegate child, a shell/python child of a worker (the child-env builder scrubs
+    ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID``), or an unrelated session handed
+    a ``task_id`` looks like — see :func:`_reject_unowned_run_completion`.
+    """
+    if _own_task_env(task_id, "HERMES_KANBAN_TASK"):
+        return True
+    if task is None:
+        return False
+    if task.claim_lock and task.claim_lock == _own_claim_lock():
+        return True
+    try:
+        return task.worker_pid is not None and int(task.worker_pid) == os.getpid()
+    except (TypeError, ValueError):
+        return False
+
+
+def _unowned_run_reason(task, task_id: str) -> str:
+    """Say "this process owns no run", in the caller's terms, naming the holder."""
+    run = f"run {task.current_run_id}" if task.current_run_id else "an open run"
+    holder = ", ".join(
+        part for part in (
+            f"claim lock {task.claim_lock}" if task.claim_lock else None,
+            f"worker pid {task.worker_pid}" if task.worker_pid else None,
+        ) if part
+    ) or "an unknown owner"
+    return (
+        f"kanban_complete: this process owns no run of {task_id} — the task is running "
+        f"under {run} (held by {holder}), and a caller that owns no run cannot complete "
+        "someone else's card. Nothing was written. A delegate child, a shell/python child "
+        "of a worker, or a session handed a bare task_id all look like this; complete the "
+        "card from the process that owns the run, or let the dispatcher/operator close it "
+        f"(hermes kanban complete {task_id}).")
+
+
+def _reject_unowned_run_completion(task, task_id: str) -> None:
+    """Refuse a completion of a RUNNING card by a process that owns no run of it.
+
+    ``complete_task`` accepts a running task whenever the caller passes no
+    ``expected_run_id``, and a caller that owns nothing never has one — so an
+    unrelated process holding a bare ``task_id`` used to end another run's card and
+    still be told the work was done. Identity gates run before content (the goal
+    judge) here: an impostor's summary is not worth judging. Non-running statuses
+    (ready/blocked/review) still complete without a run — that is the documented
+    orchestrator/manual path.
+    """
+    if task is None or task.status != "running" or _owns_run(task, task_id):
+        return
+    logger.warning(
+        "kanban_complete: refusing an unowned completion of %s (status=running, "
+        "run=%s, claim_lock=%s, worker_pid=%s)",
+        task_id, task.current_run_id, task.claim_lock, task.worker_pid)
+    raise _Reject(_unowned_run_reason(task, task_id))
+
+
+# The statuses ``complete_task``'s terminal UPDATE accepts (see hermes_cli/kanban_db.py,
+# complete_task). Anything else returns falsy without recording last_failure_error.
+_COMPLETABLE_STATUSES = frozenset({"running", "ready", "blocked", "review"})
+
+
+def _completion_failure_reason(kb, conn, tid: str, task, own_run_id: Optional[int]) -> str:
+    """Why the terminal write was refused, stated in the caller's terms.
+
+    ``complete_task`` returns falsy for several unrelated gates and records
+    ``last_failure_error`` for only some of them. The previous text listed three
+    causes ("unknown id, stale run, or already terminal"), none of which name the one
+    that actually fires for a caller owning no run — the mismatch sent a whole
+    investigation after a fence that had never been asked. Classify from the rows.
+    """
+    if task is None:
+        return (f"kanban_complete: unknown task id {tid} — no such task on the board this "
+                "session is pinned to. Nothing was written.")
+    if task.status == "running" and not _owns_run(task, tid):
+        return _unowned_run_reason(task, tid)
+    if task.status not in _COMPLETABLE_STATUSES:
+        return (f"kanban_complete: {tid} is {task.status!r}, not one of "
+                f"{sorted(_COMPLETABLE_STATUSES)} — nothing to complete: the card is already "
+                "closed, or it has not been dispatched yet.")
+    if own_run_id is not None and task.current_run_id != own_run_id:
+        return (f"kanban_complete: stale run — this worker holds run {own_run_id} but {tid} is "
+                f"on run {task.current_run_id} now (the card was reclaimed or re-dispatched). "
+                "Nothing was written; re-read the card with kanban_show.")
+    try:
+        parents_done = kb._parents_satisfied(conn, tid)
+    except Exception:  # pragma: no cover - defensive (no board layer)
+        parents_done = True
+    if not parents_done:
+        return (f"kanban_complete: {tid} still has unfinished parent tasks; the dependency gate "
+                "keeps a child out of done until every parent is done.")
+    return (f"kanban_complete: the board refused the terminal write for {tid} (status "
+            f"{task.status}); re-read the card with kanban_show and retry.")
+
+
 def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
     session_id = _own_task_env(task_id, "HERMES_SESSION_ID")
@@ -595,16 +704,20 @@ def _handle_complete(args: dict, **kw) -> str:
     _check(summary or result, "provide at least one of: summary (preferred), result")
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    own_run_id = _worker_run_id(tid)
     with _board(args.get("board")) as (kb, conn):
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
+        # Identity before content: a caller that owns no run of a running card is refused
+        # outright (and told why) instead of being handed a summary of the wrong gates.
+        _reject_unowned_run_completion(task, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=own_run_id)
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -628,7 +741,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"created_cards=[] to skip the card-claim check entirely.")
         task = kb.get_task(conn, tid)
         _check(ok, (task.last_failure_error if task else None) or
-               f"could not complete {tid} (unknown id, stale run, or already terminal)")
+               _completion_failure_reason(kb, conn, tid, task, own_run_id))
         run = kb.latest_run(conn, tid)
         return _ok(task_id=tid, run_id=run.id if run else None)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,6 +32,12 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
     attachments_root = tmp_path / "attachments"
     workspace = tmp_path / "parent-workspace"
     workspace.mkdir()
+    # A dispatched worker's ambient env pins the LIVE board (the dispatcher injects
+    # HERMES_KANBAN_DB / HERMES_KANBAN_BOARD), so clear it before HERMES_HOME is
+    # re-pointed — otherwise these tests would create and claim tasks on a real board.
+    for _var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
+                 "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(_var, raising=False)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "parent-worker")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
@@ -386,4 +393,171 @@ def test_unavailable_delegation_context_fence_refuses_when_the_process_owns_no_t
     assert "refused" in payload["error"]
     assert "delegation context" in payload["error"]
     assert any("un-evaluable" in r.getMessage() for r in caplog.records), caplog.text
+
+
+# --- Run ownership on the completion path (#22923 follow-up) -----------------
+# The fence above decides who may mutate board state at all; these pin WHO OWNS THE
+# RUN of a running card, which is a different question. ``complete_task`` accepts a
+# running task whenever the caller passes no ``expected_run_id`` — and a caller that
+# owns nothing never has one — so ownership has to be established before the write.
+
+def _make_foreign_run(kb, tid, *, worker_pid=None):
+    """Point the card's run at a process that is not this one.
+
+    ``_make_running_kanban_task`` claims the card in-process, so ``claim_lock`` is this
+    process's own ``host:pid``; rewrite it (and ``worker_pid``) so none of the
+    ownership proofs can match.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(kb.kanban_db_path(board=None))
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("UPDATE tasks SET claim_lock = ?, worker_pid = ? WHERE id = ?",
+                     ("otherhost:4242", worker_pid, tid))
+        conn.commit()
+        return kb.get_task(conn, tid)
+    finally:
+        conn.close()
+
+
+def _board_snapshot(kb, tid):
+    """Read the card straight from its file (task, latest run, event kinds)."""
+    import sqlite3
+
+    conn = sqlite3.connect(kb.kanban_db_path(board=None))
+    conn.row_factory = sqlite3.Row
+    try:
+        return (kb.get_task(conn, tid), kb.latest_run(conn, tid),
+                [e.kind for e in kb.list_events(conn, tid)])
+    finally:
+        conn.close()
+
+
+def _a_process_that_owns_nothing(monkeypatch):
+    """Drop every env proof of ownership from this process."""
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_CLAIM_LOCK", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_non_owner_cannot_complete_a_running_card(monkeypatch, tmp_path, caplog):
+    """A caller that owns no run must not complete a card running under another run.
+
+    The failure mode this closes: a shell/python child of a worker (the child-env
+    builder scrubs ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID``), or any session
+    handed a bare ``task_id``, used to end another run's card and be told the work was
+    done. The refusal must name ownership — not the unrelated gates it was reporting.
+    """
+    import logging
+
+    kb, tid, workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    from tools import kanban_tools
+
+    _a_process_that_owns_nothing(monkeypatch)
+    foreign = _make_foreign_run(kb, tid)
+
+    with caplog.at_level(logging.WARNING, logger="tools.kanban_tools"):
+        raw = kanban_tools._handle_complete({"task_id": tid, "summary": "stolen"})
+
+    payload = json.loads(raw)
+    assert payload["error"], raw
+    assert "owns no run" in payload["error"], payload["error"]
+    assert tid in payload["error"]
+    assert f"run {foreign.current_run_id}" in payload["error"]
+    assert "otherhost:4242" in payload["error"]
+    assert any("refusing an unowned completion" in r.getMessage()
+               for r in caplog.records), caplog.text
+
+    task, run, kinds = _board_snapshot(kb, tid)
+    assert task.status == "running"
+    assert run.status == "running"
+    assert "completed" not in kinds
+    assert workspace.is_dir()
+
+
+def test_worker_pid_owns_the_run_when_the_env_was_scrubbed(monkeypatch, tmp_path):
+    """A dispatcher-spawned worker keeps its own card even with no HERMES_KANBAN_TASK.
+
+    ``tasks.worker_pid`` records the process the dispatcher spawned for the run, so the
+    owner is never locked out of its own card by a scrubbed environment.
+    """
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    from tools import kanban_tools
+
+    _a_process_that_owns_nothing(monkeypatch)
+    _make_foreign_run(kb, tid, worker_pid=os.getpid())
+
+    payload = json.loads(kanban_tools._handle_complete({"task_id": tid, "summary": "mine"}))
+    assert payload.get("ok"), payload
+
+    task, run, _kinds = _board_snapshot(kb, tid)
+    assert task.status == "done"
+    assert run.status == "done"
+
+
+def test_the_claim_lock_of_this_process_owns_the_run(monkeypatch, tmp_path):
+    """Whoever took the claim owns the run: ``claim_lock`` is an ownership proof too."""
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    from tools import kanban_tools
+
+    _a_process_that_owns_nothing(monkeypatch)
+    # claim_task() ran in this process, so tasks.claim_lock is this process's host:pid.
+    payload = json.loads(kanban_tools._handle_complete({"task_id": tid, "summary": "mine"}))
+    assert payload.get("ok"), payload
+    assert _board_snapshot(kb, tid)[0].status == "done"
+
+
+def test_unknown_task_id_still_reports_the_id_case(monkeypatch, tmp_path):
+    """A bogus id keeps reporting the id case — ownership must not swallow it."""
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    from tools import kanban_tools
+
+    _a_process_that_owns_nothing(monkeypatch)
+
+    payload = json.loads(
+        kanban_tools._handle_complete({"task_id": "t_ffffffffff", "summary": "ghost"}))
+    assert payload["error"], payload
+    assert "unknown task id t_ffffffffff" in payload["error"], payload["error"]
+    assert "owns no run" not in payload["error"]
+    assert _board_snapshot(kb, tid)[0].status == "running"
+
+
+def test_a_child_process_with_the_scrubbed_env_cannot_complete_the_card(monkeypatch, tmp_path):
+    """Real process boundary: the env-scrubbed child call is refused, not obeyed.
+
+    This is the evidence-shaped call (no ``HERMES_KANBAN_TASK``, explicit ``task_id`` of
+    a card running under another run), run where it actually happens — a separate
+    interpreter that inherited a worker's env minus its ownership markers.
+    """
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    _make_foreign_run(kb, tid)
+
+    child_env = {
+        k: v for k, v in os.environ.items()
+        if k not in {"HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
+                     "HERMES_KANBAN_CLAIM_LOCK", "HERMES_DELEGATED_CHILD_CONTEXT"}
+    }
+    child_env.update({
+        "PYTHONPATH": str(_REPO_ROOT),
+        "HERMES_HOME": str(tmp_path / ".hermes"),
+        "HERMES_PROFILE": "parent-worker",
+        "HERMES_KANBAN_DB": str(kb.kanban_db_path(board=None)),
+        "HERMES_KANBAN_WORKSPACE": str(tmp_path / "parent-workspace"),
+    })
+    code = (
+        "from tools import kanban_tools as kt\n"
+        f"print(kt._handle_complete({{'task_id': {tid!r}, 'summary': 'stolen'}}))\n"
+    )
+    proc = subprocess.run(_python_with_repo_path(code), shell=True, cwd=str(tmp_path),
+                          env=child_env, capture_output=True, text=True, timeout=120)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "owns no run" in proc.stdout, (proc.stdout, proc.stderr)
+    assert tid in proc.stdout
+
+    task, run, kinds = _board_snapshot(kb, tid)
+    assert task.status == "running"
+    assert run.status == "running"
+    assert "completed" not in kinds
 
