@@ -15,6 +15,7 @@ import tools.file_tools  # noqa: F401 — importing registers the write_file/pat
 from tools.dm_body_guard import (
     CONTENT_ARG_FIELDS,
     CONTENT_TAIL_WINDOW,
+    DEFAULT_REPORT_TARGET,
     TAIL_WINDOW,
     content_refusal,
     find_truncation_marker,
@@ -67,7 +68,7 @@ def test_marker_tailed_content_is_refused_by_the_guard(value):
 
 
 def test_refusal_names_the_field_marker_length_and_what_happened():
-    refusal = content_refusal("file_content", CUT_DOCSTRING)
+    refusal = content_refusal("file_content", CUT_DOCSTRING, report_to="the duty reviewer")
     assert refusal is not None
     assert "'file_content'" in refusal
     assert "'[truncated]'" in refusal
@@ -78,7 +79,13 @@ def test_refusal_names_the_field_marker_length_and_what_happened():
     assert "no file was created" in refusal
     assert "no file was modified" in refusal
     assert "not a size limit" in refusal
-    assert "yoyodine-majordomo" in refusal
+    assert "the duty reviewer" in refusal
+
+    # The rule carries no deployment's identifiers: unset, it names nobody in particular.
+    unnamed = content_refusal("file_content", CUT_DOCSTRING)
+    assert unnamed is not None
+    assert DEFAULT_REPORT_TARGET in unnamed
+    assert "the duty reviewer" not in unnamed
 
 
 @pytest.mark.parametrize("value", [
