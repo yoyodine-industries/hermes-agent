@@ -547,3 +547,31 @@ def test_request_strips_bearer_key_across_redirect_origin():
     assert all(header is None for header in _AttackerOrigin.auth_seen), (
         f"peer's Bearer key leaked to the redirect target: {_AttackerOrigin.auth_seen}"
     )
+
+
+# ── sender-side truncation guard (2026-09-12) ────────────────────────────────
+
+
+@pytest.mark.parametrize("action", ["dm", "run"])
+def test_peer_send_refuses_a_truncated_body_without_sending(monkeypatch, capsys, action):
+    """`peer dm` and `peer run` carry the same body, so both refuse a cut one.
+
+    The refusal must land before any request: nothing may cross to the peer, and no
+    session may be created on its side.
+    """
+    sent = []
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": "http://spark.lan:8377"}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+    monkeypatch.setattr(peer_cmd, "_request", lambda *a, **kw: sent.append(kw) or {})
+
+    args = SimpleNamespace(
+        peer_action=action,
+        target="spark",
+        message="verdict: the row is [truncated]",
+        json=False,
+        idempotency_key="key-1",
+    )
+
+    assert peer_cmd.cmd_peer(args) == 2
+    assert sent == [], "nothing may cross to the peer"
+    assert "REFUSED" in capsys.readouterr().err

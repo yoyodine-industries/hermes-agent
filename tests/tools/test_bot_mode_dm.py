@@ -884,3 +884,48 @@ def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
 
     with pytest.raises(PermissionError, match="not a directory"):
         bot_mode_dm._dm_dir()
+
+
+# ── sender-side truncation guard (2026-09-12) ────────────────────────────────
+
+
+def test_truncated_body_is_refused_and_nothing_is_delivered(tmp_path, monkeypatch):
+    """A body cut before it reached the send path must not be delivered at all.
+
+    Regression: a peer DM ending in a bare ``[truncated]`` marker was delivered as if
+    whole, because the marker left the serialized tool arguments valid JSON and a
+    shortened string literal still parses.
+    """
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="@researcher",
+            message="the anchors matched but the table is [truncated]",
+            agent=agent,
+        )
+    )
+
+    assert "error" in result
+    assert "REFUSED" in result["error"]
+    assert calls == [], "a truncated body must not reach the delivery path"
+
+
+def test_marker_quoted_inside_a_body_still_delivers(tmp_path, monkeypatch):
+    """Messages *about* truncation are legitimate — only an end-anchored marker is a cut."""
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="@researcher",
+            message="the DMs looked like this: [truncated] — then they stopped arriving",
+            agent=agent,
+        )
+    )
+
+    assert result["status"] == "sent"
+    assert len(calls) == 1
