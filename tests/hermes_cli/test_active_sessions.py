@@ -646,3 +646,42 @@ def test_liveness_guard_keeps_a_just_acquired_own_lease_it_cannot_vouch_for(
     ) as active:
         assert active is False
     assert active_sessions.active_session_registry_snapshot(home) == []
+
+
+def test_renewal_marks_only_our_own_freshly_polling_lease(tmp_path):
+    """Renewal is the only thing that keeps a lease a mailbox destination.
+
+    It must refuse a lease this process does not own, a lease pinned to a different live session,
+    and a lease it no longer holds — otherwise a stale record could renew somebody else's
+    destination and keep work pinned to a pane that is not consuming.
+    """
+    home = tmp_path / ".hermes"
+    lease, error = active_sessions.try_acquire_active_session(
+        session_id="chat", surface="desktop", config={}, registry_home=home,
+        metadata={"live_session_id": "live", "bot_live_delivery_consumer": True},
+    )
+    assert lease is not None and error is None
+    try:
+        state_path = active_sessions._state_path(home)
+        entries = active_sessions._read_entries(state_path)
+        stamped = time.time() - 3600.0
+        entries[0]["updated_at"] = stamped
+        active_sessions._write_entries(state_path, entries)
+
+        assert active_sessions.touch_active_session_lease(
+            lease.lease_id, registry_home=home, live_session_id="other", force=True
+        ) is False
+        assert active_sessions.touch_active_session_lease(
+            "not-ours", registry_home=home, live_session_id="live", force=True
+        ) is False
+        assert active_sessions._read_entries(state_path)[0]["updated_at"] == stamped
+
+        assert active_sessions.touch_active_session_lease(
+            lease.lease_id, registry_home=home, live_session_id="live", force=True
+        ) is True
+        assert active_sessions._read_entries(state_path)[0]["updated_at"] > stamped
+    finally:
+        lease.release()
+    assert active_sessions.touch_active_session_lease(
+        lease.lease_id, registry_home=home, live_session_id="live", force=True
+    ) is False
