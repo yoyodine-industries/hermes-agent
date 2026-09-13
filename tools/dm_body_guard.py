@@ -23,16 +23,20 @@ and upstream NousResearch/hermes-agent#83714 writes the literal marker into the 
 multi-line ``new_string``. ``content_refusal`` / ``guard_tool_content_arguments`` are that half;
 both halves share ``find_truncation_marker`` so one rule cannot drift from the other.
 
-Pure stdlib, no import-time side effects (see ``yaan-import-side-effects``).
+Pure stdlib and side-effect free at import: importing this module starts no threads, opens no
+network connections and touches no files.
 """
 
 from __future__ import annotations
 
 import re
 
-#: How far back from the end of the body to look. A truncation marker is the LAST thing
-#: written, so a short window is always enough; anything older is quotation.
-TAIL_WINDOW = 64
+#: How far back from the end of the body to look. The window has to cover the bracketed token
+#: ITSELF, because a marker can carry an annotation naming what was dropped — measured 80 chars
+#: for ``[truncated: 8 of 19 nodes shown, full table at /opt/.../table.md]``, which a 64-char
+#: window missed entirely (the opening bracket fell outside it). Shortness is NOT what excludes
+#: quotation here: the end-anchor plus the required bracket do that. Do not tighten.
+TAIL_WINDOW = 256
 
 #: How far back from the end of a content payload to look. Deliberately generous: a content
 #: argument is routinely cut inside a docstring or a long prose paragraph, and a few residual
@@ -49,12 +53,21 @@ CONTENT_ARG_FIELDS = ("content", "file_content", "new_string")
 
 #: End-anchored, bracketed truncation marker. Covers the forms seen in the wild and those
 #: written by harnesses: ``[truncated]``, ``[...truncated]``, ``[truncated 4096 chars]``,
-#: ``<truncated>``, ``(truncated)``, ``…[truncated]``, ``... [TRUNCATED]``. The bracket or
-#: angle/paren wrapper is REQUIRED so ordinary prose is never refused.
+#: ``<truncated>``, ``(truncated)``, ``…[truncated]``, ``... [TRUNCATED]``, and annotated forms
+#: such as ``[truncated: 8 of 19 nodes shown, full table at /opt/.../table.md]``. The bracket or
+#: angle/paren wrapper is REQUIRED, and the token must START with the marker word — prose that
+#: merely mentions truncation inside a bracket (``[the truncated log]``) is not a marker. The
+#: annotation is bounded only to keep the scan local; a bracketed tail that starts with the
+#: marker word IS the cut, however it is annotated.
 _MARKER_RE = re.compile(
-    r"(?:\.{2,}|…)?\s*[\[\(<]\s*(?:\.{2,}\s*)?truncat\w*(?:\s[^\]\)>]{0,40})?[\]\)>]\s*$",
+    r"(?:\.{2,}|…)?\s*[\[\(<]\s*(?:\.{2,}\s*)?truncat\w*[^\]\)>]{0,200}[\]\)>]\s*$",
     re.IGNORECASE,
 )
+
+#: Who the sender is told to report a cut to, when the caller names nobody. Deliberately
+#: neutral: a deployment's own profile or role names are configuration, not part of the rule,
+#: so nothing here depends on (or leaks) how one install names its operator.
+DEFAULT_REPORT_TARGET = "your orchestrator"
 
 
 def find_truncation_marker(body: str, *, window: int = TAIL_WINDOW) -> str | None:
@@ -93,7 +106,34 @@ def truncation_refusal(body: str) -> str | None:
     )
 
 
-def content_refusal(field: str, value: str) -> str | None:
+class TruncatedBodyRefusal(ValueError):
+    """A body already cut was handed to an admission seam that must not accept it.
+
+    Distinct from the seat's other ``ValueError``s so a caller can tell "this argument is
+    malformed" from "this body is a fragment": the first wants a different call, the second
+    wants the SAME message re-sent with its tail attached. Carries the refusal text.
+    """
+
+    def __init__(self, refusal: str) -> None:
+        super().__init__(refusal)
+        self.refusal = refusal
+
+
+def refuse_truncated_body(body: str) -> None:
+    """Raise ``TruncatedBodyRefusal`` when ``body``'s tail is a truncation marker.
+
+    For admission seams that take a caller-supplied body — ``deliver_to_live_owner`` is fed by
+    the relay-envelope path and by cron delivery, not only by the ``message_agent`` tool — so
+    covering the tool and CLI entry points is not enough. Raising (rather than returning a
+    string) makes the seam fail closed for every caller, including ones that would ignore a
+    return value, and the refusal text reaches the sender intact.
+    """
+    refusal = truncation_refusal(body)
+    if refusal:
+        raise TruncatedBodyRefusal(refusal)
+
+
+def content_refusal(field: str, value: str, *, report_to: str | None = None) -> str | None:
     """Return the refusal for a content-bearing tool argument cut at authoring time, else ``None``.
 
     The marker is LITERAL TEXT in the argument, so what arrived is a partial payload, not a
@@ -101,43 +141,49 @@ def content_refusal(field: str, value: str) -> str | None:
     check can catch it. Writing it would ship the corruption with a success status, so the
     refusal lands before anything touches the filesystem. Callers pass the argument's own name
     so the message points at the field that arrived cut.
+
+    ``report_to`` names whoever the sender should tell. It is a parameter, not a constant, so a
+    deployment can point at its own operator without its name entering this module; unset, the
+    refusal falls back to :data:`DEFAULT_REPORT_TARGET`.
     """
     text = str(value or "")
     marker = find_truncation_marker(text, window=CONTENT_TAIL_WINDOW)
     if not marker:
         return None
     length = len(text.strip())
+    target = str(report_to or "").strip() or DEFAULT_REPORT_TARGET
     return (
         f"REFUSED: the {field!r} argument ends in a truncation marker {marker!r} ({length} chars). "
         "This is a PARTIAL payload cut where the tool call was AUTHORED, not a size limit — nothing "
         "rejected it for length, its tail is simply missing. NOTHING was written: no file was created "
         "and no file was modified. Re-send the full content. If it is long, create the file first with "
         "a short chunk and append the rest with patch instead of one oversized argument. Notify "
-        "yoyodine-majordomo that a tool argument arrived truncated."
+        f"{target} that a tool argument arrived truncated."
     )
 
 
-def guard_tool_content_arguments(args) -> str | None:
+def guard_tool_content_arguments(args, *, report_to: str | None = None) -> str | None:
     """Return the first refusal for a truncation-marked content argument in ``args``, else ``None``.
 
     The single entry point every content-writing handler calls before its first side effect.
     Walks dicts and lists of dicts (``skill_manage`` takes an ``operations`` array) and checks
     every key in ``CONTENT_ARG_FIELDS`` whose value is a ``str``; anything else is ignored, so
-    an op's non-content fields never trip it.
+    an op's non-content fields never trip it. ``report_to`` reaches every refusal this walk
+    builds; see :data:`DEFAULT_REPORT_TARGET`.
     """
     if isinstance(args, dict):
         for key, value in args.items():
             if key in CONTENT_ARG_FIELDS and isinstance(value, str):
-                refusal = content_refusal(key, value)
+                refusal = content_refusal(key, value, report_to=report_to)
                 if refusal is not None:
                     return refusal
             if isinstance(value, (dict, list, tuple)):
-                refusal = guard_tool_content_arguments(value)
+                refusal = guard_tool_content_arguments(value, report_to=report_to)
                 if refusal is not None:
                     return refusal
     elif isinstance(args, (list, tuple)):
         for item in args:
-            refusal = guard_tool_content_arguments(item)
+            refusal = guard_tool_content_arguments(item, report_to=report_to)
             if refusal is not None:
                 return refusal
     return None

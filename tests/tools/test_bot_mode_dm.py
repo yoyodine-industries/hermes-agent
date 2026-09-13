@@ -406,6 +406,33 @@ def test_live_dm_runner_retry_never_reexecutes_failed_claim(tmp_path, monkeypatc
     assert dm_file.read_text(encoding="utf-8") == "hello"
 
 
+def test_live_dm_runner_reports_a_cut_body_as_refused_not_ambiguous(tmp_path, monkeypatch, capsys):
+    """A refused cut must not borrow the ambiguous path's 'Do not resend' advice.
+
+    The ambiguous outcome means "the recipient may or may not have it" — resending is unsafe.
+    A refusal means nothing was queued, so the only correct instruction is to re-send the full
+    text, which is what the refusal itself says.
+    """
+    from tools import bot_live_delivery as live
+
+    home = _managed_home(tmp_path)
+    target = home / "profiles" / "researcher"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    owner = dict(profile_home=str(target), session_id="bot", lease_id="lease", live_session_id="live")
+    monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: owner)
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("recap of the pass follows.\n[truncated]", encoding="utf-8")
+
+    assert bot_mode_dm._run_delivery(["hermes", "-p", "researcher"], str(dm_file), stdin_file=False) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "refused"
+    assert "REFUSED" in payload["error"]
+    assert "Do not resend" not in payload["error"]
+    # Fail-closed: nothing was staged, so no consumer can replay a partial body.
+    assert live.read_delivery_result(target, payload["delivery_id"]) is None
+    assert dm_file.read_text(encoding="utf-8").endswith("[truncated]")
+
+
 # ── plaintext tempfile lifecycle ─────────────────────────────────────────────
 
 
