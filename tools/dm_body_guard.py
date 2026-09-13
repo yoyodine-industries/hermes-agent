@@ -16,7 +16,8 @@ legitimate — and the bare word "truncated" in prose is not a marker. A cut wit
 all has no detectable signature and is not guessed at here: a heuristic over "looks cut" would
 refuse good messages, and a guard that cries wolf gets bypassed.
 
-Pure stdlib, no import-time side effects (see ``yaan-import-side-effects``).
+Pure stdlib and side-effect free at import: importing this module starts no threads, opens no
+network connections and touches no files.
 """
 
 from __future__ import annotations
@@ -36,6 +37,11 @@ _MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Who the sender is told to report the cut to, when the caller names nobody. Deliberately
+#: neutral: a deployment's own profile or role names are configuration, not part of the rule,
+#: so nothing here depends on (or leaks) how one install names its operator.
+DEFAULT_REPORT_TARGET = "your orchestrator"
+
 
 def find_truncation_marker(body: str) -> str | None:
     """Return the end-of-body truncation marker (e.g. ``"[truncated]"``), else ``None``.
@@ -51,33 +57,40 @@ def find_truncation_marker(body: str) -> str | None:
     return match.group(0).strip().lstrip(".… \t") or None
 
 
-def truncation_refusal(body: str) -> str | None:
+def truncation_refusal(body: str, *, report_to: str | None = None) -> str | None:
     """Return the refusal for a truncation-marked body, else ``None``.
 
     One shared rule for every outbound DM surface (the ``message_agent`` tool and the
     ``hermes peer dm`` / ``peer run`` CLI) so the two cannot drift apart. Callers decide how
     to surface the string: a tool error payload, or stderr plus a non-zero exit.
+
+    ``report_to`` names whoever the sender should tell about the cut. It is a parameter, not
+    a constant, so a deployment can point at its own operator without its name entering this
+    module; unset, the refusal falls back to :data:`DEFAULT_REPORT_TARGET`.
     """
     marker = find_truncation_marker(body)
     if not marker:
         return None
     length = len(str(body or "").strip())
+    target = str(report_to or "").strip() or DEFAULT_REPORT_TARGET
     return (
         f"REFUSED: this message body ends in a truncation marker {marker!r} ({length} chars). "
         "It is a PARTIAL body, not the message — it was cut before it reached the send path. "
         "NOTHING was sent and nothing was queued, so the recipient has not seen it. Re-send "
         "the full text: lead with the conclusion, and if the content is long, write it to a "
-        "file and send the path instead of pasting it. Tell yoyodine-majordomo: a body that "
+        f"file and send the path instead of pasting it. Tell {target}: a body that "
         "arrives cut is a communications-integrity fault, not a typing slip."
     )
 
 
-def guard_outbound_body(body: str, *, max_chars: int | None = None) -> str | None:
+def guard_outbound_body(body: str, *, max_chars: int | None = None,
+                        report_to: str | None = None) -> str | None:
     """Return a refusal string for a body that must not be sent, else ``None``.
 
     Order: empty, over-long (only when ``max_chars`` is given), truncation marker. The cap is
     a parameter rather than a constant here so the caller's existing limit stays
-    authoritative and its wording does not change under this guard.
+    authoritative and its wording does not change under this guard. ``report_to`` is passed
+    through to the truncation refusal; see :data:`DEFAULT_REPORT_TARGET`.
     """
     text = str(body or "")
     stripped = text.strip()
@@ -86,4 +99,4 @@ def guard_outbound_body(body: str, *, max_chars: int | None = None) -> str | Non
     if max_chars is not None and len(stripped) > max_chars:
         return (f"message too long ({len(stripped)} chars > {max_chars}). "
                 "Send the essentials; share large content as a file path instead.")
-    return truncation_refusal(stripped)
+    return truncation_refusal(stripped, report_to=report_to)

@@ -8,6 +8,7 @@ good messages gets bypassed and the incident recurs.
 import pytest
 
 from tools.dm_body_guard import (
+    DEFAULT_REPORT_TARGET,
     find_truncation_marker,
     guard_outbound_body,
     truncation_refusal,
@@ -50,10 +51,16 @@ def test_refusal_names_the_marker_and_what_happened():
     assert "NOTHING was sent" in refusal
 
 
-def test_refusal_tells_the_sender_to_report_the_cut():
-    refusal = truncation_refusal("analysis follows. [truncated]")
+def test_refusal_names_the_report_target_and_defaults_to_a_neutral_one():
+    refusal = truncation_refusal("analysis follows. [truncated]", report_to="the duty reviewer")
     assert refusal is not None
-    assert "yoyodine-majordomo" in refusal
+    assert "the duty reviewer" in refusal
+
+    # The rule carries no deployment's identifiers: unset, it names nobody in particular.
+    unnamed = truncation_refusal("analysis follows. [truncated]")
+    assert unnamed is not None
+    assert DEFAULT_REPORT_TARGET in unnamed
+    assert "the duty reviewer" not in unnamed
 
 
 def test_complete_body_is_not_refused():
