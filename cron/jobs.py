@@ -133,6 +133,17 @@ def _current_cron_store() -> _CronStorePaths:
     return _CronStorePaths.for_dir(home / "cron")
 
 
+def current_cron_home() -> Path:
+    """Home that owns the cron store in effect for this execution context.
+
+    Storage is scoped separately from ``HERMES_HOME`` (see ``use_cron_store``), so callers that
+    must resolve a *job's own* per-profile paths — its Bot Chat session, its delivery receipts —
+    have to ask the store rather than the ambient process home. An ad-hoc runner that pins only
+    the store otherwise silently addresses the default profile's files.
+    """
+    return _current_cron_store().cron_dir.parent.resolve()
+
+
 @contextlib.contextmanager
 def use_cron_store(home: Union[str, Path]):
     """Route cron storage to ``home`` without mutating process globals."""

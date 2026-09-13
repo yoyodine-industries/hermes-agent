@@ -665,6 +665,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
     import tempfile
     import uuid
     from hermes_constants import get_hermes_home
+    from cron.jobs import current_cron_home
     from hermes_cli.profiles import get_profile_dir
     from tools.bot_live_delivery import (
         deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
@@ -679,7 +680,17 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
     )
     try:
         source_home = get_hermes_home().resolve()
-        home = (get_profile_dir(profile) if profile else source_home).resolve()
+        # A job belongs to the store that holds it: storage is scoped separately from
+        # HERMES_HOME (use_cron_store), so an ad-hoc runner that pins only the store must not
+        # address the process's default home's Bot Chat. Never silently deliver into a
+        # different profile than the one the job lives in.
+        job_home = current_cron_home()
+        home = (get_profile_dir(profile) if profile else job_home).resolve()
+        if job_home != source_home:
+            logger.info(
+                "Job '%s': (own) Bot Chat delivery follows the cron store home %s, not the "
+                "process home %s", job_id, job_home, source_home,
+            )
         # run_one_job/claim_fire attach the durable execution id before delivery. The
         # transient fallback supports direct helper callers, never deduping recurring
         # runs by their (potentially identical) output or previous last_run timestamp.
@@ -741,7 +752,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         env.pop("HERMES_HOME", None)
     else:
         # Multiplex workers carry the profile in a ContextVar, not os.environ.
-        env["HERMES_HOME"] = str(source_home)
+        env["HERMES_HOME"] = str(home)
 
     query_file = None
     try:

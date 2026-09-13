@@ -203,6 +203,40 @@ def test_deliver_message_carries_cron_attribution(tmp_path):
     assert "the payload" in captured["message"]
 
 
+def test_own_lane_child_home_follows_the_cron_store(tmp_path):
+    """A job belongs to the store that holds it, not to the delivering process's ambient home.
+
+    Storage is scoped independently of HERMES_HOME (``use_cron_store``), so an ad-hoc runner
+    that pins only the store (a manual refire) used to address the process's *default* home's
+    Bot Chat: the job's own profile chat never received the output and the child exited 1 with
+    SESSION_NOT_OWNED against a foreign session id. The (own) lane must inherit the home that
+    owns the active cron store.
+    """
+    from cron.jobs import use_cron_store
+
+    job_home = tmp_path / "profiles" / "majordomo"
+    (job_home / "cron").mkdir(parents=True)
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls["argv"] = argv
+        calls["kwargs"] = kwargs
+        return _completed()
+
+    with mock.patch.object(sched.subprocess, "run", side_effect=fake_run), \
+         mock.patch.object(sched_delivery.shutil, "which", return_value="/usr/bin/hermes"), \
+         use_cron_store(job_home):
+        err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "")
+
+    assert err is None
+    env = calls["kwargs"]["env"]
+    assert env["HERMES_HOME"] == str(job_home.resolve())
+    from hermes_constants import get_hermes_home
+
+    assert env["HERMES_HOME"] != str(get_hermes_home().resolve())
+    assert "-p" not in calls["argv"]  # own profile: home, not -p, carries the target
+
+
 # ── delivery-targets listing (UI pickers) ────────────────────────────────────
 
 def test_delivery_targets_include_local_profiles():
