@@ -543,6 +543,23 @@ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
     return started
 
 
+def _renew_bot_live_lease(sid: str, session: dict) -> bool:
+    """Prove this Bot Chat consumer is still consuming, once per poll tick.
+
+    ``tools.bot_live_delivery`` only treats a lease as a mailbox destination while its stamp is
+    fresh, which is what stops a leaked desktop/dashboard pane from holding peer mail forever:
+    the pane's process stays alive, but its poll loop dies with the pane. Writes are throttled
+    inside the registry, so this is a no-op on all but the first tick of each interval.
+    """
+    lease = session.get("active_session_lease")
+    if lease is None or getattr(lease, "released", False):
+        return False
+    from hermes_cli.active_sessions import touch_active_session_lease
+
+    return touch_active_session_lease(
+        lease.lease_id, registry_home=_session_home(session), live_session_id=sid)
+
+
 def _notification_poller_loop(stop_event: threading.Event, sid: str, session: dict) -> None:
     """Daemon thread (started by _init_session()) that drains the process-global completion_queue for this session
     (ownership routing: _notif_handle_event) and polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` — the
@@ -561,6 +578,12 @@ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: di
     last_kanban_poll = last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         now = time.monotonic()
+        # Prove we are still consuming BEFORE reporting failure, so a pane that dies here stops
+        # being a mailbox destination instead of holding peer mail forever.
+        try:
+            _renew_bot_live_lease(sid, session)
+        except Exception:
+            logger.warning("Bot live-owner lease renewal failed", exc_info=True)
         try:
             _poll_bot_live_delivery_once(sid, session)
         except Exception:
