@@ -2708,7 +2708,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     ) -> int:
         """Pass 4: demote inside the protected tail when it alone exceeds the soft budget (#61932).
         Keeps a short recent floor verbatim; overrides the skill guard (else the dead-end recurs).
-        Returns the number of tool results demoted (arg truncations are logged but not counted)."""
+        Returns the number of tool results demoted."""
         soft_ceiling = int(protect_tail_tokens * 1.5)
         demote_end = len(result) - min(_PRESSURE_KEEP_RECENT_MESSAGES, len(result))
         start = max(0, prune_boundary)
@@ -2716,16 +2716,18 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         def _protected_region_tokens() -> int:
             return sum(_estimate_msg_budget_tokens(result[i]) for i in range(start, len(result)))
 
-        demoted = pressure_hits = 0
+        demoted = 0
 
         def _shrink_at(i: int) -> None:
-            # Each helper no-ops on the other role, so both may run unconditionally.
-            nonlocal demoted, pressure_hits
+            # Demote only. Every index this pass walks is at or after ``prune_boundary`` (start =
+            # max(0, prune_boundary)), i.e. inside the protected tail, and a tool call's arguments are
+            # the record of what a side-effecting tool was actually ASKED to do — the transcript is the
+            # only copy, so shrinking them there leaves it disagreeing with what ran. Reclamation inside
+            # the tail comes from demoting tool RESULTS (recoverable: the tool can be re-run). Pass 3
+            # owns the argument shrink, for the indices before the boundary.
+            nonlocal demoted
             if self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars):
                 demoted += 1
-                pressure_hits += 1
-            if self._truncate_tool_call_args_at(result, i):
-                pressure_hits += 1
 
         if demote_end <= prune_boundary or _protected_region_tokens() <= soft_ceiling:
             return 0
@@ -2743,12 +2745,11 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 last_tool_idx is not None and last_tool_idx >= prune_boundary and _protected_region_tokens() > soft_ceiling
             ) and self._demote_tool_result_at(result, last_tool_idx, call_id_to_tool, min_prune_chars):
                 demoted += 1
-                pressure_hits += 1
-        if pressure_hits and not self.quiet_mode:
+        if demoted and not self.quiet_mode:
             logger.info(
-                "Pre-compression pressure demotion: reclaimed protected-tail tool output (%d change(s); "
+                "Pre-compression pressure demotion: reclaimed protected-tail tool output (%d demotion(s); "
                 "protected region now ~%s tokens, soft ceiling %s)",
-                pressure_hits, f"{_protected_region_tokens():,}", f"{soft_ceiling:,}",
+                demoted, f"{_protected_region_tokens():,}", f"{soft_ceiling:,}",
             )
         return demoted
 
@@ -2768,8 +2769,11 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Without this, a skill loaded moments before a compaction can be demoted to metadata while the
         # model still believes its instructions are in context. See #32106.
         protected_skills = _collect_protected_skill_names(result, prune_boundary)
-        # Pass 2: summarize old tool results. Pass 3: shrink large tool_call arguments INSIDE the parsed JSON so
-        # the result stays valid; otherwise providers 400 on every turn until the call leaves the window.
+        # Pass 2: summarize old tool results. Pass 3 is the ONLY pass that shrinks tool_call arguments, and
+        # only for indices before the boundary: payloads are cut INSIDE the parsed JSON so the result stays
+        # valid; otherwise providers 400 on every turn until the call leaves the window. Arguments at or after
+        # the boundary are never rewritten — the pressure pass demotes results instead, because a current
+        # turn's arguments are the record of what actually ran.
         pruned += sum(
             self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills)
             for i in range(max(0, prune_boundary))

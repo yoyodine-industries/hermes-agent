@@ -2379,6 +2379,71 @@ class TestTruncateToolCallArgsJson:
         assert parsed["content"].endswith("...[truncated]")
 
 
+class TestPressurePassLeavesToolCallArgsAlone:
+    """Pass 4 (protected-tail pressure demotion) must never rewrite tool-call
+    arguments.
+
+    A tool call's ``arguments`` are the record of what a side-effecting tool was
+    actually asked to do; the delivered transcript is the only copy. Pass 4 walks
+    indices at or after ``prune_boundary`` and used to run the same arg shrink
+    Pass 3 uses, so under context pressure the CURRENT turn's tool call came back
+    from compaction with its body cut at 200 chars — the stored transcript then
+    disagreed with what ran. Reclamation inside the protected tail must come from
+    demoting tool RESULTS (recoverable: the model can re-run the tool), never from
+    rewriting a call's arguments (unrecoverable).
+    """
+
+    def _compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+
+    def test_pressure_pass_keeps_current_turn_tool_call_args_byte_identical(self):
+        import json as _json
+        c = self._compressor()
+        current_args = _json.dumps({
+            "target": "yoyodine/yoyodine-majordomo",
+            "message": "m" * 3000,
+        })
+        stale_args = _json.dumps({"path": "notes.md", "content": "o " * 1500})
+        messages = [
+            {"role": "user", "content": "start"},
+            # Outside the protected tail: Pass 3 owns shrinking THESE arguments.
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_old", "type": "function",
+                 "function": {"name": "write_file", "arguments": stale_args}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_old", "content": "old result " * 800},
+            {"role": "user", "content": "now send the DM"},
+            # Inside the protected tail: the current turn's tool call. Its
+            # arguments are the record of what ran and must survive untouched.
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_new", "type": "function",
+                 "function": {"name": "message_agent", "arguments": current_args}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_new", "content": "new result " * 800},
+        ]
+        result, _ = c._prune_old_tool_results(
+            messages, protect_tail_count=4, protect_tail_tokens=100
+        )
+        # The pass must have fired (its last resort demotes the newest result);
+        # otherwise this test would pass for the wrong reason.
+        assert result[5]["content"] != messages[5]["content"], (
+            "pressure pass did not fire — scenario no longer exercises Pass 4"
+        )
+        # Invariant: the current turn's tool call is byte-identical after compaction.
+        assert result[4]["tool_calls"][0]["function"]["arguments"] == current_args
+        # And the fix must not disarm arg shrinking outside the protected tail.
+        stale_shrunk = result[1]["tool_calls"][0]["function"]["arguments"]
+        assert stale_shrunk != stale_args
+        assert _json.loads(stale_shrunk)["content"].endswith("...[truncated]")
+
+
 class TestLazyContextResolution:
     """Verify that ContextCompressor defers get_model_context_length until
     context_length is first accessed, so construction never blocks on network
