@@ -17,9 +17,11 @@ from typing import Any, Optional
 
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
+    _dispatch_halt_reason,
     _kanban_dispatch_allowed,
     _release_singleton_lock,
     _resolve_auto_decompose_settings,
+    _resolve_dispatch_paused,
     _gc_retention_days,
     _to_thread_process_service,
     logger,
@@ -274,6 +276,11 @@ class GatewayKanbanWatchersMixin:
         last_warn_at = 0
         dispatcher = _KanbanDispatcher(_kb, settings)
 
+        # Previous tick's `kanban.dispatch_paused` state, so the pause/resume
+        # transition is logged once instead of every tick.
+        paused_last_tick = False
+        pause_control_last_tick = ""
+
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
             try:
@@ -287,9 +294,34 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
-                # Emergency stop (`hermes pause`): no auto-decompose or
-                # dispatch while paused; running workers finish naturally.
-                if not _kanban_dispatch_allowed():
+                # Two independent halts, each read fresh every tick: the global
+                # emergency stop (`hermes pause`) and the scoped
+                # `kanban.dispatch_paused`. Neither short-circuits the other, and
+                # the log always names estop when it is engaged. Running workers
+                # are never touched by either.
+                estop_engaged = not _kanban_dispatch_allowed()
+                paused, pause_control = _resolve_dispatch_paused(_load_config)
+                if paused != paused_last_tick:
+                    if paused:
+                        logger.info(
+                            "kanban dispatcher: dispatch PAUSED via %s; auto-decompose and "
+                            "new dispatch suspended, running workers finish on their own",
+                            pause_control,
+                        )
+                    else:
+                        logger.info(
+                            "kanban dispatcher: dispatch RESUMED; %s cleared",
+                            pause_control_last_tick,
+                        )
+                    paused_last_tick = paused
+                if paused:
+                    pause_control_last_tick = pause_control
+
+                halt_reason = _dispatch_halt_reason(estop_engaged, paused, pause_control)
+                if halt_reason is not None:
+                    # One line per held tick, so a pause nobody noticed is
+                    # impossible from gateway.log alone.
+                    logger.info("kanban dispatcher: tick held: %s", halt_reason)
                     bad_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live so disabling it

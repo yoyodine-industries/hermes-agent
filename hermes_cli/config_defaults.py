@@ -1728,6 +1728,11 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
+        # Scoped alternative to the global emergency stop: while true, this install dispatches no
+        # new work and runs no auto-decompose; workers already running finish on their own. Re-read
+        # on every dispatcher tick, so flipping it takes effect on the next tick without a gateway
+        # restart — and clearing it resumes just as fast.
+        "dispatch_paused": False,
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,

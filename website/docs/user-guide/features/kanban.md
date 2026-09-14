@@ -282,7 +282,19 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  dispatch_paused: false           # default: scoped dispatch halt. While true,
+                                   # no new claims or spawns and no
+                                   # auto-decompose; running workers finish on
+                                   # their own. Read on every dispatcher tick,
+                                   # so setting or clearing it takes effect on
+                                   # the next tick — no gateway restart.
 ```
+
+`dispatch_paused` is the scoped counterpart to the global emergency stop
+(`hermes pause`): it stops new work on this install without halting anything
+else, and it is off by default. Both stops are evaluated on every tick, so the
+log names the emergency stop whenever it is engaged rather than letting the
+scoped flag mask it.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
