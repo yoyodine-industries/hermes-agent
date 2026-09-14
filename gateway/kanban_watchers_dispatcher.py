@@ -209,6 +209,37 @@ class _KanbanDispatcher:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
+    def oldest_pending(self) -> Any:
+        """Longest-waiting spawnable card on any board, as ``PendingWork``.
+
+        Same filter as :meth:`ready_nonempty` — ready (or review, when review
+        dispatch is on), assigned to a real profile, unclaimed — but it also
+        reports WHICH card and how long it has waited, so health telemetry can
+        tell "work just arrived" from "work has been waiting since before the
+        stall". Age is measured from ``created_at`` and is therefore an upper
+        bound (see ``kanban_db_dispatch.oldest_spawnable_pending``). An empty
+        ``PendingWork`` (``.pending`` False) means nothing is spawnable — including
+        when a board could not be read, so a probe failure can never invent a
+        stall.
+        """
+        kbd = _kbd()
+        review_probe = kbd.review_dispatch_enabled()
+        oldest = kbd.PendingWork()
+        for slug in self._board_slugs():
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                task_id, age = kbd.oldest_spawnable_pending(conn, include_review=review_probe)
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+            if task_id and age > oldest.age_seconds:
+                oldest = kbd.PendingWork(board=slug, task_id=task_id, age_seconds=age)
+        return oldest
+
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
 

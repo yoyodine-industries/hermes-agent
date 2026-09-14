@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from typing import Callable
 from typing import Mapping
 from typing import Optional
@@ -133,6 +133,290 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+
+    spawn_budget_blocked: Optional[str] = None
+    """Which cap had already consumed this tick's spawn budget, so no card was
+    even attempted: ``"max_spawn"`` (``kanban.max_spawn``) or
+    ``"max_in_progress"`` (host-wide). ``_tick_spawn_budget`` declines the whole
+    tick without touching any skip bucket, so before this field health telemetry
+    could not tell "queue deep, capacity full" (healthy) from "cannot spawn"
+    (broken). A deferral, never a failure."""
+
+    spawn_failed: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, assignee, reason)`` for cards that were claimed and whose
+    worker could NOT be launched this tick (workspace resolution or the spawn
+    call raised); a ``spawn_failed`` task event is written alongside each. This
+    is the operator-actionable "cannot spawn" signal — deferrals
+    (``respawn_guarded``, ``skipped_per_profile_capped``, ``skipped_locked``,
+    ``memory_pressure``, ``spawn_budget_blocked``) are not failures."""
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher health telemetry (shared by the gateway watcher and the daemon)
+#
+# What this replaces: "ready work exists and 0 workers spawned for N ticks" —
+# which is the steady state on a healthy but LOADED host, so the warning fires
+# forever while nothing is wrong. `_tick_spawn_budget` declines an entire tick
+# without recording any skip bucket once `kanban.max_spawn` /
+# `kanban.max_in_progress` are consumed, so a deep queue and a wedged dispatcher
+# looked identical; meanwhile a card that was claimed and could not be launched
+# at all (the one signal an operator must act on) raised no alarm. The rules
+# below tell the three states apart: deferred (silent), failed (warn at once,
+# naming board/profile/task/reason), and stalled (nothing attempted, nothing
+# explains it, old work waiting — warn after HEALTH_WINDOW ticks).
+# ---------------------------------------------------------------------------
+HEALTH_WINDOW = 6
+"""Consecutive unexplained no-op ticks before the stall warning."""
+
+HEALTH_STALL_AGE_SECONDS = 1800.0
+"""Pending work younger than this is not stalled — it just arrived."""
+
+HEALTH_WARN_INITIAL_INTERVAL = 300.0
+"""Seconds before a repeat of an unchanged warning state (doubles per repeat)."""
+
+HEALTH_WARN_MAX_INTERVAL = 3600.0
+"""Ceiling for the repeat interval."""
+
+
+@dataclass(frozen=True)
+class PendingWork:
+    """Longest-waiting spawnable card on a board, as a health probe sees it."""
+
+    board: Optional[str] = None
+    task_id: Optional[str] = None
+    age_seconds: float = 0.0
+
+    @property
+    def pending(self) -> bool:
+        """Some board has ready/review work the dispatcher could spawn for."""
+        return self.task_id is not None
+
+
+@dataclass
+class HealthReport:
+    """One health judgement worth emitting: ``level`` is ``"warning"``/``"info"``."""
+
+    level: str
+    message: str
+
+
+# Fields whose non-empty value means the tick CHANGED something. A tick that did
+# any work is not evidence of a wedged dispatcher, whatever it left queued.
+_TICK_WORK_FIELDS = (
+    "spawned",
+    "reclaimed",
+    "promoted",
+    "crashed",
+    "timed_out",
+    "stale",
+    "auto_blocked",
+    "reconciled_orphans",
+    "rate_limited",
+    "auto_assigned_default",
+)
+
+
+def tick_did_work(result: Optional[object]) -> bool:
+    """Did this tick change any state (spawn, reclaim, promote, crash, ...)?"""
+    if result is None:
+        return False
+    return any(getattr(result, name, None) for name in _TICK_WORK_FIELDS)
+
+
+def tick_deferral_reason(result: Optional[object]) -> Optional[str]:
+    """Why this tick attempted no spawn ON PURPOSE, or ``None`` when it cannot say.
+
+    Every reason comes from a bucket the dispatcher itself recorded, so a tick
+    with a reason is loaded/guarded host behaviour doing the right thing — never a
+    stall. ``None`` means "no spawn and nothing explains it", the only state worth
+    watching.
+    """
+    if result is None:
+        return None
+    budget = getattr(result, "spawn_budget_blocked", None)
+    if budget:
+        return f"spawn_budget:{budget}"
+    pressure = getattr(result, "memory_pressure", None)
+    if pressure:
+        return f"memory_pressure:{pressure}"
+    if getattr(result, "skipped_locked", False):
+        return "board_held"
+    if getattr(result, "respawn_guarded", None):
+        return "respawn_guarded"
+    if getattr(result, "skipped_per_profile_capped", None):
+        return "per_profile_capped"
+    if getattr(result, "skipped_unassigned", None):
+        return "unassigned"
+    return None
+
+
+def collect_spawn_failures(
+    board_results: Optional[Iterable[tuple[str, Optional[object]]]],
+) -> list[tuple[str, str, str, str]]:
+    """``(board, task_id, assignee, reason)`` for every failed launch this tick."""
+    found: list[tuple[str, str, str, str]] = []
+    for slug, result in board_results or []:
+        for entry in getattr(result, "spawn_failed", None) or []:
+            task_id, assignee, reason = (list(entry) + ["", "", ""])[:3]
+            found.append(
+                (slug or "?", str(task_id), str(assignee or "unassigned"), str(reason))
+            )
+    return found
+
+
+def _boards_label(boards: list[str]) -> str:
+    if not boards:
+        return "an unnamed board"
+    if len(boards) <= 2:
+        return "board " + ", ".join(boards)
+    return f"{len(boards)} boards ({', '.join(boards[:2])}, …)"
+
+
+def spawn_failure_message(failures: list[tuple[str, str, str, str]], total: int) -> str:
+    """Operator-facing line for launches that failed (claimed, never started)."""
+    boards = sorted({b for b, *_ in failures})
+    hint_board = boards[0] if boards else "default"
+    detail = "; ".join(f"{tid} ({who}): {why}" for _b, tid, who, why in failures[:3])
+    extra = "" if len(failures) <= 3 else f" (+{len(failures) - 3} more)"
+    return (
+        f"kanban dispatcher: {len(failures)} worker spawn failure(s) on "
+        f"{_boards_label(boards)} this tick ({total} since the dispatcher was last "
+        f"healthy) — {detail}{extra}. A spawn failure means the worker could not be "
+        f"launched at all: check that profile's venv/PATH/credentials, "
+        f"`hermes kanban list --board {hint_board} --status blocked` and errors.log."
+    )
+
+
+def stall_message(ticks: int, oldest: PendingWork) -> str:
+    """Operator-facing line for a dispatcher that stopped attempting spawns."""
+    minutes = int(oldest.age_seconds // 60)
+    board = oldest.board or "?"
+    return (
+        f"kanban dispatcher[{board}]: {ticks} consecutive ticks spawned nothing and did "
+        f"no other work while {oldest.task_id} waited ~{minutes} min for a worker — "
+        f"spawnable, assigned, unclaimed, and no concurrency cap, guard or pause explains "
+        f"it. The dispatcher loop itself is the suspect: check the gateway log for repeated "
+        f"exceptions and `hermes kanban list --board {board} --status ready`."
+    )
+
+
+class DispatcherHealth:
+    """Backlog-aware health tracker for one dispatcher loop.
+
+    States: ``failed`` (a claimed card could not be launched — warn at once),
+    ``stalled`` (no spawn attempted, nothing deferred it, and work older than
+    :data:`HEALTH_STALL_AGE_SECONDS` is waiting — warn after
+    :data:`HEALTH_WINDOW` ticks), otherwise healthy and silent. Capacity
+    deferrals, guards, pauses and work that merely arrived are NOT trouble: on a
+    loaded host they are the steady state.
+
+    Repeats of an unchanged state wait an interval that doubles from
+    :data:`HEALTH_WARN_INITIAL_INTERVAL` to :data:`HEALTH_WARN_MAX_INTERVAL`, so
+    a long outage costs a handful of lines instead of one per tick, and returning
+    to health emits exactly one ``info`` line.
+    """
+
+    def __init__(
+        self,
+        *,
+        window: int = HEALTH_WINDOW,
+        stall_age_seconds: float = HEALTH_STALL_AGE_SECONDS,
+        warn_initial_interval: float = HEALTH_WARN_INITIAL_INTERVAL,
+        warn_max_interval: float = HEALTH_WARN_MAX_INTERVAL,
+    ) -> None:
+        self.window = max(1, int(window))
+        self.stall_age_seconds = float(stall_age_seconds)
+        self.warn_initial_interval = float(warn_initial_interval)
+        self.warn_max_interval = float(warn_max_interval)
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget all state — also used when dispatch is paused or slowed down."""
+        self.stalled_ticks = 0
+        self.failures_seen = 0
+        self.state = "healthy"
+        self._interval = self.warn_initial_interval
+        self._last_report_at: Optional[float] = None
+        self._reported = False
+
+    def pause(self) -> None:
+        """Dispatch is disallowed (``hermes pause``): an idle dispatcher, not a stall."""
+        self.stalled_ticks = 0
+
+    def observe_tick(
+        self,
+        board_results: Optional[Iterable[tuple[str, Optional[object]]]] = None,
+        *,
+        pending: Optional[PendingWork] = None,
+        now: Optional[float] = None,
+    ) -> Optional[HealthReport]:
+        """Judge one tick; returns the line to emit, or ``None`` to stay silent."""
+        at = time.time() if now is None else float(now)
+        failures = collect_spawn_failures(board_results)
+        if failures:
+            self.failures_seen += len(failures)
+            self.stalled_ticks = 0
+            return self._emit(
+                "warning", spawn_failure_message(failures, self.failures_seen), "failed", at
+            )
+        stalled = self._stall_message(board_results, pending or PendingWork())
+        if stalled is not None:
+            return self._emit("warning", stalled, "stalled", at)
+        return self._clear()
+
+    # -- internals --------------------------------------------------------
+    def _stall_message(
+        self,
+        board_results: Optional[Iterable[tuple[str, Optional[object]]]],
+        pending: PendingWork,
+    ) -> Optional[str]:
+        results = [res for _slug, res in board_results or []]
+        # A tick is only suspicious when it attempted nothing AND nothing
+        # explains why: any spawn, reclaim, promotion or crash is work, and any
+        # recorded deferral (budget, memory, guard, board lock, unassigned) is a
+        # decision. A deep queue under concurrency caps hits one of those every
+        # tick, which is exactly the false positive this replaced.
+        explained = any(tick_did_work(res) or tick_deferral_reason(res) for res in results)
+        if not results or explained:
+            self.stalled_ticks = 0
+            return None
+        if not pending.pending or pending.age_seconds < self.stall_age_seconds:
+            self.stalled_ticks = 0
+            return None
+        self.stalled_ticks += 1
+        if self.stalled_ticks < self.window:
+            return None
+        return stall_message(self.stalled_ticks, pending)
+
+    def _emit(self, level: str, message: str, state: str, at: float) -> Optional[HealthReport]:
+        if state != self.state:
+            self.state = state
+            self._interval = self.warn_initial_interval
+        elif self._last_report_at is not None and at - self._last_report_at < self._interval:
+            return None
+        else:
+            self._interval = min(self._interval * 2.0, self.warn_max_interval)
+        self._last_report_at = at
+        self._reported = True
+        return HealthReport(level, message)
+
+    def _clear(self) -> Optional[HealthReport]:
+        if self.state == "healthy":
+            return None
+        previous, ticks, failures = self.state, self.stalled_ticks, self.failures_seen
+        self.state = "healthy"
+        self.stalled_ticks = 0
+        self.failures_seen = 0
+        self._interval = self.warn_initial_interval
+        self._last_report_at = None
+        if not self._reported:
+            return None
+        self._reported = False
+        return HealthReport(
+            "info",
+            f"kanban dispatcher: healthy again — clearing {previous} "
+            f"({ticks} stalled tick(s), {failures} spawn failure(s) while unhealthy)",
+        )
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1241,6 +1525,49 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     return any(profile_exists(row["assignee"]) for row in rows)
 
 
+def oldest_spawnable_pending(
+    conn: sqlite3.Connection, *, include_review: bool = True
+) -> tuple[Optional[str], float]:
+    """``(task_id, age_seconds)`` of the longest-waiting spawnable card.
+
+    Same filter as :func:`has_spawnable_ready` (assigned, unclaimed, and the
+    assignee maps to a real profile — control-plane lanes excluded), plus WHICH
+    card and how long it has waited, so health telemetry can tell "work just
+    arrived" from "work has been waiting since before the stall".
+
+    ``age_seconds`` counts from ``created_at``: the tasks table keeps no
+    "ready since" stamp, so this is an UPPER bound on time-in-ready — a card
+    created days ago and readied a minute ago looks old. That is enough to decide
+    whether a silent dispatcher is worth reporting; it is not evidence that a
+    card has been waiting that long. ``(None, 0.0)`` when nothing is spawnable.
+    """
+    statuses = ["ready"]
+    if include_review and review_dispatch_enabled():
+        statuses.append("review")
+    try:
+        rows = conn.execute(
+            "SELECT id, assignee, created_at FROM tasks "
+            f"WHERE status IN ({','.join('?' for _ in statuses)}) "
+            "AND assignee IS NOT NULL AND claim_lock IS NULL "
+            "ORDER BY created_at ASC",
+            tuple(statuses),
+        ).fetchall()
+    except sqlite3.Error:
+        return None, 0.0
+    if not rows:
+        return None, 0.0
+    profile_exists = _profile_exists_fn()
+    now = time.time()
+    for row in rows:
+        if profile_exists is not None and not profile_exists(row["assignee"]):
+            continue
+        created = row["created_at"]
+        # No usable timestamp -> age 0, i.e. "cannot show this is old", never a
+        # fabricated age that would trip the stall warning on its own.
+        return row["id"], (0.0 if created is None else max(0.0, now - float(created)))
+    return None, 0.0
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """True iff a ready+assigned+unclaimed task maps to a real Hermes profile.
 
@@ -1558,6 +1885,7 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        result.spawn_failed.append((claimed.id, claimed.assignee or "", f"workspace: {exc}"))
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -1585,6 +1913,7 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        result.spawn_failed.append((claimed.id, claimed.assignee or "", str(exc)))
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -1674,12 +2003,17 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            # Declining here records no skip bucket, so name the cap on the
+            # result: health telemetry must read this as "deferred, capacity
+            # full" and stay quiet, not as "nothing spawned, something is broken".
+            result.spawn_budget_blocked = "max_spawn"
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.spawn_budget_blocked = "max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
