@@ -1316,12 +1316,20 @@ class GatewayNotificationsMixin:
         (``tools.async_delegation`` → ``get_hermes_home()/state.db``) resolve from the ambient scope.
         The supervised ``_async_delegation_watcher`` and startup-recovered process watchers run under
         the ROOT scope, so a secondary profile's completion was looked up in the DEFAULT profile's
-        state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever."""
+        state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever.
+
+        A raw api_server event has no structured source, so the only owner evidence it can carry is
+        the restore path's in-memory ``_owner_profile_home`` stamp (see
+        ``tools.async_delegation.restore_undelivered_completions``); it is honored only together with
+        ``restored``, so an unstamped or foreign-supplied key cannot redirect the lookup."""
         from gateway.run import _async_profile_runtime_scope
         from hermes_constants import get_hermes_home_override
         source = self._build_process_event_source(evt)
         if source is None or not getattr(source, "profile", None):
-            return contextlib.nullcontext()
+            owner_home = str(evt.get("_owner_profile_home") or "") if evt.get("restored") else ""
+            if not owner_home or get_hermes_home_override() == owner_home:
+                return contextlib.nullcontext()
+            return _async_profile_runtime_scope(Path(owner_home))
         profile_home = self._resolve_profile_home_for_source(source)
         if get_hermes_home_override() == str(profile_home):
             return contextlib.nullcontext()

@@ -270,8 +270,10 @@ def restore_undelivered_completions(target_queue) -> int:
     prove ownership. Rows older than ``_MAX_COMPLETION_REPLAY_AGE_S`` are terminally dropped
     instead of replaying a turn nobody is waiting on.
 
-    Every restored event is stamped ``restored=True`` (in-memory only — the stamp is added after the durable
-    payload is deserialized and is never persisted). Restored events originate from a *previous* process, so
+    Every restored event is stamped ``restored=True`` plus ``_owner_profile_home`` (the home whose
+    state.db holds the row) in memory only — both stamps are added after the durable payload is
+    deserialized and are never persisted, so a foreign-supplied key can never masquerade as one.
+    Restored events originate from a *previous* process, so
     no consumer in THIS process implicitly owns them: drain paths that run without an ownership filter (the
     legacy single-session behavior) must leave them queued for a consumer that can positively prove
     ownership, otherwise a brand-new session adopts a dead session's delegation results seconds after boot
@@ -298,6 +300,11 @@ def restore_undelivered_completions(target_queue) -> int:
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
+                # Which profile home the row lives in. In-memory only (added after the durable payload
+                # is deserialized, never persisted): a restored raw api_server event has no structured
+                # platform/chat metadata, so without this stamp a drain running under the ROOT scope
+                # would look the ledger and the target session up in the DEFAULT profile's state.db.
+                evt["_owner_profile_home"] = str(get_hermes_home())
             target_queue.put(evt)
             restored += 1
     return restored
