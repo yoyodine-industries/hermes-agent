@@ -45,7 +45,11 @@ TERMINAL_DELIVERY = "terminal"
 # Retryable drain results allowed per event before the drain stops requeueing it. Some permanent
 # failures cannot be classified as permanent up front (an unresolvable route looks identical to a
 # route that is still connecting), so every event gets a bounded number of attempts and no more.
-_MAX_COMPLETION_REQUEUES = 5
+# 30 cycles is about a minute at the watcher's 2 s interval: long enough that a transport still
+# connecting at boot delivers normally, short enough that an unresolvable route cannot spin the
+# drain. A permanently unpersistable target never reaches this budget — it is terminal on its
+# first attempt.
+_MAX_COMPLETION_REQUEUES = 30
 
 
 def _raw_process_event_session_id(evt: dict) -> str:
