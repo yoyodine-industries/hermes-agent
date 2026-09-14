@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,11 @@ def adapter_supports_push(adapter: Any) -> bool:
 
 class WakeNotAccepted(RuntimeError):
     """No adapter admission: retry without treating a healthy chat as dead."""
+
+
+class DelegationDeliveryTargetGone(Exception):
+    """The delivery target session has no ``sessions`` row, so ``messages.session_id``'s FK can
+    never be satisfied. Permanent — retrying cannot succeed."""
 
 
 async def admit_internal_event(adapter: Any, event: Any) -> None:
@@ -89,10 +95,24 @@ def _delegation_display_metadata(evt: dict) -> dict:
     return metadata
 
 
+async def _delegation_target_session_exists(db: Any, session_id: str) -> bool:
+    """Whether the delivery target still has a ``sessions`` row. FAIL OPEN: a broken or absent
+    probe is not proof the row is gone, and skipping a real delivery is worse than the FK error."""
+    probe = getattr(db, "get_session", None)
+    if not callable(probe):
+        return True
+    try:
+        return await asyncio.to_thread(probe, session_id) is not None
+    except Exception:
+        logger.debug("delegation delivery target probe failed for %s", session_id, exc_info=True)
+        return True
+
+
 async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: str, evt: Optional[dict] = None) -> None:
     """Persist an async-delegation completion as a durable DELIVERY row (see module docstring)
     WITHOUT running any agent turn. Raises on failure so the caller can release the durable claim
-    and retry.
+    and retry; a target session with no ``sessions`` row raises ``DelegationDeliveryTargetGone``
+    (permanent — no retry can persist it).
 
     85957: on stateless api_server sessions the client owns the turn after ``event.complete`` — a completion
     must never become a new ``role=user`` prompt via the self-post (that starts an unauthorized agent turn
@@ -124,9 +144,20 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
                 session_id = str(resolved)
         except Exception:
             logger.debug("delegation delivery continuation resolve failed for %s", session_id, exc_info=True)
-    await asyncio.to_thread(
-        db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
-    )
+    # The FK on ``messages.session_id`` can never be satisfied for a target with no ``sessions``
+    # row, and no retry creates one: a permanently unpersistable delivery must be terminal so the
+    # watcher stops requeuing it every cycle. Probe first (fail open), then trust the FK error.
+    if not await _delegation_target_session_exists(db, session_id):
+        raise DelegationDeliveryTargetGone(session_id)
+    try:
+        await asyncio.to_thread(
+            db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
+        )
+    except sqlite3.IntegrityError as exc:
+        if "FOREIGN KEY" in str(exc).upper():
+            # The session row vanished between the probe and the write.
+            raise DelegationDeliveryTargetGone(session_id) from exc
+        raise
     logger.info(
         "async delegation completion persisted as delivery row for api_server session %s (no wake turn)", session_id
     )

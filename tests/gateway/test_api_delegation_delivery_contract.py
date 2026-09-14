@@ -88,3 +88,79 @@ async def test_delivery_replay_is_atomic_across_continuation_and_busy_turn(tmp_p
     finally:
         peer.close()
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_to_a_session_with_no_transcript_row_is_permanently_unpersistable(tmp_path):
+    """The ``messages`` FK can never be satisfied without a ``sessions`` row: no retry helps, so the
+    delivery must be reported as gone (terminal) instead of re-running the same impossible INSERT."""
+    from gateway.wake import DelegationDeliveryTargetGone  # raised only by the patched seam
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    adapter = SimpleNamespace(_ensure_session_db=lambda: db)
+    try:
+        with pytest.raises(DelegationDeliveryTargetGone) as excinfo:
+            await persist_delegation_delivery(
+                adapter, text="RESULT", session_id="run_gone",
+                evt={"type": "async_delegation", "delegation_id": "gone-target"},
+            )
+        assert excinfo.value.args[0] == "run_gone"
+        assert db.get_messages("run_gone") == []
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_to_a_session_with_a_transcript_row_still_appends(tmp_path):
+    """The terminal verdict is narrow: a live target keeps the delivered row."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("run_live", source="api_server")
+    adapter = SimpleNamespace(_ensure_session_db=lambda: db)
+    try:
+        await persist_delegation_delivery(
+            adapter, text="RESULT", session_id="run_live",
+            evt={"type": "async_delegation", "delegation_id": "live-target"},
+        )
+        rows = db.get_messages("run_live")
+        assert [(r["display_kind"], r["content"]) for r in rows] == [("async_delegation_complete", "RESULT")]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_broken_target_lookup_never_makes_a_deliverable_row_terminal(tmp_path, monkeypatch):
+    """Fail open: an unexpected probe failure must not turn a persistable completion into a drop."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("run_probe", source="api_server")
+
+    def _explode(session_id):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(db, "get_session", _explode)
+    adapter = SimpleNamespace(_ensure_session_db=lambda: db)
+    try:
+        await persist_delegation_delivery(
+            adapter, text="RESULT", session_id="run_probe",
+            evt={"type": "async_delegation", "delegation_id": "probe-broken"},
+        )
+        assert len(db.get_messages("run_probe")) == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_store_without_a_session_lookup_is_assumed_to_have_the_target():
+    """The absence of the probe is not evidence of a gone target: only a negative answer is."""
+    seen = []
+
+    class _Store:
+        def append_delegation_delivery(self, session_id, content, metadata):
+            seen.append((session_id, content))
+            return 1
+
+    adapter = SimpleNamespace(_ensure_session_db=lambda: _Store())
+    await persist_delegation_delivery(
+        adapter, text="RESULT", session_id="run_older",
+        evt={"type": "async_delegation", "delegation_id": "no-probe"},
+    )
+    assert seen == [("run_older", "RESULT")]
