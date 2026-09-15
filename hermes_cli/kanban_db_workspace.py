@@ -3,6 +3,16 @@
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
 late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 ``kanban_db.<name>`` keeps working.
+
+Terminal-reap invariant: a card's linked worktree is reaped when it holds no
+*unrecoverable* state — a clean tree whose HEAD either rides a branch that
+survives the removal (every non-``wt/`` branch, i.e. a project-linked card's
+``<project-slug>/<task-id>``, whose commits stay reachable) or has no commits
+unreachable from a remote-tracking ref. Commits are protected by KEEPING THE
+BRANCH, never by keeping the tree: a tree parked at ``<repo>/.worktrees/<id>``
+must not linger merely because nothing was pushed. See
+:func:`_worktree_reap_verdict` (the one predicate both the prompt reap and the
+residue sweep use) and :func:`sweep_terminal_worktree_workspaces`.
 """
 
 from __future__ import annotations
@@ -11,7 +21,9 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
+from typing import Any
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
@@ -170,35 +182,235 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+# ---------------------------------------------------------------------------
+# Card worktrees: the identity marker (Part 3) and the one reap predicate
+# ---------------------------------------------------------------------------
+
+# A card worktree parked at ``<repo>/.worktrees/<task-id>`` reads like the
+# project checkout. Every tree we materialize carries this marker, and it is
+# listed in the repo's COMMON ``.git/info/exclude`` so the marker itself never
+# dirties the tree (a dirty tree would never be reaped — see
+# :func:`_write_worktree_marker`).
+_WORKTREE_MARKER_NAME = "KANBAN-WORKTREE.md"
+
+
+def _worktree_head_is_detached(worktree_path: Path) -> bool:
+    """``git rev-parse --abbrev-ref HEAD`` == ``HEAD`` means a detached HEAD.
+
+    Fails SAFE toward True (an unreadable HEAD counts as detached), so a git
+    error can only ever preserve a tree that holds unpushed commits.
+    """
+    out = _kb._git_out(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+    return out is None or out.strip() == "HEAD"
+
+
+def _has_remote_tracking_baseline(path: Path) -> bool:
+    """Whether ``_worktree_has_unpushed_commits`` has anything to compare to.
+
+    That predicate's own contract is "no remote-tracking refs = no baseline ->
+    False", so its verdict alone must never authorise deleting a branch: in a
+    repo with no remote, every commit looks pushed. Deleting ``wt/<task-id>``
+    needs a real baseline, else the reap would destroy the only ref that held
+    those commits.
+    """
+    return bool(
+        _kb._git_out(path, "for-each-ref", "--format=%(refname)", "refs/remotes")
+    )
+
+
+def _worktree_reap_verdict(worktree_path: Path) -> tuple[bool, str]:
+    """THE terminal-reap predicate, shared by the prompt reap in
+    :func:`_cleanup_worktree_workspace` and the residue sweep in
+    :func:`sweep_terminal_worktree_workspaces` so the two cannot drift.
+
+    Returns ``(reap, reason)``. ``git worktree remove`` never touches refs, so a
+    tree is reapable when nothing in it is unrecoverable:
+      1. dirty (uncommitted tracked changes or untracked files) -> preserve;
+      2. detached HEAD holding commits no remote-tracking ref reaches ->
+         preserve (they would be unreachable once the tree goes);
+      3. otherwise -> reap: an attached HEAD rides a branch that survives the
+         removal and keeps its commits, so the tree itself is worth nothing.
+    """
+    from hermes_cli.worktree_ops import (  # late-bound: CLI safety predicates
+        _worktree_has_unpushed_commits,
+        _worktree_is_dirty,
+    )
+
+    if _worktree_is_dirty(str(worktree_path)):
+        return False, "uncommitted changes in the tree"
+    if _worktree_head_is_detached(worktree_path) and _worktree_has_unpushed_commits(
+        str(worktree_path)
+    ):
+        return False, "detached HEAD holding commits no ref points at"
+    return True, "clean tree; HEAD's branch keeps any commits"
+
+
+def _worktree_marker_path(tree: Path) -> Path:
+    return tree / _WORKTREE_MARKER_NAME
+
+
+def _worktree_marker_text(
+    *,
+    task_id: str,
+    branch_name: Optional[str],
+    repo_root: Path,
+    state: str = "created",
+    reason: Optional[str] = None,
+) -> str:
+    branch = (branch_name or "").strip() or f"wt/{task_id}"
+    stamped = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    lines = [
+        "# Kanban task worktree — NOT the project checkout",
+        "",
+        "This directory is a **kanban task worktree** (`git worktree`) that is",
+        f"parked at its own HEAD under `<repo>/.worktrees/{task_id}`. Files here",
+        "are a task snapshot, not repo truth: the canonical checkout is",
+        "",
+        f"- canonical repo root: `{repo_root}`",
+        f"- kanban task id: `{task_id}`",
+        f"- branch: `{branch}`",
+        f"- marker stamped: `{stamped}` ({state})",
+    ]
+    if reason:
+        lines += [
+            "",
+            "This tree outlived its kanban card because the terminal reap",
+            f"preserved it: {reason}.",
+        ]
+    lines += [
+        "",
+        f"`{_WORKTREE_MARKER_NAME}` is listed in the repository's common",
+        "`.git/info/exclude`, so the marker never makes the tree dirty.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _worktree_common_exclude(tree: Path) -> Optional[Path]:
+    """``<common-git-dir>/info/exclude`` for the tree, or ``None``.
+
+    ``git rev-parse --git-path info/exclude`` run inside a linked worktree
+    resolves to the COMMON git dir's exclude file, which is the same directory
+    ``--git-common-dir`` names — so we can address the file without gambling on
+    a ``--path-format``/``--git-path`` combination's git-version behavior.
+    """
+    common = _git_common_dir(tree)
+    return None if common is None else common / "info" / "exclude"
+
+
+def _ensure_marker_excluded(tree: Path) -> bool:
+    """Idempotently list the marker in the repo's common ``info/exclude``.
+
+    Returns whether the entry is in place. The marker is only ever written when
+    it is: an unexcluded marker would make the tree look dirty, and a dirty tree
+    is preserved forever — resurrecting the parked-tree bug in a new shape.
+    """
+    exclude = _worktree_common_exclude(tree)
+    if exclude is None:
+        return False
+    try:
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if _WORKTREE_MARKER_NAME in existing.split():
+            return True
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        prefix = "" if (not existing or existing.endswith("\n")) else "\n"
+        with exclude.open("a", encoding="utf-8") as handle:
+            handle.write(f"{prefix}# kanban task worktrees are not project dirt\n")
+            handle.write(f"{_WORKTREE_MARKER_NAME}\n")
+        return True
+    except OSError as exc:
+        _kb._log.debug("Could not add %s to %s: %s", _WORKTREE_MARKER_NAME, exclude, exc)
+        return False
+
+
+def _write_worktree_marker(
+    tree: Path,
+    *,
+    task_id: str,
+    branch_name: Optional[str],
+    repo_root: Path,
+    state: str = "created",
+    reason: Optional[str] = None,
+) -> None:
+    """Stamp ``<tree>/KANBAN-WORKTREE.md`` so a parked tree identifies itself.
+
+    Best-effort: never raises into the caller (worktree creation or housekeeping),
+    and never clobbers tracked content — if the branch already tracks a file of
+    that name, it is left exactly as it is.
+    """
+    try:
+        if not tree.is_dir():
+            return
+        if _kb._git_out(tree, "ls-files", "--error-unmatch", _WORKTREE_MARKER_NAME):
+            _kb._log.debug("Leaving tracked %s in %s alone", _WORKTREE_MARKER_NAME, tree)
+            return
+        if not _ensure_marker_excluded(tree):
+            _kb._log.debug(
+                "Not writing %s in %s: %s is not writable, and an unexcluded "
+                "marker would dirty the tree forever",
+                _WORKTREE_MARKER_NAME, tree, _worktree_common_exclude(tree),
+            )
+            return
+        _worktree_marker_path(tree).write_text(
+            _worktree_marker_text(
+                task_id=task_id, branch_name=branch_name, repo_root=repo_root,
+                state=state, reason=reason,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        _kb._log.debug("Could not write %s in %s: %s", _WORKTREE_MARKER_NAME, tree, exc)
+
+
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
-) -> None:
-    """Remove a finished task's linked git worktree when it holds no work.
-    Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
-    requires a clean tree AND every commit reachable from a remote-tracking
-    ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
-    branches are kept. Best-effort."""
+) -> tuple[bool, str]:
+    """Remove a finished task's linked git worktree when it holds no *unrecoverable* state.
+
+    Invariant (see the module docstring): ``git worktree remove`` never touches
+    refs, so the tree is reaped when :func:`_worktree_reap_verdict` finds nothing
+    unrecoverable — a clean tree whose HEAD either rides a branch that survives
+    the removal or has no commits unreachable from a remote-tracking ref.
+    Commits are protected by KEEPING THE BRANCH, not by keeping the tree: a
+    project-linked card's ``<project-slug>/<task-id>`` branch is never deleted,
+    so an unpushed project branch no longer pins the tree on disk forever.
+
+    Removal is plain ``git worktree remove`` — never ``--force``, so git's own
+    dirty guard re-verifies at removal time (the TOCTOU property is kept). Any
+    doubt (dirty, a detached HEAD with unpushed commits, an unresolvable repo,
+    failing git) preserves the tree and refreshes its marker with the reason
+    (Part 3). The auto-generated ``wt/<task-id>`` branch is deleted only when a
+    remote-tracking baseline proves it holds no unique commits; custom branches
+    are always kept. Best-effort; returns ``(removed, reason)``.
+    """
     try:
-        from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+        from hermes_cli.worktree_ops import _worktree_has_unpushed_commits
     except Exception:
-        return  # CLI safety predicates unavailable — preserve
+        return False, "git safety predicates unavailable"  # preserve
     try:
         wp = Path(path).expanduser()
         if not wp.is_dir():
-            return
+            return False, "tree is not on disk"
         common = _git_common_dir(wp)
         if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
+            return False, "not a linked worktree of a normal repo"
         repo_root = common.parent
         if wp.resolve(strict=False) == repo_root.resolve(strict=False):
-            return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
-            _kb._log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
-                task_id, wp,
+            return False, "path is the main checkout"
+        reap, reason = _worktree_reap_verdict(wp)
+        if not reap:
+            _kb._log.info("Preserving worktree for task %s at %s: %s", task_id, wp, reason)
+            # A surviving tree must say why it is still here (Part 3).
+            _write_worktree_marker(
+                wp, task_id=task_id, branch_name=branch_name, repo_root=repo_root,
+                state="preserved", reason=reason,
             )
-            return
+            return False, reason
+        # Both branch verdicts below need the worktree's own HEAD, so read them
+        # BEFORE the removal takes it away.
+        branch = (branch_name or "").strip() or f"wt/{task_id}"
+        branch_holds_unique_commits = _worktree_has_unpushed_commits(str(wp))
+        remote_baseline = _has_remote_tracking_baseline(repo_root)
         # No --force: git's own dirty guard re-verifies at removal time, so if
         # the tree became dirty since our check (TOCTOU) removal fails safe.
         result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
@@ -207,13 +419,110 @@ def _cleanup_worktree_workspace(
                 "git worktree remove failed for task %s at %s: %s",
                 task_id, wp, (result.stderr or result.stdout or "").strip(),
             )
-            return
+            return False, "git worktree remove refused"
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
+        # Only an auto-generated branch is ours to delete, and only when a
+        # remote-tracking ref demonstrably holds its commits.
+        if branch.startswith("wt/") and remote_baseline and not branch_holds_unique_commits:
             _git(repo_root, "branch", "-D", branch, timeout=30)
-    except Exception:
-        pass  # best-effort — never block completion
+        return True, "reaped"
+    except Exception as exc:
+        _kb._log.debug("Worktree cleanup for task %s failed: %s", task_id, exc)
+        return False, "cleanup failed"
+
+
+# Statuses after which a card's worktree is residue nobody will revisit.
+_TERMINAL_TASK_STATUSES = ("done", "archived", "failed", "cancelled")
+
+
+def sweep_terminal_worktree_workspaces(
+    conn: sqlite3.Connection,
+    *,
+    min_age_hours: float = 6.0,
+    limit: int = 20,
+    dry_run: bool = False,
+) -> dict:
+    """Reap card worktrees whose terminal reap never ran (Part 2: the residue).
+
+    ``_cleanup_workspace`` only runs from ``complete_task``/``archive_task``, so
+    a card that ended any other way (failed/cancelled, or a status written by a
+    recovery path) leaks its tree with no other reaper — ``worktree prune``
+    deliberately skips ``t_*`` trees. This is that reaper.
+
+    Callers: the **dispatcher tick** is the periodic one (hourly gate in
+    ``kanban_db_dispatch._maybe_sweep_terminal_worktrees``); ``hermes kanban gc``
+    is the manual one and is the caller that passes ``dry_run``.
+
+    Only a row whose ``<repo>/.worktrees/<task-id>`` path exists on disk is
+    considered, and each candidate goes through the same
+    :func:`_worktree_reap_verdict` predicate as the prompt reap. Never raises on
+    a missing tree, a non-repo path or a git error — logs at DEBUG and moves on
+    (this runs inside the gateway process). Returns ``{"scanned": n,
+    "removed": [...], "preserved": {path: why}, "skipped": n}``.
+    """
+    summary: dict = {"scanned": 0, "removed": [], "preserved": {}, "skipped": 0}
+    try:
+        cutoff = time.time() - max(0.0, float(min_age_hours)) * 3600.0
+        rows = list(
+            conn.execute(
+                "SELECT t.id AS id, t.workspace_path AS workspace_path, "
+                "       t.branch_name AS branch_name, t.completed_at AS completed_at, "
+                "       (SELECT MAX(r.ended_at) FROM task_runs r WHERE r.task_id = t.id) "
+                "         AS last_run_end "
+                "  FROM tasks t "
+                " WHERE t.workspace_kind = 'worktree' "
+                "   AND t.workspace_path IS NOT NULL AND t.workspace_path <> '' "
+                "   AND t.status IN ({})".format(
+                    ", ".join("?" for _ in _TERMINAL_TASK_STATUSES)
+                ),
+                _TERMINAL_TASK_STATUSES,
+            )
+        )
+    except sqlite3.Error as exc:
+        _kb._log.debug("Terminal worktree sweep skipped: %s", exc)
+        return summary
+    # No timestamp = no age verdict; never guess (skip those rows entirely).
+    candidates: list[tuple[int, Any]] = []
+    for row in rows:
+        stamp = row["completed_at"] or row["last_run_end"]
+        if stamp is None or int(stamp) > cutoff:
+            continue
+        candidates.append((int(stamp), row))
+    candidates.sort(key=lambda item: item[0])  # oldest residue first
+    budget = max(1, int(limit))
+    for _stamp, row in candidates:
+        if len(summary["removed"]) >= budget:
+            break
+        summary["scanned"] += 1
+        task_id = row["id"]
+        tree = Path((row["workspace_path"] or "").strip()).expanduser()
+        # Containment: only ever the card's own ``<repo>/.worktrees/<task-id>``.
+        if tree.parent.name != ".worktrees" or tree.name != task_id:
+            summary["skipped"] += 1
+            _kb._log.debug("Skipping non-canonical kanban worktree path %s (task %s)", tree, task_id)
+            continue
+        if not tree.is_dir():
+            summary["skipped"] += 1
+            continue
+        try:
+            if dry_run:
+                # Report-only: same predicate, no mutation.
+                reap, reason = _worktree_reap_verdict(tree)
+                if reap:
+                    summary["removed"].append(str(tree))
+                else:
+                    summary["preserved"][str(tree)] = reason
+                continue
+            removed, reason = _cleanup_worktree_workspace(task_id, str(tree), row["branch_name"])
+        except Exception as exc:  # never raise into a gateway tick / CLI
+            summary["skipped"] += 1
+            _kb._log.debug("Sweep failed for task %s at %s: %s", task_id, tree, exc)
+            continue
+        if removed:
+            summary["removed"].append(str(tree))
+        else:
+            summary["preserved"][str(tree)] = reason
+    return summary
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -393,10 +702,19 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    Also stamps the tree with ``KANBAN-WORKTREE.md`` (Part 3): a tree parked
+    under ``<repo>/.worktrees/<task-id>`` otherwise looks exactly like the
+    project checkout to anyone who finds it. The marker is written on the
+    already-materialized early return too, so trees that predate it get one.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _git_common_dir(target) == repo_common:
+        _write_worktree_marker(
+            target, task_id=target.name, branch_name=branch_name, repo_root=repo_root
+        )
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
@@ -409,6 +727,9 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    _write_worktree_marker(
+        target, task_id=target.name, branch_name=branch_name, repo_root=repo_root
+    )
 
 
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:

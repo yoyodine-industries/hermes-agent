@@ -283,40 +283,66 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
+    """Remove archived tasks' scratch workspaces, reap terminal cards' worktrees, old events, and old worker logs.
+
+    ``--dry-run`` reports without mutating anything: the worktree sweep reports
+    its candidates (and its reasons for preserving) and the retention passes are
+    skipped outright rather than partially applied.
+    """
     import shutil
+    dry_run = bool(getattr(args, "dry_run", False))
     scratch_root = kb.workspaces_root()
     removed_ws = 0
+    if not dry_run:
+        with kbc.connect_closing() as conn:
+            rows = conn.execute(
+                "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
+                "WHERE status = 'archived'"
+            ).fetchall()
+        for row in rows:
+            if row["workspace_kind"] == "worktree":
+                # Backstop for worktrees that escaped the completion/archive hook.
+                # Same predicate as the reap: a clean tree goes, because its
+                # commits survive on the branch (kept, or fully pushed); only a
+                # dirty tree or a detached HEAD with unreferenced commits stays.
+                wt_path = row["workspace_path"]
+                if wt_path and Path(wt_path).is_dir():
+                    kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+                    if not Path(wt_path).is_dir():
+                        removed_ws += 1
+                continue
+            if row["workspace_kind"] != "scratch":
+                continue
+            path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+            try:
+                path = path.resolve()
+            except OSError:
+                continue
+            try:
+                path.relative_to(scratch_root.resolve())
+            except ValueError:
+                # Safety: never delete outside the scratch root.
+                continue
+            if path.exists() and path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+                removed_ws += 1
+
+    # Terminal card worktrees whose completion/archive hook never ran: the
+    # manual half of the same sweep the dispatcher tick runs hourly. Idempotent,
+    # so re-running gc is always safe.
     with kbc.connect_closing() as conn:
-        rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
-        ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] == "worktree":
-            # Backstop for worktrees that escaped the completion/archive hook.
-            # Same safety predicate: only clean, fully-pushed worktrees go.
-            wt_path = row["workspace_path"]
-            if wt_path and Path(wt_path).is_dir():
-                kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
-                if not Path(wt_path).is_dir():
-                    removed_ws += 1
-            continue
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+        sweep = kbw.sweep_terminal_worktree_workspaces(conn, dry_run=dry_run)
+    removed_ws += len(sweep["removed"])
+    if dry_run:
+        print(
+            f"GC dry-run: no changes applied. {removed_ws} worktree(s) would be "
+            f"reaped, {len(sweep['preserved'])} preserved, "
+            f"{sweep['skipped']} skipped (scanned {sweep['scanned']}); "
+            "event/log retention passes not run."
+        )
+        for path, reason in sorted(sweep["preserved"].items()):
+            print(f"  preserved {path}: {reason}")
+        return 0
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
