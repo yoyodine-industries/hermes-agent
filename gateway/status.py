@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
+import hermes_state_guard
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home
 from utils import atomic_json_write
 
@@ -84,12 +85,64 @@ def record_start_and_check_storm(
         return None
 
 
+#: Test-isolation bypass for the gateway identity files (mirrors
+#: ``hermes_state_guard._STATE_DB_GUARD_BYPASS_ENV``). Test-safety escape hatch, not user config.
+_GATEWAY_STATE_GUARD_BYPASS_ENV = "HERMES_GATEWAY_STATE_GUARD_BYPASS"
+
+
+def _is_production_hermes_home(home: Path) -> bool:
+    """*home* is the real platform-default root or a profile directly under it
+    (``~/.hermes`` or ``~/.hermes/profiles/<name>``). Deeper scratch paths are not matched."""
+    try:
+        root = hermes_state_guard._real_platform_state_root()
+    except Exception:
+        return False
+    if root is None:
+        return False
+    try:
+        resolved = Path(home).expanduser().resolve(strict=False)
+    except Exception:
+        return False
+    if resolved == root:
+        return True
+    try:
+        parts = resolved.relative_to(root).parts
+    except ValueError:
+        return False
+    return len(parts) == 2 and parts[0] == "profiles"
+
+
+def _assert_safe_gateway_state_home(home: Path) -> None:
+    """Fail closed when a test-context process resolves the production home for a
+    gateway identity file (``gateway_state.json``/``.pid``/``.lock``/takeover markers).
+
+    A pytest process — or a child that rebuilt its env and dropped the ``HERMES_HOME``
+    redirect but inherited ``HERMES_TEST_ISOLATION`` — resolving the live home is by
+    definition an isolation escape: writing there leaves a dead test pid as the live
+    gateway's platform writer (the feishu leak) or ``--replace``s the live daemon.
+    Mirrors ``hermes_state_guard`` for the state.db. Production is never under test
+    context, so the resolve() below is skipped on the hot path."""
+    if os.environ.get(_GATEWAY_STATE_GUARD_BYPASS_ENV) == "1":
+        return
+    if not hermes_state_guard._in_test_context():
+        return
+    if _is_production_hermes_home(home):
+        raise RuntimeError(
+            "Refusing to resolve the production Hermes home for gateway identity files "
+            f"under test context: {home}. A gateway test (or a child it spawned) would "
+            "write gateway_state.json / gateway.pid to the live home. Point HERMES_HOME "
+            "at a scratch dir, or set " + _GATEWAY_STATE_GUARD_BYPASS_ENV + "=1 to bypass."
+        )
+
+
 def _get_process_hermes_home() -> Path:
     """Launch-home HERMES_HOME for identity files (PID, lock, status, markers):
     ``get_hermes_home()`` honors the per-session ``_HERMES_HOME_OVERRIDE`` and would misroute
     them."""
     val = os.environ.get("HERMES_HOME", "").strip()
-    return Path(val) if val else _get_platform_default_hermes_home()
+    home = Path(val) if val else _get_platform_default_hermes_home()
+    _assert_safe_gateway_state_home(home)
+    return home
 
 
 def _canonical_hermes_home(path: Path | str) -> Path:
