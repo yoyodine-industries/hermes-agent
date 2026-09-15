@@ -31,6 +31,7 @@ if str(_WORKTREE) not in sys.path:
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_move
 
 
 # ---------------------------------------------------------------------------
@@ -101,11 +102,26 @@ class TestPathResolution:
 
 
     def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+        """``HERMES_KANBAN_DB`` pins a store that belongs to no board outright."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
         assert kb.kanban_db_path(board="ignored") == forced
+
+
+    def test_env_var_db_override_yields_to_an_explicit_other_board(
+        self, fresh_home, monkeypatch,
+    ):
+        """A pin that belongs to ``default`` answers for ``default`` only —
+        otherwise ``--board <other>`` silently reads the pinned store."""
+        kb.create_board("research")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(fresh_home / "kanban.db"))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        assert kb.kanban_db_path(board="research") == (
+            fresh_home / "kanban" / "boards" / "research" / "kanban.db"
+        )
+        assert kb.kanban_db_path(board="default") == fresh_home / "kanban.db"
+
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +359,7 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
+
 
 
 

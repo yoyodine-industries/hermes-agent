@@ -669,7 +669,8 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     every connection so a re-created file stays robust; the first connection
     per path auto-runs :func:`init_db`, later ones skip via
     ``_INITIALIZED_PATHS``. Path: explicit ``db_path``, else ``board``, else
-    :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
+    :func:`kanban_db_path` (an explicit ``board`` > ``HERMES_KANBAN_BOARD`` >
+    ``HERMES_KANBAN_DB``, which pins the path for the board it belongs to >
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     from agent.delegation_context import is_delegated_child_process_context

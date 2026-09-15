@@ -4,6 +4,9 @@ Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db``
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
 another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
 file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+The pin answers only for the board it belongs to — a request for a *different* board still resolves
+to that board's own store, so ``--board <slug>`` works from inside a pinned worker (see
+:func:`_board_path`).
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -470,15 +473,56 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
-def _board_path(
-    env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
+def _env_path_pin(env_var: Optional[str]) -> Optional[Path]:
+    """The path ``env_var`` pins, or ``None`` when unset/blank."""
+    if not env_var:
+        return None
+    raw = os.environ.get(env_var, "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def _board_owning_path(pin: Path, default_parts: tuple[str, ...], leaf: str) -> Optional[str]:
+    """Which board ``pin`` belongs to, or ``None`` when that can't be told.
+
+    The path is mapped back onto the canonical layout first — that identifies the
+    legacy ``default`` store and every board whose DB (or workspaces/attachments
+    dir) sits where :func:`board_dir` says it should. ``HERMES_KANBAN_BOARD`` is
+    the fallback: the dispatcher injects it next to the pin, so a worker's own
+    store is attributable even when the operator gave it a custom path.
+    """
+    variants = {pin}
+    with contextlib.suppress(OSError):
+        variants.add(pin.resolve())
+
+    def _is(candidate: Path) -> bool:
+        if candidate in variants:
+            return True
+        with contextlib.suppress(OSError):
+            return candidate.resolve() in variants
+        return False
+
+    if _is(kanban_home().joinpath(*default_parts)):
+        return DEFAULT_BOARD
+    try:
+        entries = sorted(boards_root().iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        try:
+            slug = _normalize_board_slug(entry.name)
+        except ValueError:
+            continue
+        if slug and _is(entry / leaf):
+            return slug
+    return _normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD"))
+
+
+def _canonical_board_path(
+    board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
-    """Shared resolver: ``env_var`` override, else legacy ``<root>/<default_parts>``
-    for the ``default`` board, else ``board_dir(slug)/leaf``."""
-    if env_var:
-        override = os.environ.get(env_var, "").strip()
-        if override:
-            return Path(override).expanduser()
+    """``<root>/<default_parts>`` for the ``default`` board, else ``board_dir(slug)/leaf``."""
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
@@ -487,21 +531,56 @@ def _board_path(
     return board_dir(slug) / leaf
 
 
+def _board_path(
+    env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
+) -> Path:
+    """Shared resolver.
+
+    Precedence: an explicit ``board`` argument (the CLI's ``--board`` arrives as
+    the scoped current-board override) > ``HERMES_KANBAN_BOARD`` > the ``env_var``
+    path pin > ``<root>/kanban/current`` > ``default``.
+
+    The pin is honoured only while it is consistent with the board being asked
+    for. When it is attributable to a *different* board, the request wins and that
+    board's canonical path is used instead: the pin exists to inject a worker's
+    own store, so letting it answer for every board silently returns the wrong
+    one (``--board research`` handed back the pinned ``default`` DB). A pin that
+    cannot be attributed to any board is an operator-supplied store location and
+    stays authoritative.
+    """
+    pinned = _env_path_pin(env_var)
+    if pinned is None:
+        return _canonical_board_path(board, default_parts, leaf)
+    requested = (
+        _normalize_board_slug(board)
+        or _normalize_board_slug(_CURRENT_BOARD_OVERRIDE.get())
+        or _normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD"))
+    )
+    if requested is None:
+        return pinned  # nothing explicit was asked for — the pin owns the store
+    owner = _board_owning_path(pinned, default_parts, leaf)
+    if owner is None or owner == requested:
+        return pinned
+    return _canonical_board_path(requested, default_parts, leaf)
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
-    """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
+    """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers) —
+    for its own board, or for any board when it can't be attributed to one;
     ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
     return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
-    """Per-board scratch workspace root (``HERMES_KANBAN_WORKSPACES_ROOT`` wins);
-    ``default`` keeps the legacy ``<root>/kanban/workspaces/``."""
+    """Per-board scratch workspace root (``HERMES_KANBAN_WORKSPACES_ROOT`` wins
+    for its own board); ``default`` keeps the legacy ``<root>/kanban/workspaces/``."""
     return _board_path("HERMES_KANBAN_WORKSPACES_ROOT", board, ("kanban", "workspaces"), "workspaces")
 
 
 def attachments_root(board: Optional[str] = None) -> Path:
-    """Per-board attachments root (``HERMES_KANBAN_ATTACHMENTS_ROOT`` wins). Workers
-    read attachments by absolute path, so remote terminal backends must mount it."""
+    """Per-board attachments root (``HERMES_KANBAN_ATTACHMENTS_ROOT`` wins for its
+    own board). Workers read attachments by absolute path, so remote terminal
+    backends must mount it."""
     return _board_path("HERMES_KANBAN_ATTACHMENTS_ROOT", board, ("kanban", "attachments"), "attachments")
 
 
