@@ -1717,6 +1717,55 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
+    def _foreign_profile_homes(self, current_home):
+        """Other served profile homes whose state.db might already own a session id.
+
+        Guards a fork: the same session id (e.g. a bot's canonical "Bot Chat") created once in
+        its profile home and again in a different home this gateway serves. Only a multiplexed
+        gateway serves more than one home; on a single-profile daemon this is empty and the
+        guard is a no-op. ``current_home`` is the request-scoped home (the runtime scope
+        redirects ``get_hermes_home()`` per /p/<profile>/ prefix) and is excluded from the set.
+        """
+        cfg = getattr(getattr(self, "gateway_runner", None), "config", None)
+        if not getattr(cfg, "multiplex_profiles", False):
+            return []
+        try:
+            from hermes_cli.profiles import get_profile_dir, profiles_to_serve
+            served = profiles_to_serve(
+                multiplex=True,
+                profile_allowlist=getattr(cfg, "multiplex_profile_allowlist", None),
+            )
+        except Exception:
+            logger.debug("Cross-profile session guard skipped: cannot enumerate served profiles", exc_info=True)
+            return []
+        current = Path(current_home).resolve()
+        homes = []
+        for name, _ in served:
+            try:
+                home = Path(get_profile_dir(name)).resolve()
+            except Exception:
+                continue
+            if home != current:
+                homes.append(home)
+        return homes
+
+    def _session_id_exists_in_foreign_profile(self, session_id, current_home) -> bool:
+        """True when ``session_id`` already exists in a served profile home OTHER than the
+        request's own — i.e. the id is owned by a different agent. Creating it again would fork
+        two divergent lineages under one id."""
+        from hermes_state_registry import acquire, release_or_close
+        for home in self._foreign_profile_homes(current_home):
+            try:
+                db = acquire(home / "state.db")
+            except Exception:
+                continue
+            try:
+                if db.get_session(session_id) is not None:
+                    return True
+            finally:
+                release_or_close(db)
+        return False
+
     # -- Agent creation ---------------------------------------------------------------
 
     @staticmethod
@@ -2841,6 +2890,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "confirmed": bool(runtime_request.get("require_model_lock")),
                 "updated_at": time.time()}}
         title = body.get("title")
+
+        # Refuse to fork a session id across profile stores: if the id already lives in a
+        # DIFFERENT served profile's state.db, creating it here would split one canonical chat
+        # (e.g. a bot's "Bot Chat") into two divergent lineages. Only a multiplexed gateway has
+        # other homes to check; elsewhere this is a no-op.
+        from hermes_constants import get_hermes_home
+        current_home = Path(get_hermes_home())
+        if await asyncio.to_thread(self._session_id_exists_in_foreign_profile, session_id, current_home):
+            return _error_response(
+                f"Session already exists in another profile: {session_id}",
+                409,
+                code="session_exists_foreign_profile",
+            )
 
         def _atomic(conn):
             # One BEGIN IMMEDIATE write: a concurrent same-id create blocks and sees the row.
