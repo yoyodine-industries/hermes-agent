@@ -854,6 +854,37 @@ def _coerce_session_store(session_store: Any) -> dict[str, str]:
     return {"status": state if state in {"ok", "unavailable", "retrying"} else "unknown"}
 
 
+def _drop_stale_platform_writers(payload: dict[str, Any], current_record: dict[str, Any]) -> None:
+    """Drop per-platform entries stamped by a writer other than THIS process.
+
+    ``write_runtime_status`` re-stamps the top-level identity on every write, so a
+    platform entry carrying a ``(writer_pid, writer_start_time)`` identity that doesn't
+    match the current record was written by a dead predecessor — a prior gateway that
+    crashed, or a test that leaked a write to the live home (the ``feishu.writer_pid=96233``
+    incident). Those entries are stale noise that /api/status clears anyway; pruning on
+    the write side stops a dead test pid from surviving a clean gateway restart as a
+    phantom "preserved" writer one level below the top-level pid re-stamp.
+
+    Legacy entries with no writer identity are PRESERVED: they predate the identity
+    stamp and ``clear_profile_platforms`` already relies on keeping plain entries.
+    """
+    platforms = payload.get("platforms")
+    if not isinstance(platforms, dict):
+        return
+    cur_pid = current_record.get("pid")
+    cur_start = current_record.get("start_time")
+    stale = []
+    for key, entry in platforms.items():
+        if not isinstance(entry, dict):
+            continue
+        if "writer_pid" not in entry and "writer_start_time" not in entry:
+            continue  # legacy preserved entry: no identity to compare
+        if entry.get("writer_pid") != cur_pid or entry.get("writer_start_time") != cur_start:
+            stale.append(key)
+    for key in stale:
+        platforms.pop(key, None)
+
+
 def write_runtime_status(
     *, gateway_state: Any = _UNSET, exit_reason: Any = _UNSET, restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET, active_work: Any = _UNSET, platform: Any = _UNSET, platform_state: Any = _UNSET,
@@ -883,6 +914,7 @@ def write_runtime_status(
     payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
     payload["updated_at"] = _utc_now_iso()
     payload.update(_get_code_identity_fields())
+    _drop_stale_platform_writers(payload, current_record)
     _apply_set_fields(payload, (
         ("gateway_state", gateway_state, None), ("exit_reason", exit_reason, None),
         ("restart_requested", restart_requested, bool),
