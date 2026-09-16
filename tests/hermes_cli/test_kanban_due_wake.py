@@ -387,8 +387,21 @@ def test_scheduled_card_without_a_due_time_is_not_reported(conn):
     assert _overdue_diags(conn, tid) == []
 
 
-def test_diagnostic_kind_is_published(conn):
-    assert "overdue_scheduled" in kd.DIAGNOSTIC_KINDS
+def test_overdue_kind_is_published_by_the_public_api(conn):
+    """The surfaces match on ``kind``, so the parked-past-due card must NAME it.
+
+    Driven through ``compute_task_diagnostics`` rather than read off a kinds
+    list: the old ``DIAGNOSTIC_KINDS`` name now exists only in a plugin-compat
+    block (revert-scheduled), and nothing in-tree may reach it.
+    """
+    tid = _task(conn)
+    kb.schedule_task(conn, tid, reason="armed", due_at=int(time.time()) - 7200)
+
+    diags = kd.compute_task_diagnostics(
+        _get(conn, tid), kb.list_events(conn, tid), kb.list_runs(conn, tid),
+        config={"due_waker_last_tick": int(time.time())})
+
+    assert "overdue_scheduled" in {d.kind for d in diags}
     assert kd.DEFAULT_CONFIG["due_grace_seconds"] > 0
     assert kd.DEFAULT_CONFIG["due_stale_seconds"] > kd.DEFAULT_CONFIG["due_grace_seconds"]
 
