@@ -1,12 +1,13 @@
 """Shared slash command helpers for skills (CLI and gateway both invoke /skill-name)."""
 
+import difflib
 import json
 import logging
 import os
 import re
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from hermes_constants import display_hermes_home
 from agent.prompt_cache_boundary import register_stable_prefix
@@ -20,10 +21,7 @@ _skill_commands_home: Optional[str] = None
 # Guards the (map, platform-tag, home-tag) triple so publication and the
 # freshness lookup always see a consistent snapshot. Scanning stays outside.
 _publish_lock = threading.Lock()
-# ``\w`` keeps Unicode letters (CJK, Cyrillic) so a ``name: 小说拆条`` skill registers ``/小说拆条``
-# instead of slugging to "" and being dropped (#12351); Telegram's ``[a-z0-9_]`` menu limit is
-# applied by hermes_cli/commands_platforms.py, not here.
-_SKILL_INVALID_CHARS = re.compile(r"[^\w-]")
+_SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 
 # Skill-scaffolding markers. A /skill (or /bundle) turn is expanded into a
@@ -178,6 +176,60 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         except Exception:
             skill_dir = None
     return loaded_skill, skill_dir, str(loaded_skill.get("name") or normalized)
+
+
+def preload_skill_problems(skill_identifiers: Iterable[str]) -> list[dict[str, str]]:
+    """Identifiers a ``--skills`` preload would abort on, with the loader's reason.
+
+    ``build_preloaded_skills_prompt`` resolves each identifier through
+    ``_load_skill_payload`` and treats a falsy result as *missing*; a worker launched
+    with such a name exits on ``Unknown skill(s)`` before the agent starts. Callers
+    that must refuse a name earlier — kanban card creation, where the card would
+    otherwise burn an attempt and auto-block with the reason buried in the worker log
+    — ask the worker's own question here: same loader, same profile scope, bodies not
+    rendered. Each problem carries the loader's error text and the closest registered
+    names so the refusal tells the caller what to write instead.
+
+    Returns ``[]`` when every identifier loads (and for blank/duplicate entries).
+    """
+    problems: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in skill_identifiers or ():
+        identifier = str(raw or "").strip()
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+        if _load_skill_payload(identifier):
+            continue
+        failure = _skill_view_failure(identifier)
+        problems.append({
+            "identifier": identifier,
+            "error": str(failure.get("error") or f"skill {identifier!r} could not be loaded"),
+            "closest": _closest_skill_names(identifier, failure.get("available_skills")),
+        })
+    return problems
+
+
+def _skill_view_failure(identifier: str) -> dict[str, Any]:
+    """The failing ``skill_view`` payload for *identifier* (``{}`` when unreadable).
+
+    Only reached for identifiers ``_load_skill_payload`` already rejected, so the extra
+    lookup costs nothing on the happy path — it recovers the loader's error text and the
+    registry that name was judged against, for the caller's refusal message.
+    """
+    try:
+        from tools.skills_tool import skill_view
+        from agent.skill_utils import normalize_skill_lookup_name
+        payload = json.loads(skill_view(normalize_skill_lookup_name(identifier), preprocess=False))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _closest_skill_names(identifier: str, available: Any) -> str:
+    """Comma-joined near-miss suggestions drawn from the registry the name failed against."""
+    names = [str(name) for name in (available or ()) if name]
+    return ", ".join(difflib.get_close_matches(identifier, names, n=3, cutoff=0.6))
 
 
 def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None:
