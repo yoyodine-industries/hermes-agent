@@ -19,7 +19,10 @@ def test_script_termination_reaps_descendants(tmp_path, monkeypatch, trigger, to
     from cron import scheduler, scheduler_script
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr(scheduler_script, "_get_script_timeout", lambda: 3 if trigger == "timeout" else 60)
+    # The seam now takes the job record (per-job ``script_timeout_seconds``); this test pins the
+    # termination path, not resolution, so absorb the argument and keep its own budget.
+    monkeypatch.setattr(scheduler_script, "_get_script_timeout",
+                        lambda *_args, **_kwargs: 3 if trigger == "timeout" else 60)
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     ready = tmp_path / "child.pid"

@@ -89,6 +89,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Catch-up window override in minutes (0-1440) for a cron schedule. "
             "Default: half the period, clamped to 2-120 minutes. 0 = never catch up "
             "(a missed occurrence is skipped, not run late).")
+    # Declared as a bare string (no type=int) so an empty value can CLEAR the override on edit,
+    # mirroring --reasoning-effort; the numeric grammar is validated before storing.
+    cron_create.add_argument("--script-timeout-seconds", dest="script_timeout_seconds",
+        help="Per-job budget in seconds for this job's --script, overriding "
+            "cron.script_timeout_seconds for THIS job only (every other script "
+            "job in the profile keeps the global cap). Must be a positive "
+            "integer; the script is killed and reported as timed out past it. "
+            "Omit to follow the global/env chain.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -165,6 +173,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--grace-minutes", dest="grace_minutes",
         help="Catch-up window override in minutes (0-1440). 0 = never catch up. "
             "Pass empty string to restore the computed window.")
+    cron_edit.add_argument("--script-timeout-seconds", dest="script_timeout_seconds",
+        help="Per-job budget in seconds for this job's script, overriding "
+            "cron.script_timeout_seconds for THIS job only. Must be a positive "
+            "integer. Pass empty string to clear the override and follow the "
+            "global/env chain again.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
