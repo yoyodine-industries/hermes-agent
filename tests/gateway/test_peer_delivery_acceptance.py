@@ -428,3 +428,84 @@ def test_drain_invariant_n_keys_free_lock_n_turns_exactly_once(adapter, home):
     assert replay["replayed"] is True
     assert len(adapter.calls) == before, "a replay never starts a second turn"
     assert q.queue_depth(home, profile) == 0
+
+
+# ── holder identity: reap -> reoffer -> re-claim leaves TWO live holders ───────
+
+def _two_live_holders(home, n=3) -> tuple[dict, dict]:
+    """Drive the real queue into the measured two-live-holder window.
+
+    admit -> claim (attempt 1) -> the turn outlives its lease so the sweep retires
+    it (`ambiguous`/`lease_lapsed`) -> the one permitted recovery replay rewinds it
+    -> a later drain turn re-claims it (attempt 2) while the original still runs.
+    Returns ``(original_record, reclaimer_record)`` -- the stale claim's snapshot and
+    the current owner's live claim.
+    """
+    delivery_id = "%032x" % n
+    q.admit(home, sender_profile="alpha", target_profile="bravo",
+            target_session_id="sess-1", idempotency_key=f"peer-{delivery_id}",
+            fingerprint=f"fp-{delivery_id}", delivery_id=delivery_id,
+            message="two holders")
+    original = q.claim_next(home, target_profile="bravo", lease_ok=True)
+    stale = q.read_record(home, delivery_id)
+    assert stale is not None
+    stale["claimed_at"] = time.time_ns() - int(2 * 3600 * 1e9)
+    (q.delivery_root(home) / q.CLAIMED_DIR / f"{delivery_id}.json").write_text(
+        json.dumps(stale))
+    assert q.sweep_delivery_queue(home) == 1
+    assert q.reoffer_ambiguous(home, delivery_id)["status"] == q.STATUS_QUEUED
+    reclaimer = q.claim_next(home, target_profile="bravo", lease_ok=True)
+    assert original is not None and reclaimer is not None
+    assert (original["attempts"], reclaimer["attempts"]) == (1, 2)
+    assert q.read_record(home, delivery_id)["status"] == q.STATUS_RUNNING
+    return original, reclaimer
+
+
+def test_reclaimed_delivery_one_writer_and_the_projection_follows_the_winner(
+        adapter, home):
+    """The re-claimer delivers; the original holder's late failure is a no-op.
+
+    Before holder identity the original's ``settle`` raised ``ValueError`` (its
+    ``failed`` against the winner's ``delivered``) and its ``requeue_unstarted``
+    raised ``FileNotFoundError``, and either one aborted ``drain_once``'s remaining
+    profiles for that tick. Now the late call is a logged no-op and the projected
+    row carries the outcome that actually won.
+    """
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    original, reclaimer = _two_live_holders(home)
+    delivery_id = reclaimer["delivery_id"]
+
+    # (a) the current owner finishes and delivers: its outcome is projected.
+    settled, reply = asyncio.run(drain.run_record(adapter, home, reclaimer))
+    assert (settled["status"], reply) == (q.STATUS_DELIVERED, "pong")
+    row = adapter._run_statuses[delivery_id]
+    assert (row["delivery_status"], row["result"], row["reply"]) == (
+        q.STATUS_DELIVERED, q.RESULT_DELIVERED, "pong")
+
+    # (b) the original holder's turn then fails: nothing escapes run_record, and the
+    # row still carries the winner's outcome -- never the late caller's failure.
+    async def _boom(conversation_history=None, **kwargs):
+        raise RuntimeError("late turn died")
+
+    adapter._run_agent = _boom
+    late, late_reply = asyncio.run(drain.run_record(adapter, home, original))
+    assert late_reply is None
+    assert late["status"] == q.STATUS_DELIVERED
+    row = adapter._run_statuses[delivery_id]
+    assert (row["delivery_status"], row["result"], row["reply"]) == (
+        q.STATUS_DELIVERED, q.RESULT_DELIVERED, "pong")
+    assert row["attempts"] == 2, "the late holder must not rewrite the winner's row"
+
+    # The on-disk record: one settled delivery, one entry per attempt, each entry
+    # carrying its own turn's outcome.
+    stored = q.read_record(home, delivery_id)
+    assert (stored["status"], stored["reply"], stored["error"]) == (
+        q.STATUS_DELIVERED, "pong", None)
+    assert [entry["attempt"] for entry in stored["attempts_log"]] == [1, 2]
+    assert (stored["attempts_log"][0]["status"],
+            stored["attempts_log"][0]["reason"]) == (
+        q.STATUS_AMBIGUOUS, q.REASON_LEASE_LAPSED)
+    assert (stored["attempts_log"][1]["status"],
+            stored["attempts_log"][1]["reason"]) == (q.STATUS_DELIVERED, None)
+    assert _delivery_records(home) == [(q.SETTLED_DIR, f"{delivery_id}.json")]

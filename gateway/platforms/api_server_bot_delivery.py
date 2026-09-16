@@ -108,9 +108,18 @@ async def run_record(
     A contended session lease is never surfaced to a sender and never charged an
     attempt (§2.7 step 2): the record goes back to ``queued`` for the next free
     slot (``status: queued``, so the caller keeps its receipt).
+
+    Every terminal call carries this turn's holder identity (``holder_attempt``,
+    the attempt number its own claim stamped). After a reap -> reoffer -> re-claim
+    two turns can hold one delivery, and only the current owner may write the
+    outcome: a non-owner's call is a logged no-op, so nothing raises out of this
+    function and ``drain_once``'s remaining profiles still get their tick. The
+    status projection is then read off the record that actually won, never off the
+    caller's intent.
     """
     delivery_id = str(record.get("delivery_id"))
     session_id = str(record.get("target_session_id") or "")
+    holder_attempt = int(record.get("attempts") or 0)
     if ctx is None:
         kwargs = delivery_run_kwargs(record)
     else:
@@ -135,9 +144,12 @@ async def run_record(
             reply=None,
             error=error,
             reason=_failure_reason(error),
+            holder_attempt=holder_attempt,
         )
         adapter._bot_send_record_status(
-            delivery_id, settled, result=delivery_queue.RESULT_FAILED, error=error
+            delivery_id,
+            settled,
+            result=delivery_queue._result_for_status(str(settled.get("status") or "")),
         )
         log_delivery_event("turn_failed", settled, seconds=round(time.monotonic() - started, 3))
         return settled, None
@@ -148,19 +160,30 @@ async def run_record(
         and "lease" in str(result.get("error") or "").lower()
     )
     if lease_timed_out:
-        requeued = delivery_queue.requeue_unstarted(home, delivery_id)
-        adapter._bot_send_record_status(
-            delivery_id, requeued, result=delivery_queue.RESULT_RECEIPT
+        requeued = delivery_queue.requeue_unstarted(
+            home, delivery_id, holder_attempt=holder_attempt
         )
+        # A non-owner whose lease probe timed out must not emit a receipt over a
+        # terminal winner.
+        if requeued.get("status") not in delivery_queue.TERMINAL_STATUSES:
+            adapter._bot_send_record_status(
+                delivery_id, requeued, result=delivery_queue.RESULT_RECEIPT
+            )
         log_delivery_event("turn_lease_contended", requeued, waited_seconds=waited)
         return requeued, None
 
     reply = _finalize_reply(result)
     settled = delivery_queue.settle(
-        home, delivery_id, status=delivery_queue.STATUS_DELIVERED, reply=reply
+        home,
+        delivery_id,
+        status=delivery_queue.STATUS_DELIVERED,
+        reply=reply,
+        holder_attempt=holder_attempt,
     )
     adapter._bot_send_record_status(
-        delivery_id, settled, result=delivery_queue.RESULT_DELIVERED, reply=reply
+        delivery_id,
+        settled,
+        result=delivery_queue._result_for_status(str(settled.get("status") or "")),
     )
     log_delivery_event("turn_end", settled, seconds=round(time.monotonic() - started, 3))
     return settled, reply

@@ -817,7 +817,11 @@ def requeue(
 
 
 def requeue_unstarted(
-    home: str | os.PathLike[str], delivery_id: str, *, now_ns: int | None = None
+    home: str | os.PathLike[str],
+    delivery_id: str,
+    *,
+    holder_attempt: int | None = None,
+    now_ns: int | None = None,
 ) -> dict[str, Any]:
     """Return a claimed record to ``queued`` without charging the attempt.
 
@@ -831,6 +835,12 @@ def requeue_unstarted(
     retirement is rolled back and the record re-queued. The same tolerance holds
     after the one permitted reoffer has already rewound the record back to
     ``queued`` -- the uncharged attempt is still rolled back there.
+
+    ``holder_attempt`` is the calling turn's identity: ``attempts`` exactly as
+    its own ``claim_next`` returned it. After reap -> reoffer -> re-claim a
+    non-owner must neither raise nor roll back the current owner's open claim:
+    both cases return the record unchanged and write a ``requeue_conflict`` line.
+    ``holder_attempt=None`` preserves the previous behaviour exactly.
     """
     key_id = validate_delivery_id(delivery_id)
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
@@ -848,6 +858,32 @@ def requeue_unstarted(
         record = _read(claimed_path)
         settled = _read(settled_path)
         lease_lapsed = _retired_lease_lapsed(settled)
+        if (
+            holder_attempt is not None
+            and settled is not None
+            and not lease_lapsed
+            and int(settled.get("attempts", 0)) != holder_attempt
+        ):
+            # Already settled by a DIFFERENT holder: logged no-op instead of the
+            # FileNotFoundError a non-owner used to get.
+            _log(
+                "requeue_conflict",
+                settled,
+                holder_attempt=holder_attempt,
+                winner_attempt=settled.get("attempts"),
+            )
+            return dict(settled)
+        if record is not None and holder_attempt is not None:
+            open_entry = _open_attempt(record)
+            if open_entry is not None and int(open_entry.get("attempt", 0)) != holder_attempt:
+                # Do NOT roll back another holder's open attempt.
+                _log(
+                    "requeue_conflict",
+                    record,
+                    holder_attempt=holder_attempt,
+                    owner_attempt=open_entry.get("attempt"),
+                )
+                return dict(record)
         source: str
         if record is not None:
             source = CLAIMED_DIR
@@ -898,6 +934,7 @@ def settle(
     error: str | None = "",
     reason: str | None = "",
     status_detail: str | None = None,
+    holder_attempt: int | None = None,
     now_ns: int | None = None,
 ) -> dict[str, Any]:
     """Move a claimed record to ``settled/`` with a terminal status.
@@ -909,6 +946,16 @@ def settle(
     settling for real, so the turn's true terminal outcome wins over the sweep's
     premature close and the pending replay is retired. Any other already-settled
     status remains a hard conflict.
+
+    ``holder_attempt`` is the calling turn's identity: ``attempts`` exactly as
+    its own ``claim_next`` returned it. After reap -> reoffer -> re-claim one
+    delivery has two live holders, and only the holder that owns the currently
+    open attempt may write the outcome. A non-owner's call is a logged no-op --
+    the record comes back unchanged, a ``settle_conflict`` line is written, and
+    it never closes an attempt entry it does not own. ``ValueError`` stays
+    reserved for a genuine double-settle by the SAME holder with a conflicting
+    status. ``holder_attempt=None`` (a caller with no claim identity) preserves
+    the previous behaviour exactly.
     """
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"status must be terminal, got {status!r}")
@@ -919,10 +966,41 @@ def settle(
         lease_lapsed = _retired_lease_lapsed(record)
         rewound = _rewound_lease_lapsed(record)
         if record is not None and where == SETTLED_DIR and not lease_lapsed:
+            if (
+                holder_attempt is not None
+                and int(record.get("attempts", 0)) != holder_attempt
+            ):
+                # Already settled by a DIFFERENT holder: logged no-op, never a
+                # raise -- the winner's outcome stands and this caller learns it
+                # from the returned record.
+                _log(
+                    "settle_conflict",
+                    record,
+                    holder_attempt=holder_attempt,
+                    winner_attempt=record.get("attempts"),
+                )
+                return dict(record)
             if record.get("status") != status:
                 raise ValueError(
                     f"{key_id} already settled as {record.get('status')!r}"
                 )
+            return dict(record)
+        open_entry = _open_attempt(record) if record is not None else None
+        if (
+            holder_attempt is not None
+            and record is not None
+            and open_entry is not None
+            and int(open_entry.get("attempt", 0)) != holder_attempt
+        ):
+            # A still-running claim owned by a DIFFERENT holder: no-op, and in
+            # particular do NOT close their open attempt entry (that is how
+            # attempt 2's outcome used to get written by attempt 1's turn).
+            _log(
+                "settle_conflict",
+                record,
+                holder_attempt=holder_attempt,
+                owner_attempt=open_entry.get("attempt"),
+            )
             return dict(record)
         if record is None or (where == QUEUE_DIR and not rewound):
             raise FileNotFoundError(f"no claimed record for {key_id}")

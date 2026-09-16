@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -802,3 +803,215 @@ def test_settle_after_lease_lapsed_reoffer_and_reclaim_lands_delivered(tmp_path)
     assert not _claimed_path(tmp_path, 1).exists()
     assert q.build_envelope(settled)["result"] == "delivered"
     assert q.reoffer_ambiguous(tmp_path, _did(1)) is None
+
+
+# ── holder identity: after reap -> reoffer -> re-claim, one holder one writer ───
+
+def _two_holders(tmp_path, n=1) -> tuple[dict, dict]:
+    """Drive admit -> claim -> sweep reap -> reoffer -> re-claim; return both claims.
+
+    Reproduces the measured two-live-holder window: the original turn (attempt 1)
+    outlives its lease and the sweep retires it, the one permitted recovery replay
+    rewinds the record, and a later drain turn (attempt 2) re-claims it while the
+    original is still running.
+    """
+    _admit(tmp_path, n)
+    original = q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    claimed = q.read_record(tmp_path, _did(n))
+    claimed["claimed_at"] = time.time_ns() - int(2 * 3600 * 1e9)
+    _claimed_path(tmp_path, n).write_text(json.dumps(claimed))
+    assert q.sweep_delivery_queue(tmp_path) == 1
+    assert q.read_record(tmp_path, _did(n))["status"] == "ambiguous"
+    assert q.reoffer_ambiguous(tmp_path, _did(n))["status"] == "queued"
+    reclaimer = q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    assert q.read_record(tmp_path, _did(n))["status"] == "running"
+    assert original is not None and reclaimer is not None
+    return original, reclaimer
+
+
+@pytest.mark.parametrize("reclaimer_first", [True, False])
+@pytest.mark.parametrize("loser_status", ["delivered", "failed"])
+def test_only_the_current_owner_writes_the_outcome(
+    tmp_path, caplog, reclaimer_first, loser_status
+):
+    """Both orderings x agreeing/disagreeing statuses: the owner wins, nothing raises."""
+    original, reclaimer = _two_holders(tmp_path)
+    assert (original["attempts"], reclaimer["attempts"]) == (1, 2)
+    owner_attempt, original_attempt = int(reclaimer["attempts"]), int(original["attempts"])
+
+    def _owner_settles():
+        return q.settle(
+            tmp_path, _did(1), status="delivered", reply="pong",
+            holder_attempt=owner_attempt,
+        )
+
+    def _non_owner_settles():
+        return q.settle(
+            tmp_path, _did(1), status=loser_status, reply="stale", error="stale",
+            holder_attempt=original_attempt,
+        )
+
+    with caplog.at_level(logging.INFO, logger="tools.bot_delivery_queue"):
+        if reclaimer_first:
+            owner_call, loser_call = _owner_settles(), _non_owner_settles()
+        else:
+            loser_call, owner_call = _non_owner_settles(), _owner_settles()
+
+    # The non-owner's call is a logged no-op that hands back the CURRENT record:
+    # already settled by the owner if the owner went first, still running under the
+    # owner's own open attempt otherwise.
+    if reclaimer_first:
+        assert loser_call["status"] == "delivered"
+        assert loser_call["reply"] == "pong"
+    else:
+        assert loser_call["status"] == "running"
+        assert q._open_attempt(loser_call)["attempt"] == 2
+        assert q._open_attempt(loser_call)["ended_at"] is None
+    assert "settle_conflict" in caplog.text
+    assert f"holder_attempt={original_attempt}" in caplog.text
+
+    # The owner's outcome and reply survive in both orderings -- the loser neither
+    # raised nor wrote anything (its "stale" reply/error are nowhere).
+    final = q.read_record(tmp_path, _did(1))
+    assert final == owner_call
+    assert final["status"] == "delivered"
+    assert final["reply"] == "pong"
+    assert final["error"] in (None, "")
+    assert final["reason"] is None
+    assert final["attempts"] == 2
+    assert _settled_path(tmp_path, 1).exists()
+    assert not _claimed_path(tmp_path, 1).exists()
+    assert not _queued_path(tmp_path, 1).exists()
+
+    # Exactly one entry per attempt, each carrying its own turn's outcome.
+    log = final["attempts_log"]
+    assert [entry["attempt"] for entry in log] == [1, 2]
+    assert (log[0]["status"], log[0]["reason"]) == ("ambiguous", "lease_lapsed")
+    assert log[0]["ended_at"] is not None
+    assert (log[1]["status"], log[1]["reason"]) == ("delivered", None)
+    assert log[1]["ended_at"] is not None
+    assert q.build_envelope(final)["result"] == "delivered"
+
+
+def test_non_owner_requeue_unstarted_on_a_settled_delivery_is_a_noop(tmp_path, caplog):
+    """Already settled by another holder: the loser gets the record, never an error."""
+    original, reclaimer = _two_holders(tmp_path)
+    q.settle(
+        tmp_path, _did(1), status="delivered", reply="pong",
+        holder_attempt=int(reclaimer["attempts"]),
+    )
+
+    with caplog.at_level(logging.INFO, logger="tools.bot_delivery_queue"):
+        back = q.requeue_unstarted(
+            tmp_path, _did(1), holder_attempt=int(original["attempts"])
+        )
+
+    assert back["status"] == "delivered"
+    assert back["attempts"] == 2
+    assert back["reoffer_count"] == 1
+    assert back["reply"] == "pong"
+    assert "requeue_conflict" in caplog.text
+    assert f"holder_attempt={original['attempts']}" in caplog.text
+    assert _settled_path(tmp_path, 1).exists()
+    assert not _queued_path(tmp_path, 1).exists()
+
+
+def test_non_owner_requeue_unstarted_leaves_the_owner_open_attempt(tmp_path, caplog):
+    """A non-owner must not roll back the current owner's open claim."""
+    original, reclaimer = _two_holders(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="tools.bot_delivery_queue"):
+        back = q.requeue_unstarted(
+            tmp_path, _did(1), holder_attempt=int(original["attempts"])
+        )
+
+    assert back["status"] == "running"
+    assert back["attempts"] == 2
+    assert back["reoffer_count"] == 1
+    assert "requeue_conflict" in caplog.text
+    assert _claimed_path(tmp_path, 1).exists()
+    assert not _queued_path(tmp_path, 1).exists()
+
+    # The owner's claim is intact and can still land its own outcome afterwards.
+    held = q.read_record(tmp_path, _did(1))
+    open_entry = q._open_attempt(held)
+    assert open_entry["attempt"] == int(reclaimer["attempts"])
+    assert open_entry["ended_at"] is None
+
+    settled = q.settle(
+        tmp_path, _did(1), status="delivered", reply="pong",
+        holder_attempt=int(reclaimer["attempts"]),
+    )
+    assert settled["status"] == "delivered"
+    assert [entry["status"] for entry in settled["attempts_log"]] == [
+        "ambiguous",
+        "delivered",
+    ]
+
+
+def test_owner_requeue_unstarted_after_reclaim_rolls_back_only_its_own_attempt(tmp_path):
+    """The current owner's contention rollback leaves the retired attempt alone."""
+    _original, reclaimer = _two_holders(tmp_path)
+
+    back = q.requeue_unstarted(
+        tmp_path, _did(1), holder_attempt=int(reclaimer["attempts"])
+    )
+    assert back["status"] == "queued"
+    assert back["attempts"] == 1
+    assert back["claimed_at"] is None
+    assert back["reason"] is None
+    assert back["reoffer_count"] == 2
+    assert back["status_detail"] == q.STATUS_DETAIL_LEASE_CONTENDED
+    assert [entry["attempt"] for entry in back["attempts_log"]] == [1]
+    assert (
+        back["attempts_log"][0]["status"],
+        back["attempts_log"][0]["reason"],
+    ) == ("ambiguous", "lease_lapsed")
+    assert _queued_path(tmp_path, 1).exists()
+
+
+def test_holder_identity_is_a_no_op_for_a_sole_holder_settle(tmp_path):
+    """Single-holder delivery settles exactly as before, identity or not."""
+    _admit(tmp_path, 1)
+    claimed = q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    assert claimed["attempts"] == 1
+
+    settled = q.settle(
+        tmp_path, _did(1), status="delivered", reply="pong", holder_attempt=1
+    )
+    assert (settled["status"], settled["reply"]) == ("delivered", "pong")
+    entry = settled["attempts_log"][0]
+    assert (entry["status"], entry["reason"]) == ("delivered", None)
+    assert entry["ended_at"] is not None
+
+    # The same holder replaying the same status is still the idempotent return ...
+    assert q.settle(tmp_path, _did(1), status="delivered", holder_attempt=1) == settled
+    # ... and ValueError stays reserved for a conflicting double-settle, whether the
+    # identity is carried or omitted (omitted is exactly today's behaviour).
+    with pytest.raises(ValueError):
+        q.settle(tmp_path, _did(1), status="failed", holder_attempt=1)
+    with pytest.raises(ValueError):
+        q.settle(tmp_path, _did(1), status="failed")
+
+
+def test_holder_identity_is_a_no_op_for_a_sole_holder_requeue(tmp_path):
+    """A sole holder's requeue_unstarted still rolls the uncharged attempt back."""
+    _admit(tmp_path, 1)
+    claimed = q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    assert claimed["attempts"] == 1
+
+    back = q.requeue_unstarted(tmp_path, _did(1), holder_attempt=1)
+    assert back["status"] == "queued"
+    assert back["attempts"] == 0
+    assert back["attempts_log"] == []
+    assert back["reoffer_count"] == 1
+    assert back["claimed_at"] is None
+    assert back["status_detail"] == q.STATUS_DETAIL_LEASE_CONTENDED
+    assert _queued_path(tmp_path, 1).exists()
+    assert not _claimed_path(tmp_path, 1).exists()
+
+    # The next claim charges its own attempt, and the omitted-identity call rolls
+    # that claim back too -- unchanged.
+    again = q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    assert again["attempts"] == 1
+    assert q.requeue_unstarted(tmp_path, _did(1))["attempts"] == 0
