@@ -703,3 +703,102 @@ def test_sweep_slot_held_exemption_protects_queued_not_lapsed_claims(tmp_path):
     assert q.sweep_delivery_queue(tmp_path, slot_held_fn=_held) == 1
     assert q.read_record(tmp_path, _did(1))["status"] == "queued"
     assert q.read_record(tmp_path, _did(2))["status"] == "ambiguous"
+
+
+def test_settle_after_lease_lapsed_reoffer_lands_delivered(tmp_path):
+    """The one permitted replay landing first must not lose the live turn's outcome."""
+    _admit(tmp_path, 1)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+
+    # The turn runs past its lease: the sweep retires the claim, then the sender's
+    # one permitted recovery replay rewinds it back to queued (no duplicate DM yet).
+    claimed = q.read_record(tmp_path, _did(1))
+    claimed["claimed_at"] = time.time_ns() - int(2 * 3600 * 1e9)
+    _claimed_path(tmp_path, 1).write_text(json.dumps(claimed))
+    assert q.sweep_delivery_queue(tmp_path) == 1
+    assert q.read_record(tmp_path, _did(1))["status"] == "ambiguous"
+
+    reoffered = q.reoffer_ambiguous(tmp_path, _did(1))
+    assert reoffered["status"] == "queued"
+    assert reoffered["reoffer_count"] == 1
+    assert reoffered["reason"] is None
+    assert _queued_path(tmp_path, 1).exists()
+    assert not _settled_path(tmp_path, 1).exists()
+
+    # The still-alive turn settles for real: no exception, the true outcome lands,
+    # and the pending replay is retired (the delivered record is never re-runnable).
+    settled = q.settle(tmp_path, _did(1), status="delivered", reply="pong")
+    assert settled["status"] == "delivered"
+    assert settled["reply"] == "pong"
+    assert settled["reason"] is None
+    assert settled["claimed_at"] is None
+    assert settled["attempts_log"][-1]["status"] == "delivered"
+    assert settled["attempts_log"][-1]["reason"] is None
+    assert _settled_path(tmp_path, 1).exists()
+    assert not _queued_path(tmp_path, 1).exists()
+    assert not _claimed_path(tmp_path, 1).exists()
+
+    env = q.build_envelope(settled)
+    assert env["result"] == "delivered"
+    assert env["status"] == "delivered"
+
+    # A delivered record is not re-offerable again: the replay is retired.
+    assert q.reoffer_ambiguous(tmp_path, _did(1)) is None
+
+
+def test_requeue_unstarted_after_lease_lapsed_reoffer_rolls_back(tmp_path):
+    """A contended turn whose reoffered record is re-queued rolls back cleanly."""
+    _admit(tmp_path, 1)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    claimed = q.read_record(tmp_path, _did(1))
+    claimed["claimed_at"] = time.time_ns() - int(2 * 3600 * 1e9)
+    _claimed_path(tmp_path, 1).write_text(json.dumps(claimed))
+    q.sweep_delivery_queue(tmp_path)
+    q.reoffer_ambiguous(tmp_path, _did(1))
+    assert q.read_record(tmp_path, _did(1))["status"] == "queued"
+
+    # No exception; the uncharged attempt is rolled back even though the record
+    # was already rewound to queued by the one permitted replay.
+    back = q.requeue_unstarted(tmp_path, _did(1))
+    assert back["status"] == "queued"
+    assert back["attempts"] == 0
+    assert back["attempts_log"] == []
+    assert back["reoffer_count"] == 2
+    assert back["reason"] is None
+    assert back["claimed_at"] is None
+    assert back["status_detail"] == q.STATUS_DETAIL_LEASE_CONTENDED
+    assert _queued_path(tmp_path, 1).exists()
+    assert not _settled_path(tmp_path, 1).exists()
+    assert not _claimed_path(tmp_path, 1).exists()
+
+    # A second call is a no-op on the already-rolled-back queued record.
+    again = q.requeue_unstarted(tmp_path, _did(1))
+    assert again["attempts"] == 0
+    assert again["reoffer_count"] == 2
+
+
+def test_settle_after_lease_lapsed_reoffer_and_reclaim_lands_delivered(tmp_path):
+    """A reoffered record re-claimed by a later turn still tolerates the live turn."""
+    _admit(tmp_path, 1)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    claimed = q.read_record(tmp_path, _did(1))
+    claimed["claimed_at"] = time.time_ns() - int(2 * 3600 * 1e9)
+    _claimed_path(tmp_path, 1).write_text(json.dumps(claimed))
+    q.sweep_delivery_queue(tmp_path)
+    q.reoffer_ambiguous(tmp_path, _did(1))
+
+    # A later drain turn re-claims the reoffered record before the original
+    # (still-alive) turn finishes and settles.
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    assert q.read_record(tmp_path, _did(1))["status"] == "running"
+
+    # No exception; the live turn's true outcome still wins and the replay retires.
+    settled = q.settle(tmp_path, _did(1), status="delivered", reply="pong")
+    assert settled["status"] == "delivered"
+    assert settled["reply"] == "pong"
+    assert settled["attempts"] == 2
+    assert settled["attempts_log"][-1]["status"] == "delivered"
+    assert _settled_path(tmp_path, 1).exists()
+    assert not _claimed_path(tmp_path, 1).exists()
+    assert q.build_envelope(settled)["result"] == "delivered"
+    assert q.reoffer_ambiguous(tmp_path, _did(1)) is None

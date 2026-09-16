@@ -496,11 +496,21 @@ def _list(root: Path, sub: str) -> list[dict[str, Any]]:
 
 
 def _find(root: Path, delivery_id: str) -> dict[str, Any] | None:
+    record, _where = _locate(root, delivery_id)
+    return record
+
+
+def _locate(root: Path, delivery_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Locate a delivery as ``(record, subdir)``, or ``(None, None)`` when absent.
+
+    A record lives in exactly one of ``queue/``, ``claimed/``, ``settled/``;
+    ``subdir`` is one of ``QUEUE_DIR``, ``CLAIMED_DIR``, ``SETTLED_DIR``.
+    """
     for sub in (QUEUE_DIR, CLAIMED_DIR, SETTLED_DIR):
         record = _read(root / sub / f"{delivery_id}.json")
         if record is not None:
-            return record
-    return None
+            return record, sub
+    return None, None
 
 
 def _high_water(root: Path) -> int:
@@ -601,6 +611,23 @@ def _retired_lease_lapsed(record: dict[str, Any] | None) -> bool:
         record is not None
         and record.get("status") == STATUS_AMBIGUOUS
         and record.get("reason") == REASON_LEASE_LAPSED
+    )
+
+
+def _rewound_lease_lapsed(record: dict[str, Any] | None) -> bool:
+    """True when ``record`` is a lease_lapsed claim the one reoffer has re-queued.
+
+    ``reoffer_ambiguous`` moves the sweep's settled ``ambiguous`` file back to
+    ``queued`` and clears ``reason``, but it deliberately leaves the sweep's
+    bookkeeping in the closed ``attempts_log`` entry, so the retirement stays
+    visible even though the record is ``queued`` again. A still-alive turn
+    settling or requeueing it must be allowed to land its true outcome.
+    """
+    if record is None or record.get("status") != STATUS_QUEUED:
+        return False
+    return any(
+        entry.get("reason") == REASON_LEASE_LAPSED
+        for entry in (record.get("attempts_log") or [])
     )
 
 
@@ -801,31 +828,44 @@ def requeue_unstarted(
 
     A claim this lane's own sweep retired as ``lease_lapsed`` (ambiguous) is
     tolerated the same way: the turn never actually started, so the premature
-    retirement is rolled back and the record re-queued.
+    retirement is rolled back and the record re-queued. The same tolerance holds
+    after the one permitted reoffer has already rewound the record back to
+    ``queued`` -- the uncharged attempt is still rolled back there.
     """
     key_id = validate_delivery_id(delivery_id)
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     with _locked(home) as root:
         queued_path = root / QUEUE_DIR / f"{key_id}.json"
-        existing = _read(queued_path)
-        if existing is not None:
-            return dict(existing)
-
         claimed_path = root / CLAIMED_DIR / f"{key_id}.json"
         settled_path = root / SETTLED_DIR / f"{key_id}.json"
+
+        existing = _read(queued_path)
+        rewound = _rewound_lease_lapsed(existing)
+        # Already queued and already rolled back: idempotent no-op.
+        if existing is not None and not rewound:
+            return dict(existing)
+
         record = _read(claimed_path)
         settled = _read(settled_path)
         lease_lapsed = _retired_lease_lapsed(settled)
-        if record is None:
-            if not lease_lapsed:
-                raise FileNotFoundError(f"no claimed record for {key_id}")
+        source: str
+        if record is not None:
+            source = CLAIMED_DIR
+        elif lease_lapsed:
             assert settled is not None  # _retired_lease_lapsed guarantees a record
             record = settled
+            source = SETTLED_DIR
+        elif rewound:
+            assert existing is not None  # _rewound_lease_lapsed guarantees a record
+            record = existing
+            source = QUEUE_DIR
+        else:
+            raise FileNotFoundError(f"no claimed record for {key_id}")
 
         updated = dict(record)
         updated["attempts"] = max(0, int(updated.get("attempts", 0)) - 1)
         log = list(updated.get("attempts_log") or [])
-        if lease_lapsed:
+        if lease_lapsed or rewound:
             # The sweep closed the unstarted attempt as lease_lapsed; roll it
             # back too, so contention never consumes the attempt.
             if log and log[-1].get("reason") == REASON_LEASE_LAPSED:
@@ -840,12 +880,9 @@ def requeue_unstarted(
         updated["status_detail"] = STATUS_DETAIL_LEASE_CONTENDED
         updated["updated_at"] = now_ns
         updated["sequence"] = int(updated.get("sequence", 0))
-        if lease_lapsed:
-            os.replace(settled_path, queued_path)
-            _fsync_dir(root / SETTLED_DIR)
-        else:
-            os.replace(claimed_path, queued_path)
-            _fsync_dir(root / CLAIMED_DIR)
+        if source != QUEUE_DIR:
+            os.replace(root / source / f"{key_id}.json", queued_path)
+            _fsync_dir(root / source)
         updated["queue_position"] = _queue_position(root, updated) or 1
         _write(queued_path, updated)
         _log("requeued", updated, reoffer_count=updated["reoffer_count"])
@@ -865,41 +902,38 @@ def settle(
 ) -> dict[str, Any]:
     """Move a claimed record to ``settled/`` with a terminal status.
 
-    A claim this lane's own sweep retired as ``lease_lapsed`` (ambiguous) is
-    tolerated: the claim's holder was still alive and is now settling for real,
-    so the turn's true terminal outcome wins over the sweep's premature close.
-    Any other already-settled status remains a hard conflict.
+    A claim this lane's own sweep retired as ``lease_lapsed`` is tolerated in
+    both of its downstream shapes: the settled ``ambiguous`` file (reap, no
+    reoffer yet) and the re-queued record (the one permitted reoffer has since
+    rewound it). In both cases the claim's holder was still alive and is now
+    settling for real, so the turn's true terminal outcome wins over the sweep's
+    premature close and the pending replay is retired. Any other already-settled
+    status remains a hard conflict.
     """
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"status must be terminal, got {status!r}")
     key_id = validate_delivery_id(delivery_id)
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     with _locked(home) as root:
-        settled_path = root / SETTLED_DIR / f"{key_id}.json"
-        existing = _read(settled_path)
-        lease_lapsed = _retired_lease_lapsed(existing)
-        if existing is not None and not lease_lapsed:
-            if existing.get("status") != status:
+        record, where = _locate(root, key_id)
+        lease_lapsed = _retired_lease_lapsed(record)
+        rewound = _rewound_lease_lapsed(record)
+        if record is not None and where == SETTLED_DIR and not lease_lapsed:
+            if record.get("status") != status:
                 raise ValueError(
-                    f"{key_id} already settled as {existing.get('status')!r}"
+                    f"{key_id} already settled as {record.get('status')!r}"
                 )
-            return dict(existing)
-
-        claimed_path = root / CLAIMED_DIR / f"{key_id}.json"
-        if lease_lapsed:
-            assert existing is not None  # _retired_lease_lapsed guarantees a record
-            record = existing
-        else:
-            record = _read(claimed_path)
-            if record is None:
-                raise FileNotFoundError(f"no claimed record for {key_id}")
+            return dict(record)
+        if record is None or (where == QUEUE_DIR and not rewound):
+            raise FileNotFoundError(f"no claimed record for {key_id}")
+        assert record is not None and where is not None  # both set by _locate
 
         updated = dict(record)
         updated["status"] = status
         updated["updated_at"] = now_ns
         updated["status_detail"] = status_detail
         updated["queue_position"] = None
-        if lease_lapsed:
+        if lease_lapsed or rewound:
             # The sweep's premature close wrote lease_lapsed bookkeeping; the
             # turn's real terminal outcome replaces it outright.
             updated["reason"] = None
@@ -915,7 +949,7 @@ def settle(
             entry["ended_at"] = now_ns
             entry["status"] = status
             entry["reason"] = reason or None
-        elif lease_lapsed:
+        elif lease_lapsed or rewound:
             # The sweep closed the last attempt as lease_lapsed; re-mark it with
             # the turn's real terminal outcome so the log stays truthful.
             log = list(updated.get("attempts_log") or [])
@@ -924,12 +958,13 @@ def settle(
                 log[-1]["reason"] = reason or None
                 log[-1]["ended_at"] = now_ns
                 updated["attempts_log"] = log
-        if lease_lapsed:
+        settled_path = root / SETTLED_DIR / f"{key_id}.json"
+        if where == SETTLED_DIR:
             _write(settled_path, updated)
         else:
-            os.replace(claimed_path, settled_path)
+            os.replace(root / where / f"{key_id}.json", settled_path)
             _write(settled_path, updated)
-            _fsync_dir(root / CLAIMED_DIR)
+            _fsync_dir(root / where)
         _log("settled", updated, attempt=updated.get("attempts"))
         return dict(updated)
 
@@ -1011,6 +1046,7 @@ def reoffer_ambiguous(
             return None
         updated = dict(record)
         updated["status"] = STATUS_QUEUED
+        updated["reason"] = None
         updated["reoffer_count"] = int(record.get("reoffer_count", 0)) + 1
         updated["status_detail"] = STATUS_DETAIL_TARGET_BUSY
         updated["updated_at"] = now_ns
