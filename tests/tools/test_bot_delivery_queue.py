@@ -611,6 +611,79 @@ def test_sweep_leaves_fresh_running_claim_alone(tmp_path):
     assert _claimed_path(tmp_path, 1).exists()
 
 
+def test_live_turn_past_lease_still_lands_delivered(tmp_path):
+    """A still-alive turn whose lease lapsed must still land its true outcome."""
+    _admit(tmp_path, 1)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+
+    # The turn runs past its lease; the sweep retires the claim as lease_lapsed.
+    claimed = q.read_record(tmp_path, _did(1))
+    claimed["claimed_at"] = time.time_ns() - int(2 * 3600 * 1e9)
+    _claimed_path(tmp_path, 1).write_text(json.dumps(claimed))
+    assert q.sweep_delivery_queue(tmp_path) == 1
+    assert q.read_record(tmp_path, _did(1))["status"] == "ambiguous"
+
+    # The still-alive turn finishes and settles for real -- no exception, and the
+    # outcome is delivered (not the sweep's premature "unknown").
+    settled = q.settle(tmp_path, _did(1), status="delivered", reply="pong")
+    assert settled["status"] == "delivered"
+    assert settled["reply"] == "pong"
+    assert settled["reason"] is None
+    assert settled["claimed_at"] is None
+    assert settled["attempts_log"][-1]["status"] == "delivered"
+    assert settled["attempts_log"][-1]["reason"] is None
+    assert not _claimed_path(tmp_path, 1).exists()
+    assert _settled_path(tmp_path, 1).exists()
+
+    env = q.build_envelope(settled)
+    assert env["result"] == "delivered"
+    assert env["status"] == "delivered"
+
+    # Replaying the same terminal outcome stays idempotent.
+    assert q.settle(tmp_path, _did(1), status="delivered")["status"] == "delivered"
+
+
+def test_live_turn_past_lease_still_lands_failed(tmp_path):
+    """A still-alive turn that fails after its lease lapsed lands ``failed``."""
+    _admit(tmp_path, 1)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    claimed = q.read_record(tmp_path, _did(1))
+    claimed["claimed_at"] = time.time_ns() - int(2 * 3600 * 1e9)
+    _claimed_path(tmp_path, 1).write_text(json.dumps(claimed))
+    q.sweep_delivery_queue(tmp_path)
+
+    settled = q.settle(
+        tmp_path, _did(1), status="failed", error="turn failed", reason="runtime_offline"
+    )
+    assert settled["status"] == "failed"
+    assert settled["error"] == "turn failed"
+    assert settled["reason"] == "runtime_offline"
+    assert settled["attempts_log"][-1]["status"] == "failed"
+    assert q.build_envelope(settled)["result"] == "failed"
+
+
+def test_requeue_unstarted_after_lease_lapsed_rolls_back(tmp_path):
+    """A contended turn swept as lease_lapsed re-queues without charging the attempt."""
+    _admit(tmp_path, 1)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    claimed = q.read_record(tmp_path, _did(1))
+    claimed["claimed_at"] = time.time_ns() - int(2 * 3600 * 1e9)
+    _claimed_path(tmp_path, 1).write_text(json.dumps(claimed))
+    q.sweep_delivery_queue(tmp_path)
+    assert q.read_record(tmp_path, _did(1))["status"] == "ambiguous"
+
+    back = q.requeue_unstarted(tmp_path, _did(1))
+    assert back["status"] == "queued"
+    assert back["attempts"] == 0
+    assert back["attempts_log"] == []
+    assert back["reoffer_count"] == 1
+    assert back["reason"] is None
+    assert back["claimed_at"] is None
+    assert back["status_detail"] == q.STATUS_DETAIL_LEASE_CONTENDED
+    assert _queued_path(tmp_path, 1).exists()
+    assert not _settled_path(tmp_path, 1).exists()
+
+
 def test_sweep_slot_held_exemption_protects_queued_not_lapsed_claims(tmp_path):
     """The slot-held exemption protects queued records, never dead claims."""
     old = time.time_ns() - int(2 * 3600 * 1e9)

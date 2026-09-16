@@ -589,6 +589,21 @@ def _open_attempt(record: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _retired_lease_lapsed(record: dict[str, Any] | None) -> bool:
+    """True when ``record`` is a claim this lane's own sweep retired as lease_lapsed.
+
+    The sweep reaps a ``running`` claim whose lease lapsed into ``ambiguous`` with
+    reason ``lease_lapsed`` (outcome unknown). A still-alive turn later settling or
+    requeueing that record must be allowed to land its true outcome; any other
+    already-settled status remains a hard conflict.
+    """
+    return bool(
+        record is not None
+        and record.get("status") == STATUS_AMBIGUOUS
+        and record.get("reason") == REASON_LEASE_LAPSED
+    )
+
+
 # --------------------------------------------------------------------------
 # public API
 # --------------------------------------------------------------------------
@@ -783,6 +798,10 @@ def requeue_unstarted(
     never paid for, so the claim's ``attempts += 1`` and its still-open
     ``attempts_log`` entry are rolled back -- contention must never consume an
     attempt. ``reoffer_count`` increments; already-queued records are untouched.
+
+    A claim this lane's own sweep retired as ``lease_lapsed`` (ambiguous) is
+    tolerated the same way: the turn never actually started, so the premature
+    retirement is rolled back and the record re-queued.
     """
     key_id = validate_delivery_id(delivery_id)
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
@@ -793,26 +812,42 @@ def requeue_unstarted(
             return dict(existing)
 
         claimed_path = root / CLAIMED_DIR / f"{key_id}.json"
+        settled_path = root / SETTLED_DIR / f"{key_id}.json"
         record = _read(claimed_path)
+        settled = _read(settled_path)
+        lease_lapsed = _retired_lease_lapsed(settled)
         if record is None:
-            raise FileNotFoundError(f"no claimed record for {key_id}")
+            if not lease_lapsed:
+                raise FileNotFoundError(f"no claimed record for {key_id}")
+            assert settled is not None  # _retired_lease_lapsed guarantees a record
+            record = settled
 
         updated = dict(record)
         updated["attempts"] = max(0, int(updated.get("attempts", 0)) - 1)
         log = list(updated.get("attempts_log") or [])
-        if log and log[-1].get("ended_at") is None:
+        if lease_lapsed:
+            # The sweep closed the unstarted attempt as lease_lapsed; roll it
+            # back too, so contention never consumes the attempt.
+            if log and log[-1].get("reason") == REASON_LEASE_LAPSED:
+                log.pop()
+        elif log and log[-1].get("ended_at") is None:
             log.pop()
         updated["attempts_log"] = log
         updated["status"] = STATUS_QUEUED
+        updated["reason"] = None
         updated["reoffer_count"] = int(updated.get("reoffer_count", 0)) + 1
         updated["claimed_at"] = None
         updated["status_detail"] = STATUS_DETAIL_LEASE_CONTENDED
         updated["updated_at"] = now_ns
         updated["sequence"] = int(updated.get("sequence", 0))
-        os.replace(claimed_path, queued_path)
+        if lease_lapsed:
+            os.replace(settled_path, queued_path)
+            _fsync_dir(root / SETTLED_DIR)
+        else:
+            os.replace(claimed_path, queued_path)
+            _fsync_dir(root / CLAIMED_DIR)
         updated["queue_position"] = _queue_position(root, updated) or 1
         _write(queued_path, updated)
-        _fsync_dir(root / CLAIMED_DIR)
         _log("requeued", updated, reoffer_count=updated["reoffer_count"])
         return dict(updated)
 
@@ -828,7 +863,13 @@ def settle(
     status_detail: str | None = None,
     now_ns: int | None = None,
 ) -> dict[str, Any]:
-    """Move a claimed record to ``settled/`` with a terminal status."""
+    """Move a claimed record to ``settled/`` with a terminal status.
+
+    A claim this lane's own sweep retired as ``lease_lapsed`` (ambiguous) is
+    tolerated: the claim's holder was still alive and is now settling for real,
+    so the turn's true terminal outcome wins over the sweep's premature close.
+    Any other already-settled status remains a hard conflict.
+    """
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"status must be terminal, got {status!r}")
     key_id = validate_delivery_id(delivery_id)
@@ -836,7 +877,8 @@ def settle(
     with _locked(home) as root:
         settled_path = root / SETTLED_DIR / f"{key_id}.json"
         existing = _read(settled_path)
-        if existing is not None:
+        lease_lapsed = _retired_lease_lapsed(existing)
+        if existing is not None and not lease_lapsed:
             if existing.get("status") != status:
                 raise ValueError(
                     f"{key_id} already settled as {existing.get('status')!r}"
@@ -844,15 +886,24 @@ def settle(
             return dict(existing)
 
         claimed_path = root / CLAIMED_DIR / f"{key_id}.json"
-        record = _read(claimed_path)
-        if record is None:
-            raise FileNotFoundError(f"no claimed record for {key_id}")
+        if lease_lapsed:
+            assert existing is not None  # _retired_lease_lapsed guarantees a record
+            record = existing
+        else:
+            record = _read(claimed_path)
+            if record is None:
+                raise FileNotFoundError(f"no claimed record for {key_id}")
 
         updated = dict(record)
         updated["status"] = status
         updated["updated_at"] = now_ns
         updated["status_detail"] = status_detail
         updated["queue_position"] = None
+        if lease_lapsed:
+            # The sweep's premature close wrote lease_lapsed bookkeeping; the
+            # turn's real terminal outcome replaces it outright.
+            updated["reason"] = None
+            updated["error"] = None
         if reply not in (None, ""):
             updated["reply"] = reply
         if error not in (None, ""):
@@ -864,9 +915,21 @@ def settle(
             entry["ended_at"] = now_ns
             entry["status"] = status
             entry["reason"] = reason or None
-        os.replace(claimed_path, settled_path)
-        _write(settled_path, updated)
-        _fsync_dir(root / CLAIMED_DIR)
+        elif lease_lapsed:
+            # The sweep closed the last attempt as lease_lapsed; re-mark it with
+            # the turn's real terminal outcome so the log stays truthful.
+            log = list(updated.get("attempts_log") or [])
+            if log and log[-1].get("reason") == REASON_LEASE_LAPSED:
+                log[-1]["status"] = status
+                log[-1]["reason"] = reason or None
+                log[-1]["ended_at"] = now_ns
+                updated["attempts_log"] = log
+        if lease_lapsed:
+            _write(settled_path, updated)
+        else:
+            os.replace(claimed_path, settled_path)
+            _write(settled_path, updated)
+            _fsync_dir(root / CLAIMED_DIR)
         _log("settled", updated, attempt=updated.get("attempts"))
         return dict(updated)
 
