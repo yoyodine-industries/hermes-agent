@@ -3,8 +3,10 @@
 Lets a Bot Mode agent message a teammate (a profile on this install, an agent on
 a registered peer gateway, or one on another Desktop-connected machine): the
 target is validated against the live roster, the attribution prefix is applied
-server-side, and the reply arrives later via the background-process completion
-notification (fire-and-forget). Containment: the schema is injected ONLY into a
+server-side, and the call returns a delivery receipt (idempotency_key +
+delivery_id + queued/delivered status) that the sender reads in-turn; the
+receiver's own reply then arrives later via the background-process completion
+notification. Containment: the schema is injected ONLY into a
 bot's canonical "Bot Chat" session on a Bot-Mode-managed install (same gate as
 ``tools/bot_mode_probe.py``; never in the registry or any toolset), and dispatch
 re-checks that gate so a forged call returns a structured error. Transports:
@@ -65,14 +67,17 @@ def message_agent_tool_schema() -> dict:
             "name": MESSAGE_AGENT_TOOL_NAME,
             "description": (
                 "Send a message to ANOTHER agent (teammate) on this install, or to an "
-                "agent on a registered peer gateway. This is FIRE-AND-FORGET and "
-                "asynchronous, like texting: it validates the target against the live "
-                "roster, delivers your message into that agent's own Bot Chat with your "
-                "attribution automatically prefixed, and returns immediately with a "
-                "delivery acknowledgement. It does NOT return their reply and you must "
-                "not wait or poll for one — send it, finish your turn, and the reply "
-                "arrives later as a background-process completion notification that "
-                "wakes you. COMPOSE the message yourself: write what YOU want to say to "
+                "agent on a registered peer gateway. It is asynchronous, like texting: it "
+                "validates the target against the live roster, delivers your message into "
+                "that agent's own Bot Chat with your attribution automatically prefixed, "
+                "and returns immediately with a delivery receipt (idempotency_key, "
+                "delivery_id, and a status of queued/delivered). Read that receipt in the "
+                "same turn to confirm admission; 'delivered' means the receiver's gateway "
+                "ran the turn, and 'acknowledged' means the receiver signed for it. It does "
+                "NOT return their reply: do not wait or poll for the reply itself — send, "
+                "confirm the receipt, finish your turn, and the reply arrives later as a "
+                "background-process completion notification that wakes you. COMPOSE the "
+                "message yourself: write what YOU want to say to "
                 "that agent (lead with the point; include the concrete ask or result). "
                 "Never paste the user's words verbatim — paraphrase the actionable "
                 "substance, and keep private 1:1 chat content private. Message one "
