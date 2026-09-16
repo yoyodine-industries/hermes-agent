@@ -162,6 +162,10 @@ LIMIT_PER_PROFILE = "per_profile"
 LIMIT_PER_SENDER = "per_sender"
 
 REASON_QUEUED_EXPIRED = "queued_expired"
+#: A ``running`` claim whose lease lapsed without the turn settling it. The
+#: outcome is unknown (the turn may have delivered before it died), so the
+#: sweep settles the record ``ambiguous`` rather than ``failed``.
+REASON_LEASE_LAPSED = "lease_lapsed"
 
 #: `retryable(envelope)` is derived from the *envelope reason* only. It is
 #: unrelated to ``retry_action()`` (agent auto-retry) -- never derive one from
@@ -993,7 +997,7 @@ def sweep_delivery_queue(
     now_ns: int | None = None,
     slot_held_fn: Any = None,
 ) -> int:
-    """Recover orphaned claims, then expire over-age records.
+    """Recover orphaned claims, then reap lapsed claims and expire over-age records.
 
     Runs hourly and on every 30s drainer tick (VERIFICATION D1 trigger 4).
     Returns the number of records it acted on.
@@ -1002,6 +1006,11 @@ def sweep_delivery_queue(
     target mid-turn (a desktop session can hold the slot for a whole lease wait)
     must not have its inbound delivery expire underneath it: the slot holder is
     exactly the turn that will drain it next.
+
+    A ``running`` claim is given a lease (the queue TTL). A turn that claims a
+    record and then dies without settling leaves the record ``running`` forever;
+    once the lease lapses the sweep settles it ``ambiguous`` (outcome unknown)
+    so it can no longer consume one of the sender's admission slots.
     """
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     ttl = queue_ttl_seconds()
@@ -1020,7 +1029,40 @@ def sweep_delivery_queue(
             _write(root / QUEUE_DIR / f"{delivery_id}.json", record)
             actions += 1
 
-        # 2. expire records that waited past the TTL
+        # 2. reap a running claim whose lease has lapsed: the turn that claimed
+        #    it never settled, so it can never finish and must not hold one of
+        #    the sender's admission slots forever. The outcome is unknown (the
+        #    turn may have delivered before it died), so the record is settled
+        #    ``ambiguous`` -- recoverable exactly once via reoffer_ambiguous and
+        #    never silently retried. The slot-held exemption does NOT apply: a
+        #    lapsed claim is a dead turn, not a live slot holder.
+        if ttl > 0:
+            for record in _list(root, CLAIMED_DIR):
+                if record.get("status") != STATUS_RUNNING:
+                    continue
+                claimed_at = record.get("claimed_at")
+                if not claimed_at or (now_ns - int(claimed_at)) / 1e9 <= ttl:
+                    continue
+                updated = dict(record)
+                updated["status"] = STATUS_AMBIGUOUS
+                updated["reason"] = REASON_LEASE_LAPSED
+                updated["updated_at"] = now_ns
+                updated["queue_position"] = None
+                updated["claimed_at"] = None
+                entry = _open_attempt(updated)
+                if entry is not None:
+                    entry["ended_at"] = now_ns
+                    entry["status"] = STATUS_AMBIGUOUS
+                    entry["reason"] = REASON_LEASE_LAPSED
+                os.replace(
+                    root / CLAIMED_DIR / f"{updated['delivery_id']}.json",
+                    root / SETTLED_DIR / f"{updated['delivery_id']}.json",
+                )
+                _write(root / SETTLED_DIR / f"{updated['delivery_id']}.json", updated)
+                _log("lease_lapsed", updated, reason=REASON_LEASE_LAPSED)
+                actions += 1
+
+        # 3. expire records that waited past the TTL
         if ttl > 0:
             for record in _list(root, QUEUE_DIR):
                 if record.get("status") != STATUS_QUEUED:

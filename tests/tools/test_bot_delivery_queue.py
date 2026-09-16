@@ -569,3 +569,64 @@ def test_queue_full_envelope_names_the_cap_that_fired():
     # A row that lost the fired cap (an older record) reads as it always did.
     legacy = q.build_envelope(base)
     assert f"{q.max_per_profile()} per profile" in legacy["detail"]
+
+
+# ------------------------------------------------------- running-claim lease
+def test_sweep_reaps_lapsed_running_claim_and_frees_slot(tmp_path):
+    """A dead turn's running claim must not hold an admission slot forever."""
+    for n in range(1, q.max_per_sender() + 1):
+        _admit(tmp_path, n)
+    # Claim the oldest -> running (1 running + 7 queued = still 8/8).
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    with pytest.raises(q.QueueFullError):
+        _admit(tmp_path, 9)
+
+    # Backdate the running claim's lease so the sweep treats it as lapsed.
+    claimed = q.read_record(tmp_path, _did(1))
+    assert claimed["status"] == "running"
+    claimed["claimed_at"] = time.time_ns() - int(2 * 3600 * 1e9)
+    _claimed_path(tmp_path, 1).write_text(json.dumps(claimed))
+
+    # The sweep reaps the lapsed claim: slot reclaimed, record settled ambiguous.
+    assert q.sweep_delivery_queue(tmp_path) == 1
+    reaped = q.read_record(tmp_path, _did(1))
+    assert reaped["status"] == "ambiguous"
+    assert reaped["reason"] == q.REASON_LEASE_LAPSED
+    assert reaped["claimed_at"] is None
+    assert reaped["attempts_log"][-1]["reason"] == q.REASON_LEASE_LAPSED
+    assert not _claimed_path(tmp_path, 1).exists()
+    assert _settled_path(tmp_path, 1).exists()
+
+    # A new send from the same sender is now admitted.
+    assert _admit(tmp_path, 9)["delivery_id"] == _did(9)
+
+
+def test_sweep_leaves_fresh_running_claim_alone(tmp_path):
+    """A live turn's claim within its lease is not reaped."""
+    _admit(tmp_path, 1)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    assert q.read_record(tmp_path, _did(1))["status"] == "running"
+    assert q.sweep_delivery_queue(tmp_path) == 0
+    assert q.read_record(tmp_path, _did(1))["status"] == "running"
+    assert _claimed_path(tmp_path, 1).exists()
+
+
+def test_sweep_slot_held_exemption_protects_queued_not_lapsed_claims(tmp_path):
+    """The slot-held exemption protects queued records, never dead claims."""
+    old = time.time_ns() - int(2 * 3600 * 1e9)
+    # Over-age queued record for bravo: kept while the slot is held.
+    _admit(tmp_path, 1, target="bravo", now_ns=old)
+    # Fresh record for charlie, claimed and left to lapse.
+    _admit(tmp_path, 2, target="charlie")
+    q.claim_next(tmp_path, target_profile="charlie", lease_ok=True)
+    claimed = q.read_record(tmp_path, _did(2))
+    claimed["claimed_at"] = old
+    _claimed_path(tmp_path, 2).write_text(json.dumps(claimed))
+
+    def _held(_home, _target):
+        return True
+
+    # The queued record is held; the lapsed claim is reaped regardless.
+    assert q.sweep_delivery_queue(tmp_path, slot_held_fn=_held) == 1
+    assert q.read_record(tmp_path, _did(1))["status"] == "queued"
+    assert q.read_record(tmp_path, _did(2))["status"] == "ambiguous"
