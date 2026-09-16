@@ -12,6 +12,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import difflib
 import json
 import os
 import re
@@ -113,7 +114,11 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     raise ValueError(f"reasoning_effort must be one of {allowed}, got {effort!r}")
 
 
-KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
+_TOOLSET_NAMES = tuple(get_toolset_names())
+KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in _TOOLSET_NAMES)
+# casefolded -> canonical spelling; a declared toolset is normalised to the spelling
+# ``_get_platform_tools`` reports, so ``Browser`` cannot silently miss ``browser``.
+CANONICAL_TOOLSET_NAMES = {name.casefold(): name for name in _TOOLSET_NAMES}
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
 
@@ -701,6 +706,10 @@ class Task:
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     skills: Optional[list] = None            # None = defaults only; [] = explicitly none
+    # Toolsets the card needs its worker to carry, as canonical names (JSON list);
+    # None = no card-level requirement. Unioned with each pinned skill's frontmatter
+    # requirement and judged against the assignee's platform_toolsets.cli.
+    requires_toolsets: Optional[list] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
@@ -728,6 +737,10 @@ class Task:
         g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        parsed_toolsets = _json_or(g("requires_toolsets"))
+        toolsets_value = (
+            [str(t) for t in parsed_toolsets if t] if isinstance(parsed_toolsets, list) else None
+        )
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -737,6 +750,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            requires_toolsets=toolsets_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -901,6 +915,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    -- Toolsets this card's worker must carry, stored as JSON (canonical toolset
+    -- names). NULL or empty array = no card-level requirement. Unioned with the
+    -- pinned skills' frontmatter requirement and refused at create/assign when the
+    -- assignee lane's platform_toolsets.cli lacks them. See _required_toolsets.
+    requires_toolsets    TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -1245,6 +1264,48 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _normalize_required_toolsets(toolsets: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Strip/dedupe a card's declared ``requires_toolsets``; refuse non-toolset names.
+
+    Names must be canonical toolset keys (``toolsets.py`` TOOLSETS). A near-miss
+    (``files`` for ``file``) is refused HERE rather than left to dispatch: it compares
+    unequal to every lane's enabled set, so it would refuse every card that carries it
+    and read as a lane problem instead of a typo.
+    """
+    if toolsets is None:
+        return None
+    cleaned: list[str] = []
+    unknown: list[str] = []
+    for raw in toolsets:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        canonical = CANONICAL_TOOLSET_NAMES.get(name.casefold())
+        if canonical is None:
+            unknown.append(name)
+            continue
+        if canonical in cleaned:
+            continue
+        cleaned.append(canonical)
+    if unknown:
+        quoted = ", ".join(repr(name) for name in unknown)
+        noun = "is not a toolset name" if len(unknown) == 1 else "are not toolset names"
+        lines = [
+            f"requires_toolsets: {quoted} {noun}. Use canonical toolset keys from "
+            "`toolsets.py` TOOLSETS — e.g. `browser`, `vision`, `video`, `x_search`, "
+            "`cronjob`, `computer_use`, `terminal`, `file`, `web`.",
+        ]
+        known = sorted(CANONICAL_TOOLSET_NAMES)
+        for name in unknown:
+            closest = difflib.get_close_matches(name.casefold(), known, n=3, cutoff=0.6)
+            lines.append(
+                f"  {name}: did you mean {', '.join(closest)}?" if closest
+                else f"  {name}: no toolset is close to this name."
+            )
+        raise ValueError("\n".join(lines))
+    return cleaned or None
+
+
 def _unloadable_task_skills(skills: Iterable[str], assignee: Optional[str]) -> list[dict[str, str]]:
     """``skills`` entries a worker launched as *assignee* could not load.
 
@@ -1298,8 +1359,114 @@ def _task_skill_names(skills: Any) -> list[str]:
     return [str(name) for name in parsed if name] if isinstance(parsed, list) else []
 
 
-def _refuse_unloadable_skills(skills: Any, assignee: Optional[str]) -> None:
-    """Raise :class:`ValueError` for stored skill names *assignee*'s worker cannot load.
+def _required_toolsets(skills: Any, declared: Any, assignee: Optional[str]) -> list[dict[str, str]]:
+    """Every toolset this card needs, each entry naming what needs it.
+
+    Union of the card's own ``requires_toolsets`` column (``declared``) and each pinned
+    skill's frontmatter ``metadata.hermes.requires_toolsets``. The skill half runs under
+    the assignee's own profile home, exactly as ``_unloadable_task_skills`` asks the
+    worker's question. Names that do not load are skipped here — that is the other
+    refusal, and one refusal per card keeps the message readable.
+    """
+    if not assignee:
+        return []
+    # Same JSON-list reader the ``skills`` column uses; both store a JSON array.
+    entries = [
+        {"toolset": name, "source": "the card"} for name in _task_skill_names(declared)
+    ]
+    names = _task_skill_names(skills)
+    if not names:
+        return entries
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from agent.skill_commands import preload_skill_requirements
+
+    try:
+        profile_home = resolve_profile_env(normalize_profile_name(assignee))
+    except Exception:
+        return entries
+    override = set_hermes_home_override(profile_home)
+    try:
+        by_skill = preload_skill_requirements(names)
+    except Exception:
+        by_skill = {}
+    finally:
+        reset_hermes_home_override(override)
+    for skill in names:
+        for name in by_skill.get(skill, ()):
+            entries.append({"toolset": name, "source": f"skill {skill!r}"})
+    return entries
+
+
+def _assignee_cli_toolsets(assignee: Optional[str]) -> Optional[set[str]]:
+    """Toolset names the assignee's lane carries (``platform_toolsets.cli``), or None.
+
+    Resolved under the assignee's OWN profile home the way the dispatcher resolves the
+    worker's ``--toolsets`` pin (``kanban_db_dispatch._resolve_worker_cli_toolsets``), so
+    the judgement matches the tool surface the worker really launches with.
+
+    ``None`` means the question cannot be answered truthfully — an unresolvable profile
+    home is that profile's own error, exactly as ``_unloadable_task_skills`` allows — and
+    is treated as no gap.
+    """
+    if not assignee:
+        return None
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    try:
+        profile_home = resolve_profile_env(normalize_profile_name(assignee))
+    except Exception:
+        return None
+    override = set_hermes_home_override(profile_home)
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        return set(_get_platform_tools(load_config(), "cli"))
+    except Exception:
+        return None
+    finally:
+        reset_hermes_home_override(override)
+
+
+def _unsatisfiable_toolsets(
+    required: list[dict[str, str]], enabled: Optional[set[str]],
+) -> list[dict[str, str]]:
+    """Required entries the lane does not carry (``enabled`` None = unanswerable, no gap)."""
+    if not required or enabled is None:
+        return []
+    return [entry for entry in required if entry["toolset"] not in enabled]
+
+
+def _missing_toolsets_message(missing: list[dict[str, str]], assignee: Optional[str]) -> str:
+    """Refusal text for toolsets the assignee's lane does not carry."""
+    names = sorted({entry["toolset"] for entry in missing})
+    quoted = ", ".join(repr(name) for name in names)
+    noun = "toolset" if len(names) == 1 else "toolsets"
+    lines = [
+        f"{noun} {quoted} required by this task but not enabled for assignee {assignee!r} "
+        "(its `platform_toolsets.cli`), so its worker would run without the tool the "
+        "task needs.",
+    ]
+    for entry in sorted(missing, key=lambda item: (item["toolset"], item["source"])):
+        lines.append(f"  {entry['toolset']}: required by {entry['source']}")
+    lines.extend(
+        f"assign to a lane that carries {name}, or drop the requirement." for name in names
+    )
+    return "\n".join(lines)
+
+
+def _refuse_unloadable_skills(
+    skills: Any, assignee: Optional[str], requires_toolsets: Any = None,
+) -> None:
+    """Raise :class:`ValueError` for a card the assignee's worker cannot run.
+
+    Two questions, one refusal: skill names that profile's worker could not load, and
+    toolsets the profile's lane does not carry (``platform_toolsets.cli``) that the card
+    or its pinned skills require. Both are judged against the SAME profile, and both fail
+    before an attempt is burned — a card whose worker lacks the tool would otherwise run
+    without it and answer anyway, or discover the gap a turn at a time.
 
     ``create_task`` asks this where the card is created; every site that ATTACHES an
     assignee afterwards asks it again (``assign_task``, ``request_review``, the
@@ -1309,11 +1476,15 @@ def _refuse_unloadable_skills(skills: Any, assignee: Optional[str]) -> None:
     ``Unknown skill(s)`` — the failure the create-time check exists to prevent.
     """
     names = _task_skill_names(skills)
-    if not names:
-        return
     problems = _unloadable_task_skills(names, assignee)
     if problems:
         raise ValueError(_unloadable_skills_message(problems, assignee))
+    missing = _unsatisfiable_toolsets(
+        _required_toolsets(skills, requires_toolsets, assignee),
+        _assignee_cli_toolsets(assignee),
+    )
+    if missing:
+        raise ValueError(_missing_toolsets_message(missing, assignee))
 
 
 def create_task(
@@ -1323,6 +1494,7 @@ def create_task(
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
+    requires_toolsets: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
@@ -1378,12 +1550,12 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
-    if skills_list:
-        # Refuse a name no worker for this assignee can load, rather than letting the
-        # card spend an attempt and auto-block on a failure only the worker log shows.
-        unloadable = _unloadable_task_skills(skills_list, assignee)
-        if unloadable:
-            raise ValueError(_unloadable_skills_message(unloadable, assignee))
+    toolsets_list = _normalize_required_toolsets(requires_toolsets)
+    if skills_list or toolsets_list:
+        # Refuse a card this assignee's worker cannot run — a skill name it cannot load,
+        # or a toolset its lane does not carry — rather than letting the card spend an
+        # attempt and auto-block on a failure only the worker log shows.
+        _refuse_unloadable_skills(skills_list, assignee, toolsets_list)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1441,10 +1613,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, requires_toolsets, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1452,6 +1624,7 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(toolsets_list) if toolsets_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
@@ -1473,6 +1646,7 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        "requires_toolsets": list(toolsets_list) if toolsets_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -1623,7 +1797,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, skills, requires_toolsets FROM tasks WHERE id = ?",
+            (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -1636,7 +1811,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         # check (nothing to judge them against); judge them against the profile
         # being attached here, before it can reach a worker — and before the
         # failure streak and the assignee are written.
-        _refuse_unloadable_skills(row["skills"], profile)
+        _refuse_unloadable_skills(row["skills"], profile, row["requires_toolsets"])
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
@@ -3193,7 +3368,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id, skills "
+            "SELECT assignee, status, claim_lock, current_run_id, skills, requires_toolsets "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -3227,7 +3402,7 @@ def request_review(
             # implementer's hands instead of handing the reviewer a session that
             # aborts on "Unknown skill(s)".
             try:
-                _refuse_unloadable_skills(trow["skills"], reviewer)
+                _refuse_unloadable_skills(trow["skills"], reviewer, trow["requires_toolsets"])
             except ValueError as exc:
                 return _ret(False, str(exc))
         assignee_sql = ", assignee = ?" if reviewer is not None else ""

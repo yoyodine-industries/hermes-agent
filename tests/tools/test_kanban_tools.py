@@ -469,6 +469,60 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_stores_card_level_requires_toolsets(worker_env):
+    """`requires_toolsets` reaches the row, so a card can name the toolsets it needs
+    without pinning a skill. An unresolvable assignee answers no question, so it is
+    allowed through exactly like the unknown-profile skills case."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "needs a browser",
+        "assignee": "peer",
+        "requires_toolsets": ["browser"],
+    }))
+
+    assert out["ok"] is True, out
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, out["task_id"])
+        assert task is not None
+        assert task.requires_toolsets == ["browser"]
+
+
+def test_create_refuses_a_toolset_the_assignee_lane_lacks(monkeypatch, worker_env, tmp_path):
+    """The tool surface refuses the same pair ``create_task`` refuses: the model gets
+    the reason (lane, toolset, way out) instead of a card the worker cannot run."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    lean = home / "profiles" / "lean"
+    (lean / "skills").mkdir(parents=True, exist_ok=True)
+    # Explicit list = authoritative: no browser, so the requirement cannot be met.
+    (lean / "config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - web\n    - file\n    - terminal\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: home)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: home / "profiles")
+
+    out = json.loads(kt._handle_create({
+        "title": "needs a browser",
+        "assignee": "lean",
+        "requires_toolsets": ["browser"],
+    }))
+
+    # A refusal comes back as the structured tool error (no "ok"): the model reads the
+    # lane, the toolset and the way out instead of a card the worker cannot run.
+    assert out.get("ok") is not True, out
+    assert "browser" in out["error"] and "lean" in out["error"], out
+    with kbc.connect() as conn:
+        assert [t for t in kb.list_tasks(conn) if t.title == "needs a browser"] == []
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(

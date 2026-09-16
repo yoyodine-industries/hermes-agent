@@ -469,6 +469,21 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "assignee's profile."
             ),
         },
+        "requires_toolsets": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Canonical toolset names (e.g. 'browser', 'vision', "
+                "'video', 'x_search', 'cronjob', 'computer_use') this "
+                "card's worker must carry. Unioned with the pinned "
+                "skills' own frontmatter requirements and checked "
+                "against the assignee lane's platform_toolsets.cli: a "
+                "card whose requirement the lane cannot satisfy is "
+                "REFUSED at create/assign instead of dispatched to a "
+                "worker that lacks the tool. Unknown names are "
+                "rejected."
+            ),
+        },
         "goal_mode": _prop("boolean", (
                 "Run the dispatched worker in a goal loop. When true, "
                 "after each turn an auxiliary judge checks the worker's "

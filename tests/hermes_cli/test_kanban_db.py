@@ -1962,3 +1962,191 @@ def test_default_assignee_applies_when_the_default_can_load_the_skills(kanban_ho
         assert kbd._apply_default_assignee(conn, plain, "demo", dry_run=False) is True
         assert _task(conn, loadable).assignee == "demo"
         assert _task(conn, plain).assignee == "demo"
+
+
+# ---------------------------------------------------------------------------
+# …and the same refusal covers TOOLSETS the assignee's lane does not carry
+#
+# Cutting a lane's fixed per-call cost drops toolsets permanently
+# (``platform_toolsets.cli``). A card that needs one of them — declared on the card
+# (``requires_toolsets``) or inherited from a pinned skill's frontmatter
+# (``metadata.hermes.requires_toolsets``) — was dispatched anyway: the worker ran
+# without the tool and answered regardless, or burned turns discovering the gap.
+# The requirement is unioned and judged against the assignee's own
+# ``platform_toolsets.cli`` at every site that attaches an assignee, exactly like
+# the skill names above.
+# ---------------------------------------------------------------------------
+
+# Two lanes with deliberately different tool surfaces: `demo` has no browser and no
+# vision, `other` has both. An explicit list is authoritative (no composite
+# fallback), so these assertions cannot drift with the shipped defaults.
+_LEAN_TOOLSETS = ["web", "file", "terminal"]
+_RICH_TOOLSETS = ["web", "file", "terminal", "browser", "vision"]
+
+
+def _write_lane_config(home: Path, toolsets: list[str]) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n"
+        + "".join(f"    - {name}\n" for name in toolsets),
+        encoding="utf-8",
+    )
+
+
+def _write_skill_requiring(skills_dir: Path, name: str, toolsets: list[str]) -> None:
+    """A skill whose frontmatter declares the toolsets it needs (canonical names)."""
+    skill_dir = skills_dir / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {name}\n"
+        "description: test skill\n"
+        "metadata:\n"
+        "  hermes:\n"
+        f"    requires_toolsets: [{', '.join(toolsets)}]\n"
+        "---\n\n"
+        f"# {name}\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def toolset_lanes(kanban_home, profile_skills):
+    """``profile_skills``, with an explicit and different tool surface per lane."""
+    _write_lane_config(profile_skills["demo"], _LEAN_TOOLSETS)
+    _write_lane_config(profile_skills["other"], _RICH_TOOLSETS)
+    return profile_skills
+
+
+def test_create_task_refuses_a_card_requiring_a_toolset_the_lane_lacks(kanban_home, toolset_lanes):
+    """The card names a toolset its assignee's lane dropped: refused at create,
+    naming the toolset, the lane and the way out — and the card never lands."""
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError) as excinfo:
+            kb.create_task(conn, title="needs a browser", assignee="demo",
+                           requires_toolsets=["browser"])
+        message = str(excinfo.value)
+        assert "browser" in message
+        assert "demo" in message, "refusal must name the lane the requirement was judged against"
+        assert "assign to a lane that carries browser" in message, message
+        assert kb.list_tasks(conn) == [], "a refused card must not reach the board"
+
+
+def test_create_task_stores_a_toolset_the_lane_carries(kanban_home, toolset_lanes):
+    """The check must not over-refuse: a satisfiable requirement is stored as JSON
+    and round-trips through the row, normalised to the canonical spelling."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs web", assignee="demo",
+                             requires_toolsets=["Web", "web"])
+        assert _task(conn, tid).requires_toolsets == ["web"]
+        assert kb.list_tasks(conn)[0].requires_toolsets == ["web"]
+
+
+def test_create_task_refuses_a_requirement_that_is_not_a_toolset_name(kanban_home, toolset_lanes):
+    """``files`` is a plausible typo for ``file``; stored as-is it would compare
+    unequal to every lane and refuse every card that carries it, so it is refused
+    here with the closest canonical name instead."""
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError) as excinfo:
+            kb.create_task(conn, title="typo", assignee="demo", requires_toolsets=["files"])
+        message = str(excinfo.value)
+        assert "files" in message
+        assert "file" in message, "refusal must point at the closest canonical toolset name"
+        assert kb.list_tasks(conn) == []
+
+
+def test_create_task_refuses_a_pinned_skill_that_needs_a_missing_toolset(kanban_home, toolset_lanes):
+    """A skill's own frontmatter requirement is judged the same way, and the message
+    names WHICH skill asked for the tool — the reader has to drop or re-route it."""
+    _write_skill_requiring(toolset_lanes["demo"] / "skills", "browser-skill", ["browser"])
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError) as excinfo:
+            kb.create_task(conn, title="pinned", assignee="demo", skills=["browser-skill"])
+        message = str(excinfo.value)
+        assert "browser-skill" in message
+        assert "browser" in message
+        assert "demo" in message
+        assert kb.list_tasks(conn) == []
+
+
+def test_create_task_allows_a_pinned_skill_when_the_lane_carries_the_toolset(kanban_home, toolset_lanes):
+    """The same skill dispatches fine to a lane that carries the toolset."""
+    _write_skill_requiring(toolset_lanes["other"] / "skills", "browser-skill", ["browser"])
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="pinned ok", assignee="other", skills=["browser-skill"])
+        assert _task(conn, tid).skills == ["browser-skill"]
+
+
+def test_card_and_skill_requirements_are_unioned(kanban_home, toolset_lanes):
+    """Both sources count: the card asks for vision, its pinned skill for browser, and
+    the lane carries browser only — only the card's requirement is reported."""
+    # `demo` carries browser but not vision, so the skill's requirement is satisfied
+    # while the card's is not: exactly one of the two may appear in the refusal.
+    _write_lane_config(toolset_lanes["demo"], [*_LEAN_TOOLSETS, "browser"])
+    _write_skill_requiring(toolset_lanes["demo"] / "skills", "browser-skill", ["browser"])
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError) as excinfo:
+            kb.create_task(conn, title="union", assignee="demo", skills=["browser-skill"],
+                           requires_toolsets=["vision"])
+    message = str(excinfo.value)
+    assert "vision" in message and "required by the card" in message
+    assert "browser" not in message, "a requirement the lane satisfies must not be reported"
+
+
+def test_assign_task_refuses_a_card_requiring_a_toolset_the_target_lane_lacks(kanban_home, toolset_lanes):
+    """A card created with no assignee carries its requirement past the create-time
+    check; attaching a lane that cannot satisfy it is refused before the owner is
+    written, and the same card still assigns to a lane that can."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="later", requires_toolsets=["vision"])
+        with pytest.raises(ValueError) as excinfo:
+            kb.assign_task(conn, tid, "demo")
+        assert "vision" in str(excinfo.value)
+        assert _task(conn, tid).assignee is None, "a refused assign must not be written"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "assigned"] == []
+        assert kb.assign_task(conn, tid, "other") is True
+        assert _task(conn, tid).assignee == "other"
+
+
+def test_default_assignee_refuses_a_card_requiring_a_missing_toolset(
+    kanban_home, toolset_lanes, caplog,
+):
+    """The dispatcher's config-driven attach has no operator reading a raise, so it is
+    logged and NOT written — exactly like the unloadable-skill case above."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="unjudged", requires_toolsets=["browser"])
+    with kbc.connect_closing() as conn:
+        with caplog.at_level("WARNING"):
+            assert kbd._apply_default_assignee(conn, tid, "demo", dry_run=False) is False
+        assert _task(conn, tid).assignee is None, "the assign must not be written"
+    assert any("default_assignee" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_request_review_refuses_a_reviewer_lane_without_the_required_toolset(kanban_home, toolset_lanes):
+    """The reviewer takes the card over, so the reviewer's lane is judged too, and a
+    refusal leaves the card in the implementer's hands."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="review", assignee="other", requires_toolsets=["vision"])
+        kb.claim_task(conn, tid)
+        run_id = _task(conn, tid).current_run_id
+        assert run_id is not None
+        refused = kb.request_review(
+            conn, tid, reviewer="demo", expected_run_id=run_id, with_reason=True)
+        assert isinstance(refused, tuple), refused
+        ok, reason = refused
+        assert ok is False
+        assert reason and "vision" in reason
+        task = _task(conn, tid)
+        assert task.status == "running", "a refused handoff must not move the card"
+        assert task.assignee == "other"
+
+
+def test_cards_without_toolset_requirements_are_unaffected(kanban_home, toolset_lanes):
+    """No regression: a card carrying no requirement, and a skill that declares none,
+    create and assign exactly as before."""
+    with kbc.connect_closing() as conn:
+        plain = kb.create_task(conn, title="plain", assignee="demo", skills=["demo-skill"])
+        assert _task(conn, plain).requires_toolsets is None
+        unassigned = kb.create_task(conn, title="no requirement")
+        assert kb.assign_task(conn, unassigned, "demo") is True
+        assert _task(conn, unassigned).assignee == "demo"

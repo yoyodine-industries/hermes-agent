@@ -19,7 +19,7 @@ _TASK_DICT_FIELDS = (
     "id", "title", "body", "assignee", "status", "priority", "tenant",
     "workspace_kind", "workspace_path", "branch_name", "project_id",
     "created_by", "created_at", "started_at", "completed_at", "result",
-    "skills", "max_retries", "model_override", "provider_override",
+    "skills", "requires_toolsets", "max_retries", "model_override", "provider_override",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
     "due_at", "due_window_policy",
 )
@@ -86,4 +86,5 @@ def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     d = _obj_dict(t, _TASK_DICT_FIELDS)
     d["skills"] = list(t.skills) if t.skills else []
+    d["requires_toolsets"] = list(t.requires_toolsets) if t.requires_toolsets else []
     return d

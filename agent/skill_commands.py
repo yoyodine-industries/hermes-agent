@@ -210,6 +210,46 @@ def preload_skill_problems(skill_identifiers: Iterable[str]) -> list[dict[str, s
     return problems
 
 
+def preload_skill_requirements(skill_identifiers: Iterable[str]) -> dict[str, list[str]]:
+    """Toolsets each identifier's frontmatter REQUIRES, keyed by identifier as written.
+
+    The dispatch-time half of the question ``preload_skill_problems`` answers. A skill
+    whose frontmatter declares ``metadata.hermes.requires_toolsets`` (see
+    ``extract_skill_conditions``) needs those toolsets in the worker's enabled set; a
+    card that pins it against a lane that dropped one hands over work the lane
+    structurally cannot do, and the worker fails or answers without the tool. Callers
+    that must refuse that pair (kanban card create/assign) ask the worker's own question
+    here: same loader, same profile scope, bodies not rendered.
+
+    Identifiers that do not load are SKIPPED, not reported: ``preload_skill_problems``
+    owns that refusal, so one card gets one readable reason. Empty/duplicate entries are
+    skipped, and identifiers whose frontmatter declares nothing are omitted entirely.
+    """
+    from agent.skill_utils import extract_skill_conditions, parse_frontmatter
+
+    required: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for raw in skill_identifiers or ():
+        identifier = str(raw or "").strip()
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+        loaded = _load_skill_payload(identifier)
+        if not loaded:
+            continue
+        payload = loaded[0] or {}
+        try:
+            raw_content = str(payload.get("raw_content") or payload.get("content") or "")
+            frontmatter, _ = parse_frontmatter(raw_content)
+            names = extract_skill_conditions(frontmatter).get("requires_toolsets") or []
+        except Exception:
+            continue
+        cleaned = [str(name).strip() for name in names if str(name or "").strip()]
+        if cleaned:
+            required[identifier] = sorted(dict.fromkeys(cleaned))
+    return required
+
+
 def _skill_view_failure(identifier: str) -> dict[str, Any]:
     """The failing ``skill_view`` payload for *identifier* (``{}`` when unreadable).
 

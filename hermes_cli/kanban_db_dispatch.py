@@ -2054,12 +2054,20 @@ def _apply_default_assignee(
     A row whose stored skills no worker for the default can load is refused
     here as well: the assign would hand the dispatcher a card that crash-loops
     on ``Unknown skill(s)`` and auto-blocks with the reason visible only in a
-    worker log. ``kanban.default_assignee`` is a config value, so this attach is
+    worker log. The same question covers toolsets the default's lane does not
+    carry (``platform_toolsets.cli``) — the card or its pinned skills require
+    one the lane dropped, so the worker would run without the tool.
+    ``kanban.default_assignee`` is a config value, so this attach is
     the one with no operator in the loop to read a refusal — it is logged.
     """
-    row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute(
+        "SELECT skills, requires_toolsets FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
     try:
-        _kb._refuse_unloadable_skills(row["skills"] if row is not None else None, assignee)
+        _kb._refuse_unloadable_skills(
+            row["skills"] if row is not None else None, assignee,
+            row["requires_toolsets"] if row is not None else None,
+        )
     except ValueError as exc:
         _kb._log.warning(
             "kanban dispatch: not applying default_assignee=%r to task %s: %s",
