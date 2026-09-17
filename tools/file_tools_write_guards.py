@@ -140,36 +140,97 @@ _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
     "agents.md", "claude.md", "soul.md", ".cursorrules"})
 
 
-def _protected_instruction_config() -> tuple[bool, list[str]]:
-    """Return ``(enabled, extra_patterns)`` from ``security.protected_instruction_files`` /
-    ``security.protected_instruction_extra_patterns`` (fnmatch on basename). Config read
-    failures keep the gate ON — fail-safe for a security boundary."""
+def _protected_instruction_config() -> tuple[bool, list[str], list[str]]:
+    """Return ``(enabled, extra_patterns, allowlist_dirs)`` from the ``security.protected_instruction_*``
+    keys (fnmatch on basename). Config read failures keep the gate ON — fail-safe for a security boundary.
+    ``allowlist_dirs`` are Yoyodine-local trusted trees where PROJECT-CONTEXT instruction files
+    (``AGENTS.md`` / ``CLAUDE.md`` / ``.cursorrules``) are edited without the always-ask gate; identity
+    files are never covered by the allowlist (see ``_protected_instruction_reason``)."""
     try:
         from hermes_cli.config import load_config, cfg_get
         cfg = load_config()
         enabled = cfg_get(cfg, "security", "protected_instruction_files", default=True)
         extra = cfg_get(cfg, "security", "protected_instruction_extra_patterns", default=[])
+        allowlist = cfg_get(cfg, "security", "protected_instruction_allowlist_dirs", default=[])
     except Exception:
-        return True, []
+        return True, [], []
     if not isinstance(enabled, bool):
         enabled = True
     if not isinstance(extra, list):
         extra = []
-    return enabled, [str(p) for p in extra if p]
+    if not isinstance(allowlist, list):
+        allowlist = []
+    return enabled, [str(p) for p in extra if p], [str(p) for p in allowlist if p]
+
+
+def _identity_match(candidate: str, extra_patterns: list[str]) -> tuple[str, bool] | None:
+    """``(label, is_identity)`` when *candidate* names a protected instruction file, else ``None``.
+
+    ``is_identity`` marks the agent's OWN identity material: ``SOUL.md`` and the operator's
+    ``*-soul.md``-style extra patterns. Identity files keep the always-ask gate even inside an
+    allowlisted tree — a lane rewriting any bot's identity is exactly what the allowlist must not
+    open. ``AGENTS.md`` / ``CLAUDE.md`` / ``.cursorrules`` are project-context material and stay
+    exempt in an allowlisted tree (operator decision 2026-09-17)."""
+    base = os.path.basename(candidate)
+    base_lower = base.lower()
+    if base_lower == "soul.md":
+        return base, True
+    if base_lower in _PROTECTED_INSTRUCTION_BASENAMES:
+        return base, False
+    for pattern in extra_patterns:
+        if fnmatch.fnmatch(base_lower, pattern.lower()):
+            return base, True
+    return None
+
+
+def _hermes_exempt_homes() -> tuple[str, ...]:
+    """Realpaths of the Hermes home tree(s) this PROJECT-LOCAL gate stays out of: the ACTIVE profile's
+    home and — when that home is a named profile (``<root>/profiles/<name>``) — the Hermes ROOT too, so
+    the root's direct files (``LEDGER.md`` / ``notes.md`` / ``cron/jobs.json``) are not read as a
+    project-local ``<repo>/.hermes`` config. Identity files never reach this exemption: the reason
+    matcher settles them first, so widening the home cannot open a SOUL.md."""
+    home = _get_real_hermes_home()
+    if not home:
+        return ()
+    try:
+        from hermes_constants import named_profile_home
+        profile_home = named_profile_home(home)
+    except Exception:
+        profile_home = None
+    if profile_home is None:
+        return (home,)
+    root = os.path.realpath(os.path.dirname(os.path.dirname(str(profile_home))))
+    return (home, root) if root and root != home else (home,)
+
+
+def _in_allowlisted_dir(resolved: str, allowlist_dirs: list[str]) -> bool:
+    """True when *resolved* sits inside one of the operator-declared trusted trees."""
+    for entry in allowlist_dirs:
+        real_entry = os.path.realpath(os.path.normpath(_expand_tilde(entry)))
+        if real_entry and (resolved == real_entry or resolved.startswith(real_entry + os.sep)):
+            return True
+    return False
 
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
-                                  extra_patterns: list[str] | None = None) -> str | None:
+                                  extra_patterns: list[str] | None = None,
+                                  allowlist_dirs: list[str] | None = None) -> str | None:
     """Return a short label when ``filepath`` targets a protected instruction file, else ``None``.
-    Matches BOTH the normalized input and its realpath so no symlink direction escapes.
 
     Matching runs on BOTH the normalized input path and its realpath so neither a symlink pointing AT a
     protected file (#41351) nor a protected name that is itself a symlink escapes the gate. ``..`` traversal
     is neutralized by normpath/realpath before the basename compare.
+
+    ORDER: identity -> allowlist -> Hermes-home exemption -> ``.hermes`` component rule. Identity files are
+    matched before every exemption on purpose: measured 2026-09-17, an exemption-first order returned
+    ``None`` for ``~/.hermes/SOUL.md``, ``~/.hermes/profiles/<bot>/SOUL.md`` and
+    ``~/.hermes/config/yoyodine/<bot>-soul.md`` in any session whose home is the Hermes root, and the
+    allowlist swallowed the same files under ``/opt`` — i.e. the gate silently allowed a lane to rewrite a
+    bot's identity. An identity file is gated wherever it lives.
     """
-    if enabled is None or extra_patterns is None:
-        enabled, extra_patterns = _protected_instruction_config()
+    if enabled is None or extra_patterns is None or allowlist_dirs is None:
+        enabled, extra_patterns, allowlist_dirs = _protected_instruction_config()
     if not enabled:
         return None
 
@@ -179,19 +240,29 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     except (OSError, ValueError, RuntimeError):
         resolved = os.path.realpath(normalized)
 
+    # Identity files FIRST — no exemption below may swallow one.
+    for candidate in (normalized, resolved):
+        hit = _identity_match(candidate, extra_patterns)
+        if hit is not None and hit[1]:
+            return hit[0]
+
+    # Operator-declared trusted trees: PROJECT-CONTEXT instruction files are expected to be edited
+    # there without the always-ask gate. Identity files were settled above, so this can never exempt a
+    # SOUL.md; realpath'd so a symlinked directory cannot evade the list either.
+    if _in_allowlisted_dir(resolved, allowlist_dirs):
+        return None
+
     # ~/.hermes itself is governed by its own guards (config.yaml hard-block,
     # mirror guard, write_approval); this gate targets PROJECT-LOCAL files only.
     # Must run before the ``.hermes`` component rule, which would match the home.
-    real_home = _get_real_hermes_home()
-    if real_home and (resolved == real_home or resolved.startswith(real_home + os.sep)):
-        return None
+    for real_home in _hermes_exempt_homes():
+        if resolved == real_home or resolved.startswith(real_home + os.sep):
+            return None
 
     for candidate in (normalized, resolved):
-        base = os.path.basename(candidate)
-        base_lower = base.lower()
-        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
-                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
-            return base
+        hit = _identity_match(candidate, extra_patterns)
+        if hit is not None:
+            return hit[0]
         # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
         # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
         # would gate every write inside a checkout living under ~/.hermes.
@@ -278,10 +349,11 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
 def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
     the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
-    enabled, extra = _protected_instruction_config()
+    enabled, extra, allowlist = _protected_instruction_config()
     if not enabled:
         return None
-    reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra)
+    reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra,
+                                                         allowlist_dirs=allowlist)
                            for p in paths) if r]
     if not reasons:
         return None

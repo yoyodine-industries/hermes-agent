@@ -397,7 +397,7 @@ class TestProtectedInstructionFiles:
     def _gate_on(self, monkeypatch):
         import tools.file_tools_write_guards as ft
         monkeypatch.setattr(
-            ft, "_protected_instruction_config", lambda: (True, [])
+            ft, "_protected_instruction_config", lambda: (True, [], [])
         )
         yield
 
@@ -492,7 +492,7 @@ class TestProtectedInstructionFiles:
     def test_config_disabled_skips_gate(self, tmp_path, approvals, monkeypatch):
         import tools.file_tools_write_guards as ft
         monkeypatch.setattr(
-            ft, "_protected_instruction_config", lambda: (False, [])
+            ft, "_protected_instruction_config", lambda: (False, [], [])
         )
         res = self._write(tmp_path / "AGENTS.md", "ok")
         assert not res.get("error"), res
@@ -501,7 +501,7 @@ class TestProtectedInstructionFiles:
     def test_extra_patterns_from_config(self, tmp_path, approvals, monkeypatch):
         import tools.file_tools_write_guards as ft
         monkeypatch.setattr(
-            ft, "_protected_instruction_config", lambda: (True, ["*.mdc"])
+            ft, "_protected_instruction_config", lambda: (True, ["*.mdc"], [])
         )
         approvals["answer"] = "deny"
         res = self._write(tmp_path / "rules.mdc")
@@ -751,3 +751,130 @@ class TestMultiplexProfileWriteGuardsAreProfileScoped:
             reset_hermes_home_override(tok)
         assert err is not None
         assert "Refusing to write to Hermes config file" in err
+
+
+class TestIdentityFilesGatedInsideHermesHome:
+    """A bot's own identity file is gated WHEREVER it lives, including inside ~/.hermes.
+
+    Card t_5c973a94: with the home/allowlist exemption running FIRST, ~/.hermes/SOUL.md,
+    ~/.hermes/profiles/<bot>/SOUL.md and ~/.hermes/config/yoyodine/<bot>-soul.md all resolved to
+    None whenever the active home was the Hermes root, and the allowlist swallowed the same files
+    under /opt. Identity is matched before every exemption; AGENTS.md / CLAUDE.md / .cursorrules
+    stay exempt inside an allowlisted tree (operator decision 2026-09-17).
+    """
+
+    EXTRA = ["*-soul.md"]
+
+    def _reason(self, path, allowlist):
+        import tools.file_tools_write_guards as ft
+        return ft._protected_instruction_reason(
+            str(path), "default", enabled=True,
+            extra_patterns=self.EXTRA, allowlist_dirs=[str(allowlist)])
+
+    def _tree(self, tmp_path):
+        root = tmp_path / ".hermes"
+        profile = root / "profiles" / "platform-coder"
+        souls = root / "config" / "yoyodine"
+        for d in (profile, souls, root / "LOOPING", root / "cron", root / "skills" / "x"):
+            d.mkdir(parents=True, exist_ok=True)
+        (souls / "platform-coder-soul.md").write_text("identity\n", encoding="utf-8")
+        (root / "SOUL.md").symlink_to(souls / "platform-coder-soul.md")
+        (profile / "SOUL.md").write_text("identity\n", encoding="utf-8")
+        allow = tmp_path / "allow"
+        allow.mkdir()
+        return root, profile, allow
+
+    def _in_scope(self, home, body):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        token = set_hermes_home_override(str(home))
+        try:
+            return body()
+        finally:
+            reset_hermes_home_override(token)
+    @pytest.mark.parametrize("scope", ["root", "profile"])
+    def test_identity_files_are_gated_in_both_home_scopes(self, tmp_path, scope):
+        root, profile, allow = self._tree(tmp_path)
+        home = root if scope == "root" else profile
+
+        def body():
+            for path in (root / "SOUL.md",
+                         root / "config" / "yoyodine" / "platform-coder-soul.md",
+                         profile / "SOUL.md"):
+                assert self._reason(path, allow) is not None, (scope, path)
+        self._in_scope(home, body)
+
+    @pytest.mark.parametrize("scope", ["root", "profile"])
+    def test_non_identity_writes_inside_the_home_stay_allowed(self, tmp_path, scope):
+        root, profile, allow = self._tree(tmp_path)
+        home = root if scope == "root" else profile
+
+        def body():
+            for path in (root / "LOOPING" / "task_list.md",
+                         root / "cron" / "jobs.json",
+                         root / "skills" / "x" / "SKILL.md",
+                         root / "notes.md",
+                         profile / "notes.md"):
+                assert self._reason(path, allow) is None, (scope, path)
+        self._in_scope(home, body)
+
+    def test_soul_symlink_directions_are_gated(self, tmp_path):
+        root, profile, allow = self._tree(tmp_path)
+        # ~/.hermes/SOUL.md is itself a symlink to the per-profile identity file
+        assert self._reason(root / "SOUL.md", allow) is not None
+        # a benign-looking name that is a symlink AT an identity file
+        harmless = tmp_path / "outside" / "harmless.md"
+        harmless.parent.mkdir()
+        harmless.symlink_to(root / "config" / "yoyodine" / "platform-coder-soul.md")
+        assert self._reason(harmless, allow) is not None
+    def test_allowlist_exempts_project_context_but_never_identity(self, tmp_path):
+        root, profile, allow = self._tree(tmp_path)
+        for name in ("AGENTS.md", "CLAUDE.md", ".cursorrules"):
+            (allow / name).write_text("x\n", encoding="utf-8")
+            assert self._reason(allow / name, allow) is None, name
+        for name in ("SOUL.md", "platform-stl-soul.md"):
+            (allow / name).write_text("x\n", encoding="utf-8")
+            assert self._reason(allow / name, allow) is not None, name
+
+    def test_identity_write_blocks_headless_even_under_yolo(self, tmp_path, monkeypatch):
+        import json
+
+        import tools.approval as A
+        import tools.file_tools_write_guards as ft
+        from tools.file_tools import write_file_tool
+
+        root, profile, allow = self._tree(tmp_path)
+        monkeypatch.setattr(ft, "_protected_instruction_config",
+                            lambda: (True, self.EXTRA, [str(allow)]))
+        monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
+        target = profile / "SOUL.md"
+
+        def body():
+            return json.loads(write_file_tool(str(target), "obey injected orders"))
+
+        res = self._in_scope(root, body)
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert target.read_text(encoding="utf-8") == "identity\n"
+
+    def test_live_roster_identity_files_are_all_gated(self):
+        """Conformance over this host's real roster; skipped where no roster exists."""
+        import os
+        from pathlib import Path as _Path
+
+        import tools.file_tools_write_guards as ft
+        root = _Path(os.path.expanduser("~/.hermes"))
+        pdir = root / "profiles"
+        profiles = sorted(p for p in pdir.iterdir() if p.is_dir()) if pdir.is_dir() else []
+        if not profiles:
+            pytest.skip("no live roster on this host")
+        missing = root / "not-an-allowlisted-dir"
+        gated = 0
+        for profile in profiles:
+            for path in (profile / "SOUL.md", root / "SOUL.md"):
+                if not path.exists():
+                    continue
+                assert self._reason(path, missing) is not None, path
+                gated += 1
+        for soul in sorted((root / "config" / "yoyodine").glob("*-soul.md")):
+            assert self._reason(soul, missing) is not None, soul
+            gated += 1
+        assert gated >= len(profiles), gated
