@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v2"
+SCANNER_VERSION = "skills-guard-v3"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -68,7 +68,11 @@ MODIFY_VERB_RE = (
     r'|\binject(?:s|ed|ing)?\b|\boverwrit(?:e|es|ing)\b|\boverwritten\b'
     r'|\breplac(?:e|es|ed|ing)\b|\balter(?:s|ed|ing)?\b|\badd(?:s|ed|ing)\b)')
 
-_AGENT_CONFIG_FILES = r'(?:AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules)'
+_AGENT_CONFIG_FILES = (
+    r'(?:AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules|[\w.-]*-soul\.md)')
+# ``<bot>-soul\.md`` is a bot's live identity in the config repo (a profile's SOUL.md symlink target),
+# so it carries the same persistence weight as SOUL.md. The ``[\w.-]*-`` prefix keeps the tier tied to
+# the identity-file suffix: ``soul-notes.md`` / ``foo-soul.md.bak`` do not match.
 _HERMES_CONFIG_FILES = r'\.hermes/(?:config\.yaml|SOUL\.md)'
 # Path prefixes (real files are e.g. .claude/settings.json): consume trailing filename chars.
 _OTHER_AGENT_CONFIG_FILES = r'\.(?:claude/settings|codex/config)[\w.]*'
@@ -305,7 +309,7 @@ THREAT_PATTERNS = [
      "agent_config_mod_shell", "critical", "persistence", "shell write (redirect/sed -i/tee/cp/mv) targeting agent config files (persistence mechanism)"),
     (_content_contract_re(_AGENT_CONFIG_FILES),
      "agent_config_contract", "high", "persistence", "dictates agent config file contents (verify intent — authoring guides use this shape too)"),
-    (r'AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules',
+    (r'AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules|[\w.-]*-soul\.md',
      "agent_config_ref", "low", "persistence", "references agent config files (informational; only modification intent is scored)"),
     (_prose_modify_re(_HERMES_CONFIG_FILES),
      "hermes_config_mod", "high", "persistence", "modification language aimed at Hermes configuration files (verify intent)"),

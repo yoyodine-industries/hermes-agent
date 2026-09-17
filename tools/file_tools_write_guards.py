@@ -138,6 +138,12 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 # probe common case variants too, so the stricter behavior is kept uniform.
 _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
     "agents.md", "claude.md", "soul.md", ".cursorrules"})
+# A bot's live identity is ``<bot>-soul.md`` in the config repo — the file a profile's ``SOUL.md``
+# symlinks to — so an exact-name set alone leaves every bot's own standing instructions rewritable
+# with no approval prompt, which is exactly what this gate exists to stop. Globs match the BASENAME
+# only, suffix-anchored, so near-miss names (``platform-coder-soul.md.bak``, ``soul-notes.md``) stay
+# prompt-free.
+_PROTECTED_INSTRUCTION_GLOBS = frozenset({"*-soul.md"})
 
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
@@ -189,8 +195,10 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     for candidate in (normalized, resolved):
         base = os.path.basename(candidate)
         base_lower = base.lower()
-        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
-                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
+        if (base_lower in _PROTECTED_INSTRUCTION_BASENAMES
+                or any(fnmatch.fnmatch(base_lower, pattern)
+                       for pattern in _PROTECTED_INSTRUCTION_GLOBS)
+                or any(fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns)):
             return base
         # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
         # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
