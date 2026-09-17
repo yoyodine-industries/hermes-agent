@@ -214,6 +214,51 @@ def _log_tick_yield_once(reason: str) -> None:
     _last_yield_log = {"reason": reason, "at": now}
 
 
+# A job's own SOURCE process — the pre-run script runner (cron/scheduler_script.py) and the monitor
+# probe (cron/monitor.py) — reports failure as its OWN text: an exit code, its stdout, and for a
+# probe one line of findings per item. Those producer strings are a closed set, and they are the
+# only signature separating "our job's source failed" from "the agent's provider call failed".
+# Matching them by PREFIX is exact in both directions: a probe's lane "401" is that lane's status,
+# while a provider's "HTTP 401 authentication failed" is never this shape.
+_SOURCE_PROCESS_FAILURE_PREFIXES = (
+    # cron/scheduler_script.py — _resolve_script_path / _script_argv / _run_job_script
+    "script timed out after",
+    "script exited with code",
+    "script execution failed:",
+    "script cancelled because cron fire ownership was lost",
+    "script not found:",
+    "script path is not a file:",
+    "blocked: script path",
+    "cannot run .sh/.bash script",
+    # cron/monitor.py — _run_monitor_source / _fetch_monitor_url
+    "monitor_url fetch failed:",
+    "monitor_url must be http(s):",
+    "monitor job has neither monitor_script nor monitor_url",
+)
+
+# Chat bound for a source's own output: wide enough to carry a probe's findings, narrow enough that
+# the alert doesn't become the output (the full text stays in the cron output file).
+_SOURCE_OUTPUT_EXCERPT_CHARS = 320
+
+
+def _is_source_process_failure(text: str) -> bool:
+    """True when *text* is a job source process's OWN report (pre-run script / monitor probe)."""
+    return text.lower().startswith(_SOURCE_PROCESS_FAILURE_PREFIXES)
+
+
+def _source_output_excerpt(text: str) -> str:
+    """Flatten a source's output for chat, keeping BOTH ends.
+
+    A probe prints its findings LAST (the per-item table, then the summary line), so the head-only
+    bound the generic cleaner applies drops exactly the line the operator needs.
+    """
+    flat = re.sub(r"\s+", " ", text).strip()
+    if len(flat) <= _SOURCE_OUTPUT_EXCERPT_CHARS:
+        return flat
+    half = (_SOURCE_OUTPUT_EXCERPT_CHARS - 5) // 2
+    return f"{flat[:half].rstrip()} ... {flat[-half:].lstrip()}"
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Compact one-line failure message for chat delivery (full details stay in cron output)."""
     job_name = job.get("name") or job.get("id") or "cron job"
@@ -223,7 +268,15 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # no_agent jobs never reach a model, so provider errors are structurally impossible for them.
     # Gate on job MODE before substring matching, or a script's own wording ("timed out", "429")
     # would blame the wrong subsystem; the generic cleaner below reports what actually happened.
-    provider_reachable = not job.get("no_agent")
+    #
+    # Gate on the TEXT'S ORIGIN as well: when the failure text IS a source process's own output,
+    # provider keywords in it are that source's FINDINGS, not our credentials failing. A monitor
+    # probe prints one status line per item and exits non-zero when any is unhealthy, so the lane
+    # that answered 401 put the word "401" in the error text — and the alert named a provider for a
+    # job whose model never ran, hiding the one line the operator needed.
+    provider_reachable = (
+        not job.get("no_agent") and not _is_source_process_failure(text)
+    )
 
     # Script runner contract ("Script timed out after {n}s: {path}") — also for agent jobs with a
     # context script. Must precede generic timeout matching so it never claims a provider fallback.
@@ -232,6 +285,19 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
         return (
             f"⚠️ Cron '{job_name}' failed: script timed out. "
             "No model was invoked. Full details saved in cron output."
+        )
+
+    # Any other way a job's OWN source fails (bad exit, unresolvable script, failed monitor_url
+    # fetch): the failure text is that source's report, so deliver it. Nothing else ran — there is
+    # no model or provider to name, and only the source's own output carries the finding.
+    if _is_source_process_failure(text):
+        from cron.monitor import job_has_monitor  # lazy: keep cron.monitor off the import path
+        source = "monitor source" if job_has_monitor(job) else "script"
+        return (
+            f"⚠️ Cron '{job_name}' failed: the job's own {source} failed. "
+            "No model was invoked — the text below is that source's own output: "
+            f"{_source_output_excerpt(text)} "
+            "Full details saved in cron output."
         )
 
     # Whole-token 429: substrings in job ids/ports/hashes tripped false rate-limit alerts.
