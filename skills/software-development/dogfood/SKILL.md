@@ -1,6 +1,6 @@
 ---
 name: dogfood
-description: "Exploratory QA of web apps: find bugs, evidence, reports."
+description: Use when doing exploratory QA on a web application.
 version: 1.0.0
 author: Teknium (teknium1), Hermes Agent
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # Dogfood: Systematic Web Application QA Testing
+
+Covers exploratory QA of web apps: finding bugs, capturing evidence, writing reports.
 
 ## Overview
 

@@ -1,6 +1,6 @@
 ---
 name: apple-notes
-description: "Manage Apple Notes via memo CLI: create, search, edit."
+description: Use when creating, viewing, or searching Apple Notes.
 version: 1.0.1
 author: Hermes Agent
 license: MIT
@@ -14,6 +14,8 @@ prerequisites:
 ---
 
 # Apple Notes
+
+Covers creating, searching, and editing notes from the terminal.
 
 Use `memo` to manage Apple Notes directly from the terminal. Notes sync across all Apple devices via iCloud.
 

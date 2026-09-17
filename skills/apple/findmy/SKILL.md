@@ -1,6 +1,6 @@
 ---
 name: findmy
-description: "Track Apple devices/AirTags via FindMy.app on macOS."
+description: Use when locating Apple devices or AirTags on macOS.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -8,9 +8,12 @@ platforms: [macos]
 metadata:
   hermes:
     tags: [FindMy, AirTag, location, tracking, macOS, Apple]
+    requires_toolsets: [vision]
 ---
 
 # Find My (Apple)
+
+Tracks Apple devices and AirTags via FindMy.app on macOS.
 
 Track Apple devices and AirTags via the FindMy.app on macOS. Since Apple doesn't
 provide a CLI for FindMy, this skill uses AppleScript to open the app and

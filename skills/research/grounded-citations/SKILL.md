@@ -1,6 +1,6 @@
 ---
 name: grounded-citations
-description: "Ground answers and documents in cited, verifiable sources."
+description: Use when answers or documents need cited sources.
 version: 1.2.0
 author: Hermes Agent + Teknium
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 ---
 
 # Grounded Citations
+
+Covers grounding answers and documents in cited, verifiable sources.
 
 Every claim taken from an outside source gets an inline numbered citation and a
 `Sources:` list, Perplexity-style. A ledger script owns the `url → [n]` mapping

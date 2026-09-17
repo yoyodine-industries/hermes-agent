@@ -1,6 +1,6 @@
 ---
 name: node-inspect-debugger
-description: "Debug Node.js via --inspect + Chrome DevTools Protocol CLI."
+description: Use when debugging Node.js with the V8 inspector.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # Node.js Inspect Debugger
+
+Covers `--inspect` debugging over the Chrome DevTools Protocol CLI.
 
 ## Overview
 

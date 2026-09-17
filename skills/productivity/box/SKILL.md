@@ -1,6 +1,6 @@
 ---
 name: box
-description: Box manages cloud files, sharing, search, and metadata.
+description: Use when uploading, sharing, or searching Box files.
 version: 1.0.0
 author: Chris Kim (iskysun96), Hermes Agent
 license: MIT
@@ -15,6 +15,8 @@ metadata:
 ---
 
 # Box
+
+Covers cloud file management, sharing, search, and metadata.
 
 Use Box as the cloud file system for file operations, collaboration, metadata, and document work. Run operations with Hermes' `terminal` tool and use the Box CLI; use the SDK guide when building an application.
 

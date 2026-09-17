@@ -1,6 +1,6 @@
 ---
 name: github
-description: "GitHub via gh CLI: PRs, issues, reviews, repos, auth."
+description: Use when working GitHub PRs, issues, or reviews via gh.
 version: 2.0.0
 author: Ben Barclay (benbarclay), Hermes Agent
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 ---
 
 # GitHub
+
+Covers PRs, issues, reviews, repos, and auth via the `gh` CLI.
 
 Work GitHub end to end with the `gh` CLI (REST fallback where noted): auth,
 issues, the PR lifecycle, issue-to-PR delivery, code review, and repo

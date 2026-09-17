@@ -1,6 +1,6 @@
 ---
 name: pdf
-description: "PDF files: create, read, merge, fill, OCR, edit text."
+description: Use when creating, reading, merging, or filling PDFs.
 version: 1.1.0
 author: Nous Research
 license: MIT
@@ -10,9 +10,12 @@ metadata:
     tags: [pdf, documents, forms, ocr, text-extraction, reportlab, pypdf, pdfplumber, pymupdf, marker]
     category: productivity
     related_skills: [docx, xlsx, powerpoint]
+    requires_toolsets: [vision]
 ---
 
 # PDF Skill
+
+Covers creating, reading, merging, filling, OCR, and text edits on PDF files.
 
 Create PDFs from structured specs, build and fill AcroForm forms (with layout linting and visual overlays), extract text/tables/metadata, merge/split/rotate/watermark/stamp pages, export page images, manage metadata and attachments, and encrypt/decrypt — using pypdf, reportlab, and pdfplumber. Two absorbed capabilities live in references/ (read the matching file before those tasks):
 

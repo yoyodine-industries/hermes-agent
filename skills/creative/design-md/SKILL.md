@@ -1,6 +1,6 @@
 ---
 name: design-md
-description: Author/validate/export Google's DESIGN.md token spec files.
+description: Use when authoring or validating DESIGN.md token specs.
 version: 1.1.0
 author: Hermes Agent
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # DESIGN.md Skill
+
+Covers authoring, validating, and exporting Google's DESIGN.md token spec files.
 
 DESIGN.md is Google's open spec (Apache-2.0, `google-labs-code/design.md`) for
 describing a visual identity to coding agents. One file combines:

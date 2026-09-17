@@ -1,6 +1,6 @@
 ---
 name: google-workspace
-description: "Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python."
+description: Use when working with Gmail, Calendar, Drive, or Sheets.
 version: 1.2.0
 author: Nous Research
 license: MIT
@@ -18,6 +18,8 @@ metadata:
 ---
 
 # Google Workspace
+
+Covers Gmail, Calendar, Drive, Docs, and Sheets via the `gws` CLI or Python.
 
 Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. When `gws` is installed, the skill uses it as the execution backend for broader Google Workspace coverage; otherwise it falls back to the bundled Python client implementation.
 

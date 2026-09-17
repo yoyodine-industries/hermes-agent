@@ -1,6 +1,6 @@
 ---
 name: popular-web-designs
-description: 54 real design systems (Stripe, Linear, Vercel) as HTML/CSS.
+description: Use when borrowing a real design system for HTML/CSS.
 version: 1.0.0
 author: Hermes Agent + Teknium (design systems sourced from VoltAgent/awesome-design-md)
 license: MIT
@@ -19,6 +19,8 @@ triggers:
 ---
 
 # Popular Web Designs
+
+54 real design systems (Stripe, Linear, Vercel) as HTML/CSS.
 
 54 real-world design systems ready for use when generating HTML/CSS. Each template captures a
 site's complete visual language: color palette, typography hierarchy, component styles, spacing

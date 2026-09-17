@@ -1,6 +1,6 @@
 ---
 name: claude-design
-description: Design one-off HTML artifacts (landing, deck, prototype).
+description: Use when designing a one-off HTML artifact (deck, page).
 version: 1.1.0
 author: BadTechBandit
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # Claude Design for CLI/API Agents
+
+Covers one-off HTML artifacts: landing pages, decks, and prototypes.
 
 Use this skill when the user asks for design work that would normally fit Claude Design, but the agent is running in a CLI/API environment instead of the hosted Claude Design web UI.
 
