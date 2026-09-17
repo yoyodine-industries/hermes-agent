@@ -1076,6 +1076,49 @@ def _tirith_scan(command: str) -> dict:
         }]}
 
 
+def _check_terminal_identity_write(command: str, task_id: str = "default") -> dict | None:
+    """Identity-file write gate for the terminal surface (always-ask, never persisted).
+
+    Extracts literal write-target paths from *command* and matches them against the identity
+    instruction-file set (SOUL.md / *-soul.md) with the SAME matcher the file tools use, then
+    routes a hit through the one-operation always-ask approval that is never bypassed by --yolo
+    or allowlists. A positively-identified identity write with no human channel fails CLOSED;
+    non-literal targets fail OPEN (best-effort, like the ``~/.ssh/config`` terminal coverage).
+    """
+    from tools.approval_detection import iter_write_target_paths
+    from tools.file_tools_write_guards import (
+        _protected_instruction_config,
+        _protected_instruction_reason,
+        _request_protected_instruction_approval,
+    )
+
+    paths = list(iter_write_target_paths(command))
+    if not paths:
+        return None
+    enabled, extra, allowlist = _protected_instruction_config()
+    if not enabled:
+        return None
+    reasons: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        reason = _protected_instruction_reason(path, task_id, enabled=enabled,
+                                               extra_patterns=extra,
+                                               allowlist_dirs=allowlist,
+                                               identity_only=True)
+        if reason:
+            reasons.append(reason)
+    if not reasons:
+        return None
+    blocked = _request_protected_instruction_approval(list(dict.fromkeys(reasons)), task_id)
+    if blocked is None:
+        return None
+    return _blocked(blocked, pattern_key="protected_instruction_file",
+                    description="write to protected agent-instruction file(s)")
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -1089,6 +1132,12 @@ def check_all_command_guards(command: str, env_type: str,
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
+
+    # Identity instruction-file writes are always-ask and must NOT be swallowed by the
+    # --yolo / approval-off / permanent-allowlist early returns below.
+    identity_block = _check_terminal_identity_write(command)
+    if identity_block is not None:
+        return identity_block
 
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":

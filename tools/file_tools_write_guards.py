@@ -215,7 +215,8 @@ def _in_allowlisted_dir(resolved: str, allowlist_dirs: list[str]) -> bool:
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
                                   extra_patterns: list[str] | None = None,
-                                  allowlist_dirs: list[str] | None = None) -> str | None:
+                                  allowlist_dirs: list[str] | None = None,
+                                  identity_only: bool = False) -> str | None:
     """Return a short label when ``filepath`` targets a protected instruction file, else ``None``.
 
     Matching runs on BOTH the normalized input path and its realpath so neither a symlink pointing AT a
@@ -245,6 +246,12 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         hit = _identity_match(candidate, extra_patterns)
         if hit is not None and hit[1]:
             return hit[0]
+
+    if identity_only:
+        # Terminal-side identity gate: SOUL.md / *-soul.md only. Project-context files
+        # (AGENTS.md / CLAUDE.md / .cursorrules) and the .hermes-component rule stay in the
+        # file-tool's scope, so a terminal write of a project AGENTS.md is not newly gated here.
+        return None
 
     # Operator-declared trusted trees: PROJECT-CONTEXT instruction files are expected to be edited
     # there without the always-ask gate. Identity files were settled above, so this can never exempt a

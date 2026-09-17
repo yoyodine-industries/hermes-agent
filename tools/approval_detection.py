@@ -1203,6 +1203,69 @@ def _iter_shell_command_word_spans(command: str):
             positionals = _COMMAND_WRAPPER_POSITIONAL_ARGS.get(name, 0)
 
 
+_WRITE_REDIRECT_RE = re.compile(r"(?:[0-9]+|&)?(?:>>|>(?:\||&)?)")
+
+
+def iter_write_target_paths(command: str):
+    """Yield literal paths a shell command may WRITE (best-effort, never executes).
+
+    Extracted for the terminal identity-file gate: write-redirect targets (``>``, ``>>``,
+    ``>|``, ``2>``, ``&>``, ``>&`` ...), ``tee`` operands, ``cp``/``mv``/``install``
+    destinations, and ``sed``/``perl``/``ruby`` ``-i`` in-place targets. Non-literal
+    targets (variables, globs, command substitution, heredoc bodies, fd-dup ``2>&1``)
+    are intentionally NOT resolved — the gate fails OPEN on them, matching the existing
+    terminal ``~/.ssh/config`` best-effort coverage. Callers dedupe and match.
+    """
+    if not command or _command_parser_limit_exceeded(command):
+        return
+    if ">" not in command and not any(k in command for k in ("tee", "cp", "mv", "install", "sed", "perl", "ruby")):
+        return
+    for start in _iter_shell_command_starts(command):
+        cmd_name = None
+        operands: list[str] = []
+        inplace = False
+        first_word = True
+        pos = start
+        while pos < len(command):
+            ws = _skip_shell_whitespace(command, pos)
+            redirect = _WRITE_REDIRECT_RE.match(command, ws)
+            if redirect:
+                op = redirect.group(0)
+                _, end, target = _read_shell_word(command, redirect.end())
+                pos = end if target else redirect.end()
+                if target:
+                    deob = _deobfuscate_shell_word_for_detection(target)
+                    # `>&N` / `2>&1` duplicate a file descriptor; only a non-digit
+                    # RHS (`>& file`) is a file write.
+                    if not (op.endswith("&") and deob.isdigit()):
+                        yield deob
+                continue
+            word_start, word_end, word = _read_shell_word(command, pos)
+            if word_start == word_end:
+                break
+            pos = word_end
+            deob = _deobfuscate_shell_word_for_detection(word)
+            if first_word:
+                first_word = False
+                cmd_name = os.path.basename(deob).lower()
+                continue
+            if deob == "--":
+                continue
+            if deob.startswith("-"):
+                if cmd_name in {"sed", "perl", "ruby"} and (deob == "-i" or deob.startswith("-i") and len(deob) > 2):
+                    inplace = True
+                continue
+            operands.append(deob)
+        if not cmd_name:
+            continue
+        if cmd_name == "tee":
+            yield from operands
+        elif cmd_name in {"cp", "mv", "install"} and operands:
+            yield operands[-1]
+        elif cmd_name in {"sed", "perl", "ruby"} and inplace and operands:
+            yield operands[-1]
+
+
 def _shell_command_segment(command: str, start: int) -> str:
     """Bound a candidate to its command, preserving quoted argument bytes."""
     end = len(command)
