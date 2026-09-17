@@ -64,16 +64,73 @@ def _profile_name(home: Path) -> str:
     return home.name if home.parent.name == "profiles" else "default"
 
 
-def _handle(name: str) -> str:
-    # The mention middleware aliases the default profile as @hermes.
-    return "hermes" if name == "default" else name
+# Handles the mention middleware reserves for a surface rather than a bot: @all / @everyone
+# address the room and @user / @default are the client's own tokens.
+_RESERVED_HANDLES = frozenset({"all", "everyone", "user", "default"})
+_HANDLE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}", re.I)
+
+
+def _configured_handle(root: str | os.PathLike | None = None) -> str | None:
+    """The default profile's addressable handle: ``ui_meta['hermes-bots'].handle`` on the
+    install-root profile.yaml. None when unset, malformed, or a reserved token. Never raises."""
+    def _read() -> str | None:
+        data = _read_yaml_dict(_hermes_root(_resolve_home(root)) / "profile.yaml", "hermes-bots")
+        raw = str((_bots_meta(data) or {}).get("handle") or "").strip().lstrip("@")
+        return raw if _HANDLE_RE.fullmatch(raw) and raw.lower() not in _RESERVED_HANDLES else None
+
+    return _swallow(_read, None)
+
+
+def _handle(name: str, root: str | os.PathLike | None = None) -> str:
+    """The @handle teammates address ``name`` by. The default profile's handle is DATA — the
+    ``ui_meta['hermes-bots'].handle`` the operator sets on the install's own profile.yaml — and
+    falls back to the legacy @hermes alias the mention middleware publishes; a named profile is
+    addressed by its own name. ``root`` is any path inside the install (defaults to the ambient
+    one, which resolves the same way from a profile home and from the install root)."""
+    if name != "default":
+        return name
+    return _configured_handle(root) or "hermes"
+
+
+def _is_profile_dir(path: Path) -> bool:
+    """A real delivery target rather than a leftover: dot-dirs (``profiles/.deleted/`` is the
+    tombstone dir ``hermes profile delete`` leaves behind) and dirs holding neither profile.yaml
+    nor state.db (a partial leftover that ``hermes -p <name>`` would silently recreate as a
+    phantom profile home) are not profiles."""
+    return not path.name.startswith(".") and ((path / "profile.yaml").is_file() or (path / "state.db").is_file())
 
 
 def _roster(root: Path) -> list[tuple[str, Path]]:
-    """(name, dir) for the default profile + every named profile, sorted."""
+    """(name, dir) for the default profile + every named profile that is a real delivery
+    target, sorted. Tombstones and leftovers never appear, so a removed lane is not addressable."""
     profiles = root / "profiles"
-    named = _swallow(lambda: [(c.name, c) for c in sorted(profiles.iterdir()) if c.is_dir()] if profiles.is_dir() else [], [])
+    named = _swallow(lambda: [(c.name, c) for c in sorted(profiles.iterdir())
+                              if c.is_dir() and _is_profile_dir(c)] if profiles.is_dir() else [], [])
     return [("default", root), *named]
+
+
+def resolve_local_profile(root: str | os.PathLike | None, target: str,
+                          roster: list[str] | None = None) -> str | None:
+    """The ONE local address resolver, shared by every inbound path (``message_agent``,
+    ``bot_relay.deliver``): a profile name, its configured @handle, or the legacy @hermes alias
+    → the profile NAME (the install root is ``default``). ``roster`` overrides the enumerated
+    names. None when the target names nothing here, or names more than one profile — a handle
+    that collides with another profile's address fails closed instead of capturing it. Never raises."""
+    def _resolve() -> str | None:
+        want = str(target or "").strip().lstrip("@").lower()
+        if not want:
+            return None
+        names = list(roster) if roster is not None else [n for n, _d in _roster(_hermes_root(_resolve_home(root)))]
+
+        def _addresses(name: str) -> set[str]:
+            # '@hermes' is the alias the mention middleware publishes for the install root: it stays
+            # a working address whatever handle the config adds.
+            return {name.lower(), _handle(name, root).lower()} | ({"hermes"} if name == "default" else set())
+
+        matches = {n for n in names if want in _addresses(n)}
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    return _swallow(_resolve, None)
 
 
 def _read_yaml_dict(path: Path, needle: str | None = None) -> dict | None:
@@ -197,7 +254,7 @@ def _build_section(home: Path) -> str:
     if not _any_managed(root):
         return ""
 
-    roster_lines = [_bullet(f"@{_handle(name)}", _profile_role(d)) for name, d in _roster(root) if name != me]
+    roster_lines = [_bullet(f"@{_handle(name, root)}", _profile_role(d)) for name, d in _roster(root) if name != me]
     roster_block = "\n".join(roster_lines) or "- (no teammates yet)"
 
     return (
@@ -221,7 +278,7 @@ def _build_section(home: Path) -> str:
         "concisely via message_agent to their handle, and if it is a pure FYI "
         "with nothing to add, staying silent is fine — never ping-pong "
         "acknowledgements.\n"
-        f"You are `@{_handle(me)}`. Your teammates (live roster; roles from their "
+        f"You are `@{_handle(me, root)}`. Your teammates (live roster; roles from their "
         "profiles):\n"
         f"{roster_block}"
         + _remote_paragraph(root)
@@ -298,7 +355,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         surface["roster"] = sorted(n for n, d in roster if _is_bot_managed(d))
         # Roles are part of the messaging surface: renaming a bot or editing a
         # description must refresh the roster block teammates pick recipients from.
-        surface["roster_roles"] = sorted(f"{n}:{_profile_role(d)}" for n, d in roster)
+        surface["roster_roles"] = sorted(f"{n}:{_handle(n, root)}:{_profile_role(d)}" for n, d in roster)
     except Exception:
         surface["roster"] = []
     # Protocol-text version salt: bumping it refreshes every eternal Bot Chat

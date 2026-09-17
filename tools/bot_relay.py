@@ -108,13 +108,20 @@ def _bot_mode_cfg(key: str, *, loader: str) -> Any:
         return None
 
 
-def _normalize_roster_row(row: Any) -> Optional[dict]:
+def _normalize_roster_row(row: Any, root: Path | str | None = None) -> Optional[dict]:
     """Validated, minimal roster row or None. Rows come from the Desktop over
-    RPC — treat as untrusted input."""
+    RPC — treat as untrusted input. ``root`` is the install root the row's
+    fallback handle is resolved against (the ambient root when omitted)."""
     if not isinstance(row, dict):
         return None
     profile = str(row.get("profile") or "").strip()
-    handle = str(row.get("handle") or "").strip().lstrip("@") or ("hermes" if profile == "default" else profile)
+    handle = str(row.get("handle") or "").strip().lstrip("@")
+    if not handle and profile:
+        # No handle on the row: the default profile's CONFIGURED handle, never a hardcoded 'hermes'
+        # — one code path with the roster the bot is shown (#106847 follow-up).
+        from tools.bot_mode_probe import _handle
+
+        handle = _handle(profile, root)
     connection_id = str(row.get("connection_id") or "").strip()
     if not profile or not connection_id or not all(_HANDLE_RE.match(v) for v in (handle, profile, connection_id)):
         return None
@@ -134,7 +141,7 @@ def write_remote_roster(root: Path | str, rows: Any) -> int:
     """Atomically persist the Desktop-pushed remote roster. Returns count."""
     base = _ensure_dirs(root)
     by_key: dict[tuple[str, str], dict] = {}
-    for norm in filter(None, map(_normalize_roster_row, rows if isinstance(rows, list) else [])):
+    for norm in filter(None, map(lambda r: _normalize_roster_row(r, root), rows if isinstance(rows, list) else [])):
         by_key.setdefault((norm["connection_id"], norm["profile"]), norm)
     cleaned = [by_key[k] for k in sorted(by_key)]
     _atomic_write_json(base / ROSTER_FILE, {"updated_at": int(time.time()), "agents": cleaned}, sort_keys=True)
@@ -146,7 +153,7 @@ def read_remote_roster(root: Path | str) -> list[dict]:
     try:
         data = json.loads((relay_root(root) / ROSTER_FILE).read_text(encoding="utf-8"))
         agents = data.get("agents") if isinstance(data, dict) else None
-        return [r for r in map(_normalize_roster_row, agents) if r] if isinstance(agents, list) else []
+        return [r for r in map(lambda r: _normalize_roster_row(r, root), agents) if r] if isinstance(agents, list) else []
     except FileNotFoundError:
         return []
     except Exception:
