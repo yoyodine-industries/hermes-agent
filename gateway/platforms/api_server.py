@@ -3546,8 +3546,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         queue, _event_payload = events.queue, events.payload
         # Claim ownership inside the request's profile scope before any run-keyed state
         # exists, so /v1/runs/{id}* control is confined to the starting profile.
-        # See #93689.
-        self._run_owners[run_id] = self._run_idempotency_scope(request)
+        # See #93689. The same stamp records the credential-only host scope, so the peer CLI
+        # (qualified dispatch, unqualified poll) reaches its own run on either address form.
+        _api_runs._stamp_run_owner(self, request, run_id)
         self._set_run_status(
             run_id, "queued", session_id=session_id, model=ctx["body"].get("model", self._model_name))
 

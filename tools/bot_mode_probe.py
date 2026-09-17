@@ -38,9 +38,8 @@ _cached: dict[str, str] = {}
 
 
 def _default_home() -> str:
-    """Ambient process HERMES_HOME (env, else the platform default) as a string."""
-    from hermes_constants import get_process_hermes_home
-    return str(get_process_hermes_home())
+    """Ambient HERMES_HOME (env, else ~/.hermes) as a string."""
+    return os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
 
 
 def _resolve_home(home: str | os.PathLike | None) -> Path:
@@ -62,6 +61,17 @@ def _hermes_root(home: Path) -> Path:
 
 def _profile_name(home: Path) -> str:
     return home.name if home.parent.name == "profiles" else "default"
+
+
+def profile_home_dir(root: Path, name: str) -> Path:
+    """Home dir for a profile name: 'default' → root, else root/profiles/<name>.
+
+    Inverts ``_hermes_root``/``_profile_name``. Used to scope a Bot Chat turn's
+    ``--in`` to the profile's OWN sessions rather than the shared home (which maps to
+    the default profile and its desktop-held live session — delivery then failed with
+    "already has a live owner" → target_busy).
+    """
+    return root if name == "default" else root / "profiles" / name
 
 
 def _handle(name: str) -> str:

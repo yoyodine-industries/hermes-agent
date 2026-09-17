@@ -43,7 +43,7 @@ This is the shape that covers the workloads `delegate_task` can't:
 - **Engineering pipelines** — decompose → implement in parallel worktrees → review → iterate → PR.
 - **Fleet work** — one specialist managing N subjects (50 social accounts, 12 monitored services).
 
-The eight canonical collaboration patterns are catalogued in [Collaboration patterns](#collaboration-patterns) below.
+For the full design rationale, comparative analysis against Cline Kanban / Paperclip / NanoClaw / Google Gemini Enterprise, and the eight canonical collaboration patterns, see `docs/hermes-kanban-v1-spec.pdf` in the repository.
 
 ## PR completion contracts
 
@@ -116,7 +116,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
-  - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` or `kanban_request_review(artifacts=[...])` are copied into durable per-task attachment storage before cleanup (a review handoff stages them at handoff time, since the reviewer's later completion is what deletes the scratch workspace); existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
+  - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
@@ -340,29 +340,6 @@ unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
-
-## Enabling tools for a chat profile
-
-The Desktop Kanban plugin displays the board; it does not grant the chat agent
-permission to manage tasks. Enable the `kanban` toolset for the profile and
-platform that should orchestrate work:
-
-```bash
-hermes -p planner tools enable kanban                      # CLI / TUI / Desktop chats
-hermes -p planner tools enable kanban --platform telegram  # a gateway platform
-```
-
-Each platform has its own selection under `platform_toolsets.<platform>` in
-`config.yaml`; the toolset is also a checkbox in `hermes tools` and the dashboard.
-A gateway agent that has it can `kanban_create` from a chat and is auto-subscribed
-to that task's completion/block notifications in the same thread. Start a new chat
-after changing this setting; existing conversations retain their tool schemas and
-prompt cache. `agent.disabled_toolsets` remains authoritative. Legacy top-level
-`toolsets: [kanban]` is honoured as a fallback only when no platform selection was
-saved; `all` alone is not a Kanban opt-in.
-
-Dispatcher-owned workers receive their task lifecycle tools automatically.
-`delegate_task` children do not gain permission to mutate the board.
 
 ## How workers interact with the board
 
@@ -700,7 +677,6 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
-| `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
 
 And the two auxiliary LLM slots:
@@ -901,7 +877,9 @@ hermes kanban create "nightly backup audit" \
 
 ### Respawn guard
 
-The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 error on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+The dispatcher refuses to re-spawn a ready task when its previous worker process is still alive (`sibling_live`), when it hit a quota/auth/429 error on the previous run (`blocker_auth`), when it completed a run successfully within the guard window (`recent_success`), or when a recent task comment links to a GitHub PR (`active_pr`). This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+
+`sibling_live` exists because a released claim is not a dead process: `hermes kanban block` (and reclaim, and a crash requeue) clears the claim while the worker process keeps running — a worker that blocks its own card is mid-turn by definition. Every other signal the dispatcher reads then says "nobody owns this", so it would spawn a second worker over the first: two agents racing the same files and burning tokens on one card. The guard instead reads the `spawned` event — the only spawn record that survives the claim being cleared — and matches its pid *and* process create-time against the live process table, so a reused pid is not mistaken for the worker. The deferral ends when that process really exits, or after two hours, when the spawn record is treated as stale so a leaked pid can never park a card forever. A run that **completed** is exempt: its handoff is already durable and re-running the card is the designed path (`recent_success` owns that window).
 
 ### Drag-to-delete and bulk delete (dashboard)
 
@@ -1016,6 +994,8 @@ The board supports these eight patterns without any new primitives:
 | **P7 Thread-scoped workspace** | `/kanban here` in a thread | per-project gateway threads |
 | **P8 Fleet farming** | one profile, N subjects | 50 social accounts |
 | **P9 Triage specifier** | rough idea → `triage` → `hermes kanban specify` expands body → `todo` | "turn this one-liner into a spec'd task" |
+
+For worked examples of each, see `docs/hermes-kanban-v1-spec.pdf`.
 
 ## Handing context to follow-up cards (the parent link)
 
@@ -1145,7 +1125,7 @@ A "wake" forges a synthetic inbound message to the destination gateway agent so 
 
 In a one-gateway-per-profile deployment (one dispatcher, separate gateway
 processes for `writer`, `admin`, etc. — see the [multi-gateway
-guide](/user-guide/features/kanban-multi-gateway)),
+guide](https://github.com/NousResearch/hermes-agent/blob/main/docs/kanban/multi-gateway.md)),
 dispatch and delivery have separate owners:
 
 - **Dispatch stays single-owner.** Exactly one gateway keeps
@@ -1258,14 +1238,14 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 | Kind | Payload | When |
 |---|---|---|
-| `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
+| `spawned` | `{pid, create_time?}` | Dispatcher successfully started a worker process. `create_time` (process start time) is included when readable and lets the respawn guard tell this worker apart from a later process that reused the pid. |
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
-| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
+| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `sibling_live` (the previous worker process is still alive — spawning now would race two workers on one card; the claim was released while the process kept running, so the guard waits for it to exit), `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |
@@ -1275,3 +1255,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 ## Out of scope
 
 Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file and the dispatcher spawns workers on the same machine. Running a shared board across two hosts is not supported — there's no coordination primitive for "worker X on host A, worker Y on host B," and the crash-detection path assumes PIDs are host-local. If you need multi-host, run an independent board per host and use `delegate_task` / a message queue to bridge them.
+
+## Design spec
+
+The complete design — architecture, concurrency correctness, comparison with other systems, implementation plan, risks, open questions — lives in `docs/hermes-kanban-v1-spec.pdf`. Read that before filing any behavior-change PR.

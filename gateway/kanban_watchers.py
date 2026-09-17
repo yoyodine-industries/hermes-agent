@@ -68,18 +68,6 @@ class GatewayKanbanWatchersMixin:
         dispatcher respawned a crashed task). All SQLite work runs in a thread;
         one tick's failure never stops the next.
         """
-        try:
-            from hermes_cli.config import load_config as _load_config
-
-            cfg = _load_config()
-            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        except Exception as exc:
-            logger.warning("kanban notifier: cannot load config (%s); continuing enabled", exc)
-            kanban_cfg = {}
-        if not kanban_cfg.get("notify_in_gateway", True):
-            logger.info("kanban notifier: disabled via config kanban.notify_in_gateway=false")
-            return
-
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -152,21 +140,15 @@ class GatewayKanbanWatchersMixin:
         reference only), and upload errors are logged, never raised.
         """
         raw_paths: list[str] = []
-        prose_paths: list[str] = []
         if isinstance(event_payload, dict):
             raw = event_payload.get("artifacts")
             if isinstance(raw, (list, tuple)):
                 raw_paths += [item for item in raw if isinstance(item, str)]
             summary = event_payload.get("summary")
             if isinstance(summary, str) and summary:
-                prose_paths += adapter.extract_local_files(summary)[0]
+                raw_paths += adapter.extract_local_files(summary)[0]
         if task is not None and getattr(task, "result", None):
-            prose_paths += adapter.extract_local_files(str(task.result))[0]
-        # A staged copy and the scratch original it was copied from are the
-        # same deliverable; on a review handoff the original still exists, so
-        # prose mentions of it must not upload the file a second time.
-        staged_names = {os.path.basename(p) for p in raw_paths}
-        raw_paths += [p for p in prose_paths if os.path.basename(p) not in staged_names]
+            raw_paths += adapter.extract_local_files(str(task.result))[0]
         candidates: list[str] = []
         for path in raw_paths:
             expanded = os.path.expanduser(path) if path else ""
@@ -267,11 +249,17 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
         await asyncio.sleep(5)
 
-        # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
-        # is non-empty but spawns are 0 for N consecutive ticks — usually a
-        # broken PATH, missing venv, or credential loss.
-        bad_ticks = 0
-        last_warn_at = 0
+        # Health telemetry (shared with `_cmd_daemon` via DispatcherHealth): a
+        # warning here has to mean the dispatcher is BROKEN, not merely busy.
+        # Capacity deferrals (kanban.max_spawn / max_in_progress / per-profile
+        # cap), guards (respawn, board-held, memory pressure) and work that just
+        # arrived are the steady state on a loaded host and stay silent; a card
+        # claimed but never launched warns at once, naming board, profile, task
+        # and reason. Imported under a distinct name because `_kbd` is bound
+        # (as a local) further down in the loop below.
+        from hermes_cli import kanban_db_dispatch as _kbd_health
+
+        health = _kbd_health.DispatcherHealth(window=_HEALTH_WINDOW)
         dispatcher = _KanbanDispatcher(_kb, settings)
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
@@ -290,7 +278,7 @@ class GatewayKanbanWatchersMixin:
                 # Emergency stop (`hermes pause`): no auto-decompose or
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
-                    bad_ticks = 0
+                    health.pause()
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
@@ -299,19 +287,12 @@ class GatewayKanbanWatchersMixin:
                     if _ad_enabled:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(dispatcher.tick_once)
-                    any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
-                now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned. Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks,
-                    )
-                    last_warn_at = now
+                    _log_spawn_results(results)
+                    pending = await _to_thread_process_service(dispatcher.oldest_pending)
+                    report = health.observe_tick(results, pending=pending, now=time.time())
+                    if report is not None:
+                        log = logger.warning if report.level == "warning" else logger.info
+                        log("%s", report.message)
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()

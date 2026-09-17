@@ -19,6 +19,7 @@ from agent.auxiliary_client import (
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
+    compression_route_is_local,
     extract_content_or_reasoning,
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
@@ -3517,7 +3518,18 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
         # A distinct summary model gets ONE main-model retry: a specific reason for known transient classes,
         # else a best-effort "failed" retry — losing N turns is worse than one extra summary attempt.
-        if self.summary_model and self.summary_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
+        #
+        # Not when the compression route is local-only, though: retrying the pass on the main agent model
+        # is the same silent cloud summarisation the auxiliary ladder refuses (``compression_route_is_local``),
+        # and it reports "falling back to main model" for a route that cannot leave this host. The failure
+        # falls through to the cooldown path below, which aborts the pass loudly when
+        # ``abort_on_summary_failure`` is set.
+        if (
+            self.summary_model
+            and self.summary_model != self.model
+            and not getattr(self, "_summary_model_fallen_back", False)
+            and not compression_route_is_local()
+        ):
             self._fallback_to_main_for_compression(e, kind.fallback_reason())
             # Retry immediately on the main model.
             return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)

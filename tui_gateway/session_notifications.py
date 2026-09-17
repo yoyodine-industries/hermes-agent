@@ -72,23 +72,7 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
             return True
     if evt_key in current_keys:
         return False
-    if resolved_key == evt_key and _notif_other_profile_session_owns(sid, session, evt):
-        return True
     return _notif_live_session_matches({evt_key, resolved_key}, exclude=session)
-
-
-def _notif_other_profile_session_owns(sid: str, session: dict, evt: dict) -> bool:
-    """True when a live session on ANOTHER profile store provably owns ``evt`` (its compression lineage
-    resolves there). Every poller drains one process-wide queue, but lineage is looked up in the
-    dequeuer's own store; without this, profile B dequeuing an event keyed on profile A's compressed
-    parent found no owner anywhere and dropped it for good. Snapshot under the lock, resolve outside it."""
-    own_home = str(session.get("profile_home") or "")
-    candidates = _notif_locked_sessions(
-        lambda ss: [(other_sid, other) for other_sid, other in ss.items()
-                    if other is not session and not other.get("_finalized")
-                    and str(other.get("profile_home") or "") != own_home],
-        [])
-    return any(_session_owns_notification_event(other_sid, other, evt) for other_sid, other in candidates)
 
 
 def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool:
@@ -447,9 +431,8 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     # while distinct watch_match events from one process must stay visible.
     dedup_key = _notification_event_dedup_key(evt)
     if dedup_key not in emitted:
-        from tools.process_registry_notifications import async_delegation_display_text, process_completion_display_text
-        display_text = (async_delegation_display_text(evt) if is_delegation
-                        else process_completion_display_text([evt]) if evt_type == "completion" else text)
+        from tools.process_registry_notifications import async_delegation_display_text
+        display_text = async_delegation_display_text(evt) if is_delegation else text
         _emit("status.update", sid, {"kind": "process", "text": display_text})
         emitted.add(dedup_key)
     if evt_type == "completion" and completions is not None:
@@ -466,7 +449,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
 
 
 def _notif_dispatch_completions(sid, session, notifications, registry, deferred):
-    from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
+    from tools.process_registry_notifications import ProcessNotificationBatch
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
 
     if not notifications:
@@ -479,15 +462,13 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         return
     claimed = [(event, text, claim) for event, text in notifications
                if (claim := claim_event_delivery(event, "tui-completion-batch")) is not None]
-    batch = ProcessNotificationBatch(tuple((event, text) for event, text, _claim in claimed))
-    text = batch.render(registry)
+    text = ProcessNotificationBatch(tuple((event, text) for event, text, _claim in claimed)).render(registry)
     if text is None:
         _notif_release_turn(session)
     try:
         if text is not None:
             _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                          "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
-                          display_metadata={"display_text": batch.display_text(registry)})
+                          "completion batch dispatch failed")
     except Exception:
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
@@ -562,6 +543,23 @@ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
     return started
 
 
+def _renew_bot_live_lease(sid: str, session: dict) -> bool:
+    """Prove this Bot Chat consumer is still consuming, once per poll tick.
+
+    ``tools.bot_live_delivery`` only treats a lease as a mailbox destination while its stamp is
+    fresh, which is what stops a leaked desktop/dashboard pane from holding peer mail forever:
+    the pane's process stays alive, but its poll loop dies with the pane. Writes are throttled
+    inside the registry, so this is a no-op on all but the first tick of each interval.
+    """
+    lease = session.get("active_session_lease")
+    if lease is None or getattr(lease, "released", False):
+        return False
+    from hermes_cli.active_sessions import touch_active_session_lease
+
+    return touch_active_session_lease(
+        lease.lease_id, registry_home=_session_home(session), live_session_id=sid)
+
+
 def _notification_poller_loop(stop_event: threading.Event, sid: str, session: dict) -> None:
     """Daemon thread (started by _init_session()) that drains the process-global completion_queue for this session
     (ownership routing: _notif_handle_event) and polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` — the
@@ -580,6 +578,12 @@ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: di
     last_kanban_poll = last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         now = time.monotonic()
+        # Prove we are still consuming BEFORE reporting failure, so a pane that dies here stops
+        # being a mailbox destination instead of holding peer mail forever.
+        try:
+            _renew_bot_live_lease(sid, session)
+        except Exception:
+            logger.warning("Bot live-owner lease renewal failed", exc_info=True)
         try:
             _poll_bot_live_delivery_once(sid, session)
         except Exception:

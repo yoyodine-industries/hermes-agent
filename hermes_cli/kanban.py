@@ -63,11 +63,10 @@ def _run_state_kwargs(args: argparse.Namespace, cmd: str) -> tuple[Optional[dict
     return ({} if st is None else {"state_type": st, "state_name": sn}), 0
 
 
-def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``.
-    Omitted -> ``(None, None)`` so ``create_task`` can tell "default" from an explicit scratch."""
+def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
+    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``."""
     if not value:
-        return (None, None)
+        return ("scratch", None)
     v = value.strip()
     if v in {"scratch", "worktree"}:
         return (v, None)
@@ -104,15 +103,20 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
 
     The dashboard plugin API passes it because the dashboard backend process can be running under a
     different HERMES_HOME than the profile the request targets, which otherwise produced a "no gateway is
-    running" warning against a perfectly healthy profile gateway (#71211). CLI callers leave it ``None`` and
-    keep the existing process-level behavior.
+    running" warning against a perfectly healthy profile gateway (#71211).
+
+    When ``hermes_home`` is ``None`` (the CLI), the probe resolves to the *kanban store's* home
+    (``kanban_home()``), not the active profile's ``HERMES_HOME``: the board is shared at the root home by
+    design (``kanban_db.kanban_home``), so a profile-scoped shell must not warn "no gateway" against a
+    healthy root gateway just because the profile's own ``gateway.pid`` is absent.
     """
     try:
         from gateway.status import resolve_gateway_liveness  # type: ignore
 
         # Same ladder as the dashboard status endpoints so PID-file-less / cross-container gateways
         # aren't misreported; use_cache=False because this one-shot probe must see the state now.
-        liveness = resolve_gateway_liveness(profile_dir=hermes_home, use_cache=False)
+        probe_dir = hermes_home if hermes_home is not None else kb.kanban_home()
+        liveness = resolve_gateway_liveness(profile_dir=probe_dir, use_cache=False)
     except Exception:
         return (True, "")  # can't probe — silent
     if liveness.probe_error:  # resolver swallows per-rung failures; "can't tell" != "no gateway"
@@ -475,6 +479,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if rc:
         return rc
     graph = None
+    # Read before the connection closes: the overdue diagnostic uses it to tell a
+    # dead dispatcher tick apart from a waker that ran and refused to wake.
+    due_waker_last_tick = None
     want_json = getattr(args, "json", False)
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
@@ -489,6 +496,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         latest_summary = kb.latest_summary(conn, args.task_id)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
+            due_waker_last_tick = kb.get_meta_int(conn, kb.META_DUE_WAKER_LAST_TICK)
 
     if want_json:
         _print_json({
@@ -504,6 +512,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
+    if task.due_at:
+        policy = task.due_window_policy or kb.DEFAULT_DUE_WINDOW_POLICY
+        field("due", f"{_fmt_ts(task.due_at)} ({policy})")
+    elif task.status == "scheduled":
+        # A parked card with no wake time is a wait only a human can end. Say so
+        # on the card, so "scheduled forever" is visible rather than inferred.
+        field("due", "none — no due time; wakes by hand only")
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
@@ -528,7 +543,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(
+        task, events, runs, graph=graph,
+        config={"due_waker_last_tick": due_waker_last_tick},
+    )
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -571,8 +589,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
-    with kbc.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.assign_task(conn, args.task_id, profile)
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
     return _ok_or_err(ok, f"no such task: {args.task_id}",
                       f"Assigned {args.task_id} to {profile or '(unassigned)'}")
 
@@ -607,8 +628,11 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     reclaim = bool(getattr(args, "reclaim", False))
-    with kbc.connect_closing() as conn:
-        ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
     return _ok_or_err(
         ok,
         f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",
@@ -932,10 +956,43 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    due_raw = getattr(args, "due", None)
+    clear_due = bool(getattr(args, "clear_due", False))
+    window_policy = getattr(args, "window_policy", None)
+    if due_raw and clear_due:
+        return _err("--due and --clear-due are mutually exclusive")
+    due_at: Any = kb.UNSET
+    if clear_due:
+        due_at = None
+    elif due_raw:
+        from hermes_cli import kanban_due as kdue
+        try:
+            due_at = kdue.parse_due(due_raw)
+        except ValueError as exc:
+            return _err(f"--due {due_raw!r}: {exc}")
+    due_note = ""
+    if due_at is not kb.UNSET:
+        due_note = (
+            f" — due {_fmt_ts(int(due_at))} "
+            f"({window_policy or kb.DEFAULT_DUE_WINDOW_POLICY})"
+            if due_at is not None else " — due time cleared (wakes by hand only)"
+        )
+    failures: dict[str, str] = {}
+
+    def op(tid: str) -> bool:
+        try:
+            return kb.schedule_task(
+                conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
+                due_at=due_at, window_policy=window_policy,
+            )
+        except ValueError as exc:  # e.g. --window-policy with no due time
+            failures[tid] = f"{tid}: {exc}"
+            return False
+
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+        op = _commented(conn, reason, author, "SCHEDULED", op)
+        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}{due_note}",
+                           lambda tid: failures.get(tid) or f"cannot schedule {tid}")
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
@@ -1014,13 +1071,13 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     author = _profile_author()
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
-    dry_run = bool(args.dry_run)
+    dry_run, force = bool(args.dry_run), bool(args.force)
 
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
-            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
+            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, force=force, dry_run=dry_run)
+            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run, "forced": force,
                             "reason": reason, "error": err})
 
     failed = [r for r in results if not r["promoted"]]

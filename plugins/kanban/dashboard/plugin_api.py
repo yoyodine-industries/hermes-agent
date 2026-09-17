@@ -29,7 +29,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
-from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
@@ -202,6 +201,10 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     if task_ids is not None and not task_ids:
         return {}
     diag_config = kd.config_from_runtime_config(load_config())
+    # The waker's heartbeat (written on every dispatcher tick): the overdue rule
+    # uses it to tell a dead tick apart from a wake that was refused by a band.
+    diag_config["due_waker_last_tick"] = kanban_db.get_meta_int(
+        conn, kanban_db.META_DUE_WAKER_LAST_TICK)
     if task_ids is not None:
         rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
     else:
@@ -264,6 +267,7 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 # --- GET /board -------------------------------------------------------------
 
+@router.get("/board")
 def get_board(
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
     include_archived: bool = Query(False),
@@ -315,27 +319,6 @@ def get_board(
             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
 
 
-_read_board = coalesced_read(get_board)
-
-
-@router.get("/board")
-async def get_board_endpoint(
-    tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
-    include_archived: bool = Query(False),
-    board: Optional[str] = _BOARD_Q,
-    workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
-    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
-):
-    # Resolve selection before keying so a board switch cannot join an older read.
-    return await _read_board(
-        tenant=tenant,
-        include_archived=include_archived,
-        board=board or kanban_db.get_current_board(),
-        workflow_template_id=workflow_template_id,
-        current_step_key=current_step_key,
-    )
-
-
 # --- GET /tasks/:id ---------------------------------------------------------
 
 @router.get("/tasks/{task_id}")
@@ -376,7 +359,7 @@ class CreateTaskBody(BaseModel):
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
-    workspace_kind: Optional[str] = None  # None = scratch, or the board project's worktree when scoped
+    workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
@@ -506,6 +489,12 @@ class UpdateTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    # Due time for a card parked in ``scheduled`` (epoch seconds), parity with
+    # ``hermes kanban schedule --due``. ``None`` = not sent; ``clear_due_at`` clears.
+    # Setting one PARKS the card (that is the only status where a due time fires).
+    due_at: Optional[int] = None
+    due_window_policy: Optional[str] = None
+    clear_due_at: bool = False
 
 
 class BulkTaskBody(BaseModel):
@@ -545,13 +534,24 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     return _set_status_direct(conn, task_id, s)
 
 
+def _due_arg(p) -> Any:
+    """``kanban_db.UNSET`` when the payload says nothing about the due time (leave
+    the card's existing one alone) -- a plain ``None`` would CLEAR it."""
+    if getattr(p, "clear_due_at", False):
+        return None
+    value = getattr(p, "due_at", None)
+    return kanban_db.UNSET if value is None else int(value)
+
+
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
 # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
 # detection) with ``force=True``: a dashboard action is a human override of a live worker claim.
 _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(conn, tid, result=p.result, summary=p.summary, metadata=p.metadata),
     "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
-    "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "scheduled": lambda conn, tid, p: kanban_db.schedule_task(
+        conn, tid, reason=getattr(p, "block_reason", None),
+        due_at=_due_arg(p), window_policy=getattr(p, "due_window_policy", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
     "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
@@ -590,10 +590,25 @@ def _apply_reasoning_effort(conn, task_id: str, p) -> bool:
     return kanban_db.set_reasoning_effort(conn, task_id, None if p.clear_reasoning_effort else p.reasoning_effort)
 
 
+def _apply_due_at(conn, task_id: str, p) -> bool:
+    """Set/clear the due time. The status phase already carries it when the PATCH
+    moved the card to ``scheduled``; this path covers a due-time-only PATCH."""
+    if getattr(p, "status", None) == "scheduled":
+        return True
+    value = _due_arg(p)
+    policy = getattr(p, "due_window_policy", None)
+    if value is kanban_db.UNSET and not policy:
+        return True
+    return kanban_db.schedule_task(conn, task_id, due_at=value, window_policy=policy)
+
+
 # Override knobs shared by PATCH and bulk: (payload wants it?, apply, bulk refusal message).
 _OVERRIDE_OPS = (
     (lambda p: p.clear_model_override or p.model_override is not None, _apply_model_override, "model override refused"),
     (lambda p: p.clear_reasoning_effort or p.reasoning_effort is not None, _apply_reasoning_effort, "reasoning override refused"),
+    (lambda p: getattr(p, "clear_due_at", False) or getattr(p, "due_at", None) is not None
+               or getattr(p, "due_window_policy", None) is not None,
+     _apply_due_at, "due time refused"),
 )
 
 
@@ -647,7 +662,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
         if payload.assignee is not None and not review_assignee_deferred:
-            with _map_errors(409, RuntimeError):
+            # assign_task refuses a profile whose worker cannot load the card's
+            # skills (ValueError -> 400) and a live claim (RuntimeError -> 409).
+            with _map_errors(400, ValueError), _map_errors(409, RuntimeError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
@@ -789,7 +806,7 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
                   else kanban_db.assign_task(conn, tid, payload.assignee or None))
             if not ok:
                 entry.update(ok=False, error="assign refused")
-        except RuntimeError as e:
+        except (ValueError, RuntimeError) as e:
             entry.update(ok=False, error=str(e))
     if payload.priority is not None:
         _set_priority(conn, tid, payload.priority, board)
@@ -988,8 +1005,11 @@ def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[
     """Reassign to another profile, optionally reclaiming first
     (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
     with _board_conn(board) as (board, conn):
-        ok = kanban_db.reassign_task(
-            conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
+        # reassign_task rides on assign_task, so a profile whose worker cannot
+        # load the card's skills is refused here too — that is a client error.
+        with _map_errors(400, ValueError):
+            ok = kanban_db.reassign_task(
+                conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
         if not ok:
             raise _conflict(
                 f"cannot reassign {task_id}: unknown id, or still "

@@ -12,7 +12,6 @@ import os
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any, Optional
 
 from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
@@ -210,6 +209,37 @@ class _KanbanDispatcher:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
+    def oldest_pending(self) -> Any:
+        """Longest-waiting spawnable card on any board, as ``PendingWork``.
+
+        Same filter as :meth:`ready_nonempty` — ready (or review, when review
+        dispatch is on), assigned to a real profile, unclaimed — but it also
+        reports WHICH card and how long it has waited, so health telemetry can
+        tell "work just arrived" from "work has been waiting since before the
+        stall". Age is measured from ``created_at`` and is therefore an upper
+        bound (see ``kanban_db_dispatch.oldest_spawnable_pending``). An empty
+        ``PendingWork`` (``.pending`` False) means nothing is spawnable — including
+        when a board could not be read, so a probe failure can never invent a
+        stall.
+        """
+        kbd = _kbd()
+        review_probe = kbd.review_dispatch_enabled()
+        oldest = kbd.PendingWork()
+        for slug in self._board_slugs():
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                task_id, age = kbd.oldest_spawnable_pending(conn, include_review=review_probe)
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+            if task_id and age > oldest.age_seconds:
+                oldest = kbd.PendingWork(board=slug, task_id=task_id, age_seconds=age)
+        return oldest
+
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
 
@@ -248,30 +278,29 @@ class _KanbanDispatcher:
             return 0
         attempted = 0
         successes = 0
-        with _default_profile_secret_scope():
-            for slug in self._board_slugs():
-                if attempted >= auto_decompose_per_tick:
-                    break
-                # Pin the board via env for the call: the decomposer connects
-                # with no board kwarg (same pattern as the dashboard specify endpoint).
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
+        for slug in self._board_slugs():
+            if attempted >= auto_decompose_per_tick:
+                break
+            # Pin the board via env for the call: the decomposer connects
+            # with no board kwarg (same pattern as the dashboard specify endpoint).
+            prev_env = os.environ.get("HERMES_KANBAN_BOARD")
+            try:
+                os.environ["HERMES_KANBAN_BOARD"] = slug
                 try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
-                    try:
-                        triage_ids = _decomp.list_triage_ids()
-                    except Exception as exc:
-                        logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
-                        triage_ids = []
-                    for tid in triage_ids:
-                        if attempted >= auto_decompose_per_tick:
-                            break
-                        attempted += 1
-                        successes += self._decompose_one(_decomp, slug, tid)
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
+                    triage_ids = _decomp.list_triage_ids()
+                except Exception as exc:
+                    logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
+                    triage_ids = []
+                for tid in triage_ids:
+                    if attempted >= auto_decompose_per_tick:
+                        break
+                    attempted += 1
+                    successes += self._decompose_one(_decomp, slug, tid)
+            finally:
+                if prev_env is None:
+                    os.environ.pop("HERMES_KANBAN_BOARD", None)
+                else:
+                    os.environ["HERMES_KANBAN_BOARD"] = prev_env
         return successes
 
     @staticmethod
@@ -291,29 +320,6 @@ class _KanbanDispatcher:
         else:
             logger.info("kanban auto-decompose [%s]: %s → single task (no fanout)", slug, tid)
         return 1
-
-
-@contextlib.contextmanager
-def _default_profile_secret_scope():
-    """Install the gateway launch profile's secret scope while multiplexing is on.
-
-    The tick runs via ``_to_thread_process_service`` in a fresh context, so no
-    per-turn scope exists and ``get_secret`` fails closed. The decomposer's aux
-    LLM reads ``auxiliary.*`` from ``get_hermes_home()``, so its credentials come
-    from that same home. No-op for single-profile gateways.
-    """
-    from agent.secret_scope import (
-        build_profile_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope)
-    from hermes_constants import get_hermes_home
-
-    if not is_multiplex_active():
-        yield
-        return
-    token = set_secret_scope(build_profile_secret_scope(Path(get_hermes_home())))
-    try:
-        yield
-    finally:
-        reset_secret_scope(token)
 
 
 def _log_spawn_results(results: Optional[list]) -> bool:

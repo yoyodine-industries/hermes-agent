@@ -105,6 +105,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason} for (tid, reason) in res.respawn_guarded
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -136,6 +139,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    # Guard deferrals are the one bucket an operator must see: the card looks
+    # ready and simply never spawns. Not a failure (the next tick re-checks).
+    if res.respawn_guarded:
+        print(f"Guarded:      {len(res.respawn_guarded)}")
+        for tid, reason in res.respawn_guarded:
+            print(f"  - {tid}  ({reason})")
     return 0
 
 
@@ -180,54 +189,53 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
 
-    # Health telemetry: warn when every tick finds ready work but spawns
-    # nothing (broken profile, PATH drift, missing venv, credential loss) —
-    # the per-task breaker auto-blocks quietly, so the operator needs a signal.
+    # Health telemetry (shared with the gateway watcher via DispatcherHealth):
+    # warn when the dispatcher is BROKEN, not merely busy. Capacity deferrals
+    # (kanban.max_spawn / max_in_progress / per-profile cap), guards (respawn,
+    # board-held, memory pressure) and work that just arrived are the steady
+    # state on a loaded host and stay silent; a card claimed but never launched
+    # warns at once, naming board, profile, task and reason.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health = kbd.DispatcherHealth(window=HEALTH_WINDOW)
 
-    def _ready_queue_nonempty() -> bool:
-        """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
-        Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
+    def _oldest_pending():
+        """Longest-waiting spawnable card on this board, None when nothing is."""
         try:
             with kbc.connect_closing() as conn:
-                return kbd.has_spawnable_ready(conn)
+                task_id, age = kbd.oldest_spawnable_pending(conn)
         except Exception:
-            return False
+            return None
+        if not task_id:
+            return None
+        return kbd.PendingWork(
+            board=getattr(args, "board", None), task_id=task_id, age_seconds=age
+        )
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
-            health_state["bad_ticks"] += 1
-        else:
-            health_state["bad_ticks"] = 0
-        # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
-        if health_state["bad_ticks"] >= HEALTH_WINDOW:
-            now = int(time.time())
-            if now - health_state["last_warn_at"] >= 300:
-                print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully. Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
-                    file=sys.stderr, flush=True,
-                )
-                health_state["last_warn_at"] = now
+        report = health.observe_tick(res, pending=_oldest_pending(), now=time.time())
+        if report is not None:
+            print(
+                f"[{_fmt_ts(int(time.time()))}] {report.message}",
+                file=sys.stderr if report.level == "warning" else sys.stdout,
+                flush=True,
+            )
+
         if not verbose:
             return
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
-            or res.spawned or res.auto_blocked or res.stale
+            or res.spawned or res.auto_blocked or res.stale or res.respawn_guarded
         )
         if did_work:
             print(
                 f"[{_fmt_ts(int(time.time()))}] reclaimed={res.reclaimed} "
                 f"crashed={len(res.crashed)} timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
-                f"auto_blocked={len(res.auto_blocked)}",
+                f"auto_blocked={len(res.auto_blocked)} guarded={len(res.respawn_guarded)}",
                 flush=True,
             )
+            for _tid, _reason in res.respawn_guarded:
+                print(f"[{_fmt_ts(int(time.time()))}]   guarded {_tid}: {_reason}", flush=True)
 
     try:
         kbd.run_daemon(
