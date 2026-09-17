@@ -24,7 +24,11 @@ from tools import bot_relay
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     h = tmp_path / ".hermes"
-    (h / "profiles" / "ops").mkdir(parents=True)
+    ops = h / "profiles" / "ops"
+    ops.mkdir(parents=True)
+    # A profile home is a dir with profile.yaml or state.db — a bare dir is not a delivery target
+    # (the tombstone/leftover filter in tools/bot_mode_probe._roster).
+    (ops / "profile.yaml").write_text("ui_meta:\n  hermes-bots:\n    shape: cloud\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(h))
     return h
 

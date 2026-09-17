@@ -72,11 +72,13 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery) -> dict:
         if len(message) > MESSAGE_MAX_CHARS + 200:  # + attribution headroom
             return _err(rid, 4091, "message too long")
         root = _root()
-        known = {"default"}
-        if (root / "profiles").is_dir():
-            known.update(c.name for c in (root / "profiles").iterdir() if c.is_dir())
-        resolved = "default" if profile.lower() == "hermes" else profile
-        if resolved not in known:
+        # ONE resolver with the local DM path: a profile name, its configured @handle, or the legacy
+        # @hermes alias, over the same live-roster predicate — tombstone (``profiles/.deleted``) and
+        # leftover dirs are not delivery targets. Unknown or ambiguous fails closed.
+        from tools.bot_mode_probe import resolve_local_profile
+
+        resolved = resolve_local_profile(root, profile)
+        if resolved is None:
             return _err(rid, 4092, f"no profile '{profile}' on this gateway")
 
         # When THIS gateway already hosts the target's Bot Chat live, the subprocess transport is
