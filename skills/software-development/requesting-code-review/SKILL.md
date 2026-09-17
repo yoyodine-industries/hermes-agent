@@ -1,6 +1,6 @@
 ---
 name: requesting-code-review
-description: "Pre-commit review: security scan, quality gates, auto-fix."
+description: Use before landing code to scan and review the diff.
 version: 2.0.0
 author: Hermes Agent (adapted from obra/superpowers + MorAlekss)
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # Pre-Commit Code Verification
+
+Pre-commit review pipeline: security scan, quality gates, auto-fix.
 
 Automated verification pipeline before code lands. Static scans, baseline-aware
 quality gates, an independent reviewer subagent, and an auto-fix loop.

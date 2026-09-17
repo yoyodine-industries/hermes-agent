@@ -1,6 +1,6 @@
 ---
 name: youtube-content
-description: "YouTube transcripts to summaries, threads, blogs."
+description: Use when a YouTube link needs a transcript or summary.
 version: 1.0.0
 author: Teknium (teknium1), Hermes Agent
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # YouTube Content Tool
+
+Turns YouTube transcripts into summaries, threads and blog posts.
 
 ## When to use
 

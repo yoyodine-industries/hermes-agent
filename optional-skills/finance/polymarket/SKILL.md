@@ -1,6 +1,6 @@
 ---
 name: polymarket
-description: "Query Polymarket: markets, prices, orderbooks, history."
+description: Use when querying Polymarket markets, prices, or history.
 version: 1.0.0
 author: Hermes Agent + Teknium
 license: MIT
@@ -9,6 +9,8 @@ platforms: [linux, macos, windows]
 ---
 
 # Polymarket — Prediction Market Data
+
+Queries Polymarket prediction markets, prices, orderbooks and history via its public REST APIs.
 
 Query prediction market data from Polymarket using their public REST APIs.
 All endpoints are read-only and require zero authentication.

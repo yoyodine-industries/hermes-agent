@@ -1,6 +1,6 @@
 ---
 name: docx
-description: Create, read, edit, template, and review Word .docx files.
+description: Use when reading, editing, or templating Word .docx files.
 version: 1.1.0
 author: Nous Research
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 ---
 
 # Docx Skill
+
+Creates, reads, edits, templates and reviews Microsoft Word .docx files.
 
 Create, read, edit, and template Microsoft Word `.docx` files with
 python-docx via small CLIs. It handles text, styles, lists, tables,

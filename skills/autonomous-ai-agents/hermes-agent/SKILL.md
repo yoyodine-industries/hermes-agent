@@ -1,6 +1,6 @@
 ---
 name: hermes-agent
-description: "Use, configure, theme, extend, and orchestrate Hermes Agent."
+description: Use when configuring, extending, or debugging Hermes Agent.
 version: 3.2.0
 author: Hermes Agent + Teknium
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 ---
 
 # Hermes Agent
+
+Covers using, configuring, theming, extending and orchestrating Hermes Agent.
 
 Hermes Agent is an open-source AI agent framework by Nous Research that runs in your terminal, a native desktop app, messaging platforms, and IDEs. It's in the same category as Claude Code (Anthropic), Codex (OpenAI), and OpenClaw — autonomous coding and task-execution agents that use tool calling to interact with your system. Hermes works with any LLM provider (OpenRouter, Anthropic, OpenAI, Google, DeepSeek, xAI, local models, and 20+ others) and runs on Linux, macOS, Windows, and WSL.
 

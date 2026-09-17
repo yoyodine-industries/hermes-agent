@@ -1,6 +1,6 @@
 ---
 name: arxiv
-description: "Search arXiv papers by keyword, author, category, or ID."
+description: Use when searching arXiv for papers by keyword or ID.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # arXiv Research
+
+Searches and retrieves arXiv papers by keyword, author, category or ID over the free REST API.
 
 Search and retrieve academic papers from arXiv via their free REST API. No API key, no dependencies — just curl.
 

@@ -1,6 +1,6 @@
 ---
 name: stocks
-description: Stock quotes, history, search, compare, crypto via Yahoo.
+description: Use when you need quotes, history, or crypto from Yahoo.
 version: 0.1.0
 author: Mibay (Mibayy), Hermes Agent
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 ---
 
 # Stocks Skill
+
+Reads stock quotes, history, symbol search, comparison and crypto data via Yahoo Finance.
 
 Read-only market data via Yahoo Finance. Five commands: `quote`, `search`,
 `history`, `compare`, `crypto`. Python stdlib only — no API key, no pip
