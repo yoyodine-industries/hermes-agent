@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bot-to-bot messaging: call graph</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+         Helvetica, Arial, sans-serif; color: #111827; margin: 0;
+         background: #ffffff; line-height: 1.5; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 24px 20px 80px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 32px 0 10px; border-bottom: 2px solid #e5e7eb;
+       padding-bottom: 6px; }
+  .sub { color: #6b7280; font-size: 13px; margin-bottom: 16px; }
+  code { font-family: Menlo, Consolas, "SF Mono", monospace; font-size: 12px;
+         background: #f1f5f9; padding: 1px 5px; border-radius: 4px; }
+  .verdict { background: #fff7ed; border: 1px solid #fdba74; border-radius: 8px;
+             padding: 14px 16px; margin: 18px 0; }
+  .verdict b { color: #c2410c; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px;
+          margin: 8px 0 20px; }
+  th, td { border: 1px solid #e5e7eb; padding: 8px 10px; text-align: left;
+           vertical-align: top; }
+  th { background: #f8fafc; font-size: 12px; text-transform: uppercase;
+       letter-spacing: .03em; color: #475569; }
+  .chip { display: inline-block; padding: 2px 9px; border-radius: 10px;
+          font-size: 11px; font-weight: 700; color: #ffffff; }
+  ul.files { margin: 0; padding-left: 18px; }
+  ul.files code { background: transparent; padding: 0; }
+  .step { font-weight: 700; color: #4f46e5; white-space: nowrap; }
+  .code { font-family: Menlo, Consolas, monospace; font-weight: 700; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0 14px; }
+  .legend .item { display: flex; align-items: center; gap: 7px; font-size: 12px;
+                  color: #374151; }
+  .swatch { width: 16px; height: 16px; border-radius: 3px; border: 2px solid; }
+  .note { color: #6b7280; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Bot-to-bot messaging: call graph</h1>
+  <div class="sub">which component calls which, in what order, over what
+  transport &middot; stock vs ours &middot; wrap vs call &middot; three states
+  never blended</div>
+
+  <div class="verdict">
+    <b>Owner question: is target-state bot-to-bot messaging delivered?</b><br>
+    <b>No.</b> The target-state /v1/messages API is <b>built but unmerged</b>,
+    not live and not merely specified. It exists only on branch
+    <code>feat/bot-message-api @ 8ac9a2d3</code> (PR #21 OPEN, mergedAt null).
+    Live main <code>@ 51aee02d1b</code> answers <b>404</b> to
+    <code>POST /v1/messages</code> and <code>GET /v1/messages</code>. The path in
+    use today is <code>bot_send</code> on
+    <code>POST /api/sessions/{id}/chat</code> through the durable queue.
+  </div>
+
+  <div class="legend">
+    <div class="item"><span class="swatch" style="background:#e2e8f0;border-color:#475569"></span> stock Hermes</div>
+    <div class="item"><span class="swatch" style="background:#ede9fe;border-color:#7c3aed"></span> fork-patched (stock, modified)</div>
+    <div class="item"><span class="swatch" style="background:#fef3c7;border-color:#d97706"></span> our own code (fork-only)</div>
+    <div class="item"><span class="swatch" style="background:#fee2e2;border-color:#dc2626"></span> specified-only (rejected)</div>
+    <div class="item"><span style="color:#16a34a;font-weight:700">LIVE</span></div>
+    <div class="item"><span style="color:#d97706;font-weight:700">UNMERGED (dashed)</span></div>
+    <div class="item"><span style="color:#dc2626;font-weight:700">REJECTED (dashed)</span></div>
+  </div>
+
+  <h2>1. Call graph</h2>
+  <svg viewBox="0 0 1240 720" width="100%" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;">
+<defs><marker id="arrowDark" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#334155"/></marker><marker id="arrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker><marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/></marker></defs>
+<path d="M 330 86 C 330 86, 390 388, 390 388" fill="none" stroke="#334155" stroke-width="2" style="marker-end:url(#arrowDark);"/>
+<text x="300" y="90" font-size="10" fill="#334155" font-family="Menlo,Consolas,monospace">1 in-process _admit_queued_dm (local admission) [call]</text>
+<path d="M 330 214 C 330 214, 390 115, 390 115" fill="none" stroke="#334155" stroke-width="2" style="marker-end:url(#arrowDark);"/>
+<text x="300" y="200" font-size="10" fill="#334155" font-family="Menlo,Consolas,monospace">1 HTTP POST /api/sessions/{id}/chat  -&gt; 8644 [call]</text>
+<path d="M 570 190 C 570 190, 570 230, 570 230" fill="none" stroke="#334155" stroke-width="2" style="marker-end:url(#arrowDark);"/>
+<text x="760" y="224" font-size="10" fill="#334155" font-family="Menlo,Consolas,monospace">2 _handle_bot_send -&gt; derive_delivery_key [call]</text>
+<path d="M 570 300 C 570 300, 570 340, 570 340" fill="none" stroke="#334155" stroke-width="2" style="marker-end:url(#arrowDark);"/>
+<text x="760" y="334" font-size="10" fill="#334155" font-family="Menlo,Consolas,monospace">3 idempotency check -&gt; enqueue record [call]</text>
+<path d="M 570 190 C 570 190, 390 522, 390 522" fill="none" stroke="#334155" stroke-width="2" style="marker-end:url(#arrowDark);"/>
+<text x="585" y="470" font-size="10" fill="#334155" font-family="Menlo,Consolas,monospace">starts sweep_loop [wrap (owns)]</text>
+<path d="M 570 436 C 570 436, 570 476, 570 476" fill="none" stroke="#334155" stroke-width="2" style="marker-end:url(#arrowDark);"/>
+<text x="760" y="470" font-size="10" fill="#334155" font-family="Menlo,Consolas,monospace">4 sweep_loop reads next queued record [call]</text>
+<path d="M 750 522 C 750 522, 810 80, 810 80" fill="none" stroke="#334155" stroke-width="2" style="marker-end:url(#arrowDark);"/>
+<text x="720" y="500" font-size="10" fill="#334155" font-family="Menlo,Consolas,monospace">5 acquire_delivery_turn_lock [call]</text>
+<path d="M 970 120 C 970 120, 970 160, 970 160" fill="none" stroke="#334155" stroke-width="2" style="marker-end:url(#arrowDark);"/>
+<text x="980" y="152" font-size="10" fill="#334155" font-family="Menlo,Consolas,monospace">6 run turn -&gt; state.db [call]</text>
+<path d="M 810 388 C 810 388, 750 115, 750 115" fill="none" stroke="#d97706" stroke-width="2" style="stroke-dasharray:8 5;marker-end:url(#arrowAmber);"/>
+<text x="760" y="250" font-size="10" fill="#d97706" font-family="Menlo,Consolas,monospace">POST /v1/messages -&gt; _handle_message_send -&gt; _handle_bot_send (converges) [call]</text>
+<path d="M 810 388 C 810 388, 750 388, 750 388" fill="none" stroke="#d97706" stroke-width="2" style="stroke-dasharray:8 5;marker-end:url(#arrowAmber);"/>
+<text x="760" y="330" font-size="10" fill="#d97706" font-family="Menlo,Consolas,monospace">GET /v1/messages/{id} reads ledger; POST .../ack -&gt; acknowledged [call]</text>
+<path d="M 810 649 C 810 649, 750 115, 750 115" fill="none" stroke="#dc2626" stroke-width="2" style="stroke-dasharray:8 5;marker-end:url(#arrowRed);"/>
+<text x="700" y="650" font-size="10" fill="#dc2626" font-family="Menlo,Consolas,monospace">rejected name; role maps to Gateway API Server [call]</text>
+<rect x="30" y="40" width="300" height="92" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="2" style=""/>
+<text x="42" y="62" font-size="14" font-weight="700" fill="#111827">message_agent tool</text>
+<text x="42" y="80" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">tools/bot_mode_dm.py:38,659</text>
+<text x="42" y="95" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">_admit_queued_dm | _admit_live_dm</text>
+<text x="42" y="110" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">subprocess: hermes -p &lt;t&gt; chat</text>
+<rect x="280" y="31" width="41" height="18" rx="9" fill="#16a34a"/>
+<text x="301" y="44" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">LIVE</text>
+<rect x="30" y="168" width="300" height="92" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="2" style=""/>
+<text x="42" y="190" font-size="14" font-weight="700" fill="#111827">hermes peer dm CLI</text>
+<text x="42" y="208" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">hermes_cli/subcommands/peer.py:671</text>
+<text x="42" y="223" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">_delivery_headers:395</text>
+<text x="42" y="238" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">cross-host only</text>
+<rect x="280" y="159" width="41" height="18" rx="9" fill="#16a34a"/>
+<text x="301" y="172" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">LIVE</text>
+<rect x="390" y="40" width="360" height="150" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="2" style=""/>
+<text x="402" y="62" font-size="14" font-weight="700" fill="#111827">Hermes Gateway API Server</text>
+<text x="402" y="80" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">gateway/platforms/api_server.py</text>
+<text x="402" y="95" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">port 8644  (PID 9591)</text>
+<text x="402" y="110" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">route:1549  _handle_session_chat:3506</text>
+<text x="402" y="125" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">_handle_bot_send:3260</text>
+<rect x="700" y="31" width="41" height="18" rx="9" fill="#16a34a"/>
+<text x="721" y="44" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">LIVE</text>
+<rect x="390" y="230" width="360" height="70" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="2" style=""/>
+<text x="402" y="252" font-size="14" font-weight="700" fill="#111827">delivery_keys</text>
+<text x="402" y="270" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">hermes_cli/delivery_keys.py:41,75,99</text>
+<rect x="700" y="221" width="41" height="18" rx="9" fill="#16a34a"/>
+<text x="721" y="234" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">LIVE</text>
+<rect x="390" y="340" width="360" height="96" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="2" style=""/>
+<text x="402" y="362" font-size="14" font-weight="700" fill="#111827">bot_delivery_queue  (durable store)</text>
+<text x="402" y="380" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">tools/bot_delivery_queue.py</text>
+<text x="402" y="395" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">build_envelope:1130</text>
+<text x="402" y="410" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">validate_delivery_id:420</text>
+<rect x="700" y="331" width="41" height="18" rx="9" fill="#16a34a"/>
+<text x="721" y="344" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">LIVE</text>
+<rect x="390" y="476" width="360" height="92" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="2" style=""/>
+<text x="402" y="498" font-size="14" font-weight="700" fill="#111827">drainer  (api_server_bot_delivery)</text>
+<text x="402" y="516" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">gateway/platforms/api_server_bot_delivery.py</text>
+<text x="402" y="531" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">sweep_loop:344 drain_once:289</text>
+<text x="402" y="546" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">drain_under_lock:234 run_record:155</text>
+<rect x="700" y="467" width="41" height="18" rx="9" fill="#16a34a"/>
+<text x="721" y="480" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">LIVE</text>
+<rect x="810" y="40" width="320" height="80" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="2" style=""/>
+<text x="822" y="62" font-size="14" font-weight="700" fill="#111827">turn lease</text>
+<text x="822" y="80" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">agent/turn_facade_lease.py</text>
+<text x="822" y="95" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">tools/bot_relay.py:485</text>
+<text x="822" y="110" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">acquire_delivery_turn_lock</text>
+<rect x="1080" y="31" width="41" height="18" rx="9" fill="#16a34a"/>
+<text x="1101" y="44" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">LIVE</text>
+<rect x="810" y="160" width="320" height="80" rx="6" fill="#e2e8f0" stroke="#475569" stroke-width="2" style=""/>
+<text x="822" y="182" font-size="14" font-weight="700" fill="#111827">Bot Chat  (recipient)</text>
+<text x="822" y="200" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">profiles/&lt;lane&gt;/state.db</text>
+<text x="822" y="215" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">the agent turn writes here</text>
+<rect x="1080" y="151" width="41" height="18" rx="9" fill="#16a34a"/>
+<text x="1101" y="164" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">LIVE</text>
+<rect x="810" y="300" width="350" height="176" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="2" style="stroke-dasharray:6 4;"/>
+<text x="822" y="322" font-size="14" font-weight="700" fill="#111827">/v1/messages routes  (UNMERGED)</text>
+<text x="822" y="340" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">api_server.py:1571-1573</text>
+<text x="822" y="355" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">@ feat/bot-message-api 8ac9a2d3</text>
+<text x="822" y="370" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">PR #21 OPEN  (mergedAt null)</text>
+<text x="822" y="385" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">POST /v1/messages -&gt; _handle_message_send:3545</text>
+<text x="822" y="400" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">GET  /v1/messages/{id} -&gt; _handle_message_status:3598</text>
+<text x="822" y="415" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">POST /v1/messages/{id}/ack -&gt; _handle_message_ack:3621</text>
+<rect x="1046" y="291" width="105" height="18" rx="9" fill="#d97706"/>
+<text x="1099" y="304" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">UNMERGED PR#21</text>
+<rect x="810" y="510" width="350" height="72" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="2" style="stroke-dasharray:6 4;"/>
+<text x="822" y="532" font-size="14" font-weight="700" fill="#111827">_check_hub_auth  (UNMERGED)</text>
+<text x="822" y="550" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">api_server.py:3476  @ branch 8ac9a2d3</text>
+<text x="822" y="565" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">Bearer token vs gateway root API_SERVER_KEY</text>
+<rect x="1046" y="501" width="105" height="18" rx="9" fill="#d97706"/>
+<text x="1099" y="514" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">UNMERGED PR#21</text>
+<rect x="810" y="616" width="350" height="66" rx="6" fill="#fee2e2" stroke="#dc2626" stroke-width="2" style="stroke-dasharray:6 4;"/>
+<text x="822" y="638" font-size="14" font-weight="700" fill="#111827">&quot;hub&quot;  (hub-authenticated)</text>
+<text x="822" y="656" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">prose-only name; no code entity</text>
+<text x="822" y="671" font-size="11" fill="#374151" font-family="Menlo,Consolas,monospace">canonical = Gateway API Server</text>
+<rect x="1084" y="607" width="67" height="18" rx="9" fill="#dc2626"/>
+<text x="1118" y="620" font-size="10" font-weight="700" fill="#ffffff" text-anchor="middle">REJECTED</text>
+</svg>
+  <p class="note">Solid arrows = call (edge label carries order + transport).
+  The thin "wrap (owns)" edge marks the gateway process owning the drainer
+  loop. Amber dashed = unmerged (PR #21). Red dashed = rejected prose-only name.</p>
+
+  <h2>2. Provenance: stock vs ours (every component)</h2>
+  <table><thead><tr><th>Bucket</th><th>Meaning</th><th>Files</th></tr></thead>
+  <tbody><tr><td><span class="chip" style="background:#d97706">FORK-ONLY</span></td><td>our own code (new file, absent upstream)</td><td><ul class="files"><li><code>tools/bot_delivery_queue.py</code></li><li><code>gateway/platforms/api_server_bot_delivery.py</code></li><li><code>hermes_cli/delivery_keys.py</code></li></ul></td></tr><tr><td><span class="chip" style="background:#7c3aed">FORK-PATCHED</span></td><td>stock Hermes, modified by the fork (non-empty diff vs upstream/main)</td><td><ul class="files"><li><code>gateway/platforms/api_server.py</code></li><li><code>gateway/platforms/api_server_run_idempotency.py</code></li><li><code>hermes_cli/subcommands/peer.py</code></li><li><code>tools/bot_live_delivery.py</code></li><li><code>agent/turn_facade_lease.py</code></li><li><code>tools/bot_mode_dm.py</code></li><li><code>tools/bot_relay.py</code></li><li><code>tools/bot_failure_reasons.py</code></li></ul></td></tr><tr><td><span class="chip" style="background:#475569">STOCK</span></td><td>untouched stock Hermes (no diff vs upstream/main)</td><td><ul class="files"><li><code>tools/bot_mode_probe.py</code></li><li><code>agent/turn_facade.py</code></li><li><code>agent/turn_context.py</code></li><li><code>profiles/&lt;lane&gt;/state.db (conversation store)</code></li></ul></td></tr></tbody></table>
+
+  <h2>3. Three states (never blended)</h2>
+  <table><thead><tr><th>State</th><th>Definition</th><th>Border</th>
+  <th>Here</th></tr></thead><tbody><tr><td><span class="chip">LIVE</span></td><td>code on main @ 51aee02d1b; live probe answers on 8644</td><td><code>solid green border</code></td><td>the bot_send queue path (in use today)</td></tr><tr><td><span class="chip">UNMERGED</span></td><td>code on feat/bot-message-api @ 8ac9a2d3; PR #21 OPEN, mergedAt null</td><td><code>dashed amber border</code></td><td>the /v1/messages API (send + status + ack)</td></tr><tr><td><span class="chip">REJECTED</span></td><td>exists only in prose; maps to no code entity</td><td><code>dashed red border</code></td><td>the &#x27;hub&#x27; name (canonical: Gateway API Server)</td></tr></tbody></table>
+
+  <h2>4. One real message, end to end (peer dm, cross-host)</h2>
+  <table><thead><tr><th>Step</th><th>What</th><th>Process / transport</th>
+  <th>Grounding</th></tr></thead><tbody><tr><td class="step">1 send</td><td><code>hermes peer dm &lt;peer&gt;/&lt;agent&gt;</code></td><td>process: hermes CLI (sender)</td><td><code>hermes_cli/subcommands/peer.py:671</code></td></tr><tr><td class="step">2 transport</td><td><code>HTTP POST {peer.url}/api/sessions/{session_id}/chat</code></td><td>port 8644, TLS, bearer key header</td><td><code>peer.py:395 _delivery_headers</code></td></tr><tr><td class="step">3 admit</td><td><code>Gateway API Server -&gt; _handle_session_chat -&gt; _handle_bot_send</code></td><td>route detects bot_send payload</td><td><code>api_server.py:1549,3506,3260</code></td></tr><tr><td class="step">4 idem</td><td><code>delivery_keys.derive_delivery_key + delivery_fingerprint</code></td><td>idempotency key + delivery_id = run_id</td><td><code>delivery_keys.py:41,75,99</code></td></tr><tr><td class="step">5 store</td><td><code>bot_delivery_queue write (STATUS_QUEUED)</code></td><td>durable record on disk</td><td><code>tools/bot_delivery_queue.py</code></td></tr><tr><td class="step">6 drain</td><td><code>drainer sweep_loop -&gt; drain_once -&gt; drain_under_lock -&gt; run_record</code></td><td>30s sweep of queued records</td><td><code>api_server_bot_delivery.py:344,289,234,155</code></td></tr><tr><td class="step">7 deliver</td><td><code>acquire_delivery_turn_lock -&gt; turn runs in recipient Bot Chat</code></td><td>non-blocking turn lease</td><td><code>tools/bot_relay.py:485 + turn_facade_lease.py</code></td></tr><tr><td class="step">8 receipt</td><td><code>build_envelope -&gt; {delivery_id, status} returned to sender</code></td><td>sender receives delivery receipt</td><td><code>tools/bot_delivery_queue.py:1130</code></td></tr></tbody></table>
+  <p class="note">Same-host delivery (message_agent tool) converges on the same
+  queue via in-process <code>_admit_queued_dm</code> (bot_mode_dm.py:659), or a
+  live-owner direct write, or a <code>hermes chat</code> subprocess &mdash; no
+  HTTP hop. Only cross-host <code>peer dm</code> enters over HTTP.</p>
+
+  <h2>5. Live probes (the discriminator)</h2>
+  <table><thead><tr><th>Probe</th><th>Code</th><th>Meaning</th></tr></thead>
+  <tbody><tr><td><code>POST /v1/messages</code></td><td class="code">404</td><td>route NOT registered on live main</td></tr><tr><td><code>GET  /v1/messages</code></td><td class="code">404</td><td>route NOT registered on live main</td></tr><tr><td><code>POST /api/sessions/foo/chat</code></td><td class="code">401</td><td>route REGISTERED, unauthenticated</td></tr><tr><td><code>POST /health</code></td><td class="code">405</td><td>route REGISTERED, wrong method</td></tr><tr><td><code>GET  /health</code></td><td class="code">200</td><td>gateway alive</td></tr></tbody></table>
+  <p class="note">404 = route not registered (absent). 401 = route registered,
+  unauthenticated. 405 = route registered, wrong method. The same three probes
+  separate the unmerged /v1/messages routes (404 on live) from the live
+  /api/sessions/{id}/chat route (401/405).</p>
+
+  <h2>6. Grounding</h2>
+  <table><thead><tr><th>Field</th><th>Value</th></tr></thead>
+  <tbody><tr><td>fork</td><td><code>yoyodine-industries/hermes-agent</code></td></tr><tr><td>live HEAD</td><td><code>main @ 51aee02d1b</code></td></tr><tr><td>unmerged branch</td><td><code>feat/bot-message-api @ 8ac9a2d3a93b8d4e31355e1256362aece60c46c5</code></td></tr><tr><td>PR</td><td><code>#21 OPEN (mergedAt null, base main)</code></td></tr><tr><td>probe date</td><td><code>2026-09-17 (gateway PID 9591, port 8644)</code></td></tr></tbody></table>
+
+  <h2>7. What deploying PR #21 changes</h2>
+  <p>Merging PR #21 registers three routes on the gateway and adds a dedicated
+  message API on top of the existing queue and drainer &mdash; it does not
+  replace them:</p>
+  <ul class="files">
+    <li><code>POST /v1/messages</code> &rarr; <code>_handle_message_send</code>
+    &rarr; <code>_handle_bot_send</code> (converges on the same admission + queue).</li>
+    <li><code>GET /v1/messages/{delivery_id}</code> &rarr; status read from the
+    ledger.</li>
+    <li><code>POST /v1/messages/{delivery_id}/ack</code> &rarr; receiver ack,
+    adding a new <code>acknowledged</code> stage the live path lacks.</li>
+    <li>Auth: <code>_check_hub_auth</code> validates a Bearer token against the
+    gateway root <code>API_SERVER_KEY</code> (branch-only; the term "hub" is the
+    rejected prose name).</li>
+  </ul>
+  <p class="note">The missing call on live today is exactly the
+  <code>/v1/messages</code> route registration at <code>api_server.py:1571-1573</code>
+  &mdash; present only on the unmerged branch.</p>
+</div>
+</body>
+</html>
