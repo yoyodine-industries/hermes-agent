@@ -132,6 +132,44 @@ _BOARD_SPECS = [
         "NEW board — the slug gains a numeric suffix if it is already taken — so an import can "
         "never overwrite or merge into a board you already have."
     )),
+    _cmd("move", [
+        _arg("task_id", help="Task id to move to another board"),
+        _arg("--to", dest="to_slug", required=True, help="Destination board slug"),
+        _arg("--from", dest="from_slug", help="Source board (default: the current board)"),
+        _arg("--with-links", "--link-closed", dest="with_links", action="store_true",
+             help="Move the card's whole link-closed set (it and every card linked to it)"),
+        _arg("--sever-edge", dest="sever_edge", action="append", metavar="PARENT:CHILD",
+             help="Declare one parent/child edge this move cuts (repeatable); requires "
+                  "--sever-reason, and every edge left behind must be declared"),
+        _arg("--sever-reason", dest="sever_reason", metavar="TEXT",
+             help="Why those edges are cut; recorded in a link_severed event on both "
+                  "boards (required with --sever-edge)"),
+        _json_flag(),
+    ], help="Move a card (and, with --with-links, its whole link component) to another board",
+       description=(
+        "Copy a card to another board and remove it from its current one. Comments, events, "
+        "runs and file attachments move with it. Ids are preserved. Machine-local state "
+        "(claims, worker PIDs, chat subscriptions, workspace paths) is stripped, and both "
+        "boards are backed up before anything is written.\n"
+        "\n"
+        "Dependencies are never severed silently: parent/child links are NOT dropped on the "
+        "way across. If the card is linked to other cards, the move is refused (naming how "
+        "many, and pointing at --with-links) unless you pass --with-links (alias "
+        "--link-closed), which moves the card's whole link-closed set — every card "
+        "reachable through parent/child links — as one unit, carrying all of the set's "
+        "internal links. Unlink the card first if you really meant to move it alone.\n"
+        "\n"
+        "When the whole set cannot move (one gating card has to stay behind), declare each "
+        "cut edge explicitly with --sever-edge PARENT:CHILD (one flag per edge) plus "
+        "--sever-reason TEXT. Declared cuts are refused when they would strand a card in a "
+        "dispatcher pool lane (todo/ready/triage), whose orphan could then be "
+        "auto-promoted; a cut is audited as a link_severed event on both boards, and an "
+        "edge left behind that you did not declare still refuses the move.\n"
+        "\n"
+        "Refuses while any card in the set is running or holds a live claim/run; reclaim or "
+        "archive it first. Because ids are preserved, a move interrupted between the target "
+        "commit and the source delete is completed by simply re-running the same command."
+    )),
 ]
 
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
