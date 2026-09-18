@@ -1127,6 +1127,19 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    stuck = stats.get("zero_run_ready") or {}
+    if int(stuck.get("count") or 0) > 0:
+        line = (
+            f"\nNever attempted: {stuck['count']} ready task(s); oldest "
+            f"{stuck['oldest_task_id']} ({stuck.get('oldest_assignee') or 'unassigned'}) "
+            f"waiting {int(stuck['oldest_age_seconds'])}s"
+        )
+        if stuck.get("oldest_spawnable") is False:
+            line += (
+                " - its assignee is not a live profile, so the dispatcher will never "
+                "launch a worker for it (reassign it, or create it unassigned)"
+            )
+        print(line)
     return 0
 
 

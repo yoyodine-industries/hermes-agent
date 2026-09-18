@@ -240,6 +240,35 @@ class _KanbanDispatcher:
                 oldest = kbd.PendingWork(board=slug, task_id=task_id, age_seconds=age)
         return oldest
 
+    def zero_run_ready(self) -> Any:
+        """Stuck-ready probe across every board, as a plain ``dict`` or ``None``.
+
+        Wraps ``kanban_db_dispatch.zero_run_ready`` (one query, defined in
+        ``kanban_db`` so the CLI/ops API and this health surface cannot drift)
+        and keeps the board with the most stuck cards — the count is the size of
+        the fault, and the board slug lets the health line name it. ``None``
+        means no board reports one, including when a board could not be read, so
+        a probe failure can never invent a stuck board.
+        """
+        kbd = _kbd()
+        worst: Any = None
+        for slug in self._board_slugs():
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                stats = kbd.zero_run_ready(conn)
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+            if not stats or not int(stats.get("count") or 0):
+                continue
+            if worst is None or int(stats["count"]) > int(worst.get("count") or 0):
+                worst = dict(stats, board=slug)
+        return worst
+
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
 

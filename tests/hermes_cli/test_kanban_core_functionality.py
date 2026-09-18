@@ -1153,8 +1153,13 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     # skips the dispatch connect because the corrupt board fingerprint is
     # disabled, but the ready/review probes still each connect. PR f55d94a1e
     # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # probe, bumping this from 3 → 5. The dispatch-health stuck-ready probe
+    # (``zero_run_ready``, one extra read-only connect per tick, also wrapped
+    # in its own try/except so a board that cannot be read stays silent)
+    # bumps it 5 → 7. The point of this assertion is that a quarantined
+    # board produces no traceback and no amplified work: a constant +1
+    # probe per tick is expected, a growing count is not.
+    assert calls["connect"] == 7
 
 
 # ---------------------------------------------------------------------------
