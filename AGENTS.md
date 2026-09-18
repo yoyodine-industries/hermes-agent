@@ -173,6 +173,37 @@ is "inside the Hermes desktop app". The pattern:
 Test: if the capability still makes sense with the client on another machine, it is
 session-scoped. Assert the GUI session gets the tool **with the env var absent**.
 
+### Profile identity: resolved once, pinned from the home, scrubbed at the boundary
+
+`HERMES_HOME` decides WHERE a process runs; WHO it is, is the canonical name derived from that home
+(`default` for a root, `<name>` for `<root>/profiles/<name>`). `HERMES_PROFILE` is a PIN of that
+name, not a second opinion — code that needs the actor asks `profiles.get_active_profile_name()`
+(or `profile_name_for_home()`), because every child that inherits an environ inherits an actor that
+may not be its own. A session that carries the wrong one reads another profile's `config.yaml`,
+owns another profile's kanban board, and stamps its audit rows with another profile's name.
+
+- **Pin at the spawn.** Handing a session to another profile means an explicit `-p <target>` in the
+  argv AND the sender's identity dropped from the child env (`profiles.scrub_profile_identity_env`,
+  names in `profiles.PROFILE_IDENTITY_ENV`) — never one without the other.
+- **Resolve once at startup.** `_apply_profile_override` sets `HERMES_HOME` and pins
+  `HERMES_PROFILE`; `_pin_identity_after_dotenv` re-asserts both after the dotenv load. A `.env`
+  file is configuration, never identity: one that re-points `HERMES_HOME` is warned about and
+  overridden, because that is how a session silently becomes another profile (see #73381).
+- **Derive at use.** Never read `HERMES_PROFILE` as the source of truth for the actor, and do not
+  cache `get_hermes_home()` at import time in a module that can outlive its resolution — resolve at
+  call time (`cron/jobs.py::_current_cron_store` is the reference pattern).
+- **Scrub at the boundary.** Any builder of a child env bound for a different profile drops the
+  identity names rather than forwarding them, even when the argv already carries `-p`.
+
+An explicit `-p`/`--profile` always wins; an inherited `HERMES_HOME` under `profiles/<name>` names
+the actor for the process that receives it (the inheritance contract) — but only when it IS a
+profile home. A dangling or foreign path is not an identity, and resolution falls through to normal
+active-profile handling rather than adopting it.
+
+Test: a session booted with no profile flag reports the identity of the home it was given
+(`HERMES_PROFILE` equals the derived name), and a child env from any delivery/relay boundary
+carries no `HERMES_HOME`/`HERMES_PROFILE` from the sender.
+
 ## Development Environment
 
 ```bash

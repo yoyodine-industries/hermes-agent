@@ -118,7 +118,19 @@ def _title_body(parsed: dict) -> tuple[Optional[str], Optional[str]]:
 
 def _profile_author(default: str = "specifier") -> str:
     """Mirror of ``hermes_cli.kanban._profile_author``. Kept local to
-    avoid a circular import when kanban.py imports this module."""
+    avoid a circular import when kanban.py imports this module.
+
+    Derives the actor from HERMES_HOME first, like its twin: at the triage/decompose hop the
+    author must be the session's own profile, not a name inherited from whatever spawned it
+    (t_f6011a57)."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        derived = get_active_profile_name()
+        if derived and derived != "custom":
+            return derived
+    except Exception:
+        pass
     return os.environ.get("HERMES_PROFILE") or os.environ.get("USER") or default
 
 

@@ -505,19 +505,64 @@ def _desktop_ssh_backend(argv: list) -> bool:
     return "--ssh-session-token-file" in argv
 
 
+def _profile_identity_at_boot() -> "str | None":
+    """``HERMES_HOME`` as resolved at startup, or ``None`` when it was unset then.
+
+    Resolving identity and loading a ``.env`` are two different things, and the second must never
+    undo the first: a dotenv that re-points ``HERMES_HOME`` silently moves an already-resolved
+    session into another profile (the "Settings read one config.yaml and the user edits another"
+    reports). Snapshot before the load, re-assert after.
+    """
+    return os.environ.get("HERMES_HOME")
+
+
+def _pin_identity_after_dotenv(resolved_home: "str | None") -> None:
+    """Re-assert the identity resolved before the dotenv load, and PIN the profile name onto it.
+
+    Called with the snapshot from :func:`_profile_identity_at_boot`. The startup home wins over
+    anything a ``.env`` set; when nothing was resolved yet, the home the dotenv supplied becomes
+    the identity. Either way ``HERMES_PROFILE`` is pinned from the home that survives, so no reader
+    downstream has to guess at -- or inherit -- who this process is.
+    """
+    if resolved_home is not None and os.environ.get("HERMES_HOME") != resolved_home:
+        print(
+            "Warning: .env re-pointed HERMES_HOME (-> "
+            f"{os.environ.get('HERMES_HOME') or 'unset'}); keeping {resolved_home}",
+            file=sys.stderr,
+        )
+        os.environ["HERMES_HOME"] = resolved_home
+    home = resolved_home if resolved_home is not None else os.environ.get("HERMES_HOME")
+    if home:
+        from hermes_cli.profiles import pin_profile_env
+
+        pin_profile_env(home)
+
+
 def _apply_profile_override() -> None:
-    """Pre-parse --profile/-p and set HERMES_HOME before imports."""
+    """Pre-parse --profile/-p, set HERMES_HOME, and PIN the profile name derived from it.
+
+    RESOLVE half of the profile identity chain: this is the one place that decides WHERE the process
+    runs, so it is also the place that decides WHO it is. A spawned child inherits its parent's
+    environment, so without the pin a session can carry a name belonging to another profile — and
+    every reader that trusts the variable then runs as, and attributes its work to, the wrong actor.
+    """
     argv = sys.argv[1:]
     profile_name, consume, profile_index = _scan_profile_flag(argv)
 
-    # HERMES_HOME already set with no explicit flag: trust it only when it
-    # points at a specific profile dir ("profiles" as immediate parent). If it
-    # points at the hermes root (systemd hardcodes HERMES_HOME=/root/.hermes)
-    # we must still read active_profile — the user may have run
-    # `hermes profile use` and the gateway should honour it (#22502).
+    # HERMES_HOME already set with no explicit flag: a directory under profiles/ NAMES the actor for
+    # this process (the child-inheritance contract), so pin the name it implies. Trust it only when
+    # it IS a profile home — a path that does not exist, or that is not a profile directory, is not
+    # an identity, and adopting it would silently re-home the session; fall through instead. If it
+    # points at the hermes root (systemd hardcodes HERMES_HOME=/root/.hermes) we must still read
+    # active_profile — the user may have run `hermes profile use` and the gateway should honour it
+    # (#22502).
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env and Path(hermes_home_env).parent.name == "profiles":
-        return
+        from hermes_cli.profiles import pin_profile_env, profile_name_for_home
+
+        if Path(hermes_home_env).is_dir() and profile_name_for_home(hermes_home_env) != "custom":
+            pin_profile_env(hermes_home_env)
+            return
 
     if profile_name is None and not _under_gateway_supervisor(argv) and not _desktop_ssh_backend(argv):
         try:
@@ -532,6 +577,13 @@ def _apply_profile_override() -> None:
             pass  # corrupted file, skip
 
     if profile_name is None:
+        # No flag and nothing sticky: the home in hand (root, or unset at startup) is the whole
+        # identity. Pin it here when it is already known; when it is unset the dotenv is allowed to
+        # supply one, and _pin_identity_after_dotenv pins the name once it has.
+        if hermes_home_env:
+            from hermes_cli.profiles import pin_profile_env
+
+            pin_profile_env(hermes_home_env)
         return
     try:
         from hermes_cli.profiles import resolve_profile_env
@@ -550,6 +602,9 @@ def _apply_profile_override() -> None:
         print(f"Warning: profile override failed ({exc}), using default", file=sys.stderr)
         return
     os.environ["HERMES_HOME"] = hermes_home
+    from hermes_cli.profiles import pin_profile_env
+
+    pin_profile_env(hermes_home)
     # Strip the flag from argv so argparse doesn't choke
     if consume > 0 and profile_index is not None:
         start = profile_index + 1  # +1 because argv is sys.argv[1:]
@@ -593,10 +648,14 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # Profile flags have already been stripped above, so the first remaining argument is the authoritative
 # argparse subcommand. Dotenv/managed config still loads; only external secret fetches are unnecessary for
 # installation maintenance. See #73381.
+_BOOT_PROFILE_HOME = _profile_identity_at_boot()
 load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
     load_external_secrets=sys.argv[1:2] != ["update"],
 )
+# Identity first, configuration second: the load above must not be able to move a resolved session
+# into another profile, and the name it left pinned must match the home that survived.
+_pin_identity_after_dotenv(_BOOT_PROFILE_HOME)
 
 # Bridge security.redact_secrets → HERMES_REDACT_SECRETS BEFORE hermes_logging
 # imports agent.redact, which snapshots the flag exactly once at import. A

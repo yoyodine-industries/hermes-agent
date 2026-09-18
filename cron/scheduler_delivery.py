@@ -733,12 +733,15 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         return msg
 
     from agent.delegation_context import delegated_child_subprocess_env
+    from hermes_cli.profiles import scrub_profile_identity_env
     from tools.environments.local import strip_launch_profile_env
     env = strip_launch_profile_env(delegated_child_subprocess_env(os.environ))
     if profile:
         argv += ["-p", profile]
-        # -p owns profile resolution; this scheduler's HERMES_HOME must not shadow it.
-        env.pop("HERMES_HOME", None)
+        # -p owns profile resolution, so this scheduler's identity must not ride along: a delivery
+        # that inherits HERMES_HOME/HERMES_PROFILE runs as — and attributes itself to — the
+        # scheduler's profile instead of the target's (t_f6011a57).
+        scrub_profile_identity_env(env)
     else:
         # Multiplex workers carry the profile in a ContextVar, not os.environ.
         env["HERMES_HOME"] = str(source_home)

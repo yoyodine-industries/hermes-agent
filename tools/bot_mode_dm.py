@@ -363,10 +363,17 @@ def _delivery_turn_env(base: Optional[dict] = None) -> dict:
     Only deliveries carry it, so an ordinary turn keeps the plain SESSION_NOT_OWNED refusal.
     ``base`` is the caller's environment (the relay's author-carrying ``delivery_env``);
     it defaults to this process's own environment.
+
+    The child's profile identity is deliberately NOT handed over: the transport names the target
+    with ``-p``, and that flag owns resolution. A delivery that inherits the sender's
+    ``HERMES_HOME``/``HERMES_PROFILE`` runs as the sender when resolution falls through, and stamps
+    the recipient's rows with the sender's name (t_f6011a57).
     """
     from hermes_cli.active_sessions import DELIVERY_TURN_ENV
+    from hermes_cli.profiles import scrub_profile_identity_env
 
-    return {**(os.environ if base is None else base), DELIVERY_TURN_ENV: "1"}
+    env = dict(os.environ if base is None else base)
+    return {**scrub_profile_identity_env(env), DELIVERY_TURN_ENV: "1"}
 
 
 def _delivery_receipt(delivery_id: str, profile: str, *, status_detail: str,

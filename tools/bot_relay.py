@@ -421,13 +421,19 @@ def delivery_env(author: Optional[dict]) -> dict[str, str]:
     dropped first so a delivery without an author never inherits the author of the turn that sent it.
     Dispatcher session identity (the canonical ``gateway.session_context`` session env names) is
     dropped too: a nested recipient that ``message_agent``s onward must not stamp that grandchild
-    notify with the grandparent's key, or the live recipient never resumes."""
+    notify with the grandparent's key, or the live recipient never resumes. Profile identity
+    (``HERMES_HOME``/``HERMES_PROFILE``/``HERMES_PROFILE_NAME``) is dropped for the same reason: the
+    transport names the target profile with ``-p``, so an inherited pair would only ever describe the
+    SENDER — and a delivery that resolves through it runs as, and attributes itself to, the sender
+    (t_f6011a57)."""
     from agent.turn_author import TURN_AUTHOR_ENV, turn_author_env
+    from hermes_cli.profiles import scrub_profile_identity_env
 
     env = dict(os.environ)
     env.pop(TURN_AUTHOR_ENV, None)
     for name in _delivery_child_session_env_names():
         env.pop(name, None)
+    scrub_profile_identity_env(env)
     if author:
         env.update(turn_author_env(author))
     return env

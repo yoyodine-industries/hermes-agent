@@ -1438,21 +1438,72 @@ def _retarget_active_profile(old: str, new: str, message: str) -> None:
             print(message)
 
 
-def get_active_profile_name() -> str:
-    """Profile name inferred from HERMES_HOME: ``"default"`` when unset or ``~/.hermes``, the
-    name under ``~/.hermes/profiles/<name>``, ``"custom"`` for any other path."""
+# ── Profile IDENTITY ────────────────────────────────────────────────────────────────────────────
+# WHERE a process runs is ``HERMES_HOME``; WHO it is, is the canonical name derived from that home.
+# ``HERMES_PROFILE`` is a PIN of that name, written here and at startup by ``_apply_profile_override``
+# (and by spawners handing a session to another profile). Never read it as the source of truth for
+# the actor: a spawned child inherits its parent's environment, so the variable can legitimately
+# hold a name that belongs to a DIFFERENT profile. Resolve from the home — that is what this module
+# is for, and why ``get_active_profile_name()`` derives instead of reading the variable.
+PROFILE_IDENTITY_ENV = ("HERMES_HOME", "HERMES_PROFILE", "HERMES_PROFILE_NAME")
+
+
+def profile_name_for_home(home: "str | Path | None" = None) -> str:
+    """Canonical actor name for *home* (default: the active home): ``"default"`` for the hermes
+    root, the profile name under ``<root>/profiles/<name>``, ``"custom"`` for any other path."""
     from hermes_constants import get_hermes_home
-    resolved = get_hermes_home().resolve()
+
+    resolved = Path(home).expanduser().resolve() if home else get_hermes_home().resolve()
     if resolved == _get_default_hermes_home().resolve():
         return "default"
-    profiles_root = _get_profiles_root().resolve()
     try:
-        parts = resolved.relative_to(profiles_root).parts
-        if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
-            return parts[0]
+        parts = resolved.relative_to(_get_profiles_root().resolve()).parts
     except ValueError:
-        pass
+        return "custom"
+    if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
+        return parts[0]
     return "custom"
+
+
+def pin_profile_env(home: "str | Path | None" = None) -> str:
+    """Pin ``HERMES_PROFILE`` to the canonical name of *home* (default: the active home); return it.
+
+    The home is the authority, so this overwrites whatever the variable held — a spare name
+    inherited from a parent process, or one a ``.env`` tried to install. A home with no canonical
+    name (``"custom"``) clears the variable instead of leaving a plausible-looking lie behind, and a
+    legacy ``HERMES_PROFILE_NAME`` that disagrees with the home goes the same way."""
+    name = profile_name_for_home(home)
+    if name == "custom":
+        os.environ.pop("HERMES_PROFILE", None)
+        os.environ.pop("HERMES_PROFILE_NAME", None)
+        return name
+    os.environ["HERMES_PROFILE"] = name
+    legacy = os.environ.get("HERMES_PROFILE_NAME")
+    if legacy and legacy != name:
+        os.environ.pop("HERMES_PROFILE_NAME", None)
+    return name
+
+
+def scrub_profile_identity_env(env: dict) -> dict:
+    """Drop the LAUNCH profile's identity from a child env bound for another profile, in place.
+
+    When a spawn hands a session to a different profile it passes ``-p <target>`` explicitly, and
+    that flag owns resolution. Carrying the parent's ``HERMES_HOME``/``HERMES_PROFILE`` alongside it
+    only creates a window where a mis-resolved child runs as — and stamps its audit rows with — the
+    parent's actor. Env is data, identity is construction: the child derives its own."""
+    for name in PROFILE_IDENTITY_ENV:
+        env.pop(name, None)
+    return env
+
+
+def get_active_profile_name() -> str:
+    """Profile name inferred from HERMES_HOME: ``"default"`` when unset or ``~/.hermes``, the
+    name under ``~/.hermes/profiles/<name>``, ``"custom"`` for any other path.
+
+    Callers that need the ACTOR must read it through here (or ``profile_name_for_home``), never
+    from ``HERMES_PROFILE``: that variable is a pin this function's value was written into, and in
+    a spawned child it may describe the parent process."""
+    return profile_name_for_home()
 
 
 # Export / Import

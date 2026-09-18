@@ -199,16 +199,26 @@ def kanban_command(args: argparse.Namespace) -> int:
 # --- Handlers ---
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
+    """Best-effort author name for an interactive CLI call.
+
+    The ACTOR is derived from ``HERMES_HOME`` — the authority for where this process runs — never
+    from ``HERMES_PROFILE``, which is a pin that a child spawned by another profile inherits
+    unchanged (t_f6011a57). The env names stay as the fallback for a home with no canonical name
+    (a custom root), where an operator's export is the best answer available.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        derived = get_active_profile_name()
+        if derived and derived != "custom":
+            return derived
+    except Exception:
+        pass
     for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
         v = os.environ.get(env)
         if v:
             return v
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-        return get_active_profile_name() or "user"
-    except Exception:
-        return "user"
+    return "user"
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
