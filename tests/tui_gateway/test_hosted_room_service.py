@@ -2091,3 +2091,60 @@ def test_local_profiles_skips_delete_tombstones_and_dot_dirs(tmp_path: Path):
     service = HostedRoomService(_server(), db_path=tmp_path / "shared-state.db")
 
     assert service.local_profiles() == ("default", "ops")
+
+
+def _managed_root(tmp_path: Path, handle: str = "yoyodine-majordomo") -> Path:
+    """An install root whose own agent is Bot-Mode-managed."""
+    (tmp_path / "profile.yaml").write_text(
+        f"ui_meta:\n  hermes-bots:\n    handle: {handle}\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_create_room_stores_the_profile_name_for_a_configured_handle_member(tmp_path: Path):
+    """The Desktop names the install's own agent by its Bot-Mode @handle; the roster must persist the
+    profile NAME, so the dispatched task's ``target_profile`` names a real profile."""
+    _managed_root(tmp_path)
+    (tmp_path / "profiles" / "ops").mkdir(parents=True)
+    service = HostedRoomService(_server(), db_path=tmp_path / "shared-state.db")
+    assert service.local_profiles() == ("default", "ops")
+
+    room = service.create_room(room_id="room-1", name="Release room", members=[
+        {"member_id": "hermes", "profile": "yoyodine-majordomo", "handle": "yoyodine-majordomo"},
+        {"member_id": "ops", "profile": "ops", "handle": "ops"}])
+
+    assert [member["profile"] for member in room["members"]] == ["default", "ops"]
+    assert [member["handle"] for member in room["members"]] == ["yoyodine-majordomo", "ops"]
+
+
+def test_handle_member_dispatches_the_turn_to_the_profile_name(tmp_path: Path):
+    """End to end: a @handle-addressed member produces a reply from the ``default`` profile."""
+    _managed_root(tmp_path)
+    (tmp_path / "profiles" / "ops").mkdir(parents=True)
+    service = HostedRoomService(_server(), db_path=tmp_path / "shared-state.db")
+    service.rpc = _FakeRPC()
+    service.runtime.rpc = service.rpc
+    service.create_room(room_id="room-1", name="Release room", members=[
+        {"member_id": "hermes", "profile": "yoyodine-majordomo", "handle": "yoyodine-majordomo"},
+        {"member_id": "ops", "profile": "ops", "handle": "ops"}])
+
+    service.start()
+    service.send(room_id="room-1", event_id="user-1",
+                 payload={"text": "@yoyodine-majordomo report status", "thread_id": "thread-1"})
+    _wait_for(lambda: any(event["kind"] == "message.member" for event in service._events("room-1")))
+    assert service.stop(timeout=5.0)
+
+    assert service._events("room-1")[1]["payload"]["text"] == "reply from default"
+
+
+def test_ambiguous_handle_fails_closed_instead_of_capturing_a_profile(tmp_path: Path):
+    """A profile whose NAME is the default profile's configured handle makes that address ambiguous:
+    ``resolve_local_profile`` returns None, so the room is refused rather than silently captured."""
+    _managed_root(tmp_path)
+    (tmp_path / "profiles" / "yoyodine-majordomo").mkdir(parents=True)
+    service = HostedRoomService(_server(), db_path=tmp_path / "shared-state.db")
+    assert service.local_profiles() == ("default", "yoyodine-majordomo")
+
+    with pytest.raises(discussion.DiscussionValidationError, match="is not local to this gateway"):
+        service.create_room(room_id="room-1", name="Release room", members=[
+            {"member_id": "hermes", "profile": "yoyodine-majordomo", "handle": "yoyodine-majordomo"},
+            {"member_id": "other", "profile": "default", "handle": "hermes"}])

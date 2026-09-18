@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
@@ -134,6 +135,18 @@ class HostedRoomService:
                 path.name for path in profiles_dir.iterdir()
                 if path.is_dir() and not path.name.startswith(".") and not named_profile_is_deleted(path))
         return tuple(sorted(profiles))
+
+    def member_profile_resolver(self, local_profiles: Iterable[str]) -> discussion.ProfileResolver:
+        """Map a member's address — profile name, its configured @handle, or the legacy ``@hermes``
+        alias — to the profile NAME on this host; ``None`` when the address names nothing here or
+        names more than one profile (``tools.bot_mode_probe.resolve_local_profile``).
+
+        The live roster snapshot is passed through so resolution and ``validate_roster`` agree on
+        exactly which profiles are local, and a member that resolves to nothing fails closed.
+        """
+        from tools.bot_mode_probe import resolve_local_profile
+
+        return functools.partial(resolve_local_profile, self.root, roster=list(local_profiles))
 
     def bindings(self) -> tuple[HostedRoomBinding, ...]:
         local_gateway_id = hosted_rooms.local_authority_gateway_id()
@@ -370,6 +383,7 @@ class HostedRoomService:
 
     def _publish_terminal_tasks(self, room: Mapping[str, Any]) -> bool:
         changed, room_id, local_profiles = False, str(room["room_id"]), self.local_profiles()
+        resolve_profile = self.member_profile_resolver(local_profiles)
         for task in self._list_tasks(room_id, _TERMINAL_STATUSES):
             status, execution_generation = task["status"], int(task["execution_generation"])
             if self.policy_checkpoint.publication_exists(
@@ -379,11 +393,12 @@ class HostedRoomService:
             task_events = self.policy_checkpoint.events_for_task(
                 room_id=room_id, source_event_seq=int(task["payload"]["source_event_seq"]))
             plan = discussion.reconstruct_task_plan(
-                room, task_events, task, local_profiles=local_profiles)
+                room, task_events, task, local_profiles=local_profiles,
+                resolve_profile=resolve_profile)
             publication = discussion.plan_publication(
                 room, task_events, plan, status=status, result=task.get("result"),
                 execution_generation=execution_generation if status == "deferred" else None,
-                local_profiles=local_profiles)
+                local_profiles=local_profiles, resolve_profile=resolve_profile)
             for event in publication.events:
                 hosted_rooms.append_event(self.db_path, **event.append_kwargs(room_id))
             changed = True
@@ -416,9 +431,11 @@ class HostedRoomService:
                 self.db_path, room_id=binding.room_id, clock=self.runtime.clock)
             if next(iter(self._list_tasks(binding.room_id, _LIVE_STATUSES)), None) is not None:
                 return
+            local_profiles = self.local_profiles()
             decision = discussion.plan_next_task(
-                room, list(snapshot.events), local_profiles=self.local_profiles(),
-                initial_watermarks=snapshot.watermarks)
+                room, list(snapshot.events), local_profiles=local_profiles,
+                initial_watermarks=snapshot.watermarks,
+                resolve_profile=self.member_profile_resolver(local_profiles))
             if decision.status == "task" and decision.task is not None:
                 driver.admit_task(
                     self.db_path, decision.task.identity, payload=decision.task.payload,
@@ -436,7 +453,10 @@ class HostedRoomService:
         self.runtime.wakeup()
 
     def create_room(self, *, room_id: str, name: str, members: Any) -> dict[str, Any]:
-        normalized = discussion.validate_roster(members, local_profiles=self.local_profiles())
+        local_profiles = self.local_profiles()
+        normalized = discussion.validate_roster(
+            members, local_profiles=local_profiles,
+            resolve_profile=self.member_profile_resolver(local_profiles))
         room = hosted_rooms.create_room(
             self.db_path, room_id=room_id, name=name,
             members=[
