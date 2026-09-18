@@ -572,6 +572,100 @@ class TestProtectedInstructionFiles:
         assert not res.get("error"), res
         assert approvals["calls"] == []
 
+    # ---- per-bot identity files (*-soul.md) ------------------------------
+
+    @pytest.mark.parametrize(
+        "name",
+        ["yoyodine-majordomo-soul.md", "platform-coder-soul.md", "ops-soul.md"],
+    )
+    def test_identity_file_write_is_gated(self, tmp_path, approvals, name):
+        """A bot's live identity is ``<bot>-soul.md`` (the config-repo file the
+        profile ``SOUL.md`` symlinks to), not the literal ``SOUL.md`` — an
+        exact-name-only matcher left every bot's own standing instructions
+        rewritable with no approval prompt."""
+        target = tmp_path / "config" / "yoyodine" / name
+        target.parent.mkdir(parents=True)
+        approvals["answer"] = "deny"
+        res = self._write(target)
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert not target.exists()
+        assert len(approvals["calls"]) == 1
+
+    def test_profile_soul_symlink_target_is_gated(self, tmp_path, approvals):
+        """The deployed shape: ``profiles/<bot>/SOUL.md`` -> ``config/.../<bot>-soul.md``.
+        Writing through the link must gate, and so must the link target itself."""
+        identity = tmp_path / "config" / "yoyodine" / "yoyodine-majordomo-soul.md"
+        identity.parent.mkdir(parents=True)
+        identity.write_text("standing instructions", encoding="utf-8")
+        link = tmp_path / "profiles" / "yoyodine-majordomo" / "SOUL.md"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(identity)
+
+        approvals["answer"] = "deny"
+        res = self._write(link, "injected")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        res = self._write(identity, "injected")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert identity.read_text(encoding="utf-8") == "standing instructions"
+
+    def test_identity_file_via_innocent_link_name_is_gated(self, tmp_path, approvals):
+        """#41351 direction: innocent link NAME, identity TARGET."""
+        identity = tmp_path / "config" / "yoyodine" / "ops-soul.md"
+        identity.parent.mkdir(parents=True)
+        identity.write_text("original", encoding="utf-8")
+        alias = tmp_path / "current.md"
+        alias.symlink_to(identity)
+
+        approvals["answer"] = "deny"
+        res = self._write(alias, "injected")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert identity.read_text(encoding="utf-8") == "original"
+
+    def test_identity_file_approve_once_applies(self, tmp_path, approvals):
+        """It is a gate, not a wall: one-operation approval still writes."""
+        target = tmp_path / "config" / "yoyodine" / "platform-coder-soul.md"
+        target.parent.mkdir(parents=True)
+        approvals["answer"] = "once"
+        res = self._write(target, "approved identity")
+        assert not res.get("error"), res
+        assert target.read_text(encoding="utf-8") == "approved identity"
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            "config/yoyodine/platform-coder-soul.md.bak",
+            "notes/soul-notes.md",
+            "notes/soul.md.txt",
+            "docs/agent-identity.md",
+        ],
+    )
+    def test_similar_names_are_not_gated(self, tmp_path, approvals, rel):
+        """The identity glob is suffix-anchored, so ordinary files that merely
+        share the ``soul`` stem stay prompt-free (no substring over-matching)."""
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True)
+        res = self._write(target, "ordinary content")
+        assert not res.get("error"), res
+        assert target.read_text(encoding="utf-8") == "ordinary content"
+        assert approvals["calls"] == []
+
+    def test_bundled_agents_md_in_install_tree_still_gated(
+        self, tmp_path, approvals
+    ):
+        """Preserved exception: the install tree's own bundled AGENTS.md is still
+        rejectable through this gate — the identity-file rule adds no
+        install-tree exemption."""
+        import tools.file_tools_write_guards as ft
+
+        bundled = Path(ft.__file__).resolve().parents[1] / "AGENTS.md"
+        assert bundled.is_file(), bundled
+        before = bundled.read_text(encoding="utf-8")
+        approvals["answer"] = "deny"
+        res = self._write(bundled, "injected contributor rules")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert bundled.read_text(encoding="utf-8") == before
+
     # ---- patch tool -----------------------------------------------------
 
     def test_patch_replace_mode_is_gated(self, tmp_path, approvals):

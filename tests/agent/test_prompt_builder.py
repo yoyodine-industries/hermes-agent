@@ -519,6 +519,20 @@ class TestBuildContextFilesPrompt:
         assert "Never give up" not in result
         assert result == ""
 
+    def test_install_tree_exception_boundary_is_unchanged(self, monkeypatch, tmp_path):
+        # The exception stays exactly as narrow as documented: a FALLBACK cwd
+        # is skipped, while a deliberate in-tree cwd (the CLI launch dir, which
+        # passes allow_install_tree_fallback=True) still loads it.
+        import agent.runtime_cwd as rt
+
+        monkeypatch.setattr(rt, "_PACKAGE_ROOT", tmp_path.resolve())
+        (tmp_path / "AGENTS.md").write_text("In-tree contributor context.")
+        monkeypatch.chdir(tmp_path)
+        assert build_context_files_prompt(cwd=None, skip_soul=True) == ""
+        assert "In-tree contributor context" in build_context_files_prompt(
+            cwd=None, skip_soul=True, allow_install_tree_fallback=True
+        )
+
 
 
 
