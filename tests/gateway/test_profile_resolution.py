@@ -446,3 +446,81 @@ class TestMultiplexGate:
         assert mock_runner._profile_name_for_source(discord_source) is None
 
 
+class TestMissingProfileFallbackDiagnostics:
+    """A missing profile name must not flood ``gateway.log`` from a hot caller.
+
+    The fallback line is the only evidence of which record carries a stale name
+    and who keeps re-resolving it, so the first occurrence names its provenance
+    and later occurrences are counted instead of re-logged.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_dedupe_state(self):
+        from gateway.run_profile_fallback import reset_profile_fallback_log_state
+        reset_profile_fallback_log_state()
+        yield
+        reset_profile_fallback_log_state()
+
+    def test_lane_handle_resolves_to_its_serving_profile(
+        self, mock_runner, discord_source, caplog, tmp_path,
+    ):
+        """A lane handle where a profile name belongs is aliased, not reported missing.
+
+        The roster is a real file on disk (read through ``read_remote_roster``),
+        so this covers the alias path end to end, not just the caller.
+        """
+        from tools.bot_relay import write_remote_roster
+        write_remote_roster(tmp_path, [{
+            "profile": "serving-profile", "handle": "retired-lane",
+            "connection_id": "conn-retired",
+        }])
+        discord_source.profile = "retired-lane"
+
+        with patch("tools.bot_mode_probe._hermes_root", return_value=Path(tmp_path)), \
+             patch("hermes_cli.profiles.get_active_profile_name", return_value="active"), \
+             patch("hermes_cli.profiles.get_profile_dir",
+                   return_value=Path("/profiles/serving-profile")) as get_dir, \
+             patch("hermes_cli.profiles.profile_exists",
+                   side_effect=lambda name: name == "serving-profile"):
+            with caplog.at_level(logging.INFO):
+                for _ in range(3):
+                    resolved = mock_runner._resolve_profile_home_for_source(discord_source)
+                    assert resolved == Path("/profiles/serving-profile")
+
+        assert [c.args for c in get_dir.call_args_list] == [("serving-profile",)] * 3
+        # One alias notice for the hot caller — no per-resolution INFO spam, no warning.
+        assert [r.levelname for r in caplog.records] == ["INFO"], [r.message for r in caplog.records]
+        assert "retired-lane" in caplog.records[0].message
+        assert "serving-profile" in caplog.records[0].message
+
+    def test_repeat_missing_profile_logs_once_then_summarises(
+        self, mock_runner, discord_source, caplog, tmp_path, monkeypatch,
+    ):
+        """Repeats are counted, not re-logged; the summary keeps the storm visible."""
+        from gateway import run_profile_fallback
+        monkeypatch.setattr(run_profile_fallback, "PROFILE_FALLBACK_REPORT_EVERY", 3)
+        discord_source.profile = "ghost-lane"
+
+        with patch("tools.bot_mode_probe._hermes_root", return_value=Path(tmp_path)), \
+             patch("hermes_cli.profiles.get_active_profile_name", return_value="active"), \
+             patch("hermes_cli.profiles.get_profile_dir",
+                   return_value=Path("/hermes/profiles/ghost-lane")), \
+             patch("hermes_cli.profiles.profile_exists", return_value=False), \
+             patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
+            with caplog.at_level(logging.INFO):
+                for _ in range(5):
+                    assert mock_runner._resolve_profile_home_for_source(discord_source) == Path("/hermes")
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        infos = [r for r in caplog.records if r.levelname == "INFO"]
+        assert len(warnings) == 1, [r.message for r in warnings]
+        message = warnings[0].message
+        assert "ghost-lane" in message and "does not exist" in message
+        # Provenance: the reader learns who keeps resolving and which record carries the name.
+        assert "test_profile_resolution.py" in message   # real caller frame, not "unknown"
+        assert "session_key='?" not in message           # real session key, not the fallback
+        assert "explicit_profile='ghost-lane'" in message
+        assert "owner_profile=None" in message
+        # The 4th resolution reports the 3 suppressed repeats; the 5th is silent.
+        assert len(infos) == 1, [r.message for r in infos]
+        assert "3 repeated resolutions suppressed" in infos[0].message
