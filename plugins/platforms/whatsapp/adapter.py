@@ -34,6 +34,10 @@ _OWNER_REPLY_PREFIX = "[owner reply] "
 
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
 
+# An adopted bridge is not our child, so its recovery is bounded: this many in-place respawns, then a
+# retryable fatal hands the loss to the runner's reconnect path (which installs a fresh adapter).
+_BRIDGE_RESPAWN_ATTEMPTS = 3
+
 
 def _listener_pids_on_port(port: int) -> list:
     """PIDs *listening* on ``port`` (POSIX), never clients — a bare ``lsof -i :PORT`` once killed the user's browser."""
@@ -116,17 +120,23 @@ def _unlink_quietly(path: Path) -> None:
         path.unlink()
 
 
+def _read_bridge_pidfile(session_path: Path) -> tuple[Optional[int], Optional[int]]:
+    """``(pid, kernel_start_time)`` from ``bridge.pid``; ``(None, None)`` when absent/unreadable/legacy-corrupt."""
+    try:  # Line 1 = pid, optional line 2 = kernel start time (legacy files: pid only).
+        lines = [ln.strip() for ln in (session_path / "bridge.pid").read_text(encoding="utf-8").split("\n")]
+        return int(lines[0]), (int(lines[1]) if len(lines) > 1 and lines[1] else None)
+    except (ValueError, OSError, TypeError, IndexError):
+        return None, None
+
+
 def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
     """Kill an orphaned bridge recorded in ``bridge.pid``, after :func:`_bridge_pid_is_ours`."""
     from gateway.status import _pid_exists
     pid_file = session_path / "bridge.pid"
     if not pid_file.exists():
         return
-    try:  # Line 1 = pid, optional line 2 = kernel start time (legacy files: pid only).
-        lines = [ln.strip() for ln in pid_file.read_text(encoding="utf-8").split("\n")]
-        pid = int(lines[0])
-        recorded_start = int(lines[1]) if len(lines) > 1 and lines[1] else None
-    except (ValueError, OSError, TypeError, IndexError):
+    pid, recorded_start = _read_bridge_pidfile(session_path)
+    if pid is None:
         _unlink_quietly(pid_file)
         return
     if _bridge_pid_is_ours(pid, session_path, recorded_start):
@@ -283,6 +293,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
         # Set by disconnect() before SIGTERMing so _check_managed_bridge_exit() can tell an intentional exit (-15/-2/0) from a crash.
         self._shutting_down = False
+        # In-place respawns of an adopted (non-child) bridge since the last success; see _recover_adopted_bridge.
+        self._bridge_respawn_attempts = 0
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
         self._text_batch_delay_seconds = self._coerce_float_extra("text_batch_delay_seconds", 5.0)
         self._text_batch_split_delay_seconds = self._coerce_float_extra("text_batch_split_delay_seconds", 10.0)
@@ -345,11 +357,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                               "manually, then restart `hermes gateway`.", retryable=False)
         return False
 
-    def _attach_to_bridge(self, managed_process) -> None:
+    def _attach_to_bridge(self, managed_process, *, restart_poll: bool = True) -> None:
+        """Point the adapter at a serving bridge. ``restart_poll=False`` keeps the caller's
+        ``_poll_messages`` task (the in-place recovery path runs INSIDE it)."""
         import aiohttp
         self._bridge_process = managed_process
         self._http_session = aiohttp.ClientSession()
-        self._poll_task = asyncio.create_task(self._poll_messages())
+        if restart_poll:
+            self._poll_task = asyncio.create_task(self._poll_messages())
 
     async def _reuse_running_bridge(self, bridge_path: Path) -> bool:
         """Adopt a connected bridge serving the on-disk bridge.js + same read-receipt config; else say why it restarts."""
@@ -363,7 +378,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return False
             running_hash, disk_hash = data.get("scriptHash", ""), _file_content_hash(bridge_path)
             if running_hash and disk_hash and running_hash == disk_hash and bool(data.get("sendReadReceipts", False)) == self._send_read_receipts:
-                print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
+                # An adopted bridge is not our child (no returncode to poll), so its liveness rides the poll
+                # loop's own HTTP path plus the identity-checked pidfile — log which supervision it gets.
+                adopted_pid, adopted_start = _read_bridge_pidfile(self._session_path)
+                supervised_pid = adopted_pid if adopted_pid and _bridge_pid_is_ours(adopted_pid, self._session_path, adopted_start) else None
+                reason = (f"supervising it via bridge.pid {supervised_pid} + HTTP health" if supervised_pid
+                          else "no bridge.pid naming it, supervising via HTTP health only")
+                print(f"[{self.name}] Using existing bridge (status: {bridge_status}); {reason}")
                 self._mark_connected()
                 self._attach_to_bridge(None)  # Not managed by us
                 self._wire_plugin_handlers(None)
@@ -486,23 +507,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._session_path.mkdir(parents=True, exist_ok=True)
             if await self._reuse_running_bridge(bridge_path):
                 return True
-            _kill_stale_bridge_by_pidfile(self._session_path)
-            _kill_port_process(self._bridge_port)
-            await asyncio.sleep(1)
-            # Bridge output goes to a log file so QR codes, errors, and reconnection messages survive for troubleshooting.
-            self._bridge_log = self._session_path.parent / "bridge.log"
-            self._bridge_log_fh = bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
-            self._bridge_process = subprocess.Popen(
-                [find_node_executable("node") or "node", str(bridge_path), "--port", str(self._bridge_port), "--session", str(self._session_path),
-                 "--mode", _wenv("WHATSAPP_MODE", "self-chat")], stdout=bridge_log_fh, stderr=bridge_log_fh, env=self._bridge_env(), **windows_detach_popen_kwargs())
-            _write_bridge_pidfile(self._session_path, self._bridge_process.pid)
-            if not await self._wait_for_bridge():
-                return False
-            self._attach_to_bridge(self._bridge_process)
-            self._mark_connected()
-            print(f"[{self.name}] Bridge started on port {self._bridge_port}")
-            self._wire_plugin_handlers(None)
-            return True
+            return await self._spawn_bridge_process()
         except Exception as e:
             logger.error("[%s] Failed to start bridge: %s", self.name, e, exc_info=True)
             return False
@@ -517,6 +522,90 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             with suppress(Exception):
                 self._bridge_log_fh.close()
             self._bridge_log_fh = None
+
+    async def _spawn_bridge_process(self, *, restart_poll: bool = True) -> bool:
+        """Kill any stale/stranger listener, spawn bridge.js, wait for it, attach. False = failure (logged).
+
+        Shared by ``connect()`` and :meth:`_recover_adopted_bridge`. ``restart_poll=False`` re-attaches
+        without spawning a second ``_poll_messages`` task, because the caller IS that task.
+        """
+        try:
+            _kill_stale_bridge_by_pidfile(self._session_path)
+            _kill_port_process(self._bridge_port)
+            await asyncio.sleep(1)
+            # Bridge output goes to a log file so QR codes, errors, and reconnection messages survive for troubleshooting.
+            self._bridge_log = self._session_path.parent / "bridge.log"
+            self._bridge_log_fh = bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
+            self._bridge_process = subprocess.Popen(
+                [find_node_executable("node") or "node", str(Path(self._bridge_script)), "--port", str(self._bridge_port), "--session", str(self._session_path),
+                 "--mode", _wenv("WHATSAPP_MODE", "self-chat")], stdout=bridge_log_fh, stderr=bridge_log_fh, env=self._bridge_env(), **windows_detach_popen_kwargs())
+            _write_bridge_pidfile(self._session_path, self._bridge_process.pid)
+            if not await self._wait_for_bridge():
+                self._bridge_process = None  # A spawn that never became ready leaves no child to supervise.
+                return False
+            self._attach_to_bridge(self._bridge_process, restart_poll=restart_poll)
+            self._mark_connected()
+            print(f"[{self.name}] Bridge started on port {self._bridge_port}")
+            self._wire_plugin_handlers(None)
+            return True
+        except Exception as e:
+            logger.error("[%s] Failed to start bridge: %s", self.name, e, exc_info=True)
+            return False
+
+    async def _bridge_reachable(self) -> bool:
+        """True while the bridge answers ``/health`` (fresh session; a non-200 or any error = unreachable)."""
+        try:
+            ok, _ = await self._probe_bridge_health()
+            return bool(ok)
+        except Exception:
+            return False
+
+    async def _detach_http_session(self) -> None:
+        """Drop the bridge session; the poll loop exits at its next ``not self._http_session`` check."""
+        session, self._http_session = self._http_session, None
+        if session is not None and not session.closed:
+            with suppress(Exception):
+                await session.close()
+
+    async def _recover_adopted_bridge(self, cause: BaseException) -> bool:
+        """Respawn an adopted (non-child) bridge that stopped answering — from inside the poll loop.
+
+        An adopted bridge has no child handle, so without this a dead one is indistinguishable from a
+        slow one: the loop retried a dead endpoint forever while runtime status still said
+        ``connected``. True = serving again (resume polling without the error backoff); False = the
+        poll error was transient, this is a managed child (its death rides
+        ``_check_managed_bridge_exit``), or recovery is shutting down. Bounded by
+        ``_BRIDGE_RESPAWN_ATTEMPTS`` in-place spawns, after which the loss escalates to a retryable
+        fatal that hands the platform to the runner's reconnect path.
+        """
+        if self._bridge_process is not None or not self._running or getattr(self, "_shutting_down", False):
+            return False
+        if await self._bridge_reachable():
+            return False  # Bridge answers: transient poll error — leave the shared error backoff alone.
+        attempts = getattr(self, "_bridge_respawn_attempts", 0)
+        if attempts >= _BRIDGE_RESPAWN_ATTEMPTS:
+            message = f"WhatsApp bridge unreachable after {attempts} respawn attempts ({cause})."
+            logger.error("[%s] %s", self.name, message)
+            self._set_fatal_error("whatsapp_bridge_unreachable", message, retryable=True)
+            self._close_bridge_log()
+            await self._detach_http_session()
+            await self._notify_fatal_error()
+            return False
+        self._bridge_respawn_attempts = attempts + 1
+        print(f"[{self.name}] Adopted bridge is unreachable ({cause.__class__.__name__}: {cause}); respawning "
+              f"(attempt {attempts + 1}/{_BRIDGE_RESPAWN_ATTEMPTS})")
+        # Publish the loss BEFORE respawning so nothing reads ``connected`` while the bridge is gone
+        # (``retrying`` is not in _HEALTHY_PLATFORM_STATES); a successful spawn's _mark_connected clears it.
+        self._write_runtime_status_safe("bridge_unreachable", platform_state="retrying", error_code=None,
+                                        error_message="WhatsApp bridge unreachable — respawning")
+        stale_session = self._http_session
+        if not await self._spawn_bridge_process(restart_poll=False):
+            return False  # The poll loop's error path backs off, then comes back here.
+        self._bridge_respawn_attempts = 0
+        if stale_session is not None and stale_session is not self._http_session and not stale_session.closed:
+            with suppress(Exception):
+                await stale_session.close()
+        return True
 
     async def _check_managed_bridge_exit(self) -> Optional[str]:
         returncode = self._bridge_process.poll() if self._bridge_process is not None else None
@@ -726,6 +815,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             except Exception as e:
                 if await self._report_bridge_exit():
                     break
+                if await self._recover_adopted_bridge(e):
+                    continue  # Respawned in place: resume polling without the error backoff.
                 print(f"[{self.name}] Poll error: {e}")
                 await asyncio.sleep(5)
             await asyncio.sleep(1)  # Poll interval
