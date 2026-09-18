@@ -101,11 +101,50 @@ class TestPathResolution:
 
 
     def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+        """``HERMES_KANBAN_DB`` pins the file path regardless of board= arg; the
+        model-facing tools refuse the mismatch up front (see assert_board_matches_pin
+        tests) rather than this resolver doing it."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
         assert kb.kanban_db_path(board="ignored") == forced
+
+    def test_assert_board_matches_pin_refuses_mismatch(self, fresh_home, monkeypatch):
+        """Regression: an explicit board= that resolves to a different board than the
+        pinned DB is refused, not silently served — a read from the wrong board is
+        indistinguishable from success."""
+        pinned = kb.kanban_db_path(board="ops")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+        with pytest.raises(ValueError, match="refusing to target board 'financially'"):
+            kb.assert_board_matches_pin("financially")
+
+    def test_assert_board_matches_pin_names_both_boards(self, fresh_home, monkeypatch):
+        """The refusal message names both the requested and the pinned board."""
+        pinned = kb.kanban_db_path(board="ops")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+        with pytest.raises(ValueError) as excinfo:
+            kb.assert_board_matches_pin("financially")
+        msg = str(excinfo.value)
+        assert "financially" in msg
+        assert "ops" in msg
+
+    def test_assert_board_matches_pin_accepts_match(self, fresh_home, monkeypatch):
+        """A board= naming the pinned board is a no-op."""
+        pinned = kb.kanban_db_path(board="ops")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+        kb.assert_board_matches_pin("ops")  # no raise
+
+    def test_assert_board_matches_pin_noop_without_pin(self, fresh_home):
+        """No pin set -> no-op, even for an explicit board=."""
+        kb.assert_board_matches_pin(None)  # no raise
+        kb.assert_board_matches_pin("financially")  # no raise
+
+    def test_assert_board_matches_pin_refuses_noncanonical_pin(self, fresh_home, tmp_path, monkeypatch):
+        """A non-canonical pinned path still refuses a board= naming another board."""
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        with pytest.raises(ValueError, match="refusing to target board 'default'"):
+            kb.assert_board_matches_pin("default")
 
 
 # ---------------------------------------------------------------------------

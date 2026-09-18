@@ -239,9 +239,12 @@ def _require_orchestrator_tool(tool_name: str) -> None:
 def _board(board: Optional[str], *, quiet_close: bool = False):
     """``with _board(slug) as (kb, conn)``; lazy import so the module loads in non-kanban
     contexts. ``board=None`` keeps the env/symlink resolution chain; an explicit slug
-    overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges)."""
+    targets that board, but a slug that resolves to a different board than the pinned DB
+    (``HERMES_KANBAN_DB``) is refused instead of silently served. ``quiet_close`` swallows
+    close() errors (best-effort bridges)."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    kb.assert_board_matches_pin(board)
     conn = kbc.connect(board=board)
     try:
         yield kb, conn
