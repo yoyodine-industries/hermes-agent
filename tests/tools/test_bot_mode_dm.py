@@ -273,7 +273,7 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
         "researcher",
         "chat",
         "--in",
-        "~",
+        str(home / "profiles" / "researcher"),
         "-c",
         "Bot Chat",
         "--create-if-missing",
@@ -470,6 +470,81 @@ def test_live_dm_runner_retry_never_reexecutes_failed_claim(tmp_path, monkeypatc
     assert dm_file.read_text(encoding="utf-8") == "hello"
 
 
+def test_local_delivery_without_live_owner_admits_to_durable_queue(
+    tmp_path, monkeypatch, capsys
+):
+    """A local delivery with no live owner is durably queued, never run as a
+    record-less CLI turn. The runner's stdout is a retained receipt and the record
+    is readable from the queue store; the temp payload is cleared after admission."""
+    from tools import bot_delivery_queue as delivery_queue
+    from tools import bot_live_delivery as live
+
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: None)
+    monkeypatch.setattr(bot_mode_dm, "_LIVE_WAIT_SECONDS", 0)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("must not launch a CLI turn"))
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("hello", encoding="utf-8")
+    argv = ["hermes", "-p", "researcher"]
+
+    assert bot_mode_dm._run_delivery(argv, str(dm_file), stdin_file=False) == 0
+
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "queued"
+    assert receipt["result"] == "receipt"
+    assert len(receipt["delivery_id"]) == 64
+
+    # the message now lives durably in the queue record; the temp payload is cleared
+    assert not dm_file.exists()
+    target_home = home / "profiles" / "researcher"
+    record = delivery_queue.read_record(target_home, receipt["delivery_id"])
+    assert record is not None
+    assert record["status"] == "queued"
+    assert record["target_profile"] == "researcher"
+    assert record["sender_profile"] == "default"
+    assert "hello" in record["message"]
+
+
+def test_local_queued_delivery_survives_sweep_then_drains(
+    tmp_path, monkeypatch, capsys
+):
+    """Criterion C: a local delivery queued while the lane is mid-turn is held by
+    the sweep (never expired, attempts==0) and delivered on a later free turn."""
+    from tools import bot_delivery_queue as delivery_queue
+    from tools import bot_live_delivery as live
+
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: None)
+    monkeypatch.setattr(bot_mode_dm, "_LIVE_WAIT_SECONDS", 0)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("must not launch a CLI turn"))
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("hello", encoding="utf-8")
+
+    assert bot_mode_dm._run_delivery(["hermes", "-p", "researcher"], str(dm_file), stdin_file=False) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    did = receipt["delivery_id"]
+    target_home = home / "profiles" / "researcher"
+
+    # the sweep never expires a record that was never offered to a turn
+    assert delivery_queue.sweep_delivery_queue(target_home) == 0
+    held = delivery_queue.read_record(target_home, did)
+    assert held is not None
+    assert held["status"] == "queued"
+    assert held["attempts"] == 0
+
+    # on a later free turn the drain claims it and records the terminal outcome
+    claimed = delivery_queue.claim_next(target_home, target_profile="researcher", lease_ok=True)
+    assert claimed is not None and claimed["delivery_id"] == did
+    settled = delivery_queue.settle(
+        target_home, did, status=delivery_queue.STATUS_DELIVERED, reply="got it"
+    )
+    assert settled["status"] == "delivered"
+    assert settled["reply"] == "got it"
+    assert settled["attempts"] >= 1
+
+
 # ── plaintext tempfile lifecycle ─────────────────────────────────────────────
 
 
@@ -651,6 +726,11 @@ def test_real_delivery_command_round_trip_carries_author(tmp_path):
     assert result.returncode == 0
     assert json.loads(observed.read_text(encoding="utf-8")) == author
     assert not dm_file.exists()
+
+
+@pytest.mark.parametrize("args", [[], ["--run-delivery"], ["--run-delivery", "bad", "x"]])
+def test_delivery_main_rejects_invalid_cli(args):
+    assert bot_mode_dm._delivery_main(args) == 2
 
 
 @pytest.mark.parametrize("mode", ["stdin", "query-file"])

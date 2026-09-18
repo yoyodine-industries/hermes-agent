@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home
-from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -331,7 +330,17 @@ def _valid_process_start(v: Any) -> bool:
 
 
 def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
-    atomic_json_write(path, {"entries": entries}, indent=None, sort_keys=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"entries": entries}, fh, sort_keys=True)
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _process_start_time(pid: int) -> Optional[float]:
@@ -643,6 +652,52 @@ def transfer_active_session(
             return False
         _write_entries(state_path, entries)
         lease.session_id = new_session_id
+        return True
+
+
+# Registry writes on every poll tick would be pure churn: a consumer only has to prove it is
+# still consuming well inside the window others use to judge it dead.
+LEASE_TOUCH_INTERVAL_SECONDS = 60.0
+
+
+def touch_active_session_lease(
+    lease_id: str, *, registry_home: str | Path | None = None,
+    live_session_id: Optional[str] = None, interval: float = LEASE_TOUCH_INTERVAL_SECONDS,
+    force: bool = False,
+) -> bool:
+    """Renew a live consumer's ``updated_at`` stamp, proving it is still consuming.
+
+    A lease is a mailbox destination only while its consumer proves it is consuming
+    (``tools.bot_live_delivery``): the stamp separates "this pane is polling" from "this pane's
+    process is alive but nothing is listening". Renewal requires the entry to still belong to
+    THIS process and, when given, to still be pinned to ``live_session_id`` — a stale session
+    record must not keep a lease (or its successor's) destination warm. Returns True when the
+    entry is present, ours, correctly pinned, and its stamp is current.
+    """
+    key = str(lease_id or "")
+    if not key:
+        return False
+    state_path, lock_path = _lease_paths(registry_home=registry_home)
+    now = time.time()
+    with _FileLock(lock_path):
+        loaded = _read_live_entries(
+            state_path, track_liveness=True,
+            warn="Active-session registry is unavailable; cannot renew a live consumer lease",
+        )
+        if loaded is None:
+            return False
+        entries = loaded[1]
+        own = next((e for e in entries if str(e.get("lease_id") or "") == key), None)
+        if own is None or _registry_pid(own.get("pid")) != os.getpid():
+            return False
+        if live_session_id is not None and str(
+            (own.get("metadata") or {}).get("live_session_id") or ""
+        ) != str(live_session_id):
+            return False
+        if not force and now - (_optional_float(own.get("updated_at")) or 0.0) < interval:
+            return True
+        own["updated_at"] = now
+        _write_entries(state_path, entries)
         return True
 
 

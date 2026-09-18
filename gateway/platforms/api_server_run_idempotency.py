@@ -52,12 +52,22 @@ _EXTEND_RETENTION_BY_KEY = (
 _EXTEND_RETENTION_BY_RUN = (
     "UPDATE run_idempotency SET retention_until=MAX(retention_until, ?) "
     "WHERE scope=? AND run_id=?")
+# Host-level addressing: one principal reaching a globally unique run id through the bare
+# host route instead of the /p/<profile>/ mirror that created it (``hermes peer status
+# <host> <run_id>`` after ``hermes peer run <host>/<profile>``) — see #peer-run-scope.
+_SELECT_STATUS_BY_HOST_RUN = (
+    "SELECT status_json, owner_pid, owner_started, updated_at "
+    "FROM run_idempotency WHERE host_scope=? AND run_id=?")
+_EXTEND_RETENTION_BY_HOST_RUN = (
+    "UPDATE run_idempotency SET retention_until=MAX(retention_until, ?) "
+    "WHERE host_scope=? AND run_id=?")
 # Columns added after the first schema shipped; applied when missing.
 _MIGRATIONS = {
     "owner_pid": "INTEGER NOT NULL DEFAULT 0",
     "owner_started": "INTEGER NOT NULL DEFAULT 0",
     "retention_until": "REAL NOT NULL DEFAULT 0",
-    "acknowledged_at": "REAL"}
+    "acknowledged_at": "REAL",
+    "host_scope": "TEXT NOT NULL DEFAULT ''"}
 
 
 def _encode_status(status: Dict[str, Any]) -> str:
@@ -120,6 +130,7 @@ class RunIdempotencyStore:
                 owner_started INTEGER NOT NULL DEFAULT 0,
                 retention_until REAL NOT NULL DEFAULT 0,
                 acknowledged_at REAL,
+                host_scope TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (scope, idempotency_key)
@@ -156,7 +167,8 @@ class RunIdempotencyStore:
                 raise
 
     def reserve(self, scope: str, key: str, fingerprint: str, run_id: str, status: Dict[str, Any], *,
-                owner_pid: int = 0, owner_started: int = 0, retention_until: float = 0):
+                owner_pid: int = 0, owner_started: int = 0, retention_until: float = 0,
+                host_scope: str = ""):
         """Atomically reserve a key; return ``(outcome, stored_record)``."""
         now = time.time()
         retention_until = max(0.0, float(retention_until or 0))
@@ -172,10 +184,10 @@ class RunIdempotencyStore:
             self._conn.execute(
                 "INSERT INTO run_idempotency("
                 "scope,idempotency_key,fingerprint,run_id,status_json,"
-                "owner_pid,owner_started,retention_until,created_at,updated_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "owner_pid,owner_started,retention_until,created_at,updated_at,host_scope"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (scope, key, fingerprint, run_id, encoded, int(owner_pid or 0), int(owner_started or 0),
-                 retention_until, now, now))
+                 retention_until, now, now, str(host_scope or "")))
             self._conn.commit()
             return "created", _record(run_id, encoded, owner_pid, owner_started, now) | {"status": status}
 
@@ -226,6 +238,30 @@ class RunIdempotencyStore:
             return None
         return {k: v for k, v in _record(None, *row).items() if k != "run_id"}
 
+    def status_for_run_host(self, run_id: str, host_scope: str, *, retention_until: float = 0):
+        """Load one durable run for a *host-level* read: the same credential reaching a run
+        through the unqualified address instead of the route that created it.
+
+        The reservation ``scope`` namespaces runs per profile route, so a run created through
+        ``/p/<profile>/v1/runs`` is otherwise invisible to the bare ``/v1/runs/{run_id}``
+        address ``hermes peer status <host> <run_id>`` polls. ``run_id`` is globally unique
+        (unique index above) and ``host_scope`` is derived from the credential the route
+        resolved, so this admits the same principal without admitting a different profile.
+        An empty scope never matches: a keyless listener and a claim-scoped room grant are
+        deliberately not host-addressable.
+        """
+        if not host_scope:
+            return None
+        retention_until = max(0.0, float(retention_until or 0))
+        with self._lock:
+            if retention_until:
+                self._conn.execute(_EXTEND_RETENTION_BY_HOST_RUN, (retention_until, host_scope, run_id))
+                self._conn.commit()
+            row = self._conn.execute(_SELECT_STATUS_BY_HOST_RUN, (host_scope, run_id)).fetchone()
+        if row is None:
+            return None
+        return {k: v for k, v in _record(None, *row).items() if k != "run_id"}
+
     def extend_retention(self, scope: str, run_id: str, until: float) -> bool:
         """Persist the latest verified recovery horizon for an active grant."""
         checked_until = max(0.0, float(until or 0))
@@ -240,6 +276,16 @@ class RunIdempotencyStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT 1 FROM run_idempotency WHERE scope=? AND run_id=?", (scope, run_id)).fetchone()
+        return row is not None
+
+    def owns_run_host(self, run_id: str, host_scope: str) -> bool:
+        """Whether ``run_id`` was created by the principal ``host_scope`` names."""
+        if not host_scope:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM run_idempotency WHERE host_scope=? AND run_id=?",
+                (host_scope, run_id)).fetchone()
         return row is not None
 
     def update_status(self, run_id: str, status: Dict[str, Any]) -> None:

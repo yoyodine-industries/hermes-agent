@@ -39,6 +39,18 @@ _DURABLE_CLAIM_OPS = {
     "complete": ("complete_completion_delivery", "Could not acknowledge durable completion claim"),
 }
 
+# An event that can never be delivered: acked so it is not requeued, settled dropped so a restart
+# does not resurrect it.
+TERMINAL_DELIVERY = "terminal"
+# Retryable drain results allowed per event before the drain stops requeueing it. Some permanent
+# failures cannot be classified as permanent up front (an unresolvable route looks identical to a
+# route that is still connecting), so every event gets a bounded number of attempts and no more.
+# 30 cycles is about a minute at the watcher's 2 s interval: long enough that a transport still
+# connecting at boot delivers normally, short enough that an unresolvable route cannot spin the
+# drain. A permanently unpersistable target never reaches this budget — it is terminal on its
+# first attempt.
+_MAX_COMPLETION_REQUEUES = 30
+
 
 def _raw_process_event_session_id(evt: dict) -> str:
     """Recognize API routes, not malformed structured or partial messaging routes."""
@@ -987,14 +999,14 @@ class GatewayNotificationsMixin:
                 return a
         return None
 
-    async def _self_post_api_server(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
+    async def _self_post_api_server(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool | str:
         """Deliver to a non-push (api_server) session by raw session id.
 
         Async-delegation completions are persisted as a durable delivery row — after the parent
         turn's event.complete the CLIENT owns the next turn on this stateless surface, so never
         self-post them as a new role=user prompt. Other watch events wake the session via self-post.
         """
-        from gateway.wake import deliver_wake, persist_delegation_delivery
+        from gateway.wake import DelegationDeliveryTargetGone, deliver_wake, persist_delegation_delivery
         if evt.get("type") == "async_delegation":
             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
             fail = "Async delegation delivery persist failed for session %s: %s"
@@ -1007,6 +1019,14 @@ class GatewayNotificationsMixin:
             logger.info(info, raw_sid)
             await deliver()
             return True
+        except DelegationDeliveryTargetGone:
+            # Permanent (only ``persist_delegation_delivery`` raises it): the target session has no
+            # transcript row, so requeueing retries the same impossible INSERT on every drain.
+            logger.warning(
+                "Async delegation delivery skipped for session %s — no transcript row exists "
+                "(permanently unpersistable; not retried)", raw_sid,
+            )
+            return TERMINAL_DELIVERY
         except Exception as e:
             logger.warning(fail, raw_sid, e)
             return False
@@ -1035,12 +1055,14 @@ class GatewayNotificationsMixin:
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
-    ) -> Optional[bool]:
+    ) -> Optional[bool | str]:
         """Inject a watch/completion notification as a synthetic message event.
 
         Routing comes from the queued event, never the active foreground message. Returns
         ``True`` on adapter acceptance, ``False`` on retryable adapter failure, ``None`` with no
-        gateway route. Not transactional: a crash after acceptance can replay (at-least-once).
+        gateway route, and :data:`TERMINAL_DELIVERY` when the event can never be delivered (the
+        caller must acknowledge it, never requeue). Not transactional: a crash after acceptance
+        can replay (at-least-once).
         """
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
         source = await asyncio.to_thread(self._build_process_event_source, evt)
@@ -1298,12 +1320,20 @@ class GatewayNotificationsMixin:
         (``tools.async_delegation`` → ``get_hermes_home()/state.db``) resolve from the ambient scope.
         The supervised ``_async_delegation_watcher`` and startup-recovered process watchers run under
         the ROOT scope, so a secondary profile's completion was looked up in the DEFAULT profile's
-        state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever."""
+        state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever.
+
+        A raw api_server event has no structured source, so the only owner evidence it can carry is
+        the restore path's in-memory ``_owner_profile_home`` stamp (see
+        ``tools.async_delegation.restore_undelivered_completions``); it is honored only together with
+        ``restored``, so an unstamped or foreign-supplied key cannot redirect the lookup."""
         from gateway.run import _async_profile_runtime_scope
         from hermes_constants import get_hermes_home_override
         source = self._build_process_event_source(evt)
         if source is None or not getattr(source, "profile", None):
-            return contextlib.nullcontext()
+            owner_home = str(evt.get("_owner_profile_home") or "") if evt.get("restored") else ""
+            if not owner_home or get_hermes_home_override() == owner_home:
+                return contextlib.nullcontext()
+            return _async_profile_runtime_scope(Path(owner_home))
         profile_home = self._resolve_profile_home_for_source(source)
         if get_hermes_home_override() == str(profile_home):
             return contextlib.nullcontext()
@@ -1327,7 +1357,7 @@ class GatewayNotificationsMixin:
         from gateway.wake import WakeNotAccepted
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
-        accepted = identity_claimed = refused = False
+        accepted = identity_claimed = refused = terminal = False
         try:
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
@@ -1337,8 +1367,14 @@ class GatewayNotificationsMixin:
                     return None
                 identity_claimed = True
             injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
-            if injection_result is not True:
-                return injection_result
+            if injection_result is TERMINAL_DELIVERY:
+                # Permanently undeliverable: acknowledge it so the caller never requeues, and settle
+                # the durable claim as ``drop`` in the finally below so a restart cannot resurrect it.
+                injection_result, terminal = True, True
+            if injection_result is False:
+                return False
+            if injection_result is None:
+                return None
             accepted = True
             if identity is not None:
                 with self._completion_delivery_lock:
@@ -1351,7 +1387,14 @@ class GatewayNotificationsMixin:
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
-            operation = "complete" if accepted else "defer" if refused else "release"
+            if terminal:
+                operation = "drop"
+            elif accepted:
+                operation = "complete"
+            elif refused:
+                operation = "defer"
+            else:
+                operation = "release"
             if claim.claim_id:
                 self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
             for sibling, claim_id in sibling_claims:
@@ -1597,6 +1640,51 @@ class GatewayNotificationsMixin:
             if restored:
                 logger.info("Restored %d undelivered async completion(s) for profile %r", restored, profile_name)
 
+    def _count_completion_requeue(self, evt: dict) -> bool:
+        """Count one retryable (``False``) drain result. True once its budget is spent.
+
+        Bounded memory: an identity is dropped from the counter when the budget is spent or the
+        event makes progress, so the dict never grows with the number of events seen.
+        """
+        identity = self._completion_delivery_identity(evt)
+        if identity is None:
+            return False
+        counts = self._completion_delivery_requeues
+        counts[identity] = counts.get(identity, 0) + 1
+        if counts[identity] < _MAX_COMPLETION_REQUEUES:
+            return False
+        counts.pop(identity, None)
+        return True
+
+    def _clear_completion_requeue(self, evt: dict) -> None:
+        """Reset the retryable-failure budget for an event that made progress or ended terminally."""
+        identity = self._completion_delivery_identity(evt)
+        if identity is not None:
+            self._completion_delivery_requeues.pop(identity, None)
+
+    def _drop_exhausted_completion(self, evt: dict) -> None:
+        """Stop requeueing an event whose retryable-failure budget is spent.
+
+        Logs exactly one line per event and best-effort settles its durable ledger row (``drop``)
+        so a restart's replay does not resume the same loop. A row owned by another consumer is
+        left alone — the claim makes that decision atomically.
+        """
+        raw_sid = _raw_process_event_session_id(evt)
+        logger.warning(
+            "Async delegation delivery dropped after %d failed attempts for session %s",
+            _MAX_COMPLETION_REQUEUES, raw_sid,
+        )
+        delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
+        if not delegation_id:
+            return
+        try:
+            from tools.async_delegation import claim_completion_delivery, drop_completion_delivery
+            claim_id = f"gateway-requeue-cap:{id(self)}"
+            if claim_completion_delivery(delegation_id, claim_id):
+                drop_completion_delivery(delegation_id, claim_id)
+        except Exception:
+            logger.debug("Could not settle exhausted completion %s", delegation_id, exc_info=True)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async completions and pattern notifications even while sessions are idle.
 
@@ -1632,13 +1720,18 @@ class GatewayNotificationsMixin:
                 for group in groups.values():
                     try:
                         delivered = await self._deliver_async_delegation_group(group)
-                        if delivered is False:
-                            for evt in group:
-                                _pr.completion_queue.put(evt)
                     except Exception as e:
-                        for evt in group:
-                            _pr.completion_queue.put(evt)
+                        delivered = False
                         logger.error("Async delegation injection error: %s", e)
+                    for evt in group:
+                        if delivered is not False:
+                            self._clear_completion_requeue(evt)
+                        elif self._count_completion_requeue(evt):
+                            # Retryable every cycle but never progressing: stop requeueing so one
+                            # undeliverable event cannot starve the drain forever.
+                            self._drop_exhausted_completion(evt)
+                        else:
+                            _pr.completion_queue.put(evt)
             await asyncio.sleep(interval)
 
     @staticmethod

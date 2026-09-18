@@ -150,9 +150,8 @@ _SPECS = [
         _arg("--body", help="Optional opening post"),
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
-        _arg("--workspace",
-             help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
-                  "an explicit 'scratch' also opts out of a project-scoped board's project)"),
+        _arg("--workspace", default="scratch",
+             help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch)"),
         _arg("--branch", help="Branch name for worktree tasks, e.g. wt/t6-wire"),
         _arg("--project",
              help="Link to a project (id or slug). Anchors the task's "
@@ -241,7 +240,7 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
-    _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
+    _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task (does NOT stop the worker process)"),
     _cmd("reassign", [
         _TASK_ID,
         _arg("profile", help="New profile name (or 'none' to unassign)"),
@@ -300,16 +299,29 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
-    ], help="Mark one or more tasks blocked"),
+    ], help="Mark one or more tasks blocked (releases the worker's claim; does NOT stop the worker process — end your turn)"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
+        _arg("--due", metavar="WHEN",
+             help="Due time: ISO-8601 local (2026-09-16T01:40), an offset from now "
+                  "(+90m, +2h, +1d), or epoch seconds. The dispatcher tick wakes the "
+                  "task once it passes (deferred to the close of a reserved "
+                  "execution band) -- no cron entry needed. Reason words must come "
+                  "BEFORE the flags."),
+        _arg("--window-policy", choices=["defer", "ambient"], metavar="POLICY",
+             help="What to do when the due time lands inside an execution band: "
+                  "'defer' (default) holds the wake until the band closes; 'ambient' "
+                  "wakes anyway, for a wake that is a lightweight check and has to "
+                  "tick around the clock."),
+        _arg("--clear-due", action="store_true",
+             help="Drop the task's due time (it stays parked until woken by hand)."),
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
-    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open (a still-running previous worker is not signalled — its re-spawn waits for it to exit)"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
@@ -329,6 +341,7 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
         _bulk_ids("promote"),
+        _arg("--force", action="store_true", help="Promote even if parent dependencies are not yet done/archived"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
@@ -435,7 +448,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         description="Durable SQLite-backed task board shared across Hermes profiles. "
                     "Tasks are claimed atomically, can depend on other tasks, and "
                     "are executed by a named profile in an isolated workspace. "
-                    "See https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban.",
+                    "See https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban "
+                    "or docs/hermes-kanban-v1-spec.pdf for the full design.",
     )
     # --board scopes every subcommand to one board's DB; when omitted the
     # resolution is HERMES_KANBAN_BOARD, then the persisted current-board

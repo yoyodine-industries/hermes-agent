@@ -833,6 +833,174 @@ class TestRunOwnershipAcrossProfiles:
 
 
 # ---------------------------------------------------------------------------
+# Host-level run addressing (hermes peer run <host>/<profile> -> peer status <host>)
+# ---------------------------------------------------------------------------
+
+
+class TestRunHostAddressing:
+    """``hermes peer run <host>/<profile>`` dispatches on the profile-qualified route
+    (``/p/<profile>/v1/runs``), but the CLI polls the run back through the bare host address
+    (``hermes peer status <host> <run_id>``). One listener serves both routes with the same
+    ``API_SERVER_KEY``, and a run id is globally unique, so the principal that created a run
+    must reach it on either address form. Measured defect: the GET through the host address
+    answered ``404 Run not found`` for a run the same credential had just started.
+    """
+
+    # One API_SERVER_KEY is resolved for the listener and for its profile mirror (the
+    # measured peer arrangement); an unrelated profile carries its own key.
+    KEYS = {
+        "": "sk-host-listener-key-0001",
+        "yoyodine-majordomo": "sk-host-listener-key-0001",
+        "other-profile": "sk-other-profile-key-0002",
+    }
+
+    @classmethod
+    def _app(cls, adapter: APIServerAdapter) -> web.Application:
+        """Runs routes behind a stand-in for the ``/p/<profile>/`` middleware: the routed
+        profile arrives in ``X-Test-Profile`` and each route authenticates with the key it
+        resolves, as ``_expected_api_key`` does on the real listener."""
+
+        @web.middleware
+        async def stamp_profile(request, handler):
+            token = _api_request_profile.set(request.headers.get("X-Test-Profile"))
+            try:
+                return await handler(request)
+            finally:
+                _api_request_profile.reset(token)
+
+        adapter._expected_api_key = lambda: cls.KEYS.get(_api_request_profile.get() or "", "")
+        app = _create_runs_app(adapter)
+        app.middlewares.append(stamp_profile)
+        return app
+
+    @staticmethod
+    def _headers(profile: "str | None" = None) -> dict:
+        headers = {"Authorization": f"Bearer {TestRunHostAddressing.KEYS['' if profile is None else profile]}"}
+        if profile is not None:
+            headers["X-Test-Profile"] = profile
+        return headers
+
+    @pytest.mark.asyncio
+    async def test_unqualified_status_resolves_run_created_on_the_profile_route(
+        self, adapter
+    ):
+        """The peer CLI's run/status round-trip: dispatch qualified, poll unqualified."""
+        app = self._app(adapter)
+        dispatch = {
+            **self._headers("yoyodine-majordomo"),
+            "Idempotency-Key": "peer-probe-host-scope",
+        }
+        host = self._headers()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "probe"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                started = await cli.post(
+                    "/v1/runs", json={"input": "probe"}, headers=dispatch
+                )
+                assert started.status == 202
+                run_id = (await started.json())["run_id"]
+                # Settle the run first, so both address forms are read at the same point in
+                # the lifecycle rather than racing the executor.
+                for _ in range(40):
+                    poll = await cli.get(f"/v1/runs/{run_id}", headers=dispatch)
+                    if (await poll.json()).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                qualified = await cli.get(f"/v1/runs/{run_id}", headers=dispatch)
+                qualified_body = await qualified.json()
+                unqualified = await cli.get(f"/v1/runs/{run_id}", headers=host)
+                unqualified_body = await unqualified.json()
+                stopped = await cli.post(f"/v1/runs/{run_id}/stop", headers=host)
+
+        assert (qualified.status, qualified_body.get("run_id")) == (200, run_id)
+        assert (unqualified.status, unqualified_body.get("run_id")) == (200, run_id)
+        assert unqualified_body.get("status") == qualified_body.get("status") == "completed"
+        assert stopped.status == 200
+
+    @pytest.mark.asyncio
+    async def test_host_address_refuses_a_run_created_by_another_key(self, adapter):
+        """The host alias keys on the credential, not on the run id alone."""
+        app = self._app(adapter)
+        other = {
+            **self._headers("other-profile"),
+            "Idempotency-Key": "peer-probe-foreign-scope",
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "probe"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                started = await cli.post(
+                    "/v1/runs", json={"input": "probe"}, headers=other
+                )
+                run_id = (await started.json())["run_id"]
+
+                foreign_read = await cli.get(f"/v1/runs/{run_id}", headers=self._headers())
+                foreign_stop = await cli.post(
+                    f"/v1/runs/{run_id}/stop", headers=self._headers()
+                )
+
+        assert (foreign_read.status, foreign_stop.status) == (404, 404)
+
+    @pytest.mark.asyncio
+    async def test_unqualified_status_resolves_a_durable_run_after_restart(
+        self, adapter, tmp_path
+    ):
+        """The host alias must survive a restart: the store carries it, not process memory."""
+        path = tmp_path / "idem.db"
+        _use_idempotency_db(adapter, path)
+        first_app = self._app(adapter)
+        dispatch = {
+            **self._headers("yoyodine-majordomo"),
+            "Idempotency-Key": "peer-probe-durable-host-scope",
+        }
+        async with TestClient(TestServer(first_app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "probe"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                started = await cli.post(
+                    "/v1/runs", json={"input": "probe"}, headers=dispatch
+                )
+                run_id = (await started.json())["run_id"]
+                for _ in range(40):
+                    poll = await cli.get(f"/v1/runs/{run_id}", headers=dispatch)
+                    if (await poll.json()).get("status") in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "interrupted",
+                    }:
+                        break
+                    await asyncio.sleep(0.05)
+        adapter._run_idempotency_store.close()
+
+        restarted = _make_adapter()
+        _use_idempotency_db(restarted, path)
+        restarted_app = self._app(restarted)
+        async with TestClient(TestServer(restarted_app)) as cli:
+            unqualified = await cli.get(f"/v1/runs/{run_id}", headers=self._headers())
+            body = await unqualified.json()
+        restarted._run_idempotency_store.close()
+
+        assert (unqualified.status, body.get("run_id")) == (200, run_id)
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/runs/{run_id}/stop — interrupt a running agent
 # ---------------------------------------------------------------------------
 

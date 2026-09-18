@@ -2,8 +2,12 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_WORKSPACES_ROOT`` / ``HERMES_KANBAN_ATTACHMENTS_ROOT``
+pin a worker's DB/workspace/attachments path (the dispatcher injects them) and win over ``board=``
+at this layer; otherwise ``board=`` > ``HERMES_KANBAN_BOARD`` > ``<root>/kanban/current`` >
+``default``. The model-facing tools (``tools/kanban_tools``) refuse an explicit ``board=`` that
+resolves to a different board than the pinned DB (``HERMES_KANBAN_DB``), so a pin never silently
+retargets a tool call.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -470,11 +474,41 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _slug_board_path(slug: str, default_parts: tuple[str, ...], leaf: str) -> Path:
+    """``default`` -> legacy ``<root>/<default_parts>``, else ``board_dir(slug)/leaf``."""
+    if slug == DEFAULT_BOARD:
+        return kanban_home().joinpath(*default_parts)
+    return board_dir(slug) / leaf
+
+
+def _pinned_board_slug(pinned: Path, default_parts: tuple[str, ...], leaf: str) -> Optional[str]:
+    """Best-effort slug a pinned path names (``None`` when it is not canonical)."""
+    try:
+        resolved = pinned.resolve()
+    except OSError:
+        return None
+    home = kanban_home()
+    if resolved == home.joinpath(*default_parts).resolve():
+        return DEFAULT_BOARD
+    try:
+        rel = resolved.relative_to(boards_root().resolve())
+    except ValueError:
+        return None
+    parts = rel.parts
+    return parts[0] if len(parts) == 2 and parts[1] == leaf else None
+
+
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
     """Shared resolver: ``env_var`` override, else legacy ``<root>/<default_parts>``
-    for the ``default`` board, else ``board_dir(slug)/leaf``."""
+    for the ``default`` board, else ``board_dir(slug)/leaf``.
+
+    The ``env_var`` pin (dispatcher-injected) deliberately wins over ``board=`` here:
+    internal consumers such as the notifier poll the pinned DB by slug and rely on it.
+    The model-facing tools layer refuses a mismatched explicit ``board=`` up front via
+    :func:`assert_board_matches_pin`, so the pin never silently retargets a tool call.
+    """
     if env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
@@ -482,9 +516,32 @@ def _board_path(
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home().joinpath(*default_parts)
-    return board_dir(slug) / leaf
+    return _slug_board_path(slug, default_parts, leaf)
+
+
+def assert_board_matches_pin(board: Optional[str]) -> None:
+    """Refuse an explicit ``board=`` slug that resolves to a different board than the
+    pinned DB (``HERMES_KANBAN_DB``), instead of silently serving it from the pin — a
+    read from the wrong board is indistinguishable from success. No-op when the board
+    is omitted or the process is not DB-pinned. Called by the model-facing tools.
+    """
+    if not board:
+        return
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if not override:
+        return
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        return
+    pinned = Path(override).expanduser()
+    natural = _slug_board_path(slug, ("kanban.db",), "kanban.db")
+    if natural.resolve() != pinned.resolve():
+        pinned_name = _pinned_board_slug(pinned, ("kanban.db",), "kanban.db")
+        pinned_label = f"board {pinned_name!r}" if pinned_name else str(pinned)
+        raise ValueError(
+            f"refusing to target board {slug!r}: this process is pinned to "
+            f"{pinned_label} (HERMES_KANBAN_DB)"
+        )
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
@@ -715,6 +772,13 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Absolute epoch seconds at which a ``scheduled`` card becomes due. The
+    # dispatcher tick wakes it (``kanban_due.wake_due_cards``) -- no external
+    # cron is involved. NULL = parked with no wake time.
+    due_at: Optional[int] = None
+    # VALID_DUE_WINDOW_POLICIES; NULL reads as "defer". Decides whether a due
+    # time landing inside a reserved execution band defers the wake or not.
+    due_window_policy: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -744,11 +808,12 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "due_at",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "due_window_policy",
 )
 
 
@@ -941,7 +1006,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Absolute epoch seconds at which a ``scheduled`` card becomes DUE. Set by
+    -- ``schedule_task(due_at=...)`` / ``hermes kanban schedule --due``. The
+    -- dispatcher tick wakes every due card itself (``kanban_due.wake_due_cards``)
+    -- so a time-gated card needs no external cron. NULL = parked with no wake
+    -- time (a wait on an unknown moment, woken by a human/unblock).
+    due_at               INTEGER,
+    -- One of VALID_DUE_WINDOW_POLICIES; NULL reads as 'defer'. Decides what the
+    -- waker does when the due time falls inside a reserved execution band:
+    -- 'defer' holds the wake until the band closes, 'ambient' wakes anyway.
+    due_window_policy    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1032,6 +1107,15 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     last_event_id INTEGER NOT NULL DEFAULT 0,
     last_ping_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+-- Board-level key/value bookkeeping that is not a task (the due-card waker's
+-- last-tick heartbeat; see kanban_db.record_due_waker_tick). One row per key,
+-- upserted in place -- never a log.
+CREATE TABLE IF NOT EXISTS kanban_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -1218,10 +1302,81 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _unloadable_task_skills(skills: Iterable[str], assignee: Optional[str]) -> list[dict[str, str]]:
+    """``skills`` entries a worker launched as *assignee* could not load.
+
+    A worker resolves ``--skills`` against ITS OWN profile's skill directories and exits
+    on ``Unknown skill(s)`` before the agent starts, so a card carrying one of these
+    names spends an attempt and auto-blocks with the reason only the worker log shows.
+    Ask the worker's own question instead (``agent.skill_commands``).
+
+    Empty when the question cannot be answered truthfully: an unassigned card cannot
+    dispatch at all (``assign_task`` attaches the profile), and an unresolvable profile
+    home is that profile's own error — neither has a registry to judge names against.
+    """
+    if not skills or not assignee:
+        return []
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from agent.skill_commands import preload_skill_problems
+
+    try:
+        profile_home = resolve_profile_env(normalize_profile_name(assignee))
+    except Exception:
+        return []
+    override = set_hermes_home_override(profile_home)
+    try:
+        return preload_skill_problems(list(skills))
+    finally:
+        reset_hermes_home_override(override)
+
+
+def _unloadable_skills_message(problems: list[dict[str, str]], assignee: Optional[str]) -> str:
+    """Refusal text for skill names the assignee profile's worker would exit on."""
+    quoted = ", ".join(repr(problem["identifier"]) for problem in problems)
+    noun = "skill" if len(problems) == 1 else "skills"
+    lines = [
+        f"{noun} {quoted} cannot be loaded by a worker for assignee {assignee!r}, "
+        "so the task would fail on 'Unknown skill(s)' before the agent starts."
+    ]
+    for problem in problems:
+        closest = problem.get("closest") or ""
+        lines.append(
+            f"  {problem['identifier']}: {problem.get('error') or 'not registered for that profile'}"
+            + (f" Closest name(s): {closest}." if closest else "")
+        )
+    lines.append(f"List that profile's skills with `hermes -p {assignee} skills list`.")
+    return "\n".join(lines)
+
+
+def _task_skill_names(skills: Any) -> list[str]:
+    """Skill names off a task row's JSON ``skills`` column (or a raw list of names)."""
+    parsed = skills if isinstance(skills, (list, tuple)) else _json_or(skills)
+    return [str(name) for name in parsed if name] if isinstance(parsed, list) else []
+
+
+def _refuse_unloadable_skills(skills: Any, assignee: Optional[str]) -> None:
+    """Raise :class:`ValueError` for stored skill names *assignee*'s worker cannot load.
+
+    ``create_task`` asks this where the card is created; every site that ATTACHES an
+    assignee afterwards asks it again (``assign_task``, ``request_review``, the
+    dispatcher's ``kanban.default_assignee`` fallback), because the pair can only be
+    judged once the profile is known. A card created with no assignee therefore
+    reaches a worker with its names unjudged and spends its attempts on
+    ``Unknown skill(s)`` — the failure the create-time check exists to prevent.
+    """
+    names = _task_skill_names(skills)
+    if not names:
+        return
+    problems = _unloadable_task_skills(names, assignee)
+    if problems:
+        raise ValueError(_unloadable_skills_message(problems, assignee))
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
-    workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
+    workspace_kind: str = "scratch", workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
@@ -1245,8 +1400,6 @@ def create_task(
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
-    ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
-    an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1259,17 +1412,6 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
-    # A project-scoped board anchors every new task to its project's repo
-    # (deterministic worktree + branch) without each surface repeating it.
-    # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
-    # it must not be upgraded to a worktree in the board's repo (#106342).
-    if project_id is None and workspace_kind != "scratch":
-        try:
-            project_id = (_board_meta_for(board).get("project_id") or "").strip() or None
-        except Exception:
-            pass
-    if workspace_kind is None:
-        workspace_kind = "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -1280,11 +1422,25 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    # A project-scoped board anchors every new task to its project's repo
+    # (deterministic worktree + branch) without each surface repeating it.
+    if project_id is None:
+        try:
+            project_id = (_board_meta_for(board).get("project_id") or "").strip() or None
+        except Exception:
+            pass
+
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    if skills_list:
+        # Refuse a name no worker for this assignee can load, rather than letting the
+        # card spend an attempt and auto-block on a failure only the worker log shows.
+        unloadable = _unloadable_task_skills(skills_list, assignee)
+        if unloadable:
+            raise ValueError(_unloadable_skills_message(unloadable, assignee))
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1305,6 +1461,19 @@ def create_task(
         board_default = _board_meta_for(board).get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+        else:
+            # A dir/worktree card with no anchor (no explicit path, no project
+            # repo, no board default_workdir) can never resolve its workspace at
+            # dispatch — it would park in `blocked` forever while its request
+            # looks "handled". Refuse at creation so the error surfaces to the
+            # caller (dashboard 400 / CLI / tool) instead of silently creating
+            # a black hole.
+            raise ValueError(
+                f"workspace_kind={workspace_kind!r} requires a resolvable workspace: "
+                f"pass an explicit workspace_path, a project with a repo, or set a "
+                f"default_workdir on board {board!r}. Got none of these, so the task "
+                f"could never resolve its workspace at dispatch."
+            )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -1505,11 +1674,13 @@ def list_tasks(
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+    """Assign/reassign; raises RuntimeError while the task is running under a claim,
+    and ValueError when a worker for *profile* could not load the task's skills.
+    """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -1518,6 +1689,11 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        # A card created with no assignee carried its skills past the create-time
+        # check (nothing to judge them against); judge them against the profile
+        # being attached here, before it can reach a worker — and before the
+        # failure streak and the assignee are written.
+        _refuse_unloadable_skills(row["skills"], profile)
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
@@ -2652,18 +2828,15 @@ def _gate_created_cards(
 def _stage_completion_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: dict, now: int, *,
     uploaded_by: str = "kanban_complete",
-) -> list[Path]:
-    """Copy scratch artifacts to the attachments dir and record each as an
-    attachment row; returns the copies so the caller can discard them if its
-    transaction rolls back."""
+) -> None:
+    """Copy scratch artifacts to the attachments dir and record each as an attachment row."""
     _persist_scratch_completion_artifacts(conn, task_id, metadata)
-    staged = [Path(stored_path) for stored_path in metadata.pop("_staged_artifacts", [])]
-    for path in staged:
+    for stored_path in metadata.pop("_staged_artifacts", []):
+        path = Path(stored_path)
         _insert_completion_attachment(
             conn, task_id, filename=path.name, stored_path=str(path),
             size=path.stat().st_size, created_at=now, uploaded_by=uploaded_by,
         )
-    return staged
 
 
 def _cleaned_artifact_paths(metadata: Any) -> list[str]:
@@ -2782,7 +2955,11 @@ def _persist_scratch_completion_artifacts(
     changed = False
 
     def _discard_copies() -> None:
-        _discard_staged_copies(used_destinations, attachment_dir)
+        for copied in used_destinations:
+            with contextlib.suppress(OSError):
+                copied.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            attachment_dir.rmdir()
 
     for item in raw_artifacts:
         artifact = str(item).strip() if isinstance(item, str) else ""
@@ -2835,16 +3012,6 @@ def _persist_scratch_completion_artifacts(
         metadata["_staged_artifacts"] = [
             path for path in persisted if path.startswith(str(attachment_dir.resolve()))
         ]
-
-
-def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:
-    """Remove staged attachment copies whose DB rows never committed; a leaked
-    copy would make the retry stage ``name_1.ext`` next to an orphan."""
-    for copied in copies:
-        with contextlib.suppress(OSError):
-            Path(copied).unlink(missing_ok=True)
-    with contextlib.suppress(OSError):
-        attachment_dir.rmdir()
 
 
 def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
@@ -3021,10 +3188,30 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def _declare_handoff_artifacts(
+    metadata: Optional[dict], artifacts: Optional[Iterable[str]],
+) -> Optional[dict]:
+    """Fold an explicit ``artifacts`` argument into ``metadata["artifacts"]``
+    (order-preserving, deduped). Returns ``metadata`` untouched when there is
+    nothing to add, so callers can pass ``None`` through."""
+    if not artifacts:
+        return metadata
+    items = [str(item).strip() for item in artifacts if item is not None and str(item).strip()]
+    if not items:
+        return metadata
+    updated = dict(metadata) if isinstance(metadata, dict) else {}
+    existing = updated.get("artifacts")
+    merged = list(existing) if isinstance(existing, (list, tuple)) else []
+    merged.extend(items)
+    updated["artifacts"] = list(dict.fromkeys(str(p).strip() for p in merged if str(p).strip()))
+    return updated
+
+
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    artifacts: Optional[Iterable[str]] = None,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3034,7 +3221,11 @@ def request_review(
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
 
-    ``metadata["artifacts"]`` names the handoff's deliverable
+    ``reviewer`` reassigns the task, so it must be able to load the task's own
+    skills (the ``create_task``/``assign_task`` check); a name its worker cannot
+    load is refused here rather than crash-looped in the reviewer's session.
+
+    ``artifacts`` (or ``metadata["artifacts"]``) names the handoff's deliverable
     files; a review handoff is the last implementer transition, and the
     *reviewer's* completion is what cleans the managed scratch workspace up, so
     the files are staged into the task's durable attachments dir here and the
@@ -3049,91 +3240,93 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
-    # Declared (metadata["artifacts"]) and prose-referenced files
+    # Declared (explicit arg or metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
+    metadata = _declare_handoff_artifacts(metadata, artifacts)
     metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
     now = int(time.time())
-    # Staged copies live outside the txn: a rollback after staging must not
-    # leave orphans that make the retry stage ``name_1.ext`` beside them.
-    staged_copies: list[Path] = []
-    try:
-        with write_txn(conn):
-            if not _parents_satisfied(conn, task_id):
-                return _ret(False, "parent dependencies are not satisfied")
-            trow = conn.execute(
-                "SELECT assignee, status, claim_lock, current_run_id "
-                "FROM tasks WHERE id = ?", (task_id,),
-            ).fetchone()
-            if trow is None:
-                return _ret(False, "task not found")
-            # Refuse to clear a live worker's claim without proof of ownership
-            # (expected_run_id) or an explicit human override (force=True).
-            if (
-                expected_run_id is None
-                and not force
-                and trow["status"] == "running"
-                and trow["claim_lock"] is not None
-            ):
+    with write_txn(conn):
+        if not _parents_satisfied(conn, task_id):
+            return _ret(False, "parent dependencies are not satisfied")
+        trow = conn.execute(
+            "SELECT assignee, status, claim_lock, current_run_id, skills "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if trow is None:
+            return _ret(False, "task not found")
+        # Refuse to clear a live worker's claim without proof of ownership
+        # (expected_run_id) or an explicit human override (force=True).
+        if (
+            expected_run_id is None
+            and not force
+            and trow["status"] == "running"
+            and trow["claim_lock"] is not None
+        ):
+            return _ret(
+                False, "task is running under a live claim; pass expected_run_id "
+                "(worker ownership) or force=True (explicit operator "
+                "override) instead of clearing the live run's claim",
+            )
+        implementer = trow["assignee"]
+        if reviewer is None:
+            reviewer = _prior_reviewer(conn, task_id)
+            if reviewer is False:
                 return _ret(
-                    False, "task is running under a live claim; pass expected_run_id "
-                    "(worker ownership) or force=True (explicit operator "
-                    "override) instead of clearing the live run's claim",
+                    False, "re-review has no durable reviewer provenance (the "
+                    "latest changes_requested event is missing or "
+                    "malformed); pass reviewer= explicitly",
                 )
-            implementer = trow["assignee"]
-            if reviewer is None:
-                reviewer = _prior_reviewer(conn, task_id)
-                if reviewer is False:
-                    return _ret(
-                        False, "re-review has no durable reviewer provenance (the "
-                        "latest changes_requested event is missing or "
-                        "malformed); pass reviewer= explicitly",
-                    )
-            reviewer = _canonical_assignee(reviewer)
-            assignee_sql = ", assignee = ?" if reviewer is not None else ""
-            run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
-            params: tuple[Any, ...] = (
-                *(() if reviewer is None else (reviewer,)), task_id,
-                *(() if expected_run_id is None else (int(expected_run_id),)),
+        reviewer = _canonical_assignee(reviewer)
+        if reviewer is not None:
+            # The reviewer takes the card over, so the skill pair is judged here
+            # exactly as assign_task judges it: refusing keeps the card in the
+            # implementer's hands instead of handing the reviewer a session that
+            # aborts on "Unknown skill(s)".
+            try:
+                _refuse_unloadable_skills(trow["skills"], reviewer)
+            except ValueError as exc:
+                return _ret(False, str(exc))
+        assignee_sql = ", assignee = ?" if reviewer is not None else ""
+        run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
+        params: tuple[Any, ...] = (
+            *(() if reviewer is None else (reviewer,)), task_id,
+            *(() if expected_run_id is None else (int(expected_run_id),)),
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'review',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+            """ + assignee_sql + """
+             WHERE id = ?
+               AND status IN ('running', 'ready')
+            """ + run_guard,
+            params,
+        )
+        if cur.rowcount != 1:
+            return _ret(
+                False, "task is not in running/ready (or expected_run_id did not match the current run)",
             )
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'review',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL
-                """ + assignee_sql + """
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + run_guard,
-                params,
+        if isinstance(metadata, dict):
+            _stage_completion_artifacts(
+                conn, task_id, metadata, now, uploaded_by="kanban_request_review",
             )
-            if cur.rowcount != 1:
-                return _ret(
-                    False, "task is not in running/ready (or expected_run_id did not match the current run)",
-                )
-            if isinstance(metadata, dict):
-                staged_copies = _stage_completion_artifacts(
-                    conn, task_id, metadata, now, uploaded_by="kanban_request_review",
-                )
-            run_id = _end_or_synthesize_run(
-                conn, task_id, outcome="review_requested", status="review",
-                summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
-            )
-            payload: dict = {
-                "summary": _first_line(summary, 400) or None,
-                "implementer": implementer,
-                "reviewer": reviewer,
-            }
-            staged = _cleaned_artifact_paths(metadata)
-            if staged:
-                payload["artifacts"] = staged
-            _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
-    except Exception:
-        if staged_copies:
-            _discard_staged_copies(staged_copies, staged_copies[0].parent)
-        raise
+        run_id = _end_or_synthesize_run(
+            conn, task_id, outcome="review_requested", status="review",
+            summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
+        )
+        payload: dict = {
+            "summary": _first_line(summary, 400) or None,
+            "implementer": implementer,
+            "reviewer": reviewer,
+        }
+        staged = _cleaned_artifact_paths(metadata)
+        if staged:
+            payload["artifacts"] = staged
+        _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
     return _ret(True)
 
 
@@ -3229,11 +3422,11 @@ def request_changes(
 
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
+    force: bool = False, dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    Refused while a parent is unfinished unless ``force``; ``dry_run`` only
+    validates. Returns ``(ok, reason)``."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
@@ -3244,22 +3437,18 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
-    # No override: claim_task demotes ready -> todo on an undone parent whichever
-    # writer set 'ready', so a forced promotion would only report a success the
-    # first claim silently reverts (#106195). The dependency itself is the knob.
-    parents = conn.execute(
-        "SELECT t.id, t.status FROM tasks t "
-        "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ?", (task_id,),
-    ).fetchall()
-    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
-    if unsatisfied:
-        return False, (
-            f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
-            f"(the ready -> running claim re-checks parents, so promotion cannot "
-            f"bypass them; complete the parents or drop the link with "
-            f"`hermes kanban unlink <parent_id> {task_id}`)"
-        )
+    if not force:
+        parents = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ?", (task_id,),
+        ).fetchall()
+        unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
+        if unsatisfied:
+            return False, (
+                f"unsatisfied parent dependencies: "
+                f"{', '.join(unsatisfied)} (use --force to override)"
+            )
 
     if dry_run:
         return True, None
@@ -3271,7 +3460,9 @@ def promote_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        _append_event(
+            conn, task_id, "promoted_manual", {"actor": actor, "reason": reason, "forced": force},
+        )
 
     return True, None
 
@@ -3306,9 +3497,16 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, extra_event: Optional[dict] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    ``extra_event`` merges into the ``unblocked`` event payload, so a caller that
+    unblocked the card for a reason of its own (the due-card waker, say) leaves
+    that reason on the board's event stream without a second event.
+    """
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3331,22 +3529,25 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # resetting them is the amnesia that let cron-unblock <-> re-block loop
         # unbounded; only complete_task clears them. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # is a fresh start for the retry budget. The due columns are cleared
+        # because the card is no longer time-gated: leaving a stale ``due_at``
+        # behind would re-wake (or falsely alarm about) a card already running.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "due_at = NULL, due_window_policy = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        payload = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else None
         )
+        if extra_event:
+            payload = {**(payload or {}), **extra_event}
+        _append_event(conn, task_id, "unblocked", payload)
         return True
 
 
@@ -3538,29 +3739,8 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
-    """Archive a task; a *running* task's host-local worker is terminated.
-
-    Clearing ``worker_pid`` in the DB alone left the OS process running past its
-    own archive — it kept executing (and pushing work) against a task nothing
-    tracked anymore (#76196). Snapshot pid+claim inside the archive txn so the
-    kill is contingent on THIS caller winning the archive transition (a losing
-    concurrent archiver must never signal the pid); the kill itself runs after
-    commit — ``_poll_worker_exit`` can wait ~5 s and must not hold the write
-    lock. Post-release kill is safe here because ``archived`` is terminal: no
-    dispatcher can spawn a duplicate worker off the released claim. The
-    termination outcome lands as its own ``archive_worker_termination`` event so
-    the ``archived`` event stays atomic with the status flip.
-    """
+def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row:
-            return False
-        was_running = row["status"] == "running"
-        prev_pid, prev_lock = row["worker_pid"], row["claim_lock"]
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -3574,10 +3754,6 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-    if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn)
-        with write_txn(conn):
-            _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
@@ -3614,22 +3790,163 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+# --- Time-gated cards (due_at) ---
+#
+# ``due_at`` is what makes a parked card self-waking: the dispatcher tick calls
+# ``kanban_due.wake_due_cards`` and unblocks every card whose due time has
+# passed, so a time-gated card does not need an external cron to come back.
+class _UnsetType:
+    """Sentinel for ``schedule_task(due_at=...)``.
+
+    Omitting ``due_at`` (the default, ``UNSET``) leaves whatever due time the
+    card already has. Passing ``None`` explicitly CLEARS it -- re-parking a card
+    by hand means "no wake time". Collapsing the two would make every legacy
+    ``schedule_task`` call silently drop a card's due time.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _UnsetType()
+
+# What the waker does when a due time lands inside a reserved execution band.
+# ``defer`` holds the wake to the end of the band (a wake hands the card to the
+# spawn pass in the same tick, so it would start work inside the band);
+# ``ambient`` wakes anyway, for a wake that is a lightweight check.
+VALID_DUE_WINDOW_POLICIES = ("defer", "ambient")
+DEFAULT_DUE_WINDOW_POLICY = "defer"
+
+
+def list_due_tasks(
+    conn: sqlite3.Connection, *, now: int, limit: int = 200, status: str = "scheduled",
+) -> list[Task]:
+    """``scheduled`` cards whose ``due_at`` has passed, oldest due first.
+
+    The read side of the waker: ``due_at IS NOT NULL`` keeps a card parked
+    without a wake time (a wait on an unknown moment) out of the result, so this
+    never becomes a second, implicit unblock path for human-parked cards.
+    """
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE status = ? AND due_at IS NOT NULL AND due_at <= ? "
+        "ORDER BY due_at ASC LIMIT ?",
+        (status, int(now), int(limit)),
+    ).fetchall()
+    return [Task.from_row(r) for r in rows]
+
+
+# --- Board-level key/value bookkeeping (``kanban_meta``) ---
+#
+# ``due_waker_last_tick`` is the waker's heartbeat: the overdue diagnostic reads
+# it to tell "the card's wake time passed and the tick that would wake it did
+# not happen" (gateway dispatcher down) apart from "the tick ran and the waker
+# refused" -- the two need different fixes.
+META_DUE_WAKER_LAST_TICK = "due_waker_last_tick"
+# Heartbeat write throttle: the dispatcher ticks every ~60 s and a heartbeat per
+# tick is a WAL write for nothing. 30 s keeps "has it ticked lately?" sharp while
+# halving the write rate.
+_META_TICK_THROTTLE_SECONDS = 30
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: Optional[str]) -> None:
+    """Upsert one board-level key. The CALLER owns the transaction."""
+    conn.execute(
+        "INSERT OR REPLACE INTO kanban_meta (key, value, updated_at) VALUES (?, ?, ?)",
+        (key, value, int(time.time())),
+    )
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM kanban_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row is not None else None
+
+
+def get_meta_int(conn: sqlite3.Connection, key: str, default=None):
+    """``get_meta`` as an int; a missing or unparsable value reads as ``default``."""
+    raw = get_meta(conn, key)
+    try:
+        return int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def record_due_waker_tick(conn: sqlite3.Connection, *, now: Optional[int] = None) -> None:
+    """Note that the due-card waker ran (throttled; see ``_META_TICK_THROTTLE_SECONDS``).
+
+    A missing heartbeat is how the board tells that nothing is ticking at all:
+    a parked card with a due time and no heartbeat is not a card about to wake.
+    """
+    ts = int(now if now is not None else time.time())
+    prev = get_meta_int(conn, META_DUE_WAKER_LAST_TICK)
+    if prev is not None and 0 <= ts - prev < _META_TICK_THROTTLE_SECONDS:
+        return
+    with write_txn(conn):
+        set_meta(conn, META_DUE_WAKER_LAST_TICK, str(ts))
+
+
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    due_at: Any = UNSET, window_policy: Optional[str] = None,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until ``unblock_task`` re-gates it.
+
+    ``due_at`` (epoch seconds) makes the card self-waking: the dispatcher tick
+    unblocks it on the first pass after that time via
+    ``kanban_due.wake_due_cards``, so nothing external has to run. Omit it to
+    leave an existing due time alone; pass ``None`` to clear it.
+
+    ``window_policy`` decides what the waker does when the due time falls inside
+    a reserved execution band -- ``"defer"`` (the default once ``due_at`` is set)
+    holds the wake until the band closes, ``"ambient"`` wakes anyway for a wake
+    that is a lightweight check and must tick around the clock.
+
+    Re-parking an already-``scheduled`` card is allowed, and is how a deferral
+    moves the same card forward; that path synthesizes no run (the card was
+    never claimed in the first place).
+    """
+    if window_policy is not None and window_policy not in VALID_DUE_WINDOW_POLICIES:
+        raise ValueError(
+            f"window_policy must be one of {sorted(VALID_DUE_WINDOW_POLICIES)}"
+        )
     with write_txn(conn):
-        params: list[Any] = [task_id]
-        sql = """
+        row = conn.execute(
+            "SELECT status, due_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        was_scheduled = row is not None and row["status"] == "scheduled"
+        # A band policy with nothing to apply it to is dead state no wake will
+        # ever read: refuse it instead of writing an inert column.
+        if (window_policy is not None and due_at is UNSET
+                and (row is None or row["due_at"] is None)):
+            raise ValueError(
+                "window_policy needs a due time: pass due_at as well "
+                "(CLI: --due ... --window-policy ...)"
+            )
+        sets = [
+            "status = 'scheduled'", "claim_lock = NULL", "claim_expires = NULL",
+            "worker_pid = NULL",
+        ]
+        set_params: list[Any] = []
+        if due_at is not UNSET:
+            sets.append("due_at = ?")
+            set_params.append(None if due_at is None else int(due_at))
+            if due_at is None:
+                sets.append("due_window_policy = NULL")
+            else:
+                sets.append("due_window_policy = ?")
+                set_params.append(window_policy or DEFAULT_DUE_WINDOW_POLICY)
+        elif window_policy is not None:
+            sets.append("due_window_policy = ?")
+            set_params.append(window_policy)
+        params: list[Any] = [*set_params, task_id]
+        sql = f"""
             UPDATE tasks
-               SET status       = 'scheduled',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL
+               SET {', '.join(sets)}
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'scheduled')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -3637,9 +3954,19 @@ def schedule_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome="scheduled", status="scheduled", summary=reason,
+            synthesize=bool(reason) and not was_scheduled,
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload: dict = {"reason": reason}
+        if due_at is not UNSET or window_policy is not None:
+            # Re-read rather than echo the arguments: the event has to say what
+            # the card is now waiting on, including an inherited due time.
+            final = conn.execute(
+                "SELECT due_at, due_window_policy FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            payload["due_at"] = final["due_at"] if final is not None else None
+            payload["window_policy"] = final["due_window_policy"] if final is not None else None
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
 
 

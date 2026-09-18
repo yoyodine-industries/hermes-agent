@@ -77,8 +77,9 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
 
 
 def _kanban_stop_nudge(agent, messages) -> Optional[str]:
-    """Workers must end with kanban_complete / kanban_block; a narrated stop is recorded
-    as protocol_violation, so nudge once or twice first."""
+    """Workers must end with a terminal board tool — kanban_complete / kanban_block, or a
+    lane handoff (kanban_request_review / kanban_request_changes); a narrated stop is
+    recorded as protocol_violation, so nudge once or twice first."""
     try:
         from agent.kanban_stop import build_kanban_stop_nudge
 
@@ -164,7 +165,7 @@ def apply_stop_gates(
         )
         agent._emit_status(
             "⚠️ Kanban worker tried to exit without "
-            "kanban_complete/kanban_block — nudging to finish"
+            "a terminal board tool — nudging to finish"
         )
         return verdict
     return StopGateVerdict(

@@ -55,6 +55,7 @@ def _runner(adapter, *, origins=None):
     runner._completion_deliveries_inflight = set()
     runner._completion_deliveries_delivered = OrderedDict()
     runner._completion_delivery_retention = 2048
+    runner._completion_delivery_requeues = {}
     runner._background_tasks = set()
     return runner
 

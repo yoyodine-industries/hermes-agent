@@ -108,7 +108,7 @@ def aux_probe_mode():
 
 from agent.credential_pool import load_pool
 from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH, get_model_context_length,
+    MINIMUM_CONTEXT_LENGTH, get_model_context_length, is_local_endpoint,
     strip_codex_context_variant_suffix as _strip_codex_ctx_variant,
 )
 from hermes_cli.config import get_hermes_home
@@ -3239,12 +3239,18 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     return "auxiliary " in msg and "llm returned invalid response" in msg and "choices[0].message" in msg
 
 
-# Tasks on a user-visible critical path (compression blocks resuming an oversized session; vision
-# stalls the serialised turn queue). A same-provider retry after a full-budget timeout costs another
-# whole ``timeout`` window, so they skip straight to fallback; fast blips still retry.
-# Fast blips (a streaming-close or a 5xx) still retry, since those are cheap. See issue #54465 for the
-# compression case.
-_TIMEOUT_NO_RETRY_TASKS = frozenset({"compression", "vision"})
+# Tasks on a user-visible critical path (a vision call stalls the serialised turn queue). A
+# same-provider retry after a full-budget timeout costs another whole ``timeout`` window, so they
+# skip straight to fallback; fast blips (a streaming-close or a 5xx) still retry, since those are cheap.
+#
+# ``compression`` is deliberately NOT on this list. Its route is local-only
+# (``_LOCAL_ONLY_FALLBACK_TASKS``), so there is no fallback to hand the work to: spending the retry on
+# the one endpoint it may use is the only recovery left, and abandoning it loses the summary outright.
+# The bounded retry window is what keeps that affordable — ``auxiliary.compression.timeout`` is
+# honoured down to ``_COMPRESSION_TIMEOUT_FLOOR_SECONDS``, so the whole local attempt
+# (``auxiliary.transient_retries`` + backoff) stays inside the 300 s the old floor used to spend on a
+# single stalled request. See issue #54465.
+_TIMEOUT_NO_RETRY_TASKS = frozenset({"vision"})
 
 
 def _should_skip_same_provider_retry(task: Optional[str], exc: Exception) -> bool:
@@ -3875,6 +3881,9 @@ def _try_payment_fallback(
         if (not failed_base_url and label in skip_chain_labels) or skip_backend(
                 label, None, candidate_base_url):
             continue
+        if _local_only_fallback_refused(task, label, None, candidate_base_url, surface="discovery chain"):
+            tried.append(f"{label} (not local)")
+            continue
         if _is_provider_unhealthy(label, candidate_base_url):
             _log_skip_unhealthy(label, task, base_url=candidate_base_url)
             tried.append(f"{label} (unhealthy)")
@@ -3910,6 +3919,67 @@ def _failed_backend_skip(
     return _skip
 
 
+# Tasks whose auxiliary route is local-only: never served by a cloud provider, whatever fails.
+#
+# A local summariser (a llama-server on loopback) that times out must not escalate to the recovery
+# ladder's cloud rungs. The summary is the operator's own conversation, and sending it to the main
+# agent model is a silent data-egress and cost decision nobody made: this fleet logged 345 "falling
+# back to main agent model" events on task=compression and 138 ``session_model_usage`` rows served by
+# a cloud model before the fence. Every other task keeps the full ladder (`_try_main_agent_model_fallback`).
+_LOCAL_ONLY_FALLBACK_TASKS = frozenset({"compression"})
+
+
+def _task_route_is_local(task: Optional[str]) -> bool:
+    """True when *task*'s configured auxiliary route is an endpoint on this host.
+
+    A task that inherits the main agent's route (neither ``provider`` nor ``base_url`` of its own) is
+    NOT local-only: there is no local route to protect, so its fallbacks stay exactly as they were.
+    """
+    if not task:
+        return False
+    task_config = _get_auxiliary_task_config(task)
+    provider = str(task_config.get("provider", "")).strip()
+    base_url = str(task_config.get("base_url", "")).strip()
+    if not provider and not base_url:
+        return False
+    return is_local_endpoint(_custom_health_base_url(provider, base_url) or base_url)
+
+
+def compression_route_is_local() -> bool:
+    """True when ``task="compression"`` resolves to an endpoint on this host, so its route is fenced."""
+    return "compression" in _LOCAL_ONLY_FALLBACK_TASKS and _task_route_is_local("compression")
+
+
+def _aux_route_label(task: Optional[str]) -> str:
+    """``provider (endpoint)`` for *task*'s configured route — what the log line names."""
+    task_config = _get_auxiliary_task_config(task or "")
+    provider = str(task_config.get("provider", "")).strip() or "auto"
+    base_url = str(task_config.get("base_url", "")).strip()
+    endpoint = _custom_health_base_url(provider, base_url) or base_url
+    return f"{provider} ({endpoint})" if endpoint else provider
+
+
+def _local_only_fallback_refused(
+    task: Optional[str], provider: str, model: Optional[str] = None, base_url: str = "", *, surface: str,
+) -> bool:
+    """True when a fallback candidate must be refused: local-only *task*, candidate off this host.
+
+    ``surface`` names the ladder rung that offered the candidate. Each refusal emits one INFO line with
+    the route and the outcome — the escalation this prevents was previously invisible until someone
+    read the model-attribution table, and the operator greps for exactly this absence.
+    """
+    if task not in _LOCAL_ONLY_FALLBACK_TASKS or not _task_route_is_local(task):
+        return False
+    if is_local_endpoint(_custom_health_base_url(provider, base_url) or base_url):
+        return False
+    logger.info(
+        "Auxiliary %s: refusing %s fallback to %s (%s) — not a local endpoint; %s's route is %s, "
+        "which is local-only, so this task stays on this host",
+        task, surface, provider or "auto", model or "default", task, _aux_route_label(task),
+    )
+    return True
+
+
 def _try_main_agent_model_fallback(
     failed_provider: str, task: str = None, reason: str = "error",
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
@@ -3928,6 +3998,10 @@ def _try_main_agent_model_fallback(
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
         return None, None, ""
     main_base_url = _custom_health_base_url(main_provider)
+    # A local-only route (compression) never reaches the main agent model — this rung is the cloud leak
+    # that produced "falling back to main agent model" on the compression task.
+    if _local_only_fallback_refused(task, main_provider, main_model, main_base_url, surface="main-agent-model"):
+        return None, None, ""
     if _failed_backend_skip(
             failed_provider, failed_model, failed_base_url=failed_base_url,
             failure_scope=failure_scope)(main_provider, main_model, main_base_url):
@@ -4025,6 +4099,11 @@ def _try_configured_fallback_chain(
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
         if skip(fb_provider, fb_model_raw, fb_base_url):
             continue
+        # Refuse before probing: a local-only task never uses an off-host rung, so don't spend a
+        # health probe on it either.
+        if _local_only_fallback_refused(task, fb_provider, fb_model_raw, fb_base_url, surface=f"fallback_chain[{i}]({fb_provider})"):
+            tried.append(f"fallback_chain[{i}]({fb_provider}) (not local)")
+            continue
         if _is_provider_unhealthy(fb_provider, fb_base_url):
             _log_skip_unhealthy(fb_provider, task, base_url=fb_base_url)
             tried.append(f"fallback_chain[{i}]({fb_provider}) (unhealthy)")
@@ -4117,6 +4196,9 @@ def _try_main_fallback_chain(
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
             tried.append(f"{label} (skipped)")
+            continue
+        if _local_only_fallback_refused(task, fb_provider, fb_model, fb_base_url, surface=label):
+            tried.append(f"{label} (not local)")
             continue
         if _is_provider_unhealthy(fb_norm, fb_base_url):
             _log_skip_unhealthy(fb_norm, task, base_url=fb_base_url)
@@ -5728,10 +5810,14 @@ _DEFAULT_AUX_TIMEOUT = 30.0
 # overrides an explicit per-call timeout.
 # Compression summarises large conversation histories; a reasoning auxiliary model (e.g. Codex / GPT-5.5)
 # can legitimately take longer than the default ``auxiliary.compression.timeout`` (120 s), causing the
-# stream to time out and the compressor to fall back to the deterministic context marker (#54915). A floor
-# is harmless for fast compression models (they finish before the deadline) and is a minimum, so a higher
-# config value is kept unchanged.
-_COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
+# stream to time out and the compressor to fall back to the deterministic context marker (#54915).
+#
+# The floor is the *lower* bound of a window the operator can actually move: compression's route is
+# local-only (``_LOCAL_ONLY_FALLBACK_TASKS``), so a value below it is a typo rather than a preference,
+# and a stalled request used to burn the whole 300 s floor before the summary failed. Config above the
+# floor is honoured unchanged, so ``auxiliary.compression.timeout`` is now a real knob (the stream
+# ceiling it feeds is ``max(600, 4x)`` — see ``_aux_stream_total_ceiling``).
+_COMPRESSION_TIMEOUT_FLOOR_SECONDS = 60.0
 
 
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
@@ -5835,7 +5921,7 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
 
 def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     """Explicit ``timeout`` wins, else config; compression gets a floor so a reasoning model
-    summarising a large context isn't cut off."""
+    summarising a large context isn't cut off (a higher config value is kept unchanged)."""
     if timeout is not None:
         return timeout
     effective = _get_task_timeout(task)
@@ -7124,13 +7210,18 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
                     task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope)
                 if fb_client is None:
                     break
-    # All fallback layers exhausted — one user-visible warning, then re-raise.
+    # All fallback layers exhausted — one user-visible warning, then re-raise. (#26882)
+    # A local-only task never consulted the off-host layers, so say which ladder actually ran out.
+    _exhausted_ladder = (
+        "local endpoints only" if task in _LOCAL_ONLY_FALLBACK_TASKS
+        else "fallback_chain + main agent model"
+    )
     logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
                    # All fallback layers exhausted — emit a single user-visible warning so the operator
                    # knows aux task is about to fail. (#26882) The error itself is re-raised below.
                    # (#26882)
-                   "(fallback_chain + main agent model). Raising original error.",
-                   task or "call", tag, reason, resolved_provider)
+                   "(%s). Raising original error.",
+                   task or "call", tag, reason, resolved_provider, _exhausted_ladder)
     return None
 
 

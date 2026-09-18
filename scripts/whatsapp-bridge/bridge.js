@@ -30,7 +30,7 @@ import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { matchesAllowedUser, parseAllowedUsers, normalizeWhatsAppIdentifier } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
@@ -40,9 +40,7 @@ import {
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
-  createQuotedMediaCache,
   extractBridgeEvent,
-  getMessageContent,
   inboundReadReceiptKeys,
   inferMediaType,
   mediaPayloadForFile,
@@ -115,7 +113,7 @@ const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
-const DEFAULT_REPLY_PREFIX = '☤ *Hermes Agent*\n────────────\n';
+const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
@@ -227,6 +225,28 @@ function emitDebugEvent(payload) {
   } catch {}
 }
 
+function getMessageContent(msg) {
+  const content = msg?.message || {};
+  if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
+  if (content.viewOnceMessage?.message) return content.viewOnceMessage.message;
+  if (content.viewOnceMessageV2?.message) return content.viewOnceMessageV2.message;
+  if (content.documentWithCaptionMessage?.message) return content.documentWithCaptionMessage.message;
+  if (content.templateMessage?.hydratedTemplate) return content.templateMessage.hydratedTemplate;
+  if (content.buttonsMessage) return content.buttonsMessage;
+  if (content.listMessage) return content.listMessage;
+  return content;
+}
+
+function getContextInfo(messageContent) {
+  if (!messageContent || typeof messageContent !== 'object') return {};
+  for (const value of Object.values(messageContent)) {
+    if (value && typeof value === 'object' && value.contextInfo) {
+      return value.contextInfo;
+    }
+  }
+  return {};
+}
+
 mkdirSync(SESSION_DIR, { recursive: true });
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
@@ -261,10 +281,6 @@ const MAX_QUEUE_SIZE = 100;
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
-// Bounded cache of already-downloaded inbound media, so a later reply to an
-// uncaptioned photo/video/document/voice note can still surface the original
-// file — see createQuotedMediaCache's doc comment in bridge_helpers.js.
-const quotedMediaCache = createQuotedMediaCache(512);
 
 function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
   const selected = [];
@@ -372,11 +388,52 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 
+// After a WhatsApp number change, the "Message yourself" self-chat can stay
+// bound to the PREVIOUS number's LID, so matching only sock.user.id/lid
+// silently drops the user's own inbound messages. Recognize every number/LID
+// the account has owned — the current identity plus the historical pairs
+// already harvested into lidToPhone from the session's lid-mapping-*.json
+// files — as "self".
+function isSelfChatId(chatId) {
+  const n = normalizeWhatsAppIdentifier(chatId);
+  if (!n) return false;
+  const myNumber = normalizeWhatsAppIdentifier(sock?.user?.id);
+  const myLid = normalizeWhatsAppIdentifier(sock?.user?.lid);
+  if ((myNumber && n === myNumber) || (myLid && n === myLid)) return true;
+  for (const [lid, phone] of Object.entries(lidToPhone)) {
+    if (
+      normalizeWhatsAppIdentifier(lid) === n ||
+      normalizeWhatsAppIdentifier(phone) === n
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
   try {
     console.log(JSON.stringify({ ts: Date.now(), ...event }));
   } catch {}
+}
+
+// Exponential reconnect backoff with jitter. WhatsApp 428/503 disconnects are
+// often transient; a flat 3s retry hammers the server (hundreds of close
+// events) and never recovers cleanly. 3s -> 6s -> 12s -> 24s -> 48s -> 60s
+// (cap), each + up to 1s random jitter. Counter resets to 0 on 'open'.
+// 515 (server-requested restart) is benign, not a flap: returns the 1000ms
+// reconnect AND resets the counter.
+let reconnectAttempts = 0;
+function reconnectDelayMs(reason) {
+  if (reason === 515) {
+    reconnectAttempts = 0;
+    return 1000;
+  }
+  const base = Math.min(3000 * (2 ** reconnectAttempts), 60000);
+  reconnectAttempts += 1;
+  const jitter = Math.floor(Math.random() * 1000);
+  return base + jitter;
 }
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
@@ -430,18 +487,22 @@ async function startSocket() {
         process.exit(1);
       } else {
         // 515 = restart requested (common after pairing). Always reconnect.
+        // Other closes use exponential backoff so a flapping WhatsApp isn't
+        // hammered with a flat 3s retry forever.
+        const delayMs = reconnectDelayMs(reason);
         emitPairEvent({ event: 'disconnected', reason });
         if (!PAIR_JSON) {
           if (reason === 515) {
             console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
           } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in ${(delayMs / 1000).toFixed(1)}s...`);
           }
         }
-        scheduleReconnect(reason === 515 ? 1000 : 3000);
+        scheduleReconnect(delayMs);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      reconnectAttempts = 0;
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
@@ -590,10 +651,9 @@ async function startSocket() {
           // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
           // AND classic format: 34652029134@s.whatsapp.net
           // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
-          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-          const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
-          const chatNumber = chatId.replace(/@.*/, '');
-          const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+          // isSelfChatId also recognizes a self-chat bound to a PREVIOUS
+          // number/LID after a number change (see helper above).
+          const isSelfChat = isSelfChatId(chatId);
           emitDebugEvent({
             stage: 'self_chat_check',
             matched: !!isSelfChat,
@@ -620,15 +680,20 @@ async function startSocket() {
       // to arbitrary incoming messages (#8389).
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
+          // After a number change, the user's own messages arrive as !fromMe
+          // under the migrated LID; accept them but keep rejecting genuine
+          // strangers (whose chatId AND senderId are both non-self).
+          if (!isSelfChatId(senderId) && !isSelfChatId(chatId)) {
+            try {
+              console.log(JSON.stringify({
+                event: 'ignored',
+                reason: 'self_chat_mode_rejects_non_self',
+                chatId,
+                senderId,
+              }));
+            } catch {}
+            continue;
+          }
         }
         if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
           try {
@@ -716,7 +781,6 @@ async function startSocket() {
           document: DOCUMENT_CACHE_DIR,
           audio: AUDIO_CACHE_DIR,
         },
-        lookupQuotedMedia: (quotedChatId, quotedMessageId) => quotedMediaCache.get(quotedChatId, quotedMessageId),
       });
       event.fromOwner = fromOwner;
 
@@ -733,9 +797,8 @@ async function startSocket() {
         continue;
       }
 
-      // Skip empty messages (but not a bare quote-reply whose own text/media
-      // is empty when the quoted message resolved to cached media).
-      if (!event.body && !event.hasMedia && !event.quotedMediaUrls.length) {
+      // Skip empty messages
+      if (!event.body && !event.hasMedia) {
         emitDebugEvent({
           stage: 'ignored',
           reason: 'empty',
@@ -746,15 +809,6 @@ async function startSocket() {
       }
 
       messageStore.remember(msg);
-      // Remember this message's already-downloaded media/text so a later
-      // reply to it (even uncaptioned media) can resolve the original
-      // content instead of seeing only a stripped-down quoted-message stub.
-      quotedMediaCache.remember(chatId, msg.key.id, {
-        body: event.body,
-        hasMedia: event.hasMedia,
-        mediaType: event.mediaType,
-        mediaUrls: event.mediaUrls,
-      });
       messageQueue.push(event);
       emitDebugEvent({
         stage: 'queued',

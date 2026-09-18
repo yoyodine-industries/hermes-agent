@@ -413,8 +413,11 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
+                # macOS symlinks /private/var to /var; SessionDB may resolve the
+                # realpath, so compare resolved paths to avoid false negatives.
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    os.path.realpath(str(child_db.db_path)),
+                    os.path.realpath(str(parent_db.db_path)),
                 )
             finally:
                 if child_db is not None:
@@ -1788,6 +1791,51 @@ class TestMaxSpawnDepth(unittest.TestCase):
             result = _get_max_spawn_depth()
         self.assertEqual(result, 1)
         self.assertTrue(any("below floor 1" in m for m in cm.output))
+
+# =========================================================================
+# load_soul_identity flag
+# =========================================================================
+
+class TestLoadSoulIdentity(unittest.TestCase):
+    """_get_load_soul_identity: config wins, DELEGATE_WITH_SOUL env fallback."""
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_default_false_when_absent(self, mock_cfg):
+        from tools.delegate_tool import _get_load_soul_identity
+        with patch.dict(os.environ):
+            os.environ.pop("DELEGATE_WITH_SOUL", None)
+            self.assertFalse(_get_load_soul_identity())
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"load_soul_identity": True})
+    def test_true_from_config(self, mock_cfg):
+        from tools.delegate_tool import _get_load_soul_identity
+        self.assertTrue(_get_load_soul_identity())
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"load_soul_identity": False})
+    def test_false_from_config(self, mock_cfg):
+        from tools.delegate_tool import _get_load_soul_identity
+        self.assertFalse(_get_load_soul_identity())
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_env_fallback_true(self, mock_cfg):
+        from tools.delegate_tool import _get_load_soul_identity
+        with patch.dict(os.environ, {"DELEGATE_WITH_SOUL": "true"}):
+            self.assertTrue(_get_load_soul_identity())
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_env_fallback_false(self, mock_cfg):
+        from tools.delegate_tool import _get_load_soul_identity
+        with patch.dict(os.environ, {"DELEGATE_WITH_SOUL": "false"}):
+            self.assertFalse(_get_load_soul_identity())
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"load_soul_identity": True})
+    def test_config_wins_over_env(self, mock_cfg):
+        from tools.delegate_tool import _get_load_soul_identity
+        with patch.dict(os.environ, {"DELEGATE_WITH_SOUL": "false"}):
+            self.assertTrue(_get_load_soul_identity())
 
 # =========================================================================
 # role param plumbing

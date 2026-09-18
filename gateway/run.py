@@ -3477,6 +3477,8 @@ class GatewayRunner(
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
         self._completion_delivery_retention = 2048
+        # Consecutive retryable drain results per completion identity, for the bounded requeue cap.
+        self._completion_delivery_requeues: dict[tuple[str, str, object], int] = {}
         # Agent-triggered terminal completions from one conversation often land in the same scheduler
         # tick; hold them briefly so the agent gets one synthetic turn instead of one per process.
         # See #70300.
@@ -5318,7 +5320,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     def _recover_pending() -> None:
         from gateway.shutdown_flush import recover_pending_to_db
-        recovered = recover_pending_to_db()
+        session_store = getattr(runner, "session_store", None)
+        resolve_session_id = None
+        if session_store is not None and hasattr(session_store, "resolve_session_id_for_key"):
+            # shutdown_flush calls the resolver as (session_key, payload); the store resolves
+            # from the key alone (it encodes the profile/platform/chat identity).
+            resolve_session_id = lambda session_key, _payload: session_store.resolve_session_id_for_key(
+                session_key)
+        recovered = recover_pending_to_db(
+            resolve_session_id=resolve_session_id, session_store=session_store)
         if recovered:
             logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
 

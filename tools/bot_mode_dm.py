@@ -188,7 +188,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
             BOT_CHAT_TITLE, _handle, _hermes_root, _peers, _profile_name as _self_profile_name, _roster,
             is_bot_mode_managed,
         )
-        from tools.bot_relay import BOT_CHAT_TURN_ARGS
+        from tools.bot_relay import _bot_chat_turn_args
 
         if _session_title(agent) != BOT_CHAT_TITLE:
             return _err("message_agent is only available in a Bot Mode 'Bot Chat' session. "
@@ -209,11 +209,15 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _err(msg, roster=teammates, peers=peers)
 
     body = str(message or "").strip()
-    if not body:
-        return _err("message is required — compose what you want to say to that agent.")
-    if len(body) > MESSAGE_MAX_CHARS:
-        return _err(f"message too long ({len(body)} chars > {MESSAGE_MAX_CHARS}). "
-                    "Send the essentials; share large content as a file path instead.")
+    # Sender-side truncation guard (2026-09-12). Imported lazily because this module also
+    # runs as a script, where the package path is not importable — the same convention the
+    # bot_relay imports above follow. The length cap stays authoritative here; the guard
+    # owns the truncation rule so this tool and the `hermes peer` CLI cannot drift apart.
+    from tools.dm_body_guard import guard_outbound_body
+
+    refusal = guard_outbound_body(body, max_chars=MESSAGE_MAX_CHARS)
+    if refusal:
+        return _err(refusal)
 
     raw_target = str(target or "").strip().lstrip("@")
     if not raw_target:
@@ -257,7 +261,8 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _roster_err(f"No teammate named '{raw_target}' on this install, on a connected "
                            "machine, or on a registered peer. Pick a name from the roster "
                            "(roles are listed in your system prompt).")
-    return _start_delivery(["hermes", "-p", resolved, *BOT_CHAT_TURN_ARGS], content, f"@{_handle(resolved)}",
+    return _start_delivery(["hermes", "-p", resolved, *_bot_chat_turn_args(resolved, root)], content,
+                           f"@{_handle(resolved)}",
                            stdin_file=False, profile_home=roster_homes[resolved], author=author, **delivery)
 
 
@@ -516,6 +521,111 @@ def _wait_live_dm(home: str, delivery_id: str) -> int:
     return 0 if status in ("settled", "queued", "claimed") else 1
 
 
+def _sender_profile(author: Optional[dict]) -> str:
+    """The sending profile's canonical name from its author record.
+
+    ``author["id"]`` is ``bot:<profile>`` for a local teammate (the canonical
+    roster name), while ``author["name"]`` is the handle ('hermes' for the
+    default profile). The queue buckets per-sender capacity on the canonical
+    name, so prefer the id and only fall back to the handle.
+    """
+    author_id = str((author or {}).get("id") or "")
+    if author_id.startswith("bot:"):
+        return author_id[len("bot:"):]
+    name = str((author or {}).get("name") or "")
+    return "default" if name == "hermes" else (name or "default")
+
+
+def _bot_chat_session_id(home: Path) -> str:
+    """The target lane's canonical Bot Chat session id, or '' when unresolved.
+
+    Mirrors ``api_server_bot_delivery._canonical_bot_chat_tip``'s SessionDB
+    lookup but returns the session id the drainer runs the turn in. An empty id
+    degrades to the drainer's ``resolve_delivery_session`` fallback.
+    """
+    try:
+        from tools.bot_mode_probe import BOT_CHAT_TITLE
+        from hermes_state import SessionDB
+    except Exception:
+        return ""
+    state = Path(home).resolve() / "state.db"
+    if not state.is_file():
+        return ""
+    try:
+        db = SessionDB(db_path=state, read_only=True)
+    except Exception:
+        return ""
+    try:
+        row = db.get_session_by_title(BOT_CHAT_TITLE)
+        if not row:
+            return ""
+        return str(row["id"])
+    except Exception:
+        return ""
+    finally:
+        db.close()
+
+
+def _admit_queued_dm(home: Path, argv: list[str], dm_file: str,
+                     author: Optional[dict] = None) -> dict:
+    """Admit a local delivery with no live owner into the durable queue.
+
+    The receiver-side drainer (``api_server_bot_delivery.sweep_loop``) runs the
+    turn and settles the record, so the delivery is durably recorded from the
+    moment it is admitted — never a record-less CLI turn — and a stranded record
+    is expired or re-offered, never invisible.
+    """
+    from tools import bot_delivery_queue as delivery_queue
+
+    target_profile = _delivery_target(argv) or "default"
+    message = Path(dm_file).read_text(encoding="utf-8")
+    delivery_id = _delivery_fingerprint(dm_file)
+    return delivery_queue.admit(
+        home,
+        sender_profile=_sender_profile(author),
+        target_profile=target_profile,
+        target_session_id=_bot_chat_session_id(home) or None,
+        idempotency_key=delivery_id,
+        fingerprint=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        delivery_id=delivery_id,
+        message=message,
+        status_detail=delivery_queue.observed_detail(home, target_profile),
+    )
+
+
+def _wait_queued_dm(home: Path, delivery_id: str) -> int:
+    """Poll a queued local delivery until terminal, then print its outcome.
+
+    The runner's stdout is the completion notification that wakes the sender, so
+    it must carry the reply (delivered), the pending notice (still queued/running
+    at timeout), or the failure detail. Exit 0 for any delivered or still-retained
+    state; 1 for a terminal failure/expiry.
+    """
+    from tools import bot_delivery_queue as delivery_queue
+
+    deadline = time.monotonic() + _LIVE_WAIT_SECONDS
+    record = None
+    status = delivery_queue.STATUS_QUEUED
+    while True:
+        record = delivery_queue.read_record(home, delivery_id)
+        status = record["status"] if record else delivery_queue.STATUS_AMBIGUOUS
+        if status in delivery_queue.TERMINAL_STATUSES or time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+    if record is None:
+        print(json.dumps({"status": delivery_queue.STATUS_AMBIGUOUS, "delivery_id": delivery_id,
+                          "detail": "Delivery outcome unknown. Do not resend."}))
+        return 1
+    if status in delivery_queue.TERMINAL_STATUSES:
+        envelope = (delivery_queue.build_delivered_envelope(record)
+                    if status == delivery_queue.STATUS_DELIVERED
+                    else delivery_queue.build_envelope(record))
+        print(json.dumps(envelope))
+        return 0 if status == delivery_queue.STATUS_DELIVERED else 1
+    print(json.dumps(delivery_queue.build_receipt(record)))
+    return 0
+
+
 def _argv_profile(command: str) -> str:
     """Target profile named by a local delivery command line (``hermes -p <name> …``)."""
     with contextlib.suppress(ValueError):
@@ -579,6 +689,35 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 return 1
             if record is not None:
                 return _wait_live_dm(record["profile_home"], record["delivery_id"])
+        # No live owner: the durable queue owns the delivery. Admit there and wait
+        # for the receiver-side drainer to run and settle the turn, so every local
+        # delivery is durably recorded and a stranded record is expired or
+        # re-offered — never a record-less CLI turn.
+        if home is not None:
+            from tools import bot_delivery_queue as delivery_queue
+            try:
+                record = _admit_queued_dm(home, argv, dm_file, author)
+            except delivery_queue.QueueFullError as exc:
+                print(json.dumps({
+                    "status": delivery_queue.STATUS_FAILED,
+                    "result": delivery_queue.RESULT_FAILED,
+                    "delivery_id": _delivery_fingerprint(dm_file),
+                    "reason": "queue_full",
+                    "detail": delivery_queue.queue_full_detail(
+                        limit_kind=exc.limit_kind,
+                        limit=exc.limit),
+                }))
+                return 1
+            except Exception as exc:
+                print(json.dumps({"status": delivery_queue.STATUS_AMBIGUOUS,
+                                  "delivery_id": _delivery_fingerprint(dm_file),
+                                  "error": f"Queue admission outcome unknown: {exc}. Do not resend.",
+                                  "evidence_file": dm_file}))
+                return 1
+            # The message now lives durably in the queue record; the temp payload
+            # is redundant and safe to clear.
+            _unlink_dm_file(dm_file)
+            return _wait_queued_dm(home, record["delivery_id"])
     try:
         from tools.bot_relay import delivery_env
 

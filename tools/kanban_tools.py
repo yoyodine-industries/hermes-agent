@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
-from tools.registry import no_cache_check_fn, registry, tool_error
+from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
@@ -35,39 +35,30 @@ KANBAN_LIST_MAX_LIMIT = 200
 # --- Gating ---
 
 def _profile_has_kanban_toolset() -> bool:
-    from tools.kanban_toolset_context import kanban_toolset_requested
-
-    requested = kanban_toolset_requested()
-    if requested:
-        return True
+    # load_config() is mtime-cached and check_fn results are TTL-cached (~30s).
     try:
-        config = load_config()
-        # Preserve the legacy profile-wide opt-in for callers using bundles.
-        if "kanban" in (config.get("toolsets") or []):
-            return True
-        if requested is not None:
-            # Never borrow another platform's opt-in during schema assembly.
-            return False
-        # Offer-time skill discovery has no platform selection. A saved opt-in
-        # makes the playbook relevant; actual schemas still use the scope above.
-        from hermes_cli.tools_config import _get_platform_tools
-
-        platforms = config.get("platform_toolsets") or {}
-        return any(
-            "kanban" in _get_platform_tools(config, platform, include_default_mcp_servers=False)
-            for platform, names in platforms.items() if isinstance(names, list)
-        )
+        return "kanban" in load_config().get("toolsets", [])
     except Exception:
         return False
 
 
-def _delegation_ctx(predicate: str, default: bool) -> bool:
-    """``agent.delegation_context.<predicate>()``; ``default`` when it cannot be evaluated."""
+def _delegation_ctx_or_none(predicate: str) -> Optional[bool]:
+    """``agent.delegation_context.<predicate>()``; ``None`` when it cannot be
+    evaluated (module missing, version-skewed, or shadowed on ``sys.path``)."""
     try:
         from agent import delegation_context
-        return getattr(delegation_context, predicate)()
+        return bool(getattr(delegation_context, predicate)())
     except Exception:
-        return default
+        return None
+
+
+def _delegation_ctx(predicate: str, default: bool) -> bool:
+    """``agent.delegation_context.<predicate>()``; ``default`` when it cannot be
+    evaluated. Hints and visibility only — an identity gate that guards a board
+    write must go through :func:`_reject_delegated_child_mutation`, which fails
+    closed instead of assuming."""
+    value = _delegation_ctx_or_none(predicate)
+    return default if value is None else value
 
 
 def _is_delegated_child_context() -> bool:
@@ -90,13 +81,11 @@ def _visible(*, to_env_worker: bool) -> bool:
     return _profile_has_kanban_toolset()
 
 
-@no_cache_check_fn
 def _check_kanban_mode() -> bool:
     """Lifecycle tools: dispatcher workers + profiles with the ``kanban`` toolset."""
     return _visible(to_env_worker=True)
 
 
-@no_cache_check_fn
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock): hidden from task workers."""
     return _visible(to_env_worker=False)
@@ -138,12 +127,41 @@ def _kanban_handler(tool_name: str) -> Callable:
 
 def _reject_delegated_child_mutation(tool_name: str) -> None:
     """A delegate_task child shares the parent's process, so inherited HERMES_KANBAN_*
-    env is not proof of ownership: it may report findings but must not mutate."""
-    if _delegation_ctx("is_delegated_child_process_context", False):
+    env is not proof of ownership: it may report findings but must not mutate.
+
+    Fails CLOSED when the delegation context cannot be evaluated: a silently disabled
+    identity gate is indistinguishable from no gate at all, and this one guards board
+    writes. The escape is provenance, not assumption — a process scrubbed for a
+    descendant has its ``HERMES_KANBAN_TASK`` removed, so a process still holding one
+    is the dispatcher worker for that task and must not be stranded mid-run by a
+    broken import. (An in-process delegate child inherits the parent's variables, so
+    this escape alone cannot separate it; that residual exists only in the
+    un-evaluable case and is logged.) Both outcomes are audited.
+    """
+    verdict = _delegation_ctx_or_none("is_delegated_child_process_context")
+    if verdict is True:
         raise _Reject(
             f"{tool_name} refused: delegate_task child agents are not Kanban run owners. "
             "Return findings to the parent agent; the dispatcher worker or an explicitly "
             "configured Kanban orchestrator must perform board mutations.")
+    if verdict is None:
+        # Never read "unknown" as "not a child".
+        owned = os.environ.get("HERMES_KANBAN_TASK")
+        if owned:
+            logger.warning(
+                "kanban %s: agent.delegation_context is un-evaluable in this process; "
+                "allowing the mutation because this process owns %s, but the "
+                "delegate-child fence is degraded here.", tool_name, owned)
+            return
+        logger.warning(
+            "kanban %s: agent.delegation_context is un-evaluable in this process and no "
+            "HERMES_KANBAN_TASK proves ownership; refusing to mutate the board.",
+            tool_name)
+        raise _Reject(
+            f"{tool_name} refused: the delegation context could not be evaluated in this "
+            "process (agent.delegation_context is unavailable), so board ownership cannot "
+            "be established. Nothing was written; perform the mutation from a process "
+            "that owns the task (HERMES_KANBAN_TASK) on a working install.")
 
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
@@ -221,9 +239,12 @@ def _require_orchestrator_tool(tool_name: str) -> None:
 def _board(board: Optional[str], *, quiet_close: bool = False):
     """``with _board(slug) as (kb, conn)``; lazy import so the module loads in non-kanban
     contexts. ``board=None`` keeps the env/symlink resolution chain; an explicit slug
-    overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges)."""
+    targets that board, but a slug that resolves to a different board than the pinned DB
+    (``HERMES_KANBAN_DB``) is refused instead of silently served. ``quiet_close`` swallows
+    close() errors (best-effort bridges)."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    kb.assert_board_matches_pin(board)
     conn = kbc.connect(board=board)
     try:
         yield kb, conn
@@ -664,20 +685,12 @@ def _handle_request_review(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
-    if reviewer:
-        from hermes_cli.profiles import list_profile_names, profile_exists
-
-        # A non-profile reviewer would park the card in `review` on an assignee
-        # the dispatcher can never spawn (#106163).
-        _check(profile_exists(reviewer),
-               f"reviewer profile {reviewer!r} is not installed. "
-               f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid), with_reason=True)
+                artifacts=artifacts, expected_run_id=_worker_run_id(tid), with_reason=True)
         except kb.ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
             # back, the task is untouched and retryable — say so explicitly or
@@ -857,8 +870,8 @@ def _handle_create(args: dict, **kw) -> str:
     # mutate review evidence or race its checkout). Project identity is the one safe thing
     # to inherit implicitly (the DB turns it into a fresh per-task worktree).
     workspace_kind, workspace_path = args.get("workspace_kind"), args.get("workspace_path")
-    # See #67567. ``project=""`` is an explicit "no project" (no ``or`` collapse, #106342).
-    project_id = args["project"] if "project" in args else args.get("project_id")
+    # See #67567.
+    project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
@@ -881,10 +894,8 @@ def _handle_create(args: dict, **kw) -> str:
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
-            workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
-            # Board-project inheritance must read the board this call opened, not the
-            # session's current board.
-            board=args.get("board"),
+            workspace_kind=str(workspace_kind if workspace_kind is not None else "scratch"),
+            workspace_path=workspace_path, project_id=project_id,
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),

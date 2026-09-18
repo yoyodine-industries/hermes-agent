@@ -1145,6 +1145,105 @@ def test_reassign_endpoint_switches_profile(client):
 
 
 # ---------------------------------------------------------------------------
+# Assign paths refuse a profile whose worker cannot load the card's skills
+#
+# kanban_db raises ValueError from these attach points; the REST surface must
+# turn that into a 400 carrying the reason (which profile, which names, closest
+# registered name) instead of letting it escape as a 500.
+# ---------------------------------------------------------------------------
+
+
+def _write_skill(skills_dir: Path, name: str) -> None:
+    skill_dir = skills_dir / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: test skill\n---\n\n# {name}\n", encoding="utf-8")
+
+
+@pytest.fixture
+def profile_skills(kanban_home, monkeypatch):
+    """``kanban_home`` plus one profile whose worker can load only ``demo-skill``."""
+    from hermes_cli import profiles
+
+    profiles_root = kanban_home / "profiles"
+    home = profiles_root / "demo"
+    (home / "skills").mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    _write_skill(home / "skills", "demo-skill")
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: kanban_home)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
+    return {"demo": home}
+
+
+def _assignee_of(task_id: str):
+    conn = kbc.connect()
+    try:
+        return conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
+    finally:
+        conn.close()
+
+
+def test_patch_assignee_refuses_profile_that_cannot_load_card_skills(client, profile_skills):
+    """A card created unassigned carries its skill names unjudged; PATCHing an
+    assignee that cannot load them is a 400 naming the profile and the typo."""
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="unjudged", skills=["demo-skil"])
+    finally:
+        conn.close()
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{t}", json={"assignee": "demo"})
+
+    assert r.status_code == 400, r.text
+    assert "demo-skil" in r.text, r.text
+    assert "demo" in r.text, "the 400 must name the profile the names were judged against"
+    # No closest-name assertion here: that hint rides on the loader's registry of
+    # available skills, which an earlier test in this file can leave warmed for its
+    # own tmp home. The identity of the refusal is what this surface owes the client.
+    assert _assignee_of(t) is None, "the refused assign must not be written"
+
+
+def test_reassign_endpoint_refuses_profile_that_cannot_load_card_skills(client, profile_skills):
+    """The reassign endpoint rides on assign_task, so it refuses for the same
+    reason — and the card keeps the owner it had."""
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="unjudged", assignee="orig", skills=["demo-skil"])
+    finally:
+        conn.close()
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t}/reassign",
+        json={"profile": "demo", "reclaim_first": False},
+    )
+
+    assert r.status_code == 400, r.text
+    assert "demo-skil" in r.text, r.text
+    assert _assignee_of(t) == "orig", "the refused reassign must keep the owner"
+
+
+def test_bulk_assign_reports_skill_refusal_per_row(client, profile_skills):
+    """Bulk assign collects per-row errors; a skill refusal is one of them, not a
+    swallowed no-op that leaves the card looking assigned."""
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="unjudged", skills=["demo-skil"])
+    finally:
+        conn.close()
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [t], "assignee": "demo"},
+    )
+
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert results and results[0]["ok"] is False, r.text
+    assert "demo-skil" in json.dumps(results)
+    assert _assignee_of(t) is None, "the refused assign must not be written"
+
+
+# ---------------------------------------------------------------------------
 # Diagnostics endpoint (/api/plugins/kanban/diagnostics)
 # ---------------------------------------------------------------------------
 

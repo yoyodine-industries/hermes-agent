@@ -28,6 +28,7 @@ from agent.auxiliary_client import (
     _is_model_incompatible_error,
     _refresh_nous_recommended_model,
     _normalize_aux_provider,
+    _transient_retry_count,
     _try_payment_fallback,
     _try_openrouter,
     _OPENROUTER_MODEL,
@@ -2098,10 +2099,15 @@ class TestTransientTransportRetry:
         assert client.chat.completions.create.call_count == 1
 
 
-    def test_compression_skips_same_provider_retry_on_timeout(self):
-        """A timeout on the critical compression path must NOT retry the same
-        provider (that doubles the user-visible stall, issue #54465) — it
-        falls straight through to the fallback chain instead.
+    def test_compression_retries_own_route_before_fallback_on_timeout(self):
+        """Compression's route is local-only, so a timeout spends the *bounded*
+        same-provider retry on that route before any fallback rung is consulted.
+
+        This reverses #54465: skipping the retry only helped while a cloud
+        fallback could absorb the work, and that escalation is now refused for
+        compression. With no rung left to hand the summary to, the retry is the
+        only recovery, and ``auxiliary.transient_retries`` (clamped to 6) is what
+        keeps it affordable.
         """
         class _Timeout(Exception):
             pass
@@ -2118,6 +2124,8 @@ class TestTransientTransportRetry:
         p1, p2, p3 = self._patches(primary)
         with (
             p1, p2, p3,
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={}),
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0),
             patch(
                 "agent.auxiliary_client._try_configured_fallback_chain",
                 return_value=(None, None, ""),
@@ -2129,8 +2137,10 @@ class TestTransientTransportRetry:
         ):
             result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
         assert result == {"fallback": True}
-        # Primary tried ONCE only — no same-provider timeout retry — then fallback.
-        assert primary.chat.completions.create.call_count == 1
+        retries = _transient_retry_count()
+        assert 0 <= retries <= 6, "the retry window is clamped"
+        # Primary retried within its bounded window, then the ladder ran once.
+        assert primary.chat.completions.create.call_count == 1 + retries
         assert fb_client.chat.completions.create.call_count == 1
 
     def test_vision_skips_same_provider_retry_on_timeout(self):

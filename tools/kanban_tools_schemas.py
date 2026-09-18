@@ -12,9 +12,10 @@ _DESC_BOARD = (
     "Kanban board slug to target. When omitted, the call resolves the "
     "active board the usual way: HERMES_KANBAN_DB env → "
     "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "home → 'default'. An explicit slug targets that board, but if it "
+    "resolves to a different board than the pinned DB (HERMES_KANBAN_DB) "
+    "the call is refused (ValueError) rather than silently served from "
+    "the pin."
 )
 
 
@@ -173,7 +174,11 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
+        "``reason`` is shown to the human on the board. Blocking releases your worker "
+        "claim but does NOT stop your process: end your turn after blocking rather "
+        "than starting more work, and know that the dispatcher will not re-spawn this "
+        "card while your process is still alive (that spin-up would race you). If a "
+        "task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."

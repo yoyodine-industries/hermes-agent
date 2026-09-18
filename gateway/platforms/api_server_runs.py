@@ -89,15 +89,18 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owner_started = 0
     # All keyed by run_id: SSE queues (+creation time for the TTL sweep), connected
     # subscribers, live agent/task refs for cooperative stop (the executor thread may
-    # outlive the request, hence the separate stopping set), pollable statuses, and
-    # approval session keys (approval core resolves by session key, clients by run_id).
+    # outlive the request, hence the separate stopping set), pollable statuses,
+    # approval session keys (approval core resolves by session key, clients by run_id),
+    # and the credential-only host scope that admits the same principal on the unqualified
+    # route too (#peer-run-scope).
     self._run_idempotency_ids: set[str] = set()
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
-    ) = ({} for _ in range(7))
+        self._run_host_scopes,
+    ) = ({} for _ in range(8))
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -203,6 +206,33 @@ def _run_idempotency_scope(self, request: "web.Request", *, _api_server) -> str:
     return hashlib.sha256("\0".join(map(str, parts)).encode()).hexdigest()
 
 
+def _host_run_scope(self, request: "web.Request") -> str:
+    """Credential-only run scope for *host-level* (unqualified) run addressing.
+
+    ``_run_idempotency_scope`` namespaces a run by the route that minted it — each profile
+    mirror needs its own reservation namespace — but ownership follows the *principal*.
+    One listener serves every ``/p/<profile>/`` mirror, and the key a mirror authenticates
+    with is the same ``API_SERVER_KEY`` the bare host route resolves (``_expected_api_key``),
+    so the principal that started a run through a mirror also owns it when it addresses the
+    same, globally unique, run id through the host route — exactly the ``hermes peer run
+    <host>/<profile>`` then ``hermes peer status <host>`` pair (#peer-run-scope). Room grants
+    are claim-scoped and never host-addressable; a keyless listener has no credential to
+    match on, so it gets no host scope at all rather than a shared one.
+    """
+    if self._room_grant_token(request):
+        return ""
+    key = self._expected_api_key() or ""
+    return hashlib.sha256(("host-run-scope\0" + key).encode()).hexdigest() if key else ""
+
+
+def _stamp_run_owner(self, request: "web.Request", run_id: str) -> None:
+    """Record who may control *run_id*: the route/profile scope that minted it (its
+    reservation namespace) plus the credential-only host scope, so the same principal can
+    address the run through either the ``/p/<profile>/`` mirror or the bare host route."""
+    self._run_owners[run_id] = self._run_idempotency_scope(request)
+    self._run_host_scopes[run_id] = _host_run_scope(self, request)
+
+
 def _check_run_auth(self, request: "web.Request", *, permission: str, _api_server) -> "web.Response | None":
     if not self._room_grant_token(request):
         return self._check_auth(request)
@@ -232,8 +262,15 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
             self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
         return status
     scope = self._run_idempotency_scope(request)
+    retention_until = _room_retention_until(request)
     record = self._run_idempotency_store.status_for_run(
-        scope, run_id, retention_until=_room_retention_until(request))
+        scope, run_id, retention_until=retention_until)
+    if record is None:
+        # Host-level read of a run minted through a profile mirror: the stored owner scope is
+        # the mirror's, so resolve it by the credential the two routes share (#peer-run-scope).
+        host_scope = _host_run_scope(self, request)
+        record = self._run_idempotency_store.status_for_run_host(
+            run_id, host_scope, retention_until=retention_until) if host_scope else None
     if record is None:
         return None
     status = dict(record["status"])
@@ -245,7 +282,7 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
         self._run_idempotency_store.update_status(run_id, status)
     self._run_statuses[run_id] = status
     self._run_idempotency_ids.add(run_id)
-    self._run_owners[run_id] = scope
+    _stamp_run_owner(self, request, run_id)
     return status
 
 
@@ -448,7 +485,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if limited is not None:
         return limited
     run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = self._run_idempotency_scope(request)
+    _stamp_run_owner(self, request, run_id)
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
     # conversation > run_id (which would otherwise re-key every affinity surface per run).
     # An explicit or chained session owns its routing key and is never rebound to the header.
@@ -481,7 +518,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
-            retention_until=_room_retention_until(request))
+            retention_until=_room_retention_until(request),
+            host_scope=_host_run_scope(self, request))
         if outcome != "created":
             _forget_run(
                 self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
@@ -676,13 +714,24 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
             self._run_approval_sessions)
     if not any(run_id in table for table in live):
         self._run_owners.pop(run_id, None)
+        self._run_host_scopes.pop(run_id, None)
 
 
 def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
     scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
+    if owner is not None and owner == scope:
+        return True
+    # Same principal, other address form: a run id is globally unique and this caller presents
+    # the credential the run was minted with, so a host-level read of a run started through a
+    # profile mirror (and vice versa) resolves here (#peer-run-scope). The host scope is the
+    # credential, never the run id alone, so another profile's key still does not admit it.
+    host_scope = _host_run_scope(self, request)
+    if host_scope and (host_scope == self._run_host_scopes.get(run_id)
+                       or self._run_idempotency_store.owns_run_host(run_id, host_scope)):
+        return True
     if owner is not None:
-        return owner == scope
+        return False
     # No in-memory owner: only a durable record under the caller's scope admits it.
     # Under multiplex_profiles every profile holds a valid key, so ownerless = allow-all.
     # Run state that exists without an owner stamp is an unanswered authorization question, not a run anyone

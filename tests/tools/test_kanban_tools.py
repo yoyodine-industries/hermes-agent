@@ -81,6 +81,29 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_board_refuses_mismatched_pin(monkeypatch, tmp_path):
+    """Regression: a tool call targeting board=X while DB-pinned to board=Y raises
+    instead of silently serving the pinned board (fail-closed board resolution)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    pinned = kb.kanban_db_path(board="ops")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+
+    from tools import kanban_tools as kt
+    with pytest.raises(ValueError, match="refusing to target board 'financially'"):
+        with kt._board("financially"):
+            pass  # pragma: no cover
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
