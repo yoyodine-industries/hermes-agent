@@ -13,7 +13,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from functools import partial
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
@@ -33,6 +33,10 @@ _TRUNCATED_REPLY_NOTICE = "\n\n[Reply truncated. Ask the Bot to share the full r
 Payload = Mapping[str, Any]
 DecisionStatus = Literal["idle", "task", "settled", "bounded"]
 TerminalKind = Literal["settled", "failed", "cancelled", "deferred"]
+# Injected member-address resolver: a profile name, its configured @handle, or the legacy @hermes
+# alias -> the profile NAME on this gateway; None when it names nothing here or names more than one
+# profile (a collision fails closed instead of capturing another profile's address).
+ProfileResolver = Callable[[str], str | None]
 
 _MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9._:-]*)", re.IGNORECASE)
 _TURN_ID_RE = re.compile(
@@ -219,7 +223,25 @@ def _validate_member_target(value: Any, *, profile: str, known_profiles: set[str
         "profile": target_profile, "capability_digest": digest}
 
 
-def _validate_member(raw: Any, index: int, known_profiles: set[str]) -> DiscussionMember:
+def _resolved_local_profile(profile: str, resolve_profile: ProfileResolver | None, *, index: int) -> str:
+    """Normalize ONE local member's address into a profile name; fail closed on an unknown address.
+
+    ``resolve_profile`` is dependency-injected (``tui_gateway`` binds the same
+    ``tools.bot_mode_probe.resolve_local_profile`` every other inbound path uses); ``None`` keeps the
+    original exact-match behavior. A member that resolves to nothing raises the error the strict check
+    would have raised, so an unknown or ambiguous handle never captures another profile's address.
+    """
+    if resolve_profile is None:
+        return profile
+    resolved = resolve_profile(profile)
+    if not isinstance(resolved, str) or not resolved.strip():
+        raise DiscussionValidationError(f"member {index} profile '{profile}' is not local to this gateway")
+    return resolved.strip()
+
+
+def _validate_member(
+    raw: Any, index: int, known_profiles: set[str], *, resolve_profile: ProfileResolver | None = None
+) -> DiscussionMember:
     if not isinstance(raw, Mapping):
         raise DiscussionValidationError(f"member {index} must be an object")
     if remote_fields := frozenset(raw) & _REMOTE_MEMBER_FIELDS:
@@ -231,6 +253,12 @@ def _validate_member(raw: Any, index: int, known_profiles: set[str]) -> Discussi
     member_id, profile, handle = (
         _identifier(member[field], label=f"member {index} {label}")
         for field, label in (("member_id", "id"), ("profile", "profile"), ("handle", "handle")))
+    target_value = member.get("target")
+    if target_value is None or (isinstance(target_value, Mapping) and target_value.get("kind") == "local"):
+        # LOCAL-ONLY: a peer member's profile names a REMOTE gateway profile, never resolved here.
+        # Normalizing here (before the target + uniqueness checks) is what makes the frozen roster,
+        # the dispatched payload's ``target_profile`` and the mention handles agree on one name.
+        profile = _resolved_local_profile(profile, resolve_profile, index=index)
     target = _validate_member_target(member.get("target"), profile=profile, known_profiles=known_profiles, index=index)
     if not isinstance(display_name := member.get("display_name", ""), str):
         raise DiscussionValidationError(f"member {index} display_name must be a string")
@@ -239,7 +267,9 @@ def _validate_member(raw: Any, index: int, known_profiles: set[str]) -> Discussi
     return DiscussionMember(member_id, profile, handle, display_name, target)
 
 
-def validate_roster(value: Any, *, local_profiles: Iterable[str]) -> tuple[DiscussionMember, ...]:
+def validate_roster(
+    value: Any, *, local_profiles: Iterable[str], resolve_profile: ProfileResolver | None = None
+) -> tuple[DiscussionMember, ...]:
     """Validate a frozen 2-6 member roster of profiles on this gateway."""
     if not isinstance(value, list):
         raise DiscussionValidationError("members must be a list")
@@ -252,7 +282,7 @@ def validate_roster(value: Any, *, local_profiles: Iterable[str]) -> tuple[Discu
     handles: set[str] = {"all", "everyone"}  # reserved mention handles
     member_ids: set[str] = set()
     for index, raw in enumerate(value):
-        member = _validate_member(raw, index, known_profiles)
+        member = _validate_member(raw, index, known_profiles, resolve_profile=resolve_profile)
         unique = "profiles" if member.target.get("kind") == "local" else "targets"
         for key, seen, message in (
             (compact_json(member.target, ensure_ascii=False).casefold(), targets, f"member {unique} must be unique"),
@@ -265,7 +295,9 @@ def validate_roster(value: Any, *, local_profiles: Iterable[str]) -> tuple[Discu
     return tuple(members)
 
 
-def validate_room(value: Any, *, local_profiles: Iterable[str]) -> DiscussionRoom:
+def validate_room(
+    value: Any, *, local_profiles: Iterable[str], resolve_profile: ProfileResolver | None = None
+) -> DiscussionRoom:
     """Project a hosted-room row into the strict same-gateway policy shape."""
     if not isinstance(value, Mapping):
         raise DiscussionValidationError("room must be an object")
@@ -278,7 +310,7 @@ def validate_room(value: Any, *, local_profiles: Iterable[str]) -> DiscussionRoo
         raise DiscussionValidationError("room name is too long")
     gateway_id = _identifier(value.get("authority_gateway_id"), label="authority_gateway_id")
     authority_epoch = _positive_int(value.get("authority_epoch"), label="authority_epoch")
-    members = validate_roster(value.get("members"), local_profiles=local_profiles)
+    members = validate_roster(value.get("members"), local_profiles=local_profiles, resolve_profile=resolve_profile)
     return DiscussionRoom(room_id, name, members, gateway_id, authority_epoch)
 
 
@@ -445,11 +477,14 @@ def _validated_events(events: Sequence[Mapping[str, Any]], *, room: DiscussionRo
 
 
 def derive_member_watermarks(
-    room_value: Any, events: Sequence[Mapping[str, Any]], *, local_profiles: Iterable[str]
+    room_value: Any, events: Sequence[Mapping[str, Any]], *, local_profiles: Iterable[str],
+    resolve_profile: ProfileResolver | None = None
 ) -> dict[tuple[str, str], int]:
     """Derive ``(thread_id, member_id)`` watermarks from terminal events."""
     return _derive_member_watermarks(
-        _validated_events(events, room=validate_room(room_value, local_profiles=local_profiles)))
+        _validated_events(
+            events,
+            room=validate_room(room_value, local_profiles=local_profiles, resolve_profile=resolve_profile)))
 
 
 def _derive_member_watermarks(events: Sequence[_ValidatedEvent]) -> dict[tuple[str, str], int]:
@@ -604,9 +639,10 @@ def _effective_watermarks(
 
 def plan_next_task(
     room_value: Any, events: Sequence[Mapping[str, Any]], *, local_profiles: Iterable[str],
-    initial_watermarks: Mapping[tuple[str, str], int] | None = None) -> DiscussionDecision:
+    initial_watermarks: Mapping[tuple[str, str], int] | None = None,
+    resolve_profile: ProfileResolver | None = None) -> DiscussionDecision:
     """Replay the complete room log and return at most one next member task."""
-    room = validate_room(room_value, local_profiles=local_profiles)
+    room = validate_room(room_value, local_profiles=local_profiles, resolve_profile=resolve_profile)
     validated = _validated_events(events, room=room)
     if (discussion := _pending_discussion(validated)) is None:
         return DiscussionDecision(status="idle", reason="no_pending_user_event")
@@ -651,10 +687,11 @@ def plan_next_task(
 
 
 def reconstruct_task_plan(
-    room_value: Any, events: Sequence[Mapping[str, Any]], task: Mapping[str, Any], *, local_profiles: Iterable[str]
+    room_value: Any, events: Sequence[Mapping[str, Any]], task: Mapping[str, Any], *,
+    local_profiles: Iterable[str], resolve_profile: ProfileResolver | None = None
 ) -> DiscussionTaskPlan:
     """Reconstruct and verify one persisted driver task after a restart."""
-    room = validate_room(room_value, local_profiles=local_profiles)
+    room = validate_room(room_value, local_profiles=local_profiles, resolve_profile=resolve_profile)
     validated = _validated_events(events, room=room)
     identity, payload = task.get("identity"), task.get("payload")
     if not isinstance(identity, driver.TaskIdentity) or not isinstance(payload, Mapping):
@@ -750,13 +787,14 @@ _TERMINAL_EFFECTS = {
 
 def plan_publication(
     room_value: Any, events: Sequence[Mapping[str, Any]], task: DiscussionTaskPlan, *, status: TerminalKind,
-    result: Any = None, execution_generation: int | None = None, local_profiles: Iterable[str]) -> PublicationPlan:
+    result: Any = None, execution_generation: int | None = None, local_profiles: Iterable[str],
+    resolve_profile: ProfileResolver | None = None) -> PublicationPlan:
     """Plan idempotent room effects for one terminal driver task.
 
     A newer user event in the same thread supersedes a late result: the task stays terminal in driver state,
     but only a deterministic cancellation is published so stale prose and its watermark cannot hide it.
     """
-    room = validate_room(room_value, local_profiles=local_profiles)
+    room = validate_room(room_value, local_profiles=local_profiles, resolve_profile=resolve_profile)
     validated = _validated_events(events, room=room)
     for failed, message in (
         (task.identity.room_id != room.room_id, "task belongs to a different room"),
