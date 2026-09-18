@@ -211,8 +211,19 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             board=getattr(args, "board", None), task_id=task_id, age_seconds=age
         )
 
+    def _zero_run_ready():
+        """Stuck-ready probe on this board: ready cards nothing has attempted."""
+        try:
+            with kbc.connect_closing() as conn:
+                stats = kbd.zero_run_ready(conn)
+        except Exception:
+            return None
+        return stats if int(stats.get("count") or 0) else None
+
     def _on_tick(res):
-        report = health.observe_tick(res, pending=_oldest_pending(), now=time.time())
+        report = health.observe_tick(
+            res, pending=_oldest_pending(), stuck=_zero_run_ready(), now=time.time()
+        )
         if report is not None:
             print(
                 f"[{_fmt_ts(int(time.time()))}] {report.message}",

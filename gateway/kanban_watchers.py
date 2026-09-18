@@ -289,7 +289,10 @@ class GatewayKanbanWatchersMixin:
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     _log_spawn_results(results)
                     pending = await _to_thread_process_service(dispatcher.oldest_pending)
-                    report = health.observe_tick(results, pending=pending, now=time.time())
+                    stuck = await _to_thread_process_service(dispatcher.zero_run_ready)
+                    report = health.observe_tick(
+                        results, pending=pending, stuck=stuck, now=time.time()
+                    )
                     if report is not None:
                         log = logger.warning if report.level == "warning" else logger.info
                         log("%s", report.message)

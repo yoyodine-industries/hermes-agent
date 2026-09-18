@@ -920,7 +920,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     body                 TEXT,
     assignee             TEXT,
     status               TEXT NOT NULL,
-    priority             INTEGER DEFAULT 0,
+    priority             INTEGER DEFAULT 1,  -- P0=3 P1=2 P2=1 P3=0; unset = P2 (normal)
     created_by           TEXT,
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
@@ -1176,6 +1176,75 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def assignee_is_spawnable(assignee: Optional[str]) -> bool:
+    """Can the dispatcher launch a worker for ``assignee`` TODAY?
+
+    Deliberately the dispatcher's own predicate — ``profile_exists`` from
+    ``hermes_cli.profiles``, resolved at call time through a lazy import so the
+    dispatcher's monkeypatched seam and this one are the same seam — NOT a
+    private directory check that could disagree with what
+    ``kanban_db_dispatch`` actually spawns. Fails OPEN (returns ``True``) when
+    the profiles module is unimportable or raises, matching the dispatcher's
+    trust-the-operator fallback. An unassigned card is also ``True`` here: the
+    dispatcher buckets that case separately (``skipped_unassigned``) and
+    ``kanban.default_assignee`` may still resolve it.
+    """
+    name = _canonical_assignee(assignee)
+    if not name:
+        return True
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return True
+    try:
+        return bool(profile_exists(name))
+    except Exception:
+        return True
+
+
+def unspawnable_assignee_reason(assignee: Optional[str]) -> Optional[str]:
+    """Why the dispatcher could never spawn a worker for ``assignee``: text, or ``None``.
+
+    A card whose assignee is not a live profile is bucketed
+    ``skipped_nonspawnable`` on every tick — it never runs, and dispatch health
+    suppresses the stuck diagnostic for that bucket, so it sits silently ready
+    with zero runs (incident: 9 cards to a retired profile string, 4h16m, zero
+    runs, zero alerts). Create time is the one moment the producer can still be
+    told, and a NAMED event on the card is how it is told: refusing the create
+    outright would break the control-plane lanes that legitimately pull their
+    work with ``claim_task`` and carry no profile of their own.
+
+    ``None`` when the assignee is spawnable, merely unassigned (the dispatcher
+    buckets that case separately as ``skipped_unassigned``), or when
+    spawnability cannot be judged at all.
+    """
+    name = _canonical_assignee(assignee)
+    if not name or assignee_is_spawnable(name):
+        return None
+    return (
+        f"{name!r} is not a live Hermes profile: the dispatcher buckets this card "
+        f"skipped_nonspawnable on every tick and never launches a worker for it"
+    )
+
+
+def assignee_unspawnable_event(task_id: str, assignee: str, reason: str) -> dict:
+    """Durable, named record of a card filed to a lane that can never be spawned.
+
+    One shape, written by ``create_task`` and re-read by the board surfaces, so
+    the fault is greppable by kind (``assignee_unspawnable``) rather than buried
+    in a tick log line.
+    """
+    return {
+        "task_id": task_id,
+        "assignee": assignee,
+        "reason": reason,
+        "fix": (
+            "reassign it to a live profile (`hermes kanban assign <id> <profile>`) "
+            "or let a control-plane lane claim it (`claim_task`)"
+        ),
+    }
+
+
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],
@@ -1377,7 +1446,7 @@ def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: str = "scratch", workspace_path: Optional[str] = None,
-    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
+    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 1,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
@@ -1408,6 +1477,7 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    unspawnable_reason = unspawnable_assignee_reason(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1542,6 +1612,19 @@ def create_task(
                         "blocked",
                         {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
                     )
+                if unspawnable_reason:
+                    # Park LOUDLY by name. The card is created as filed (refusing
+                    # would break control-plane lanes that pull via ``claim_task``),
+                    # but nothing about it is silent from here on: the event names
+                    # the assignee and the fix in the card's own history, and
+                    # ``zero_run_ready`` escalates it once it has waited past the
+                    # alert age with no attempt.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "assignee_unspawnable",
+                        assignee_unspawnable_event(task_id, assignee or "", unspawnable_reason),
+                    )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -1628,6 +1711,60 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
+# --- Priority + age-aware dispatch ordering --------------------------------
+#
+# ``priority`` is claimed-first-ordered by DESC: 3 = P0 (top), 2 = P1, 1 = P2,
+# 0 = P3 (bottom). Declared priority alone starves low-priority work: on a
+# loaded board a P3 never overtakes the steady arrival of P0-P1 cards, so it
+# can sit ready indefinitely. Every order site therefore sorts on the
+# EFFECTIVE priority, which credits waiting time:
+#
+#     effective = priority + MIN(CAP, MAX(0, floor(wait_seconds / STEP)))
+#
+# With STEP = 1h a bottom-rung card gains a rung an hour and overtakes a fresh
+# top-rung card after 3h; once CAP = 6 is reached priority differences are
+# erased and the tie falls through to ``created_at ASC`` (plain FIFO). Wait
+# time is measured from ``created_at``, so the order is stable while a card
+# waits and identical across processes and boards.
+PRIORITY_AGE_BONUS_STEP_SECONDS = 3600
+PRIORITY_AGE_BONUS_CAP = 6
+
+
+def priority_age_bonus(created_at: Optional[float], *, now: Optional[float] = None) -> int:
+    """Waiting-time credit for one card: ``floor(wait / STEP)`` clamped to ``[0, CAP]``."""
+    if created_at is None:
+        return 0
+    at = time.time() if now is None else float(now)
+    waited = at - float(created_at)
+    if waited <= 0:
+        return 0
+    return int(min(PRIORITY_AGE_BONUS_CAP, waited // PRIORITY_AGE_BONUS_STEP_SECONDS))
+
+
+def effective_priority(
+    priority: Optional[int], created_at: Optional[float], *, now: Optional[float] = None,
+) -> int:
+    """``priority`` plus :func:`priority_age_bonus` — Python mirror of
+    :func:`effective_priority_order_sql`, for tests and single-row reasoning."""
+    return int(priority or 0) + priority_age_bonus(created_at, now=now)
+
+
+def effective_priority_order_sql(now: Optional[float] = None) -> tuple[str, list[Any]]:
+    """``(order_by_body, params)`` shared by EVERY ready/review order site.
+
+    The dispatcher lane order (``kanban_db_dispatch._lane_rows``) and
+    :func:`list_tasks` both call this one helper so the two can never drift.
+    ``now`` defaults to ``time.time()``; pass it explicitly for deterministic
+    tests.
+    """
+    at = time.time() if now is None else float(now)
+    expr = (
+        f"(priority + MIN({int(PRIORITY_AGE_BONUS_CAP)}, "
+        f"MAX(0, CAST((? - created_at) / {int(PRIORITY_AGE_BONUS_STEP_SECONDS)} AS INTEGER))))"
+    )
+    return f"{expr} DESC, created_at ASC", [at]
+
+
 VALID_SORT_ORDERS: dict[str, str] = {
     "created": "created_at ASC, id ASC",
     "created-desc": "created_at DESC, id DESC",
@@ -1645,6 +1782,7 @@ def list_tasks(
     tenant: Optional[str] = None, session_id: Optional[str] = None, include_archived: bool = False,
     limit: Optional[int] = None, order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
+    now: Optional[float] = None,
 ) -> list[Task]:
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
@@ -1666,7 +1804,11 @@ def list_tasks(
             raise ValueError(f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}")
         query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
     else:
-        query += " ORDER BY priority DESC, created_at ASC"
+        # Age-aware default order, shared with the dispatcher lane order so the
+        # two cannot drift (see ``effective_priority_order_sql``).
+        _order_body, _order_params = effective_priority_order_sql(now)
+        query += f" ORDER BY {_order_body}"
+        params.extend(_order_params)
     if limit:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
@@ -4186,8 +4328,59 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
 
 # --- Stats + SLA helpers ---
 
+# A ready card with no ``task_runs`` row has never been attempted by anything:
+# not the dispatcher (it starts a run the moment it claims one) and not a
+# terminal pulling via ``claim_task``. Past this age that is always a fault — a
+# dead assignee the dispatcher buckets ``skipped_nonspawnable`` (the bucket
+# health telemetry suppresses the stuck diagnostic for), a starved board, or a
+# worker pool that never polls — so every health surface reports it by name
+# instead of looking healthy.
+ZERO_RUNS_ALERT_AGE_SECONDS = 30 * 60
+
+
+def zero_run_ready(
+    conn: sqlite3.Connection, *, now: Optional[float] = None,
+    min_age_seconds: float = ZERO_RUNS_ALERT_AGE_SECONDS,
+) -> dict:
+    """Stuck-ready probe: ``ready``, unclaimed, never attempted, past ``min_age_seconds``.
+
+    Returns ``{"count", "oldest_task_id", "oldest_assignee",
+    "oldest_age_seconds", "oldest_spawnable"}`` — always a dict, so a caller
+    reports "0" rather than guessing. ``oldest_spawnable`` is False when the
+    oldest card's assignee is not a live profile, i.e. nothing will EVER run it
+    however long the board waits. Unassigned cards are included (they also never
+    run on their own) and are distinguishable by ``oldest_assignee`` being None.
+    """
+    at = time.time() if now is None else float(now)
+    rows = conn.execute(
+        "SELECT t.id, t.assignee, t.created_at FROM tasks t "
+        "WHERE t.status = 'ready' AND t.claim_lock IS NULL AND t.created_at <= ? "
+        "AND NOT EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = t.id) "
+        "ORDER BY t.created_at ASC",
+        (at - float(min_age_seconds),),
+    ).fetchall()
+    if not rows:
+        return {
+            "count": 0,
+            "oldest_task_id": None,
+            "oldest_assignee": None,
+            "oldest_age_seconds": None,
+            "oldest_spawnable": None,
+        }
+    oldest = rows[0]
+    return {
+        "count": len(rows),
+        "oldest_task_id": oldest["id"],
+        "oldest_assignee": oldest["assignee"],
+        "oldest_age_seconds": int(at - float(oldest["created_at"])),
+        "oldest_spawnable": assignee_is_spawnable(oldest["assignee"]),
+    }
+
+
 def board_stats(conn: sqlite3.Connection) -> dict:
-    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
+    """Per-status + per-assignee counts, the oldest ``ready`` age, and the
+    stuck-ready probe (see :func:`zero_run_ready`) — the board-health surface
+    behind ``hermes kanban stats`` and the dashboard API."""
     by_status: dict[str, int] = {}
     for row in conn.execute(
         "SELECT status, COUNT(*) AS n FROM tasks "
@@ -4210,6 +4403,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "zero_run_ready": zero_run_ready(conn, now=now),
         "now": now,
     }
 
@@ -4525,6 +4719,12 @@ _PLUGIN_COMPAT_LAZY = {
     'set_workspace_path': ('hermes_cli.kanban_db_workspace', 'set_workspace_path'),
     'unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'unseen_events_for_sub'),
     'worker_log_rotation_config': ('hermes_cli.kanban_db_dispatch', 'worker_log_rotation_config'),
+    # Stuck-ready probe (deliverable 3). The query is defined natively in this
+    # module, so `kanban_db.zero_run_ready` resolves without the lazy map; the
+    # entry lists the probe here anyway so plugin consumers that enumerate the
+    # compat registry find it next to `has_spawnable_ready`, pointing at the
+    # dispatcher's forwarder (the board-aware entry point they should call).
+    'zero_run_ready': ('hermes_cli.kanban_db_dispatch', 'zero_run_ready'),
 }
 
 

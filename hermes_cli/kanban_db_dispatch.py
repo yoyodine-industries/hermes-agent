@@ -322,6 +322,38 @@ def stall_message(ticks: int, oldest: PendingWork) -> str:
     )
 
 
+def stuck_ready_message(stats: dict) -> str:
+    """Operator-facing line for ready cards nothing has ever attempted.
+
+    Distinct from :func:`stall_message` (the dispatcher loop doing nothing) and
+    from the ``skipped_nonspawnable`` bucket, which health telemetry suppresses
+    precisely because ``hermes kanban assign`` — not the dispatcher — is the fix.
+    """
+    count = int(stats.get("count") or 0)
+    task_id = stats.get("oldest_task_id") or "?"
+    assignee = stats.get("oldest_assignee") or "(unassigned)"
+    minutes = int((stats.get("oldest_age_seconds") or 0) // 60)
+    board = stats.get("board")
+    where = f"kanban dispatcher[{board}]" if board else "kanban dispatcher"
+    if stats.get("oldest_spawnable") is False:
+        why = (
+            f"the oldest card's assignee {assignee!r} is not a live profile, so every "
+            f"tick buckets it skipped_nonspawnable and no worker will EVER launch for "
+            f"it — reassign it to a real profile or recreate it unassigned."
+        )
+    else:
+        why = (
+            f"the oldest card's assignee {assignee!r} is spawnable and unclaimed, so "
+            f"nothing running it means the lane is starved (caps, guards, memory "
+            f"pressure) or that worker never polls; check "
+            f"`hermes kanban list --status ready` and the gateway log."
+        )
+    return (
+        f"{where}: {count} ready card(s) have never been attempted by any worker; "
+        f"oldest is {task_id} ({assignee}) waiting ~{minutes} min. {why}"
+    )
+
+
 class DispatcherHealth:
     """Backlog-aware health tracker for one dispatcher loop.
 
@@ -370,9 +402,18 @@ class DispatcherHealth:
         board_results: Optional[Iterable[tuple[str, Optional[object]]]] = None,
         *,
         pending: Optional[PendingWork] = None,
+        stuck: Optional[dict] = None,
         now: Optional[float] = None,
     ) -> Optional[HealthReport]:
-        """Judge one tick; returns the line to emit, or ``None`` to stay silent."""
+        """Judge one tick; returns the line to emit, or ``None`` to stay silent.
+
+        ``stuck`` is the board's :func:`zero_run_ready` probe (or ``None`` when
+        there is none): ready cards nothing has ever attempted. It is judged
+        after spawn failures — a botched launch is the louder fact — but BEFORE
+        the stall heuristic, because "the dispatcher tried nothing" and "nothing
+        exists in the fleet that could ever try" are different diagnoses and the
+        second one is silent under the old rule.
+        """
         at = time.time() if now is None else float(now)
         failures = collect_spawn_failures(board_results)
         if failures:
@@ -381,6 +422,8 @@ class DispatcherHealth:
             return self._emit(
                 "warning", spawn_failure_message(failures, self.failures_seen), "failed", at
             )
+        if stuck and int(stuck.get("count") or 0) > 0:
+            return self._emit("warning", stuck_ready_message(stuck), "stuck_ready", at)
         stalled = self._stall_message(board_results, pending or PendingWork())
         if stalled is not None:
             return self._emit("warning", stalled, "stalled", at)
@@ -2177,12 +2220,37 @@ def _tick_spawn_budget(
     return True, spawn_budget
 
 
+def zero_run_ready(
+    conn: sqlite3.Connection, *, now: Optional[float] = None,
+    min_age_seconds: Optional[float] = None,
+) -> dict:
+    """Stuck-ready probe — see :func:`hermes_cli.kanban_db.zero_run_ready`.
+
+    Defined ONCE in ``kanban_db`` so the dispatcher health surfaces
+    (``DispatcherHealth``, the gateway watcher, the standalone daemon) and the
+    board-stats / ops-API export all read the same query; this module only
+    forwards.
+    """
+    if min_age_seconds is None:
+        return _kb.zero_run_ready(conn, now=now)
+    return _kb.zero_run_ready(conn, now=now, min_age_seconds=min_age_seconds)
+
+
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed rows of one lane in dispatch order.
+
+    Ordering is the shared age-aware effective priority
+    (``kanban_db.effective_priority_order_sql``): a card that has waited long
+    enough outranks fresher higher-priority work, so a low-priority lane can
+    never be starved indefinitely by a steady trickle of P0/P1 cards. Both lane
+    orders (ready and review) call the one helper so they cannot drift.
+    """
+    order_body, order_params = _kb.effective_priority_order_sql()
     return conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        f"ORDER BY {order_body}",
+        order_params,
     ).fetchall()
 
 
