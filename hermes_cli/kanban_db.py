@@ -56,6 +56,24 @@ def _json_dict(value: Any) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _body_text(raw: Any) -> str:
+    """A non-TEXT cell read from a body column, as ``str``.
+
+    SQLite returns a BLOB-typed cell as ``bytes`` even when the column is
+    declared ``TEXT`` and even with ``text_factory`` set (that only covers TEXT
+    values), so a body that picked up a BLOB reaches ``re.search`` or
+    ``str.join`` as bytes and raises ``TypeError`` a long way from the row that
+    caused it: one odd comment aborts a whole dispatch pass, and a card carrying
+    one cannot have its worker context built at all. Decoding lossily keeps the
+    row readable instead of taking the board down. ``None`` becomes ``""``.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw).decode("utf-8", "replace")
+    if raw is None:
+        return ""
+    return raw
+
+
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     """Integer env override: absent/empty/non-integer/below ``minimum`` falls back to ``default``."""
     raw = os.environ.get(name, "").strip()
@@ -802,7 +820,7 @@ class Comment:
     def from_row(cls, r: sqlite3.Row) -> "Comment":
         return cls(
             id=r["id"], task_id=r["task_id"], author=r["author"],
-            body=r["body"], created_at=r["created_at"],
+            body=_body_text(r["body"]), created_at=r["created_at"],
         )
 
 

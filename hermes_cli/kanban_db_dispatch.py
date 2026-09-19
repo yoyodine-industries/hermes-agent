@@ -1171,7 +1171,7 @@ def check_respawn_guard(
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
-    err = row["last_failure_error"]
+    err = _kb._body_text(row["last_failure_error"])
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
@@ -1209,7 +1209,10 @@ def check_respawn_guard(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        # A non-TEXT body (BLOB-typed row) reaches re.search as ``bytes`` and
+        # raised TypeError, aborting the whole dispatch pass — see _body_text.
+        body = _kb._body_text(c["body"])
+        if body and _RESPAWN_GUARD_PR_URL_RE.search(body):
             return "active_pr"
 
     return None

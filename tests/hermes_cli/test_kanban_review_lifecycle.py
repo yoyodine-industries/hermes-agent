@@ -21,6 +21,7 @@ down:
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -476,6 +477,98 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kbd.check_respawn_guard(
             conn, review_id, lane="review"
         ) == "rate_limit_cooldown"
+
+
+def test_blob_comment_body_does_not_abort_dispatch_pass(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-TEXT comment body must not abort the whole dispatch pass.
+
+    SQLite hands a BLOB-typed column back as ``bytes``, and the respawn guard
+    passed it straight to ``re.search`` -> ``TypeError: cannot use a string
+    pattern on a bytes-like object``. Raised from inside the tick, that killed
+    the pass for every row AFTER it, so the ready tasks behind the odd comment
+    silently never spawned and the board showed nothing wrong.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {"kanban": {}})
+
+    with kbc.connect() as conn:
+        poisoned = kb.create_task(conn, title="blob comment", assignee="worker")
+        kb.add_comment(conn, poisoned, author="worker", body="placeholder")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_comments SET body = ? "
+                "WHERE task_id = ? AND body = 'placeholder'",
+                (sqlite3.Binary(b"\x00\x01 no pr url here \xff\xfe"), poisoned),
+            )
+        following = kb.create_task(conn, title="must still spawn", assignee="worker")
+
+        assert kbd.check_respawn_guard(conn, poisoned) is None
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+
+        spawned_ids = [s[0] for s in res.spawned]
+        assert poisoned in spawned_ids
+        assert following in spawned_ids
+
+
+def test_blob_comment_body_still_builds_a_worker_context(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same odd row on the spawn path: it must not cost the card its worker.
+
+    ``Comment.from_row`` passed the raw cell on to the handoff builder, which
+    joins comment bodies into a ``str``. Every affected card raised
+    ``TypeError`` from ``build_worker_context`` as well, so fixing only the
+    respawn guard would have traded an aborted pass for cards that cannot be
+    spawned at all.
+    """
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="blob comment", body="placeholder", assignee="worker"
+        )
+        kb.add_comment(conn, tid, author="worker", body="placeholder")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_comments SET body = ? WHERE task_id = ?",
+                (sqlite3.Binary(b"comment \xff\xfe blob"), tid),
+            )
+
+        assert [c.body for c in kb.list_comments(conn, tid)] == [
+            "comment \ufffd\ufffd blob"
+        ]
+        ctx = kb.build_worker_context(conn, tid)
+        assert isinstance(ctx, str)
+        assert "comment \ufffd\ufffd blob" in ctx
+
+
+def test_blob_last_failure_error_is_still_matched_as_text(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard's sibling raw read, one line above the one that raised first.
+
+    Both reads in ``check_respawn_guard`` take the cell straight out of a
+    ``SELECT`` and hand it to a ``re`` pattern, so both have to survive a BLOB.
+    Coercing the cell is also what keeps the guard *useful* here: the pattern
+    still has to match, rather than the row being skipped.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="blob error", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                (sqlite3.Binary(b"worker failed: 429 quota exceeded"), tid),
+            )
+
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
 
 
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
