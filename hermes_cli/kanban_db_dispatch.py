@@ -122,7 +122,8 @@ class DispatchResult:
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
-    """Task ids whose workers exceeded ``max_runtime_seconds``."""
+    """Task ids whose workers exceeded their own ``max_runtime_seconds`` or, when
+    the card set none, the resolved default cap (``kanban.default_max_runtime_seconds``)."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
@@ -766,6 +767,11 @@ def heartbeat_worker(
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
+    A card that set no cap of its own (NULL) is bounded by the resolved default
+    (``kanban.default_max_runtime_seconds``) rather than running forever — the
+    default is applied HERE, at enforcement, and deliberately not written into
+    the column (see ``resolve_default_max_runtime_seconds``).
+
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
     task's source phase so the next tick re-spawns the same kind of worker —
     unless the circuit breaker already gave up, leaving it blocked. Host-local
@@ -774,16 +780,23 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = _kb._host_prefix()
+    default_limit = resolve_default_max_runtime_seconds()
 
+    # The limit column is COALESCEd against the resolved default and the
+    # ``max_runtime_seconds IS NOT NULL`` guard is gone: a NULL cap means "no
+    # explicit cap", which is bounded by the default rather than unbounded.
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds AS card_max_runtime_seconds, "
+        "       COALESCE(t.max_runtime_seconds, ?) AS max_runtime_seconds, "
+        "       t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status = 'running' "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
+        "  AND t.worker_pid IS NOT NULL",
+        (default_limit,),
     ).fetchall()
     for row in rows:
         lock = row["claim_lock"] or ""
@@ -793,6 +806,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # so retries must be measured from the active task_runs row.
         elapsed = now - int(row["active_started_at"])
         limit = int(row["max_runtime_seconds"])
+        limit_source = "task" if row["card_max_runtime_seconds"] is not None else "default"
         if elapsed < limit:
             continue
 
@@ -811,6 +825,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        if limit_source == "default":
+            error += " (kanban.default_max_runtime_seconds)"
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -826,6 +842,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
+                    "max_runtime_source": limit_source,
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
@@ -1772,6 +1789,10 @@ MEMORY_GUARD_MB_PER_WORKER = 512
 DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
+# Built-in wall-clock cap for a card whose ``max_runtime_seconds`` is NULL (i.e.
+# one that set no cap). A NULL column is "no explicit cap", not "unbounded".
+DEFAULT_MAX_RUNTIME_SECONDS = 7200
+
 
 def _system_memory_sample() -> dict:
     """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
@@ -1830,6 +1851,42 @@ def configured_max_in_progress() -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return ival if ival >= 1 else None
+
+
+def configured_default_max_runtime_seconds() -> Optional[int]:
+    """Read ``kanban.default_max_runtime_seconds`` from config, or None when unset/invalid.
+
+    Shared so every enforcement entry point agrees on "explicitly configured": a
+    positive integer wins, anything else falls through to the built-in default.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("default_max_runtime_seconds")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        ival = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= 1 else None
+
+
+def resolve_default_max_runtime_seconds(configured: Optional[int] = None) -> int:
+    """Effective wall-clock cap for a card that set no ``max_runtime_seconds``.
+
+    Always a positive bound: a card with no explicit cap is bounded by this
+    value, never left unbounded. Resolved at ENFORCEMENT time and never written
+    into the column — ``_worker_terminal_timeout_env`` reads that NULL-ness to
+    decide whether to raise the worker's terminal-tool default, so materializing
+    the value would inflate it to ~2 h for every NULL-cap worker.
+    """
+    if configured is None:
+        configured = configured_default_max_runtime_seconds()
+    if configured is not None and configured >= 1:
+        return configured
+    return DEFAULT_MAX_RUNTIME_SECONDS
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:

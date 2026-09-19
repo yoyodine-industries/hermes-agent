@@ -318,6 +318,171 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
         _kb._pid_alive = original_alive
 
 
+def _running_card(conn, *, title, elapsed_seconds, max_runtime_seconds=None):
+    """Create + claim a card whose ACTIVE run is already ``elapsed_seconds`` old.
+
+    ``max_runtime_seconds=None`` (the default) is what every creator gets when it
+    omits the cap — the case this section is about.
+    """
+    tid = kb.create_task(
+        conn, title=title, assignee="worker",
+        max_runtime_seconds=max_runtime_seconds,
+    )
+    kb.claim_task(conn, tid)
+    kbd._set_worker_pid(conn, tid, os.getpid())
+    old_started = int(time.time()) - elapsed_seconds
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?", (old_started, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (old_started, tid),
+        )
+    return tid
+
+
+def test_null_cap_card_is_bounded_by_the_default(kanban_home):
+    """A NULL-cap card is bounded, not unbounded: the dispatcher applies
+    ``kanban.default_max_runtime_seconds`` at enforcement time, and leaves the
+    column NULL (that NULL-ness is what keeps the worker's terminal timeout off)."""
+    import hermes_cli.kanban_db as _kb
+    original_alive = _kb._pid_alive
+    _kb._pid_alive = lambda pid: False
+    try:
+        conn = kbc.connect()
+        try:
+            # Unset config: the schema default (7200s) is what bounds a NULL cap.
+            assert kbd.configured_default_max_runtime_seconds() == 7200
+            assert kbd.resolve_default_max_runtime_seconds() == 7200
+            default = kbd.resolve_default_max_runtime_seconds()
+            tid = _running_card(conn, title="no cap", elapsed_seconds=default + 1)
+
+            assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda *_: None)
+
+            to_event = next(e for e in kb.list_events(conn, tid) if e.kind == "timed_out")
+            assert to_event.payload["limit_seconds"] == default
+            assert to_event.payload["max_runtime_source"] == "default"
+
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "ready"
+            assert task.max_runtime_seconds is None, (
+                "enforcement must not materialize the default into the column"
+            )
+        finally:
+            conn.close()
+    finally:
+        _kb._pid_alive = original_alive
+
+
+def test_null_cap_card_is_reaped_by_a_pinned_default(kanban_home, monkeypatch):
+    """Resolver-pinned variant: with the default pinned to 1s, a 30s-old NULL-cap card
+    is reaped — the resolved default, not the raw NULL column, drives the sweep."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(kbd, "resolve_default_max_runtime_seconds", lambda configured=None: 1)
+    original_alive = _kb._pid_alive
+    _kb._pid_alive = lambda pid: False
+    try:
+        conn = kbc.connect()
+        try:
+            tid = _running_card(conn, title="no cap, pinned default", elapsed_seconds=30)
+
+            assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda *_: None)
+
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "ready"
+            assert task.max_runtime_seconds is None
+        finally:
+            conn.close()
+    finally:
+        _kb._pid_alive = original_alive
+
+
+def test_explicit_cap_wins_and_the_default_does_not_fire_early(kanban_home):
+    """The default is a fallback for cards with no cap: an explicit cap bounds its
+    own card (and is reported as the source), the default never shortens it, and a
+    young NULL-cap card is left alone."""
+    import hermes_cli.kanban_db as _kb
+    original_alive = _kb._pid_alive
+    _kb._pid_alive = lambda pid: False
+    try:
+        conn = kbc.connect()
+        try:
+            default = kbd.resolve_default_max_runtime_seconds()
+            explicit = _running_card(
+                conn, title="explicit cap", elapsed_seconds=30, max_runtime_seconds=1,
+            )
+            uncapped_young = _running_card(conn, title="no cap, young", elapsed_seconds=30)
+            uncapped_old = _running_card(
+                conn, title="no cap, over the default", elapsed_seconds=default + 1,
+            )
+
+            timed_out = set(kbd.enforce_max_runtime(conn, signal_fn=lambda *_: None))
+            assert timed_out == {explicit, uncapped_old}
+
+            explicit_event = next(
+                e for e in kb.list_events(conn, explicit) if e.kind == "timed_out"
+            )
+            assert explicit_event.payload["limit_seconds"] == 1
+            assert explicit_event.payload["max_runtime_source"] == "task"
+
+            young = kb.get_task(conn, uncapped_young)
+            assert young is not None
+            assert young.status == "running"
+            assert not [e for e in kb.list_events(conn, uncapped_young) if e.kind == "timed_out"]
+        finally:
+            conn.close()
+    finally:
+        _kb._pid_alive = original_alive
+
+
+def test_configured_default_max_runtime_is_honored(kanban_home):
+    """The bound comes from ``kanban.default_max_runtime_seconds``, and an invalid
+    value falls back to the built-in default instead of disabling the cap."""
+    config_path = kanban_home / "config.yaml"
+    config_path.write_text("kanban:\n  default_max_runtime_seconds: 60\n")
+    assert kbd.configured_default_max_runtime_seconds() == 60
+    assert kbd.resolve_default_max_runtime_seconds() == 60
+
+    import hermes_cli.kanban_db as _kb
+    original_alive = _kb._pid_alive
+    _kb._pid_alive = lambda pid: False
+    try:
+        conn = kbc.connect()
+        try:
+            tid = _running_card(conn, title="no cap under a 60s default", elapsed_seconds=61)
+            assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda *_: None)
+            to_event = next(e for e in kb.list_events(conn, tid) if e.kind == "timed_out")
+            assert to_event.payload["limit_seconds"] == 60
+            assert to_event.payload["max_runtime_source"] == "default"
+        finally:
+            conn.close()
+    finally:
+        _kb._pid_alive = original_alive
+
+    config_path.write_text("kanban:\n  default_max_runtime_seconds: 0\n")
+    assert kbd.configured_default_max_runtime_seconds() is None
+    assert kbd.resolve_default_max_runtime_seconds() == kbd.DEFAULT_MAX_RUNTIME_SECONDS
+
+
+def test_default_cap_does_not_raise_the_worker_terminal_timeout():
+    """Contract: the default is an enforcement-time bound ONLY. A NULL-cap worker
+    keeps the terminal tool's own default — materializing the default into the
+    column (or passing it to the worker env) would inflate a capless card's
+    terminal timeout to ~2 h, which is the regression this design avoids."""
+    assert kbd._worker_terminal_timeout_env(None, None) is None
+    assert kbd._worker_terminal_timeout_env(None, "300") is None
+    # Contrast: a card that DID set that cap gets the raised terminal default.
+    assert kbd._worker_terminal_timeout_env(kbd.DEFAULT_MAX_RUNTIME_SECONDS, "300") == str(
+        kbd.DEFAULT_MAX_RUNTIME_SECONDS - kbd.KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS
+    )
+
+
+
 
 
 

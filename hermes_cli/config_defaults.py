@@ -1768,6 +1768,15 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Wall-clock cap applied to a card whose own max_runtime_seconds is NULL (0 = off would
+        # mean unbounded again, so this is always a positive bound). A NULL column means "this
+        # card set no explicit cap" — NOT "no limit" — so the dispatcher resolves this value at
+        # ENFORCEMENT time and terminates the worker once the card's active run exceeds it.
+        # The column itself is left NULL on purpose: that NULL-ness is what tells
+        # _worker_terminal_timeout_env "no explicit cap", and materializing the default into it
+        # would raise every such worker's terminal-tool default to ~2 h. A card that
+        # legitimately needs longer sets its own max_runtime_seconds.
+        "default_max_runtime_seconds": 7200,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,
