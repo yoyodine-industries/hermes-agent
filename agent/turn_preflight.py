@@ -51,6 +51,9 @@ class PreflightGateVerdict:
     _preflight_compression_blocked: Any
     _provider_overflow_recovery_pending: Any
     _last_preflight_pressure: Any
+    # Latched by the loop: an aborted compression pass ends compression for the turn, so a forced
+    # provider-overflow re-check cannot re-arm it either.
+    compression_failed_this_turn: Any = False
     result: Optional[Dict[str, Any]] = None
 
 
@@ -58,6 +61,7 @@ def run_preflight_compression(
     agent: Any, v: PreflightGateVerdict, *, compressor: Any, request_pressure_tokens: int,
     provider_overflow_preflight: bool, defer_preflight: Any, moa_prepared_request: Any,
     system_message: Any, user_message: Any, max_compression_attempts: int, effective_task_id: Any,
+    compression_failed_this_turn: bool = False,
 ) -> PreflightGateVerdict:
     """Mirror of the turn-prologue guard chain (defer on noisy estimate → skip in failure
     cooldown → ``should_compress``), rebinding the loop locals on ``v`` and setting
@@ -65,7 +69,8 @@ def run_preflight_compression(
     call/budget in every branch (skip, re-run, timeout) so ``api_call_count`` never
     over-reports; a lock/transient skip refunds the attempt and leaves the progress
     blocker unarmed. A forced provider-overflow preflight that any gate blocks fails
-    closed (llama.cpp may silently truncate)."""
+    closed (llama.cpp may silently truncate). A compression pass that aborted earlier in the
+    same turn (``compression_failed_this_turn``) is never retried here, forced pass included."""
     from agent.conversation_loop import (
         _COMPRESSION_TIMEOUT_FINAL_RESPONSE, _HANDOFF_SKIP_FINAL_RESPONSE,
         _compression_deferred_result, _maybe_grow_local_window, _provider_overflow_exhausted_result,
@@ -95,6 +100,9 @@ def run_preflight_compression(
         and not _review_fork_first_request_pending(agent)
         and (not v._preflight_compression_blocked or provider_overflow_preflight)
         and (not defer_preflight(request_pressure_tokens) or provider_overflow_preflight)
+        # A pass that already aborted this turn (host stall) is not retried here either: a second
+        # one burns another full idle budget, and one turn may only ever wait for one summary.
+        and not compression_failed_this_turn
         and not _compression_cooldown
         and compressor.should_compress(request_pressure_tokens)
     ):
@@ -233,6 +241,9 @@ class PostToolCompressionVerdict:
     active_system_prompt: Any
     conversation_history: Any
     compression_attempts: int
+    # One aborted (host-timed-out) pass ends compression for the turn: latched by the loop and
+    # read back on the next tool result.
+    compression_failed_this_turn: bool
     final_response: Any
     turn_exit_reason: Any
 
@@ -241,7 +252,7 @@ def compress_after_tool_results(
     agent: Any, *, messages: List[Dict[str, Any]], system_message: Any, user_message: Any,
     active_system_prompt: Any, conversation_history: Any, compression_attempts: int,
     max_compression_attempts: int, effective_task_id: Any, final_response: Any,
-    turn_exit_reason: Any,
+    turn_exit_reason: Any, compression_failed_this_turn: bool = False,
 ) -> PostToolCompressionVerdict:
     """Post-tool-call compression decision. Pressure comes from API-reported
     ``prompt_tokens`` (a tight lower bound; thinking models inflate completion tokens),
@@ -259,6 +270,7 @@ def compress_after_tool_results(
         return PostToolCompressionVerdict(
             end_turn=end_turn, messages=messages, active_system_prompt=active_system_prompt,
             conversation_history=conversation_history, compression_attempts=compression_attempts,
+            compression_failed_this_turn=compression_failed_this_turn,
             final_response=final_response, turn_exit_reason=turn_exit_reason,
         )
 
@@ -287,6 +299,7 @@ def compress_after_tool_results(
 
     if (
         agent.compression_enabled
+        and not compression_failed_this_turn
         and compression_attempts < max_compression_attempts
         and not bool(
             getattr(_compressor, "awaiting_real_usage_after_compression", False)
@@ -304,7 +317,23 @@ def compress_after_tool_results(
         messages, active_system_prompt = agent._compress_context(
             messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id
         )
-        if messages is _post_tool_input and compression_skipped_due_to_lock(agent):
+        if (
+            messages is _post_tool_input
+            and not compression_skipped_due_to_lock(agent)
+            and context_compression_timed_out(agent)
+        ):
+            # An ABORT: nothing came back and the host marked its timeout. Not a lock-skip
+            # no-op (that is a temporary defer — the branch below refunds it) and not a pass
+            # that returned a new list. Everything that made this pass slow is still true, so a
+            # retry buys another full idle budget and nothing else — one turn must never burn N
+            # of them (observed: three consecutive 600s aborts inside one api_server turn, so the
+            # lane answered no inbound relay for ~11 min while deliveries queued behind the held
+            # turn slot). Latch for the rest of the turn: later tool results skip
+            # compression here AND at the pre-API gate, while the deterministic tool-result prune
+            # below stays available. The attempt is NOT refunded — same accounting as the pre-API
+            # timeout branch.
+            compression_failed_this_turn = True
+        elif messages is _post_tool_input and compression_skipped_due_to_lock(agent):
             # Lock-skip no-op is a temporary defer, not evidence about compressibility:
             # refund so a lock-loser loop doesn't burn the budget toward exhausted.
             # #69870 lock-skip / #97488 transient-block: this pass no-oped for a TEMPORARY reason (another
