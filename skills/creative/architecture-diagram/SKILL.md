@@ -1,6 +1,6 @@
 ---
 name: architecture-diagram
-description: "Dark-themed SVG architecture/cloud/infra diagrams as HTML."
+description: Use when drawing an architecture or infrastructure diagram.
 version: 1.0.0
 author: Cocoon AI (hello@cocoon-ai.com), ported by Hermes Agent
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 ---
 
 # Architecture Diagram Skill
+
+Produces dark-themed SVG architecture, cloud and infrastructure diagrams as standalone HTML.
 
 Generate professional, dark-themed technical architecture diagrams as standalone HTML files with inline SVG graphics. No external tools, no API keys, no rendering libraries — just write the HTML file and open it in a browser.
 
@@ -130,6 +132,25 @@ The generated HTML file follows a four-part layout:
   </ul>
 </div>
 ```
+
+## Pitfalls (learned the hard way)
+
+- **Generate, never hand-author.** Lay out the diagram programmatically from the
+  source of truth (DAG census, live config, `ps` / llama-server `/props`) and
+  compute every box and edge position in code. Hand-typed coordinates produce
+  clipped labels and arrows crossing headers; the reader cannot tell what you meant.
+- **Verify by rendering, not by re-reading your own HTML.** Load the file in a real
+  browser and assert programmatically: every `<rect>` has non-zero size, no text
+  extends past the viewBox, no two text boxes intersect, chips sit inside their card.
+  Then look at a clipped screenshot. "It should render" is not "it renders".
+- **Never paint SVG with CSS classes or `var(--x)`.** If the `<style>` block is
+  stripped or the variable resolves to nothing, default black-on-black paints an
+  invisible diagram. Use explicit hex and ship a standalone document.
+- **Put measured numbers on it or leave them off.** Read limits from the running
+  system (`/props` for slots, `/metrics` counters for tps, `state.db` for tokens).
+  A figure copied from a stale doc is worse than no figure.
+- **Colour-code verdicts.** Marking where the system is *wrong* (mismatch chips
+  against capacity) turns a diagram into a decision instrument, not decoration.
 
 ## Output Requirements
 - **Single File:** One self-contained `.html` file

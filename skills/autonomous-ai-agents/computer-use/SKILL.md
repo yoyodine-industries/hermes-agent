@@ -1,6 +1,6 @@
 ---
 name: computer-use
-description: "Drive the desktop background-first; escalate on signal."
+description: Use when driving the desktop GUI with the computer_use tool.
 version: 2.0.0
 author: Francesco Bonacci (f-trycua), Hermes Agent
 license: MIT
@@ -10,9 +10,12 @@ metadata:
     tags: [computer-use, desktop, automation, gui, cross-platform]
     category: desktop
     related_skills: []
+    requires_toolsets: [computer_use, browser]
 ---
 
 # Computer Use (universal, any-model, cross-platform)
+
+Drives the desktop background-first and escalates on signal; universal, any-model, cross-platform.
 
 You have a `computer_use` tool that drives the user's desktop in the
 **background** — your actions do NOT move the user's cursor, steal

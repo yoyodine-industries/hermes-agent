@@ -1,6 +1,6 @@
 ---
 name: 3-statement-model
-description: Build integrated IS/BS/CF financial workbooks in Excel.
+description: Use when building an IS/BS/CF Excel financial model.
 version: 1.0.0
 author: Anthropic (adapted by Nous Research)
 license: Apache-2.0
@@ -18,6 +18,8 @@ Follow the `excel-author` skill's conventions for cell coloring, formulas, named
 Recalculate before delivery: `python /path/to/excel-author/scripts/recalc.py ./out/model.xlsx`.
 
 # 3-Statement Financial Model Template Completion
+
+Builds integrated income-statement, balance-sheet and cash-flow workbooks in Excel.
 
 Complete and populate integrated financial model templates with proper linkages between Income Statement, Balance Sheet, and Cash Flow Statement.
 

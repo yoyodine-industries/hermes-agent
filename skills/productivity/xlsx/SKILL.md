@@ -1,6 +1,6 @@
 ---
 name: xlsx
-description: Create, read, edit Excel .xlsx workbooks and CSVs.
+description: Use when reading or writing .xlsx workbooks and CSVs.
 version: 1.1.0
 author: Nous Research
 license: MIT
@@ -13,6 +13,8 @@ metadata:
 ---
 
 # Xlsx Skill
+
+Creates, reads and edits Excel .xlsx workbooks and CSVs.
 
 Work with Excel .xlsx workbooks using Python and openpyxl: build styled
 multi-sheet workbooks with formulas and charts, inspect or dump existing
