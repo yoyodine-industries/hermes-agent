@@ -353,6 +353,12 @@ export function routineLastResult(status: string | null | undefined): null | str
     case 'delivery_failed':
       return 'Ran, but delivery failed'
 
+    // Accepted but never confirmed (a reply-wait / subprocess timeout): the payload may
+    // already be in the chat, so this must not read as a failure and must not invite a
+    // re-send. Not 'ok' either — the confirmation never arrived.
+    case 'delivery_unconfirmed':
+      return 'Ran, but delivery unconfirmed (do not re-send)'
+
     case 'blocked_config':
       return 'Blocked by configuration (not run)'
 

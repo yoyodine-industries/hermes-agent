@@ -77,12 +77,24 @@ must never test `== "ok"` for "the user got their result":
 | `delivery_failed` | Agent run succeeded, but the output never reached its target | `last_delivery_error` (`last_error` is `null`) |
 | `blocked_config` | Pre-dispatch validation refused to burn a run | `last_error` |
 | `interrupted` | Gateway shutdown killed the run's tool subprocess mid-flight: the run's own outcome is unknown | `last_error` (the shutdown phase and reason) |
+| `delivery_unconfirmed` | Agent run succeeded and the delivery was **accepted** (a receipt exists, or a live owner took the turn) but its confirmation never came back — a reply-wait / subprocess timeout | `last_delivery_error` (`last_error` is `null`) |
 
 `interrupted` is deliberately NOT `error`: nothing was recorded about the run's
 outcome, so it must not read as "the agent failed" to the operator or to any
 consumer keyed on the cron record. It is also **streak-neutral** —
 `cron.jobs._record_run_outcome` leaves `failure_streak` untouched for an
 interrupted run, while a genuine agent error still increments it.
+
+`delivery_unconfirmed` is streak-neutral for the same reason — the agent run
+succeeded and the delivery was admitted, so there is nothing to escalate — and
+it is also not `ok`: `last_error` stays `null` and the whole diagnostic lives in
+`last_delivery_error`, which is why every renderer must branch on the literal
+instead of falling through to `last_error` (that fall-through prints
+`delivery_unconfirmed: None`). The literal is written from the delivery
+classifier, which softens an error to unconfirmed **only** when the failure
+carries admission evidence (a receipt, or a handed-off live-owner send);
+without that evidence the same timeout stays `delivery_failed`, so a genuine
+send failure can never be laundered into an unconfirmed one.
 
 ### Job Lifecycle States
 
@@ -296,6 +308,17 @@ failures still use best-effort group cleanup, not a sandbox guarantee. Any targe
 stopped by cleanup is resumed if termination fails; already-stopped targets keep
 their original state. Explicit graceful signals do not suspend their recipients.
 Windows continues to use `taskkill /F /T`.
+
+**The script's exit code is the job's verdict, and it is a coarse one.** A
+script job (`no_agent`) exits 0 → the run is recorded `ok`, its stdout retained
+in the run output, and any alert line inside that stdout is *content*, not
+status. A non-zero exit (or a timeout) is a job error: `last_status: error`,
+the script's output and exit code in `last_error`, and `failure_streak`
+increments. So a detection script must report through stdout and exit 0 —
+exiting non-zero to "raise visibility" books the run as a failure, lifts the
+streak and can trip the repeated-failure nudge, while saying nothing more than
+the stdout line already did. Reported findings are read from the retained run
+output (`hermes cron history <job>`), not from a status field.
 
 ### Provider Recovery
 

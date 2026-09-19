@@ -316,9 +316,11 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
             execution = get_execution(str(execution_id))
         last_status = refreshed.get("last_status")
         # "delivery_failed": the run succeeded but output never reached the user — not a
-        # success for the caller; surface last_delivery_error.
+        # success for the caller; surface last_delivery_error. Same for "delivery_unconfirmed":
+        # the payload was handed off but never confirmed, so the caller must relay the
+        # do-not-resend diagnostic instead of an unexplained failure.
         run_error = refreshed.get("last_error")
-        if last_status == "delivery_failed" and not run_error:
+        if last_status in {"delivery_failed", "delivery_unconfirmed"} and not run_error:
             run_error = refreshed.get("last_delivery_error")
         # That is NOT a success for the caller — the calling agent relays this result — so report it as
         # failed and surface the delivery error, which lives in last_delivery_error (last_error is None for

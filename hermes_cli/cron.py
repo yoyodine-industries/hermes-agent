@@ -178,6 +178,14 @@ def _last_run_display(job: Dict[str, Any]) -> str:
     if last_status == "delivery_failed":
         # Agent succeeded but the result never reached the user — not green; last_error is None.
         return color(f"delivery_failed: {job.get('last_delivery_error') or '?'}", Colors.YELLOW)
+    if last_status == "delivery_unconfirmed":
+        # Admitted, but the confirmation never came back (reply-wait/subprocess expiry): the
+        # message may already be in the chat, so this is amber and never the fall-through below —
+        # last_error is None for a delivery-only outcome, which would render as a bare "None".
+        return color(
+            "delivery_unconfirmed: "
+            f"{job.get('last_delivery_error') or 'completion unconfirmed'} (do NOT resend)",
+            Colors.YELLOW)
     display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
     streak = int(job.get("failure_streak") or 0)
     if streak >= 2:
@@ -226,7 +234,13 @@ def _job_warnings(job: Dict[str, Any]) -> List[str]:
     lines = []
     if queued := job.get("last_delivery_queued"):
         lines.append(f"Delivery queued (completion unverified; do not resend): {queued}")
-    if job.get("last_delivery_error"):
+    if job.get("last_status") == "delivery_unconfirmed":
+        # The payload left for its target; only the confirmation is missing. "Delivery failed"
+        # would tell the operator to re-send a message that may already be in the chat.
+        lines.append(
+            f"{color('⚠ Delivery UNCONFIRMED:', Colors.YELLOW)} "
+            f"{job.get('last_delivery_error') or 'completion unconfirmed'} (do NOT resend)")
+    elif job.get("last_delivery_error"):
         lines.append(f"{color('⚠ Delivery failed:', Colors.YELLOW)} {job['last_delivery_error']}")
     # A live adapter acked the last send but returned no message_id / raw_response
     # (Slack/Matrix/Mattermost shape): accepted as delivered, but say so here.
@@ -569,8 +583,10 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
 def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
     issues: List[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
-    # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
-    if last_status and last_status not in {"ok", "delivery_failed", "delivery_queued"}:
+    # "delivery_failed" / "delivery_unconfirmed" = the agent run succeeded; the delivery issue
+    # below reports it (unconfirmed is not a failure at all — the message may be out).
+    if last_status and last_status not in {
+            "ok", "delivery_failed", "delivery_queued", "delivery_unconfirmed"}:
         if last_status == "interrupted":
             # Not "last run failed": nothing is known about this run's outcome — shutdown killed
             # its tool subprocess mid-flight and the run never recorded a terminal state.
@@ -580,7 +596,10 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
         else:
             issues.append(f"last run failed: {str(job.get('last_error') or 'unknown error').strip()}")
     if delivery_err := str(job.get("last_delivery_error") or "").strip():
-        issues.append(f"last delivery failed: {delivery_err}")
+        if last_status == "delivery_unconfirmed":
+            issues.append(f"last delivery unconfirmed (do NOT resend): {delivery_err}")
+        else:
+            issues.append(f"last delivery failed: {delivery_err}")
     if unverified := job.get("last_delivery_unverified"):
         issues.append("last delivery unverified (adapter acked without evidence): "
                       + _unverified_targets(unverified))

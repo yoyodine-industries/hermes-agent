@@ -121,6 +121,10 @@ export interface CronLastResult {
 const CRON_LAST_RESULT_TONE: Record<string, CronLastResultTone> = {
   ok: "success",
   delivery_failed: "warning",
+  // Accepted but never confirmed (reply-wait / subprocess timeout). The payload may already be
+  // in the chat, so it is not a failure — and it is not green either. Unknown literals (and any
+  // new gateway literal this map has not learned) still fall through to "destructive" below.
+  delivery_unconfirmed: "warning",
   blocked_config: "warning",
   error: "destructive",
 };
@@ -133,7 +137,7 @@ export function cronLastResult(
   const tone = CRON_LAST_RESULT_TONE[status] ?? "destructive";
   if (status === "ok") return { status, tone, detail: null };
   const detail =
-    status === "delivery_failed"
+    status === "delivery_failed" || status === "delivery_unconfirmed"
       ? asString(job.last_delivery_error).trim() || asString(job.last_error).trim()
       : asString(job.last_error).trim() || asString(job.last_delivery_error).trim();
   return { status, tone, detail: detail || null };

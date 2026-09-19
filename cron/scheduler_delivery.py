@@ -766,11 +766,21 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         logger.info("Job '%s': delivered to Bot Chat of profile '%s'", job_id, profile_label)
         return None
     except subprocess.TimeoutExpired:
-        return _fail(
+        message = (
             f"bot-chat delivery to profile '{profile_label}' timed out "
-            f"after {_get_bot_chat_delivery_timeout()}s (the bot's turn may "
-            "still complete; raise cron.bot_chat_delivery_timeout_seconds if "
-            "this recurs)")
+            f"after {_get_bot_chat_delivery_timeout()}s waiting for the "
+            "completion confirmation: the payload had already been handed to "
+            "the Bot Chat runner, so do NOT resend it (a second copy would "
+            "duplicate the message); raise "
+            "cron.bot_chat_delivery_timeout_seconds if this recurs")
+        # Evidence, not inference: the runner was spawned (a spawn failure raises into the
+        # generic arm below) and ran the FULL budget; a runner that cannot resolve its session
+        # exits non-zero (the arm above). So what expired is the reply wait, not the send —
+        # record the admission so the tail books ``delivery_unconfirmed`` (amber, never
+        # re-send) instead of ``delivery_failed``. The completion stays genuinely unknown,
+        # which is why this is not ``ok`` either.
+        _note_bot_chat_unconfirmed(job, f"{BOT_CHAT_PLATFORM}:{profile_label}", message)
+        return _fail(message)
     except Exception as e:
         return _fail(f"bot-chat delivery failed: {str(e) or type(e).__name__}", exc_info=True)
     finally:
@@ -798,6 +808,29 @@ _ROUTING_TOKENS = frozenset({"all"})
 # Pseudo-platform: deliver output as a real inbound turn into a profile's "Bot Chat" (not a mirror).
 # ``bot-chat`` = own profile; ``bot-chat:<name>`` = named profile on THIS machine.
 BOT_CHAT_PLATFORM = "bot-chat"
+
+# Transient per-run marker (target label → diagnostic) for a Bot Chat delivery whose payload was
+# handed to the delivery runner but whose completion confirmation never came back (e.g. the CLI
+# lane's reply wait expired). The bookkeeping tail pops it via _pop_bot_chat_unconfirmed and books
+# ``delivery_unconfirmed`` instead of ``delivery_failed``: the message may well be sitting in the
+# chat, and a failure status tells the operator to re-send a message that was already delivered.
+# Transient like ``_bot_chat_delivery_receipts`` / ``_model_unreachable`` — never persisted.
+BOT_CHAT_UNCONFIRMED_KEY = "_bot_chat_delivery_unconfirmed"
+
+
+def _note_bot_chat_unconfirmed(job: dict, target_label: str, message: str) -> None:
+    """Record that ``target_label``'s delivery was handed off but never confirmed."""
+    job.setdefault(BOT_CHAT_UNCONFIRMED_KEY, {})[target_label] = message
+
+
+def _pop_bot_chat_unconfirmed(job: dict) -> Optional[str]:
+    """Pop (and return) the admitted-but-unconfirmed delivery diagnostic, or None.
+
+    Popped unconditionally by the bookkeeping tail so the transient key can neither leak into
+    the next run's snapshot nor reach the job store.
+    """
+    record = job.pop(BOT_CHAT_UNCONFIRMED_KEY, None) or {}
+    return "; ".join(str(text) for text in record.values()) or None
 
 
 def parse_bot_chat_deliver_token(part: str) -> Optional[str]:
