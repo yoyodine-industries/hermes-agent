@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -1774,9 +1775,10 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
 # promotes it on the very next tick: a card filed to the backlog ("Todo") could
 # never stay there. ``initial_status="todo"`` is that explicit hold — it appends
 # a ``backlog_hold`` event, and ``recompute_ready`` skips a parent-free ``todo``
-# card while that event is the newest one. Holds are explicit, never implicit:
-# every later transition event is newer and clears the hold by construction, so
-# no other path changes behaviour.
+# card while that event is the newest RELEASE-kind one. Holds are explicit, never
+# implicit: a later transition (``_BACKLOG_HOLD_RELEASE_KINDS``) clears it, while
+# an annotation (comment, attachment, reassign, override) leaves it standing — an
+# annotation is not a transition, so it must not dispatch a backlogged card.
 # ---------------------------------------------------------------------------
 
 
@@ -1843,6 +1845,50 @@ def test_a_later_transition_event_supersedes_the_backlog_hold(kanban_home):
     with kbc.connect() as conn:
         assert kb.get_task(conn, held).status == "ready"
         assert _newest_event_kind(conn, held) == "promoted"
+
+
+def test_annotations_do_not_release_the_backlog_hold(kanban_home):
+    """An annotation is not a transition. Filing a card to the backlog and then
+    commenting on it, attaching a file, reassigning it or setting a per-task
+    override must leave the hold standing — resolving the hold as "newest event
+    of any kind" would let any of those silently dispatch the card on the next
+    tick. Only a release-kind event (here the dashboard's drag, ``status``)
+    clears it.
+    """
+    with kbc.connect() as conn:
+        held = kb.create_task(conn, title="held", assignee="a", initial_status="todo")
+        assert _newest_event_kind(conn, held) == "backlog_hold"
+
+    with kbc.connect() as conn:
+        kb.add_comment(conn, held, author="operator", body="not yet")
+        kb.assign_task(conn, held, "b")
+        kb.set_model_override(conn, held, "some-model")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'attached', NULL, ?)",
+            (held, int(time.time())),
+        )
+        conn.commit()
+        # Each of those IS the newest event of any kind...
+        assert _newest_event_kind(conn, held) == "attached"
+
+    with kbc.connect() as conn:
+        # ...and the hold stands anyway, tick after tick.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, held).status == "todo"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, held).status == "todo"
+
+    with kbc.connect() as conn:
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'status', ?, ?)",
+            (held, json.dumps({"status": "ready", "requested_status": "ready"}), int(time.time())),
+        )
+        conn.commit()
+
+    with kbc.connect() as conn:
+        # A release-kind event is what clears it.
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, held).status == "ready"
 
 
 def test_parent_gated_promotion_is_unchanged_by_the_hold(kanban_home):

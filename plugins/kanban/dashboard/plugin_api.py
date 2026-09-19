@@ -726,6 +726,15 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
+        if effective_status == "todo" and not kanban_db._linked_ids(conn, "parent_id", "child_id", task_id):
+            # Drag-to-Todo IS the operator backlog hold (same meaning as
+            # create_task(initial_status="todo")). Without the event this
+            # parent-free card has nothing to wait for, so recompute_ready would
+            # promote it on the very next tick — the drag would silently no-op.
+            # Written AFTER the ``status`` event above, so the hold is the newest
+            # release-kind event; a later drag to ready writes a newer ``status``
+            # and releases it.
+            kanban_db._append_event(conn, task_id, "backlog_hold", {"reason": "dashboard_todo", "status": "todo"})
         if reopening_satisfied_parent:
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
             # back worker terminations to perform post-commit.

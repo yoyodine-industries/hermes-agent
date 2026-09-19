@@ -1382,9 +1382,9 @@ def create_task(
                     # Explicit backlog hold. A parent-free ``todo`` card has
                     # nothing to wait for, so recompute_ready would promote it on
                     # the next tick; this event is what keeps it on the backlog.
-                    # Any later event (specified / decomposed / unblocked /
-                    # requeued / promoted / status, ...) is newer and clears the
-                    # hold by construction.
+                    # A later release-kind event (specified / decomposed /
+                    # unblocked / requeued / promoted / status, ...) clears it —
+                    # see _BACKLOG_HOLD_RELEASE_KINDS; annotations never do.
                     _append_event(
                         conn,
                         task_id,
@@ -1999,18 +1999,54 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
-def _has_backlog_hold(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the newest ``task_events`` row of ANY kind is ``backlog_hold``.
+# Event kinds that RELEASE an explicit backlog hold. A hold is operator intent, so
+# the hold is resolved against this allowlist and NOT against "the newest event of
+# any kind": an annotation (``commented`` / ``attached`` / ``attachment_removed`` /
+# ``assigned`` / ``edited`` / ``reprioritized`` / ``model_override_set``) carries no
+# transition and must LEAVE the hold standing, or an operator who files a card to
+# the backlog and then adds a note sees it silently dispatch. A denylist of
+# annotations would instead fail open on the next annotation kind someone adds —
+# the same defect again — so anything not named here is invisible to the hold.
+#
+# ``status`` is deliberately a release: it is what a dashboard drag writes, so
+# drag-todo->ready still releases. ``dependency_wait`` is deliberately NOT a
+# release: the dependency router only lands a card AT ``todo``, it never moves one
+# out of it, so it cannot be an operator releasing the backlog.
+_BACKLOG_HOLD_RELEASE_KINDS = (
+    "specified",
+    "decomposed",
+    "unblocked",
+    "requeued",
+    "promoted",
+    "promoted_manual",
+    "scheduled",
+    "linked",
+    "unlinked",
+    "blocked",
+    "archived",
+    "status",
+)
+# The hold marker itself plus everything that releases it: the comparison set
+# ``_has_backlog_hold`` resolves "newest" against. Every other kind in
+# ``task_events`` is an annotation (or run-scoped noise) and is invisible here.
+_BACKLOG_HOLD_STATE_KINDS = ("backlog_hold",) + _BACKLOG_HOLD_RELEASE_KINDS
+_BACKLOG_HOLD_STATE_KINDS_SQL = ", ".join(f"'{kind}'" for kind in _BACKLOG_HOLD_STATE_KINDS)
 
-    An explicit backlog hold, written by ``create_task(initial_status="todo")``:
-    a parent-free ``todo`` card has nothing to wait for, so :func:`recompute_ready`
-    would otherwise promote it on the next tick. Every later transition event
-    (``specified`` / ``decomposed`` / ``unblocked`` / ``requeued`` / ``promoted``
-    / ``status``, ...) is newer and so clears the hold by construction — no other
-    path changes behaviour.
+
+def _has_backlog_hold(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the newest RELEASE-kind ``task_events`` row is ``backlog_hold``.
+
+    An explicit backlog hold, written by ``create_task(initial_status="todo")`` and
+    by a dashboard drag into Todo: a parent-free ``todo`` card has nothing to wait
+    for, so :func:`recompute_ready` would otherwise promote it on the next tick.
+    Only a lifecycle transition releases it (:data:`_BACKLOG_HOLD_RELEASE_KINDS`);
+    the newest row among ``_BACKLOG_HOLD_STATE_KINDS`` decides, so a note, an
+    attachment, a reassignment or a per-task override cannot dispatch a card an
+    operator parked on the backlog.
     """
     row = conn.execute(
         "SELECT kind FROM task_events WHERE task_id = ? "
+        f"AND kind IN ({_BACKLOG_HOLD_STATE_KINDS_SQL}) "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     return bool(row) and row["kind"] == "backlog_hold"
@@ -2057,7 +2093,10 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 
     A ``todo`` card carries one of two meanings, and they are independent: a
     dependency wait (a parent is not ``done``/``archived`` yet) or an explicit
-    operator backlog hold (``create_ta...[truncated]
+    operator backlog hold — written by ``create_task(initial_status="todo")`` and
+    by a dashboard drag into Todo. With no parents there is nothing to wait for,
+    so ``all([])`` would otherwise promote the card straight out of the backlog.
+    Only a lifecycle transition (:data:`_BACKLOG_HOLD_RELEASE_KINDS`) releases it.
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).

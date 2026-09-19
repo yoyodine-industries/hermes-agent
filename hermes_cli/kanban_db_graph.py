@@ -32,9 +32,9 @@ def initial_task_state(
     Validate parents even for parked tasks so links never dangle.
 
     ``initial_status="todo"`` parks the card on the backlog under an explicit
-    hold (``create_task`` writes the matching ``backlog_hold`` event, which
-    ``recompute_ready`` honours) instead of letting a parent-free card be
-    promoted on the next tick.
+    hold (a ``backlog_hold`` event — written here and by a dashboard drag into
+    Todo — which ``recompute_ready`` honours) instead of letting a parent-free
+    card be promoted on the next tick.
     """
     rows = {}
     if parents:
