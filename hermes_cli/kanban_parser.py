@@ -200,7 +200,10 @@ _SPECS = [
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
-                  "to skip the brief running-to-blocked transition."),
+                  "to skip the brief running-to-blocked transition. "
+                  "Use 'todo' to file the card on the backlog under "
+                  "an explicit hold: it stays there (no dispatcher "
+                  "promotion) until it is released."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [

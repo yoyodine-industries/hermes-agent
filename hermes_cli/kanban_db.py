@@ -87,7 +87,10 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 # --- Constants ---
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+# ``"todo"`` files a new card on the backlog under an explicit hold (the
+# ``backlog_hold`` event ``create_task`` writes); ``recompute_ready`` skips a
+# parent-free held card, so it is never promoted straight past the backlog.
+VALID_INITIAL_STATUSES = {"running", "blocked", "todo"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
@@ -1236,7 +1239,9 @@ def create_task(
     """Create a task (optionally under ``parents``); returns its id.
 
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
-    forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+    forces ``triage``; ``initial_status="blocked"`` parks it for human ops;
+    ``initial_status="todo"`` files it on the backlog under an explicit hold
+    (a ``backlog_hold`` event) that ``recompute_ready`` honours.
     ``idempotency_key``: an existing non-archived task with the key is returned
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
@@ -1372,6 +1377,19 @@ def create_task(
                         task_id,
                         "blocked",
                         {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
+                    )
+                if initial_status == "todo" and task_status == "todo":
+                    # Explicit backlog hold. A parent-free ``todo`` card has
+                    # nothing to wait for, so recompute_ready would promote it on
+                    # the next tick; this event is what keeps it on the backlog.
+                    # Any later event (specified / decomposed / unblocked /
+                    # requeued / promoted / status, ...) is newer and clears the
+                    # hold by construction.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "backlog_hold",
+                        {"reason": "initial_status", "status": "todo", "actor": created_by or "user"},
                     )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
@@ -1981,6 +1999,23 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _has_backlog_hold(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the newest ``task_events`` row of ANY kind is ``backlog_hold``.
+
+    An explicit backlog hold, written by ``create_task(initial_status="todo")``:
+    a parent-free ``todo`` card has nothing to wait for, so :func:`recompute_ready`
+    would otherwise promote it on the next tick. Every later transition event
+    (``specified`` / ``decomposed`` / ``unblocked`` / ``requeued`` / ``promoted``
+    / ``status``, ...) is newer and so clears the hold by construction — no other
+    path changes behaviour.
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    return bool(row) and row["kind"] == "backlog_hold"
+
+
 def _latest_event(
     conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
@@ -2020,6 +2055,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     trip). Limit order matches ``_record_task_failure``: ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
 
+    A parent-free ``todo`` card whose newest event is a ``backlog_hold`` is
+    skipped as well: that is an explicit hold (``create_task(initial_status="todo")``),
+    never an implicit one — with no parents there is nothing to wait for, so
+    ``all([])`` would otherwise promote the card straight out of the backlog.
+
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).
     """
@@ -2042,6 +2082,10 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
+            if not parents and _has_backlog_hold(conn, task_id):
+                # Explicit backlog hold: the card waits for a release, not for a
+                # parent, so the parent gate below must not promote it.
+                continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
