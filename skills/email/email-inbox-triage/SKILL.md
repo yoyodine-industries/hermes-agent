@@ -1,6 +1,6 @@
 ---
 name: email-inbox-triage
-description: "Triage an inbox: prioritize threads, draft replies safely."
+description: Use when triaging an inbox or prioritizing email threads.
 version: 0.1.0
 author: Ben Barclay (benbarclay), Hermes Agent
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # Email Inbox Triage
+
+Covers prioritizing threads and drafting replies safely.
 
 Turn a mailbox into a bounded queue of decisions. This skill owns thread-aware prioritization and reply policy; connector skills (`himalaya`, `google-workspace`) own provider commands.
 

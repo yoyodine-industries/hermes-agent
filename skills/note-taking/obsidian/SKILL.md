@@ -1,6 +1,6 @@
 ---
 name: obsidian
-description: Read, search, create, and edit notes in the Obsidian vault.
+description: Use when reading, searching, or editing Obsidian notes.
 version: 1.0.0
 author: Teknium (teknium1), Hermes Agent
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # Obsidian Vault
+
+Covers reading, searching, creating, and editing notes in the Obsidian vault.
 
 Use this skill for filesystem-first Obsidian vault work: reading notes, listing notes, searching note files, creating notes, appending content, and adding wikilinks.
 

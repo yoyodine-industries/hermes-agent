@@ -1,6 +1,6 @@
 ---
 name: spike
-description: "Throwaway experiments to validate an idea before build."
+description: Use when validating an idea with a throwaway spike.
 version: 1.0.0
 author: Hermes Agent (adapted from gsd-build/get-shit-done)
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # Spike
+
+Covers throwaway experiments that validate an idea before a build.
 
 Use this skill when the user wants to **feel out an idea** before committing to a real build — validating feasibility, comparing approaches, or surfacing unknowns that no amount of research will answer. Spikes are disposable by design. Throw them away once they've paid their debt.
 

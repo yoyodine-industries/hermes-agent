@@ -1,6 +1,6 @@
 ---
 name: airtable
-description: Airtable REST API via curl. Records CRUD, filters, upserts.
+description: Use when reading or writing Airtable records via curl.
 version: 1.1.0
 author: community
 license: MIT
@@ -15,6 +15,8 @@ metadata:
 ---
 
 # Airtable — Bases, Tables & Records
+
+Covers record CRUD, filters, and upserts against the Airtable REST API via `curl`.
 
 Work with Airtable's REST API directly via `curl` using the `terminal` tool. No MCP server, no OAuth flow, no Python SDK — just `curl` and a personal access token.
 

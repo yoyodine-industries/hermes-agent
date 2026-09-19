@@ -1,6 +1,6 @@
 ---
 name: teams-meeting-pipeline
-description: Teams meeting summaries, job replay, Graph subscriptions.
+description: Use when handling Teams meeting summaries or transcripts.
 version: 1.1.0
 author: Hermes Agent + Teknium
 license: MIT
@@ -22,6 +22,8 @@ metadata:
 ---
 
 # Teams Meeting Pipeline
+
+Covers Teams meeting summaries, job replay, and Graph subscriptions.
 
 Use this skill whenever the user asks about Microsoft Teams meeting summaries, transcripts, recordings, action items, Graph subscriptions, or any operational question about the Teams meeting pipeline. Works in any language — the triggers below are examples, not an exhaustive list.
 

@@ -1,6 +1,6 @@
 ---
 name: xurl
-description: "X/Twitter via xurl CLI: raw post search, posting, DM, media."
+description: Use when reading or posting to X/Twitter via the xurl CLI.
 version: 1.1.3
 author: xdevplatform + openclaw + Hermes Agent
 license: MIT
@@ -15,6 +15,8 @@ metadata:
 ---
 
 # xurl — X (Twitter) API via the Official CLI
+
+Covers raw post search, posting, DM, and media upload via the X/Twitter `xurl` CLI.
 
 `xurl` is the X developer platform's official CLI for the X API. It supports shortcut commands for common actions AND raw curl-style access to any v2 endpoint. All commands return JSON to stdout.
 

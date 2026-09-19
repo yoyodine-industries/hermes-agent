@@ -1,6 +1,6 @@
 ---
 name: meeting-action-items
-description: "Turn meeting notes into cited decisions, owners, tickets."
+description: Use when turning meeting notes into decisions and tickets.
 version: 0.1.0
 author: Ben Barclay (benbarclay), Hermes Agent
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # Meeting Action Items
+
+Covers turning meeting notes into cited decisions, owners, and tickets.
 
 Convert an existing transcript or notes set into accountable follow-through. `teams-meeting-pipeline` can retrieve Teams artifacts; this skill begins once notes/transcript content is available, from any source.
 

@@ -1,6 +1,6 @@
 ---
 name: weekly-review-planning
-description: "Weekly reset: commitments, stalled work, next-week plan."
+description: Use when running a weekly review or planning next week.
 version: 0.1.0
 author: Ben Barclay (benbarclay), Hermes Agent
 license: MIT
@@ -12,6 +12,8 @@ metadata:
 ---
 
 # Weekly Review and Planning
+
+Covers the weekly reset: commitments, stalled work, and next-week plans.
 
 Run a bounded weekly reset across the user's chosen systems. This is a concrete recurring task, not a generic productivity methodology — the `weekly-review` Automation Blueprint schedules it as a cron job.
 
