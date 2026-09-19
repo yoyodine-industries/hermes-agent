@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -1765,3 +1766,271 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+# ---------------------------------------------------------------------------
+# Explicit backlog hold — create_task(initial_status="todo")
+#
+# A parent-free card in ``todo`` has nothing to wait for, so ``recompute_ready``
+# promotes it on the very next tick: a card filed to the backlog ("Todo") could
+# never stay there. ``initial_status="todo"`` is that explicit hold — it appends
+# a ``backlog_hold`` event, and ``recompute_ready`` skips a parent-free ``todo``
+# card while that event is the newest RELEASE-kind one. Holds are explicit, never
+# implicit: a later transition (``_BACKLOG_HOLD_RELEASE_KINDS``) clears it, while
+# an annotation (comment, attachment, reassign, override) leaves it standing — an
+# annotation is not a transition, so it must not dispatch a backlogged card.
+# ---------------------------------------------------------------------------
+
+
+def _newest_event_kind(conn, task_id):
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row["kind"] if row else None
+
+
+def test_initial_status_todo_holds_a_parent_free_card_on_the_backlog(kanban_home):
+    """T1/T2: the hold is a real marker event and it survives every later tick."""
+    with kbc.connect() as conn:
+        held = kb.create_task(conn, title="held", assignee="a", initial_status="todo")
+        plain = kb.create_task(conn, title="plain", assignee="a")
+
+        assert kb.get_task(conn, held).status == "todo"
+        # No hold, no parents: a card is still promoted implicitly, as before.
+        assert kb.get_task(conn, plain).status == "ready"
+        assert _newest_event_kind(conn, held) == "backlog_hold"
+
+    with kbc.connect() as conn:
+        # The promotion loop this card would otherwise be swept up by.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, held).status == "todo"
+        # Repeated ticks must not wear the hold off either.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, held).status == "todo"
+
+
+def test_todo_without_a_backlog_hold_event_still_promotes(kanban_home):
+    """A ``todo`` card with no hold marker (direct DB edit, legacy row) keeps the
+    pre-existing auto-promote behaviour — the hold is never implicit."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="legacy todo", assignee="a")
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (t,))
+        conn.commit()
+        assert _newest_event_kind(conn, t) == "created"
+
+    with kbc.connect() as conn:
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_a_later_transition_event_supersedes_the_backlog_hold(kanban_home):
+    """Newest-event-wins: a later transition releases the hold instead of
+    stranding the card — here the operator links a new upstream dependency."""
+    with kbc.connect() as conn:
+        held = kb.create_task(conn, title="held", assignee="a", initial_status="todo")
+        upstream = kb.create_task(conn, title="new upstream", assignee="a")
+        assert kb.recompute_ready(conn) == 0
+
+    with kbc.connect() as conn:
+        kb.link_tasks(conn, upstream, held)
+        assert _newest_event_kind(conn, held) == "linked"
+        # Released from the hold, now gated by the new parent instead.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, held).status == "todo"
+
+    with kbc.connect() as conn:
+        kb.complete_task(conn, upstream)
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, held).status == "ready"
+        assert _newest_event_kind(conn, held) == "promoted"
+
+
+def test_annotations_do_not_release_the_backlog_hold(kanban_home):
+    """An annotation is not a transition. Filing a card to the backlog and then
+    commenting on it, attaching a file, reassigning it or setting a per-task
+    override must leave the hold standing — resolving the hold as "newest event
+    of any kind" would let any of those silently dispatch the card on the next
+    tick. Only a release-kind event (here the dashboard's drag, ``status``)
+    clears it.
+    """
+    with kbc.connect() as conn:
+        held = kb.create_task(conn, title="held", assignee="a", initial_status="todo")
+        assert _newest_event_kind(conn, held) == "backlog_hold"
+
+    with kbc.connect() as conn:
+        kb.add_comment(conn, held, author="operator", body="not yet")
+        kb.assign_task(conn, held, "b")
+        kb.set_model_override(conn, held, "some-model")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'attached', NULL, ?)",
+            (held, int(time.time())),
+        )
+        conn.commit()
+        # Each of those IS the newest event of any kind...
+        assert _newest_event_kind(conn, held) == "attached"
+
+    with kbc.connect() as conn:
+        # ...and the hold stands anyway, tick after tick.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, held).status == "todo"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, held).status == "todo"
+
+    with kbc.connect() as conn:
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'status', ?, ?)",
+            (held, json.dumps({"status": "ready", "requested_status": "ready"}), int(time.time())),
+        )
+        conn.commit()
+
+    with kbc.connect() as conn:
+        # A release-kind event is what clears it.
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, held).status == "ready"
+
+
+def test_parent_gated_promotion_is_unchanged_by_the_hold(kanban_home):
+    """A held card that has parents is released by the parent gate, not by the
+    hold's absence."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="upstream", assignee="a")
+        child = kb.create_task(
+            conn, title="downstream", assignee="b", parents=[parent], initial_status="todo",
+        )
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.recompute_ready(conn) == 0
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, child).status == "todo"
+        kb.complete_task(conn, parent)
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_cli_create_accepts_initial_status_todo(kanban_home):
+    """T5: the CLI edge exposes the hold as ``--initial-status todo``."""
+    from hermes_cli import kanban as kc
+
+    out = kc.run_slash("create 'backlog card' --assignee tooling --initial-status todo")
+    with kbc.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE title = 'backlog card'"
+        ).fetchall()
+        assert len(rows) == 1, out
+        assert rows[0]["status"] == "todo"
+
+    with kbc.connect() as conn:
+        assert _newest_event_kind(conn, rows[0]["id"]) == "backlog_hold"
+        # ...and the dispatcher tick still refuses to promote it.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, rows[0]["id"]).status == "todo"
+
+
+def test_hold_releases_via_the_operator_promote_path(kanban_home):
+    """T8: ``hermes kanban promote`` returns a held card to ready, end to end."""
+    from hermes_cli import kanban as kc
+
+    from hermes_cli.kanban_db_dispatch import DispatchResult, _run_reclaim_phase
+
+    with kbc.connect() as conn:
+        held = kb.create_task(conn, title="release me", assignee="a", initial_status="todo")
+        assert kb.recompute_ready(conn) == 0
+
+    # The real dispatcher tick runs the same recompute inside its reclaim phase.
+    with kbc.connect() as conn:
+        tick = DispatchResult()
+        _run_reclaim_phase(
+            conn, tick, stale_timeout_seconds=900, failure_limit=3, reconcile_orphans=False,
+        )
+        assert tick.promoted == 0
+        assert kb.get_task(conn, held).status == "todo"
+
+    out = kc.run_slash(f"promote {held}")
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, held).status == "ready", out
+        # The release is a newer event, so the hold is gone for good.
+        assert _newest_event_kind(conn, held) == "promoted_manual"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, held).status == "ready"
+
+
+def test_specify_of_a_parent_free_triage_card_still_promotes(kanban_home):
+    """T6: the specify path (triage -> specified) is untouched — a parent-free
+    card promotes on the next tick."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="rough idea", assignee="a", triage=True)
+        assert kb.get_task(conn, t).status == "triage"
+
+    with kbc.connect() as conn:
+        assert kb.specify_triage_task(
+            conn, t, title="Refined", body="**Goal**\nDo the thing.", author="specifier",
+        )
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_decompose_without_auto_promote_leaves_children_in_todo(kanban_home):
+    """T7: ``auto_promote=False`` and the parent-gated release are untouched —
+    children stay in todo until the tick, and a child waits on its parent."""
+    from hermes_cli.kanban_db_graph import decompose_triage_task
+
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="ship it", assignee="orch", triage=True)
+
+    with kbc.connect() as conn:
+        children = decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orch",
+            children=[
+                {"title": "A", "assignee": "a"},
+                {"title": "B", "assignee": "b", "parents": [0]},
+            ],
+            author="decomposer",
+            auto_promote=False,
+        )
+    assert children
+
+    with kbc.connect() as conn:
+        # The fan-out itself promoted nothing, not even the parent-free child.
+        assert [kb.get_task(conn, c).status for c in children] == ["todo", "todo"]
+        assert kb.get_task(conn, root).status == "todo"
+        # The next dispatcher tick promotes A, and only A.
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, children[0]).status == "ready"
+        assert kb.get_task(conn, children[1]).status == "todo"
+
+    with kbc.connect() as conn:
+        kb.complete_task(conn, children[0])
+
+    with kbc.connect() as conn:
+        # B stayed in todo while its parent A was unfinished; completing A
+        # released it, while the root still waits on B.
+        assert kb.get_task(conn, children[1]).status == "ready"
+        assert kb.get_task(conn, root).status == "todo"
+
+
+def test_parentless_non_sticky_blocked_card_still_auto_recovers(kanban_home):
+    """T3: the ``blocked`` branch is untouched — no sticky ``kanban_block``
+    event (circuit breaker / direct write) still auto-recovers."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="breaker", assignee="a")
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (t,))
+        conn.commit()
+        assert _newest_event_kind(conn, t) == "created"
+
+    with kbc.connect() as conn:
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_initial_status_still_rejects_an_unknown_value(kanban_home):
+    """T4: widening the set kept the validation."""
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError):
+            kb.create_task(conn, title="nope", assignee="a", initial_status="bogus")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0

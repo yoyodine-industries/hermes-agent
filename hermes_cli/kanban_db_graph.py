@@ -30,6 +30,11 @@ def initial_task_state(
 
     Parent order breaks ties in this soft namespace; explicit tenant wins.
     Validate parents even for parked tasks so links never dangle.
+
+    ``initial_status="todo"`` parks the card on the backlog under an explicit
+    hold (a ``backlog_hold`` event — written here and by a dashboard drag into
+    Todo — which ``recompute_ready`` honours) instead of letting a parent-free
+    card be promoted on the next tick.
     """
     rows = {}
     if parents:
@@ -46,6 +51,8 @@ def initial_task_state(
         return "blocked", tenant
     if triage:
         return "triage", tenant
+    if initial_status == "todo":
+        return "todo", tenant
     if any(row["status"] != "done" for row in rows.values()):
         return "todo", tenant
     return "ready", tenant

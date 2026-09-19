@@ -274,6 +274,30 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
         )
 
 
+def test_drag_into_todo_holds_the_card_on_the_backlog(client):
+    """A dashboard drag into Todo IS the operator backlog hold. Without the hold
+    event a parent-free card has nothing to wait for, so ``recompute_ready``
+    promotes it straight back to ready on the next tick and the drag silently
+    no-ops; a later drag to ready must still release it.
+    """
+    tid = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "backlog me"}).json()["task"]["id"]
+
+    assert client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "todo"}).status_code == 200
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "todo"
+        assert kb.list_events(conn, tid)[-1].kind == "backlog_hold"
+        # The tick that would otherwise promote the card out of the backlog.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "todo"
+
+    # Dragging it back to ready writes a newer release-kind event.
+    assert client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "ready"}).status_code == 200
+    with kbc.connect() as conn:
+        assert kb.list_events(conn, tid)[-1].kind == "status"
+        assert kb.get_task(conn, tid).status == "ready"
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 

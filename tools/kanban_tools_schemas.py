@@ -444,12 +444,15 @@ KANBAN_CREATE_SCHEMA = _schema(
         )),
         "initial_status": {
             "type": "string",
-            "enum": ["running", "blocked"],
+            "enum": ["running", "blocked", "todo"],
             "description": (
                 "Initial card status. Use 'blocked' for tasks that "
                 "require immediate human ops (R3 gate) to skip the "
-                "brief running-to-blocked transition. Defaults to "
-                "'running', which preserves the usual dispatch path."
+                "brief running-to-blocked transition. Use 'todo' to "
+                "file the task on the backlog under an explicit hold "
+                "— it is not promoted by the dispatcher until it is "
+                "released. Defaults to 'running', which preserves the "
+                "usual dispatch path."
             ),
         },
         "skills": {
