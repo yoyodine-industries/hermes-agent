@@ -2055,10 +2055,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     trip). Limit order matches ``_record_task_failure``: ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
 
-    A parent-free ``todo`` card whose newest event is a ``backlog_hold`` is
-    skipped as well: that is an explicit hold (``create_task(initial_status="todo")``),
-    never an implicit one — with no parents there is nothing to wait for, so
-    ``all([])`` would otherwise promote the card straight out of the backlog.
+    A ``todo`` card carries one of two meanings, and they are independent: a
+    dependency wait (a parent is not ``done``/``archived`` yet) or an explicit
+    operator backlog hold (``create_ta...[truncated]
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).

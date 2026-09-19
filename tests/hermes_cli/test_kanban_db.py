@@ -1887,9 +1887,20 @@ def test_hold_releases_via_the_operator_promote_path(kanban_home):
     """T8: ``hermes kanban promote`` returns a held card to ready, end to end."""
     from hermes_cli import kanban as kc
 
+    from hermes_cli.kanban_db_dispatch import DispatchResult, _run_reclaim_phase
+
     with kbc.connect() as conn:
         held = kb.create_task(conn, title="release me", assignee="a", initial_status="todo")
         assert kb.recompute_ready(conn) == 0
+
+    # The real dispatcher tick runs the same recompute inside its reclaim phase.
+    with kbc.connect() as conn:
+        tick = DispatchResult()
+        _run_reclaim_phase(
+            conn, tick, stale_timeout_seconds=900, failure_limit=3, reconcile_orphans=False,
+        )
+        assert tick.promoted == 0
+        assert kb.get_task(conn, held).status == "todo"
 
     out = kc.run_slash(f"promote {held}")
     with kbc.connect() as conn:
@@ -1955,3 +1966,25 @@ def test_decompose_without_auto_promote_leaves_children_in_todo(kanban_home):
         # released it, while the root still waits on B.
         assert kb.get_task(conn, children[1]).status == "ready"
         assert kb.get_task(conn, root).status == "todo"
+
+
+def test_parentless_non_sticky_blocked_card_still_auto_recovers(kanban_home):
+    """T3: the ``blocked`` branch is untouched — no sticky ``kanban_block``
+    event (circuit breaker / direct write) still auto-recovers."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="breaker", assignee="a")
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (t,))
+        conn.commit()
+        assert _newest_event_kind(conn, t) == "created"
+
+    with kbc.connect() as conn:
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_initial_status_still_rejects_an_unknown_value(kanban_home):
+    """T4: widening the set kept the validation."""
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError):
+            kb.create_task(conn, title="nope", assignee="a", initial_status="bogus")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
