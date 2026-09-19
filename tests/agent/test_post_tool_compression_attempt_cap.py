@@ -22,6 +22,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from run_agent import AIAgent
+from agent.conversation_compression import (
+    mark_context_compression_timed_out,
+    reset_context_compression_timeout_outcome,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +123,16 @@ def agent():
     return a
 
 
-def _run_tool_loop(agent, n_tool_iterations: int):
-    """Drive one turn: ``n_tool_iterations`` tool calls, then a stop."""
+def _run_tool_loop(agent, n_tool_iterations: int, abort_after: int | None = None):
+    """Drive one turn: ``n_tool_iterations`` tool calls, then a stop.
+
+    ``abort_after`` simulates the host giving up on a compression pass: from the
+    N-th ``_compress_context`` call on, the pass hands the input back unchanged AND
+    marks the host timeout — exactly what ``agent.compression_facade`` does when the
+    idle budget runs out without summary progress. The fake clears the previous
+    outcome on entry the way the real ``_compress_context`` does, so a mark left by
+    an earlier pass cannot masquerade as this one's abort.
+    """
     responses = [_tool_response(i) for i in range(n_tool_iterations)]
     responses.append(_stop_response())
     agent.client.chat.completions.create.side_effect = responses
@@ -129,6 +141,10 @@ def _run_tool_loop(agent, n_tool_iterations: int):
 
     def _fake_compress(messages, system_message, **_kwargs):
         compress_calls.append(len(messages))
+        reset_context_compression_timeout_outcome(agent)
+        if abort_after is not None and len(compress_calls) >= abort_after:
+            mark_context_compression_timed_out(agent)
+            return messages, system_message
         return messages, "compressed prompt"
 
     with (
@@ -206,3 +222,51 @@ class TestPostToolCompressionAttemptCap:
 
         assert len(first) == 3
         assert len(second) == 3
+
+
+class TestPostToolCompressionAbortEndsTheTurn:
+    """One aborted pass ends compression for the turn.
+
+    A host timeout hands the input back unchanged AND marks the timeout, so the loop
+    latches ``compression_failed_this_turn`` instead of measuring the same pressure
+    again. Before the fix the post-tool gate re-fired on the next tool result and
+    each re-fire burned another full idle budget (600s in production), so one inbound
+    relay could sit un-answered for 3x that before the turn ended.
+    """
+
+    def test_aborted_pass_is_not_retried_in_the_same_turn(self, agent):
+        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7, abort_after=1)
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 1, (
+            "an aborted compression pass must not be re-attempted in the same turn, "
+            f"got {len(compress_calls)} passes"
+        )
+
+    def test_abort_also_stands_down_the_pre_api_gate(self, agent):
+        """Pre-API and post-tool compression share the one attempt the turn gets.
+
+        Only the first pre-API check defers, so every later iteration's pre-API gate
+        is eligible: without the latch it compresses again after the abort.
+        """
+        defers = iter([True])
+        agent.context_compressor.should_defer_preflight_to_real_usage.side_effect = (
+            lambda _t: next(defers, False)
+        )
+
+        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7, abort_after=1)
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 1, (
+            "an aborted turn must not re-compress anywhere, pre-API gate included, "
+            f"got {len(compress_calls)} passes"
+        )
+
+    def test_next_turn_gets_a_fresh_attempt(self, agent):
+        """The latch is per-turn state, never a sticky agent flag."""
+        _result, aborted = _run_tool_loop(agent, n_tool_iterations=5, abort_after=1)
+        agent.client.chat.completions.create.side_effect = None
+        _result, healthy = _run_tool_loop(agent, n_tool_iterations=5)
+
+        assert len(aborted) == 1
+        assert len(healthy) == 3

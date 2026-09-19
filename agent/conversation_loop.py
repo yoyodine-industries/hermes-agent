@@ -1301,6 +1301,9 @@ class _LoopState:
     # a consecutive-ineffective-attempt backstop, rearmed only after a provider response
     # reports a prompt below threshold.
     max_compression_attempts: Any
+    # One aborted (host-timed-out) compression pass ends compression for the turn: latched True by
+    # run_tool_round and read by both it and the pre-API gate (_LATCHED_VERDICT_FIELDS).
+    compression_failed_this_turn: bool = False
     api_call_count: int = 0
     final_response: Any = None
     interrupted: bool = False
@@ -1364,7 +1367,13 @@ _CTX_FIELDS = frozenset({
 _PHASE_PARAMS: Dict[Any, tuple] = {}
 # Verdict fields the loop latches (only ever sets True) instead of copying back:
 # ``handle_api_error`` reports overflow recovery per call and must not clear an earlier arm.
-_LATCHED_VERDICT_FIELDS = {"handle_api_error": frozenset({"_provider_overflow_recovery_pending"})}
+_LATCHED_VERDICT_FIELDS = {
+    "handle_api_error": frozenset({"_provider_overflow_recovery_pending"}),
+    # A stalled compression pass ends compression for the turn: the tool round and the pre-API gate
+    # may only ever raise this flag, never clear it.
+    "run_tool_round": frozenset({"compression_failed_this_turn"}),
+    "run_preflight_gate": frozenset({"compression_failed_this_turn"}),
+}
 
 
 def _run_phase(fn, agent, state: _LoopState, **extra):

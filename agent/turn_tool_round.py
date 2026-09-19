@@ -39,6 +39,8 @@ class ToolRoundVerdict:
     failed: Any
     _turn_exit_reason: Any
     truncated_tool_call_retries: Any
+    # Latched by the loop: one aborted post-tool compression pass ends compression for the turn.
+    compression_failed_this_turn: Any
     result: Optional[Dict[str, Any]] = None
 
 
@@ -47,7 +49,7 @@ def run_tool_round(
     conversation_history: Any, api_call_count: Any, effective_task_id: Any, user_message: Any,
     system_message: Any, active_system_prompt: Any, compression_attempts: Any,
     max_compression_attempts: Any, final_response: Any, failed: Any, _turn_exit_reason: Any,
-    truncated_tool_call_retries: Any,
+    truncated_tool_call_retries: Any, compression_failed_this_turn: Any,
 ) -> ToolRoundVerdict:
     """Execute one tool round in the exact original order. Persist-before-execute is a
     durability invariant: resume must see the executed block if a destructive tool restarts
@@ -60,7 +62,8 @@ def run_tool_round(
             action=action, messages=messages, conversation_history=conversation_history,
             active_system_prompt=active_system_prompt, compression_attempts=compression_attempts,
             final_response=final_response, failed=failed, _turn_exit_reason=_turn_exit_reason,
-            truncated_tool_call_retries=truncated_tool_call_retries, result=result,
+            truncated_tool_call_retries=truncated_tool_call_retries,
+            compression_failed_this_turn=compression_failed_this_turn, result=result,
         )
 
     if not agent.quiet_mode:
@@ -189,6 +192,7 @@ def run_tool_round(
         agent, messages=messages, system_message=system_message, user_message=user_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,
         compression_attempts=compression_attempts,
+        compression_failed_this_turn=compression_failed_this_turn,
         max_compression_attempts=max_compression_attempts, effective_task_id=effective_task_id,
         final_response=final_response, turn_exit_reason=_turn_exit_reason,
     )
@@ -198,6 +202,7 @@ def run_tool_round(
     compression_attempts = _ptc.compression_attempts
     final_response = _ptc.final_response
     _turn_exit_reason = _ptc.turn_exit_reason
+    compression_failed_this_turn = _ptc.compression_failed_this_turn
     if _ptc.end_turn:
         return _verdict("break")
 
