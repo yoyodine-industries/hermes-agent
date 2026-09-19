@@ -2635,10 +2635,14 @@ def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], executio
 def _classify_delivery_outcome(
     *, delivery_error, should_deliver: bool, unresolved_origin: bool,
     normalized_deliver: str, incident_acked: bool, success: bool,
-    delivery_queued=None,
+    delivery_queued=None, delivery_unconfirmed=None,
 ) -> str:
     if delivery_error:
-        return "failed"
+        # A delivery that was handed off but never confirmed is UNCONFIRMED, not failed: nothing
+        # is known to be lost, and "failed" tells the operator to re-send a message that may
+        # already be in the chat. Only an admitted delivery (``delivery_unconfirmed``, recorded
+        # by cron.scheduler_delivery) softens the verdict; every other error stays "failed".
+        return "unconfirmed" if delivery_unconfirmed else "failed"
     if should_deliver and delivery_queued:
         return "queued"
     if should_deliver and unresolved_origin:
@@ -2849,12 +2853,20 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    # Transient admission evidence, popped on every terminal path so it can never leak into the
+    # next run's snapshot (see cron.scheduler_delivery.BOT_CHAT_UNCONFIRMED_KEY).
+    unconfirmed_delivery = _pop_bot_chat_unconfirmed(job)
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
         mark_kwargs["model_unreachable"] = True
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
+    if d.success and d.delivery_error and unconfirmed_delivery:
+        # Agent run succeeded and the payload left for its target, but the confirmation never
+        # came back (reply-wait expiry). Amber, never "delivery_failed" — that reads as "the
+        # message did not go out" and invites a duplicate re-send.
+        mark_kwargs["status"] = "delivery_unconfirmed"
     if fire_owner is not None:
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
@@ -2868,6 +2880,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
+        delivery_unconfirmed=unconfirmed_delivery,
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,
         # Read the lane the notice was actually routed through (failure_deliver on failure).
@@ -3935,8 +3948,8 @@ def tick(
 # ``_sched``). Only names this module itself calls; everything else lives in the split module.
 # ---------------------------------------------------------------------------
 from cron.scheduler_delivery import (  # noqa: E402
-    _deliver_result, _delivery_lane_value, _normalize_deliver_value, _resolve_delivery_target,
-    _resolve_delivery_targets,
+    _deliver_result, _delivery_lane_value, _normalize_deliver_value, _pop_bot_chat_unconfirmed,
+    _resolve_delivery_target, _resolve_delivery_targets,
 )
 from cron.scheduler_script import (  # noqa: E402
     _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,

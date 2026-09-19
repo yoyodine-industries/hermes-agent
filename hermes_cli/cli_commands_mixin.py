@@ -1690,10 +1690,11 @@ class CLICommandsMixin:
             print(f"  Prompt: {job.get('prompt_preview', '')}")
             if job.get("last_run_at"):
                 status = job.get("last_status") or "?"
-                # delivery_failed: the run succeeded but delivery didn't — the reason lives
-                # in last_delivery_error (last_error is None).
-                if status == "delivery_failed" and job.get("last_delivery_error"):
-                    status = f"delivery_failed: {job['last_delivery_error']}"
+                # delivery_failed / delivery_unconfirmed: the run succeeded but the delivery
+                # didn't land (or its confirmation never came back) — the reason lives in
+                # last_delivery_error (last_error is None).
+                if status in ("delivery_failed", "delivery_unconfirmed") and job.get("last_delivery_error"):
+                    status = f"{status}: {job['last_delivery_error']}"
                 elif status == "error" and job.get("last_error"):
                     status = f"error: {job['last_error']}"
                 print(f"  Last run: {job['last_run_at']} ({status})")

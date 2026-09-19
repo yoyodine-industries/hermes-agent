@@ -185,6 +185,23 @@ describe("cronLastResult", () => {
     });
   });
 
+  it("is amber for delivery_unconfirmed and explains it from last_delivery_error", () => {
+    // The run succeeded and the payload was handed to its target; only the confirmation
+    // never came back (reply-wait expiry), so the message may already be in the chat.
+    // Amber — not green, and not the destructive fall-through for an unknown literal.
+    expect(
+      cronLastResult({
+        last_status: "delivery_unconfirmed",
+        last_error: null,
+        last_delivery_error: "bot-chat: handed to the runner — do NOT resend",
+      }),
+    ).toEqual({
+      status: "delivery_unconfirmed",
+      tone: "warning",
+      detail: "bot-chat: handed to the runner — do NOT resend",
+    });
+  });
+
   it("is red for error and any unrecognised literal", () => {
     expect(cronLastResult({ last_status: "error", last_error: "boom" })).toEqual({
       status: "error",

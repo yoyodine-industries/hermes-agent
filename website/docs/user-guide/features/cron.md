@@ -552,6 +552,22 @@ error. A delivery failure does not count toward the job's `failure_streak`
 (the agent did its job); the next fully successful run returns the status to
 `ok`.
 
+### A delivery that was accepted but never confirmed
+
+Delivery can also be **unconfirmed**: the send was admitted — a durable receipt
+exists, or a live owner took the turn — and the reply-wait was armed against
+it, but the confirmation did not come back inside the timeout window. That is
+not a failure. The message may already be in the target's chat, so recording
+`delivery_failed` tells the operator to re-send something that was delivered.
+Those runs record `last_status: delivery_unconfirmed`, keeping the diagnostic
+in `last_delivery_error`: `hermes cron list` shows it in yellow as
+`delivery_unconfirmed: <reason>`, `hermes cron doctor` reports it as
+unconfirmed rather than failed, and a manual `cronjob run` returns
+`success: false` carrying the same do-not-resend reason. Like
+`delivery_failed` it leaves `failure_streak` alone; unlike it, nothing is
+broken to fix and the message must **not** be re-sent. The next fully
+successful run returns the status to `ok`.
+
 ### Bot Chat delivery (`bot-chat`)
 
 `bot-chat` delivers the output **into a profile's canonical "Bot Chat" session as a real message**. Unlike every other target — where the recipient is a human reading a channel — the recipient here is the bot itself: it receives the output as an incoming message, acts on anything that needs action, and responds in its chat. Use it when scheduled output should be *processed*, not just posted.
@@ -846,6 +862,7 @@ Semantics:
 - Script stdout (trimmed) → delivered verbatim as the message.
 - **Empty stdout → silent tick**, no delivery. This is the watchdog pattern: "only say something when something is wrong".
 - Non-zero exit or timeout → an error alert is delivered, so a broken watchdog can't fail silently.
+- **Exit 0 is the whole verdict — reporting something is not failing.** A watchdog that *found* something and said so on stdout (an `ALERT` / `LEAK-ALERT` / `STALE-CLAIM-ALERT` line, exit 0) is recorded `ok`, with that line retained in the run output where the next reader can find it. Exit 0 means the script did its job, and an alert is part of the job. Only a non-zero exit (or a timeout) is a job error, so a detection script never has to fail its own run to get the operator's attention — and it must not, because a non-zero exit books `last_status: error` and increments `failure_streak`.
 - `{"wakeAgent": false}` on the last line → silent tick (same gate LLM jobs use).
 - No tokens, no model, no provider fallback — the job never touches the inference layer.
 

@@ -95,6 +95,11 @@ describe('the facts the row never showed', () => {
     expect(routineLastResult('ok')).toBe('Succeeded')
     expect(routineLastResult('error')).toBe('Failed')
     expect(routineLastResult('delivery_failed')).toBe('Ran, but delivery failed')
+    // Admitted but never confirmed: not a failure (do not re-send) and not a success.
+    expect(routineLastResult('delivery_unconfirmed')).toBe('Ran, but delivery unconfirmed (do not re-send)')
+    expect(
+      valueOf(routineDetailRows({ ...activeJob, last_status: 'delivery_unconfirmed' }), 'Last result')
+    ).toBe('Ran, but delivery unconfirmed (do not re-send)')
     expect(routineLastResult('blocked_config')).toBe('Blocked by configuration (not run)')
     // Unknown literals pass through rather than vanish.
     expect(routineLastResult('something_new')).toBe('something_new')
