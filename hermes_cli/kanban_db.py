@@ -92,7 +92,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
-# Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
+# Same-reason block -> unblock -> re-block cycles before the task is parked for a human.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
@@ -937,10 +937,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
-    -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
-    -- successful completion — NOT on unblock (resetting on unblock is exactly
-    -- the amnesia that let the loop run unbounded).
+    -- BLOCK_RECURRENCE_LIMIT the task still lands in ``blocked`` (never
+    -- ``triage``) but is PARKED: the disposition sweep escalates it at
+    -- recurrence >= 2 instead of requeueing it, so a cron can't spin it
+    -- forever. Reset to 0 only on a successful completion — NOT on unblock
+    -- (resetting on unblock is exactly the amnesia that let the loop run
+    -- unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
 );
 
@@ -2539,12 +2541,15 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
+    """``running|ready|blocked|review|triage -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval; with no active run the handoff fields survive via
-    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
-    ``metadata`` land on the closing run for :func:`build_worker_context`.
+    approval, and ``triage`` so a rough idea whose work already happened
+    elsewhere can be closed out instead of sitting on the spec shelf with no
+    exit (D4: ``complete`` is ``triage``'s explicit close). With no active run
+    the handoff fields survive via :func:`_synthesize_ended_run`. ``summary``
+    (defaults to ``result``) and ``metadata`` land on the closing run for
+    :func:`build_worker_context`.
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
@@ -2581,7 +2586,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'review', 'triage')
                 """
         params: tuple = (result, now, task_id)
         if expected_run_id is not None:
@@ -2934,8 +2939,8 @@ def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
 ) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``transient`` still counts toward the loop breaker
+    """``running``/``ready`` -> ``blocked`` (or ``todo`` for a dependency wait,
+    see :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
@@ -2992,7 +2997,13 @@ def _route_block(
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``BLOCK_RECURRENCE_LIMIT`` the task PARKS: it lands in ``blocked`` like any
+    other human ask, carrying ``block_recurrences``/``block_kind`` and a
+    ``block_loop_detected`` event, and stops being auto-requeued (the disposition
+    sweep escalates a card at recurrence >= 2). It deliberately does NOT route to
+    ``triage``: triage is the spec shelf, and a card parked there has no exit —
+    ``promote``/``unblock`` both refused it, so the only documented way out was
+    hand-written SQL against the live board.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
@@ -3002,7 +3013,10 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
+        # Park, don't stash: `blocked` is where a card waits for the human whose
+        # decision the breaker is asking for, and it is the only status with a
+        # documented exit for every other lane's tooling.
+        return "blocked", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
@@ -3231,17 +3245,21 @@ def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    """Operator promotion ``triage``/``todo``/``blocked`` -> ``ready`` with an
+    audit event. ``triage`` is accepted so the spec shelf is never a one-way
+    door: a rough idea that is already specified — or one you just judged
+    workable as it stands — has to be releasable without hand-written SQL. The
+    audit event records ``from_status`` so the departure from the shelf is
+    visible on the card. Refused while a parent is unfinished; ``dry_run`` only
+    validates. Returns ``(ok, reason)``."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("triage", "todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'triage', 'todo' or 'blocked'"
         )
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
@@ -3267,11 +3285,14 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            "WHERE id = ? AND status IN ('triage', 'todo', 'blocked')", (task_id,),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        _append_event(
+            conn, task_id, "promoted_manual",
+            {"actor": actor, "reason": reason, "from_status": cur_status},
+        )
 
     return True, None
 
