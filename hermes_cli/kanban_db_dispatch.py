@@ -172,6 +172,19 @@ class DispatchResult:
     (``respawn_guarded``, ``skipped_per_profile_capped``, ``skipped_locked``,
     ``memory_pressure``, ``spawn_budget_blocked``) are not failures."""
 
+    deferred_host_capped: list[str] = field(default_factory=list)
+    """Task ids the HOST cap (``kanban.max_in_progress``) left unspawned this
+    tick, in dispatch order — head of line first.
+
+    ``spawn_budget_blocked="max_in_progress"`` says a cap consumed the tick; it
+    says nothing about WHAT was starved, so a board could lose the host-wide
+    race for days while health telemetry read "capacity full" as a healthy
+    steady state. Naming the denied cards lets :class:`DispatcherHealth` age the
+    deferral and warn once one board has been starved past
+    :data:`HEALTH_HOST_CAP_DEFER_SECONDS`. Empty for every other deferral:
+    ``max_spawn`` is a per-board setting the board's own owner chose, not a race
+    with other boards."""
+
 
 # ---------------------------------------------------------------------------
 # Dispatcher health telemetry (shared by the gateway watcher and the daemon)
@@ -183,15 +196,30 @@ class DispatchResult:
 # `kanban.max_in_progress` are consumed, so a deep queue and a wedged dispatcher
 # looked identical; meanwhile a card that was claimed and could not be launched
 # at all (the one signal an operator must act on) raised no alarm. The rules
-# below tell the three states apart: deferred (silent), failed (warn at once,
-# naming board/profile/task/reason), and stalled (nothing attempted, nothing
-# explains it, old work waiting — warn after HEALTH_WINDOW ticks).
+# below tell the states apart: deferred (silent), failed (warn at once, naming
+# board/profile/task/reason), stalled (nothing attempted, nothing explains it,
+# old work waiting — warn after HEALTH_WINDOW ticks), and host-cap starved (one
+# board has lost the host-wide budget for long enough to be worth a line —
+# see HEALTH_HOST_CAP_DEFER_SECONDS).
 # ---------------------------------------------------------------------------
 HEALTH_WINDOW = 6
 """Consecutive unexplained no-op ticks before the stall warning."""
 
 HEALTH_STALL_AGE_SECONDS = 1800.0
 """Pending work younger than this is not stalled — it just arrived."""
+
+HEALTH_HOST_CAP_DEFER_SECONDS = 3600.0
+"""How long one board may stay host-cap-deferred before it is reported.
+
+Deliberately NOT ``HEALTH_STALL_AGE_SECONDS``: the two measure different
+things. That one ages a card from ``created_at`` (an upper bound on time spent
+ready — a card filed days ago and readied a minute ago looks old), while this
+one clocks CONSECUTIVE host-cap deferral as the dispatcher observed it. Nor is
+a deferral itself the fault: on a loaded host minutes of it are the steady
+state, and warning there would recreate the false positive the rule above
+replaced. An hour of losing the ``kanban.max_in_progress`` race, tick after
+tick, is a starved board, not a busy host.
+"""
 
 HEALTH_WARN_INITIAL_INTERVAL = 300.0
 """Seconds before a repeat of an unchanged warning state (doubles per repeat)."""
@@ -252,6 +280,11 @@ def tick_deferral_reason(result: Optional[object]) -> Optional[str]:
     with a reason is loaded/guarded host behaviour doing the right thing — never a
     stall. ``None`` means "no spawn and nothing explains it", the only state worth
     watching.
+
+    ``spawn_budget:max_in_progress`` is the one reason that does not by itself
+    mean the host is fine: it is still not a stall (the dispatcher is working),
+    so the rule above stays silent, and :class:`DispatcherHealth` carries the
+    separate starvation warning it can age.
     """
     if result is None:
         return None
@@ -354,15 +387,40 @@ def stuck_ready_message(stats: dict) -> str:
     )
 
 
+def host_cap_deferral_message(
+    board: Optional[str], task_id: str, age_seconds: float, waiting: int
+) -> str:
+    """Operator-facing line for a board that keeps losing the HOST budget.
+
+    Distinct from :func:`stall_message`: the dispatcher IS working — it hands
+    the host-wide ``kanban.max_in_progress`` budget to other boards every tick,
+    and this board never gets a slot. Distinct from an ordinary deferral too:
+    that one is short, and this one has been unbroken for ``age_seconds``.
+    """
+    minutes = int(age_seconds // 60)
+    where = f"kanban dispatcher[{board}]" if board else "kanban dispatcher"
+    return (
+        f"{where}: {task_id} has waited ~{minutes} min as head of line while "
+        f"{waiting} spawnable card(s) went unspawned and every running slot was "
+        f"given to another board — `kanban.max_in_progress` is host-wide, so this "
+        f"board loses that race tick after tick and nothing here can start. Raise "
+        f"`kanban.max_in_progress`, or take work off the boards holding the budget."
+    )
+
+
 class DispatcherHealth:
     """Backlog-aware health tracker for one dispatcher loop.
 
     States: ``failed`` (a claimed card could not be launched — warn at once),
     ``stalled`` (no spawn attempted, nothing deferred it, and work older than
     :data:`HEALTH_STALL_AGE_SECONDS` is waiting — warn after
-    :data:`HEALTH_WINDOW` ticks), otherwise healthy and silent. Capacity
-    deferrals, guards, pauses and work that merely arrived are NOT trouble: on a
-    loaded host they are the steady state.
+    :data:`HEALTH_WINDOW` ticks), ``host_cap_deferred`` (this board has lost the
+    host-wide ``kanban.max_in_progress`` budget past
+    :data:`HEALTH_HOST_CAP_DEFER_SECONDS` — warn, naming board, card and wait),
+    otherwise healthy and silent. Capacity deferrals, guards, pauses and work
+    that merely arrived are NOT trouble: on a loaded host they are the steady
+    state — with that one bounded exception, because a host-cap deferral is the
+    only deferral this board cannot end by itself.
 
     Repeats of an unchanged state wait an interval that doubles from
     :data:`HEALTH_WARN_INITIAL_INTERVAL` to :data:`HEALTH_WARN_MAX_INTERVAL`, so
@@ -375,11 +433,13 @@ class DispatcherHealth:
         *,
         window: int = HEALTH_WINDOW,
         stall_age_seconds: float = HEALTH_STALL_AGE_SECONDS,
+        host_cap_defer_seconds: float = HEALTH_HOST_CAP_DEFER_SECONDS,
         warn_initial_interval: float = HEALTH_WARN_INITIAL_INTERVAL,
         warn_max_interval: float = HEALTH_WARN_MAX_INTERVAL,
     ) -> None:
         self.window = max(1, int(window))
         self.stall_age_seconds = float(stall_age_seconds)
+        self.host_cap_defer_seconds = float(host_cap_defer_seconds)
         self.warn_initial_interval = float(warn_initial_interval)
         self.warn_max_interval = float(warn_max_interval)
         self.reset()
@@ -392,10 +452,14 @@ class DispatcherHealth:
         self._interval = self.warn_initial_interval
         self._last_report_at: Optional[float] = None
         self._reported = False
+        self._host_cap_since: dict[str, float] = {}
 
     def pause(self) -> None:
         """Dispatch is disallowed (``hermes pause``): an idle dispatcher, not a stall."""
         self.stalled_ticks = 0
+        # A paused dispatcher defers nothing, so a starvation clock carried
+        # across the pause would report an outage that never happened.
+        self._host_cap_since.clear()
 
     def observe_tick(
         self,
@@ -413,6 +477,10 @@ class DispatcherHealth:
         the stall heuristic, because "the dispatcher tried nothing" and "nothing
         exists in the fleet that could ever try" are different diagnoses and the
         second one is silent under the old rule.
+
+        A host-cap deferral is judged last and only on age: it is an explained
+        tick (so the stall rule stays silent by design) that must still surface
+        once it stops being transient.
         """
         at = time.time() if now is None else float(now)
         failures = collect_spawn_failures(board_results)
@@ -424,12 +492,57 @@ class DispatcherHealth:
             )
         if stuck and int(stuck.get("count") or 0) > 0:
             return self._emit("warning", stuck_ready_message(stuck), "stuck_ready", at)
+        starved = self._host_cap_message(board_results, at)
+        if starved is not None:
+            return self._emit("warning", starved, "host_cap_deferred", at)
         stalled = self._stall_message(board_results, pending or PendingWork())
         if stalled is not None:
             return self._emit("warning", stalled, "stalled", at)
         return self._clear()
 
     # -- internals --------------------------------------------------------
+    def _host_cap_message(
+        self,
+        board_results: Optional[Iterable[tuple[str, Optional[object]]]],
+        at: float,
+    ) -> Optional[str]:
+        """Warn once a board has been host-cap-deferred past the bounded age.
+
+        The clock is per BOARD and runs only while that board appears in a
+        host-cap-deferred tick; a board that spawns, or stops being deferred,
+        starts over. Not per card: a rotating head of line would reset the clock
+        and hide a board that has been starved for hours — the exact fault this
+        exists to expose. The card NAMED is that tick's head of line, i.e. the
+        one the cap denied first.
+
+        Ticks that record the cap without naming any card (nothing spawnable,
+        another producer) are left alone: unproven starvation is not a warning.
+        """
+        waiting: dict[str, int] = {}
+        heads: dict[str, str] = {}
+        for slug, result in board_results or []:
+            deferred = getattr(result, "deferred_host_capped", None) or []
+            if not deferred:
+                continue
+            slug = slug or "?"
+            waiting[slug] = len(deferred)
+            heads.setdefault(slug, str(deferred[0]))
+            self._host_cap_since.setdefault(slug, at)
+
+        for slug in [s for s in self._host_cap_since if s not in waiting]:
+            self._host_cap_since.pop(slug, None)
+
+        overdue = [
+            (slug, at - since)
+            for slug, since in self._host_cap_since.items()
+            if at - since > self.host_cap_defer_seconds
+        ]
+        if not overdue:
+            return None
+        # Name the longest-starved board: it is the one losing the race hardest.
+        slug, age = max(overdue, key=lambda entry: entry[1])
+        return host_cap_deferral_message(slug, heads.get(slug, "?"), age, waiting.get(slug, 0))
+
     def _stall_message(
         self,
         board_results: Optional[Iterable[tuple[str, Optional[object]]]],
@@ -2192,6 +2305,11 @@ def _tick_spawn_budget(
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
             result.spawn_budget_blocked = "max_in_progress"
+            # The cap is HOST-wide and raced by every board, so unlike the
+            # buckets above a board deferred here has no local signal of its
+            # own: name the cards the cap denied, so health telemetry can age
+            # the starvation instead of reading "capacity full" as healthy.
+            result.deferred_host_capped = spawnable_pending_ids(conn)
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -2236,22 +2354,77 @@ def zero_run_ready(
     return _kb.zero_run_ready(conn, now=now, min_age_seconds=min_age_seconds)
 
 
-def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
+def _lane_rows(
+    conn: sqlite3.Connection, status: str, *, now: Optional[float] = None
+) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order.
 
     Ordering is the shared age-aware effective priority
     (``kanban_db.effective_priority_order_sql``): a card that has waited long
     enough outranks fresher higher-priority work, so a low-priority lane can
     never be starved indefinitely by a steady trickle of P0/P1 cards. Both lane
-    orders (ready and review) call the one helper so they cannot drift.
+    orders (ready and review) call the one helper so they cannot drift, and the
+    rank probes below read it too — a board is therefore ranked by exactly the
+    order its own cards will be spawned in.
+
+    ``priority``/``created_at`` ride along so a caller can read in Python the
+    same effective priority the ``ORDER BY`` composed in SQL; ``now`` pins both
+    to one instant for deterministic tests.
     """
-    order_body, order_params = _kb.effective_priority_order_sql()
+    order_body, order_params = _kb.effective_priority_order_sql(now)
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, priority, created_at FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         f"ORDER BY {order_body}",
         order_params,
     ).fetchall()
+
+
+def _spawnable_lane_rows(
+    conn: sqlite3.Connection,
+    *,
+    include_review: Optional[bool] = None,
+    now: Optional[float] = None,
+) -> list[sqlite3.Row]:
+    """This board's spawnable ready (and review) rows, head of line first.
+
+    Spawnable is the dispatcher's own gate, the one ``_has_spawnable`` applies:
+    an unclaimed ready/review card assigned to a real profile. Cards no worker
+    could ever run — unassigned ones parked for triage, and control-plane lanes
+    that pull their work with ``claim_task`` — are excluded, so everything named
+    from here is something a free slot would really have started.
+    """
+    if include_review is None:
+        include_review = review_dispatch_enabled()
+    rows = _lane_rows(conn, "ready", now=now)
+    if include_review:
+        rows = rows + _lane_rows(conn, "review", now=now)
+    profile_exists = _profile_exists_fn()
+    if profile_exists is None:
+        return [row for row in rows if row["assignee"]]
+    return [row for row in rows if row["assignee"] and profile_exists(row["assignee"])]
+
+
+def spawnable_pending_ids(conn: sqlite3.Connection) -> list[str]:
+    """Ids of this board's spawnable cards waiting for a worker, head of line first."""
+    return [row["id"] for row in _spawnable_lane_rows(conn)]
+
+
+def head_of_line_priority(
+    conn: sqlite3.Connection, *, now: Optional[float] = None
+) -> Optional[int]:
+    """Effective priority of this board's head-of-line spawnable card, or ``None``.
+
+    ``None`` means the board has nothing a worker could start. A caller that
+    allocates a shared budget must still VISIT such a board — reclaim,
+    promotion and decomposition work is board-local — it simply cannot rank it.
+    """
+    rows = _spawnable_lane_rows(conn, now=now)
+    if not rows:
+        return None
+    head = rows[0]
+    at = time.time() if now is None else float(now)
+    return _kb.effective_priority(head["priority"], head["created_at"], now=at)
 
 
 def _any_spawnable_review(review_rows: list[sqlite3.Row]) -> bool:

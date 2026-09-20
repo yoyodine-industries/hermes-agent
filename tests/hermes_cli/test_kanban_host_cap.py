@@ -313,3 +313,138 @@ def test_review_budget_still_bounded_by_shared_cap(
 
     # Budget 2 total across both lanes, reservation notwithstanding.
     assert len(res.spawned) == 2
+
+
+# ---------------------------------------------------------------------------
+# 4. A host-cap deferral NAMES the cards it starved (Q3)
+# ---------------------------------------------------------------------------
+
+
+def test_host_cap_deferral_names_the_cards_it_starves(
+    kanban_home, all_assignees_spawnable,
+):
+    """``max_in_progress`` races every board, so the deferred board must say what it lost.
+
+    ``spawn_budget_blocked="max_in_progress"`` only recorded that a cap had
+    consumed the tick. With no per-board list of the work that was denied, a
+    board could lose that race for days while every health rule read "capacity
+    full, healthy" — the deferral hid indefinite starvation.
+    """
+    kb.create_board("second")
+
+    with kbc.connect(board="second") as conn:
+        for title in ("busy-1", "busy-2"):
+            tid = kb.create_task(conn, title=title, assignee="alice")
+            assert kb.claim_task(conn, tid) is not None
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        head = kb.create_task(conn, title="starved-head", assignee="alice", priority=3)
+        tail = kb.create_task(conn, title="starved-next", assignee="alice", priority=1)
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    assert not spawns
+    assert res.spawn_budget_blocked == "max_in_progress"
+    # Dispatch order: head of line (P3) first, then the P1 card behind it.
+    assert res.deferred_host_capped == [head, tail]
+
+
+def test_max_spawn_deferral_names_no_starved_cards(
+    kanban_home, all_assignees_spawnable,
+):
+    """``max_spawn`` is this board's own setting — not a race with other boards."""
+    spawns: list = []
+    with kbc.connect() as conn:
+        running = kb.create_task(conn, title="already-running", assignee="alice")
+        assert kb.claim_task(conn, running) is not None
+        kb.create_task(conn, title="waiting", assignee="alice")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_spawn=1,
+        )
+
+    assert not spawns
+    assert res.spawn_budget_blocked == "max_spawn"
+    assert res.deferred_host_capped == []
+
+
+def test_host_cap_deferral_lists_only_spawnable_cards(
+    kanban_home, monkeypatch,
+):
+    """A card no worker could ever run is not a card the HOST cap starved.
+
+    Unassigned cards and control-plane lanes (a Claude Code terminal pulling
+    work with ``claim_task``) are not spawnable. Naming them would send the
+    operator after ``kanban.max_in_progress`` when the real fault is routing.
+    """
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name == "alice")
+
+    kb.create_board("second")
+    with kbc.connect(board="second") as conn:
+        tid = kb.create_task(conn, title="busy", assignee="alice")
+        assert kb.claim_task(conn, tid) is not None
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        spawnable = kb.create_task(conn, title="spawnable", assignee="alice")
+        kb.create_task(conn, title="no-assignee")
+        kb.create_task(conn, title="control-plane", assignee="orion-cc")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1,
+        )
+
+    assert res.spawn_budget_blocked == "max_in_progress"
+    assert res.deferred_host_capped == [spawnable]
+
+
+def test_spawnable_pending_ids_follows_the_lane_order(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """The named list is the same head-of-line order the spawn loops use."""
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    with kbc.connect() as conn:
+        low = kb.create_task(conn, title="P1", assignee="alice", priority=1)
+        high = kb.create_task(conn, title="P4", assignee="alice", priority=4)
+        # Higher effective priority first; the equal-priority card filed later
+        # waits behind the older one (created_at ASC is the tiebreak).
+        assert kbd.spawnable_pending_ids(conn) == [high, low]
+        review = _park_in_review(conn, "review-me", "reviewer")
+        assert kbd.spawnable_pending_ids(conn) == [high, low, review]
+
+
+def test_spawnable_pending_ids_skips_unspawnable_cards(
+    kanban_home, monkeypatch,
+):
+    """Only cards a free slot could actually run are named."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name == "alice")
+
+    with kbc.connect() as conn:
+        spawnable = kb.create_task(conn, title="spawnable", assignee="alice")
+        kb.create_task(conn, title="control-plane", assignee="orion-cc")
+        _park_in_review(conn, "human-review", "some-human")
+        assert kbd.spawnable_pending_ids(conn) == [spawnable]
+
+    # Review dispatch off: the lane is not enumerated at all.
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": False}},
+    )
+    with kbc.connect() as conn:
+        _park_in_review(conn, "autonomous-review", "alice")
+        assert kbd.spawnable_pending_ids(conn) == [spawnable]

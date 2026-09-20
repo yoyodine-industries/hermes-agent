@@ -1156,10 +1156,13 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     # probe, bumping this from 3 → 5. The dispatch-health stuck-ready probe
     # (``zero_run_ready``, one extra read-only connect per tick, also wrapped
     # in its own try/except so a board that cannot be read stays silent)
-    # bumps it 5 → 7. The point of this assertion is that a quarantined
-    # board produces no traceback and no amplified work: a constant +1
-    # probe per tick is expected, a growing count is not.
-    assert calls["connect"] == 7
+    # bumps it 5 → 7. The head-of-line ranking probe
+    # (``head_of_line_priority``, one read-only connect per board per dispatch
+    # tick, wrapped in contextlib.suppress for the same reason) runs on both
+    # dispatch ticks, bumping it 7 → 9. The point of this assertion is that a
+    # quarantined board produces no traceback and no amplified work: a constant
+    # +1 probe per tick is expected, a growing count is not.
+    assert calls["connect"] == 9
 
 
 # ---------------------------------------------------------------------------

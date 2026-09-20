@@ -362,3 +362,88 @@ def test_create_task_parks_an_unspawnable_assignee_with_a_named_event(
     assert "reassign" in payload["fix"]  # names the fix
     assert "claim_task" in payload["fix"]  # ... and the lane that keeps working
     assert clean == 0
+
+
+# ---------------------------------------------------------------------------
+# The head-of-line probe: one rank per board
+#
+# ``gateway.kanban_watchers_dispatcher.tick_once`` allocates the one host-wide
+# spawn budget in board visit order, so it needs a single number per board — and
+# that number has to come from the SAME order the spawn loops use, waiting time
+# included, or a board holding a week-old P3 card keeps losing to a board with
+# one fresh P0 card.
+# ---------------------------------------------------------------------------
+
+
+def _plant_ranked(card_id: str, *, priority: int, seconds_ago: float, assignee):
+    """A ready card with an exact effective priority (awaited: no workers)."""
+    import time as _time
+
+    created = int(_time.time() - seconds_ago)
+    with _open() as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
+            "VALUES (?, ?, ?, 'ready', ?, ?)",
+            (card_id, card_id, assignee, priority, created),
+        )
+        conn.commit()
+
+
+def test_head_of_line_priority_ranks_a_board_by_its_most_starved_card(
+    kanban_home, monkeypatch
+):
+    """A week of waiting outranks any declared priority (the age bonus, capped)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    _plant_ranked("t_old_backlog", priority=0, seconds_ago=7 * 24 * 3600, assignee="alice")
+    _plant_ranked("t_fresh_p0", priority=3, seconds_ago=0, assignee="alice")
+
+    with _open() as conn:
+        rank = kbd.head_of_line_priority(conn)
+        assert rank == kb.PRIORITY_AGE_BONUS_CAP  # 0 + capped bonus ≠ 3
+        assert rank > kb.effective_priority(3, None)  # ... and beats the fresh P0
+
+    # Drop the backlog card: the fresh P0 becomes the head of line.
+    with _open() as conn:
+        conn.execute("DELETE FROM tasks WHERE id = 't_old_backlog'")
+        conn.commit()
+        assert kbd.head_of_line_priority(conn) == 3
+
+        # Order is the LANE order, not another sort: the head changes when a
+        # higher-ranked card arrives, and the probe follows it.
+        conn.execute(
+            "UPDATE tasks SET priority = 0 WHERE id = 't_fresh_p0'"
+        )
+        conn.commit()
+        assert kbd.head_of_line_priority(conn) == 0
+
+
+def test_head_of_line_priority_is_none_when_no_card_could_be_spawned(
+    kanban_home, monkeypatch
+):
+    """No spawnable card ⇒ no rank. Unranked is not the same as unvisited."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "alice")
+    with _open() as conn:
+        assert kbd.head_of_line_priority(conn) is None
+        # Claimed work is not waiting for a worker.
+        claimed = kb.create_task(conn, title="claimed", assignee="alice", priority=3)
+        assert kb.claim_task(conn, claimed) is not None
+        assert kbd.head_of_line_priority(conn) is None
+        # Neither is a control-plane lane (pulls work with claim_task)...
+        kb.create_task(conn, title="control-plane", assignee="orion-cc", priority=3)
+        assert kbd.head_of_line_priority(conn) is None
+        # ... nor a card nobody owns.
+        kb.create_task(conn, title="unassigned", priority=3)
+        assert kbd.head_of_line_priority(conn) is None
+
+        # One real card, and the board has a rank again.
+        real = kb.create_task(conn, title="real", assignee="alice", priority=2)
+        assert kbd.head_of_line_priority(conn) == 2
+        assert kbd.spawnable_pending_ids(conn) == [real]

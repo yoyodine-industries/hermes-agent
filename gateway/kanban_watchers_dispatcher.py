@@ -29,6 +29,30 @@ def _kbd():
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
 
+def order_boards_by_head_priority(priorities: dict) -> list:
+    """``{slug: head-of-line effective priority or None}`` → board visit order.
+
+    Descending head-of-line effective priority, ties broken by board name. The
+    order is the host-budget ALLOCATION policy, not a cosmetic detail: every
+    board draws from the one host-wide ``kanban.max_in_progress`` budget, and
+    :meth:`_KanbanDispatcher.tick_once` hands the free slots to whatever board
+    it reaches first. In filesystem order that is an accident of naming — a
+    board whose slug sorts late loses every race to an earlier board however
+    long its cards have waited.
+
+    ``None`` (nothing spawnable, or a probe that failed) ranks LAST, and by name
+    among its peers: unranked boards still get their turn, they simply cannot
+    outrank a board with work waiting.
+    """
+
+    def rank(entry: tuple) -> tuple:
+        slug, priority = entry
+        effective = float("-inf") if priority is None else float(priority)
+        return (-effective, str(slug))
+
+    return [slug for slug, _priority in sorted(priorities.items(), key=rank)]
+
+
 @dataclass
 class _DispatcherSettings:
     """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
@@ -136,6 +160,36 @@ class _KanbanDispatcher:
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
 
+    def head_of_line_priority(self, slug: str) -> Optional[int]:
+        """Effective priority of *slug*'s head-of-line spawnable card, or ``None``.
+
+        A probe, never a decision: a board that cannot be read, or that has
+        nothing a worker could start, returns ``None``. Such a board is still
+        visited — reclaim, promotion and decomposition work is board-local — it
+        just cannot be ranked. Never raises, so one bad board cannot cost the
+        whole tick its order.
+        """
+        conn = None
+        try:
+            conn = _kbc().connect(board=slug)
+            return _kbd().head_of_line_priority(conn)
+        except Exception:
+            return None
+        finally:
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
+
+    def board_visit_order(self) -> list:
+        """Every board, most-starved head of line first (see the helper below).
+
+        One probe per board; ``_board_slugs`` is read once so a board appearing
+        mid-tick cannot be visited twice or dropped.
+        """
+        return order_boards_by_head_priority(
+            {slug: self.head_of_line_priority(slug) for slug in self._board_slugs()}
+        )
+
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         path = self.kb.kanban_db_path(slug)
         try:
@@ -206,8 +260,15 @@ class _KanbanDispatcher:
                     conn.close()
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
-        """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        """Run one dispatch_once per board, most-starved head of line first.
+
+        Returns ``(slug, result)`` pairs in the order the boards were VISITED,
+        which is also the order they drew from the one host-wide
+        ``kanban.max_in_progress`` budget this tick.
+        """
+        return [
+            (slug, self.tick_once_for_board(slug)) for slug in self.board_visit_order()
+        ]
 
     def oldest_pending(self) -> Any:
         """Longest-waiting spawnable card on any board, as ``PendingWork``.

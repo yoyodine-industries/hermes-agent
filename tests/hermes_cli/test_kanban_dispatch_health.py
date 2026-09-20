@@ -11,6 +11,8 @@ raised nothing.
 
 from __future__ import annotations
 
+import pytest
+
 from hermes_cli.kanban_db_dispatch import (
     DispatcherHealth,
     DispatchResult,
@@ -18,6 +20,21 @@ from hermes_cli.kanban_db_dispatch import (
     tick_deferral_reason,
     tick_did_work,
 )
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME with an empty kanban DB (the daemon entry point opens one)."""
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
 
 
 def _tick(**fields) -> list[tuple[str, DispatchResult]]:
@@ -101,3 +118,153 @@ def test_a_deferral_is_not_a_failure_and_work_is_not_a_deferral() -> None:
     assert tick_did_work(DispatchResult(reclaimed=2)) is True
     assert tick_did_work(DispatchResult()) is False
     assert tick_did_work(None) is False
+
+
+# ---------------------------------------------------------------------------
+# The host cap is the ONE deferral that must eventually report
+#
+# Every other deferral bucket is decided by the deferred board's own config or
+# state, so silence about it is honest. `kanban.max_in_progress` is a race with
+# every OTHER board: a board can lose it for days, recording a deferral every
+# tick and no skip bucket, while the queue behind it grows. These pin the
+# bounded-age override that turns that indefinite starvation into a line.
+# ---------------------------------------------------------------------------
+
+
+def _starved(head: str = "t_head", **fields) -> list[tuple[str, DispatchResult]]:
+    """One host-cap-deferred tick that names the card it was denied."""
+    return _tick(
+        spawn_budget_blocked="max_in_progress",
+        deferred_host_capped=[head],
+        **fields,
+    )
+
+
+def test_host_cap_starvation_warns_only_past_the_bounded_age() -> None:
+    """A board that has lost the host budget for long enough gets named."""
+    health = DispatcherHealth(host_cap_defer_seconds=600.0)
+    starved = _starved()
+
+    # Ten minutes of losing every race: still the loaded host's steady state.
+    for tick in range(40):
+        report = health.observe_tick(starved, pending=PendingWork(), now=1_000.0 + tick * 10)
+        assert report is None, f"tick {tick} warned during a normal deferral: {report}"
+
+    report = health.observe_tick(starved, pending=PendingWork(), now=2_000.0)
+    assert report is not None and report.level == "warning"
+    for token in ("ops", "t_head", "min"):
+        assert token in report.message
+
+
+def test_host_cap_starvation_clock_resets_when_the_board_gets_a_slot() -> None:
+    """Starvation is CONSECUTIVE: a board given a slot is not still starving."""
+    health = DispatcherHealth(host_cap_defer_seconds=600.0)
+    assert health.observe_tick(_starved(), pending=PendingWork(), now=1_000.0) is None
+    assert health.observe_tick(_starved(), pending=PendingWork(), now=1_500.0) is None
+
+    # This board spawned: its deferral is over.
+    spawned = _tick(spawned=[("t_head", "alice", "/w")])
+    assert health.observe_tick(spawned, pending=PendingWork(), now=1_600.0) is None
+
+    # Starved again — the earlier wait must not be inherited.
+    assert health.observe_tick(_starved(), pending=PendingWork(), now=1_700.0) is None
+    assert health.observe_tick(_starved(), pending=PendingWork(), now=2_100.0) is None
+    report = health.observe_tick(_starved(), pending=PendingWork(), now=2_400.0)
+    assert report is not None and "t_head" in report.message
+
+
+def test_host_cap_deferral_with_no_named_cards_stays_silent() -> None:
+    """No recorded victims means unproven starvation — never a warning.
+
+    Covers the producers that record the cap without enumerating (a board with
+    nothing spawnable, a write that failed): the rule needs evidence, so it
+    cannot invent a starved board.
+    """
+    health = DispatcherHealth(host_cap_defer_seconds=10.0)
+    for tick in range(50):
+        report = health.observe_tick(
+            _tick(spawn_budget_blocked="max_in_progress"),
+            pending=_old_pending(),
+            now=1_000.0 + tick * 100,
+        )
+        assert report is None
+
+
+def test_host_cap_starvation_names_the_head_of_line_card() -> None:
+    """The named card is the one the cap denied first — the head of line."""
+    health = DispatcherHealth(host_cap_defer_seconds=600.0)
+    starved = _starved(head="t_oldest")
+    starved[0][1].deferred_host_capped.append("t_behind")
+    assert health.observe_tick(starved, pending=PendingWork(), now=1_000.0) is None
+    report = health.observe_tick(starved, pending=PendingWork(), now=2_000.0)
+    assert report is not None
+    assert "t_oldest" in report.message
+    assert "t_behind" not in report.message
+
+
+def test_host_cap_starvation_clears_like_any_other_state() -> None:
+    """Returning to health emits exactly one info line, then silence."""
+    health = DispatcherHealth(host_cap_defer_seconds=600.0)
+    assert health.observe_tick(_starved(), pending=PendingWork(), now=1_000.0) is None
+    assert health.observe_tick(_starved(), pending=PendingWork(), now=2_000.0) is not None
+
+    recovered = _tick(spawned=[("t_head", "alice", "/w")])
+    report = health.observe_tick(recovered, pending=PendingWork(), now=2_100.0)
+    assert report is not None and report.level == "info"
+    assert health.observe_tick(recovered, pending=PendingWork(), now=2_200.0) is None
+
+
+def test_pause_clears_the_starvation_clock() -> None:
+    """A paused dispatcher is not a starved board: no clock survives a pause."""
+    health = DispatcherHealth(host_cap_defer_seconds=600.0)
+    assert health.observe_tick(_starved(), pending=PendingWork(), now=1_000.0) is None
+    health.pause()
+    assert health.observe_tick(_starved(), pending=PendingWork(), now=5_000.0) is None
+
+
+def test_the_standalone_daemon_feeds_the_tracker_labelled_results(
+    kanban_home, monkeypatch
+) -> None:
+    """``hermes kanban dispatch --force`` must reach these rules at all.
+
+    Regression: the standalone loop ticks ONE board and handed DispatcherHealth
+    the bare ``DispatchResult``, so the first rule raised on
+    ``for slug, result in board_results`` — and ``run_daemon``'s
+    ``contextlib.suppress`` ate it. Every rule here (launch failures, stuck
+    ready, host-cap starvation) was dead on that entry point while its own
+    comment advertised them.
+    """
+    from types import SimpleNamespace
+
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_ops
+
+    seen: dict = {}
+    result = kbd.DispatchResult(spawn_budget_blocked="max_in_progress")
+
+    class _Tracker:
+        def __init__(self, **kwargs) -> None:
+            seen["init"] = kwargs
+
+        def observe_tick(self, board_results=None, **kwargs):
+            seen["board_results"] = board_results
+            return None
+
+    # kanban_ops resolves both through the dispatch module, and run_daemon is
+    # what actually calls on_tick — patch where that call site reads them, or
+    # the real daemon loop runs and the tick never happens.
+    monkeypatch.setattr(kbd, "DispatcherHealth", _Tracker)
+    monkeypatch.setattr(
+        kbd, "run_daemon",
+        lambda **kwargs: kwargs["on_tick"](result),  # one tick, then stop
+    )
+
+    args = SimpleNamespace(
+        force=True, interval=5.0, max=None, failure_limit=2, board="ops",
+        pidfile=None, verbose=False,
+    )
+    assert kanban_ops._cmd_daemon(args) == 0
+
+    # The tracker got the shape it documents: (board, result) pairs.
+    assert seen["board_results"] == [("ops", result)]
+    assert DispatcherHealth().observe_tick(seen["board_results"]) is None  # never raises

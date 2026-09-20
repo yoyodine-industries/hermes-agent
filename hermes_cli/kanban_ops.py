@@ -194,9 +194,12 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # (kanban.max_spawn / max_in_progress / per-profile cap), guards (respawn,
     # board-held, memory pressure) and work that just arrived are the steady
     # state on a loaded host and stay silent; a card claimed but never launched
-    # warns at once, naming board, profile, task and reason.
+    # warns at once, naming board, profile, task and reason, and a board starved
+    # by the host-wide max_in_progress budget for over an hour is reported too
+    # (the one deferral this board cannot end by itself).
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
     health = kbd.DispatcherHealth(window=HEALTH_WINDOW)
+    board_label = getattr(args, "board", None) or kb.get_current_board()
 
     def _oldest_pending():
         """Longest-waiting spawnable card on this board, None when nothing is."""
@@ -221,8 +224,17 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         return stats if int(stats.get("count") or 0) else None
 
     def _on_tick(res):
+        # DispatcherHealth speaks in (board, result) pairs — that is what the
+        # gateway's multi-board tick hands it. This loop ticks ONE board, so the
+        # pair is built here from the board it is actually ticking: passing the
+        # bare result made the first health rule raise on unpacking, and
+        # run_daemon's suppress() swallowed it, so this entry point reported
+        # nothing at all.
         report = health.observe_tick(
-            res, pending=_oldest_pending(), stuck=_zero_run_ready(), now=time.time()
+            [(board_label, res)],
+            pending=_oldest_pending(),
+            stuck=_zero_run_ready(),
+            now=time.time(),
         )
         if report is not None:
             print(
