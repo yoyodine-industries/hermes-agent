@@ -685,6 +685,47 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
+# Closed-run outcomes that spent an attempt without settling the card: the
+# worker never made a terminal call, or the run died under it. Anything else
+# (``completed``, ``blocked``, ``review_requested``, ``changes_requested``,
+# ``scheduled``, and unknown/legacy values) settles the attempt cycle and starts
+# a fresh budget. ``rate_limited`` is skipped outright — a quota wall says
+# nothing about the task (same rule as ``_protocol_violation_streak``).
+_NO_DISPOSITION_OUTCOMES = frozenset({
+    "crashed", "timed_out", "spawn_failed", "reclaimed", "stale", "gave_up",
+})
+
+
+def _attempts_without_disposition(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of closed attempts that settled nothing.
+
+    The retry budget has to be *durable*. ``consecutive_failures`` lives on the
+    task row and the deliberate re-queue paths reset it on purpose — an operator
+    ``unblock`` starts a fresh cycle, and a reassignment gives a fresh profile a
+    fresh budget — so on its own it cannot bound a card that re-queues through
+    those paths, and the ledger shows cards reaching 8+ attempts with the
+    counter back at 0.
+
+    A run row cannot be reset: re-queuing a card never edits its ledger. Reading
+    the budget off the ledger is therefore the one count that survives every
+    re-queue, and it is also the honest one — it counts attempts that actually
+    happened, not a counter someone remembered to increment.
+    """
+    attempts = 0
+    rows = conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome == "rate_limited":
+            continue
+        if outcome not in _NO_DISPOSITION_OUTCOMES:
+            break
+        attempts += 1
+    return attempts
+
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
@@ -805,9 +846,11 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
+    now = int(time.time())
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, "
+            "       max_runtime_seconds "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -828,6 +871,23 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             dead = _classify_dead_worker(pid, row["claim_lock"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            # The attempt is RECORDED, not discarded: an exit code alone says
+            # nothing about how much of the run was spent, so the reaped attempt
+            # also books its wall-clock duration and the runtime budget it was
+            # working against. Same field names ``enforce_max_runtime`` uses, so
+            # a run's cost reads the same whether it timed out or died.
+            open_run = conn.execute(
+                "SELECT started_at FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            run_started_at = _kb._row_get(open_run, "started_at") if open_run is not None else None
+            if run_started_at:
+                dead.event_payload["elapsed_seconds"] = max(0, now - int(run_started_at))
+            budget = _kb._row_get(row, "max_runtime_seconds")
+            if budget is not None:
+                dead.event_payload["limit_seconds"] = int(budget)
+            dead.event_payload.setdefault("exit_kind", dead.kind)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -1023,6 +1083,17 @@ def _record_task_failure(
             else ("review" if row["status"] == "review" else "ready")
         )
         failures = int(row["consecutive_failures"]) + 1
+        # Spend the retry budget ONCE. ``consecutive_failures`` is reset by the
+        # deliberate re-queue paths — an operator ``unblock`` starts a fresh
+        # cycle, a reassignment gives a fresh profile a fresh budget — so on its
+        # own it cannot bound a card that keeps coming back. The run ledger
+        # counts the attempts that actually happened, and floors the counter at
+        # them. Without this floor a protocol-violation trip lands at
+        # failures=1, ``recompute_ready`` reads 1 < limit and promotes the card
+        # in the very same dispatcher tick: blocked -> promoted -> respawned,
+        # unbounded (measured: 43 cards past their ceiling on one board).
+        attempts = _attempts_without_disposition(conn, task_id)
+        failures = max(failures, attempts)
 
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
@@ -1066,12 +1137,23 @@ def _record_task_failure(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
                if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
+            + "consecutive_failures = ?, last_failure_error = ?, "
+            # A dispatcher park is a DOCUMENTED park. ``block_kind`` stops the
+            # disposition sweep from reading the card as an undocumented
+            # blocker (which it drains straight back into the queue, closing the
+            # loop) and is what routes the card to a human. ``needs_input`` is
+            # the honest kind: the card needs a decision — buy attempts by
+            # raising ``max_retries``, or close it — not another blind retry.
+            # ``block_recurrences`` is deliberately NOT bumped: it counts
+            # worker-initiated block loops, and inflating it here would fast-path
+            # a later real worker block of the same kind to triage.
+            "block_kind = 'needs_input' "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
             (failures, error, task_id),
         )
         payload = {
             "failures": failures,
+            "attempts_without_disposition": attempts,
             "effective_limit": effective_limit,
             "limit_source": limit_source,
             "error": error,
