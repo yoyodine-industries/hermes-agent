@@ -199,6 +199,33 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "Omit only if none apply."
             ),
         },
+        "due_at": {
+            "type": ["string", "integer"],
+            "description": (
+                "Optional time fence: release this hold automatically on the "
+                "first dispatcher pass after this time, with no human "
+                "unblocking. Same forms as the CLI's --due: epoch seconds "
+                "(1760000000), an ISO-8601 timestamp (2026-09-16T01:40), or a "
+                "relative offset (+30m, 15m, +1h, +1d). Arm it when what you "
+                "are waiting on is a CLOCK (a deploy window, a cooldown, a "
+                "rate limit) and nobody needs to read the card to release it. "
+                "It is meaningless and REFUSED on kind='dependency', which "
+                "waits on a parent task finishing, not on a clock."
+            ),
+        },
+        "window_policy": {
+            "type": "string",
+            "enum": ["defer", "ambient"],
+            "description": (
+                "How a due_at release interacts with the host's reserved "
+                "execution bands; needs due_at (refused without it). "
+                "'defer' (the default) holds the wake until a band that "
+                "would block it closes, so the released card is dispatched "
+                "in a window that permits it; 'ambient' releases on the "
+                "first dispatcher pass regardless of bands, for a wake that "
+                "is a lightweight check meant to tick around the clock."
+            ),
+        },
     },
     ["reason"],
 )

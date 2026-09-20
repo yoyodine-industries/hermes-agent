@@ -636,6 +636,28 @@ def _handle_complete(args: dict, **kw) -> str:
         return _ok(task_id=tid, run_id=run.id if run else None)
 
 
+def _due_at_arg(tool_name: str, raw: Any) -> Optional[int]:
+    """Normalize a ``due_at`` tool arg (epoch / ISO-8601 / relative offset) to
+    epoch seconds, or ``None`` when it was not supplied.
+
+    One normalizer, not two: ``hermes_cli.kanban_due.parse_due`` is what the CLI's
+    ``block --due`` uses, and a dispatched worker cannot reach the CLI (its terminal is
+    fenced as a delegated-child context), so the tool surface has to accept the same
+    forms or a time-fenced hold is unreachable by its primary caller. A due time that
+    cannot be read is refused loudly — silently parking a card forever is the failure
+    this fence exists to prevent.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
+        return None
+    try:
+        from hermes_cli import kanban_due as kdue
+        return int(kdue.parse_due(raw, now=int(time.time())))
+    except ValueError as exc:
+        raise _Reject(f"{tool_name}: due_at {raw!r}: {exc}")
+
+
 @_kanban_handler("kanban_block")
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
@@ -643,6 +665,8 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
+    due_at = _due_at_arg("kanban_block", args.get("due_at"))
+    window_policy = args.get("window_policy") or None
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
@@ -662,9 +686,26 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        try:
+            ok = kb.block_task(conn, tid, reason=reason, kind=kind,
+                               expected_run_id=_worker_run_id(tid),
+                               due_at=due_at, window_policy=window_policy)
+        except ValueError as exc:
+            # block_task owns the due rules — a due time on a `dependency` block, a
+            # window_policy with no due time, an unknown policy. Report them as tool
+            # errors naming the offending arg; the card is untouched either way.
+            raise _Reject(f"kanban_block: {exc} "
+                          f"(due_at={args.get('due_at')!r}, window_policy={window_policy!r})")
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
-        return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
+        # Report the armed fence only when one was requested, and read it back from the
+        # landed card: block_task sets due_at on the `blocked` landing alone, so a card
+        # routed to `triage` by the loop breaker stores nothing and must say so.
+        due_fields: dict[str, Any] = {}
+        if due_at is not None:
+            landed = kb.get_task(conn, tid)
+            due_fields = {"due_at": landed.due_at if landed else None,
+                          "window_policy": landed.due_window_policy if landed else None}
+        return _ok_landed(kb, conn, tid, "blocked", block_kind=kind, **due_fields)
 
 
 @_kanban_handler("kanban_request_review")

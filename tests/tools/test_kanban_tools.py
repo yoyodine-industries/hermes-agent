@@ -297,6 +297,158 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Time-fenced hold: kanban_block(due_at=..., window_policy=...)
+#
+# A dispatched worker cannot reach `hermes kanban block --due` (its terminal is
+# fenced as a delegated-child context), so the tool surface is the ONLY way a
+# worker can arm a hold that releases itself. These tests pin the passthrough to
+# the DB columns the due-card sweep actually reads.
+# ---------------------------------------------------------------------------
+
+def _card(conn, tid):
+    """The task row; asserts it exists (``kanban_db.get_task`` is Optional)."""
+    from hermes_cli import kanban_db as kb
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    return task
+
+
+def test_block_due_at_arms_time_fenced_release(worker_env):
+    """kanban_block(due_at="+30m", window_policy="ambient") lands the due_at +
+    due_window_policy columns, and the waker's read side picks the card up when
+    (and only when) the fence expires."""
+    import time as _time
+
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    before = int(_time.time())
+    out = kt._handle_block({
+        "reason": "waiting out the deploy freeze; no human needed",
+        "kind": "transient", "due_at": "+30m", "window_policy": "ambient",
+    })
+    after = int(_time.time())
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["status"] == "blocked"
+
+    conn = kbc.connect()
+    try:
+        task = _card(conn, worker_env)
+        assert task.status == "blocked"
+        due = task.due_at
+        assert due is not None, "the due fence did not land a due_at column"
+        # "+30m" is read relative to the call, on the same normalizer the CLI uses.
+        assert before + 1800 <= due <= after + 1800, due
+        assert task.due_window_policy == "ambient"
+        # The response confirms the armed fence, not the requested words.
+        assert d["due_at"] == due and d["window_policy"] == "ambient"
+        # The waker reads blocked cards with a passed due_at, and nothing before it:
+        # due_at IS NOT NULL is what keeps a human-parked (fenceless) hold out.
+        assert kb.list_due_tasks(
+            conn, now=due - 1, limit=10, statuses=("blocked",)) == []
+        assert [t.id for t in kb.list_due_tasks(
+            conn, now=due, limit=10, statuses=("blocked",))] == [worker_env]
+    finally:
+        conn.close()
+
+
+def test_block_due_at_defaults_window_policy_to_defer(worker_env):
+    """An epoch due time is accepted as-is and the omitted policy stores 'defer',
+    so a released card is held to the next permitted execution band."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    epoch = 1_800_000_000
+    out = kt._handle_block({"reason": "cooling off", "due_at": epoch})
+    assert json.loads(out)["ok"] is True
+
+    conn = kbc.connect()
+    try:
+        task = _card(conn, worker_env)
+        assert task.due_at == epoch
+        assert task.due_window_policy == kb.DEFAULT_DUE_WINDOW_POLICY == "defer"
+    finally:
+        conn.close()
+
+
+def test_block_due_at_refused_on_dependency_kind(worker_env):
+    """A dependency block waits on a parent task, not a clock: the due fence is
+    refused as a tool error and the card is left untouched (still running)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    out = kt._handle_block({
+        "reason": "waiting on the parent card", "kind": "dependency", "due_at": "+30m",
+    })
+    d = json.loads(out)
+    assert "error" in d, d
+    assert "due_at is meaningless" in d["error"]
+    assert "dependency" in d["error"]
+
+    conn = kbc.connect()
+    try:
+        task = _card(conn, worker_env)
+        assert task.status == "running", "refused block must not write the board"
+        assert task.due_at is None and task.due_window_policy is None
+    finally:
+        conn.close()
+
+
+def test_block_due_at_and_window_policy_errors_are_tool_errors(worker_env):
+    """An unreadable due time and a policy with no due time are reported as
+    structured tool errors naming the offender — never a silent park, never a
+    traceback (a mistyped fence is what leaves a card parked forever)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db_connect as kbc
+
+    bad_due = json.loads(kt._handle_block({"reason": "typo", "due_at": "soonish"}))
+    assert "cannot read 'soonish' as a due time" in bad_due["error"]
+    assert "ISO-8601" in bad_due["error"]
+
+    orphan_policy = json.loads(kt._handle_block(
+        {"reason": "policy without a fence", "window_policy": "ambient"}))
+    assert "window_policy needs a due time" in orphan_policy["error"]
+
+    bad_policy = json.loads(kt._handle_block(
+        {"reason": "unknown policy", "due_at": "+1h", "window_policy": "whenever"}))
+    assert "window_policy must be one of" in bad_policy["error"]
+
+    conn = kbc.connect()
+    try:
+        task = _card(conn, worker_env)
+        assert task.status == "running", "a refused fence must not block the card"
+    finally:
+        conn.close()
+
+
+def test_block_schema_exposes_the_time_fence(worker_env):
+    """The fence is only reachable if the model can SEE the arguments: a populated
+    DB column nobody can write is the gap this pair of args closes, so pin the
+    registered kanban_block schema — not just the handler that reads it."""
+    import tools.kanban_tools  # noqa: F401 — ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    defs = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    block = next(d for d in defs
+                 if d.get("function", {}).get("name") == "kanban_block")
+    props = block["function"]["parameters"]["properties"]
+    assert "due_at" in props, sorted(props)
+    assert props["window_policy"]["enum"] == ["defer", "ambient"]
+    # The union is what lets a model pass a JSON number epoch as well as the
+    # string forms the CLI accepts.
+    assert props["due_at"]["type"] == ["string", "integer"]
+    assert "dependency" in props["due_at"]["description"], (
+        "the refusal belongs in the description the model reads, not only in the error"
+    )
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
