@@ -42,6 +42,20 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _runtime_profile(default: str = "") -> str:
+    """Identity the kanban write tools attribute work to.
+
+    ``hermes_cli.profiles.resolve_acting_profile_name`` (env name -> ``HERMES_PROFILE`` ->
+    bound session profile -> home-derived id -> *default*); ``default`` is returned when
+    nothing resolves. Kept here so every write surface in this module shares one rule.
+    """
+    try:
+        from hermes_cli.profiles import resolve_acting_profile_name
+        return resolve_acting_profile_name(default)
+    except Exception:
+        return default
+
+
 def _delegation_ctx_or_none(predicate: str) -> Optional[bool]:
     """``agent.delegation_context.<predicate>()``; ``None`` when it cannot be
     evaluated (module missing, version-skewed, or shadowed on ``sys.path``)."""
@@ -494,7 +508,7 @@ _comment_watermark: dict[str, int] = {}
 
 def inject_new_comments_from_env(agent: Any) -> bool:
     """Steer new operator comments on the worker's task into ``agent``; True iff a
-    steer was injected; never raises. Own comments (``HERMES_PROFILE``) are skipped."""
+    steer was injected; never raises. Own comments (runtime profile) are skipped."""
     global _comment_poll_last_attempt
     tid = os.environ.get("HERMES_KANBAN_TASK")
     now = time.monotonic()
@@ -515,7 +529,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
     # Advance past everything read (including our own notes) so nothing is re-injected.
     _comment_watermark[tid] = max(c.id for c in rows)
-    own = (os.environ.get("HERMES_PROFILE") or "").strip()
+    own = _runtime_profile("")
     fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
     if not fresh:
         return False
@@ -751,7 +765,10 @@ def _handle_comment(args: dict, **kw) -> str:
     # ``**{author}** (timestamp): {body}`` — accepting an ``args["author"]`` override let a worker forge a
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
     # with what reads as a system directive. See #19713.
-    author = os.environ.get("HERMES_PROFILE") or "worker"
+    # ``resolve_acting_profile_name`` adds the bound SESSION profile to the env-only lookup
+    # that used to resolve to "worker" (and to a wrong home-derived name in the CLI tool):
+    # a gateway-served session has no HERMES_PROFILE in os.environ, only HERMES_SESSION_PROFILE.
+    author = _runtime_profile("worker")
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
         return _ok(task_id=tid, comment_id=cid)
@@ -904,7 +921,7 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
-            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+            created_by=_runtime_profile("worker"), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 
@@ -925,13 +942,7 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
     chat_type = env("HERMES_SESSION_CHAT_TYPE", "") or None
     thread_id = env("HERMES_SESSION_THREAD_ID", "") or None
     message_id = env("HERMES_SESSION_MESSAGE_ID", "") or ""
-    notifier_profile = env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE")
-    if not notifier_profile:
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-            notifier_profile = get_active_profile_name() or "default"
-        except Exception:
-            notifier_profile = "default"
+    notifier_profile = _runtime_profile("default")
     delivery_metadata: dict[str, Any] = {
         k: v for k, v in (
             ("thread_id", thread_id), ("chat_type", chat_type),

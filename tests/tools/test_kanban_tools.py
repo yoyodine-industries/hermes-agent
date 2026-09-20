@@ -470,6 +470,62 @@ def test_comment_ignores_caller_supplied_author(worker_env):
         conn.close()
 
 
+def test_comment_author_uses_the_bound_session_profile(worker_env, monkeypatch):
+    """A gateway-served session carries no ``HERMES_PROFILE`` in ``os.environ`` — the
+    served profile is bound in the session ContextVar. Its comments must be authored
+    under that name, not the ``worker``/``default`` fallback."""
+    from gateway.session_context import (
+        clear_session_vars, reset_session_vars, set_session_vars)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    tokens = set_session_vars(profile="ops-coder")
+    try:
+        assert json.loads(kt._handle_comment({
+            "task_id": worker_env, "body": "from a served session",
+        }))["ok"]
+    finally:
+        clear_session_vars(tokens)
+        reset_session_vars()
+
+    conn = kbc.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+        assert comments[0].author == "ops-coder"
+    finally:
+        conn.close()
+
+
+def test_create_created_by_uses_the_bound_session_profile(worker_env, monkeypatch):
+    """Same resolver for ``kanban_create``'s ``created_by``."""
+    from gateway.session_context import (
+        clear_session_vars, reset_session_vars, set_session_vars)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    tokens = set_session_vars(profile="ops-coder")
+    try:
+        out = kt._handle_create({"title": "child task", "assignee": "peer",
+                                 "parents": [worker_env]})
+    finally:
+        clear_session_vars(tokens)
+        reset_session_vars()
+    assert json.loads(out)["ok"] is True
+
+    conn = kbc.connect()
+    try:
+        child = kb.get_task(conn, json.loads(out)["task_id"])
+        assert child.created_by == "ops-coder"
+    finally:
+        conn.close()
+
+
 def test_create_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({
