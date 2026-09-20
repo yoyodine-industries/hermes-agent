@@ -93,6 +93,14 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Statuses no worker will ever be launched in again: the card is closed, so the
+# ``(assignee, skills)`` pair cannot fail at dispatch any more. Read by the sites
+# that judge that pair to tell attribution on a finished card from handing a name
+# to a worker that cannot load it. Distinct from ``goals._KANBAN_TERMINAL_STATUSES``,
+# which names the worker-driven GOAL-LOOP terminators (``blocked``/``review`` are
+# terminators there and very much still dispatchable here).
+TERMINAL_STATUSES = {"done", "archived"}
+
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
@@ -1819,7 +1827,9 @@ def list_tasks(
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim,
-    and ValueError when a worker for *profile* could not load the task's skills.
+    and ValueError when a worker for *profile* could not load the task's skills —
+    except on a card in a terminal status (``done``/``archived``), which no worker
+    will run again and can therefore be assigned for attribution.
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
@@ -1836,8 +1846,12 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         # A card created with no assignee carried its skills past the create-time
         # check (nothing to judge them against); judge them against the profile
         # being attached here, before it can reach a worker — and before the
-        # failure streak and the assignee are written.
-        _refuse_unloadable_skills(row["skills"], profile)
+        # failure streak and the assignee are written. A card in a terminal status
+        # is not a dispatch: no worker will load those names again, so the pair
+        # cannot fail on ``Unknown skill(s)``. Judging it there would only make a
+        # finished (or archived) card un-attributable.
+        if row["status"] not in TERMINAL_STATUSES:
+            _refuse_unloadable_skills(row["skills"], profile)
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(

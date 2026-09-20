@@ -1901,6 +1901,27 @@ def test_assign_task_still_unassigns_a_card_with_unloadable_skills(kanban_home, 
         assert _task(conn, tid).assignee is None
 
 
+def test_assign_task_allows_a_terminal_card_despite_unloadable_skills(kanban_home, profile_skills):
+    """A finished card never launches a worker again, so the names stored on it
+    cannot fail to load: assigning one is attribution on a closed card, not a
+    dispatch hazard, and must not be refused. Both terminal statuses, because
+    ``done`` cards get archived and the assign has to keep working across that."""
+    with kbc.connect_closing() as conn:
+        done_id = kb.create_task(conn, title="shipped", skills=["other-skill"])
+        assert kb.complete_task(conn, done_id, result="shipped") is True
+        assert _task(conn, done_id).status == "done"
+        assert kb.assign_task(conn, done_id, "demo") is True
+        assert _task(conn, done_id).assignee == "demo"
+        assert [e for e in kb.list_events(conn, done_id) if e.kind == "assigned"] != [], (
+            "the assign on a terminal card is recorded, not silently skipped")
+
+        archived_id = kb.create_task(conn, title="shelved", skills=["other-skill"])
+        assert kb.archive_task(conn, archived_id) is True
+        assert _task(conn, archived_id).status == "archived"
+        assert kb.assign_task(conn, archived_id, "demo") is True
+        assert _task(conn, archived_id).assignee == "demo"
+
+
 def test_request_review_refuses_reviewer_that_cannot_load_the_cards_skills(kanban_home, profile_skills):
     """A review handoff reassigns the card to the reviewer, so the reviewer is
     judged like any other assignee — and a refusal leaves the card running."""
