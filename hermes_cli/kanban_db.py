@@ -1679,6 +1679,17 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 # --- Comments & events ---
 
 def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+    # ``sqlite3`` binds ``bytes`` as BLOB, and every reader of these two columns
+    # is str-based. A BLOB body surfaces later as
+    # ``TypeError: cannot use a string pattern on a bytes-like object`` in
+    # whichever str operation touches the row first — for the respawn guard that
+    # was one row aborting a whole board tick. This is the only writer of
+    # ``task_comments``, so the column is normalised once here instead of being
+    # tolerated by each reader.
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        body = bytes(body).decode("utf-8", errors="replace")
+    if isinstance(author, (bytes, bytearray, memoryview)):
+        author = bytes(author).decode("utf-8", errors="replace")
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():

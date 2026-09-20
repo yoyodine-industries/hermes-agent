@@ -72,6 +72,23 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 
+def _db_text(value: Any) -> str:
+    """A DB text value as ``str``, whatever shape the connection handed back.
+
+    ``text_factory=bytes`` connections — and rows whose text was written as a
+    BLOB by a caller that bypassed ``add_comment``'s str contract — return
+    ``bytes``, where a str regex raises ``TypeError``: ``cannot use a string
+    pattern on a bytes-like object``. One such row aborted the whole board tick,
+    so every reader of a text column goes through here. Undecodable bytes are
+    replaced rather than raised — a corrupt body must never take down a pass.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", errors="replace")
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass.
@@ -1171,7 +1188,7 @@ def check_respawn_guard(
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
-    err = row["last_failure_error"]
+    err = _db_text(row["last_failure_error"])
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
@@ -1209,7 +1226,8 @@ def check_respawn_guard(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        body = _db_text(c["body"])
+        if body and _RESPAWN_GUARD_PR_URL_RE.search(body):
             return "active_pr"
 
     return None

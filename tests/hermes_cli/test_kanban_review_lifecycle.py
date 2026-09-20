@@ -21,6 +21,7 @@ down:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -476,6 +477,48 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kbd.check_respawn_guard(
             conn, review_id, lane="review"
         ) == "rate_limit_cooldown"
+
+
+def test_active_pr_guard_tolerates_a_bytes_comment_body(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A comment body stored as BLOB must not abort the ready-lane pass.
+
+    A ``text_factory=bytes`` connection hands the guard ``bytes``, where the
+    str PR-URL regex raises ``TypeError``. That exception escapes the
+    dispatcher's per-task call and takes down the whole tick for the board —
+    one row poisons every other lane. The guard reads a bytes body as text
+    (undecodable bytes replaced, never raised) and reaches the same verdict.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
+
+    with kbc.connect() as conn:
+        pr_id = kb.create_task(conn, title="blob body, pr url", assignee="worker")
+        plain_id = kb.create_task(conn, title="blob body, no url", assignee="worker")
+        # Raw INSERT on purpose: add_comment normalises a body to text, so the
+        # BLOB shape can only be reproduced by writing the blob directly.
+        with kb.write_txn(conn):
+            for tid, text in ((pr_id, pr_comment), (plain_id, "no link here")):
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (tid, "worker", text.encode("utf-8"), int(time.time())),
+                )
+
+        assert kbd.check_respawn_guard(conn, pr_id) == "active_pr"
+        assert kbd.check_respawn_guard(conn, plain_id) is None
+
+        # The tick as a whole must survive the poisoned row.
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert dict(res.respawn_guarded).get(pr_id) == "active_pr"
 
 
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
