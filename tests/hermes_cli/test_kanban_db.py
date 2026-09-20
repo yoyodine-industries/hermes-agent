@@ -1765,3 +1765,26 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_add_comment_normalises_a_bytes_body_to_text(kanban_home):
+    """The single writer of ``task_comments`` must never store a BLOB.
+
+    ``sqlite3`` binds ``bytes`` as BLOB and every reader of the column is
+    str-based, so a bytes body written here surfaces later as a ``TypeError``
+    in whichever str operation reads the row first — the respawn guard's PR-URL
+    regex aborted a whole board tick that way. Normalising at the writer keeps
+    the column one type; the guard's ``_db_text`` only has to cover rows written
+    before this.
+    """
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="bytes body", assignee="worker")
+        kb.add_comment(conn, t, b"worker", "hi ✓".encode("utf-8"))  # type: ignore[arg-type]
+        row = conn.execute(
+            "SELECT typeof(body) AS body_t, body, typeof(author) AS author_t, author "
+            "FROM task_comments WHERE task_id = ?",
+            (t,),
+        ).fetchone()
+        assert (row["body_t"], row["body"]) == ("text", "hi ✓")
+        assert (row["author_t"], row["author"]) == ("text", "worker")
+        assert [c.body for c in kb.list_comments(conn, t)] == ["hi ✓"]
