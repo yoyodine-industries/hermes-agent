@@ -1374,10 +1374,19 @@ def _launchd_service_registered(label: str, *, timeout: int = 5) -> bool:
 
 
 def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]:
-    """``(domain, pid)`` for ``label``, probing ``gui/<uid>`` then ``user/<uid>``. Never uses the current
-    profile's cached ``_launchd_domain()`` — a fleet can mix domains. ``TimeoutExpired`` propagates."""
+    """``(domain, pid)`` for ``label``, probing ``gui/<uid>``, ``user/<uid>``, then the uid-less
+    ``system`` domain (a LaunchDaemon from ``sudo hermes gateway install``). Never uses the current
+    profile's cached ``_launchd_domain()`` — a fleet can mix domains. ``TimeoutExpired`` propagates.
+
+    ``system`` is last and reports only a LOADED job, so a daemon this install merely *installed*
+    still resolves to ``(None, None)`` — the fleet updater reads that as "no restart target" and
+    would otherwise kickstart a label no domain has loaded. Mirrors the domain probing in
+    ``_probe_launchd_domain_for_label()``; without it a daemon host locates nothing, so
+    ``_get_service_pids()`` comes back empty and the supervised gateway PID is neither excluded
+    from stale-process sweeps nor visible to ``gateway status``.
+    """
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
-    for domain in (f"gui/{uid}", f"user/{uid}"):
+    for domain in (f"gui/{uid}", f"user/{uid}", "system"):
         loaded, pid = _launchd_print_service_pid(domain, label)
         if loaded:
             return (domain, pid)

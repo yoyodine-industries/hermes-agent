@@ -816,6 +816,89 @@ class TestLaunchdDomainDetection:
         assert domain == "user/501"
 
 
+class TestLaunchdSystemDaemonServicePids:
+    """A ``sudo hermes gateway install`` host supervises the gateway as a system LaunchDaemon.
+
+    ``_locate_launchd_gateway_service()`` probed only ``gui/<uid>`` and ``user/<uid>``, so on a
+    LaunchDaemon host it reported ``(None, None)`` and ``_get_service_pids()`` came back empty:
+    the supervised gateway PID was neither protected from the stale-process sweep nor visible to
+    ``gateway status`` and the update path's supervision check. This is the same detection gap
+    ``_probe_launchd_domain_for_label()`` closes for domain selection, one function over.
+    """
+
+    def _daemon_host(self, monkeypatch, pid: int = 4321):
+        """Patch launchctl so the current label is loaded ONLY in the uid-less ``system`` domain.
+
+        Mirrors the real exit codes on a LaunchDaemon host: ``system/<label>`` prints, while
+        ``gui/<uid>`` answers 125 ("Domain does not support specified action") and ``user/<uid>``
+        113 ("Could not find service").
+        """
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        label = gateway_cli.get_launchd_label()
+        run_calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            run_calls.append(cmd)
+            if cmd[2] == f"system/{label}":
+                return SimpleNamespace(returncode=0, stdout=f"\tpid = {pid}\n", stderr="")
+            return SimpleNamespace(returncode=113, stdout="", stderr="Could not find service")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        return label, run_calls
+
+    def test_locate_probes_system_after_gui_and_user(self, monkeypatch):
+        """A loaded LaunchDaemon is found in ``system`` — probed last, after both uid domains."""
+        label, run_calls = self._daemon_host(monkeypatch)
+
+        assert gateway_cli._locate_launchd_gateway_service(label) == ("system", 4321)
+        assert run_calls[:3] == [
+            ["launchctl", "print", f"gui/501/{label}"],
+            ["launchctl", "print", f"user/501/{label}"],
+            ["launchctl", "print", f"system/{label}"],
+        ]
+
+    def test_get_service_pids_returns_the_daemon_pid(self, monkeypatch):
+        """The supervised PID must land in the exclusion set, not read as an unmanaged process."""
+        self._daemon_host(monkeypatch)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+
+        assert gateway_cli._get_service_pids() == {4321}
+
+    def test_agent_domain_still_wins_when_a_gui_agent_is_loaded(self, monkeypatch):
+        """The system probe is last: a loaded account LaunchAgent is located as before."""
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        label = gateway_cli.get_launchd_label()
+        probed = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            probed.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="\tpid = 777\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._locate_launchd_gateway_service(label) == ("gui/501", 777)
+        assert probed == [["launchctl", "print", f"gui/501/{label}"]]
+
+    def test_unloaded_everywhere_still_reports_no_target(self, monkeypatch):
+        """Installed-but-unloaded stays ``(None, None)``.
+
+        The fleet update path reads a ``None`` domain as "no restart target" and skips the label;
+        returning a domain for a job no domain has loaded would turn that skip into a kickstart
+        against an unloaded service.
+        """
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=113, stdout="", stderr="Could not find service")
+            return SimpleNamespace(returncode=0, stdout="Background\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._locate_launchd_gateway_service(gateway_cli.get_launchd_label()) == (None, None)
+
+
 class TestGatewayServiceDetection:
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
