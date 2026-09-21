@@ -355,7 +355,19 @@ def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False
     for slug, res in (results or []):
-        if res is not None and getattr(res, "spawned", None):
+        if res is None:
+            continue
+        # A convergence-guard park is operator-actionable and happens on an
+        # otherwise-idle tick (the card was guarded, not spawned), so it must
+        # surface even when nothing spawned.
+        for tid, reason in getattr(res, "non_converging", None) or []:
+            logger.warning(
+                "kanban dispatcher [%s]: non-converging card %s parked "
+                "(respawn guard reason=%s) - completion contract appears "
+                "unsatisfiable",
+                slug, tid, reason,
+            )
+        if getattr(res, "spawned", None):
             any_spawned = True
             # Quiet by default: an idle gateway stays silent.
             logger.info(

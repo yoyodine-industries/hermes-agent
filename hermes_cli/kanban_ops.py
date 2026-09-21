@@ -112,6 +112,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "respawn_guarded": [
                 {"task_id": tid, "reason": reason} for (tid, reason) in res.respawn_guarded
             ],
+            "non_converging": [
+                {"task_id": tid, "reason": reason} for (tid, reason) in res.non_converging
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -148,6 +151,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.respawn_guarded:
         print(f"Guarded:      {len(res.respawn_guarded)}")
         for tid, reason in res.respawn_guarded:
+            print(f"  - {tid}  ({reason})")
+    # The convergence guard parks a card that the respawn guard has held N ticks
+    # in a row (a completion contract that can never be satisfied). This is the
+    # operator-actionable "this card will never finish on its own" signal.
+    if res.non_converging:
+        print(f"Non-converging (parked): {len(res.non_converging)}")
+        for tid, reason in res.non_converging:
             print(f"  - {tid}  ({reason})")
     for tid, reason in res.skipped_self_review:
         if reason == "implementer_unknown":

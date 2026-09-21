@@ -78,6 +78,28 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 # forever. A worker turn is minutes, so two hours is generous.
 _SIBLING_LIVE_WINDOW_SECONDS = 2 * 3600  # 2 hours
 
+# A card whose completion contract cannot be satisfied never converges: its
+# worker opens a PR, the acceptance gate rejects the contract (e.g. a
+# branch-rules API 403 on a private repo), and the respawn guard then holds the
+# card every tick because the PR is open — writing one ``respawn_guarded`` event
+# per tick forever (measured: t_1678d65b accumulated 310+ ``active_pr`` holds
+# before this guard existed). After this many CONSECUTIVE guard holds of the
+# same reason with no intervening progress, the card is parked ``blocked`` /
+# ``transient`` instead of silently spinning.
+_NONCONVERGENCE_LIMIT = 3
+
+# Guard reasons that signal a STUCK card (one that will never clear on its own)
+# rather than a transient wait. ``active_pr`` is the completion-contract case: an
+# open PR whose required checks can never pass. The transient reasons
+# (``sibling_live``, ``rate_limit_cooldown``, ``recent_success``) clear on a
+# clock / a worker exit and are NOT convergence failures.
+_NONCONVERGENCE_REASONS = frozenset({"active_pr"})
+
+# Upper bound on how many trailing task events to scan for the convergence
+# streak. A held card writes one ``respawn_guarded`` event per tick, so this
+# needs only to exceed _NONCONVERGENCE_LIMIT with headroom.
+_NONCONVERGENCE_SCAN_LIMIT = 32
+
 
 @dataclass
 class DispatchResult:
@@ -140,6 +162,11 @@ class DispatchResult:
     ``"rate_limit_cooldown"``, ``"blocker_auth"`` (quota/auth error — also
     auto-blocked), ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    non_converging: list[tuple[str, str]] = field(default_factory=list)
+    """(task_id, reason) parked blocked/transient this tick by the convergence
+    guard: the respawn guard held the card for _NONCONVERGENCE_LIMIT
+    consecutive ticks (a completion contract that can never be satisfied) and it
+    would otherwise spin forever."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1567,6 +1594,46 @@ def _live_sibling_worker(conn: sqlite3.Connection, task_id: str) -> Optional[dic
     return {"pid": pid, "run_id": _kb._row_get(latest_run, "id"), "spawned_at": spawned_at}
 
 
+def _trailing_guard_holds(conn: sqlite3.Connection, task_id: str, reason: str) -> int:
+    """Count the card's trailing run of ``respawn_guarded`` events of ``reason``.
+
+    Contiguous holds mean the dispatcher has declined to spawn this card every
+    tick since the last time it actually progressed — a spawn (``claimed`` /
+    ``spawned``), a completion, a block, or a handoff all write a non-guard
+    event that breaks the run. A card that is genuinely making progress never
+    accumulates a streak.
+    """
+    holds = 0
+    for row in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _NONCONVERGENCE_SCAN_LIMIT),
+    ):
+        if row["kind"] != "respawn_guarded":
+            break
+        if _kb._json_dict(row["payload"]).get("reason") != reason:
+            break
+        holds += 1
+    return holds
+
+
+def _park_nonconverging(conn: sqlite3.Connection, task_id: str, reason: str) -> bool:
+    """Park a card the respawn guard has held ``_NONCONVERGENCE_LIMIT`` times.
+
+    Returns True when the card was parked (a real ``ready`` -> ``blocked``
+    transition); False when it had already moved on (another writer claimed or
+    blocked it mid-tick). The blocker names the guard reason and the streak so
+    ``hermes kanban show`` / ``tail`` tells the operator WHY the card parked.
+    """
+    blocker = (
+        f"convergence guard: respawn guard held this card for "
+        f"{_NONCONVERGENCE_LIMIT} consecutive dispatcher ticks (reason={reason}) "
+        f"with no progress - its completion contract appears unsatisfiable. "
+        f"Unblock to retry, or fix the contract / close the card."
+    )
+    return _kb.block_task(conn, task_id, reason=blocker, kind="transient")
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -2067,6 +2134,12 @@ def _dispatch_lane_task(
         if not dry_run:
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+            if (
+                guard_reason in _NONCONVERGENCE_REASONS
+                and _trailing_guard_holds(conn, task_id, guard_reason) >= _NONCONVERGENCE_LIMIT
+                and _park_nonconverging(conn, task_id, guard_reason)
+            ):
+                result.non_converging.append((task_id, guard_reason))
         return False
 
     def _count_spawn(name: str) -> None:
