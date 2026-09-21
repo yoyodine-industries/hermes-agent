@@ -2292,6 +2292,68 @@ class TestThresholdTokensCap:
 
 
 
+class TestProseToolArgsKeepTheirPayload:
+    """A tool call whose arguments ARE authored prose must survive the args shrink.
+
+    Regression: a ``message_agent`` DM body was cut to the 200-char default, and the shrunken list
+    is PERSISTED (``session_db.archive_and_compact``), so the session record of that DM read
+    ``<200 chars>...[truncated]`` — and a body re-sent from that record is REFUSED by
+    ``tools.dm_body_guard``, which treats an end-anchored marker as a partial body.
+    """
+
+    BODY = "a line of the message. " * 100  # ~2.2K chars, well past the 500-char args floor
+
+    @staticmethod
+    def _msgs(tool_name, body):
+        import json as _json
+
+        args = _json.dumps({"target": "another-agent", "message": body, "content": body})
+        return [{"role": "assistant", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": tool_name, "arguments": args}},
+        ]}]
+
+    def test_dm_body_survives_the_pass_intact(self):
+        import json as _json
+
+        from agent.context_compressor import ContextCompressor
+
+        msgs = self._msgs("message_agent", self.BODY)
+        assert ContextCompressor._truncate_tool_call_args_at(msgs, 0) is False
+        sent = _json.loads(msgs[0]["tool_calls"][0]["function"]["arguments"])
+        assert sent["message"] == self.BODY  # the record of what was actually sent
+
+    def test_the_head_is_per_tool(self):
+        import json as _json
+
+        from agent.context_compressor import (
+            _DEFAULT_ARG_HEAD_CHARS, _PROSE_ARG_HEAD_CHARS, ContextCompressor,
+        )
+
+        marker = "...[truncated]"
+        # A prose payload is still bounded, just at the wider head.
+        prose = self._msgs("message_agent", "x" * (_PROSE_ARG_HEAD_CHARS * 3))
+        assert ContextCompressor._truncate_tool_call_args_at(prose, 0) is True
+        body = _json.loads(prose[0]["tool_calls"][0]["function"]["arguments"])["message"]
+        assert len(body) == _PROSE_ARG_HEAD_CHARS + len(marker)
+        # Every other tool keeps the narrow head, and its short leaves are untouched.
+        other = self._msgs("write_file", self.BODY)
+        assert ContextCompressor._truncate_tool_call_args_at(other, 0) is True
+        parsed = _json.loads(other[0]["tool_calls"][0]["function"]["arguments"])
+        assert len(parsed["content"]) == _DEFAULT_ARG_HEAD_CHARS + len(marker)
+        assert parsed["target"] == "another-agent"
+
+    def test_helper_returns_its_input_when_nothing_shrinks(self):
+        import json as _json
+
+        from agent.context_compressor import _truncate_tool_call_args_json
+
+        # Over the 500-char floor with every leaf under the head: re-serializing would rewrite the
+        # persisted bytes (and break the prompt cache) for no reclaim.
+        args = _json.dumps({f"field_{i}": "c" * 120 for i in range(6)})
+        assert len(args) > 500
+        assert _truncate_tool_call_args_json(args) is args
+
+
 class TestTruncateToolCallArgsJson:
     """Regression tests for #11762.
 
