@@ -217,7 +217,11 @@ async def test_killed_adopted_bridge_is_respawned_and_state_corrected(tmp_path, 
             lambda: adapter._bridge_process is not None
             and bool(_health(adapter._bridge_port))
             and "retrying" in states
-            and _platform_state(status_path) == "connected")
+            and _platform_state(status_path) == "connected"
+            # The SAMPLER must have seen the recovery too: it is the reader this test speaks for, and it
+            # is cancelled the instant this predicate returns, so its own last sample is the sync point
+            # (asserting on the file read below raced the sampler's next 20ms tick and lost).
+            and states and states[-1] == "connected")
         sampler.cancel()
 
         assert respawned, f"a killed adopted bridge was never respawned (states={states})"
