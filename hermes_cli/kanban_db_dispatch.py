@@ -1668,7 +1668,12 @@ def check_respawn_guard(
             requeued_after = conn.execute(
                 "SELECT 1 FROM task_events "
                 "WHERE task_id = ? AND created_at >= ? "
-                "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+                # The review handoff writes ONLY 'changes_requested' (the card
+                # moves review->ready by UPDATE, not by a 'status' event), and a
+                # re-review writes 'review_reopened'; without them the lift set
+                # misses the very shape it was written for.
+                "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', "
+                "'changes_requested', 'review_reopened') "
                 "LIMIT 1",
                 (task_id, pr_comment_at),
             ).fetchone()

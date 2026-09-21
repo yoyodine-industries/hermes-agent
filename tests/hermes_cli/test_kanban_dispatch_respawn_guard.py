@@ -113,3 +113,34 @@ def test_active_pr_guard_is_not_lifted_by_an_unrelated_event(kanban_home: Path) 
         _add_event(conn, task_id, "commented", at + 5)
 
         assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_active_pr_guard_is_lifted_by_the_review_changes_handoff(
+    kanban_home: Path,
+) -> None:
+    """The real review handoff re-queues with a *changes_requested* event only.
+
+    Driven through the real API rather than a synthetic event, because the kind
+    the handoff writes is the whole question: it moves the card review→ready by
+    ``UPDATE tasks`` and appends ``changes_requested`` — no ``status`` event goes
+    with it, so a lift set built from the ``recent_success`` precedent alone
+    leaves the exact shape that deadlocked the card still guarded.
+    """
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="sent back", assignee="builder")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        kb.add_comment(conn, task_id, author="builder", body=PR_COMMENT)
+        assert kb.request_review(
+            conn, task_id, summary="v1", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+        assert kb.request_changes(
+            conn, task_id, reason="fix the migration",
+            expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+        assert kb.get_task(conn, task_id).status == "ready"
+
+        assert kbd.check_respawn_guard(conn, task_id) is None
