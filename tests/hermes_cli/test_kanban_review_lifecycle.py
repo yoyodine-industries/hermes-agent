@@ -21,6 +21,7 @@ down:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -715,3 +716,301 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         ev = _events(conn, tid, kind="review_requested")[0][1]
         assert ev["reviewer"] == "lead-reviewer"
         assert ev["implementer"] == "worker"
+
+
+# ---------------------------------------------------------------------------
+# active_pr vs a deliberate handoff: a re-queue recorded AFTER the PR comment
+# ---------------------------------------------------------------------------
+
+_PR_URL = "https://github.com/example/repo/pull/123"
+_PR_COMMENT = f"Opened {_PR_URL} for review."
+
+
+def _write_pr_comment_at(
+    conn, task_id: str, created_at: int, url: str = _PR_URL
+) -> None:
+    """PR-URL comment with an explicit timestamp, so no test races the clock.
+
+    ``url`` has to be the URL the test's gh stub answers for: the guard's verdict
+    comes from the state of the URL in the comment, so a mismatch would silently
+    exercise the stub's DEFAULT state instead of the one the test set up.
+    """
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, f"Opened {url} for review.", created_at),
+        )
+
+
+def _write_event_at(conn, task_id: str, kind: str, created_at: int, payload=None) -> None:
+    """Lifecycle event with an explicit timestamp and payload."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                kind,
+                json.dumps(payload) if payload is not None else None,
+                created_at,
+            ),
+        )
+
+
+def test_active_pr_guard_lifts_when_review_sends_the_card_back(
+    kanban_home: Path, gh_pr_state
+) -> None:
+    """The deadlock shape: PR comment, review bounce, card back in ready.
+
+    Driven through the real API — ``request_changes`` moves the card review→ready
+    and appends the ``changes_requested`` event; nothing else is written. The
+    implementer is now the only profile that can fix the PR its own comment
+    quotes, so holding it re-parks the lane for the whole 24h window.
+    """
+    gh_pr_state.answer(_PR_URL, "OPEN")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="sent back", assignee="builder")
+        # The comment PREDATES the bounce (as it does in the world: the reviewer
+        # reads it minutes or hours later). The handoff test is strictly newer,
+        # so a same-second tie stays guarded — fail closed.
+        _write_pr_comment_at(conn, tid, int(time.time()) - 30)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="v1", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        ) is True
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.request_changes(
+            conn, tid, reason="fix the migration",
+            expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # The PR is still OPEN — and the card is still released, because the
+        # handoff re-queued it against that very PR.
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        # A PR comment NEWER than the handoff guards again: the newest PR in the
+        # window is what the card is now about.
+        _write_pr_comment_at(conn, tid, int(time.time()) + 5)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+@pytest.mark.parametrize("kind", ["changes_requested", "review_reopened"])
+def test_active_pr_guard_lifts_on_a_review_handoff_event(
+    kanban_home: Path, gh_pr_state, kind: str
+) -> None:
+    """Every non-``assigned`` kind in the lift set releases the card."""
+    gh_pr_state.answer(_PR_URL, "OPEN")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title=f"{kind} handoff", assignee="builder")
+        at = int(time.time()) - 30
+        _write_pr_comment_at(conn, tid, at)
+        _write_event_at(conn, tid, kind, at + 10)
+
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,  # pre-`from` row, and what this line's assign writers emit today
+        {},  # an unassign
+        {"assignee": "builder", "from": "builder"},  # same-profile re-assign
+        {"assignee": "builder", "source": "kanban.default_assignee"},
+    ],
+)
+def test_active_pr_guard_ignores_a_no_op_assign(
+    kanban_home: Path, gh_pr_state, payload
+) -> None:
+    """An ``assigned`` event that did not MOVE the card is not a handoff.
+
+    A no-op re-assign, an unassign, or the dispatcher's default-assignee
+    fill-in would otherwise lift ``active_pr`` for the very implementer that
+    opened the PR. Rows written without ``from`` are not trusted — fail closed,
+    which is also why nothing lifts here until the fork reconciliation lands
+    writers that record ``from``.
+    """
+    gh_pr_state.answer(_PR_URL, "OPEN")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="no-op assign", assignee="builder")
+        at = int(time.time()) - 30
+        _write_pr_comment_at(conn, tid, at)
+        _write_event_at(conn, tid, "assigned", at + 10, payload)
+
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_lifts_when_the_card_moves_to_a_different_profile(
+    kanban_home: Path, gh_pr_state
+) -> None:
+    """An ``assigned`` event that MOVES the card is a handoff (and lifts).
+
+    The reader is pinned here even though this line's ``assign_task`` does not
+    yet record ``from``; the payload contract is upstream's and arrives with the
+    fork reconciliation.
+    """
+    gh_pr_state.answer(_PR_URL, "OPEN")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="handed over", assignee="builder")
+        at = int(time.time()) - 30
+        _write_pr_comment_at(conn, tid, at)
+        _write_event_at(conn, tid, "assigned", at + 10, {"assignee": "closer", "from": "builder"})
+
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_active_pr_guard_holds_on_a_same_second_handoff(
+    kanban_home: Path, gh_pr_state
+) -> None:
+    """Ties fail closed: only a STRICTLY newer handoff lifts the card."""
+    gh_pr_state.answer(_PR_URL, "OPEN")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="same second", assignee="builder")
+        at = int(time.time()) - 30
+        _write_pr_comment_at(conn, tid, at)
+        _write_event_at(conn, tid, "changes_requested", at)
+
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+# ---------------------------------------------------------------------------
+# Upstream's reference set (cdc4fc4c8f, `-k active_pr`), carried so the same
+# assertions run on this line. Two spots record the handoff event directly
+# instead of leaning on ``kb.assign_task``: on this line the ``assigned``
+# writer does not put ``from`` in the payload yet, so an ``assigned`` row fails
+# closed by design (the fork caveat; the writer arrives with t_5340fcdc). Every
+# assertion is upstream's.
+# ---------------------------------------------------------------------------
+
+_CARRIED_PR_URL = "https://github.com/example/repo/pull/44"
+
+
+def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, gh_pr_state
+) -> None:
+    """A ready card whose PR is open spawns the profile it was handed to.
+
+    #111910: ``active_pr`` exists to stop the implementer from opening a
+    duplicate PR; it must not stop the closer/recovery profile an operator
+    assigned AFTER the PR comment — that handoff is why the PR must be worked.
+    The un-reassigned implementer stays guarded; a newer PR comment posted
+    after the handoff (the closer's own run) guards again.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    gh_pr_state.answer(_CARRIED_PR_URL, "OPEN")
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config", lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    pr_comment = f"Opened {_CARRIED_PR_URL} for review."
+
+    with kbc.connect() as conn:
+        dev_id = kb.create_task(conn, title="dev own pr", assignee="dev")
+        kb.add_comment(conn, dev_id, author="dev", body=pr_comment)
+        closer_id = kb.create_task(conn, title="closer recovery", assignee="dev")
+        _write_pr_comment_at(conn, closer_id, int(time.time()) - 300, url=_CARRIED_PR_URL)
+        assert kb.assign_task(conn, closer_id, "closer") is True
+        # The handoff as upstream's writer will record it (fork caveat).
+        _write_event_at(
+            conn, closer_id, "assigned", int(time.time()) - 200,
+            {"assignee": "closer", "from": "dev"},
+        )
+
+        assert kbd.check_respawn_guard(conn, dev_id) == "active_pr"
+        assert kbd.check_respawn_guard(conn, closer_id) is None
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert closer_id in [s[0] for s in res.spawned]
+        assert dict(res.respawn_guarded).get(dev_id) == "active_pr"
+
+        kb.add_comment(
+            conn, closer_id, author="closer",
+            body=f"Pushed to {_CARRIED_PR_URL}",
+        )
+        assert kbd.check_respawn_guard(conn, closer_id) == "active_pr"
+
+
+def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, gh_pr_state
+) -> None:
+    """Only a handoff to a DIFFERENT profile lifts ``active_pr``.
+
+    A no-op ``assign dev -> dev`` (CLI, dashboard PATCH, ``reassign --reclaim``)
+    and an unassign both record an ``assigned`` event but change no owner; if
+    they counted as handoffs the implementer would be re-spawned against its own
+    PR — the duplicate-work protection #111910 says must survive.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    gh_pr_state.answer(_CARRIED_PR_URL, "OPEN")
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="same assign", assignee="dev")
+        _write_pr_comment_at(conn, tid, int(time.time()) - 300, url=_CARRIED_PR_URL)
+        assert kb.assign_task(conn, tid, "dev") is True
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        assert kb.reassign_task(conn, tid, "dev", reclaim_first=True) is True
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        assert kb.assign_task(conn, tid, None) is True
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        # The dispatcher's own default_assignee write is not an operator handoff.
+        res = kbd.dispatch_once(conn, dry_run=False, default_assignee="dev")
+        assert tid in res.auto_assigned_default
+        assert dict(res.respawn_guarded).get(tid) == "active_pr"
+        assert tid not in [s[0] for s in res.spawned]
+
+        # A real handoff after all of that still lifts the guard.
+        assert kb.assign_task(conn, tid, "closer") is True
+        _write_event_at(
+            conn, tid, "assigned", int(time.time()),
+            {"assignee": "closer", "from": "dev"},
+        )
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
+    kanban_home: Path, gh_pr_state
+) -> None:
+    """Reviewer CHANGES_REQUESTED routes the card back to ``ready`` for the
+    implementer to fix the SAME PR; ``active_pr`` must not hold it (#111910).
+    ``recent_success`` is untouched by the handoff exemption."""
+    gh_pr_state.answer(_CARRIED_PR_URL, "OPEN")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="changes requested", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        _write_pr_comment_at(conn, tid, int(time.time()) - 300, url=_CARRIED_PR_URL)
+        assert kb.request_review(
+            conn, tid, summary="PR ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        ok, implementer = kb.request_changes(
+            conn, tid, reason="fix tests", expected_run_id=rclaim.current_run_id,
+        )
+        assert (ok, implementer) == (True, "dev")
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        done_id = kb.create_task(conn, title="recent success", assignee="dev")
+        kb.claim_task(conn, done_id)
+        assert kb.complete_task(conn, done_id, summary="done") is True
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (done_id,))
+        assert kbd.check_respawn_guard(conn, done_id) == "recent_success"
+

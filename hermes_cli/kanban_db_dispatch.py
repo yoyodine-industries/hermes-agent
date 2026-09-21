@@ -1873,6 +1873,22 @@ def _log_unverifiable_pr_hold(task_id: str, url: str) -> None:
     )
 
 
+def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
+    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
+    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
+    --reclaim``), an unassign, or the dispatcher's own
+    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
+    the very implementer that opened the PR. Events without ``from`` (written
+    before it was recorded) are not trusted as handoffs — fail closed."""
+    if kind != "assigned":
+        return True
+    data = _kb._json_or(payload, {})
+    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
+        return False
+    to = data.get("assignee")
+    return bool(to) and "from" in data and data["from"] != to
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1891,6 +1907,9 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (an OPEN PR quoted in a recent comment; re-spawning risks a duplicate PR).
     A merged or closed PR is not a guard reason: the work it proposes is done.
+    Neither is an OPEN PR the card was re-queued against after that comment — a
+    changes-requested verdict, a review reopen, or a handoff to a different
+    profile reads as a deliberate re-queue, exactly as in step 3.
     The review lane skips the last two: they are the *inputs* to a review handoff.
     Stale / dead claim locks are NOT a guard reason — the reclaim passes own those.
     """
@@ -1965,19 +1984,40 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — but only while that PR is OPEN.
+    # 4. GitHub PR URL in a recent comment — but only while that PR is OPEN and
+    #    no handoff re-queued the card after that comment.
+    #
     #    A URL proves a worker once OPENED a PR, not that the work is still in
     #    flight: a merged PR is finished work, and holding the card on it parks
     #    the lane for the whole window (the defect this fixes — a merged PR kept
     #    a lane's only card off the board for a day). MERGED and CLOSED are not
     #    guard reasons; UNKNOWN falls back to the text-only rule, loudly.
+    #
+    #    Same predicate as step 3: a handoff recorded after the comment is a
+    #    deliberate re-queue of THAT PR — a reviewer's changes-requested verdict,
+    #    a review reopen, a card handed to a different profile — and the profile
+    #    now on the card is the one that must fix it. Newest comment first, so
+    #    the handoff that prompted the current state decides. A PR comment newer
+    #    than the handoff guards again.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
-        body = _db_text(c["body"])
-        for url in _RESPAWN_GUARD_PR_URL_RE.findall(body):
+        urls = _RESPAWN_GUARD_PR_URL_RE.findall(_db_text(c["body"]))
+        if not urls:
+            continue
+        events = conn.execute(
+            # Strictly after: a same-second tie stays guarded (fail closed).
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND created_at > ? "
+            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
+            (task_id, int(c["created_at"] or 0)),
+        ).fetchall()
+        if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+            return None
+        for url in urls:
             state = _pr_state_cached(url)
             if state == "OPEN":
                 return "active_pr"
