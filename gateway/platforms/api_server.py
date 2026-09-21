@@ -19,6 +19,7 @@ from functools import wraps
 import logging
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -200,6 +201,72 @@ def _hermes_version() -> str:
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
+# EADDRINUSE retries while the outgoing instance's socket tail drains. macOS refuses the bind for
+# 2*MSL (~30s) after the previous instance closed a connection first, and a restart re-binds seconds
+# later: 2026-09-19 lost 127.0.0.1:8644 at 12:13:52 that way and every lane's peer DM stayed refused
+# until a manual restart. Each delay is the wait AFTER a failed attempt; the last one is the total
+# wait before the failure is declared. Injectable: tests shorten it, they never re-time production.
+_BIND_BACKOFF_SECONDS = (0.5, 1.0, 2.0, 4.0, 8.0, 15.0)
+# Seconds ``disconnect`` waits for our own listener to stop accepting, so the replacement instance
+# that starts right after does not race a live socket (the restart hands the port over in-process).
+_PORT_RELEASE_WAIT_SECONDS = 10.0
+
+
+def _is_wildcard_host(host: Optional[str]) -> bool:
+    """A bind-all address, where a foreign listener cannot be probed interface by interface."""
+    return (host or "").strip() in ("", "0.0.0.0", "::", "*")
+
+
+def _has_live_listener(host: Optional[str], port: int) -> bool:
+    """Blocking probe: True when something accepts connections on ``host:port``. Refused = nobody
+    listens; any other failure (timeout, unroutable) is treated as live so the caller stays exclusive.
+    """
+    try:
+        with socket.create_connection((host or DEFAULT_HOST, port), timeout=1.0):
+            return True
+    except ConnectionRefusedError:
+        return False
+    except OSError:
+        return True
+
+
+async def _start_tcp_site(
+    runner: "web.BaseRunner", host: Optional[str], port: int, *, log_tag: str
+) -> "web.TCPSite":
+    """Bind ``host:port`` on ``runner`` and return the started site; raises OSError when unavailable.
+
+    SO_REUSEADDR: on macOS (BSD) two wildcard/specific sockets can silently split traffic while both
+    report success → disable. On Linux it only permits rebinding past TIME_WAIT (a quick restart would
+    otherwise fail to bind for ~60s) → keep the default.
+
+    The macOS exclusive bind also refuses the port while a server-side TIME_WAIT socket lingers
+    (2*MSL = 30s after the previous gateway closed a connection first — its shutdown, or any
+    ``Connection: close`` request), so a restart re-binding within seconds failed with EADDRINUSE
+    although nobody was listening. Preventing the TIME_WAIT at close time (SO_LINGER 0) would reset
+    in-flight senders and misses the per-request case, hence the bind-side retry: for an explicit host,
+    ``_has_live_listener`` refused proves the address is free (the kernel still rejects an exact
+    duplicate even with SO_REUSEADDR, and a foreign wildcard listener answers the probe), so one retry
+    with reuse_address=True is safe. A wildcard host keeps the strict path: a foreign listener on a
+    non-loopback interface could not be probed, so it must keep winning.
+    """
+    exclusive = sys.platform == "darwin"
+    site = web.TCPSite(runner, host, port, reuse_address=False if exclusive else None)
+    try:
+        await site.start()
+    except OSError as exc:
+        if not exclusive or exc.errno != errno.EADDRINUSE or _is_wildcard_host(host):
+            raise
+        if await asyncio.to_thread(_has_live_listener, host, port):
+            raise
+        await site.stop()  # aiohttp registers a site before binding: drop the dead one from the runner
+        logger.info(
+            "[%s] %s:%d busy without a live listener (TIME_WAIT from the previous gateway); "
+            "rebinding with SO_REUSEADDR", log_tag, host, port)
+        site = web.TCPSite(runner, host, port, reuse_address=True)
+        await site.start()
+    return site
+
+
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
@@ -4470,42 +4537,52 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._wire_plugin_handlers(self._app)
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
-            # Bind directly (a pre-probe raced the bind, misreporting TIME_WAIT as "in use").
-            # SO_REUSEADDR off on macOS (BSD can split traffic between two listeners).
             # Bind directly instead of probing 127.0.0.1 first — the old single-family pre-probe raced the
             # real bind and reported a TIME_WAIT socket as "in use" (#10297), failing gateway restarts for
-            # up to ~60s. SO_REUSEADDR is platform-dependent (same rationale as the webhook adapter,
-            # #65482): - macOS (BSD semantics): two sockets with SO_REUSEADDR can silently split traffic
-            # while both report success — disable. - Linux: SO_REUSEADDR only permits rebinding past
-            # TIME_WAIT (a second live listener needs SO_REUSEPORT, never set), so keep the default
-            # (enabled) for instant restart rebinds.
-            self._site = web.TCPSite(
-                self._runner, self._host, self._port, reuse_address=False if sys.platform == "darwin" else None)
+            # up to ~60s. start_tcp_site owns the platform rule: SO_REUSEADDR is off on macOS (BSD
+            # semantics can silently split traffic between two listeners) and default elsewhere, plus a
+            # rebind when the address is busy with nobody listening (macOS TIME_WAIT, 2*MSL ~30s); the
+            # retry loop below covers a predecessor that is still shutting down (live 2026-09-19: the
+            # restart at 12:13:52 lost 127.0.0.1:8644 and every lane's peer DM stayed refused).
             try:
-                await self._site.start()
+                self._site = await self._bind_site()
             except OSError as exc:
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
                 if getattr(exc, "errno", None) == errno.EADDRINUSE:
-                    # Config error: non-retryable, or the reconnect watcher leaks fds forever.
-                    self._set_fatal_error(
-                        # A port conflict is a configuration error, not a transient blip — another process
-                        # holds the port for its lifetime. A bare ``return False`` makes the reconnect
-                        # watcher in gateway.run treat it as retryable and loop forever at the backoff cap
-                        # (observed: 1568+ retries over 5 days across multi-profile setups all defaulting to
-                        # the same port, #52132), filling errors.log and leaking the adapter's ResponseStore
-                        # fds each retry. Non-retryable drops it from the reconnect queue; the operator
-                        # recovers with ``/platform resume api_server`` after changing the port.
-                        "api_server_port_in_use",
-                        f"Port {self._port} already in use. Set "
-                        f"platforms.api_server.port in config.yaml to a "
-                        f"different value, then `/platform resume api_server`.",
-                        retryable=False)
-                logger.error(
-                    "[%s] Could not bind %s:%d: %s. Set a different port in "
-                    "config.yaml: platforms.api_server.port",
-                    self.name, self._host, self._port, exc)
+                    # Only a LIVE foreign listener owns the port for its whole lifetime, and that is a
+                    # configuration error: keep it non-retryable, or the reconnect watcher leaks fds
+                    # forever (observed: 1568+ retries over 5 days across multi-profile setups all
+                    # defaulting to the same port, #52132). When nobody accepts on the address, the
+                    # port is held by a socket tail instead — transient, so leave no fatal error and let
+                    # run_startup queue it as retryable (``retrying`` status, reconnect watcher with
+                    # backoff, NEEDS_ATTENTION escalation) rather than dropping the platform for the
+                    # life of the gateway.
+                    if await asyncio.to_thread(_has_live_listener, self._host, self._port):
+                        self._set_fatal_error(
+                            "api_server_port_in_use",
+                            f"Port {self._port} already in use. Set "
+                            f"platforms.api_server.port in config.yaml to a "
+                            f"different value, then `/platform resume api_server`.",
+                            retryable=False)
+                        logger.error(
+                            "[%s] Could not bind %s:%d after %ds of retries: another process is "
+                            "listening there. Set a different port in "
+                            "config.yaml: platforms.api_server.port",
+                            self.name, self._host, self._port, int(sum(_BIND_BACKOFF_SECONDS)))
+                    else:
+                        logger.error(
+                            "[%s] Could not bind %s:%d after %ds of retries and nothing accepts on "
+                            "the address (%s): leaving the platform retryable for the reconnect "
+                            "watcher. Set a different port in config.yaml: platforms.api_server.port",
+                            self.name, self._host, self._port, int(sum(_BIND_BACKOFF_SECONDS)),
+                            exc)
+                else:
+                    logger.error(
+                        "[%s] Could not bind %s:%d: %s. Set a different port in "
+                        "config.yaml: platforms.api_server.port",
+                        self.name, self._host, self._port, exc)
                 return False
             from gateway.platforms.shared_ingress import listener_base_url
             self._mark_connected(listener_base=listener_base_url(self._host, self._port))
@@ -4516,6 +4593,44 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
+
+    async def _bind_site(self):
+        """Start the listener, retrying EADDRINUSE while the outgoing instance's socket tail drains.
+
+        Raises the last ``OSError`` when the window is exhausted so ``connect`` can classify it. Every
+        delay is the wait AFTER a failed attempt, so the total wait is ``sum(_BIND_BACKOFF_SECONDS)``.
+        """
+        delays = _BIND_BACKOFF_SECONDS
+        for attempt in range(len(delays) + 1):
+            try:
+                return await _start_tcp_site(self._runner, self._host, self._port, log_tag=self.name)
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE or attempt == len(delays):
+                    raise
+                logger.warning(
+                    "[%s] %s:%d not bindable yet (EADDRINUSE); retrying in %.1fs (%d/%d)",
+                    self.name, self._host, self._port, delays[attempt], attempt + 1, len(delays))
+                # aiohttp registers a site with its runner before binding, so a failed start leaves the
+                # site registered: rebuild the runner per attempt rather than reach into its internals.
+                await self._runner.cleanup()
+                self._runner = web.AppRunner(self._app)
+                await self._runner.setup()
+                await asyncio.sleep(delays[attempt])
+
+    async def _await_listener_release(self) -> None:
+        """Return once nothing accepts on our address, bounded by ``_PORT_RELEASE_WAIT_SECONDS``.
+
+        A socket tail (TIME_WAIT) accepts nothing, so this normally returns on the first probe; the wait
+        only bites when another process holds the address.
+        """
+        deadline = time.monotonic() + _PORT_RELEASE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            if not await asyncio.to_thread(_has_live_listener, self._host, self._port):
+                return
+            await asyncio.sleep(0.1)
+        logger.warning(
+            "[%s] %s:%d still accepts connections %.0fs after stop; the replacement instance will "
+            "retry the bind", self.name, self._host, self._port, _PORT_RELEASE_WAIT_SECONDS)
 
     async def disconnect(self) -> None:
         """Stop the aiohttp server and release every owned resource, including the ResponseStore
@@ -4534,6 +4649,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             except Exception:
                 logger.debug("Failed to close response store for %s", self.name, exc_info=True)
         _api_runs._close_run_state(self)
+        _had_listener = self._site is not None
         try:
             if self._site:
                 await self._site.stop()
@@ -4544,6 +4660,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         finally:
             self._close_cached_session_dbs()
             self._app = None
+        if _had_listener:
+            # Hand the address over deterministically: the replacement instance binds the SAME
+            # host:port seconds later, and losing it strands every lane's peer DM (2026-09-19).
+            await self._await_listener_release()
         logger.info("[%s] API server stopped", self.name)
 
     async def send(

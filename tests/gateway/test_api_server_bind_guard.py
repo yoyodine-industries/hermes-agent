@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms import api_server
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import is_network_accessible
 
@@ -146,7 +147,7 @@ class TestBindMechanics:
 
 
     @pytest.mark.asyncio
-    async def test_port_conflict_sets_non_retryable_fatal_error(self):
+    async def test_port_conflict_sets_non_retryable_fatal_error(self, monkeypatch):
         """A real port conflict (EADDRINUSE) must set a non-retryable fatal
         error so the reconnect watcher drops the platform from the retry
         queue instead of looping indefinitely.
@@ -155,7 +156,13 @@ class TestBindMechanics:
         watcher treated as retryable — retrying every 5 minutes forever,
         filling errors.log and leaking 2 fds per retry (#52132: 1568+
         retries over 5 days in a multi-profile setup).
+
+        Only a LIVE foreign listener is a configuration error: a socket tail
+        with nobody listening stays retryable (test_api_server_bind_retry.py).
+        The window is ~30s in production; a live holder never releases the
+        port, so shorten it here rather than waiting it out.
         """
+        monkeypatch.setattr(api_server, "_BIND_BACKOFF_SECONDS", (), raising=False)
         port = self._free_port()
         first = self._make_adapter(port)
         assert await first.connect() is True
