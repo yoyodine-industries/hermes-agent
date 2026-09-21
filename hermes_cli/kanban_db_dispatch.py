@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -63,12 +64,37 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Within this window a GitHub PR URL in a comment blocks re-spawn.
+# Within this window a GitHub PR URL in a comment blocks re-spawn — but only
+# while that PR is actually OPEN (see ``_resolve_pr_state``).
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
+)
+
+# A resolved PR state is trusted for this long before the forge is asked again.
+# The guard runs for every ready row on every tick, so an uncached lookup would
+# shell `gh` once per PR-URL comment per card per tick. Keyed by URL, not by
+# task: several cards routinely quote the same PR.
+_RESPAWN_GUARD_PR_STATE_TTL = 300  # 5 minutes
+
+# Hard ceiling on one `gh pr view`. The lookup happens inside the dispatch lock,
+# so a hung network call must not hold the tick open indefinitely; past this the
+# state is UNKNOWN and the caller takes its fallback.
+_RESPAWN_GUARD_PR_TIMEOUT = 10  # seconds
+
+_RESPAWN_GUARD_PR_STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
+
+# Ceiling on the URL -> state cache; expired entries are evicted past it, so a
+# long-lived dispatcher cannot grow the dict without bound.
+_RESPAWN_GUARD_PR_CACHE_LIMIT = 256
+
+# "The forge does not know this PR." gh reports a purged/deleted PR (or a
+# deleted repo) as a GraphQL 404 — that is an ANSWER, not a failure, and a
+# reference no longer resolvable is not an open PR.
+_RESPAWN_GUARD_PR_MISSING_RE = re.compile(
+    r"could not resolve to a (pull ?request|repository)", re.IGNORECASE
 )
 
 
@@ -138,7 +164,9 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    within guard window), ``"active_pr"`` (an OPEN GitHub PR quoted in a recent
+    comment; a PR whose state cannot be read holds too — see
+    ``_resolve_pr_state``)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1139,6 +1167,91 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+# URL -> (monotonic stamp, state) for the guard's PR lookups.
+_respawn_guard_pr_states: dict[str, tuple[float, Optional[str]]] = {}
+
+# "task_id\0url" -> monotonic stamp of the last unverifiable-hold log line.
+_respawn_guard_hold_logged: dict[str, float] = {}
+
+
+def _resolve_pr_state(url: str) -> Optional[str]:
+    """A PR URL's state — ``"OPEN"``/``"MERGED"``/``"CLOSED"`` — or ``None``.
+
+    ``gh pr view <url> --json state`` is the whole query: one URL in, one word
+    out, no owner/repo/number parsing of ours to get wrong. A PR the forge
+    cannot resolve is ``"CLOSED"`` — the forge answered, and a purged reference
+    is not an open PR. Everything else that can go wrong (no ``gh`` on PATH, no
+    network, an auth wall, a timeout, output we cannot parse) is ``None``
+    (UNKNOWN); ``check_respawn_guard`` decides what UNKNOWN means.
+
+    FAILURE MODE: CLOSED. UNKNOWN holds the card (the text-only fallback).
+    Holding costs a delayed turn; failing open costs a DUPLICATE PR for work
+    already proposed, which is the failure this guard exists to prevent. The
+    fallback is deliberately loud, never silent (``_log_unverifiable_pr_hold``):
+    a lane parked on a state nobody could read has to say so — exactly what the
+    pre-fix guard never did.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", url, "--json", "state"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_RESPAWN_GUARD_PR_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # No gh, no PATH entry, no route to the host, or the timeout fired.
+        return None
+    if proc.returncode != 0:
+        stderr = proc.stderr or ""
+        return "CLOSED" if _RESPAWN_GUARD_PR_MISSING_RE.search(stderr) else None
+    try:
+        state = json.loads(proc.stdout or "{}").get("state")
+    except (ValueError, AttributeError):
+        return None
+    return state if state in _RESPAWN_GUARD_PR_STATES else None
+
+
+def _pr_state_cached(url: str) -> Optional[str]:
+    """``_resolve_pr_state`` behind the TTL cache that keeps a tick bounded."""
+    now = time.monotonic()
+    hit = _respawn_guard_pr_states.get(url)
+    if hit is not None and (now - hit[0]) < _RESPAWN_GUARD_PR_STATE_TTL:
+        return hit[1]
+    if len(_respawn_guard_pr_states) > _RESPAWN_GUARD_PR_CACHE_LIMIT:
+        for key, (stamp, _state) in list(_respawn_guard_pr_states.items()):
+            if (now - stamp) >= _RESPAWN_GUARD_PR_STATE_TTL:
+                del _respawn_guard_pr_states[key]
+    state = _resolve_pr_state(url)
+    # UNKNOWN is cached too: a forge outage must not cost one timeout per ready
+    # row per tick for as long as it lasts.
+    _respawn_guard_pr_states[url] = (now, state)
+    return state
+
+
+def _log_unverifiable_pr_hold(task_id: str, url: str) -> None:
+    """Say ONCE per card that the guard held it on a PR it could not verify.
+
+    The pre-fix defect was not only the wrong verdict but the silence around it:
+    a lane sat parked for the whole 24h window with nothing anywhere explaining
+    why. Deduped per card+URL inside the guard window, so a card held for hours
+    does not fill the log on every tick.
+    """
+    key = f"{task_id}\x00{url}"
+    now = time.monotonic()
+    last = _respawn_guard_hold_logged.get(key)
+    if last is not None and (now - last) < _RESPAWN_GUARD_PR_WINDOW:
+        return
+    _respawn_guard_hold_logged[key] = now
+    _kb._log.warning(
+        "kanban: respawn guard holding %s on PR %s — its state could not be read "
+        "(gh missing, offline, unauthenticated or timed out), so the text-only "
+        "rule applies. That PR may be merged or closed.",
+        task_id,
+        url,
+    )
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1152,9 +1265,10 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
-    lane skips the last two: they are the *inputs* to a review handoff. Stale /
-    dead claim locks are NOT a guard reason — the reclaim passes own those.
+    (an OPEN PR quoted in a recent comment; re-spawning risks a duplicate PR).
+    A merged or closed PR is not a guard reason: the work it proposes is done.
+    The review lane skips the last two: they are the *inputs* to a review handoff.
+    Stale / dead claim locks are NOT a guard reason — the reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1220,15 +1334,25 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. GitHub PR URL in a recent comment — but only while that PR is OPEN.
+    #    A URL proves a worker once OPENED a PR, not that the work is still in
+    #    flight: a merged PR is finished work, and holding the card on it parks
+    #    the lane for the whole window (the defect this fixes — a merged PR kept
+    #    a lane's only card off the board for a day). MERGED and CLOSED are not
+    #    guard reasons; UNKNOWN falls back to the text-only rule, loudly.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _db_text(c["body"])
-        if body and _RESPAWN_GUARD_PR_URL_RE.search(body):
-            return "active_pr"
+        for url in _RESPAWN_GUARD_PR_URL_RE.findall(body):
+            state = _pr_state_cached(url)
+            if state == "OPEN":
+                return "active_pr"
+            if state is None:
+                _log_unverifiable_pr_hold(task_id, url)
+                return "active_pr"
 
     return None
 

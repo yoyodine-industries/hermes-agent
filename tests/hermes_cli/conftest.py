@@ -19,6 +19,81 @@ def all_assignees_spawnable(monkeypatch):
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
 
 
+class _GhPrStateStub:
+    """Stand-in for the ``subprocess`` module inside ``kanban_db_dispatch``.
+
+    Only ``run`` is replaced; every other attribute proxies to the real module,
+    so the dispatcher's other subprocess use is untouched. Under this stub the
+    REAL guard runs its REAL ``gh`` argv and its REAL JSON parse — this pins the
+    forge, never the code under test.
+    """
+
+    def __init__(self) -> None:
+        self.states: dict[str, str] = {}
+        self.calls: list[list[str]] = []
+        self.offline = False
+
+    def answer(self, url: str, state: str) -> None:
+        """What ``gh pr view <url> --json state`` reports for ``url``."""
+        self.states[url] = state
+
+    def go_offline(self) -> None:
+        """Make ``gh`` itself fail — state unknowable, not "closed"."""
+        self.offline = True
+
+    def __getattr__(self, name: str):
+        import subprocess
+
+        return getattr(subprocess, name)
+
+    def run(self, argv, **_kwargs):
+        import json
+        import subprocess
+
+        self.calls.append([str(arg) for arg in argv])
+        if self.offline:
+            raise OSError("gh: no route to host")
+        url = next((arg for arg in argv if str(arg).startswith("http")), "")
+        state = self.states.get(url)
+        if state is None:
+            # What gh really answers for a reference the forge cannot resolve
+            # (purged PR, recreated repo): a GraphQL 404 on stderr, exit 1.
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                stdout="",
+                stderr=(
+                    "GraphQL: Could not resolve to a PullRequest with the number "
+                    "of 123. (repository.pullRequest)\n"
+                ),
+            )
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps({"state": state}), stderr=""
+        )
+
+
+@pytest.fixture
+def gh_pr_state(monkeypatch):
+    """Pin the respawn guard's one network hop (``gh pr view <url>``).
+
+    The guard decides whether a PR-URL comment still means "work in flight", and
+    that answer comes from the forge — which a test must never really call.
+    Returns the stub: set states with ``.answer(url, state)``, break the link
+    with ``.go_offline()``, and read the argv back from ``.calls``.
+    """
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    stub = _GhPrStateStub()
+    monkeypatch.setattr(kbd, "subprocess", stub)
+    # The guard's PR-state caches are module-level; hand each test fresh ones so
+    # a cached verdict from another test can never decide this one's. raising=False
+    # keeps this fixture usable against a tree that predates the caches.
+    monkeypatch.setattr(kbd, "_respawn_guard_pr_states", {}, raising=False)
+    monkeypatch.setattr(kbd, "_respawn_guard_hold_logged", {}, raising=False)
+    return stub
+
+
 @pytest.fixture(autouse=True)
 def _suppress_concurrent_hermes_gate(request, monkeypatch):
     """Default ``_detect_concurrent_hermes_instances`` to ``[]`` for every test.
