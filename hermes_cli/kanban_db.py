@@ -2986,11 +2986,14 @@ def block_task(
     see :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition.
 
-    ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on the
+    ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on a plain
     ``blocked`` landing only: the due-card waker unblocks the card on the first
     dispatcher pass after that time, so a time-fenced hold releases without a
-    human touching it. It is meaningless on the ``todo`` (dependency) landing
-    and is refused there."""
+    human touching it. It is meaningless on the ``todo`` (dependency) landing and
+    is refused on it. A loop-breaker PARK (``block_loop_detected``) is excluded
+    too — that card is waiting on a human decision, not a clock, so arming a wake
+    time would let it release itself and re-enter the loop the breaker just
+    stopped."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     if window_policy is not None and window_policy not in VALID_DUE_WINDOW_POLICIES:
@@ -3015,7 +3018,7 @@ def block_task(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
-        if new_status == "blocked" and due_at is not None:
+        if new_status == "blocked" and due_at is not None and event_kind == "blocked":
             set_sql += ",\n                       due_at = ?,\n                       due_window_policy = ?"
             params = (*params, int(due_at), window_policy or DEFAULT_DUE_WINDOW_POLICY)
             payload["due_at"] = int(due_at)
