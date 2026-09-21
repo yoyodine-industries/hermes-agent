@@ -1537,6 +1537,14 @@ export { SkillsView } from '@/app/skills'
  *  renders anywhere (a plugin dialog); pass a live `gateway` (see
  *  `host.getGateway()`) and an optional `profile` to scope it to one bot. */
 export { McpTab } from '@/app/skills/mcp-tab'
+/** THE canonical message-text surface: the same preprocess → Streamdown →
+ *  component pipeline core chat renders assistant answers, reasoning, tool
+ *  output and user bubbles with, transcript directives included. Render a
+ *  settled message with
+ *  `<MarkdownTextContent isRunning={false} text={…} />`. Raw `Streamdown`
+ *  (below) skips that pipeline, so a `::name{…}` directive a plugin claimed
+ *  comes out as literal prose and none of the core chat components mount. */
+export { MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
 /** The oversized Collapse lettering an empty chat is titled with — core writes
  *  "HERMES AGENT" with it, a `chat.empty` contribution writes its own name. */
 export { Wordmark } from '@/components/chat/wordmark'
@@ -1805,6 +1813,8 @@ export { Blobatar } from 'blobatar/react'
 /** Plugin-local reactive state (share between a trigger and its panel, poll
  *  loops, cross-component signals) — the same primitive `host.state` uses. */
 export { atom, computed } from 'nanostores'
-/** Markdown renderer (same pipeline core chat surfaces use) so plugins render
- *  message text as a preview instead of raw Markdown source. */
+/** Raw Streamdown — Markdown only: no transcript directives, no core chat
+ *  components (media, artifact cards, session refs, cards). It is the right
+ *  tool for a thumbnail of source text; for anything a reader takes as a
+ *  message, use `MarkdownTextContent`. */
 export { Streamdown } from 'streamdown'

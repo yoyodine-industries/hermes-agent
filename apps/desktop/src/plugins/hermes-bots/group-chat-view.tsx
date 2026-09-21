@@ -101,6 +101,11 @@ import { bumpBotOpenGeneration, getPluginCtx, ID } from './shared'
 import type { Attachment, BotMeta, GroupChat, GroupMember, GroupMessage, RosterRow } from './types'
 
 const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
+/** Room entries are messages bots wrote, so they render through the SDK's
+ *  canonical markdown surface — the one that runs the transcript directive
+ *  parser. Raw `Streamdown` here rendered a research render's
+ *  `::preview{file="…"}` as literal prose instead of the report. */
+const MarkdownTextContent = typeof sdk === 'undefined' ? undefined : sdk.MarkdownTextContent
 
 /** Soft-disband a group chat: remove only this group from every local member's
  *  membership list (the metadata syncs cross-machine via ui_meta), drop the
@@ -1004,7 +1009,13 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
             // back in so drag-select and ⌘C work in group chat logs.
             data-selectable-text="true"
           >
-            {Streamdown ? <Streamdown>{entry.text}</Streamdown> : entry.text}
+            {MarkdownTextContent ? (
+              <MarkdownTextContent isRunning={false} text={entry.text} />
+            ) : Streamdown ? (
+              <Streamdown>{entry.text}</Streamdown>
+            ) : (
+              entry.text
+            )}
           </div>
           {/* User attachments: what every responding bot was */
           /* shown — image previews, or a named chip for */

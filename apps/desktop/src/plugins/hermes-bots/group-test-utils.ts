@@ -433,6 +433,7 @@ export async function pluginSdkMock(host: Record<string, unknown>) {
     computed: nanostores.computed,
     createBudgetedLoop: undefined,
     host,
+    MarkdownTextContent: undefined,
     SkillsView: undefined,
     Streamdown: undefined,
     queryClient: { invalidateQueries: () => undefined },
