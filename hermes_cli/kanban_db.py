@@ -305,6 +305,14 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # breaker must never trip on a throttle). 75 == BSD EX_TEMPFAIL.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Worker exit "provider billing exhausted": the provider REFUSED the run on a
+# credit/billing wall (HTTP 402 "Insufficient Balance"), so no work was attempted.
+# Released without counting a failure like the throttle above, but PARKED instead
+# of re-queued: a quota window clears by itself, an empty account does not. 76 is
+# unused by the BSD sysexits convention and distinct from 75 so the dispatcher can
+# tell the two walls apart.
+KANBAN_BILLING_EXHAUSTED_EXIT_CODE = 76
+
 
 def _resolve_crash_grace_seconds() -> int:
     """``HERMES_KANBAN_CRASH_GRACE_SECONDS`` (0 = immediate, for tests) else default."""

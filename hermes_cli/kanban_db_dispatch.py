@@ -136,6 +136,11 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    billing_exhausted: list[str] = field(default_factory=list)
+    """Task ids whose workers were refused by the provider on a credit/billing
+    wall (HTTP 402) and were PARKED in ``blocked`` WITHOUT counting a failure —
+    an empty account does not clear on a clock, so the card waits for the human
+    who can top it up instead of re-running into the same wall."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -234,6 +239,7 @@ _TICK_WORK_FIELDS = (
     "auto_blocked",
     "reconciled_orphans",
     "rate_limited",
+    "billing_exhausted",
     "auto_assigned_default",
 )
 
@@ -515,8 +521,10 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
     (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
-    ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
-    not in the reap registry; ``code`` None)."""
+    ``billing_exhausted`` (``KANBAN_BILLING_EXHAUSTED_EXIT_CODE``, never counts
+    as a failure either and parks the card), ``nonzero_exit``, ``signaled``
+    (``code`` is the signal), ``unknown`` (pid not in the reap registry; ``code``
+    None)."""
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
@@ -528,6 +536,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == _kb.KANBAN_BILLING_EXHAUSTED_EXIT_CODE:
+                return ("billing_exhausted", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -1034,16 +1044,65 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
+# Closed-run outcomes that spent an attempt without settling the card: the
+# worker never made a terminal call, or the run died under it. Anything else
+# (``completed``, ``blocked``, ``review_requested``, ``changes_requested``,
+# ``scheduled``, and unknown/legacy values) settles the attempt cycle and starts
+# a fresh budget.
+_NO_DISPOSITION_OUTCOMES = frozenset({
+    "crashed", "timed_out", "spawn_failed", "reclaimed", "stale", "gave_up",
+})
+
+# Provider walls: the run never got a chance to work, so it says nothing about
+# the task. Neutral for BOTH the retry budget and the violation streak — the same
+# rule in ``_attempts_without_disposition`` and ``_protocol_violation_streak``, so
+# the two counters can't drift apart on a wall. ``rate_limited`` is a quota window
+# that clears on a clock; ``billing_exhausted`` is an empty account that parks the
+# card (a parked card has no next attempt, but a run of walls that ends in a park
+# must not retroactively read as a spent budget either).
+_NEUTRAL_RUN_OUTCOMES = frozenset({"rate_limited", "billing_exhausted"})
+
+
+def _attempts_without_disposition(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of closed attempts that settled nothing.
+
+    The retry budget has to be *durable*. ``consecutive_failures`` lives on the
+    task row and the deliberate re-queue paths reset it on purpose — an operator
+    ``unblock`` starts a fresh cycle, and a reassignment gives a fresh profile a
+    fresh budget — so on its own it cannot bound a card that re-queues through
+    those paths, and the ledger shows cards reaching 8+ attempts with the
+    counter back at 0.
+
+    A run row cannot be reset: re-queuing a card never edits its ledger. Reading
+    the budget off the ledger is therefore the one count that survives every
+    re-queue, and it is also the honest one — it counts attempts that actually
+    happened, not a counter someone remembered to increment.
+    """
+    attempts = 0
+    rows = conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome in _NEUTRAL_RUN_OUTCOMES:
+            continue
+        if outcome not in _NO_DISPOSITION_OUTCOMES:
+            break
+        attempts += 1
+    return attempts
+
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
 
     Walks closed runs newest-first (including the one ``detect_crashed_workers``
-    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
-    the budget counts ONLY protocol violations. Violations are recognized by the
-    ``protocol_violation`` run-metadata marker, with the error text as fallback
-    for runs recorded before the marker existed.
+    just closed). Provider walls (``_NEUTRAL_RUN_OUTCOMES``) are neutral and
+    skipped (a wall says nothing about the task); any other closed run breaks the
+    streak, so the budget counts ONLY protocol violations. Violations are
+    recognized by the ``protocol_violation`` run-metadata marker, with the error
+    text as fallback for runs recorded before the marker existed.
     """
     streak = 0
     rows = conn.execute(
@@ -1054,7 +1113,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in _NEUTRAL_RUN_OUTCOMES:
             continue
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
@@ -1080,6 +1139,45 @@ _PROTOCOL_VIOLATION_ERROR = (
 )
 
 
+_BILLING_EXHAUSTED_ERROR = (
+    # HTTP 402 from the provider: the account is out of credits, so the run was
+    # refused before any work happened. Nothing about this is the task's fault and
+    # it cannot clear on its own, so the card is parked for the operator instead of
+    # spending retries on the provider's billing state.
+    "pid {pid} exited on a provider billing wall (HTTP 402) — provider credits/"
+    "billing exhausted, no work was attempted. Card parked: top up the provider "
+    "account and unblock to re-dispatch."
+)
+
+# The park a billing wall goes to: ``capability`` — the wall is missing access
+# (credit) that no retry and no worker can supply, so the card waits for the
+# operator rather than for another attempt.
+_BILLING_WALL_BLOCK_KIND = "capability"
+
+
+def _billing_wall_park(row, retry_status: str, error_text: str) -> dict:
+    """Park bookkeeping for a billing wall, routed by ``_route_block``.
+
+    Returns ``{"status", "event_kind", "set_sql", "params", "payload"}``: the
+    ``status``/``event_kind``/``set_sql``/``params`` shape lets the reclaim txn
+    park the card in the SAME ``UPDATE`` that releases the claim (no nested write
+    txn), and reusing ``_route_block`` keeps the ``block_kind``/recurrence
+    arithmetic in ONE place — a repeat park after an unblock counts a recurrence,
+    which is what lets the disposition sweep escalate a card that keeps hitting
+    the same wall.
+    """
+    status, event_kind, set_sql, params, payload = _kb._route_block(
+        _BILLING_WALL_BLOCK_KIND, error_text, retry_status,
+        prev_kind=_kb._row_get(row, "block_kind"),
+        prev_recurrences=int(_kb._row_get(row, "block_recurrences") or 0),
+    )
+    payload["billing_exhausted"] = True
+    return {
+        "status": status, "event_kind": event_kind, "set_sql": set_sql,
+        "params": params, "payload": payload,
+    }
+
+
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1091,9 +1189,14 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    billing_exhausted: bool = False
 
     @property
     def run_outcome(self) -> str:
+        # A provider wall is recorded under its own outcome so board history
+        # doesn't show a phantom crash for a refusal that never reached the model.
+        if self.billing_exhausted:
+            return "billing_exhausted"
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
         return "rate_limited" if self.rate_limited else "crashed"
@@ -1124,6 +1227,18 @@ def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
         )
+    if kind == "billing_exhausted":
+        # PROVIDER CREDIT WALL (HTTP 402): the provider refused the run, so no
+        # work was attempted and the task tells us nothing — NOT a failure. But
+        # unlike a quota window an empty account does not refill on a clock, so
+        # the card is PARKED for the human who can top it up instead of being
+        # re-queued into the same wall.
+        return _DeadWorker(
+            kind, code, _BILLING_EXHAUSTED_ERROR.format(pid=pid),
+            "billing_exhausted",
+            {"pid": pid, "claimer": claimer, "exit_code": code, "billing_exhausted": True},
+            billing_exhausted=True,
+        )
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -1143,6 +1258,9 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    # Billing walls: PARKED in ``blocked`` (not requeued), and never counted as a
+    # failure — the provider refused the run, so the task was never tried.
+    billing_exhausted: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, protocol_violation, error_text)``: accounted
     # after the txn via ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, bool, str]] = field(default_factory=list)
@@ -1152,11 +1270,14 @@ class _CrashSweep:
 
 
 def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
-    """Release every host-local ``running`` task whose worker PID is dead."""
+    """Release — or PARK, for a provider billing wall — every host-local
+    ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
+    now = int(time.time())
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, "
+            "       max_runtime_seconds, block_kind, block_recurrences "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1177,12 +1298,45 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             dead = _classify_dead_worker(pid, row["claim_lock"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            # The attempt is RECORDED, not discarded: an exit code alone says
+            # nothing about how much of the run was spent, so the reaped attempt
+            # also books its wall-clock duration and the runtime budget it was
+            # working against. Same field names ``enforce_max_runtime`` uses, so
+            # a run's cost reads the same whether it timed out or died.
+            open_run = conn.execute(
+                "SELECT started_at FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            run_started_at = _kb._row_get(open_run, "started_at") if open_run is not None else None
+            if run_started_at:
+                dead.event_payload["elapsed_seconds"] = max(0, now - int(run_started_at))
+            budget = _kb._row_get(row, "max_runtime_seconds")
+            if budget is not None:
+                dead.event_payload["limit_seconds"] = int(budget)
+            dead.event_payload.setdefault("exit_kind", dead.kind)
+            # A billing wall PARKS the card; everything else releases it to the
+            # source phase for another attempt. The park's event kind is
+            # ``blocked`` — the shape ``block_task`` emits — and that is what makes
+            # it STICKY for ``recompute_ready``: a park that left
+            # ``consecutive_failures`` untouched would otherwise be promoted
+            # straight back to ``ready`` in the same tick and re-spawned into the
+            # same wall, which is the loop this carve-out exists to stop.
+            park = None
+            set_sql = "status = ?, "
+            params: tuple = (retry_status,)
+            if dead.billing_exhausted:
+                park = _billing_wall_park(row, retry_status, dead.error_text)
+                dead.event_kind = park["event_kind"]
+                dead.event_payload.update(park["payload"])
+                set_sql = f"status = '{park['status']}', {park['set_sql']}, "
+                params = park["params"]
             cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "UPDATE tasks SET " + set_sql +
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (*params, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -1203,10 +1357,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.billing_exhausted:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
+                # blocker; a billing wall must show the operator WHY the card is
+                # parked; a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
                 # board UI and retry worker need the corrective message.
                 conn.execute(
@@ -1215,6 +1370,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.billing_exhausted:
+                sweep.billing_exhausted.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append(
@@ -1292,6 +1449,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
     wall, released WITHOUT counting a failure and surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
+    ``KANBAN_BILLING_EXHAUSTED_EXIT_CODE`` is a provider billing wall: also not
+    a failure, but PARKED in ``blocked`` (waiting for a human) rather than
+    requeued, and surfaced via ``_last_billing_exhausted``.
     """
     sweep = _reclaim_dead_workers(conn)
     # Outside the main txn: account each crash and maybe trip the breaker.
@@ -1301,6 +1461,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    # Billing walls parked the card instead of requeueing it; also not crashes.
+    detect_crashed_workers._last_billing_exhausted = sweep.billing_exhausted  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1372,6 +1534,17 @@ def _record_task_failure(
             else ("review" if row["status"] == "review" else "ready")
         )
         failures = int(row["consecutive_failures"]) + 1
+        # Spend the retry budget ONCE. ``consecutive_failures`` is reset by the
+        # deliberate re-queue paths — an operator ``unblock`` starts a fresh
+        # cycle, a reassignment gives a fresh profile a fresh budget — so on its
+        # own it cannot bound a card that keeps coming back. The run ledger
+        # counts the attempts that actually happened, and floors the counter at
+        # them. Without this floor a protocol-violation trip lands at
+        # failures=1, ``recompute_ready`` reads 1 < limit and promotes the card
+        # in the very same dispatcher tick: blocked -> promoted -> respawned,
+        # unbounded (measured: 43 cards past their ceiling on one board).
+        attempts = _attempts_without_disposition(conn, task_id)
+        failures = max(failures, attempts)
 
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
@@ -1415,12 +1588,23 @@ def _record_task_failure(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
                if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
+            + "consecutive_failures = ?, last_failure_error = ?, "
+            # A dispatcher park is a DOCUMENTED park. ``block_kind`` stops the
+            # disposition sweep from reading the card as an undocumented
+            # blocker (which it drains straight back into the queue, closing the
+            # loop) and is what routes the card to a human. ``needs_input`` is
+            # the honest kind: the card needs a decision — buy attempts by
+            # raising ``max_retries``, or close it — not another blind retry.
+            # ``block_recurrences`` is deliberately NOT bumped: it counts
+            # worker-initiated block loops, and inflating it here would fast-path
+            # a later real worker block of the same kind to triage.
+            "block_kind = 'needs_input' "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
             (failures, error, task_id),
         )
         payload = {
             "failures": failures,
+            "attempts_without_disposition": attempts,
             "effective_limit": effective_limit,
             "limit_source": limit_source,
             "error": error,
@@ -2150,6 +2334,9 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.billing_exhausted.extend(
+        getattr(detect_crashed_workers, "_last_billing_exhausted", [])
+    )
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
