@@ -697,13 +697,29 @@ gateway:
     cors_origins: http://localhost:3000
     model_name: my-hermes
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
+    run_queue_max_depth: 100  # queued requests allowed to wait; 0 = unbounded
+    run_queue_wait_seconds: 1800  # how long a queued request waits for a slot
 ```
 
 `port`, `key`, `host`, `cors_origins`, and `model_name` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
 
-### Concurrent-run cap
+### Concurrent-run cap and the admission queue
 
-The API server limits how many agent runs may execute at once across the OpenAI-compatible and Runs endpoints. The cap is read from `gateway.api_server.max_concurrent_runs` (default **10**; `0` disables the limit, negative values clamp to 0). When the cap is reached, new run-starting requests are rejected with **HTTP 429** `Too many concurrent runs (max N)` — clients should back off and retry.
+The API server limits how many agent runs may execute at once across the OpenAI-compatible and Runs endpoints. The cap is read from `gateway.api_server.max_concurrent_runs` (default **10**; `0` disables the limit, negative values clamp to 0). A run-starting request beyond the cap is **admitted and queued**, not refused: it waits its turn behind the live runs in arrival (FIFO) order, and `POST /v1/runs` reports the wait as `{"status": "queued"}` in its 202 body (`"started"` when a slot was free immediately).
+
+Two bounds keep that queue from becoming an unbounded hold:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `gateway.api_server.run_queue_max_depth` | `100` | Requests admitted and waiting for a slot before new ones are refused (`0` = unbounded). |
+| `gateway.api_server.run_queue_wait_seconds` | `120` | How long a queued request waits before it gives up. |
+
+The only **HTTP 429** responses are refusals, each with a `Retry-After` header and a machine-readable `error.code`:
+
+- `run_queue_full` — the queue is already at `run_queue_max_depth`; the request was never enqueued.
+- `run_queue_timeout` — no slot freed within `run_queue_wait_seconds`. `POST /v1/runs` has already answered `202`, so it reports this on the run instead: the run ends `failed` with `code: "run_queue_timeout"`.
+
+Clients should back off on either code and retry.
 
 ## Security Headers
 
