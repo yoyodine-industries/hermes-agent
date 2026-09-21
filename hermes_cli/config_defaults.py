@@ -2056,7 +2056,10 @@ DEFAULT_CONFIG = {
             # request beyond this is ADMITTED and queued (it waits its turn in arrival order)
             # instead of refused: 429 + Retry-After is reserved for a queue already at
             # run_queue_max_depth and for a wait that expires (run_queue_wait_seconds).
-            # 0 = no cap (nothing queues).
+            # 0 = no cap (nothing queues). The first-party session-chat surfaces
+            # (POST /api/sessions/{id}/chat and /chat/stream) are intentionally OUTSIDE this cap:
+            # they call _run_agent directly and are serialized per session by the turn lease
+            # instead, so there is nothing for them to queue behind.
             "max_concurrent_runs": 10,
             # Max run-starting requests admitted and waiting for a slot before new ones get
             # 429 run_queue_full. 0 = unbounded queue.

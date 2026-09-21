@@ -1177,7 +1177,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Bounded run-admission queue (#7483 follow-up): a run-starting request is admitted into
         # the queue whenever it has room and waits its turn in FIFO arrival order, so a burst
         # larger than the cap is served in sequence instead of refused. One counter, one
-        # invariant: executing turns <= _max_concurrent_runs across every run-starting endpoint.
+        # invariant: executing turns <= _max_concurrent_runs across the OpenAI-compatible
+        # run-starting endpoints (/v1/chat/completions, /v1/responses, /v1/runs). The first-party
+        # session-chat surfaces (POST /api/sessions/{id}/chat and /chat/stream, which call
+        # _run_agent directly) take no slot — a session's own turns are serialized instead by its
+        # per-session turn lease (agent/turn_facade_lease.py, over SessionDB's
+        # acquire_session_turn_lease), not by this cap.
         # The only 429s are a queue already at run_queue_max_depth (_run_queue_full_response)
         # and a wait that expires (_run_queue_timeout_response); 0 disables each bound.
         self._run_queue_max_depth: int = self._resolve_run_queue_max_depth()

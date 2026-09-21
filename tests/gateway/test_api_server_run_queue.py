@@ -47,6 +47,7 @@ def _runs_app(adapter: APIServerAdapter) -> web.Application:
         adapter,
         ("POST", "/v1/runs", adapter._handle_runs),
         ("GET", "/v1/runs/{run_id}", adapter._handle_get_run),
+        ("POST", "/v1/runs/{run_id}/stop", adapter._handle_stop_run),
     )
 
 
@@ -95,6 +96,17 @@ async def _end_hold(adapter: APIServerAdapter, waiter) -> None:
     except asyncio.CancelledError:
         pass
     await _wait_for(lambda: waiter not in adapter._run_slot_waiters)
+
+
+def _drain_run_stream(adapter: APIServerAdapter, run_id: str) -> list:
+    """Snapshot a run's buffered SSE events; the ``None`` sentinel is the stream close."""
+    queue = adapter._run_streams.get(run_id)
+    if queue is None:
+        return []
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +331,64 @@ class TestRunAdmissionQueue:
                 await _wait_for(lambda: adapter._run_statuses[body["run_id"]]["status"] == "completed")
 
         assert adapter._run_slots_in_use == 0
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs/{run_id}/stop — cancel a run parked in the slot queue
+# ---------------------------------------------------------------------------
+
+
+class TestStopQueuedRun:
+    """A queued run has no agent to interrupt, so stop must cancel its parked task.
+
+    Otherwise the stop is a no-op until ``run_queue_wait_seconds`` expires and the run ends
+    ``failed`` / ``run_queue_timeout`` — a deliberate stop reported as a rate-limit failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_a_queued_run_and_closes_its_stream(self):
+        adapter = _make_adapter(max_runs=1, wait_seconds=30.0)
+        adapter._run_slots_in_use = 1  # the only slot is held by another turn
+        app = _runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            posted = await (await cli.post("/v1/runs", json={"input": "queued"})).json()
+            run_id = posted["run_id"]
+            assert posted["status"] == "queued"
+            await _wait_for(lambda: adapter._run_queue_depth() == 1)
+
+            stopped = await cli.post(f"/v1/runs/{run_id}/stop")
+            assert stopped.status == 200
+            assert (await stopped.json())["status"] == "stopping"
+
+            # Prompt: far inside the slot wait, and never the expiry failure.
+            await _wait_for(
+                lambda: adapter._run_statuses[run_id]["status"] == "cancelled", timeout=2.0)
+
+            assert adapter._run_slots_in_use == 1  # the slot held elsewhere is untouched
+            events = _drain_run_stream(adapter, run_id)
+            assert events and events[-1] is None  # sentinel: the SSE stream was closed
+            assert any(e and e["event"] == "run.cancelled" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_queued_run_leaves_no_waiter_and_no_phantom_slot_release(self):
+        adapter = _make_adapter(max_runs=1, wait_seconds=30.0)
+        adapter._run_slots_in_use = 1
+        app = _runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            posted = await (await cli.post("/v1/runs", json={"input": "queued"})).json()
+            run_id = posted["run_id"]
+            await _wait_for(lambda: adapter._run_queue_depth() == 1)
+
+            assert (await cli.post(f"/v1/runs/{run_id}/stop")).status == 200
+            await _wait_for(
+                lambda: adapter._run_statuses[run_id]["status"] == "cancelled", timeout=2.0)
+
+            # It never held a slot, so the count must not dip (a dip over-admits later runs).
+            assert list(adapter._run_slot_waiters) == []
+            assert adapter._run_slots_in_use == 1
+            assert run_id not in adapter._active_run_tasks
 
 
 # ---------------------------------------------------------------------------

@@ -662,13 +662,16 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     # The admitted run owns no slot until it reaches the front of the queue: over cap it waits
     # here in FIFO arrival order (its status stays "queued" meanwhile) and starts only once the
     # head of the queue frees a slot. A wait that expires ends the run instead of starting it.
-    slot_error = await self._acquire_run_slot()
-    if slot_error is not None:
-        code, message = _api_server._error_envelope(slot_error)
-        _finish("failed", error=message, code=code)
-        return
-
+    # The wait sits INSIDE the try so that cancelling a parked run (POST /v1/runs/{id}/stop) still
+    # gets the terminal status, the stream sentinel and the live-state retire below.
+    slot_held = False
     try:
+        slot_error = await self._acquire_run_slot()
+        if slot_error is not None:
+            code, message = _api_server._error_envelope(slot_error)
+            _finish("failed", error=message, code=code)
+            return
+        slot_held = True
         self._set_run_status(run_id, "running")
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
@@ -693,6 +696,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
             _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
     except asyncio.CancelledError:
+        # Also the parked-in-the-queue case: /stop cancels a run that has no agent yet.
         _finish("cancelled")
         raise
     except _api_server._ProviderAuthResolutionError as exc:
@@ -709,7 +713,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
         _retire_live_run(self, run_id)
-        self._release_run_slot()
+        if slot_held:
+            # A run cancelled while still queued never held a slot; releasing one here would
+            # hand another turn's slot to the queue and over-admit the next burst.
+            self._release_run_slot()
 
 
 def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
@@ -942,6 +949,10 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")
+    elif task is not None:
+        # Over cap the run is still parked in the slot queue and owns no agent to interrupt:
+        # cancel its task so the stop is immediate instead of waiting out run_queue_wait_seconds.
+        task.cancel()
     return web.json_response({"run_id": run_id, "status": "stopping"})
 
 
