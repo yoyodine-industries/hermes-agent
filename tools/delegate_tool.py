@@ -642,6 +642,14 @@ DELEGATE_TASK_SCHEMA = {
                             "schema_valid, plus schema_errors on failure). Keep it forgiving — require only "
                             "fields you will read.",
                         ),
+                        "images": _p(
+                            "array",
+                            "Optional images this child must SEE (max 8): local file paths or http(s) URLs — e.g. a "
+                            "screenshot the user sent, a design mock, a chart. Vision-capable children receive the "
+                            "pixels on their first turn; non-vision children get path hints for vision_analyze. Text "
+                            "files do NOT belong here — put paths in 'context' instead.",
+                            items={"type": "string"},
+                        ),
                         "group": _p(
                             "string",
                             "Optional result-delivery bucket within this call (only when delegation.independent_completions "
