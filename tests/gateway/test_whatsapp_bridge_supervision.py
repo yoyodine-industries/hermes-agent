@@ -12,6 +12,7 @@ interpreter — the spawn / wait / attach path under test is the production one,
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import socket
@@ -263,3 +264,37 @@ async def test_managed_child_death_is_left_to_the_fatal_path(tmp_path, monkeypat
     finally:
         adapter._bridge_process = None
         await _teardown(adapter, first)
+
+
+@pytest.mark.asyncio
+async def test_adoption_record_reaches_the_logger_not_stdout(tmp_path, monkeypatch, caplog, capsys):
+    """The adopt record must ride the adapter's logger (the gateway.log stream), never unharvested stdout.
+
+    The record is the payload's whole claim that a non-child bridge is "no longer adopted silently": on
+    this host the gateway's stdout is a file nothing reads, so a ``print()`` record is an invisible one.
+    """
+    import plugins.platforms.whatsapp.adapter as adapter_mod
+
+    with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+        adapter, first = await _adopt_stub(tmp_path, monkeypatch)
+    try:
+        printed = capsys.readouterr().out
+        records = [r for r in caplog.records if r.name == adapter_mod.logger.name and r.levelno == logging.INFO]
+        adopt = [r.getMessage() for r in records if "Using existing bridge" in r.getMessage()]
+        assert "Using existing bridge" not in printed, "the adopt record is back on the unharvested stdout stream"
+        assert adopt, f"the adoption record never reached the logger: {[r.getMessage() for r in records]}"
+        # Contract between the record and the supervision it reports: it names the pid it validated, or
+        # says there was none — the reader can tell which supervision the adopted bridge actually gets.
+        assert adopt[0].endswith("+ HTTP health") or adopt[0].endswith("supervising via HTTP health only"), adopt
+        supervised = f"bridge.pid {first.pid} " in adopt[0]
+        assert supervised == _supervised_pid_matches(first, adapter), f"record disagrees with the pidfile: {adopt[0]}"
+    finally:
+        await _teardown(adapter, first)
+
+
+def _supervised_pid_matches(proc, adapter) -> bool:
+    """True when the adapter's own identity check accepts the adopted pidfile's pid (as the record claims)."""
+    from plugins.platforms.whatsapp.adapter import _bridge_pid_is_ours, _read_bridge_pidfile
+
+    pid, start = _read_bridge_pidfile(adapter._session_path)
+    return bool(pid) and pid == proc.pid and _bridge_pid_is_ours(pid, adapter._session_path, start)

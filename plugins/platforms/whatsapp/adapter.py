@@ -374,7 +374,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return False
             bridge_status = data.get("status", "unknown")
             if bridge_status != "connected":
-                print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
+                logger.info("[%s] Bridge found but not connected (status: %s), restarting", self.name, bridge_status)
                 return False
             running_hash, disk_hash = data.get("scriptHash", ""), _file_content_hash(bridge_path)
             if running_hash and disk_hash and running_hash == disk_hash and bool(data.get("sendReadReceipts", False)) == self._send_read_receipts:
@@ -384,13 +384,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 supervised_pid = adopted_pid if adopted_pid and _bridge_pid_is_ours(adopted_pid, self._session_path, adopted_start) else None
                 reason = (f"supervising it via bridge.pid {supervised_pid} + HTTP health" if supervised_pid
                           else "no bridge.pid naming it, supervising via HTTP health only")
-                print(f"[{self.name}] Using existing bridge (status: {bridge_status}); {reason}")
+                logger.info("[%s] Using existing bridge (status: %s); %s", self.name, bridge_status, reason)
                 self._mark_connected()
                 self._attach_to_bridge(None)  # Not managed by us
                 self._wire_plugin_handlers(None)
                 return True
             stale_reason = f"running={running_hash or 'unversioned'}, disk={disk_hash}" if running_hash != disk_hash else "send_read_receipts config changed"
-            print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
+            logger.info("[%s] Running bridge is stale (%s), restarting", self.name, stale_reason)
         except Exception:
             pass  # Bridge not running, start a new one
         return False
@@ -424,8 +424,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return bridge_env
 
     def _bridge_died(self, detail: str) -> bool:
-        print(f"[{self.name}] {detail}")
-        print(f"[{self.name}] Check log: {self._bridge_log}")
+        logger.info("[%s] %s", self.name, detail)
+        logger.info("[%s] Check log: %s", self.name, self._bridge_log)
         self._close_bridge_log()
         return False
 
@@ -444,7 +444,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if d is not None:
                         data = d
                         if data.get("status") == "connected":
-                            print(f"[{self.name}] Bridge ready (status: connected)")
+                            logger.info("[%s] Bridge ready (status: connected)", self.name)
                             return True, http_ready, data
             except Exception:
                 continue
@@ -458,14 +458,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not http_ready:
             return self._bridge_died("Bridge HTTP server did not start in 15s")
         if data.get("status") != "connected":
-            print(f"[{self.name}] Bridge HTTP ready, waiting for WhatsApp connection...")
+            logger.info("[%s] Bridge HTTP ready, waiting for WhatsApp connection...", self.name)
             connected, _, _ = await self._poll_bridge_health("Bridge process died during connection")
             if connected is False:
                 return False
             if connected is None:
-                print(f"[{self.name}] ⚠ WhatsApp not connected after 30s")
-                print(f"[{self.name}]   Bridge log: {self._bridge_log}")
-                print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
+                logger.info("[%s] ⚠ WhatsApp not connected after 30s", self.name)
+                logger.info("[%s]   Bridge log: %s", self.name, self._bridge_log)
+                logger.info("[%s]   If session expired, re-pair: hermes whatsapp", self.name)
         return True
 
     def _preflight(self) -> bool:
@@ -545,7 +545,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return False
             self._attach_to_bridge(self._bridge_process, restart_poll=restart_poll)
             self._mark_connected()
-            print(f"[{self.name}] Bridge started on port {self._bridge_port}")
+            logger.info("[%s] Bridge started on port %s", self.name, self._bridge_port)
             self._wire_plugin_handlers(None)
             return True
         except Exception as e:
@@ -592,8 +592,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             await self._notify_fatal_error()
             return False
         self._bridge_respawn_attempts = attempts + 1
-        print(f"[{self.name}] Adopted bridge is unreachable ({cause.__class__.__name__}: {cause}); respawning "
-              f"(attempt {attempts + 1}/{_BRIDGE_RESPAWN_ATTEMPTS})")
+        logger.info("[%s] Adopted bridge is unreachable (%s: %s); respawning (attempt %s/%s)",
+                    self.name, cause.__class__.__name__, cause, attempts + 1, _BRIDGE_RESPAWN_ATTEMPTS)
         # Publish the loss BEFORE respawning so nothing reads ``connected`` while the bridge is gone
         # (``retrying`` is not in _HEALTHY_PLATFORM_STATES); a successful spawn's _mark_connected clears it.
         self._write_runtime_status_safe("bridge_unreachable", platform_state="retrying", error_code=None,
@@ -633,7 +633,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
         self._shutting_down = True  # flip BEFORE signalling so send()/poll loop don't report the intentional exit as fatal
         if not self._bridge_process:
-            print(f"[{self.name}] Disconnecting (external bridge left running)")
+            logger.info("[%s] Disconnecting (external bridge left running)", self.name)
         else:
             try:
                 self._terminate_bridge(force=False)
@@ -641,7 +641,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if self._bridge_process.poll() is None:
                     self._terminate_bridge(force=True)
             except Exception as e:
-                print(f"[{self.name}] Error stopping bridge: {e}")
+                logger.warning("[%s] Error stopping bridge: %s", self.name, e)
         _unlink_quietly(self._session_path / "bridge.pid")
         await cancel_task(self._poll_task)
         if self._http_session and not self._http_session.closed:
@@ -650,7 +650,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._release_platform_lock()
         self._mark_disconnected()
         self._close_bridge_log()
-        print(f"[{self.name}] Disconnected")
+        logger.info("[%s] Disconnected", self.name)
 
     async def _bridge_unavailable(self) -> Optional[str]:
         return "Not connected" if not self._running or not self._http_session else (await self._check_managed_bridge_exit() or None)
@@ -791,7 +791,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     async def _report_bridge_exit(self) -> bool:
         bridge_exit = await self._check_managed_bridge_exit()
         if bridge_exit:
-            print(f"[{self.name}] {bridge_exit}")
+            logger.info("[%s] %s", self.name, bridge_exit)
         return bool(bridge_exit)
 
     async def _poll_messages(self) -> None:
@@ -817,7 +817,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     break
                 if await self._recover_adopted_bridge(e):
                     continue  # Respawned in place: resume polling without the error backoff.
-                print(f"[{self.name}] Poll error: {e}")
+                logger.info("[%s] Poll error: %s", self.name, e)
                 await asyncio.sleep(5)
             await asyncio.sleep(1)  # Poll interval
 
