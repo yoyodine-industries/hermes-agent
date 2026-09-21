@@ -815,6 +815,103 @@ class TestLaunchdDomainDetection:
         domain = gateway_cli._launchd_domain()
         assert domain == "user/501"
 
+    def test_system_domain_is_probed_after_gui_and_user(self, monkeypatch):
+        """A LaunchDaemon (``sudo hermes gateway install``) is loaded in the uid-less ``system``
+        domain: gui/<uid> and user/<uid> are probed first, then system."""
+        self._reset_domain_cache()
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        label = gateway_cli.get_launchd_label()
+        run_calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            run_calls.append(cmd)
+            if cmd[:3] == ["launchctl", "print", f"system/{label}"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise subprocess.CalledProcessError(1, cmd, stderr="Could not find service")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._probe_launchd_domain_for_label(label) == "system"
+        assert run_calls[:3] == [
+            ["launchctl", "print", f"gui/501/{label}"],
+            ["launchctl", "print", f"user/501/{label}"],
+            ["launchctl", "print", f"system/{label}"],
+        ]
+
+    def test_unloaded_launchdaemon_resolves_to_system(self, monkeypatch, tmp_path):
+        """Installed but not loaded: bootstrapping into gui/<uid> would register a second copy of the
+        label, so the daemon plist file decides the domain even when every ``launchctl print`` misses."""
+        self._reset_domain_cache()
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "_SYSTEM_LAUNCHD_DIR", tmp_path)
+        label = gateway_cli.get_launchd_label()
+        (tmp_path / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+
+        def fake_run(cmd, check=False, **kwargs):
+            raise subprocess.CalledProcessError(1, cmd, stderr="Could not find service")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._probe_launchd_domain_for_label(label) == "system"
+
+    def test_agent_domain_still_wins_without_a_daemon_plist(self, monkeypatch, tmp_path):
+        """The system fallback must not claim a host that has no LaunchDaemon plist for the label."""
+        self._reset_domain_cache()
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "_SYSTEM_LAUNCHD_DIR", tmp_path / "absent")
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                raise subprocess.CalledProcessError(1, cmd, stderr="Could not find service")
+            return SimpleNamespace(returncode=0, stdout="Background\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._probe_launchd_domain_for_label("ai.hermes.gateway") == "user/501"
+
+
+class TestLaunchdSystemDaemonDetection:
+    """``sudo hermes gateway install`` keeps this install's only plist in ``/Library/LaunchDaemons``.
+
+    Reading just ``~/Library/LaunchAgents`` reported "no service installed" there, so ``gateway
+    restart`` took the manual stop+start path and started a second, unsupervised gateway beside the
+    launchd-managed one that was still draining.
+    """
+
+    def test_candidates_cover_both_launchd_directories(self, tmp_path):
+        """One label, two install domains: the account agent and the system daemon."""
+        home = tmp_path / "account"
+        system_dir = tmp_path / "LaunchDaemons"
+        agent, daemon = gateway_cli.launchd_plist_candidates(home, system_dir)
+        assert agent == home / "Library" / "LaunchAgents" / daemon.name
+        assert daemon.parent == system_dir
+
+    def test_plist_path_prefers_agent_but_falls_back_to_daemon(self, monkeypatch, tmp_path):
+        agent, daemon = tmp_path / "agent.plist", tmp_path / "daemon.plist"
+        monkeypatch.setattr(
+            gateway_cli, "launchd_plist_candidates", lambda home, system_dir=None: (agent, daemon)
+        )
+
+        assert gateway_cli.get_launchd_plist_path() == agent  # nothing installed → install target
+        daemon.write_text("<plist/>", encoding="utf-8")
+        assert gateway_cli.get_launchd_plist_path() == daemon
+        agent.write_text("<plist/>", encoding="utf-8")
+        assert gateway_cli.get_launchd_plist_path() == agent
+
+    def test_installed_service_kind_reports_launchd_for_a_system_daemon(self, monkeypatch, tmp_path):
+        """The whole chain: a daemon-only host must report an installed launchd service, not None."""
+        home, system_dir = tmp_path / "account", tmp_path / "LaunchDaemons"
+        system_dir.mkdir()
+        monkeypatch.setattr(gateway_cli, "_SYSTEM_LAUNCHD_DIR", system_dir)
+        monkeypatch.setattr(gateway_cli, "_systemd_unit_installed", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(home)))
+        plist = system_dir / f"{gateway_cli.get_launchd_label()}.plist"
+        plist.write_text("<plist/>", encoding="utf-8")
+
+        assert gateway_cli.get_launchd_plist_path() == plist
+        assert gateway_cli._installed_service_kind_for(lambda: False) == "launchd"
+
 
 class TestGatewayServiceDetection:
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):

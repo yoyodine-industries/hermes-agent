@@ -2625,14 +2625,42 @@ def get_systemd_linger_status(username: str | None = None) -> tuple[bool | None,
     return None, f"unexpected loginctl output: {value or '<empty>'}"
 
 
-def get_launchd_plist_path() -> Path:
-    """``~/Library/LaunchAgents/ai.hermes.gateway[-<profile>].plist`` under the real account home."""
-    import pwd
+_SYSTEM_LAUNCHD_DIR = Path("/Library/LaunchDaemons")
+
+
+def launchd_plist_candidates(home: Path, system_dir: Path | None = None) -> tuple[Path, Path]:
+    """``(user_agent, system_daemon)`` plist paths that can carry THIS install's gateway label.
+
+    macOS supervises the gateway either as a per-account LaunchAgent (``~/Library/LaunchAgents``,
+    installable without root) or as a LaunchDaemon (``/Library/LaunchDaemons``, root-owned, with
+    ``UserName`` set for the account it runs as). Both carry the same label, so detection has to
+    consider both. ``system_dir`` is injectable so the daemon half is testable without root.
+    """
     suffix = _profile_suffix()
     name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+    return (
+        home / "Library" / "LaunchAgents" / f"{name}.plist",
+        (system_dir if system_dir is not None else _SYSTEM_LAUNCHD_DIR) / f"{name}.plist",
+    )
+
+
+def get_launchd_plist_path() -> Path:
+    """Plist launchd supervises this install from: the account LaunchAgent when one is installed, else
+    the system LaunchDaemon when *that* exists, else the LaunchAgent path (the install target).
+
+    A ``sudo hermes gateway install`` host has ONLY ``/Library/LaunchDaemons/...``: reading just
+    ``~/Library/LaunchAgents`` reported "no service installed" there, so ``gateway restart`` fell
+    through to the manual stop+start path and started a second, unsupervised gateway while the
+    launchd-managed one was still draining. The LaunchAgent still wins when both exist — it is the
+    one this install manages without root.
+    """
+    import pwd
     # Real account home: profile mode may point HOME at a profile dir.
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
-    return home / "Library" / "LaunchAgents" / f"{name}.plist"
+    user_plist, system_plist = launchd_plist_candidates(home)
+    if user_plist.exists():
+        return user_plist
+    return system_plist if system_plist.exists() else user_plist
 
 
 def launchd_gateway_labels_for_install() -> list[str]:
@@ -3015,6 +3043,20 @@ def _refuse_temp_home_service_write(definition: str, kind: str) -> bool:
         "  This usually means a test/E2E environment exported HERMES_HOME. "
         "Unset it (or run from a clean shell) and retry."
     )
+    return True
+
+
+def _refuse_root_owned_system_plist_write(plist_path: Path, action: str) -> bool:
+    """Refuse (with guidance) when ``plist_path`` is a LaunchDaemon this process cannot write.
+
+    ``get_launchd_plist_path()`` resolves to ``/Library/LaunchDaemons/...`` on a system-domain
+    install, which is root-owned: rewriting or unlinking it from a non-root CLI would raise
+    PermissionError out of the command. The daemon belongs to the root install that created it.
+    """
+    if plist_path.parent != _SYSTEM_LAUNCHD_DIR or os.access(plist_path, os.W_OK):
+        return False
+    print(f"✗ Refusing to {action} the system gateway daemon ({plist_path}): it is root-owned.")
+    print("  Re-run with sudo to manage a LaunchDaemon; the account LaunchAgent is written without root.")
     return True
 
 
@@ -3563,18 +3605,24 @@ _resolved_launchd_domain: str | None = None
 
 def _probe_launchd_domain_for_label(label: str) -> str:
     """Launchd domain managing ``label`` (uncached): ``gui/<uid>`` (Aqua), then ``user/<uid>``
-    (Background/SSH), else the ``launchctl managername`` heuristic. Sibling profiles may live in
-    different domains, so never reuse the cached ``_launchd_domain()`` for another label."""
+    (Background/SSH), then ``system`` (a LaunchDaemon), else the ``launchctl managername`` heuristic.
+    Sibling profiles may live in different domains, so never reuse the cached ``_launchd_domain()``
+    for another label. ``system`` is a uid-less domain: the target is ``system/<label>``."""
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
-    gui_domain, user_domain = f"gui/{uid}", f"user/{uid}"
+    gui_domain, user_domain, system_domain = f"gui/{uid}", f"user/{uid}", "system"
 
     launchctl_errors = (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError)
-    for domain in (gui_domain, user_domain):
+    for domain in (gui_domain, user_domain, system_domain):
         try:
             subprocess.run(["launchctl", "print", f"{domain}/{label}"], check=True, timeout=5, capture_output=True)
             return domain
         except launchctl_errors:
             pass
+
+    # A LaunchDaemon that is installed but not loaded still belongs to ``system``: bootstrapping it
+    # into gui/<uid> would register a SECOND, unsupervised copy of the same label.
+    if (_SYSTEM_LAUNCHD_DIR / f"{label}.plist").exists():
+        return system_domain
 
     # Not loaded anywhere: Aqua → gui/<uid>; anything else (Background, loginwindow) → user/<uid>,
     # the pre-probing default and the recommended domain on macOS 26+.
@@ -3993,6 +4041,8 @@ def refresh_launchd_plist_if_needed() -> bool:
     new_plist = generate_launchd_plist()
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
         return False
+    if _refuse_root_owned_system_plist_write(plist_path, "rewrite"):
+        return False
 
     plist_path.write_text(new_plist, encoding="utf-8")
     label = get_launchd_label()
@@ -4073,6 +4123,8 @@ def launchd_install(force: bool = False):
     new_plist = generate_launchd_plist()
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
         return
+    if _refuse_root_owned_system_plist_write(plist_path, "reinstall"):
+        return
     print(f"Installing launchd service to: {plist_path}")
     plist_path.write_text(new_plist, encoding="utf-8")
 
@@ -4094,6 +4146,8 @@ def launchd_install(force: bool = False):
 
 def launchd_uninstall():
     plist_path = get_launchd_plist_path()
+    if _refuse_root_owned_system_plist_write(plist_path, "remove"):
+        return
     # Captured: uninstalling an already-unloaded job is fine — don't print Boot-out failed: 3.
     subprocess.run(
         ["launchctl", "bootout", f"{_launchd_domain()}/{get_launchd_label()}"],

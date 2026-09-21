@@ -219,9 +219,11 @@ def _remove_systemd_gateway() -> bool:
 
 def _remove_launchd_gateway() -> bool:
     """macOS: uninstall launchd plist."""
-    from hermes_cli.gateway import get_launchd_plist_path
+    from hermes_cli.gateway import _refuse_root_owned_system_plist_write, get_launchd_plist_path
     plist_path = get_launchd_plist_path()
     if not plist_path.exists():
+        return False
+    if _refuse_root_owned_system_plist_write(plist_path, "remove"):
         return False
     subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True, check=False)
     plist_path.unlink()

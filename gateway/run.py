@@ -4987,7 +4987,16 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
     return shutdown_signal_handler
 
 
-def _start_gateway_claim_pid_file() -> bool:
+def _start_gateway_other_live_gateway_pids() -> list[int]:
+    """Live gateway processes other than this one, from the process-table scan rather than the PID
+    file. ``--replace`` never consults this: replacing the incumbent is its whole job. The scan
+    excludes this process and its ancestors (``_scan_gateway_pids``), so an agent-driven start is
+    not blocked by the gateway that spawned the CLI."""
+    from hermes_cli.gateway import find_gateway_pids
+    return find_gateway_pids()
+
+
+def _start_gateway_claim_pid_file(*, replace: bool = False) -> bool:
     """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost."""
     import atexit
     from gateway.status import (
@@ -4998,6 +5007,16 @@ def _start_gateway_claim_pid_file() -> bool:
         logger.error("Another gateway instance (PID %d) started during our startup. "
                      "Exiting to avoid double-running.", _current_pid)
         return False
+    # get_running_pid() only knows the PID file, and a draining gateway removes that on its way out.
+    # A start landing in that window (the manual stop-then-start path after a failed service stop)
+    # found the file free and opened sockets beside a gateway that was still serving — two gateways,
+    # one of them unsupervised. The process scan closes the window; replacing is opt-in via --replace.
+    if not replace:
+        _live_pids = _start_gateway_other_live_gateway_pids()
+        if _live_pids:
+            logger.error("Gateway process(es) %s are still alive though the PID file is free. "
+                         "Exiting to avoid double-running.", ", ".join(map(str, _live_pids)))
+            return False
     if not acquire_gateway_runtime_lock():
         logger.error("Gateway runtime lock is already held by another instance. Exiting.")
         return False
@@ -5277,7 +5296,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _planned_stop_watcher_thread.start()
 
     # PID file BEFORE adapters: of two concurrent `run --replace`, only the O_EXCL winner opens sockets.
-    if not _start_gateway_claim_pid_file():
+    if not _start_gateway_claim_pid_file(replace=replace):
         return False
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
