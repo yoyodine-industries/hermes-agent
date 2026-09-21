@@ -1,6 +1,7 @@
 """Task graph initialization and atomic decomposition persistence."""
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from typing import Any, Optional
@@ -87,6 +88,70 @@ def _validate_children_graph(children: list) -> None:
         raise ValueError("cyclic dependency detected in decomposed children list")
 
 
+def _text(value: Any) -> str:
+    """Read a column real board stores hold as either TEXT or BLOB.
+
+    Measured 2026-09-21: the ops store carries comment bodies as BLOB, so a regex
+    run straight over them raises TypeError ("cannot use a string pattern on a
+    bytes-like object"). A guard that crashes the decomposer is worse than none.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return value or ""
+
+
+# The fan-out is the one destructive door out of `triage`: the root's body is
+# rewritten into children, so a design spec consumed that way is gone -- what the
+# designer wrote is replaced by the model's paraphrase of it. Two deliberately
+# narrow mechanical clauses, because `triage` exists to shred genuinely
+# under-specified work and the guard must not disable that:
+#   * a comment authored by an identity OTHER than the assignee -- a designer or
+#     another lane has already engaged with the card; or
+#   * an explicit frozen marker in the title, body or a comment -- the
+#     deliberate, reassignment-proof form, since the assignee can change and
+#     silently erase the comment clause's signal.
+# Measured over the seven live board stores (read-only, 2026-09-21): of the 61
+# cards that have ever been in `triage`, 44 match the comment clause and 7 match
+# the marker (114 of the 1573 never-triage cards contain the word at all, so it
+# is prose-adjacent rather than a hair trigger); only 2 of the 61 have the
+# disposition sweep's own `kanban-disposition` as their sole foreign commenter,
+# so the comment clause is not a proxy for "a machine touched this card".
+_SPEC_MARKER_RE = re.compile(r"\bfrozen\b", re.IGNORECASE)
+
+
+def spec_carrying_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Short reason ``task_id`` carries a design spec, or None when it is ordinary.
+
+    Read-only and cheap, so a caller can decide BEFORE spending an auxiliary LLM
+    call on a decomposition it would have to throw away.
+    """
+    row = conn.execute(
+        "SELECT title, body, assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    assignee = row["assignee"]
+    title, body = _text(row["title"]), _text(row["body"])
+    foreign, comments = set(), []
+    for comment in conn.execute(
+        "SELECT author, body FROM task_comments WHERE task_id = ?", (task_id,),
+    ):
+        author = _text(comment["author"])
+        comments.append(_text(comment["body"]))
+        if author and author != assignee:
+            foreign.add(author)
+    if foreign:
+        return ("spec-carrying: %s (not the assignee) commented on it"
+                % ", ".join(sorted(foreign)))
+    if _SPEC_MARKER_RE.search(title):
+        return "spec-carrying: explicit frozen marker in the title"
+    if _SPEC_MARKER_RE.search(body):
+        return "spec-carrying: explicit frozen marker in the body"
+    if any(_SPEC_MARKER_RE.search(c) for c in comments):
+        return "spec-carrying: explicit frozen marker in a comment"
+    return None
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
     author: Optional[str] = None, auto_promote: bool = True,
@@ -97,7 +162,8 @@ def decompose_triage_task(
     ``children``: dicts of ``title`` (required), ``body``, ``assignee``,
     ``parents`` (indices into this list), optional workspace overrides.
     Returns child ids in input order, or None when the root is missing / not
-    in triage, or has already decomposed. Atomic: malformed entries abort fan-out.
+    in triage, has already decomposed, or carries a design spec
+    (``spec_carrying_reason``). Atomic: malformed entries abort fan-out.
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
@@ -126,6 +192,17 @@ def decompose_triage_task(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
             (task_id,),
         ).fetchone():
+            return None
+        # Refuse before anything is spawned, and leave the diagnosis on the card:
+        # the scheduled drain re-sees every triage card it can decompose, so the
+        # evidence is written once per card rather than once per attempt.
+        refusal = spec_carrying_reason(conn, task_id)
+        if refusal:
+            if not conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decompose_refused' LIMIT 1",
+                (task_id,),
+            ).fetchone():
+                _append_event(conn, task_id, "decompose_refused", {"reason": refusal})
             return None
         child_ids = [
             _insert_decomposed_child(conn, task_id, root_row, child, author, now)

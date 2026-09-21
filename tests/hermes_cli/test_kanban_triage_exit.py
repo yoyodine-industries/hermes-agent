@@ -105,6 +105,9 @@ def _promote_ns(task_id, *, ids=None, reason=None, dry_run=False, as_json=False)
         ids=list(ids or []) or None,
         dry_run=dry_run,
         json=as_json,
+        # The live lineage's `_cmd_promote` reads args.force; the fixture must
+        # carry it or the exit this test pins dies on AttributeError there.
+        force=False,
     )
 
 
