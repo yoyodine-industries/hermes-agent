@@ -2007,22 +2007,30 @@ def _synthesize_ended_run(
 # --- Dependency resolution (todo -> ready) ---
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the newest ``blocked``/``unblocked`` event is ``blocked`` — an
-    explicit ``kanban_block`` that must wait for an operator. A breaker trip
-    emits ``gave_up`` (not ``blocked``) and so auto-recovers, as does a task
-    with no such event at all (direct DB edit).
+    """True when the newest park/release event is a PARK — an explicit
+    ``kanban_block`` (``blocked``) or the unblock-loop breaker's park
+    (``block_loop_detected``) — so the card waits for a human instead of being
+    re-promoted by the ready sweep.
+
+    ``block_loop_detected`` is what :func:`_route_block` emits when it parks a
+    card at ``BLOCK_RECURRENCE_LIMIT``: leave it out of the filter and the park
+    reads as "no park at all", so ``recompute_ready`` requeues the card on the
+    next tick — the respawn loop measured on card t_2fa42d98 (run 1579), which
+    was parked at 14:56:35 and back in ``ready`` at 14:56:37.
+
+    The circuit breaker's ``gave_up`` stays OUT of the predicate: it is not a
+    park, and a task with no park event at all (``gave_up``, or a direct DB edit
+    that set ``status='blocked'``) keeps auto-recovering, which preserves the
+    pre-#28712 semantics of that path.
 
     See #28712.
-    Returns ``False`` when there is no such event at all (e.g. the task was set to ``status='blocked'`` by
-    the circuit breaker or by direct DB manipulation) — preserves the pre-#28712 auto-recover semantics for
-    that path.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected', 'unblocked') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in ("blocked", "block_loop_detected")
 
 
 def _latest_event(
@@ -2064,8 +2072,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     trip). Limit order matches ``_record_task_failure``: ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
 
-    1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).
+    1. The most recent park event was a worker-initiated ``kanban_block`` or the
+    unblock-loop breaker's ``block_loop_detected`` park — those stay blocked until
+    an explicit ``kanban_unblock`` (#28712).
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -2986,14 +2995,16 @@ def block_task(
     see :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition.
 
-    ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on a plain
+    ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on a
     ``blocked`` landing only: the due-card waker unblocks the card on the first
     dispatcher pass after that time, so a time-fenced hold releases without a
     human touching it. It is meaningless on the ``todo`` (dependency) landing and
-    is refused on it. A loop-breaker PARK (``block_loop_detected``) is excluded
-    too — that card is waiting on a human decision, not a clock, so arming a wake
-    time would let it release itself and re-enter the loop the breaker just
-    stopped."""
+    is refused on it. A loop-breaker PARK (``block_loop_detected``) arms it too:
+    the caller that passed ``due_at`` asked for a time fence, and dropping it
+    parked the card with no wake time at all. A fenced park still cannot loop
+    unbound — once the fence releases the card, the next same-kind re-block trips
+    the breaker again at ``BLOCK_RECURRENCE_LIMIT``, and that park carries no
+    fence unless the caller asks for one."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     if window_policy is not None and window_policy not in VALID_DUE_WINDOW_POLICIES:
@@ -3018,7 +3029,9 @@ def block_task(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
-        if new_status == "blocked" and due_at is not None and event_kind == "blocked":
+        if new_status == "blocked" and due_at is not None and event_kind in (
+            "blocked", "block_loop_detected",
+        ):
             set_sql += ",\n                       due_at = ?,\n                       due_window_policy = ?"
             params = (*params, int(due_at), window_policy or DEFAULT_DUE_WINDOW_POLICY)
             payload["due_at"] = int(due_at)
