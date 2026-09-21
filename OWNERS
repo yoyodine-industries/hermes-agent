@@ -3,7 +3,7 @@
 # whose HEAD lacks a matching "Reviewed-by:" trailer. GitHub cannot enforce this
 # on a private repo (branch protection is Pro-gated), so the deploy seam does.
 #
-# engines-stl - the agent fork we maintain and publish PRs to.
+# platform-stl - the agent fork we maintain and publish PRs to.
 #
 # Ownership follows the four-domain coder / tech-lead structure (operator ruling,
 # APR-0112, approved 2026-09-15): every repository is owned by the tech lead of
@@ -15,4 +15,4 @@
 # compares it to the --owner the deploy ran with. A second name here is inert -
 # read by nobody. To move ownership, change this line and the YAAN_OWNER the
 # deploy runs under, together.
-engines-stl
+platform-stl
