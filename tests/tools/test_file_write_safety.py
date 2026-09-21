@@ -751,3 +751,118 @@ class TestMultiplexProfileWriteGuardsAreProfileScoped:
             reset_hermes_home_override(tok)
         assert err is not None
         assert "Refusing to write to Hermes config file" in err
+
+
+class TestProtectedInstructionProjectHermesScope:
+    """The ``.hermes`` clause is scoped to project-local CONFIG files, not to the root home.
+
+    A profile lane's Hermes home is ``<root>/profiles/<lane>``, so the home exemption never
+    covered the ROOT home: the clause's blanket "immediate parent is .hermes" test read the
+    root home's own files as project-local config and refused inert ones (``~/.hermes/.gitignore``)
+    as an agent-instruction write for every profile lane. The clause now keys on the FILE (a
+    config-shaped basename) while instruction basenames keep the gate in ANY directory.
+    """
+
+    @staticmethod
+    def _reason(path, task_id="default"):
+        """Gate pinned ON, so the fixture set never depends on the host's config.yaml.
+
+        Tolerates the fork-local ``allowlist_dirs`` kwarg the deploy line carries (fork ``main``'s
+        signature has two kwargs): passing it where it exists keeps the config read out of the
+        picture on both lines.
+        """
+        import inspect
+        import tools.file_tools_write_guards as ft
+        kwargs = {"enabled": True, "extra_patterns": []}
+        if "allowlist_dirs" in inspect.signature(ft._protected_instruction_reason).parameters:
+            kwargs["allowlist_dirs"] = []
+        return ft._protected_instruction_reason(str(path), task_id, **kwargs)
+
+    @pytest.fixture
+    def lane_session(self, tmp_path, monkeypatch):
+        """A profile-lane session: the lane's home lives UNDER the shared root home."""
+        import tools.file_tools_write_guards as ft
+        root = tmp_path / ".hermes"
+        lane = root / "profiles" / "lane-b"
+        lane.mkdir(parents=True)
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: os.path.realpath(str(lane)))
+        return root, lane
+
+    def _write(self, path, content="inert\n"):
+        import json
+        from tools.file_tools import write_file_tool
+        return json.loads(write_file_tool(str(path), content))
+
+    # ---- the reported defect: root-home inert files ---------------------
+
+    def test_root_home_inert_file_is_not_gated(self, lane_session):
+        root, _lane = lane_session
+        target = root / ".gitignore"
+        target.write_text("*.log\n", encoding="utf-8")
+        assert self._reason(target) is None
+
+    def test_root_home_inert_write_goes_through(self, lane_session):
+        """End-to-end through the write tool: no BLOCKED error for a non-instruction file."""
+        root, _lane = lane_session
+        res = self._write(root / ".gitignore", "*.log\n")
+        assert not res.get("error"), res
+        assert (root / ".gitignore").read_text(encoding="utf-8") == "*.log\n"
+
+    def test_project_local_hermes_inert_file_is_not_gated(self, tmp_path):
+        """Sibling of the reported case: an inert file in a PROJECT-local .hermes dir is data."""
+        proj = tmp_path / "proj" / ".hermes"
+        proj.mkdir(parents=True)
+        (proj / ".gitignore").write_text("*.log\n", encoding="utf-8")
+        assert self._reason(proj / ".gitignore") is None
+
+    def test_checkout_nested_under_root_home_not_gated(self, lane_session):
+        """Guards the clause's original intent: a repo living under a .hermes dir is not config."""
+        root, _lane = lane_session
+        repo = root / "hermes-agent" / "src"
+        repo.mkdir(parents=True)
+        assert self._reason(repo / "module.py") is None
+
+    # ---- what must stay gated ------------------------------------------
+
+    @pytest.mark.parametrize("name", ["SOUL.md", "AGENTS.md", "CLAUDE.md", ".cursorrules"])
+    def test_root_home_instruction_file_still_gated(self, lane_session, name):
+        """The root lane's own identity files: a profile lane editing them is a cross-profile
+        write, so the gate must still fire even though they sit in the root home."""
+        root, _lane = lane_session
+        (root / name).write_text("x\n", encoding="utf-8")
+        assert self._reason(root / name)
+
+    def test_other_lane_instruction_file_still_gated(self, lane_session):
+        root, _lane = lane_session
+        other = root / "profiles" / "lane-a"
+        other.mkdir(parents=True)
+        (other / "SOUL.md").write_text("x\n", encoding="utf-8")
+        assert self._reason(other / "SOUL.md")
+
+    def test_root_home_config_yaml_still_gated(self, lane_session):
+        """The default lane's config.yaml stays gated for a profile lane."""
+        root, _lane = lane_session
+        (root / "config.yaml").write_text("model: x\n", encoding="utf-8")
+        assert self._reason(root / "config.yaml")
+
+    def test_project_local_hermes_config_still_gated(self, tmp_path):
+        """The clause's stated purpose, unchanged."""
+        proj = tmp_path / "proj" / ".hermes"
+        proj.mkdir(parents=True)
+        (proj / "config.yaml").write_text("model: x\n", encoding="utf-8")
+        assert self._reason(proj / "config.yaml")
+
+    def test_project_local_hermes_env_still_gated(self, tmp_path):
+        """..env steers the runtime (secrets, env config): config-shaped, stays gated."""
+        proj = tmp_path / "proj" / ".hermes"
+        proj.mkdir(parents=True)
+        (proj / ".env").write_text("FOO=1\n", encoding="utf-8")
+        assert self._reason(proj / ".env")
+
+    # ---- the session's OWN home is exempt, as before --------------------
+
+    def test_lane_own_home_files_not_gated_by_this_gate(self, lane_session):
+        """The home exemption runs first: a lane's own home is its own store."""
+        _root, lane = lane_session
+        (lane / "SOUL.md").write_text("x\n", encoding="utf-8")
+        assert self._reason(lane / "SOUL.md") is None
