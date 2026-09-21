@@ -480,10 +480,12 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             retention_until=_room_retention_until(request))
         if outcome == "conflict" or (outcome == "reused" and record is not None):
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
-    # Enforce concurrency only for a genuinely new run.
-    limited = self._concurrency_limited_response()
-    if limited is not None:
-        return limited
+    # Enforce the queue only for a genuinely new run: over cap it is ADMITTED as "queued" and
+    # waits its turn in _execute_run (FIFO); only a queue already at run_queue_max_depth is
+    # refused, since refusing there is what keeps the waiting set bounded.
+    over_cap = self._run_queue_is_saturated()
+    if over_cap and self._run_queue_max_depth > 0 and self._run_queue_depth() >= self._run_queue_max_depth:
+        return self._run_queue_full_response()
     run_id = f"run_{uuid.uuid4().hex}"
     _stamp_run_owner(self, request, run_id)
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
@@ -543,7 +545,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
-    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+    return _accepted_response(
+        run_id, "queued" if over_cap else "started", gateway_session_key, replayed=False)
 
 
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
@@ -656,6 +659,15 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))
 
+    # The admitted run owns no slot until it reaches the front of the queue: over cap it waits
+    # here in FIFO arrival order (its status stays "queued" meanwhile) and starts only once the
+    # head of the queue frees a slot. A wait that expires ends the run instead of starting it.
+    slot_error = await self._acquire_run_slot()
+    if slot_error is not None:
+        code, message = _api_server._error_envelope(slot_error)
+        _finish("failed", error=message, code=code)
+        return
+
     try:
         self._set_run_status(run_id, "running")
         if run_id in self._stopping_run_ids:
@@ -697,6 +709,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
         _retire_live_run(self, run_id)
+        self._release_run_slot()
 
 
 def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
