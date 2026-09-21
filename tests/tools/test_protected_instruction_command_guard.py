@@ -84,6 +84,11 @@ class TestTerminalVector:
             f"sh -c \"echo x > {target}\"",
             f"tee {target}",
             f"cp /tmp/anything {target}",
+            f"ln /tmp/anything {target}",
+            f"ln -s /tmp/anything {target}",
+            f"curl -o {target} http://example.invalid/x",
+            f"curl --output {target} http://example.invalid/x",
+            f"wget -O {target} http://example.invalid/x",
             f"sed -i 's/a/b/' {target}",
         )
         for command in shapes:
@@ -123,6 +128,73 @@ class TestTerminalVector:
         result, env = _run_terminal(f"cat {tmp_path}/AGENTS.md", tmp_path)
         assert result.get("status") != "blocked"
         env.execute.assert_called_once()
+
+    def test_non_protected_write_verbs_still_run(self, tmp_path):
+        """Gating a verb must not make it fatal: an ordinary destination still runs.
+
+        A malformed ``_WRITE_VERBS`` entry raises inside extraction, which the terminal
+        tool reports as an error for EVERY invocation of that verb — including the
+        harmless ones. These are the same verbs as the shapes above, aimed elsewhere.
+        """
+        commands = (
+            f"ln -s /tmp/anything {tmp_path}/notes.md",
+            f"cp /tmp/anything {tmp_path}/notes.md",
+            f"curl -o {tmp_path}/notes.md http://example.invalid/x",
+            f"wget -O {tmp_path}/notes.md http://example.invalid/x",
+        )
+        for command in commands:
+            result, env = _run_terminal(command, tmp_path)
+            assert result.get("status") != "blocked", command
+            assert not result.get("error"), (command, result)
+            env.execute.assert_called_once()
+
+
+# One command per write verb, each with the protected destination at the position that
+# verb writes. Every command must extract the destination: that is the contract between
+# the table and `_verb_targets`, so a malformed entry or an unreachable verb fails here.
+_VERB_COMMANDS = {
+    "cp": "cp /tmp/anything {t}",
+    "mv": "mv /tmp/anything {t}",
+    "install": "install -m 644 /tmp/anything {t}",
+    "rsync": "rsync /tmp/anything {t}",
+    "scp": "scp /tmp/anything {t}",
+    "ln": "ln -s /tmp/anything {t}",
+    "dd": "dd if=/tmp/anything of={t}",
+    "tee": "tee {t}",
+    "sponge": "sponge {t}",
+    "truncate": "truncate -s 0 {t}",
+    "curl": "curl -o {t} http://example.invalid/x",
+    "wget": "wget -O {t} http://example.invalid/x",
+    "sort": "sort -o {t} /tmp/anything",
+    "sed": "sed -i 's/a/b/' {t}",
+}
+
+
+def test_every_write_verb_is_well_formed_and_extracts_its_target(tmp_path):
+    """``_WRITE_VERBS`` is unpacked as ``(mode, value_flags)``; every entry must match.
+
+    Regression: ``"ln": ("last",)`` unpacked to one value, so every ``ln`` command
+    raised ValueError at extraction time — gated and harmless alike.
+    """
+    from tools.protected_instruction_command_guard import (
+        TOOL_TERMINAL,
+        _WRITE_VERBS,
+        write_targets,
+    )
+
+    assert not set(_VERB_COMMANDS) - set(_WRITE_VERBS)
+    assert not set(_WRITE_VERBS) - set(_VERB_COMMANDS)
+
+    target = tmp_path / "SOUL.md"
+    for verb, template in sorted(_VERB_COMMANDS.items()):
+        entry = _WRITE_VERBS[verb]
+        assert isinstance(entry, tuple) and len(entry) == 2, f"{verb}: {entry!r}"
+        mode, value_flags = entry
+        assert isinstance(mode, str) and mode, f"{verb}: {mode!r}"
+        assert isinstance(value_flags, tuple), f"{verb}: value_flags {value_flags!r}"
+
+        command = template.format(t=target)
+        assert str(target) in write_targets(command, tool=TOOL_TERMINAL), command
 
 
 class TestExecuteCodeVector:

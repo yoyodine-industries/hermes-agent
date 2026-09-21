@@ -139,7 +139,7 @@ _WRITE_REDIRECT_OPS = frozenset({">", ">>", ">|", "&>", "&>>", "1>", "1>>", "2>"
 #   "in-place" -> sed rewriting its file operands
 _WRITE_VERBS = {
     "cp": ("last", ()), "mv": ("last", ()), "install": ("last", ()), "rsync": ("last", ()),
-    "scp": ("last", ()), "ln": ("last",), "dd": ("of=", ()),
+    "scp": ("last", ()), "ln": ("last", ()), "dd": ("of=", ()),
     "tee": ("all", ()), "sponge": ("all", ()), "truncate": ("all", ("-s", "-r", "--size", "--reference")),
     "curl": ("flag", ("-o", "--output")), "wget": ("flag", ("-O", "--output-document")),
     "sort": ("flag", ("-o", "--output")), "sed": ("in-place", ()),
