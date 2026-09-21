@@ -1739,6 +1739,10 @@ DEFAULT_CONFIG = {
         # that implemented it. "" = the row's own assignee reviews it (the reviewer the worker set,
         # which is the implementer when nobody was reassigned). Ignored when it does not name an
         # installed profile. Spawn-only: the card keeps showing its own assignee.
+        # It is also the per-home author key: set, it names the profile this home's own board
+        # writes (kanban CLI comments/status moves, kanban_comment/kanban_create) are attributed
+        # to; "" leaves those to HERMES_PROFILE_NAME/HERMES_PROFILE (and to --author / the routed
+        # chat profile, which always outrank it).
         "review_profile": "",
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
