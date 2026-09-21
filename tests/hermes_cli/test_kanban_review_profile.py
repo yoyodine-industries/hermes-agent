@@ -6,9 +6,15 @@ card's own implementer, so the review lane used to spawn the author to review
 their own work. With ``kanban.review_profile`` set to an installed profile the
 review lane spawns that profile instead — spawn-only, so the board keeps showing
 the row's own assignee — and the key is ignored when it names nothing installed.
+
+The key is a convenience, never the safety. The dispatch path is now fail-closed on
+its own: when the reviewer it resolved to (from the key, or from the row) is the
+card's own author, the spawn is REFUSED — config-free — and the card is marked
+with the reason so the routing can be corrected.
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -92,9 +98,14 @@ def test_review_profile_spawns_configured_profile_not_the_row_assignee(kanban_ho
 
 
 @pytest.mark.parametrize("configured", [None, "not-an-installed-profile"])
-def test_unset_or_unresolvable_review_profile_keeps_row_assignee(kanban_home, configured):
-    """Back-compat: unset, or a value naming no installed profile, spawns the
-    row's own assignee exactly as before."""
+def test_unset_or_unresolvable_review_profile_is_refused_not_spawned_as_the_author(
+    kanban_home, configured
+):
+    """Fail-closed: unset (or unresolvable) ``kanban.review_profile`` falls back
+    to the row's own assignee — and when that assignee IS the card's implementer,
+    the spawn is refused instead of self-reviewing. Spawning the row's assignee
+    here was the historical back-compat contract, and it is exactly the
+    self-review this guard closes, so the contract is now a refusal."""
     kb, home = kanban_home
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_dispatch as kbd
@@ -107,7 +118,84 @@ def test_unset_or_unresolvable_review_profile_keeps_row_assignee(kanban_home, co
     seen: list = []
 
     with kbc.connect_closing() as conn:
-        kbd.dispatch_once(conn, spawn_fn=_spawn_recorder(seen), dry_run=False)
+        res = kbd.dispatch_once(conn, spawn_fn=_spawn_recorder(seen), dry_run=False)
+        markers = _refusal_markers(conn, task_id)
+
+    assert seen == []  # the author is never spawned as its own reviewer
+    assert (task_id, "default") in res.self_review_refused
+    assert not [s for s in res.spawned if s[0] == task_id]
+    # Routing is left for the operator, with the reason on the card.
+    assert _db_assignee(kbc, task_id) == "default"
+    assert markers["events"] == [{"reviewer": "default", "author": "default",
+                                  "reason": "reviewer_is_author"}]
+    assert len(markers["comments"]) == 1
+    assert "Refused to start a review run" in markers["comments"][0]["body"]
+    assert "is the author of this card's change" in markers["comments"][0]["body"]
+
+
+def _refusal_markers(conn, task_id: str) -> dict:
+    """The refusal as it is visible ON the card: the structured event, plus the
+    human-readable comment that carries the reason."""
+    events = [
+        json.loads(r["payload"] or "{}")
+        for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'self_review_refused' "
+            "ORDER BY id", (task_id,),
+        ).fetchall()
+    ]
+    comments = [
+        {"author": r["author"], "body": r["body"]}
+        for r in conn.execute(
+            "SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+    ]
+    return {"events": events, "comments": comments}
+
+
+def test_review_profile_naming_the_author_is_refused_too(kanban_home):
+    """Invariant: setting the key does not buy a self-review. When
+    ``kanban.review_profile`` itself resolves to the card's author, the spawn is
+    refused exactly as it is for the fallback assignee — the guard judges the
+    reviewer that WOULD run, whichever path chose it."""
+    kb, home = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    _write_review_profile(home, "default")  # the default profile always exists
+    assert kbd.review_profile() == "default"
+    task_id = _review_card(kb, kbc, assignee="default")  # ...and it is the author
+    seen: list = []
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_spawn_recorder(seen), dry_run=False)
+        markers = _refusal_markers(conn, task_id)
+
+    assert seen == []
+    assert (task_id, "default") in res.self_review_refused
+    assert markers["events"] == [{"reviewer": "default", "author": "default",
+                                  "reason": "reviewer_is_author"}]
+
+
+def test_a_reassigned_reviewer_still_spawns(kanban_home):
+    """Control: the guard refuses the author, never the review lane. The same
+    handoff naming a different reviewer spawns that reviewer."""
+    kb, home = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="impl", assignee="implementer")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.request_review(
+            conn, tid, summary="Implementation complete", reviewer="default",
+            expected_run_id=run_id,
+        ) is True
+        seen: list = []
+        res = kbd.dispatch_once(conn, spawn_fn=_spawn_recorder(seen), dry_run=False)
 
     assert [s["assignee"] for s in seen] == ["default"]
-    assert _db_assignee(kbc, task_id) == "default"
+    assert tid in [s[0] for s in res.spawned]
+    assert tid not in [t[0] for t in res.self_review_refused]

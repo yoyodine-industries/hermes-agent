@@ -134,6 +134,12 @@ class DispatchResult:
     claim bookkeeping, dead/gone worker)."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
+    self_review_refused: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reviewer)`` pairs whose spawn was REFUSED because the reviewer
+    resolved for the card is the card's own author — the ``implementer`` recorded
+    when it was handed to review. Fail-closed and config-free: the card is never
+    spawned as a review of its own change, and is marked with the reason instead so
+    its routing can be corrected."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids with no assignee at all — operator-actionable (usually a
     misfiled task waiting for routing)."""
@@ -1652,13 +1658,20 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
-    # Review self-review guard: with ``kanban.review_profile`` resolved, the
-    # review lane spawns that profile instead of the row's assignee, which is the
-    # card's own implementer whenever no reviewer was reassigned. Applies to the
-    # review lane only, and to the spawn only — see the claim below.
+    # Reviewer resolution for the review lane, in two layers. ``kanban.review_profile``
+    # (when it resolves) makes the lane spawn that profile instead of the row's
+    # assignee — which is the card's own implementer whenever no reviewer was
+    # reassigned. Spawn-only, so the board keeps showing the row's assignee (see the
+    # claim below). That key is a convenience, never the safety: the hard rule below
+    # refuses the spawn outright when the reviewer we resolved to IS the author of the
+    # change, so nothing — not even a key naming the author — can buy a self-review.
     effective_assignee = (
         review_profile if (lane == "review" and review_profile) else assignee
     )
+    if lane == "review" and _refuse_self_review(
+        conn, task_id, effective_assignee, result, dry_run=dry_run
+    ):
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -1936,6 +1949,87 @@ def _resolve_review_profile(configured: Optional[str]) -> Optional[str]:
         except Exception:
             pass
     return name
+
+
+_SELF_REVIEW_REFUSED = "self_review_refused"
+
+
+def _review_author(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The author of the change under review: the ``implementer`` recorded when the
+    card was handed to review — the card's author field, taken from the assignee
+    :func:`kanban_db.request_review` received it from. Falls back to that handoff
+    run's profile. None when the card carries no handoff provenance at all: a card
+    created straight into ``review`` has no author to compare against, and this
+    guard refuses on a match, never on a guess.
+    """
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if event is None:
+        return None
+    author = _kb._json_dict(event["payload"]).get("implementer")
+    if isinstance(author, str) and author.strip():
+        return author.strip()
+    run = conn.execute(
+        "SELECT profile FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    profile = (run["profile"] if run is not None else None) or ""
+    return profile.strip() or None
+
+
+def _refuse_self_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reviewer: Optional[str],
+    result: "DispatchResult",
+    *,
+    dry_run: bool,
+) -> bool:
+    """True when spawning ``reviewer`` would review the card's own author, so the
+    caller must not spawn it. Records the refusal on ``result`` and, outside
+    ``dry_run``, marks the card with the reason. Canonicalised on both sides, so an
+    alias of the author's profile is caught too; a reviewer that does not match the
+    author — including a card whose author is unknown — is left alone.
+    """
+    author = _review_author(conn, task_id)
+    if not author or not reviewer:
+        return False
+    if _kb._canonical_assignee(author) != _kb._canonical_assignee(reviewer):
+        return False
+    result.self_review_refused.append((task_id, reviewer))
+    if not dry_run:
+        _mark_self_review_refused(conn, task_id, reviewer=reviewer, author=author)
+    return True
+
+
+def _mark_self_review_refused(
+    conn: sqlite3.Connection, task_id: str, *, reviewer: str, author: str
+) -> None:
+    """Put the refusal on the card, ONCE. The card stays in ``review`` — refused, not
+    moved — so an operator can re-route its reviewer; re-marking on every tick would
+    bury the board in duplicate copies of the same refusal.
+    """
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+        (task_id, _SELF_REVIEW_REFUSED),
+    ).fetchone() is not None:
+        return
+    body = (
+        f"Refused to start a review run: {reviewer!r} is the author of this card's "
+        f"change (the implementer recorded when it was handed to review). Nothing was "
+        f"spawned. Reassign the card to a different reviewer — or set "
+        f"kanban.review_profile to one — and the review will run."
+    )
+    with _kb.write_txn(conn, allow_nested=True):
+        _kb._append_event(
+            conn, task_id, _SELF_REVIEW_REFUSED,
+            {"reviewer": reviewer, "author": author, "reason": "reviewer_is_author"},
+        )
+        _kb.add_comment(conn, task_id, "kanban_dispatch", body)
 
 
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
