@@ -21,6 +21,7 @@ down:
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -519,6 +520,34 @@ def test_active_pr_guard_tolerates_a_bytes_comment_body(
         # The tick as a whole must survive the poisoned row.
         res = kbd.dispatch_once(conn, dry_run=True)
         assert dict(res.respawn_guarded).get(pr_id) == "active_pr"
+
+
+def test_blob_comment_body_still_builds_a_worker_context(kanban_home: Path) -> None:
+    """A BLOB comment body must not cost the card its worker.
+
+    ``Comment.from_row`` passed the raw cell on to the handoff builder, which
+    joins comment bodies into a ``str``. Every affected card raised
+    ``TypeError`` from ``build_worker_context`` as well, so fixing only the
+    respawn guard would have traded an aborted pass for cards that cannot be
+    spawned at all.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="blob comment", body="placeholder", assignee="worker"
+        )
+        kb.add_comment(conn, tid, author="worker", body="placeholder")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_comments SET body = ? WHERE task_id = ?",
+                (sqlite3.Binary(b"comment \xff\xfe blob"), tid),
+            )
+
+        assert [c.body for c in kb.list_comments(conn, tid)] == [
+            "comment \ufffd\ufffd blob"
+        ]
+        ctx = kb.build_worker_context(conn, tid)
+        assert isinstance(ctx, str)
+        assert "comment \ufffd\ufffd blob" in ctx
 
 
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
