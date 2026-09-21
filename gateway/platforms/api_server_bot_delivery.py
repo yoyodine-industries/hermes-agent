@@ -47,6 +47,36 @@ IN_CALL_DRAIN_MIN_SECONDS = 1.0
 #: Trigger 3's budget per tick, so one deep backlog cannot monopolise the loop.
 SWEEP_DRAIN_BUDGET_SECONDS = 60.0
 
+#: Rotating start offset for the roster walk. Advanced once per pass, so the lane
+#: a spent budget cut off at the tail of one pass leads the next one.
+_roster_offset = 0
+
+
+def _rotate_roster(roster: list[Any], offset: int) -> list[Any]:
+    """``roster`` re-ordered to start at ``offset``, wrapping around. Pure.
+
+    A pass normally ends at the first lane whose turn ran past the tick's budget
+    (a drained record runs a full agent turn inline, measured 359-566 s), so every
+    lane behind it is skipped for that pass. Starting the next pass one position
+    further along turns that skipped tail into its head -- the roster order itself
+    is stable, so without the rotation the same tail lanes starve every tick.
+    """
+    if not roster:
+        return []
+    start = offset % len(roster)
+    return [*roster[start:], *roster[:start]]
+
+
+def _queued_roster(root: Path) -> list[Tuple[Path, str]]:
+    """``(lane home, target profile)`` pairs with a queued record, in roster order."""
+    from tools.bot_mode_probe import _delivery_homes
+
+    return [
+        (profile_home, profile)
+        for _name, profile_home in _delivery_homes(root)
+        for profile in delivery_queue.queued_target_profiles(profile_home)
+    ]
+
 
 def delivery_run_kwargs(record: dict[str, Any]) -> Dict[str, Any]:
     """Run kwargs for a delivery with no live request behind it (§2.5).
@@ -301,43 +331,89 @@ async def drain_once(
     ``profiles/<lane>``), not the default home. Draining only ``home`` left a
     named lane's backlog invisible (the live sweep logged ``actions=0`` while
     two lanes held 13 queued records).
+
+    Two rules keep a tick fair instead of first-come, because the budget is a TIME
+    budget and one turn can swallow all of it:
+
+    * the walk is ROTATED one position per pass (:func:`_rotate_roster`), so the
+      lane a spent budget cut off at the tail of one pass leads the next -- the
+      roster order is stable, so the same tail lanes starved every tick;
+    * a lane takes at most ONE record per pass, so a deep backlog cannot spend the
+      budget in front of the lanes behind it.
+
+    The budget gates the START of each turn only: a turn already running is never
+    abandoned. A lane with queued records that the spent budget could not reach is
+    named in the log (``drain_budget_exhausted``) with its queued depth -- that skip
+    used to be silent, which is why the starved lanes were invisible.
     """
-    from tools.bot_mode_probe import _delivery_homes, _hermes_root
+    from tools.bot_mode_probe import _hermes_root
     from tools.bot_relay import TurnBusyError, acquire_turn_lock
+
+    global _roster_offset
 
     root = _hermes_root(home)
     budget = SWEEP_DRAIN_BUDGET_SECONDS if budget_seconds is None else budget_seconds
     deadline = time.monotonic() + budget
     drained = 0
-    for _name, profile_home in _delivery_homes(root):
-        for profile in delivery_queue.queued_target_profiles(profile_home):
-            while time.monotonic() < deadline:
-                try:
-                    with acquire_turn_lock(root, profile, timeout_seconds=0):
-                        record = delivery_queue.claim_next(
-                            profile_home, target_profile=profile, lease_ok=True
-                        )
-                        if record is None:
-                            # A lane with queued records that still came back
-                            # unclaimable is the exact state that used to vanish
-                            # without a trace -- name the lane and its depth.
-                            log_delivery_event(
-                                "drain_nothing_claimable",
-                                None,
-                                target=profile,
-                                home=str(profile_home),
-                                reason="claim_empty_while_queued",
-                                queued=delivery_queue.queue_depth(profile_home, profile),
-                            )
-                            break
-                        settled, _reply = await run_record(adapter, profile_home, record)
-                        drained += 1
-                        log_delivery_event("drained", settled, drained=drained)
-                except TurnBusyError:
-                    log_delivery_event(
-                        "drain_deferred", None, target=profile, reason="slot_held"
+    #: Lanes this call already passed over (busy slot, unclaimable): as in the
+    #: single-lane loop, they are left for the next call, not re-probed in this one.
+    skipped: set[Tuple[Path, str]] = set()
+    while time.monotonic() < deadline:
+        walk = _rotate_roster(_queued_roster(root), _roster_offset)
+        _roster_offset += 1
+        if not walk:
+            break
+        served = 0
+        for profile_home, profile in walk:
+            if (profile_home, profile) in skipped:
+                continue
+            if time.monotonic() >= deadline:
+                # Budget spent: name every lane left unserved, so a starved lane is
+                # visible in the log instead of skipped and forgotten.
+                log_delivery_event(
+                    "drain_budget_exhausted",
+                    None,
+                    target=profile,
+                    home=str(profile_home),
+                    queued=delivery_queue.queue_depth(profile_home, profile),
+                )
+                continue
+            try:
+                with acquire_turn_lock(root, profile, timeout_seconds=0):
+                    record = delivery_queue.claim_next(
+                        profile_home, target_profile=profile, lease_ok=True
                     )
-                    break
+                    if record is None:
+                        # A lane with queued records that still came back
+                        # unclaimable is the exact state that used to vanish
+                        # without a trace -- name the lane and its depth.
+                        log_delivery_event(
+                            "drain_nothing_claimable",
+                            None,
+                            target=profile,
+                            home=str(profile_home),
+                            reason="claim_empty_while_queued",
+                            queued=delivery_queue.queue_depth(profile_home, profile),
+                        )
+                        skipped.add((profile_home, profile))
+                        continue
+                    # The turn AND its settle run inside the lock, as in the
+                    # in-call path: the flock is what makes slot_held() true for a
+                    # concurrent delivery to this lane, and a drained turn runs for
+                    # minutes (359-566 s measured), so releasing it before
+                    # run_record would admit a second turn for the same profile.
+                    settled, _reply = await run_record(adapter, profile_home, record)
+                    drained += 1
+                    served += 1
+                    log_delivery_event("drained", settled, drained=drained)
+            except TurnBusyError:
+                log_delivery_event(
+                    "drain_deferred", None, target=profile, reason="slot_held"
+                )
+                skipped.add((profile_home, profile))
+                continue
+        if not served:
+            break
     return drained
 
 
