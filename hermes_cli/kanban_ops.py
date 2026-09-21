@@ -105,6 +105,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "row_errors": [
+                {"task_id": tid, "error": err} for tid, err in res.row_errors
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -136,6 +139,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.row_errors:
+        print(f"Row errors:   {len(res.row_errors)}")
+        for tid, err in res.row_errors:
+            print(f"  - {tid}  {err}")
     return 0
 
 
