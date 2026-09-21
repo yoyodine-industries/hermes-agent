@@ -418,7 +418,7 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
 
 
 def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, gh_pr_state
 ) -> None:
     """B2 regression: a fresh PR-URL comment must not block reviewer spawns.
 
@@ -437,6 +437,10 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         lambda *a, **k: {"kanban": {"review_dispatch": True}},
     )
     pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
+    # The forge is the guard's one network hop: pin it, never call it. The PR in
+    # this scenario is genuinely OPEN — the subject here is the ready-lane hold
+    # (the state lookup itself is covered by test_kanban_respawn_guard_pr_state).
+    gh_pr_state.answer("https://github.com/example/repo/pull/123", "OPEN")
 
     with kbc.connect() as conn:
         # Review-lane task with a fresh PR comment.
