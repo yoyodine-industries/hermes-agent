@@ -1048,6 +1048,23 @@ def _triage_exit_hint(conn, tid: str) -> str:
             f"or close it with `hermes kanban complete {tid}`")
 
 
+def _unblock_refusal(tid: str, permanent: dict[str, str], conn) -> str:
+    """Why ``unblock`` refused ``tid``: a permanent spawn failure, or its state.
+
+    A plain "not blocked/scheduled?" would be a lie for a card that IS blocked —
+    and the ops disposition sweep's drain-leaks leg reads this line when it books
+    the card as still leaking, so the cause has to be in it.
+    """
+    cause = permanent.get(tid)
+    if cause:
+        return (
+            f"cannot unblock {tid}: its last spawn failed permanently ({cause}) — "
+            f"repair the card's workspace_path (or the board's default workdir) "
+            f"first, then re-run with --force"
+        )
+    return f"cannot unblock {tid} (not blocked/scheduled?)" + _triage_exit_hint(conn, tid)
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
@@ -1057,11 +1074,22 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = _stripped_or_none(getattr(args, "reason", None))
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
+    force = bool(getattr(args, "force", False))
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        # A card parked on a spawn no retry can clear needs its CAUSE fixed, not
+        # another attempt. Name the cause in the refusal: the ops disposition
+        # sweep drives this verb without --force, so this line is what tells the
+        # operator why a drained-looking card stayed blocked.
+        permanent: dict[str, str] = {}
+        if not force:
+            for tid in ids:
+                cause = kb.spawn_failure_cause(conn, tid)
+                if cause:
+                    permanent[tid] = cause
+        op = _commented(conn, reason, author, "UNBLOCK",
+                        lambda tid: kb.unblock_task(conn, tid, force=force))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)"
-                                       + _triage_exit_hint(conn, tid))
+                           lambda tid: _unblock_refusal(tid, permanent, conn))
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:

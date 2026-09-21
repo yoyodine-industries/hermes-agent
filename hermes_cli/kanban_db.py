@@ -3724,8 +3724,37 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
+def spawn_failure_cause(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The permanent cause recorded by the task's NEWEST failure, else ``None``.
+
+    ``kanban_db_dispatch._record_task_failure`` stamps ``permanent_spawn_cause``
+    on the failure when the spawn could not succeed for a reason no retry can
+    clear — the card's own ``workspace_path``/``workspace_kind`` or the board's
+    ``default_workdir`` — and that park is meant to reach a human, not to be
+    re-queued by the re-queue paths.
+
+    Read off the NEWEST ``spawn_failed``/``gave_up`` event rather than "any ever
+    recorded": a later transient failure means the last thing that happened is a
+    failure a retry can still clear, and the re-queue paths stay open for it.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('spawn_failed', 'gave_up') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    cause = payload.get("permanent_spawn_cause") if isinstance(payload, dict) else None
+    return str(cause) if cause else None
+
+
 def unblock_task(
     conn: sqlite3.Connection, task_id: str, *, extra_event: Optional[dict] = None,
+    force: bool = False,
 ) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first.
@@ -3733,7 +3762,19 @@ def unblock_task(
     ``extra_event`` merges into the ``unblocked`` event payload, so a caller that
     unblocked the card for a reason of its own (the due-card waker, say) leaves
     that reason on the board's event stream without a second event.
+
+    REFUSES (``False``, nothing written) when the card's newest failure was a
+    PERMANENT spawn failure (:func:`spawn_failure_cause`): re-queuing one spends
+    another worker slot on a spawn that cannot succeed, and — because an unblock
+    deliberately resets ``consecutive_failures`` — it also hands the card a fresh
+    retry budget, which is how a card with an unspawnable ``workspace_path``
+    looped through the ops disposition sweep's drain-leaks leg indefinitely.
+    ``force=True`` is the operator override for a card whose cause has since been
+    fixed; the ops sweep drives plain ``hermes kanban unblock`` and so never
+    resurrects one.
     """
+    if not force and spawn_failure_cause(conn, task_id):
+        return False
     now = int(time.time())
     with write_txn(conn):
         resume_status = (

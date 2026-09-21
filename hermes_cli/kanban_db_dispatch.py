@@ -1547,6 +1547,43 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return sweep.crashed
 
 
+# Spawn failures no retry can clear: the cause is a fact about what the CARD or the
+# BOARD RECORDS (its ``workspace_path`` / ``workspace_kind``, the board's
+# ``default_workdir``), so the identical spawn fails identically every time. Retrying
+# one buys nothing and costs a worker slot per attempt — and when the ops disposition
+# sweep's drain-leaks leg re-queues the park (``leak-null-kind`` -> ``hermes kanban
+# unblock``), the re-queue resets ``consecutive_failures`` and the loop restarts
+# forever. Measured on the ops board 2026-09-16..19: a card whose ``workspace_path``
+# pointed at a path that is not a git repo root was claimed -> spawn_failed ->
+# requeued six times, and every one of those re-queues was booked as a drain.
+# Each pattern is a message from ``hermes_cli/kanban_db_workspace.py``. An error that
+# matches NONE of them stays TRANSIENT (the pre-existing behaviour): a git lock, a
+# permission denial or a full disk really can clear on the next attempt.
+_PERMANENT_SPAWN_CAUSE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("workspace_path", "has non-absolute worktree path"),
+    ("workspace_path", "has non-absolute workspace_path"),
+    ("workspace_path", "is not inside a git repo"),
+    ("workspace_path", "default_workdir"),
+    ("workspace_path", "has workspace_kind=dir but no workspace_path"),
+    ("workspace_path", "has workspace_kind=worktree but no workspace_path"),
+    ("workspace_path", "unknown workspace_kind:"),
+)
+
+
+def permanent_spawn_cause(error: str) -> Optional[str]:
+    """Cause tag for a spawn failure no retry can clear, else ``None``.
+
+    Only the workspace-resolution errors that are a property of the card's own
+    recorded fields match (see ``_PERMANENT_SPAWN_CAUSE_PATTERNS``), so a
+    host-side hiccup keeps its retry budget.
+    """
+    text = str(error or "")
+    for cause, pattern in _PERMANENT_SPAWN_CAUSE_PATTERNS:
+        if pattern in text:
+            return cause
+    return None
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1558,6 +1595,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    permanent_cause: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1570,6 +1608,13 @@ def _record_task_failure(
     ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
+
+    ``permanent_cause``: the spawn failure cannot be cleared by retrying (what is
+    wrong is the card's own ``workspace_path``/``workspace_kind`` or the board's
+    ``default_workdir`` — see :func:`permanent_spawn_cause`). The counter is
+    pinned AT the effective limit, so the card reaches its ceiling on this first
+    attempt, and the ``gave_up`` payload carries the cause so a later re-queue
+    can refuse to hand the card a fresh budget.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1605,6 +1650,15 @@ def _record_task_failure(
             effective_limit, limit_source = int(task_override), "task"
         else:
             effective_limit, limit_source = int(failure_limit), "dispatcher"
+
+        if permanent_cause:
+            # A permanent spawn failure is spent HERE, on the first attempt: pin
+            # the counter at the ceiling instead of only tripping, because
+            # ``recompute_ready`` auto-recovers any blocked card whose counter is
+            # still below its effective limit. ``force_trip`` alone would park a
+            # limit-2 card at failures=1 and the next tick would promote it
+            # straight back into the same unspawnable spawn.
+            failures = max(failures, effective_limit)
 
         if not (force_trip or failures >= effective_limit):
             if release_claim:
@@ -1664,18 +1718,26 @@ def _record_task_failure(
             "trigger_outcome": outcome,
             "retry_status": retry_status,
         }
+        if permanent_cause:
+            # Machine-readable cause so the re-queue paths (the ops sweep's
+            # drain-leaks leg drives ``hermes kanban unblock``) can tell a park
+            # no retry can clear from one an operator has since fixed.
+            payload["permanent_spawn_cause"] = permanent_cause
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
+            run_metadata = {
+                "failures": failures,
+                "trigger_outcome": outcome,
+                "effective_limit": effective_limit,
+                "limit_source": limit_source,
+                "retry_status": retry_status,
+            }
+            if permanent_cause:
+                run_metadata["permanent_spawn_cause"] = permanent_cause
             run_id = _kb._end_run(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
-                metadata={
-                    "failures": failures,
-                    "trigger_outcome": outcome,
-                    "effective_limit": effective_limit,
-                    "limit_source": limit_source,
-                    "retry_status": retry_status,
-                },
+                metadata=run_metadata,
             )
         if event_payload_extra:
             payload.update(event_payload_extra)
@@ -2456,10 +2518,22 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
-        result.spawn_failed.append((claimed.id, claimed.assignee or "", f"workspace: {exc}"))
+        error = f"workspace: {exc}"
+        # A workspace error that is a property of the card's own recorded fields
+        # cannot be cleared by retrying. Park it for a human on this FIRST
+        # attempt rather than spending the budget and letting the re-queue paths
+        # (the ops sweep's drain-leaks leg) restart the loop.
+        permanent_cause = permanent_spawn_cause(error)
+        result.spawn_failed.append((claimed.id, claimed.assignee or "", error))
+        if permanent_cause:
+            _kb._log.warning(
+                "kanban dispatcher: %s has an unspawnable workspace — parking it "
+                "for a human (%s)", claimed.id, error,
+            )
         if _record_task_failure(
-            conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            conn, claimed.id, error,
+            outcome="spawn_failed", failure_limit=failure_limit,
+            release_claim=True, end_run=True, permanent_cause=permanent_cause,
         ):
             result.auto_blocked.append(claimed.id)
         return False

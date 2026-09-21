@@ -332,6 +332,11 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--force", action="store_true",
+             help="Re-queue a card whose last spawn failed permanently — its "
+                  "workspace_path/workspace_kind, or the board's default_workdir, "
+                  "was what was wrong. Use it once you have repaired the cause; "
+                  "the automated drain-leaks re-queue never passes it."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open (a still-running previous worker is not signalled — its re-spawn waits for it to exit)"),
     _cmd("request-review", [
