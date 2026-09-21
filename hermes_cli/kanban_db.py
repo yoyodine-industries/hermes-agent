@@ -602,8 +602,10 @@ def create_board(
         normed, name=name, description=description, icon=icon, color=color,
         default_workdir=default_workdir, project_id=project_id,
     )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
+    # Touch the DB so list_boards() sees it immediately. Recreating is the
+    # point of this verb, so it opts into it explicitly (a deleted board's file
+    # is otherwise refused; see kanban_db_connect's replaced-board guard).
+    init_db(board=normed, allow_recreate=True)
     return meta
 
 
@@ -4174,6 +4176,7 @@ _PLUGIN_COMPAT_LAZY = {
     'DERIVED_MAX_IN_PROGRESS_FLOOR': ('hermes_cli.kanban_db_dispatch', 'DERIVED_MAX_IN_PROGRESS_FLOOR'),
     'KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS': ('hermes_cli.kanban_db_dispatch', 'KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS'),
     'KanbanDbCorruptError': ('hermes_cli.kanban_db_connect', 'KanbanDbCorruptError'),
+    'KanbanDbReplacedError': ('hermes_cli.kanban_db_connect', 'KanbanDbReplacedError'),
     'MEMORY_GUARD_MB_PER_WORKER': ('hermes_cli.kanban_db_dispatch', 'MEMORY_GUARD_MB_PER_WORKER'),
     'RepairResult': ('hermes_cli.kanban_db_connect', 'RepairResult'),
     'add_notify_sub': ('hermes_cli.kanban_db_notify', 'add_notify_sub'),
