@@ -133,7 +133,9 @@ def test_a_refused_spec_card_keeps_a_supported_exit(kanban_home):
     with kbc.connect_closing() as conn:
         tid = _specd_card(conn)
 
-    ns = argparse.Namespace(task_id=tid, reason=[], ids=None, dry_run=False, json=False)
+    ns = argparse.Namespace(
+        task_id=tid, reason=[], ids=None, dry_run=False, json=False, force=False
+    )
     assert kb_cli._cmd_promote(ns) == 0
 
     with kbc.connect_closing() as conn:
