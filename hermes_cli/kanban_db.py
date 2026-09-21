@@ -804,7 +804,7 @@ class Comment:
     def from_row(cls, r: sqlite3.Row) -> "Comment":
         return cls(
             id=r["id"], task_id=r["task_id"], author=r["author"],
-            body=r["body"], created_at=r["created_at"],
+            body=_db_text(r["body"]), created_at=r["created_at"],
         )
 
 
@@ -4132,6 +4132,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
     _clear_failure_counter,
+    _db_text,
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _terminate_reclaimed_worker,
