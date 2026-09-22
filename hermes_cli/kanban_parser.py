@@ -240,6 +240,12 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("priority", [
+        _TASK_ID,
+        _arg("level", type=int,
+             help="Dispatch-priority tiebreaker (bigger = claimed first)"),
+        _bulk_ids("re-prioritize"),
+    ], help="Set the dispatch-priority tiebreaker on a card (takes effect on the next dispatch; does not make a card ready)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task (does NOT stop the worker process)"),
     _cmd("reassign", [
         _TASK_ID,

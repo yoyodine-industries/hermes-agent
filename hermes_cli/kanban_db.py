@@ -1911,6 +1911,21 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
     )
 
 
+def set_priority(conn: sqlite3.Connection, task_id: str, priority: int) -> bool:
+    """Set the dispatch-priority tiebreaker after creation (bigger = claimed first).
+
+    A tiebreaker only: it re-orders which ready card a tick claims first and never
+    makes a card ready or parks one, so it is settable in any non-archived status —
+    including ``running``, where it applies on the NEXT dispatch. ``False`` when the
+    id is unknown.
+    """
+    return _set_task_override(
+        conn, task_id, "UPDATE tasks SET priority = ? WHERE id = ?", (int(priority),),
+        "reprioritized", {"priority": int(priority)},
+        ("priority",), archived_msg="cannot set priority",
+    )
+
+
 # --- Links ---
 
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
