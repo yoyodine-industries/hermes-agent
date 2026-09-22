@@ -45,12 +45,13 @@ logger = logging.getLogger(__name__)
 #: abandoned (it is the delivery that was promised).
 IN_CALL_DRAIN_MIN_SECONDS = 1.0
 
-#: Trigger 3's budget per PROFILE per tick, so one deep backlog cannot monopolise
-#: the loop. It replaced a single shared 60s tick deadline: that one deadline was
-#: spent by an early lane's slow turn (a lease wait, a desktop-held slot), so every
-#: lane behind it went unserved for the rest of the tick. Each profile now gets its
-#: own freshly-started slice of this length.
-PER_PROFILE_DRAIN_BUDGET_SECONDS = 60.0
+#: Trigger 3's budget per PROFILE per tick is deliberately ABSENT now: a lane is
+#: drained back-to-back until one of its stop conditions fires (queue empty, slot
+#: held, lease-contended). A wall-clock slice only ever bounded how many turns a
+#: lane STARTED, never how long one turn ran, so an idle lane's head waited behind
+#: every other lane's slow turns -- hours of it, while its own slot sat free. Since
+#: each lane now runs on its own task, no lane can spend another lane's time, and
+#: there is nothing left for a budget to protect.
 
 #: Roster rotation cursor: the next tick starts at the next lane, so a full tick
 #: never leaves the same lane last twice in a row. In-memory: losing it costs one
@@ -384,9 +385,68 @@ async def drain_under_lock(
     )
 
 
-async def drain_once(
-    adapter: Any, home: Path, *, budget_seconds: Optional[float] = None
+async def _drain_profile(
+    adapter: Any,
+    *,
+    root: Path,
+    profile_home: Path,
+    profile: str,
 ) -> int:
+    """Drain ONE lane's queue back-to-back until it can make no more progress.
+
+    Runs to completion inside a single task: a lane's records stay strictly FIFO
+    and are never drained twice, while every other lane runs on its own task.
+    Three stop conditions, all of them LANE-LOCAL -- the queue came back empty, the
+    lane's slot is held by another turn, or a settled status came back ``queued``
+    (lease-contended). There is deliberately no wall-clock slice: it bounded how
+    many turns a lane started, never how long one ran, so a slow lane left its
+    backlog for the next tick while other lanes waited behind it.
+    """
+    from tools.bot_relay import TurnBusyError, acquire_turn_lock
+
+    drained = 0
+    while True:
+        try:
+            with acquire_turn_lock(root, profile, timeout_seconds=0):
+                record = delivery_queue.claim_next(
+                    profile_home, target_profile=profile, lease_ok=True
+                )
+                if record is None:
+                    # A lane with queued records that still came back
+                    # unclaimable is the exact state that used to vanish
+                    # without a trace -- name the lane and its depth.
+                    log_delivery_event(
+                        "drain_nothing_claimable",
+                        None,
+                        target=profile,
+                        home=str(profile_home),
+                        reason="claim_empty_while_queued",
+                        queued=delivery_queue.queue_depth(profile_home, profile),
+                    )
+                    break
+                settled, _reply = await run_record(adapter, profile_home, record)
+                if str(settled.get("status")) == delivery_queue.STATUS_QUEUED:
+                    # A lease-contended requeue: the turn never started, so
+                    # the record is back in the queue, still claimable, with
+                    # `reoffer_count` as the loop's only progress signal.
+                    # Re-claiming it here re-runs the same un-runnable turn
+                    # until the slice expires (28 claims in one live tick,
+                    # each reported as drained). Leave it for the next tick.
+                    log_delivery_event(
+                        "drain_lease_contended", settled, target=profile
+                    )
+                    break
+                drained += 1
+                log_delivery_event("drained", settled, drained=drained)
+        except TurnBusyError:
+            log_delivery_event(
+                "drain_deferred", None, target=profile, reason="slot_held"
+            )
+            break
+    return drained
+
+
+async def drain_once(adapter: Any, home: Path) -> int:
     """Run queued deliveries for every profile whose slot is free.
 
     Returns the number of turns actually run. A slot held by any other turn (a
@@ -400,68 +460,60 @@ async def drain_once(
     named lane's backlog invisible (the live sweep logged ``actions=0`` while
     two lanes held 13 queued records).
 
-    ``budget_seconds`` is a PER-PROFILE slice: every profile on the roster gets
-    its own freshly-started deadline, so one lane's slow turn cannot spend the
-    budget of the lanes behind it. The roster start rotates one lane per tick,
-    so the lane a full tick served last is the lane the next tick tries first.
+    Every lane holding a backlog is drained on its OWN task, concurrently. The
+    roster used to be one sequential pass -- ``for lane: take its slot, run its
+    turn`` -- so a lane whose turn was slow (a 28-minute delivery was observed
+    live, or a lease wait, or a desktop-held slot) held the loop for the whole
+    turn and every lane behind it went unserved, however idle and however deep
+    its own backlog. Slots are independent (one lockfile per profile), so the
+    lanes are independent too: each task claims and runs under its own lane's
+    lock, and no lane can spend another lane's time. The roster start rotates
+    one lane per tick, so the lane a full tick started last is the lane the next
+    tick starts first.
     """
     from tools.bot_mode_probe import _hermes_root, _roster
-    from tools.bot_relay import TurnBusyError, acquire_turn_lock
 
     global _roster_offset
 
     root = _hermes_root(home)
-    budget = (
-        PER_PROFILE_DRAIN_BUDGET_SECONDS if budget_seconds is None else budget_seconds
-    )
     roster = _roster(root)
     n = len(roster) or 1
     offset = _roster_offset % n
     ordered = roster[offset:] + roster[:offset]
     _roster_offset = (offset + 1) % n
-    drained = 0
-    for _name, profile_home in ordered:
-        for profile in delivery_queue.queued_target_profiles(profile_home):
-            deadline = time.monotonic() + budget  # this profile's own slice
-            while time.monotonic() < deadline:
-                try:
-                    with acquire_turn_lock(root, profile, timeout_seconds=0):
-                        record = delivery_queue.claim_next(
-                            profile_home, target_profile=profile, lease_ok=True
-                        )
-                        if record is None:
-                            # A lane with queued records that still came back
-                            # unclaimable is the exact state that used to vanish
-                            # without a trace -- name the lane and its depth.
-                            log_delivery_event(
-                                "drain_nothing_claimable",
-                                None,
-                                target=profile,
-                                home=str(profile_home),
-                                reason="claim_empty_while_queued",
-                                queued=delivery_queue.queue_depth(profile_home, profile),
-                            )
-                            break
-                        settled, _reply = await run_record(adapter, profile_home, record)
-                        if str(settled.get("status")) == delivery_queue.STATUS_QUEUED:
-                            # A lease-contended requeue: the turn never started, so
-                            # the record is back in the queue, still claimable, with
-                            # `reoffer_count` as the loop's only progress signal.
-                            # Re-claiming it here re-runs the same un-runnable turn
-                            # until the slice expires (28 claims in one live tick,
-                            # each reported as drained). Leave it for the next tick.
-                            log_delivery_event(
-                                "drain_lease_contended", settled, target=profile
-                            )
-                            break
-                        drained += 1
-                        log_delivery_event("drained", settled, drained=drained)
-                except TurnBusyError:
-                    log_delivery_event(
-                        "drain_deferred", None, target=profile, reason="slot_held"
-                    )
-                    break
-    return drained
+
+    # One task per (profile, home) pair holding a backlog, decided up front so
+    # every lane is scheduled together and none waits for another to finish.
+    lanes = [
+        (profile_home, profile)
+        for _name, profile_home in ordered
+        for profile in delivery_queue.queued_target_profiles(profile_home)
+    ]
+    if not lanes:
+        return 0
+
+    async def lane_task(profile_home: Path, profile: str) -> int:
+        try:
+            return await _drain_profile(
+                adapter, root=root, profile_home=profile_home, profile=profile
+            )
+        except asyncio.CancelledError:
+            # Gateway shutdown: let the cancel propagate, taking this lane's turn
+            # with it, rather than leaving a turn task running after the gather.
+            raise
+        except Exception:  # noqa: BLE001 - one lane must not strand the others
+            logger.exception(
+                "[api_server] lane drain failed (lane=%s home=%s)",
+                profile,
+                profile_home,
+            )
+            return 0
+
+    # Each lane task returns its own subtotal: a shared counter would lose the
+    # += of any lane that was awaiting its turn when another lane finished.
+    return sum(
+        await asyncio.gather(*(lane_task(h, p) for h, p in lanes))
+    )
 
 
 async def sweep_loop(adapter: Any) -> None:
