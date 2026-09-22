@@ -324,6 +324,143 @@ def test_sweep_recovers_orphaned_claim(tmp_path):
     assert not _claimed_path(tmp_path, 1).exists()
 
 
+def _free(home, profile):
+    return False
+
+
+def _busy(home, profile):
+    return True
+
+
+def test_sweep_recovers_a_claim_whose_turn_died(tmp_path):
+    """A ``running`` claim with a FREE turn lock is an orphan: requeue it.
+
+    Recovery re-offers the record so the next drain runs it; the attempt stays
+    consumed (it really happened) and the open attempt is closed with the
+    recovery reason, not left dangling for the next restart to read as live.
+    """
+    _admit(tmp_path, 1)
+    claimed = q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    assert claimed["status"] == "running"
+    assert q.sweep_delivery_queue(tmp_path, slot_held_fn=_free) == 1
+    record = q.read_record(tmp_path, _did(1))
+    assert record["status"] == "queued"
+    assert record["claimed_at"] is None
+    assert record["reoffer_count"] == 1
+    # The sender-visible cause: the slot was FREE (that is the recovery
+    # predicate), not held -- LEASE_CONTENDED here would name a holder the fix
+    # just proved is gone.
+    assert record["status_detail"] == q.STATUS_DETAIL_RECOVERED
+    assert q.build_envelope(record)["status_detail"] == q.STATUS_DETAIL_RECOVERED
+    assert record["attempts"] == 1  # the dead attempt stays consumed
+    assert record["attempts_log"][0]["ended_at"] is not None
+    assert record["attempts_log"][0]["reason"] == q.REASON_RESTART_RECOVERED
+    assert _queued_path(tmp_path, 1).exists()
+    assert not _claimed_path(tmp_path, 1).exists()
+
+
+def test_sweep_recovers_an_over_age_claim_instead_of_reaping_it(tmp_path):
+    """Recovery restarts the wait it just re-offered (live data: one stranded
+    claim had waited 6422s before its turn was even claimed).
+
+    Requeueing that record and then expiring it in the same pass would settle
+    the sender ``expired`` -- about the one delivery the drain, or the
+    already-in-history guard, is a tick away from settling.
+    """
+    stale = time.time_ns() - int(3 * q.queue_ttl_seconds() * 1e9)
+    _admit(tmp_path, 1, now_ns=stale)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    assert q.queued_seconds(q.read_record(tmp_path, _did(1))) > q.queue_ttl_seconds()
+    assert q.sweep_delivery_queue(tmp_path, slot_held_fn=_free) == 1
+    record = q.read_record(tmp_path, _did(1))
+    assert record["status"] == "queued"
+    assert _queued_path(tmp_path, 1).exists()
+    # The reprieve is a fresh window, not an exemption: once it is spent the
+    # ordinary TTL rule still bounds the record.
+    later = time.time_ns() + int(2 * q.queue_ttl_seconds() * 1e9)
+    assert q.sweep_delivery_queue(tmp_path, slot_held_fn=_free, now_ns=later) == 1
+    assert q.read_record(tmp_path, _did(1))["reason"] == q.REASON_QUEUED_EXPIRED
+
+
+def test_recover_running_claim_is_the_public_entry_point(tmp_path):
+    """The sweep's recovery is reachable on its own, for a drainer or an operator."""
+    _admit(tmp_path, 1)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    recovered = q.recover_running_claim(tmp_path, _did(1))
+    assert recovered["status"] == "queued"
+    assert recovered["claimed_at"] is None
+    assert recovered["reoffer_count"] == 1
+    assert recovered["attempts"] == 1
+    assert recovered["status_detail"] == q.STATUS_DETAIL_RECOVERED
+    assert recovered["attempts_log"][0]["reason"] == q.REASON_RESTART_RECOVERED
+    with pytest.raises(FileNotFoundError):
+        q.recover_running_claim(tmp_path, _did(9))
+
+
+def test_sweep_never_recovers_a_long_running_turn(tmp_path):
+    """Liveness is the turn lock, never the claim's age.
+
+    A turn can legitimately hold its slot for hours (a desktop or card session
+    waits out a whole lease). Recovering on "the claim is old" would rip a
+    delivery out from under a live turn and run it twice.
+    """
+    hours_ago = time.time_ns() - int(6 * 3600 * 1e9)
+    _admit(tmp_path, 1, now_ns=hours_ago)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True, now_ns=hours_ago)
+    assert q.sweep_delivery_queue(tmp_path, slot_held_fn=_busy) == 0
+    record = q.read_record(tmp_path, _did(1))
+    assert record["status"] == "running"
+    assert record["claimed_at"] == hours_ago
+    assert record["reoffer_count"] == 0
+    assert record["attempts_log"][0]["ended_at"] is None
+    assert _claimed_path(tmp_path, 1).exists()
+
+
+def test_sweep_fails_a_claim_that_exhausted_its_attempts(tmp_path):
+    """Recovery cannot spin: an orphan at the attempt cap settles terminal.
+
+    ``failed`` is honest here -- the sender was promised a run that the restart
+    interrupted, and there is no attempt left to spend on another one.
+    """
+    _admit(tmp_path, 1)
+    for _ in range(q.max_turn_attempts()):
+        q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+        if q.read_record(tmp_path, _did(1))["attempts"] < q.max_turn_attempts():
+            q.requeue(tmp_path, _did(1))
+    claimed = q.read_record(tmp_path, _did(1))
+    assert claimed["attempts"] == q.max_turn_attempts()
+    assert claimed["status"] == "running"
+    assert q.sweep_delivery_queue(tmp_path, slot_held_fn=_free) == 1
+    record = q.read_record(tmp_path, _did(1))
+    assert record["status"] == "failed"
+    assert record["reason"] == q.REASON_RESTART_INTERRUPTED
+    assert record["status_detail"] == q.REASON_RESTART_INTERRUPTED
+    # The sender reads the sentence, not the bare machine key: `reason` stays
+    # restart_interrupted (routing), `error` says what actually happened.
+    env = q.build_envelope(record)
+    assert env["error"] == "turn interrupted by gateway restart; retries exhausted"
+    assert env["reason"] == q.REASON_RESTART_INTERRUPTED
+    assert env["retryable"] is False  # no attempt is left to spend
+    assert record["attempts_log"][-1]["ended_at"] is not None
+    assert _settled_path(tmp_path, 1).exists()
+    assert not _claimed_path(tmp_path, 1).exists()
+    # terminal, so the next tick has nothing left to recover
+    assert q.sweep_delivery_queue(tmp_path, slot_held_fn=_free) == 0
+
+
+def test_recover_running_claim_requeues_one_named_record(tmp_path):
+    _admit(tmp_path, 1)
+    q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    recovered = q.recover_running_claim(tmp_path, _did(1))
+    assert recovered["status"] == "queued"
+    assert recovered["attempts"] == 1
+    assert recovered["reoffer_count"] == 1
+    assert recovered["attempts_log"][0]["reason"] == q.REASON_RESTART_RECOVERED
+    assert _queued_path(tmp_path, 1).exists()
+    with pytest.raises(FileNotFoundError):
+        q.recover_running_claim(tmp_path, _did(9))
+
+
 # ---------------------------------------------------------------- derivation
 def test_queued_seconds_counts_waiting_only(tmp_path):
     day_ago = time.time_ns() - int(86400 * 1e9)

@@ -151,6 +151,11 @@ STATUS_DETAIL_TARGET_BUSY = "target_busy: turn slot held by another turn; delive
 STATUS_DETAIL_LIVE_OWNER = "live_owner_present"
 STATUS_DETAIL_LEASE_CONTENDED = "lease_contended"
 STATUS_DETAIL_QUEUE_FULL = "queue_full"
+#: A ``running`` claim the sweep requeued because the turn that held it died
+#: with the process holding the slot. LEASE_CONTENDED would misstate the cause
+#: in a field the sender reads verbatim: the recovery predicate is precisely
+#: that the slot is FREE (the flock went with its holder).
+STATUS_DETAIL_RECOVERED = "restart_recovered"
 #: A queued delivery whose target slot is FREE -- a different cause from
 #: TARGET_BUSY, and the one a receipt must not misreport (VERIFICATION D2).
 STATUS_DETAIL_BACKLOG = (
@@ -162,6 +167,18 @@ LIMIT_PER_PROFILE = "per_profile"
 LIMIT_PER_SENDER = "per_sender"
 
 REASON_QUEUED_EXPIRED = "queued_expired"
+
+#: A claim whose turn died with the process that held it (the flock is gone, so
+#: the turn provably is too). ``_RECOVERED`` closes the dead attempt; the record
+#: is requeued and re-offered. ``_INTERRUPTED`` is terminal: the sender's turn
+#: was started and never finished, and no attempt is left to spend on another.
+REASON_RESTART_RECOVERED = "restart_recovered"
+REASON_RESTART_INTERRUPTED = "restart_interrupted"
+#: The sender-visible twin of REASON_RESTART_INTERRUPTED: ``reason`` stays the
+#: machine key, ``error`` is the sentence the sender reads.
+ERROR_RESTART_INTERRUPTED = (
+    "turn interrupted by gateway restart; retries exhausted"
+)
 
 #: `retryable(envelope)` is derived from the *envelope reason* only. It is
 #: unrelated to ``retry_action()`` (agent auto-retry) -- never derive one from
@@ -551,6 +568,28 @@ def queued_seconds(record: dict[str, Any], *, now_ns: int | None = None) -> floa
     return total / 1e9
 
 
+def _recovered_since_seconds(record: dict[str, Any], *, now_ns: int) -> float | None:
+    """Seconds since restart recovery last re-offered this record, else ``None``.
+
+    Recovery restarts the record's TTL window. Its pre-crash wait was served by a
+    turn that really did start, and the wait still open is the one since the
+    crash -- without this the sweep would requeue an over-age claim and reap it
+    as ``expired`` in the same pass, telling a sender "not delivered" about the
+    very record the drain is one tick from settling. It cannot spin: recovery
+    settles ``failed`` once the attempt cap is reached.
+    """
+    latest = 0
+    for entry in record.get("attempts_log") or []:
+        if entry.get("reason") != REASON_RESTART_RECOVERED:
+            continue
+        ended = entry.get("ended_at")
+        if ended and int(ended) > latest:
+            latest = int(ended)
+    if not latest:
+        return None
+    return max(0.0, (now_ns - latest) / 1e9)
+
+
 def _queue_position(root: Path, record: dict[str, Any]) -> int | None:
     if record.get("status") != STATUS_QUEUED:
         return None
@@ -813,6 +852,54 @@ def requeue_unstarted(
         return dict(updated)
 
 
+def _recover_running_claim_locked(
+    root: Path, record: dict[str, Any], *, now_ns: int
+) -> dict[str, Any]:
+    """Requeue one orphaned ``running`` claim. The caller holds the queue lock."""
+    delivery_id = record["delivery_id"]
+    queued_path = root / QUEUE_DIR / f"{delivery_id}.json"
+    claimed_path = root / CLAIMED_DIR / f"{delivery_id}.json"
+    updated = dict(record)
+    updated["status"] = STATUS_QUEUED
+    updated["reoffer_count"] = int(updated.get("reoffer_count", 0)) + 1
+    updated["claimed_at"] = None
+    updated["updated_at"] = now_ns
+    updated["status_detail"] = STATUS_DETAIL_RECOVERED
+    entry = _open_attempt(updated)
+    if entry is not None:
+        entry["ended_at"] = now_ns
+        entry["status"] = STATUS_QUEUED
+        entry["reason"] = REASON_RESTART_RECOVERED
+    updated["sequence"] = int(updated.get("sequence", 0))
+    os.replace(claimed_path, queued_path)
+    updated["queue_position"] = _queue_position(root, updated) or 1
+    _write(queued_path, updated)
+    _fsync_dir(root / CLAIMED_DIR)
+    _log("recovered_running", updated, reason=REASON_RESTART_RECOVERED)
+    return dict(updated)
+
+
+def recover_running_claim(
+    home: str | os.PathLike[str], delivery_id: str, *, now_ns: int | None = None
+) -> dict[str, Any]:
+    """Return an orphaned ``running`` claim to ``queued`` (restart recovery).
+
+    The turn that claimed the record died with the process holding its slot, so
+    the open attempt is closed as ``restart_recovered``, ``reoffer_count``
+    increments and ``claimed_at`` clears. ``attempts`` is unchanged: the attempt
+    really was consumed, and the cap has to keep counting it or recovery would
+    re-run a record the queue had already given up on.
+    """
+    key_id = validate_delivery_id(delivery_id)
+    now_ns = time.time_ns() if now_ns is None else int(now_ns)
+    with _locked(home) as root:
+        claimed_path = root / CLAIMED_DIR / f"{key_id}.json"
+        record = _read(claimed_path)
+        if record is None:
+            raise FileNotFoundError(f"no claimed record for {key_id}")
+        return _recover_running_claim_locked(root, record, now_ns=now_ns)
+
+
 def settle(
     home: str | os.PathLike[str],
     delivery_id: str,
@@ -843,28 +930,59 @@ def settle(
         record = _read(claimed_path)
         if record is None:
             raise FileNotFoundError(f"no claimed record for {key_id}")
+        return _settle_locked(
+            root,
+            record,
+            status=status,
+            reply=reply,
+            error=error,
+            reason=reason,
+            status_detail=status_detail,
+            now_ns=now_ns,
+        )
 
-        updated = dict(record)
-        updated["status"] = status
-        updated["updated_at"] = now_ns
-        updated["status_detail"] = status_detail
-        updated["queue_position"] = None
-        if reply not in (None, ""):
-            updated["reply"] = reply
-        if error not in (None, ""):
-            updated["error"] = error
-        if reason not in (None, ""):
-            updated["reason"] = reason
-        entry = _open_attempt(updated)
-        if entry is not None:
-            entry["ended_at"] = now_ns
-            entry["status"] = status
-            entry["reason"] = reason or None
-        os.replace(claimed_path, settled_path)
-        _write(settled_path, updated)
-        _fsync_dir(root / CLAIMED_DIR)
-        _log("settled", updated, attempt=updated.get("attempts"))
-        return dict(updated)
+
+def _settle_locked(
+    root: Path,
+    record: dict[str, Any],
+    *,
+    status: str,
+    reply: str | None = "",
+    error: str | None = "",
+    reason: str | None = "",
+    status_detail: str | None = None,
+    now_ns: int,
+    event: str = "settled",
+) -> dict[str, Any]:
+    """Settle one claimed record. The caller already holds the queue lock.
+
+    Split out of :func:`settle` because :func:`sweep_delivery_queue` settles a
+    restart-interrupted claim while it holds that same (non-reentrant) lock.
+    """
+    key_id = record["delivery_id"]
+    claimed_path = root / CLAIMED_DIR / f"{key_id}.json"
+    settled_path = root / SETTLED_DIR / f"{key_id}.json"
+    updated = dict(record)
+    updated["status"] = status
+    updated["updated_at"] = now_ns
+    updated["status_detail"] = status_detail
+    updated["queue_position"] = None
+    if reply not in (None, ""):
+        updated["reply"] = reply
+    if error not in (None, ""):
+        updated["error"] = error
+    if reason not in (None, ""):
+        updated["reason"] = reason
+    entry = _open_attempt(updated)
+    if entry is not None:
+        entry["ended_at"] = now_ns
+        entry["status"] = status
+        entry["reason"] = reason or None
+    os.replace(claimed_path, settled_path)
+    _write(settled_path, updated)
+    _fsync_dir(root / CLAIMED_DIR)
+    _log(event, updated, attempt=updated.get("attempts"))
+    return dict(updated)
 
 
 def mark_expired(
@@ -1013,6 +1131,12 @@ def sweep_delivery_queue(
     reaped here either: the drain on the same tick is its first -- and only --
     chance to run. TTL expiry bounds only records that have actually been
     attempted and come back for another round.
+
+    A claim still marked ``running`` is an orphan exactly when its target's turn
+    slot is free: the slot is a flock, the kernel released it when the holder
+    died, so nothing is left to finish that turn. It is requeued at once, unless
+    it has already spent ``max_turn_attempts()`` -- then it settles terminal
+    ``failed``, so recovery can never spin one record forever.
     """
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     ttl = queue_ttl_seconds()
@@ -1031,12 +1155,44 @@ def sweep_delivery_queue(
             _write(root / QUEUE_DIR / f"{delivery_id}.json", record)
             actions += 1
 
-        # 2. expire records that waited past the TTL
+        # 2. a claim whose turn died with the process that held the slot. The
+        #    turn lock is a flock: the kernel drops it when the holder dies and
+        #    every claim is made under a held lock, so a FREE slot proves the
+        #    turn is gone. Liveness is that lock, never the claim's age -- the
+        #    live build saw a desktop session hold one slot for 1800s, and a
+        #    "claim older than the lease" trigger would have re-run its turn.
+        for record in _list(root, CLAIMED_DIR):
+            if record.get("status") != STATUS_RUNNING:
+                continue
+            if held(home, record.get("target_profile") or ""):
+                _log("recover_skipped_slot_held", record)
+                continue
+            if int(record.get("attempts", 0)) >= max_turn_attempts():
+                _settle_locked(
+                    root,
+                    record,
+                    status=STATUS_FAILED,
+                    reason=REASON_RESTART_INTERRUPTED,
+                    error=ERROR_RESTART_INTERRUPTED,
+                    status_detail=REASON_RESTART_INTERRUPTED,
+                    now_ns=now_ns,
+                    event="recovered_failed",
+                )
+                actions += 1
+                continue
+            _recover_running_claim_locked(root, record, now_ns=now_ns)
+            actions += 1
+
+        # 3. expire records that waited past the TTL
         if ttl > 0:
             for record in _list(root, QUEUE_DIR):
                 if record.get("status") != STATUS_QUEUED:
                     continue
-                if queued_seconds(record, now_ns=now_ns) <= ttl:
+                waited = queued_seconds(record, now_ns=now_ns)
+                recovered = _recovered_since_seconds(record, now_ns=now_ns)
+                if recovered is not None and recovered < waited:
+                    waited = recovered
+                if waited <= ttl:
                     continue
                 # Never reap a record that was never offered to a live turn: the
                 # drain on the same tick is its first (and only) chance to run.
