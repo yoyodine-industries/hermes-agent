@@ -19,6 +19,13 @@ class _HardExitObserved(BaseException):
         self.code = code
 
 
+def gateway_run_module():
+    """The ``gateway.run`` module object, so tests can patch the exit-driver seam the CLI imports."""
+    import gateway.run as gateway_run
+
+    return gateway_run
+
+
 def _prepare(monkeypatch):
     import hermes_cli.gateway as gateway_cli
     import gateway.run as gateway_run
@@ -43,18 +50,29 @@ def _prepare(monkeypatch):
 
 
 def test_run_gateway_hard_exits_after_clean_return(monkeypatch):
+    """Also pins the seam: the CLI must drive the gateway through gateway.run's exit driver, NOT
+    asyncio.run, whose teardown joins the loop's default executor with no leash (t_58fe16cb)."""
     gateway_cli = _prepare(monkeypatch)
 
-    def _fake_run(coro):
+    driven = []
+
+    def _fake_driver(coro):
         coro.close()
+        driven.append(True)
         return True
 
-    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
+    def _asyncio_run_must_not_be_used(coro):  # pragma: no cover - only on regression
+        coro.close()
+        raise AssertionError("hermes gateway run must use the wedge-proof exit driver")
+
+    monkeypatch.setattr(gateway_run_module(), "_run_gateway_until_verdict", _fake_driver)
+    monkeypatch.setattr(gateway_cli.asyncio, "run", _asyncio_run_must_not_be_used)
 
     with pytest.raises(_HardExitObserved) as excinfo:
         gateway_cli.run_gateway()
 
     assert excinfo.value.code == 0
+    assert driven == [True]
 
 
 def test_run_gateway_hard_exits_after_keyboard_interrupt(monkeypatch):
@@ -65,11 +83,11 @@ def test_run_gateway_hard_exits_after_keyboard_interrupt(monkeypatch):
     """
     gateway_cli = _prepare(monkeypatch)
 
-    def _fake_run(coro):
+    def _fake_driver(coro):
         coro.close()
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
+    monkeypatch.setattr(gateway_run_module(), "_run_gateway_until_verdict", _fake_driver)
 
     with pytest.raises(_HardExitObserved) as excinfo:
         gateway_cli.run_gateway()

@@ -4649,7 +4649,9 @@ def _absorb_windows_console_controls() -> None:
 
 def _make_exit_diag():
     """``_exit_diag(tag, **extra)`` recorder writing ``logs/gateway-exit-diag.log`` — captures every way
-    ``asyncio.run()`` can return, for chasing silent Windows gateway deaths. HERMES_GATEWAY_EXIT_DIAG=0 opts out."""
+    the gateway coroutine can return or fail, for chasing silent Windows gateway deaths.
+    HERMES_GATEWAY_EXIT_DIAG=0 opts out. Tags are ``gateway.run_returned`` / ``gateway.run.SystemExit`` /
+    ``gateway.run.KeyboardInterrupt`` / ``gateway.run.exception`` / ``gateway.exit_nonzero``."""
     from datetime import datetime as _dt, timezone as _tz
 
     def _exit_diag(tag: str, **extra: object) -> None:
@@ -4748,7 +4750,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         except Exception:
             pass  # best-effort; don't block gateway startup
 
-    from gateway.run import start_gateway
+    from gateway.run import _run_gateway_until_verdict, start_gateway
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ☤ Hermes Gateway Starting...                 │")
     print("├─────────────────────────────────────────────────────────┤")
@@ -4780,20 +4782,22 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
-        _exit_diag("asyncio.run.returned", success=success)
+        # NOT asyncio.run: its teardown joins the loop's default executor with no leash, which is what
+        # stranded the exit verdict behind a live PID (t_58fe16cb). See _run_gateway_until_verdict.
+        success = _run_gateway_until_verdict(start_gateway(replace=replace, verbosity=verbosity))
+        _exit_diag("gateway.run_returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
-        _exit_diag("asyncio.run.KeyboardInterrupt", traceback=_traceback.format_exc())
+        _exit_diag("gateway.run.KeyboardInterrupt", traceback=_traceback.format_exc())
         print("\nGateway stopped.")
         _hard_exit_after_gateway_teardown(0)
         return  # unreachable in production (os._exit); guard for test stubs
     except SystemExit as e:
-        _exit_diag("asyncio.run.SystemExit", code=e.code, traceback=_traceback.format_exc())
+        _exit_diag("gateway.run.SystemExit", code=e.code, traceback=_traceback.format_exc())
         _hard_exit_after_gateway_teardown(0 if e.code is None else e.code if isinstance(e.code, int) else 1)
     except BaseException as e:
         # Everything else (CancelledError, exotic BaseExceptions): log the cause, then re-raise.
-        _exit_diag("asyncio.run.exception", exc_type=type(e).__name__, exc_repr=repr(e), traceback=_traceback.format_exc())
+        _exit_diag("gateway.run.exception", exc_type=type(e).__name__, exc_repr=repr(e), traceback=_traceback.format_exc())
         raise
     if not success:
         _exit_diag("gateway.exit_nonzero")

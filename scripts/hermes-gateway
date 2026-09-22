@@ -301,11 +301,11 @@ def run_gateway():
         arm_startup_watchdog()
     except Exception:
         pass
-    from gateway.run import start_gateway
+    from gateway.run import _run_gateway_until_verdict, start_gateway
     print("Starting Hermes Gateway...")
     print("Press Ctrl+C to stop.")
     print()
-    asyncio.run(start_gateway())
+    _run_gateway_until_verdict(start_gateway())
 
 
 # =============================================================================

@@ -4615,6 +4615,10 @@ _CRON_SHUTDOWN_DRAIN_TIMEOUT = 65.0
 # Housekeeping's channel-directory refresh blocks on fut.result(timeout=30); cover that + margin.
 _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT = 35.0
 
+# Work the post-stop exit tail may legitimately do: the two joins above, the planned-stop watcher join
+# (2s) and MCP shutdown. The exit leash adds its own grace on top. See _arm_exit_leash.
+_SHUTDOWN_TAIL_BUDGET_S = _CRON_SHUTDOWN_DRAIN_TIMEOUT + _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT + 2.0
+
 
 async def _await_thread_exit(
     thread: Optional[threading.Thread], timeout: float, poll: float = 0.1) -> bool:
@@ -5153,12 +5157,91 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     return cron_stop, cron_provider, cron_thread, housekeeping_thread
 
 
+# ---- Process-exit leash (post-stop) ------------------------------------------------------------
+# ``_stop_impl``'s watchdog is disarmed the moment stop() returns, which leaves the whole exit tail —
+# the cron/housekeeping joins below, the planned-stop watcher, MCP shutdown, the process-exit driver
+# and asyncio's own loop teardown — unguarded. Every phase can log completion, release the PID file and
+# still never exit: measured on the live host, pid 37970 logged "Exiting with code 1" and then sat in
+# ``select_kqueue_control_impl`` with zero LISTEN sockets — no watchdog dump, no return out of
+# ``asyncio.run``, and launchd unable to restart a PID that still looked alive (t_58fe16cb). This leash
+# covers that window with the stop-phase watchdog's dump-then-``os._exit`` behaviour.
+_exit_leash_done: Optional[threading.Event] = None
+
+
+def _exit_leash_delay_s() -> float:
+    """Leash for the exit tail: the work it may legitimately do, plus the watchdog grace."""
+    from gateway.shutdown_watchdog import DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
+    return _SHUTDOWN_TAIL_BUDGET_S + DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
+
+
+def _disarm_exit_leash() -> None:
+    """Release the exit leash. Idempotent; a no-op when nothing is armed."""
+    global _exit_leash_done
+    done, _exit_leash_done = _exit_leash_done, None
+    if done is not None:
+        with suppress(Exception):
+            done.set()
+
+
+def _exit_leash_snapshot(loop, cron_thread, housekeeping_thread, signal_initiated) -> Dict[str, Any]:
+    """The waiters that outlived teardown, dumped when the exit leash fires.
+
+    The tasks matter more than the threads: the loop's DEFAULT executor is the process's generic
+    blocking pool (``asyncio.to_thread`` / ``run_in_executor(None, …)`` at hundreds of call sites, none
+    of which installs a custom executor), so a single synchronous call that never returns leaves no
+    other trace. Task attributes are read from the watchdog thread deliberately — ``get_name`` and
+    ``repr(coro)`` touch no loop state, the same reason faulthandler's all-thread dump is safe there.
+    """
+    snapshot: Dict[str, Any] = {
+        "phase": "gateway_exit_tail",
+        "pid": os.getpid(),
+        "signal_initiated": bool(signal_initiated),
+        "threads": [t.name for t in threading.enumerate()],
+        "exit_leash_delay_s": _exit_leash_delay_s(),
+    }
+    # A dump must never raise: the watchdog catches this, but a half-built snapshot is worse than none.
+    for key, thread in (("cron_thread_alive", cron_thread),
+                        ("housekeeping_thread_alive", housekeeping_thread)):
+        with suppress(Exception):
+            snapshot[key] = bool(thread is not None and thread.is_alive())
+    with suppress(Exception):
+        if not loop.is_closed():
+            snapshot["pending_tasks"] = [
+                {"name": task.get_name(), "done": task.done(), "coro": repr(task.get_coro())}
+                for task in asyncio.all_tasks(loop)
+            ]
+    return snapshot
+
+
+def _arm_exit_leash(loop, cron_thread, housekeeping_thread, signal_initiated) -> None:
+    """Arm the post-stop process-exit leash; ``_exit_after_graceful_shutdown`` disarms it."""
+    global _exit_leash_done
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        # Same reason _stop_impl skips its watchdog: tests drive start_gateway() to completion
+        # in-process and must not inherit a delayed hard-exit from a leash no test exit path disarms.
+        return
+    from gateway.shutdown_watchdog import arm_shutdown_watchdog
+    done = threading.Event()
+    _exit_leash_done = done
+    arm_shutdown_watchdog(
+        _exit_leash_delay_s(), done_event=done,
+        snapshot_fn=lambda: _exit_leash_snapshot(
+            loop, cron_thread, housekeeping_thread, signal_initiated),
+        exit_code=1, name="gateway-exit-leash",
+    )
+
+
 async def _start_gateway_shutdown_tail(
     runner, _control_server, cron_stop: threading.Event, cron_provider,
     cron_thread: threading.Thread, housekeeping_thread: threading.Thread,
     _planned_stop_watcher_stop: threading.Event, _planned_stop_watcher_thread: threading.Thread,
     _signal_initiated_shutdown: list) -> bool:
     """Post-``wait_for_shutdown`` teardown; returns the process exit verdict (True = exit 0)."""
+    # First statement: everything below runs AFTER stop() returned, i.e. after the stop-phase watchdog
+    # was disarmed — so arm the exit leash before the first await that could wedge.
+    _arm_exit_leash(
+        asyncio.get_running_loop(), cron_thread, housekeeping_thread,
+        bool(_signal_initiated_shutdown[0]))
     # Control socket first: once shutdown begins we are no longer a truthful "serving here" answer and a
     # successor must be able to bind. Early-exit paths rely on the atexit cleanup_files hook instead.
     if _control_server is not None:
@@ -5377,6 +5460,43 @@ def _guard_corrupt_user_config() -> None:
         raise SystemExit(2) from exc
 
 
+def _run_gateway_until_verdict(coro) -> Any:
+    """Run the gateway coroutine to completion and return its result — WITHOUT asyncio's shutdown phase.
+
+    ``asyncio.run`` is the wrong driver for a process that is about to ``os._exit``: after the coroutine
+    returns, ``Runner.close()`` runs three waits with no leash — ``_cancel_all_tasks`` (gathers every
+    task left on the loop), ``loop.shutdown_asyncgens()`` and ``loop.shutdown_default_executor()``. The
+    last one joins the loop's DEFAULT executor, and the gateway submits blocking work through it at
+    hundreds of call sites (``asyncio.to_thread`` / ``run_in_executor(None, …)``; no site installs a
+    custom executor), so ONE synchronous call that has not returned — an in-flight LLM, tool or bridge
+    call from a run the drain interrupted — parks the process in the selector forever. Measured on the
+    live host: pid 37970 logged its exit verdict and released its PID file, then sat in
+    ``select_kqueue_control_impl`` with no LISTEN sockets and no watchdog dump until it was SIGKILLed;
+    launchd saw a live PID the whole time (t_58fe16cb).
+
+    Teardown is already complete when the coroutine returns (adapters disconnected, sessions flushed,
+    SQLite closed, cron/MCP stopped, PID file + runtime lock released), and the caller hard-exits via
+    ``_exit_after_graceful_shutdown`` immediately after — so waiting on any of those three is pure
+    downside. Skipping them also drops the "Task was destroyed but it is pending" noise os._exit hides.
+
+    Exceptions propagate unchanged (``SystemExit`` for the restart/fatal-config codes, ``KeyboardInterrupt``
+    for Ctrl+C): the loop is closed first, and never based on whether that succeeded.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        # Deliberately NOT ``loop.shutdown_asyncgens()`` / ``loop.shutdown_default_executor()`` /
+        # task-cancel gather: each one can wait on a waiter that will never finish, and none of them
+        # has anything left to do here. ``loop.close()`` only closes the selector and drops callbacks —
+        # it joins no thread and cannot block.
+        with suppress(Exception):
+            asyncio.set_event_loop(None)
+        with suppress(Exception):
+            loop.close()
+
+
 def main():
     """CLI entry point for the gateway."""
     # Before any config-dependent startup (watchdog, DB opens, provider resolution).
@@ -5432,7 +5552,7 @@ def main():
         # planned-restart, and service-restart paths, all of which complete teardown first. Routing those
         # codes through the same os._exit backstop means EVERY exit path is wedge-proof, not just the
         # boolean-return ones.
-        success = asyncio.run(start_gateway(config))
+        success = _run_gateway_until_verdict(start_gateway(config))
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).
@@ -5448,6 +5568,8 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
 
     Graceful teardown is already complete by the time this runs, so there is nothing left that needs a clean
     interpreter shutdown. See #53107.
+    First action is disarming the exit leash: the exit is now intentional, and letting the leash race us
+    here would mark the life unclean and force code 1 on a clean restart. See t_58fe16cb.
     ``os._exit`` bypasses ``atexit`` handlers, so we cannot rely on the ``atexit``-registered
     ``remove_pid_file`` / ``release_gateway_runtime_lock`` (registered in ``start_gateway``) to run. The
     full-shutdown path releases both explicitly in ``_stop_impl``, but the EARLY exit paths —
@@ -5461,6 +5583,10 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     for stream in (sys.stdout, sys.stderr):
         with suppress(Exception):
             stream.flush()
+    # Before anything else: the exit is now deliberate, so the exit leash must stop counting down or it
+    # would mark this life unclean and force code 1 over a clean exit. Idempotent (t_58fe16cb).
+    _disarm_exit_leash()
+
     def _release_locks() -> None:
         # BEFORE the log drain (bounded, but could take its full timeout on a wedged disk); idempotent.
         from gateway.status import remove_pid_file, release_gateway_runtime_lock

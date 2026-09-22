@@ -4356,13 +4356,12 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
 
 def _run_legacy_gateway():
     """Legacy `cli.py --gateway` entry: arm the startup watchdog (before importing the gateway graph), then run it."""
-    import asyncio
     with suppress(Exception):
         from hermes_startup_watchdog import arm_startup_watchdog
         arm_startup_watchdog()
-    from gateway.run import start_gateway
+    from gateway.run import _run_gateway_until_verdict, start_gateway
     print("Starting Hermes Gateway (messaging platforms)...")
-    asyncio.run(start_gateway())
+    _run_gateway_until_verdict(start_gateway())
 
 
 def _start_worktree_setup(list_tools, list_toolsets, worktree, w):
