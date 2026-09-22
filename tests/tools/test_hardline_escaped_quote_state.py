@@ -23,6 +23,8 @@ from tools.approval_detection import detect_dangerous_command, detect_hardline_c
     r'grep -v "^./tests/\|def \|\"\"\"" x.py | grep -v "read_only=True"',
     'grep -n "; reboot" f.txt',
     'echo "value is ${HOME}/x"',
+    r'grep -rnE "\"(restart|shutdown|stop|reboot)\"|kind ==|handle_" ~/.hermes/hermes-agent/hermes_cli/tui_gateway*.py | head -14',
+    r'hermes kanban comment t_1 --body "the sweep reads \"(shutdown|reboot)\" as data"',
 ])
 def test_escaped_quotes_in_a_valid_grep_pattern_are_not_malformed(command):
     assert detect_hardline_command(command) == (False, None)

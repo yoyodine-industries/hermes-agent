@@ -42,6 +42,20 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _runtime_profile(default: str = "") -> str:
+    """Identity the kanban write tools attribute work to.
+
+    ``hermes_cli.profiles.resolve_acting_profile_name`` (env name -> ``HERMES_PROFILE`` ->
+    bound session profile -> home-derived id -> *default*); ``default`` is returned when
+    nothing resolves. Kept here so every write surface in this module shares one rule.
+    """
+    try:
+        from hermes_cli.profiles import resolve_acting_profile_name
+        return resolve_acting_profile_name(default)
+    except Exception:
+        return default
+
+
 def _delegation_ctx_or_none(predicate: str) -> Optional[bool]:
     """``agent.delegation_context.<predicate>()``; ``None`` when it cannot be
     evaluated (module missing, version-skewed, or shadowed on ``sys.path``)."""
@@ -494,7 +508,7 @@ _comment_watermark: dict[str, int] = {}
 
 def inject_new_comments_from_env(agent: Any) -> bool:
     """Steer new operator comments on the worker's task into ``agent``; True iff a
-    steer was injected; never raises. Own comments (``HERMES_PROFILE``) are skipped."""
+    steer was injected; never raises. Own comments (runtime profile) are skipped."""
     global _comment_poll_last_attempt
     tid = os.environ.get("HERMES_KANBAN_TASK")
     now = time.monotonic()
@@ -515,7 +529,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
     # Advance past everything read (including our own notes) so nothing is re-injected.
     _comment_watermark[tid] = max(c.id for c in rows)
-    own = (os.environ.get("HERMES_PROFILE") or "").strip()
+    own = _runtime_profile("")
     fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
     if not fresh:
         return False
@@ -636,6 +650,28 @@ def _handle_complete(args: dict, **kw) -> str:
         return _ok(task_id=tid, run_id=run.id if run else None)
 
 
+def _due_at_arg(tool_name: str, raw: Any) -> Optional[int]:
+    """Normalize a ``due_at`` tool arg (epoch / ISO-8601 / relative offset) to
+    epoch seconds, or ``None`` when it was not supplied.
+
+    One normalizer, not two: ``hermes_cli.kanban_due.parse_due`` is what the CLI's
+    ``block --due`` uses, and a dispatched worker cannot reach the CLI (its terminal is
+    fenced as a delegated-child context), so the tool surface has to accept the same
+    forms or a time-fenced hold is unreachable by its primary caller. A due time that
+    cannot be read is refused loudly — silently parking a card forever is the failure
+    this fence exists to prevent.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
+        return None
+    try:
+        from hermes_cli import kanban_due as kdue
+        return int(kdue.parse_due(raw, now=int(time.time())))
+    except ValueError as exc:
+        raise _Reject(f"{tool_name}: due_at {raw!r}: {exc}")
+
+
 @_kanban_handler("kanban_block")
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
@@ -643,6 +679,8 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
+    due_at = _due_at_arg("kanban_block", args.get("due_at"))
+    window_policy = args.get("window_policy") or None
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
@@ -662,9 +700,26 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        try:
+            ok = kb.block_task(conn, tid, reason=reason, kind=kind,
+                               expected_run_id=_worker_run_id(tid),
+                               due_at=due_at, window_policy=window_policy)
+        except ValueError as exc:
+            # block_task owns the due rules — a due time on a `dependency` block, a
+            # window_policy with no due time, an unknown policy. Report them as tool
+            # errors naming the offending arg; the card is untouched either way.
+            raise _Reject(f"kanban_block: {exc} "
+                          f"(due_at={args.get('due_at')!r}, window_policy={window_policy!r})")
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
-        return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
+        # Report the armed fence only when one was requested, and read it back from the
+        # landed card: block_task sets due_at on the `blocked` landing alone, so a card
+        # routed to `triage` by the loop breaker stores nothing and must say so.
+        due_fields: dict[str, Any] = {}
+        if due_at is not None:
+            landed = kb.get_task(conn, tid)
+            due_fields = {"due_at": landed.due_at if landed else None,
+                          "window_policy": landed.due_window_policy if landed else None}
+        return _ok_landed(kb, conn, tid, "blocked", block_kind=kind, **due_fields)
 
 
 @_kanban_handler("kanban_request_review")
@@ -751,7 +806,10 @@ def _handle_comment(args: dict, **kw) -> str:
     # ``**{author}** (timestamp): {body}`` — accepting an ``args["author"]`` override let a worker forge a
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
     # with what reads as a system directive. See #19713.
-    author = os.environ.get("HERMES_PROFILE") or "worker"
+    # ``resolve_acting_profile_name`` adds the bound SESSION profile to the env-only lookup
+    # that used to resolve to "worker" (and to a wrong home-derived name in the CLI tool):
+    # a gateway-served session has no HERMES_PROFILE in os.environ, only HERMES_SESSION_PROFILE.
+    author = _runtime_profile("worker")
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
         return _ok(task_id=tid, comment_id=cid)
@@ -904,7 +962,7 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
-            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+            created_by=_runtime_profile("worker"), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 
@@ -925,13 +983,7 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
     chat_type = env("HERMES_SESSION_CHAT_TYPE", "") or None
     thread_id = env("HERMES_SESSION_THREAD_ID", "") or None
     message_id = env("HERMES_SESSION_MESSAGE_ID", "") or ""
-    notifier_profile = env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE")
-    if not notifier_profile:
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-            notifier_profile = get_active_profile_name() or "default"
-        except Exception:
-            notifier_profile = "default"
+    notifier_profile = _runtime_profile("default")
     delivery_metadata: dict[str, Any] = {
         k: v for k, v in (
             ("thread_id", thread_id), ("chat_type", chat_type),

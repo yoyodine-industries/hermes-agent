@@ -437,6 +437,11 @@ class CLIChatTurnMixin:
             self._prompt_duration = max(0.0, time.time() - self._prompt_start_time)
             self._prompt_start_time = None
         self._last_turn_finished_at = time.time()  # status bar idle time
+        # The finished turn's result, so a one-shot caller can turn a provider
+        # refusal into its exit status (``cli._kanban_wall_exit_code``): the
+        # dispatcher's worker path is non-quiet ``chat -q``, which otherwise just
+        # returns and exits 0, hiding the refusal from the board.
+        self._last_turn_result = getattr(turn, "result", None)
         # AsyncOpenAI clients bound to the worker's now-closed loop would crash
         # prompt_toolkit's loop from __del__ on GC.
         try:

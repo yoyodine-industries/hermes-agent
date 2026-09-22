@@ -283,6 +283,25 @@ class SessionPersistenceMixin:
         # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
         self._prune_stale_sessions_locked()
 
+    def _legacy_entry_profile_is_live(self, entry: Any) -> bool:
+        """False when a mirrored entry names an explicit profile that does not exist (a retired
+        lane). Such an entry is the one route a deleted routing key has back into the index: it is
+        folded in here, re-persisted by the next ``_save``, and then re-resolved (and re-logged)
+        for its source on every heartbeat poll tick."""
+        origin = getattr(entry, "origin", None)
+        name = (getattr(origin, "profile", None) or "").strip()
+        if not name:
+            return True
+        try:
+            from gateway.run_profile_fallback import profile_alias_from_roster
+            from hermes_cli.profiles import profile_exists
+            if profile_exists(name):
+                return True
+            alias = profile_alias_from_roster(name)
+            return bool(alias and alias != name and profile_exists(alias))
+        except Exception:
+            return True  # never drop an entry whose liveness cannot be established
+
     def _import_legacy_sessions_json(self, db_had_entries: bool) -> None:
         """Legacy import: sessions.json fills only keys the DB lacks. Lock held."""
         from gateway.session import SessionEntry
@@ -293,6 +312,7 @@ class SessionPersistenceMixin:
             with open(sessions_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             imported = 0
+            retired = []
             for key, entry_data in data.items():
                 # "_"-prefixed keys are sentinels (e.g. "_README"), not entries.
                 if key.startswith("_") or key in self._entries:
@@ -303,10 +323,22 @@ class SessionPersistenceMixin:
                         type(entry_data).__name__)
                     continue
                 try:
-                    self._entries[key] = SessionEntry.from_dict(entry_data)
-                    imported += 1
+                    entry = SessionEntry.from_dict(entry_data)
                 except (ValueError, KeyError, TypeError) as e:
                     logger.warning("Skipping invalid session entry %r: %s", key, e)
+                    continue
+                # A retired lane's key must not come back: the imported entry is persisted into
+                # state.db by the next _save, and its source then re-resolves on every poll tick.
+                if not self._legacy_entry_profile_is_live(entry):
+                    retired.append(key)
+                    continue
+                self._entries[key] = entry
+                imported += 1
+            if retired:
+                logger.info(
+                    "gateway.session: skipped %d legacy sessions.json entr%s naming a "
+                    "non-existent profile (not re-imported)", len(retired),
+                    "y" if len(retired) == 1 else "ies")
             if imported and db_had_entries:
                 logger.info(
                     "gateway.session: imported %d legacy sessions.json entr%s missing from "

@@ -39,7 +39,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli.kanban_db_graph import decompose_triage_task
+from hermes_cli.kanban_db_graph import decompose_triage_task, spec_carrying_reason
 from hermes_cli.kanban_scope import scope_verdict
 from hermes_cli.kanban_specify import (
     _call_aux,
@@ -234,6 +234,13 @@ def _decompose_capped(
         logger.exception("drain: DB error decomposing %s", task_id)
         return Action(task_id, "refuse", f"DB error: {type(exc).__name__}")
     if child_ids is None:
+        # The DB layer refuses a spec-carrying card (``decompose_refused``); the
+        # reason lives on that event, so read it back instead of telling the
+        # operator the card "moved out of triage" and sending them after a race.
+        with kbc.connect_closing() as conn:
+            refusal = spec_carrying_reason(conn, task_id)
+        if refusal:
+            return Action(task_id, "refuse", refusal)
         return Action(task_id, "refuse", "task already decomposed or moved out of triage")
     return Action(
         task_id, "decompose", f"decomposed into {len(child_ids)} children (capped; land todo)",

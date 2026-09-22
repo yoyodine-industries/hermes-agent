@@ -29,8 +29,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from tools import bot_delivery_queue as delivery_queue
 
@@ -44,8 +45,17 @@ logger = logging.getLogger(__name__)
 #: abandoned (it is the delivery that was promised).
 IN_CALL_DRAIN_MIN_SECONDS = 1.0
 
-#: Trigger 3's budget per tick, so one deep backlog cannot monopolise the loop.
-SWEEP_DRAIN_BUDGET_SECONDS = 60.0
+#: Trigger 3's budget per PROFILE per tick, so one deep backlog cannot monopolise
+#: the loop. It replaced a single shared 60s tick deadline: that one deadline was
+#: spent by an early lane's slow turn (a lease wait, a desktop-held slot), so every
+#: lane behind it went unserved for the rest of the tick. Each profile now gets its
+#: own freshly-started slice of this length.
+PER_PROFILE_DRAIN_BUDGET_SECONDS = 60.0
+
+#: Roster rotation cursor: the next tick starts at the next lane, so a full tick
+#: never leaves the same lane last twice in a row. In-memory: losing it costs one
+#: tick of ordering, never a delivery (every lane is visited every tick).
+_roster_offset = 0
 
 
 def delivery_run_kwargs(record: dict[str, Any]) -> Dict[str, Any]:
@@ -152,6 +162,37 @@ def _finalize_reply(payload: Any) -> str:
         return str(payload.get("final_response", "") or "")
 
 
+@contextmanager
+def target_profile_scope(adapter: Any, record: dict[str, Any]) -> Iterator[None]:
+    """Run a DRAINED turn inside its target lane's own runtime scope.
+
+    A drained record has no live request behind it, so nothing has scoped the
+    turn: ``_api_request_profile`` is unset, and the ``_profile_scope(None)`` that
+    ``_run_agent`` applies for an unset profile enters the DEFAULT profile's scope
+    whenever ``multiplex_profiles`` is on. The lane's own session id would then be
+    applied against the DEFAULT home's ``state.db``: the record still settles
+    ``delivered``, but the lane's Bot Chat never sees the message and the sender's
+    text is echoed into a brand-new "Message from ..." session in the default home.
+
+    Set the request profile to the record's target lane for the duration of the
+    turn -- and enter that lane's scope, so every home-relative read in between
+    (the session history included) resolves to the lane that owns the record --
+    then restore both. The target profile is the lane the record was admitted into
+    (``_bot_send_home``), so scope and ``home`` agree by construction; ``"default"``
+    resolves back to the default home in ``get_profile_dir``, so a default-lane
+    record is scoped exactly as before.
+    """
+    from gateway.platforms.api_server import _api_request_profile
+
+    profile = str(record.get("target_profile") or "")
+    token = _api_request_profile.set(profile)
+    try:
+        with adapter._profile_scope(profile):
+            yield
+    finally:
+        _api_request_profile.reset(token)
+
+
 async def run_record(
     adapter: Any,
     home: Path,
@@ -177,19 +218,26 @@ async def run_record(
         session_id = resolve_delivery_session(home, record)
         kwargs = delivery_run_kwargs(record)
         kwargs["session_id"] = session_id
+        # ...and nothing has scoped the turn to that lane: a drained record has no
+        # request behind it, so enter its target profile's scope for the turn
+        # itself. Otherwise the lane's session id is applied to the DEFAULT home.
+        scope = target_profile_scope(adapter, record)
     else:
         session_id = str(record.get("target_session_id") or "")
         kwargs = dict(ctx.get("run_kwargs") or {})
         kwargs["session_id"] = session_id
-    history = await adapter._conversation_history_for_session(session_id)
+        # The caller's own request already set the profile it was routed to.
+        scope = nullcontext()
     started = time.monotonic()
     log_delivery_event("turn_start", record, drained=ctx is None)
     try:
-        result, _usage = await adapter._run_agent(
-            conversation_history=history,
-            lease_wait_seconds=delivery_queue.lease_probe_seconds(),
-            **kwargs,
-        )
+        with scope:
+            history = await adapter._conversation_history_for_session(session_id)
+            result, _usage = await adapter._run_agent(
+                conversation_history=history,
+                lease_wait_seconds=delivery_queue.lease_probe_seconds(),
+                **kwargs,
+            )
     except Exception as exc:  # noqa: BLE001 - any turn failure settles the record
         logger.exception("[api_server] peer delivery turn failed: %s", delivery_id)
         error = str(exc) or exc.__class__.__name__
@@ -301,16 +349,30 @@ async def drain_once(
     ``profiles/<lane>``), not the default home. Draining only ``home`` left a
     named lane's backlog invisible (the live sweep logged ``actions=0`` while
     two lanes held 13 queued records).
+
+    ``budget_seconds`` is a PER-PROFILE slice: every profile on the roster gets
+    its own freshly-started deadline, so one lane's slow turn cannot spend the
+    budget of the lanes behind it. The roster start rotates one lane per tick,
+    so the lane a full tick served last is the lane the next tick tries first.
     """
     from tools.bot_mode_probe import _hermes_root, _roster
     from tools.bot_relay import TurnBusyError, acquire_turn_lock
 
+    global _roster_offset
+
     root = _hermes_root(home)
-    budget = SWEEP_DRAIN_BUDGET_SECONDS if budget_seconds is None else budget_seconds
-    deadline = time.monotonic() + budget
+    budget = (
+        PER_PROFILE_DRAIN_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    )
+    roster = _roster(root)
+    n = len(roster) or 1
+    offset = _roster_offset % n
+    ordered = roster[offset:] + roster[:offset]
+    _roster_offset = (offset + 1) % n
     drained = 0
-    for _name, profile_home in _roster(root):
+    for _name, profile_home in ordered:
         for profile in delivery_queue.queued_target_profiles(profile_home):
+            deadline = time.monotonic() + budget  # this profile's own slice
             while time.monotonic() < deadline:
                 try:
                     with acquire_turn_lock(root, profile, timeout_seconds=0):
@@ -331,6 +393,17 @@ async def drain_once(
                             )
                             break
                         settled, _reply = await run_record(adapter, profile_home, record)
+                        if str(settled.get("status")) == delivery_queue.STATUS_QUEUED:
+                            # A lease-contended requeue: the turn never started, so
+                            # the record is back in the queue, still claimable, with
+                            # `reoffer_count` as the loop's only progress signal.
+                            # Re-claiming it here re-runs the same un-runnable turn
+                            # until the slice expires (28 claims in one live tick,
+                            # each reported as drained). Leave it for the next tick.
+                            log_delivery_event(
+                                "drain_lease_contended", settled, target=profile
+                            )
+                            break
                         drained += 1
                         log_delivery_event("drained", settled, drained=drained)
                 except TurnBusyError:

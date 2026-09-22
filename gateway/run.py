@@ -2118,6 +2118,10 @@ from gateway.run_inbound import GatewayInboundMixin
 from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
+from gateway.run_profile_fallback import (
+    driver_caller_label, log_profile_alias, log_profile_fallback,
+    owner_profile_label, profile_alias_from_roster,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     _reply_anchor_for_event,
@@ -4306,13 +4310,22 @@ class GatewayRunner(
             explicit_profile = name or None
             if not name:
                 name = get_active_profile_name() or "default"
+            elif not profile_exists(name):
+                # A bot-relay lane handle can arrive where a profile name is expected (a retired
+                # lane's source replayed from persisted routing). Alias it to the profile that
+                # serves the handle before reporting the name as missing.
+                alias = profile_alias_from_roster(name)
+                if alias and alias != name and profile_exists(alias):
+                    log_profile_alias(name, alias, source)
+                    name = alias
             profile_dir = get_profile_dir(name)
             if explicit_profile and not profile_exists(name):
-                logger.warning(
-                    "Profile %r does not exist for source %s/%s (guild_id=%s), "
-                    "falling back to global HERMES_HOME",
-                    explicit_profile, source.platform.value, source.chat_id,
-                    getattr(source, "guild_id", None))
+                log_profile_fallback(
+                    explicit_profile, source, explicit_profile=source.profile or None,
+                    owner_profile=owner_profile_label(
+                        self._transport_owner(source)
+                        if callable(getattr(source, "_transport_adapter_ref", None)) else None),
+                    caller=driver_caller_label())
                 return get_hermes_home()
             return profile_dir
         except ProfileRouteRejected:

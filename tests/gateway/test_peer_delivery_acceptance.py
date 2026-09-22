@@ -535,3 +535,171 @@ def test_drain_invariant_n_keys_free_lock_n_turns_exactly_once(adapter, home):
     assert replay["replayed"] is True
     assert len(adapter.calls) == before, "a replay never starts a second turn"
     assert q.queue_depth(home, profile) == 0
+
+
+# ── drain fairness: exactly-once claim, per-profile slice, rotation, tombstones ─
+#
+# Four signals, each red on the drainer as it stood (2026-09-21):
+#   * SPIN -- one tick CLAIMED the same un-runnable record 28 times: the loop
+#     re-claimed the record its own ``requeue_unstarted`` had just put back, and
+#     reported every requeue as a drained delivery.
+#   * STARVATION -- one shared 60s deadline covered the whole tick, so a lane whose
+#     turn outlived it (a real 1800s lease wait, beside a desktop-held slot) meant
+#     the lanes at the tail of the roster never ran in that tick at all.
+#   * ROTATION -- every tick started at the default lane, so the tail lanes were
+#     only ever offered what the head lane left behind.
+#   * TOMBSTONE -- ``profiles/.deleted`` (the rename tombstone dir) was enumerated
+#     as a lane, putting a phantom profile in the roster, the sweep and the drain.
+
+
+class _FakeClock:
+    """The drain module's ``time`` with a controllable ``monotonic``.
+
+    A turn that costs real seconds is exactly what the per-profile slice is about,
+    so the clock is injected rather than the test sleeping. Only ``monotonic`` is
+    faked; ``time``/``time_ns``/``sleep`` stay real.
+    """
+
+    def __init__(self, start=0.0):
+        self.now = float(start)
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def _lane_home(home, profile):
+    """The home a lane's queue lives in (``default`` is the root itself)."""
+    return home if profile == "default" else home / "profiles" / profile
+
+
+def _seed(home, *, profile, message, delivery_id):
+    """Admit one queued record straight into ``profile``'s own queue."""
+    return q.admit(
+        _lane_home(home, profile),
+        sender_profile="yoyodine-coder",
+        target_profile=profile,
+        target_session_id=f"sess-{profile}",
+        idempotency_key=q.validate_idempotency_key(f"auto:fair:{profile}"),
+        fingerprint=f"fp-{profile}",
+        delivery_id=delivery_id,
+        message=message,
+    )
+
+
+def test_a_lease_contended_record_is_claimed_once_in_a_tick(adapter, home, monkeypatch):
+    """SPIN: one un-runnable record is claimed ONCE in a tick, never 28 times.
+
+    ``requeue_unstarted`` is a requeue, not a delivery: the record goes back to
+    ``queued`` still claimable without charging an attempt. A tick that re-claims
+    it re-runs the same un-runnable turn until its budget expires -- live, 28
+    claims and 28 reoffers in ONE tick -- while reporting each one as drained.
+    """
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    clock = _FakeClock()
+    monkeypatch.setattr(drain, "time", clock)
+    calls: list[dict] = []
+
+    async def _run_agent(conversation_history=None, **kwargs):
+        calls.append(kwargs)
+        clock.advance(2.5)  # a turn costs time; the faked clock keeps the test fast
+        return {"failed": True, "error": "lease wait timed out"}, {}
+
+    adapter._run_agent = _run_agent
+    record = _seed(home, profile="default", message="unrunnable", delivery_id="a" * 32)
+
+    assert asyncio.run(drain.drain_once(adapter, home)) == 0, (
+        "a requeued record is queued, never drained")
+    assert len(calls) == 1, "one claim per tick: the requeue is left for the next tick"
+    stored = q.read_record(home, record["delivery_id"])
+    assert stored["status"] == q.STATUS_QUEUED
+    assert stored["reoffer_count"] == 1
+    assert stored["attempts"] == 0, "contention never charges an attempt"
+
+
+def test_one_long_turn_does_not_starve_the_tail_lane(adapter, home, monkeypatch):
+    """STARVATION: the tail lane runs in the SAME tick as a 90s head-lane turn.
+
+    The budget is per PROFILE per tick, not per tick: with one shared 60s deadline
+    the named lane only ran if the head lane's turn left budget behind -- and a
+    lane waiting out a lease never does.
+    """
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    clock = _FakeClock()
+    monkeypatch.setattr(drain, "time", clock)
+    monkeypatch.setattr(drain, "_roster_offset", 0, raising=False)
+    calls: list[dict] = []
+
+    async def _run_agent(conversation_history=None, **kwargs):
+        calls.append(kwargs)
+        clock.advance(90.0)  # outlives a whole tick's budget
+        return {"final_response": "pong"}, {}
+
+    adapter._run_agent = _run_agent
+    head = _seed(home, profile="default", message="head", delivery_id="b" * 32)
+    tail = _seed(home, profile="platform-worker", message="tail", delivery_id="c" * 32)
+
+    assert asyncio.run(drain.drain_once(adapter, home)) == 2, (
+        "the tail lane gets its own fresh slice in the same tick")
+    assert [call["user_message"] for call in calls] == ["head", "tail"]
+    assert q.read_record(home, head["delivery_id"])["status"] == q.STATUS_DELIVERED
+    assert q.read_record(_lane_home(home, "platform-worker"),
+                         tail["delivery_id"])["status"] == q.STATUS_DELIVERED
+
+
+def test_the_roster_start_rotates_one_lane_per_tick(adapter, home, monkeypatch):
+    """ROTATION: tick two starts at the lane tick one served LAST.
+
+    Both records stay queued (their turns never start), so the claim ORDER across
+    two ticks is the thing asserted: [default, named] then [named, default].
+    """
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    clock = _FakeClock()  # advanced per turn: a frozen clock never expires a budget
+    monkeypatch.setattr(drain, "time", clock)
+    monkeypatch.setattr(drain, "_roster_offset", 0, raising=False)
+
+    async def _run_agent(conversation_history=None, **kwargs):
+        clock.advance(2.5)
+        return {"failed": True, "error": "lease wait timed out"}, {}
+
+    adapter._run_agent = _run_agent
+    claimed: list[str] = []
+    real_claim = drain.delivery_queue.claim_next
+
+    def _spy(claim_home, *, target_profile, **kwargs):
+        record = real_claim(claim_home, target_profile=target_profile, **kwargs)
+        if record is not None:
+            claimed.append(target_profile)
+        return record
+
+    monkeypatch.setattr(drain.delivery_queue, "claim_next", _spy)
+    _seed(home, profile="default", message="default payload", delivery_id="d" * 32)
+    _seed(home, profile="platform-worker", message="lane payload", delivery_id="e" * 32)
+
+    assert asyncio.run(drain.drain_once(adapter, home)) == 0
+    assert claimed == ["default", "platform-worker"], "tick one starts at the default lane"
+    assert asyncio.run(drain.drain_once(adapter, home)) == 0
+    assert claimed == ["default", "platform-worker", "platform-worker", "default"], (
+        "tick two starts one lane further along the roster")
+
+
+def test_the_roster_skips_the_deleted_profile_tombstone(home):
+    """TOMBSTONE: ``profiles/.deleted`` is a rename tombstone dir, not a lane.
+
+    Enumerating it put a phantom profile in the roster -- and therefore in the
+    sweep and the drain -- for a lane that can never have a queue.
+    """
+    from tools.bot_mode_probe import _roster
+
+    (home / "profiles" / ".deleted").mkdir(parents=True)
+    (home / "profiles" / "lane").mkdir(parents=True)
+
+    assert [name for name, _home in _roster(home)] == ["default", "lane"]

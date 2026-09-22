@@ -1,9 +1,12 @@
 """Sender-side guard for outbound bot DMs: a body that is already truncated is refused.
 
 Why this exists (2026-09-12): two peer DMs arrived cut mid-sentence, one ending in a bare
-``[truncated]`` marker. The cut happened where the body was authored — upstream of the send
-path — and every downstream check passed, because the marker left the serialized tool
-arguments *valid* JSON and a shortened string literal still parses. The recipient could not
+``[truncated]`` marker. The producer is the compression args shrink, ``_truncate_tool_call_args_at``
+in agent/context_compressor.py, which bounds a long string leaf with a ``...[truncated]`` tail
+upstream of the send path — in this tree the cap is 200 chars per string leaf. Every downstream
+check passed because the marker left the serialized tool arguments *valid* JSON and a shortened
+string literal still parses. (Fork PR #37 raises DM/``message_agent`` args to 4000; it is merged
+on fork main but was not in this checkout as of 2026-09-21.) The recipient could not
 tell a truncated body from a terse one, so a partial instruction was acted on as if whole.
 
 This moves the failure to the sender: a body whose tail is a truncation marker is refused

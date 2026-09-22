@@ -170,17 +170,22 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards.pop(slug, None)
         return True
 
-    def tick_once_for_board(self, slug: str) -> Optional[object]:
+    def tick_once_for_board(self, slug: str, tick_spawn_cap: Optional[int] = None) -> Optional[object]:
         """Run one dispatch_once for a specific board.
 
         The per-board DB is opened explicitly so boards never share a
-        connection or claim across each other.
+        connection or claim across each other. ``tick_spawn_cap`` is the
+        fair-share ceiling computed by :meth:`_fair_share_caps`; ``None`` means
+        "no fair-share cap" (no host-level cap configured, or this board has no
+        spawnable work), so the per-board budget check decides as before.
         """
         conn = None
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        if tick_spawn_cap is not None:
+            kwargs["tick_spawn_cap"] = tick_spawn_cap
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
@@ -206,8 +211,63 @@ class _KanbanDispatcher:
                     conn.close()
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
-        """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        """Run one dispatch_once per board. Returns (slug, result) pairs.
+
+        When a host-level ``max_in_progress`` cap is engaged, each board's tick
+        is capped at a fair share of the free host budget (computed up front by
+        :meth:`_fair_share_caps`) so a deep queue on an early board cannot
+        consume every free slot and starve the boards behind it. Without a host
+        cap there is no cross-board contention and this is a no-op.
+        """
+        slugs = self._board_slugs()
+        caps = self._fair_share_caps(slugs)
+        return [(slug, self.tick_once_for_board(slug, caps.get(slug))) for slug in slugs]
+
+    def _fair_share_caps(self, slugs: list) -> dict[str, int]:
+        """Per-board fair-share spawn caps for this tick, or ``{}`` to skip.
+
+        Only engages when a host-level cap is configured
+        (``settings.max_in_progress``); without one there is no cross-board
+        contention and the per-board budget is already correct, so returning
+        ``{}`` preserves the exact pre-existing behavior (and avoids a
+        read-only sweep that is pointless on uncapped hosts).
+
+        One read-only sweep yields, per board, its running count (to size the
+        free host budget) and its spawnable work (oldest age + count); then
+        ``kanban_db_dispatch.fair_share_spawn_budget`` apportions the free slots
+        oldest-first. A board with spawnable work but no slot this tick is
+        returned with cap ``0`` (not omitted) so it is hard-capped to zero
+        rather than allowed to grab a scarce slot by board order behind the live
+        host-cap backstop. Fails open per board: a board that cannot be read
+        contributes no running count and no work, matching the rest of the
+        dispatcher.
+        """
+        if self.settings.max_in_progress is None:
+            return {}
+        kbd = _kbd()
+        review_probe = kbd.review_dispatch_enabled()
+        total_running = 0
+        board_work: list[tuple[str, float, int]] = []
+        for slug in slugs:
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                total_running += kbd.count_running_tasks(conn)
+                oldest_age, count = kbd.board_spawnable_work(conn, include_review=review_probe)
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+            if count > 0:
+                board_work.append((slug, oldest_age, count))
+        host_budget = self.settings.max_in_progress - total_running
+        if host_budget <= 0:
+            # Host already at (or over) cap; the per-board budget check will
+            # report the max_in_progress deferral. No caps to hand out.
+            return {}
+        return kbd.fair_share_spawn_budget(host_budget, board_work)
 
     def oldest_pending(self) -> Any:
         """Longest-waiting spawnable card on any board, as ``PendingWork``.
