@@ -1297,7 +1297,16 @@ def create_task(
         except Exception:
             pass
     if workspace_kind is None:
+        # A board ``default_workdir`` names the repo this board works under:
+        # default to worktree so cards share one object store instead of each
+        # cloning it. An explicit ``--workspace scratch`` still opts out above.
         workspace_kind = "scratch"
+        try:
+            board_default = (_board_meta_for(board).get("default_workdir") or "").strip()
+        except Exception:
+            board_default = ""
+        if board_default:
+            workspace_kind = "worktree"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "

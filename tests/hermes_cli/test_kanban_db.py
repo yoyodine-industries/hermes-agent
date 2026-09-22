@@ -1718,6 +1718,33 @@ def _make_task(**overrides) -> "kb.Task":
 # ---------------------------------------------------------------------------
 
 
+def test_omitted_workspace_defaults_to_worktree_on_repo_board(kanban_home, tmp_path):
+    """A board that declares a ``default_workdir`` names the repo its cards work
+    under: omitting ``--workspace`` (``workspace_kind=None``) defaults to a
+    worktree so cards share one object store instead of each cloning the repo.
+    An explicit ``scratch`` still opts out."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("boarded", name="Boarded", default_workdir=str(repo))
+    kb.create_board("bare", name="Bare")
+
+    with kbc.connect() as conn:
+        implicit = kb.create_task(conn, title="implicit", board="boarded", workspace_kind=None)
+        explicit = kb.create_task(conn, title="explicit", board="boarded", workspace_kind="scratch")
+        bare = kb.create_task(conn, title="bare", board="bare", workspace_kind=None)
+
+        implicit_task = kb.get_task(conn, implicit)
+        explicit_task = kb.get_task(conn, explicit)
+        bare_task = kb.get_task(conn, bare)
+
+    assert implicit_task is not None
+    assert explicit_task is not None
+    assert bare_task is not None
+    assert implicit_task.workspace_kind == "worktree"
+    assert explicit_task.workspace_kind == "scratch"
+    assert bare_task.workspace_kind == "scratch"
+
+
 
 
 # ---------------------------------------------------------------------------
