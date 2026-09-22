@@ -12,12 +12,15 @@ Invariants asserted here (see AGENTS.md "Behavior contracts over snapshots"):
    off-box provider — not the configured chain, not the discovery chain, not the main agent model.
    Each refusal is one INFO line naming the route and the outcome, and the string the operator greps
    for ("falling back to main agent model") is never logged for compression.
-2. A timeout on the local route retries that same local endpoint inside the bounded transient window
-   (``auxiliary.transient_retries``) and then aborts the pass: no cloud client is ever called.
-3. Contrast cases — another auxiliary task and the vision task keep their main-agent fallback, and
-   vision keeps skipping the same-provider timeout retry. Compression is the only task fenced.
+2. A timeout on the local route retries that same local endpoint inside the bounded window
+   (``_transient_retry_plan``: 15 s of retry sleeps, independent of ``auxiliary.transient_retries``) and
+   then aborts the pass: no cloud client is ever called.
+3. Contrast cases — another auxiliary task and the vision task keep their main-agent fallback and keep
+   the generic attempt-count-bounded window (no seconds ceiling), and vision keeps skipping the
+   same-provider timeout retry. Compression is the only task fenced.
 """
 
+import contextlib
 import logging
 import os
 import textwrap
@@ -179,13 +182,15 @@ def test_local_compression_timeout_retries_local_endpoint_then_aborts(monkeypatc
     with caplog.at_level(logging.INFO), pytest.raises(_Timeout):
         aux.call_llm(task="compression", messages=_messages())
 
-    retries = aux._transient_retry_count()
+    retries = aux._transient_retry_plan("compression")[0]
     attempts = local.chat.completions.create.call_count
     assert attempts == 1 + retries, (
         f"local endpoint must be retried within the bounded window: {attempts} attempts "
-        f"for transient_retries={retries}"
+        f"for the compression retry plan={retries}"
     )
-    assert attempts <= 1 + 6, "the retry window stays bounded by the documented clamp"
+    assert aux._transient_retry_plan("compression")[1] is not None, (
+        "compression's window carries a seconds ceiling, not an attempt count alone"
+    )
     assert cloud_created == [], "compression must never reach a cloud endpoint"
     messages = [r.getMessage() for r in caplog.records]
     assert not any("falling back to main agent model" in m for m in messages)
@@ -326,7 +331,7 @@ def test_e2e_temp_home_local_compression_never_resolves_a_cloud_client(monkeypat
         aux.call_llm(task="compression", messages=_messages())
 
     assert cloud_resolved == [], "no cloud client may be resolved for a local-only compression route"
-    retries = aux._transient_retry_count()
+    retries = aux._transient_retry_plan("compression")[0]
     assert local.chat.completions.create.call_count == 1 + retries
     messages = [r.getMessage() for r in caplog.records]
     assert not any("falling back to main agent model" in m for m in messages), messages
@@ -334,3 +339,117 @@ def test_e2e_temp_home_local_compression_never_resolves_a_cloud_client(monkeypat
     assert refusals, f"each refused rung needs one INFO line: {messages}"
     assert all("compression" in m for m in refusals)
     assert any("openrouter" in m for m in refusals), "the configured cloud rung is named"
+
+
+# ---------------------------------------------------------------------------
+# Invariant 5: the compression window is bounded in SECONDS, and only compression has it
+# ---------------------------------------------------------------------------
+
+
+class _LoadingModel(Exception):
+    """Shaped like the local llama-server's 503 while it reloads the model."""
+
+    status_code = 503
+
+    def __init__(self):
+        super().__init__(
+            'Error code: 503 - {"error": {"message": "Loading model", "type": "unavailable_error"}}')
+
+
+def test_compression_retry_sleeps_are_capped_by_seconds_not_attempts(monkeypatch):
+    """Compression retries inside one ~15 s window, and a raised attempt count cannot widen it.
+
+    The route is local-only and the retry exists to outlast a llama-server restart, so the sleeps are
+    expected to fill the window rather than stop at the generic count — and to stop at the seconds
+    ceiling once the count is raised, so a persistent outage aborts instead of holding the turn.
+    """
+    monkeypatch.setattr(aux, "_COMPRESSION_TRANSIENT_RETRIES", 12)
+    local = _local_client()
+    _patch_common(monkeypatch, task_config=_local_compression_config(), client=local, cloud_created=[])
+    monkeypatch.setattr(aux, "_TRANSIENT_RETRY_BACKOFF_BASE", 1.0)
+    slept = []
+    monkeypatch.setattr("time.sleep", slept.append)
+
+    with pytest.raises(_Timeout):
+        aux.call_llm(task="compression", messages=_messages())
+
+    budget = aux._COMPRESSION_TRANSIENT_RETRY_BUDGET_SECONDS
+    assert local.chat.completions.create.call_count == len(slept) + 1
+    assert slept == sorted(slept), f"backoff must be non-decreasing: {slept}"
+    assert len(slept) > aux._transient_retry_count(), (
+        "compression gets a longer window than the generic count"
+    )
+    assert sum(slept) <= budget, f"retry sleeps must stay inside the {budget}s ceiling: {slept}"
+    assert sum(slept) >= 0.8 * budget, f"the window must be spent, not cut short: {slept}"
+
+
+def test_loading_model_503_on_compression_is_retried_not_terminal(monkeypatch, caplog):
+    """A 503 "Loading model" is a retry-soon signal on compression: retry inside the window, then abort."""
+    local = MagicMock()
+    local.base_url = LOCAL_BASE_URL
+    local.chat.completions.create.side_effect = _LoadingModel()
+    cloud_created = []
+    _patch_common(monkeypatch, task_config=_local_compression_config(), client=local,
+                  cloud_created=cloud_created)
+
+    with caplog.at_level(logging.INFO), pytest.raises(_LoadingModel):
+        aux.call_llm(task="compression", messages=_messages())
+
+    retries = aux._transient_retry_plan("compression")[0]
+    assert local.chat.completions.create.call_count == 1 + retries, (
+        "the model-reload 503 must be retried inside the window, not treated as terminal"
+    )
+    assert cloud_created == [], "a reloading local endpoint must not push the summary off-box"
+    assert any("transient transport error" in r.getMessage() for r in caplog.records)
+
+
+def test_non_compression_task_keeps_the_generic_retry_budget(monkeypatch):
+    """Contrast: only compression carries a seconds ceiling; other tasks keep ``transient_retries``."""
+    client = MagicMock()
+    client.base_url = LOCAL_BASE_URL
+    client.chat.completions.create.side_effect = Exception("Connection refused")
+    _patch_common(monkeypatch, task_config=_local_compression_config(), client=client, cloud_created=[])
+    monkeypatch.setattr(aux, "_transient_retry_count", lambda: 6)
+
+    with contextlib.suppress(Exception):
+        aux.call_llm(task="session_search", messages=_messages())
+
+    retries, budget = aux._transient_retry_plan("session_search")
+    assert budget is None, "the generic window has no seconds ceiling to enforce"
+    assert retries == 6
+    assert client.chat.completions.create.call_count == 1 + 6, (
+        "a non-compression task still spends every configured retry"
+    )
+
+
+def test_a_stalled_attempt_spends_the_window_instead_of_buying_a_retry(monkeypatch):
+    """The ceiling is checked on the wall clock too: a slow failure must not multiply a whole timeout.
+
+    ``auxiliary.compression.timeout`` is 600 s on this host, so a bound that counted only attempts would
+    let one bad pass hold the turn for a full timeout per retry. A stalled attempt spends the window even
+    though it never sleeps, and the pass then aborts.
+    """
+    clock = [0.0]
+    local = MagicMock()
+    local.base_url = LOCAL_BASE_URL
+
+    def _stall(**_kwargs):
+        clock[0] += 60.0  # a stalled attempt: no sleeps, but real time passes
+        raise _Timeout()
+
+    local.chat.completions.create.side_effect = _stall
+    _patch_common(monkeypatch, task_config=_local_compression_config(), client=local, cloud_created=[])
+    monkeypatch.setattr(aux.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(aux, "_TRANSIENT_RETRY_BACKOFF_BASE", 0.2)
+    slept = []
+    monkeypatch.setattr("time.sleep", slept.append)
+
+    with pytest.raises(_Timeout):
+        aux.call_llm(task="compression", messages=_messages())
+
+    budget = aux._COMPRESSION_TRANSIENT_RETRY_BUDGET_SECONDS
+    assert local.chat.completions.create.call_count == 1 + len(slept)
+    assert sum(slept) <= budget, f"retry sleeps must stay inside the {budget}s ceiling: {slept}"
+    assert len(slept) < aux._COMPRESSION_TRANSIENT_RETRIES, (
+        f"a 60 s stall must spend the window, not buy every retry: {slept}"
+    )

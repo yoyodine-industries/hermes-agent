@@ -3113,6 +3113,20 @@ def _is_transient_transport_error(exc: Exception) -> bool:
 
 _DEFAULT_TRANSIENT_RETRIES = 2
 _TRANSIENT_RETRY_BACKOFF_BASE = 1.0  # Backoff base (seconds); overridable so tests can zero it out.
+_TRANSIENT_RETRY_BACKOFF_MAX = 8.0  # Ceiling for one backoff sleep; the ladder flattens here.
+
+# ``compression`` retries its own endpoint on a window of its own instead of ``auxiliary.transient_retries``.
+# Its failure differs in kind from every other task's: the route is local-only, so there is no fallback to
+# hand the work to, and what the retry has to clear is a llama-server RESTART (model reload + relaunch + the
+# 503 "Loading model" window), not a dropped socket — seconds, not milliseconds. The window is 4 retries
+# backed off 1+2+4+8. The ceiling that matters is in SECONDS, not attempts, and it is checked on both
+# clocks — the sleeps already spent and the wall clock since the first failure — so neither a raised count
+# nor an attempt that stalls for a full timeout can widen it: a persistent outage still fails the summary
+# inside one 15 s window and the pass aborts with the session preserved rather than holding the turn.
+# Per-attempt call time is untouched — that stays bounded
+# by ``auxiliary.compression.timeout`` down to ``_COMPRESSION_TIMEOUT_FLOOR_SECONDS``.
+_COMPRESSION_TRANSIENT_RETRIES = 4
+_COMPRESSION_TRANSIENT_RETRY_BUDGET_SECONDS = 15.0
 
 
 def _transient_retry_count() -> int:
@@ -3124,6 +3138,18 @@ def _transient_retry_count() -> int:
         return _DEFAULT_TRANSIENT_RETRIES if val is None else max(0, min(int(val), 6))
     except Exception:
         return _DEFAULT_TRANSIENT_RETRIES
+
+
+def _transient_retry_plan(task: Optional[str]) -> Tuple[int, Optional[float]]:
+    """``(retries, sleep_budget_seconds)`` for a task's same-provider transient retry window.
+
+    A ``None`` budget means the generic window, bounded by its attempt count alone. ``compression`` gets
+    ``_COMPRESSION_TRANSIENT_RETRIES`` under the hard ``_COMPRESSION_TRANSIENT_RETRY_BUDGET_SECONDS``
+    ceiling (sleeps spent AND wall clock since the first failure) and ignores ``auxiliary.transient_retries``
+    — that config key stays the global default for every other task, unchanged."""
+    if task == "compression":
+        return _COMPRESSION_TRANSIENT_RETRIES, _COMPRESSION_TRANSIENT_RETRY_BUDGET_SECONDS
+    return _transient_retry_count(), None
 
 
 def _is_auth_error(exc: Exception) -> bool:
@@ -3247,9 +3273,10 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
 # (``_LOCAL_ONLY_FALLBACK_TASKS``), so there is no fallback to hand the work to: spending the retry on
 # the one endpoint it may use is the only recovery left, and abandoning it loses the summary outright.
 # The bounded retry window is what keeps that affordable — ``auxiliary.compression.timeout`` is
-# honoured down to ``_COMPRESSION_TIMEOUT_FLOOR_SECONDS``, so the whole local attempt
-# (``auxiliary.transient_retries`` + backoff) stays inside the 300 s the old floor used to spend on a
-# single stalled request. See issue #54465.
+# honoured down to ``_COMPRESSION_TIMEOUT_FLOOR_SECONDS``, and the retry sleeps are budgeted in SECONDS
+# by ``_transient_retry_plan`` (15 s, independent of ``auxiliary.transient_retries``: this retry's job is
+# to outlast a llama-server restart, not just a dropped socket), so the whole local attempt stays inside
+# the 300 s the old floor used to spend on a single stalled request. See issue #54465.
 _TIMEOUT_NO_RETRY_TASKS = frozenset({"vision"})
 
 
@@ -7487,9 +7514,10 @@ def _call_llm_impl(
         # isn't retried simply loses that advisor for the turn (root of the run2 double-advisor "Connection
         # error" collapse — a genuine upstream blip hitting both parallel advisors at once). Attempts are
         # bounded and use exponential backoff. Count is configurable via auxiliary.transient_retries
-        # (default 2 retries → 3 total attempts); a second/third failure or any non-transient error falls
-        # through to ``first_err`` and the existing fallback handling unchanged. Unified home for the
-        # transient retry every auxiliary task shares. (PR #16587)
+        # (default 2 retries → 3 total attempts), except for the local-only tasks that carry their own
+        # seconds-bounded window (``_transient_retry_plan``: compression); a second/third failure or any
+        # non-transient error falls through to ``first_err`` and the existing fallback handling unchanged.
+        # Unified home for the transient retry every auxiliary task shares. (PR #16587)
         return _validate_llm_response(
             _relay_sync_completion(
                 client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
@@ -7510,10 +7538,25 @@ def _call_llm_impl(
         except Exception as transient_err:
             if not _should_retry_same_provider(task, transient_err, ""):
                 raise
-            _max_transient_retries = _transient_retry_count()
+            _max_transient_retries, _retry_sleep_budget = _transient_retry_plan(task)
             _last_transient = transient_err
+            _retry_sleep_spent = 0.0
+            _retry_window_started = time.monotonic()
             for _attempt in range(1, _max_transient_retries + 1):
-                _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
+                _backoff = min(
+                    _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), _TRANSIENT_RETRY_BACKOFF_MAX)
+                # A seconds budget outranks the attempt count, on both clocks: the sleeps already spent and
+                # the wall clock since the first failure (an attempt that stalls for a full timeout spends
+                # the window without sleeping at all). Stop when the next sleep fits in neither.
+                if _retry_sleep_budget is not None and (
+                    _retry_sleep_spent + _backoff > _retry_sleep_budget
+                    or time.monotonic() - _retry_window_started + _backoff > _retry_sleep_budget
+                ):
+                    logger.info("Auxiliary %s: transient retry budget of %.0fs spent after %d retry(ies); "
+                                "failing to fallback: %s",
+                                task or "call", _retry_sleep_budget, _attempt - 1, _last_transient)
+                    break
+                _retry_sleep_spent += _backoff
                 logger.info("Auxiliary %s: transient transport error (attempt %d/%d); "
                             "retrying same provider after %.1fs before fallback: %s",
                             task or "call", _attempt, _max_transient_retries, _backoff, _last_transient)

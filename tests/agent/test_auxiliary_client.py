@@ -28,7 +28,7 @@ from agent.auxiliary_client import (
     _is_model_incompatible_error,
     _refresh_nous_recommended_model,
     _normalize_aux_provider,
-    _transient_retry_count,
+    _transient_retry_plan,
     _try_payment_fallback,
     _try_openrouter,
     _OPENROUTER_MODEL,
@@ -2106,8 +2106,9 @@ class TestTransientTransportRetry:
         This reverses #54465: skipping the retry only helped while a cloud
         fallback could absorb the work, and that escalation is now refused for
         compression. With no rung left to hand the summary to, the retry is the
-        only recovery, and ``auxiliary.transient_retries`` (clamped to 6) is what
-        keeps it affordable.
+        only recovery, and that route's own seconds-bounded window
+        (``_transient_retry_plan``, independent of ``auxiliary.transient_retries``)
+        is what keeps it affordable.
         """
         class _Timeout(Exception):
             pass
@@ -2137,8 +2138,8 @@ class TestTransientTransportRetry:
         ):
             result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
         assert result == {"fallback": True}
-        retries = _transient_retry_count()
-        assert 0 <= retries <= 6, "the retry window is clamped"
+        retries, budget = _transient_retry_plan("compression")
+        assert budget is not None, "compression's retry window is bounded in seconds"
         # Primary retried within its bounded window, then the ladder ran once.
         assert primary.chat.completions.create.call_count == 1 + retries
         assert fb_client.chat.completions.create.call_count == 1

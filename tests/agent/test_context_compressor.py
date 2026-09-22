@@ -1,6 +1,7 @@
 """Tests for agent/context_compressor.py — compression logic, thresholds, truncation fallback."""
 
 import json
+import logging
 import sqlite3
 import pytest
 import time
@@ -953,6 +954,32 @@ class TestAuthFailureAborts:
         assert result is None
         assert c._last_summary_network_failure is True
         assert c._last_summary_auth_failure is False
+
+    def test_network_abort_warning_names_the_uncompressed_over_budget_state(self, caplog):
+        """A network-aborted compaction must say the summary is missing and the context is over budget.
+
+        The warning is all the user sees when compression fails; "retry with /compress" alone never says
+        that the pass produced no summary and left the session uncompressed at/over its budget.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=False)
+        msgs = self._msgs()
+        over_budget_tokens = c.threshold_tokens + 500
+
+        with caplog.at_level(logging.WARNING), patch(
+            "agent.context_compressor.call_llm", side_effect=ConnectionError("Connection error."),
+        ):
+            result = c.compress(msgs, current_tokens=over_budget_tokens, force=True)
+
+        assert result == msgs, "an aborted compaction keeps every message"
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        aborts = [m for m in warnings if "aborting compression" in m]
+        assert aborts, f"the user-facing abort warning must be emitted: {warnings}"
+        assert all("No summary was produced" in m for m in aborts), aborts
+        assert all("uncompressed" in m for m in aborts), aborts
+        assert all(str(over_budget_tokens) in m and str(c.threshold_tokens) in m for m in aborts), (
+            f"the at/over-budget state must be stated with the actual readings: {aborts}"
+        )
 
     def test_generate_summary_flags_empty_content_failure(self):
         """An empty-content response on the summary call flags

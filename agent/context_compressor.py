@@ -606,8 +606,9 @@ _TERMINAL_SUMMARY_FAILURES = (
     (
         "_last_summary_network_failure",
         "summary_network_failure",
-        "Summary generation failed with a network/connection error — aborting compression. %d message(s) "
-        "preserved unchanged; the session was NOT rotated. This is transient: retry with /compress once "
+        "Summary generation failed with a network/connection error — aborting compression. No summary was "
+        "produced: the %d message(s) are preserved unchanged, the session was NOT rotated, and it stays "
+        "uncompressed until a later compaction succeeds. This is transient: retry with /compress once "
         "connectivity recovers, or continue the conversation as-is.",
     ),
     (
@@ -4463,8 +4464,27 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Roll back the self-heal rehydration so the aborted attempt is a true no-op (#57835).
         self._previous_summary = previous_summary_before_scan
         if not self.quiet_mode:
-            logger.warning(message, n_skipped)
+            logger.warning(message + self._over_budget_abort_note(failure_class, telemetry), n_skipped)
         return True
+
+    def _over_budget_abort_note(self, failure_class: str, telemetry: Dict[str, Any]) -> str:
+        """Suffix for a terminal summary-failure warning when the session is left at/over budget.
+
+        An aborted compaction keeps every message but produces NO summary, so a session that had already
+        crossed the compression budget keeps running uncompressed and every later turn pays the full
+        prompt. "Retry with /compress" alone reads as if the pass merely skipped an optimization; say
+        outright that the context is at/over budget and the summary is still missing. Empty for every
+        other failure class and whenever the readings are absent, so the warning stays one bounded line."""
+        if failure_class != "summary_network_failure":
+            return ""
+        current = telemetry.get("current_estimated_tokens")
+        threshold = telemetry.get("effective_threshold") or self.threshold_tokens
+        if not current or not threshold or current < threshold:
+            return ""
+        return (
+            f" Context is at/over the compression budget ({current} of {threshold} tokens) with no summary "
+            "in place: the session continues uncompressed until a later compaction succeeds."
+        )
 
     _COMPRESSION_NOTE = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.]"
 
