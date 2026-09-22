@@ -139,6 +139,15 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
     "agents.md", "claude.md", "soul.md", ".cursorrules"})
 
+# Config-shaped names that still steer behavior when they sit DIRECTLY inside a project-local
+# ``.hermes`` dir -- the companion of the set above, which keeps matching in ANY directory.
+# Deliberately NOT "anything inside a .hermes dir": a profile lane's home is
+# ``<root>/profiles/<lane>``, so the home exemption below never covers the ROOT home, and the
+# blanket form read every file in the root home (``~/.hermes/.gitignore``) as project-local
+# config, refusing an inert file as an agent-instruction write for every profile lane. The
+# rest of a .hermes tree is data (.gitignore, caches, scratch), not behavior-steering config.
+_PROJECT_HERMES_CONFIG_BASENAMES = frozenset({"config.yaml", "config.yml", ".env"})
+
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
     """Return ``(enabled, extra_patterns)`` from ``security.protected_instruction_files`` /
@@ -192,11 +201,16 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
                 fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
             return base
-        # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
-        # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
-        # would gate every write inside a checkout living under ~/.hermes.
+        # Project-local .hermes CONFIG dirs (<repo>/.hermes/config.yaml) steer behavior too, so
+        # they stay gated. Only the IMMEDIATE parent counts -- matching any ancestor would gate
+        # every write inside a checkout living under ~/.hermes -- AND the file itself must be
+        # config-shaped: an unqualified "parent is .hermes" test also matched the ROOT home's own
+        # files (a profile lane's home is <root>/profiles/<lane>, so the exemption above never
+        # covers the root) and refused inert ones like ~/.hermes/.gitignore as instruction
+        # writes. Instruction basenames keep the gate in ANY directory via the rule above.
         parts = candidate.replace("\\", "/").rstrip("/").split("/")
-        if len(parts) >= 2 and parts[-2] == ".hermes":
+        if (len(parts) >= 2 and parts[-2] == ".hermes"
+                and base_lower in _PROJECT_HERMES_CONFIG_BASENAMES):
             return candidate
     return None
 
