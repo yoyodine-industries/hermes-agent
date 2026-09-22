@@ -969,3 +969,154 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# skill_view not-found hint: the shared skills tree
+# ---------------------------------------------------------------------------
+
+
+class TestSharedTreeNotFoundHint:
+    """A name absent from THIS profile's index but present in the shared skills tree gets a
+    self-diagnosing hint: the asking profile, the shared entry, and the fix. Message-only — the
+    resolution set is untouched, and a name nowhere gets the previous hint verbatim."""
+
+    BASE_HINT = "Use skills_list to see all available skills"
+
+    @staticmethod
+    def _tree(tmp_path, profile="probe-lane"):
+        """<tmp>/hermes/{profiles/<profile>/skills = the lane index, skills/ = the shared tree}."""
+        root = tmp_path / "hermes"
+        profile_home = root / "profiles" / profile
+        lane = profile_home / "skills"
+        lane.mkdir(parents=True)
+        _make_skill(lane, "lane-local", category="devops")
+        shared = root / "skills"
+        shared.mkdir()
+        entry = _make_skill(shared, "shared-only", category="finance")
+        return root, profile_home, lane, entry
+
+    @staticmethod
+    def _patches(root, profile_home):
+        """Point the module at the temp root/profile; never patch SKILLS_DIR, so the lane dir keeps
+        coming from the (patched) HERMES_HOME exactly as a profile session would. ``create=True``
+        because the shared-root seam lands WITH the fix: on an unfixed tree the test must run the
+        real (old) code and fail on its assertion, not on the patch target."""
+        return (
+            patch.object(skills_tool_module, "get_hermes_home", return_value=profile_home),
+            patch.object(skills_tool_module, "get_default_hermes_root", return_value=root, create=True),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        )
+
+    def test_bare_name_present_in_shared_tree_is_pointed_at(self, tmp_path):
+        root, profile_home, lane, entry = self._tree(tmp_path)
+        p1, p2, p3 = self._patches(root, profile_home)
+        with p1, p2, p3:
+            result = json.loads(skill_view("shared-only"))
+
+        assert result["success"] is False
+        assert result["error"] == "Skill 'shared-only' not found."  # error text unchanged
+        hint = result["hint"]
+        assert "probe-lane" in hint                                    # who is asking
+        assert str(entry / "SKILL.md") in hint                         # where the entry lives
+        assert str(root / "skills") in hint                            # the shared root
+        assert f"mkdir -p {lane / 'finance'}" in hint                  # the fix, exactly
+        assert f"ln -s {entry} {lane / 'finance' / 'shared-only'}" in hint
+        assert 'skill_view(name="finance/shared-only")' in hint
+        assert self.BASE_HINT in hint                                  # previous hint survives
+        assert result["available_skills"] == ["lane-local"]
+
+    def test_categorized_path_present_in_shared_tree_is_pointed_at(self, tmp_path):
+        root, profile_home, lane, entry = self._tree(tmp_path)
+        p1, p2, p3 = self._patches(root, profile_home)
+        with p1, p2, p3:
+            result = json.loads(skill_view("finance/shared-only"))
+
+        assert result["success"] is False
+        hint = result["hint"]
+        assert str(entry / "SKILL.md") in hint
+        assert 'skill_view(name="finance/shared-only")' in hint
+        assert result["available_skills"] == ["lane-local"]
+
+    def test_absent_everywhere_keeps_the_plain_hint(self, tmp_path):
+        root, profile_home, lane, entry = self._tree(tmp_path)
+        p1, p2, p3 = self._patches(root, profile_home)
+        with p1, p2, p3:
+            result = json.loads(skill_view("no-such-skill-anywhere"))
+
+        assert result["success"] is False
+        assert result["error"] == "Skill 'no-such-skill-anywhere' not found."
+        assert result["hint"] == self.BASE_HINT  # byte-for-byte the previous behaviour
+        assert "probe-lane" not in json.dumps(result)
+
+    def test_frontmatter_alias_in_shared_tree_is_pointed_at(self, tmp_path):
+        """The shared entry's directory leaf differs from its frontmatter name: the general scan
+        (not the literal probe) has to find it."""
+        root, profile_home, lane, _ = self._tree(tmp_path)
+        alias_dir = root / "skills" / "finance" / "alias-dir"
+        alias_dir.mkdir(parents=True)
+        (alias_dir / "SKILL.md").write_text(
+            "---\nname: shared-alias\ndescription: Alias.\n---\n\nStep 1: Do the thing.\n")
+
+        p1, p2, p3 = self._patches(root, profile_home)
+        with p1, p2, p3:
+            result = json.loads(skill_view("shared-alias"))
+
+        assert result["success"] is False
+        hint = result["hint"]
+        assert str(alias_dir / "SKILL.md") in hint
+        assert 'skill_view(name="finance/alias-dir")' in hint
+
+    def test_default_profile_lane_is_not_pointed_at_its_own_tree(self, tmp_path):
+        """HERMES_HOME == the default root: the lane dir IS the shared tree, so a shared pointer
+        would be noise (and the entry resolves normally there)."""
+        root = tmp_path / "hermes"
+        shared = root / "skills"
+        entry = _make_skill(shared, "shared-only", category="finance")
+
+        p1, p2, p3 = self._patches(root, root)
+        with p1, p2, p3:
+            found = json.loads(skill_view("finance/shared-only"))
+            missing = json.loads(skill_view("no-such-skill-anywhere"))
+
+        assert found["success"] is True
+        assert found["name"] == "shared-only"
+        assert missing["success"] is False
+        assert missing["hint"] == self.BASE_HINT
+
+    def test_linking_the_entry_into_the_index_resolves_it(self, tmp_path):
+        """The fix the hint prints is the real one: linked in, the entry resolves; unlinked, the
+        shared tree is never served behind the profile's back."""
+        root, profile_home, lane, entry = self._tree(tmp_path)
+        p1, p2, p3 = self._patches(root, profile_home)
+        with p1, p2, p3:
+            before = json.loads(skill_view("finance/shared-only"))
+            assert before["success"] is False
+
+            # the fix as printed, then run it verbatim
+            dest = lane / "finance" / "shared-only"
+            assert f"mkdir -p {dest.parent}" in before["hint"]
+            assert f"ln -s {entry} {dest}" in before["hint"]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest.symlink_to(entry, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+            after = json.loads(skill_view("finance/shared-only"))
+            bare = json.loads(skill_view("shared-only"))
+
+        assert after["success"] is True
+        assert after["name"] == "shared-only"
+        assert "Do the thing" in after["content"]
+        assert bare["success"] is True  # the linked entry answers to the bare name too
+
+    def test_traversal_name_never_reaches_the_shared_tree(self, tmp_path):
+        root, profile_home, lane, entry = self._tree(tmp_path)
+        p1, p2, p3 = self._patches(root, profile_home)
+        with p1, p2, p3:
+            result = json.loads(skill_view("../shared-only"))
+
+        assert result["success"] is False
+        assert "ln -s" not in (result.get("hint") or "")
+        assert str(root) not in json.dumps(result)

@@ -12,7 +12,8 @@ from contextlib import suppress
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_default_hermes_root, get_hermes_home, profile_name_for_home)
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
@@ -67,6 +68,69 @@ def _skills_dir() -> Path:
     it, else live profile-scoped HERMES_HOME (long-lived runtimes may import before profile set)."""
     configured = Path(SKILLS_DIR)
     return configured if configured != _SKILLS_DIR_AT_IMPORT else get_hermes_home() / "skills"
+
+
+def _shared_skills_dir() -> Path:
+    """The fleet-wide skills tree (``<default hermes root>/skills``) that every profile's index is
+    curated FROM. Never a resolution root: read-only context for the not-found message."""
+    return get_default_hermes_root() / "skills"
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    """True when *a* and *b* are the same directory (resolved where possible)."""
+    with suppress(OSError, RuntimeError, ValueError):
+        return a.resolve(strict=False) == b.resolve(strict=False)
+    return Path(a) == Path(b)
+
+
+def _shared_tree_entry(name: str, local_category_name: Optional[str]) -> Optional[Path]:
+    """The SKILL.md for *name* in the shared skills tree, else None. Read-only. Acceptance
+    matches the resolver's: literal path / directory leaf / frontmatter name / legacy flat .md.
+    The cheap literal probe runs first; the general scan only when it misses."""
+    if _skill_lookup_path_error(name):  # never join a traversal/absolute/drive name onto the root
+        return None
+    shared = _shared_skills_dir()
+    if not shared.is_dir():
+        return None
+    direct = shared / name
+    if direct.is_dir() and (direct / "SKILL.md").exists():
+        return direct / "SKILL.md"
+    hits = _collect_skill_candidates(name, local_category_name, [shared])
+    return hits[0][1] if hits else None
+
+
+def _not_found_hint(name: str, local_category_name: Optional[str]) -> str:
+    """Not-found hint, self-diagnosing when *name* is absent from this profile's index but IS
+    present in the shared skills tree: it names the asking profile, the shared entry, and the fix.
+
+    Message-only by construction — no search dir changes, so a name that resolves today still
+    resolves to the same file (the lane dir IS the resolution set; see yaan-skill-locations). The
+    default profile's skills dir IS the shared tree, so there the pointer would be noise."""
+    base = "Use skills_list to see all available skills"
+    try:
+        shared = _shared_skills_dir()
+        lane = _skills_dir()
+        if not shared.is_dir() or _same_dir(shared, lane):
+            return base
+        entry = _shared_tree_entry(name, local_category_name)
+        if entry is None:
+            return base
+    except Exception:  # a diagnostic must never replace the real error
+        logger.debug("shared-tree hint skipped for %r", name, exc_info=True)
+        return base
+    skill_dir = entry.parent if entry.name == "SKILL.md" else entry
+    try:
+        rel = skill_dir.relative_to(shared)
+    except ValueError:
+        rel = Path(name)
+    dest = lane / rel
+    profile = profile_name_for_home(get_hermes_home()) or "this session"
+    return (
+        f"Profile '{profile}' does not index this skill, but it exists in the shared skills tree "
+        f"the fleet curates from ({shared}): {entry}. Fix: mkdir -p {dest.parent} && "
+        f"ln -s {skill_dir} {dest} - then skill_view(name=\"{rel.as_posix()}\") resolves it; "
+        f"or read {entry} directly. {base}"
+    )
 
 
 _secret_capture_callback = None
@@ -492,7 +556,7 @@ def _locate_skill(name: str, local_category_name: Optional[str], project_dirs: l
     if not skill_md or not skill_md.exists():
         available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
         return _fail(f"Skill '{name}' not found.", available_skills=available,
-                     hint="Use skills_list to see all available skills"), None, None
+                     hint=_not_found_hint(name, local_category_name)), None, None
     return None, skill_dir, skill_md
 
 
