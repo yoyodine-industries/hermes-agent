@@ -397,7 +397,7 @@ class TestProtectedInstructionFiles:
     def _gate_on(self, monkeypatch):
         import tools.file_tools_write_guards as ft
         monkeypatch.setattr(
-            ft, "_protected_instruction_config", lambda: (True, [])
+            ft, "_protected_instruction_config", lambda: (True, [], [])
         )
         yield
 
@@ -492,7 +492,7 @@ class TestProtectedInstructionFiles:
     def test_config_disabled_skips_gate(self, tmp_path, approvals, monkeypatch):
         import tools.file_tools_write_guards as ft
         monkeypatch.setattr(
-            ft, "_protected_instruction_config", lambda: (False, [])
+            ft, "_protected_instruction_config", lambda: (False, [], [])
         )
         res = self._write(tmp_path / "AGENTS.md", "ok")
         assert not res.get("error"), res
@@ -501,7 +501,7 @@ class TestProtectedInstructionFiles:
     def test_extra_patterns_from_config(self, tmp_path, approvals, monkeypatch):
         import tools.file_tools_write_guards as ft
         monkeypatch.setattr(
-            ft, "_protected_instruction_config", lambda: (True, ["*.mdc"])
+            ft, "_protected_instruction_config", lambda: (True, ["*.mdc"], [])
         )
         approvals["answer"] = "deny"
         res = self._write(tmp_path / "rules.mdc")
@@ -866,3 +866,125 @@ class TestProtectedInstructionProjectHermesScope:
         _root, lane = lane_session
         (lane / "SOUL.md").write_text("x\n", encoding="utf-8")
         assert self._reason(lane / "SOUL.md") is None
+
+
+class TestProtectedInstructionAllowlist:
+    """``security.protected_instruction_allowlist_dirs`` exempts operator-trusted project trees.
+
+    Operator-trusted project trees edit instruction files as ordinary work, so the
+    always-ask gate only ever fails closed there (no human channel to approve). The
+    exemption is read from the live config key, realpath's BOTH the declared entry and the
+    candidate — a link under a trusted tree that points OUTSIDE it stays gated — and remains a
+    path-boundary directory test, not a blanket gate-off.
+    """
+
+    @staticmethod
+    def _install_allowlist(monkeypatch, *dirs):
+        """Declare *dirs* through the REAL config read (``load_config`` -> ``cfg_get``), so the
+        tests exercise the config KEY rather than ``_protected_instruction_reason``'s kwargs."""
+        import hermes_cli.config as config_mod
+        real_load = config_mod.load_config
+
+        def load():
+            cfg = real_load()
+            security = cfg.get("security")
+            if not isinstance(security, dict):
+                security = {}
+                cfg["security"] = security
+            security["protected_instruction_allowlist_dirs"] = [str(d) for d in dirs]
+            return cfg
+
+        monkeypatch.setattr(config_mod, "load_config", load)
+
+    @pytest.fixture
+    def trusted(self, tmp_path, monkeypatch):
+        trusted = tmp_path / "trusted-tree"
+        trusted.mkdir()
+        self._install_allowlist(monkeypatch, trusted)
+        return trusted
+
+    @pytest.fixture
+    def approvals(self, monkeypatch):
+        """Record any approval prompt; an exempt write must never reach this."""
+        from tools.terminal_tool import set_approval_callback
+        state = {"calls": []}
+
+        def cb(command, description, **kwargs):
+            state["calls"].append(command)
+            return "deny"
+
+        set_approval_callback(cb)
+        yield state
+        set_approval_callback(None)
+
+    def _write(self, path, content="ok"):
+        import json
+        from tools.file_tools import write_file_tool
+        return json.loads(write_file_tool(str(path), content))
+
+    # ---- the feature ----------------------------------------------------
+
+    def test_allowlisted_dir_exempts_instruction_files(self, trusted):
+        """Read with no explicit kwargs, so the CONFIG KEY is what decides."""
+        import tools.file_tools_write_guards as ft
+        for name in ("AGENTS.md", "SOUL.md", ".cursorrules"):
+            (trusted / name).write_text("x\n", encoding="utf-8")
+            assert ft._protected_instruction_reason(str(trusted / name)) is None
+
+    def test_allowlisted_dir_write_goes_through_end_to_end(self, trusted, approvals):
+        """No gate, no prompt, content lands: the always-ask pause is gone for the trusted tree."""
+        res = self._write(trusted / "AGENTS.md", "trusted\n")
+        assert not res.get("error"), res
+        assert (trusted / "AGENTS.md").read_text(encoding="utf-8") == "trusted\n"
+        assert approvals["calls"] == []
+
+    def test_gate_still_fires_without_the_config_key(self, tmp_path, monkeypatch):
+        """The key is the switch: drop it and the same shape of path is gated again."""
+        import hermes_cli.config as config_mod
+        import tools.file_tools_write_guards as ft
+        real_load = config_mod.load_config
+
+        def load():
+            cfg = real_load()
+            security = cfg.get("security")
+            if isinstance(security, dict):
+                security.pop("protected_instruction_allowlist_dirs", None)
+            return cfg
+
+        monkeypatch.setattr(config_mod, "load_config", load)
+        target = tmp_path / "trusted-tree" / "AGENTS.md"
+        target.parent.mkdir()
+        assert ft._protected_instruction_reason(str(target)) == "AGENTS.md"
+
+    # ---- the exemption must not leak beyond the declared tree -----------
+
+    def test_sibling_dir_sharing_the_prefix_name_stays_gated(self, tmp_path, trusted):
+        """Prefix match is path-boundary aware: ``trusted-tree-evil`` is not inside ``trusted-tree``."""
+        import tools.file_tools_write_guards as ft
+        sibling = tmp_path / "trusted-tree-evil"
+        sibling.mkdir()
+        assert ft._protected_instruction_reason(str(sibling / "AGENTS.md")) == "AGENTS.md"
+
+    def test_symlink_out_of_a_trusted_tree_stays_gated(self, tmp_path, trusted):
+        """realpath discipline: a link INSIDE the trusted tree pointing OUT is not covered.
+
+        Comparing the normalized path against the allowlist would exempt
+        ``trusted-tree/escape/AGENTS.md`` on its name alone; the realpath'd destination is outside
+        the declared tree, so the gate must fire.
+        """
+        import tools.file_tools_write_guards as ft
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (trusted / "escape").symlink_to(outside, target_is_directory=True)
+        assert ft._protected_instruction_reason(
+            str(trusted / "escape" / "AGENTS.md")) == "AGENTS.md"
+
+    def test_allowlist_entry_given_as_a_symlink_covers_the_real_tree(self, tmp_path, monkeypatch):
+        """The declared ENTRY is realpath'd too: a symlinked spelling still covers its target."""
+        import tools.file_tools_write_guards as ft
+        real = tmp_path / "real-tree"
+        real.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        self._install_allowlist(monkeypatch, alias)
+        assert ft._protected_instruction_reason(str(real / "AGENTS.md")) is None
