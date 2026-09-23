@@ -3260,9 +3260,11 @@ def block_task(
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
     due_at: Optional[int] = None, window_policy: Optional[str] = None,
 ) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``transient`` still counts toward the loop breaker
-    so a forever-flaky task escalates. True on any transition.
+    """``running``, ``ready`` or ``todo`` -> ``blocked`` (or ``todo`` /
+    ``triage``, see :func:`_route_block`). ``todo`` is admissible because that is
+    where a card waits on its parents: refusing it left a dependency wait with no
+    way to record a kind or a wake time. ``transient`` still counts toward the loop
+    breaker so a forever-flaky task escalates. True on any transition.
 
     ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on the
     ``blocked`` landing only: the due-card waker unblocks the card on the first
@@ -3288,7 +3290,10 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        source_status = (
+            _retry_status_for_run(conn, task_id) if cur_row["status"] == "running"
+            else cur_row["status"]
+        )
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
@@ -3306,7 +3311,7 @@ def block_task(
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'todo')
                 """
         params = (*params, task_id)
         if expected_run_id is not None:
@@ -3336,10 +3341,11 @@ def _route_block(
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
     as something to "unblock". Every other kind counts unblock-loop
-    recurrences: block_task only fires from running/ready (AFTER an unblock
-    returned the task to the pool), so a stored ``block_kind`` equal to the
-    incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
+    recurrences: block_task pages a card in from running/ready/todo (AFTER an
+    unblock returned the task to the pool, or on a card still waiting on a
+    parent), so a stored ``block_kind`` equal to the incoming one means blocked
+    -> unblocked -> re-block for the same cause (un-typed None compares equal to
+    a prior un-typed block). At
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -596,3 +596,81 @@ def test_cli_block_dependency_rejects_due(conn):
 
     assert "dependency" in out.lower()
     assert _get(conn, tid).status != "blocked"
+
+
+# ---------------------------------------------------------------------------
+# block from `todo`: a card waiting on its parents can still be parked
+# ---------------------------------------------------------------------------
+
+
+def _todo_card(conn, title="waits on parent") -> tuple[str, str]:
+    """A card that is genuinely in ``todo``: its parent is still open.
+
+    ``create_task`` starts a card in ``running`` (an authoring session), so a
+    ``todo`` card has to be built the way the board builds one — an unmet
+    parent edge. Returns ``(parent_id, child_id)``.
+    """
+    parent = _task(conn, title="parent still open")
+    child = kb.create_task(conn, title=title, assignee="smoke", parents=[parent])
+    assert _get(conn, child).status == "todo", "fixture must start in todo"
+    return parent, child
+
+
+@pytest.mark.parametrize("surface", ["kernel", "cli"])
+def test_block_admits_a_todo_card_and_arms_the_due_fence(conn, surface):
+    """A ``todo`` card can be parked, on both surfaces that arm a card.
+
+    The block transition admitted only ``running``/``ready``, so a card whose
+    parents are still open — the shape of any dependency wait — could not be
+    given a kind or a wake time at all: the kernel returned False and the CLI
+    answered "cannot block <id>" while the card silently kept no hold. That is
+    the horizon a reviewer reads to decide whether to come back, so the wait
+    has to be expressible.
+    """
+    _parent, tid = _todo_card(conn)
+
+    if surface == "kernel":
+        assert kb.block_task(conn, tid, reason="hold until the window",
+                             kind="needs_input", due_at=int(time.time()) + 600,
+                             window_policy="defer") is True
+    else:
+        due_iso = (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime(
+            "%Y-%m-%dT%H:%M:%S+0000")
+        out = kc.run_slash(
+            f"block {tid} hold until the window --kind needs_input --due {due_iso}")
+        assert "cannot block" not in out.lower(), out
+        assert "auto-release" in out.lower(), out
+
+    task = _get(conn, tid)
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert task.due_at is not None and task.due_at > time.time()
+    assert task.due_window_policy == "defer"
+    event = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1]
+    assert event.payload["due_at"] == task.due_at
+    assert event.payload["window_policy"] == "defer"
+
+
+def test_a_released_todo_hold_waits_on_its_parent_again(conn, tmp_path):
+    """A clock must never become a side door past the parent edge.
+
+    Parking a ``todo`` card is safe only because release goes back through the
+    parent gate: the waker must return the card to ``todo`` (still waiting),
+    never to ``ready`` where the dispatcher would spawn it over an unfinished
+    parent. And the card must not be stranded by its own park.
+    """
+    parent, tid = _todo_card(conn)
+    assert kb.block_task(conn, tid, reason="hold", kind="needs_input",
+                         due_at=int(time.time()) - 60) is True
+
+    out = kdue.wake_due_cards(conn, map_path=_elsewhere_map(tmp_path))
+
+    assert out.woken == [tid] and out.problems == []
+    task = _get(conn, tid)
+    assert task.status == "todo", "a released hold must wait on its parent again"
+    assert task.due_at is None and task.due_window_policy is None
+
+    # Finishing the parent is what releases it (it is parked, not stranded).
+    assert kb.complete_task(conn, parent, summary="parent finished") is True
+    kb.recompute_ready(conn)
+    assert _get(conn, tid).status == "ready"
