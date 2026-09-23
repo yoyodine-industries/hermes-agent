@@ -32,17 +32,31 @@ def _running_venv_site_packages() -> Path:
     return Path(sys.prefix) / "lib" / pyver / "site-packages"
 
 
+def _fake_proc():
+    """A fake child handle for the paths that only look at spawn kwargs."""
+    proc = MagicMock()
+    proc.poll.return_value = 0
+    proc.returncode = 0
+    proc.stdout = MagicMock(__iter__=lambda s: iter([]), __next__=lambda s: (_ for _ in ()).throw(StopIteration))
+    proc.stdin = MagicMock()
+    return proc
+
+
 def _make_fake_popen(captured: dict):
     """Return a fake Popen constructor that records the env kwarg."""
     def fake_popen(cmd, **kwargs):
         captured["env"] = kwargs.get("env", {})
-        proc = MagicMock()
-        proc.poll.return_value = 0
-        proc.returncode = 0
-        proc.stdout = MagicMock(__iter__=lambda s: iter([]), __next__=lambda s: (_ for _ in ()).throw(StopIteration))
-        proc.stdin = MagicMock()
-        return proc
+        return _fake_proc()
     return fake_popen
+
+
+def _make_fake_spawn(captured: dict):
+    """Record the env handed to the posix_spawn path (the live path on POSIX)."""
+    def fake_spawn(argv, env, stdin_data=None):
+        captured["env"] = env
+        captured["argv"] = argv
+        return _fake_proc()
+    return fake_spawn
 
 
 def _run_with_env(extra_os_env=None, self_env=None):
@@ -61,6 +75,8 @@ def _run_with_env(extra_os_env=None, self_env=None):
 
     with patch("tools.environments.local._find_bash", return_value="/bin/bash"), \
          patch("subprocess.Popen", side_effect=_make_fake_popen(captured)), \
+         patch("tools.environments.local._spawn_bash_posix",
+               side_effect=_make_fake_spawn(captured)), \
          patch.dict(os.environ, test_environ, clear=True):
         env.execute("echo hello")
 
