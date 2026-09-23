@@ -1,10 +1,12 @@
 """Dashboard mutation-boundary coverage for ``on_kanban_task_updated``.
 
-The dashboard plugin API's priority/title/body editors write task rows with
-direct SQL, bypassing every ``kanban_db`` mutator — the exact gap the RFC
-#58548 mutation-boundary review called out. These tests verify each
-direct-SQL write path (single-task PATCH and bulk POST) reports through
-``kanban_db.notify_task_updated`` with the right ``changed_fields``.
+The dashboard plugin API's priority editor writes task rows with direct SQL,
+bypassing every ``kanban_db`` mutator — the exact gap the RFC #58548
+mutation-boundary review called out. These tests verify each write path
+(single-task PATCH and bulk POST) reports through
+``kanban_db.notify_task_updated`` with the right ``changed_fields``. The
+title/body path writes through the shared ``kanban_db.patch_task_text``
+mutator (the CLI's set-title/set-body writer) and must report identically.
 """
 
 from __future__ import annotations
@@ -99,3 +101,68 @@ def test_bulk_priority_fires_task_updated_per_task(client, captured_updates):
     fired = {kw["task_id"]: kw for kw in captured_updates}
     assert set(fired) == {tid1, tid2}
     assert all(kw["changed_fields"] == ["priority"] for kw in fired.values())
+
+
+def test_patch_title_body_routes_through_the_shared_mutator(client, monkeypatch):
+    """One writer: the dashboard route must go through ``kanban_db.patch_task_text``
+    (the CLI verbs' writer) instead of updating the columns itself, and it must pass its
+    own request-scoped board — the contextvar is not pinned on this path."""
+    tid = _make_task("old title")
+    seen: dict = {}
+    real = kb.patch_task_text
+
+    def spy(conn, task_id, **kw):
+        seen["task_id"] = task_id
+        seen.update(kw)
+        return real(conn, task_id, **kw)
+
+    monkeypatch.setattr(kb, "patch_task_text", spy, raising=False)
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}?board=default", json={"title": "renamed"})
+
+    assert r.status_code == 200, r.text
+    assert seen.get("task_id") == tid
+    assert seen.get("title") == "renamed"
+    assert seen.get("board") == "default", "the request's own board is passed through (no contextvar guess)"
+    assert seen.get("body") is None, "a field the request did not carry is left alone"
+
+
+def test_patch_title_body_reports_field_names_to_subscribers(client, captured_updates):
+    """The refactor keeps the plugin's side of the contract: one ``edited`` event, and the
+    observer gets field NAMES (never the new values) with the request's board."""
+    tid = _make_task("old title")
+    captured_updates.clear()
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}", json={"title": "renamed", "body": "body text"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["title"] == "renamed"
+    assert len(captured_updates) == 1
+    kw = captured_updates[0]
+    assert kw["task_id"] == tid
+    assert kw["changed_fields"] == ["title", "body"]
+    assert kw["board"]
+    assert "renamed" not in str(kw), "the observer payload carries field names, never values"
+
+    conn = kbc.connect()
+    try:
+        row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (tid,)).fetchone()
+        edits = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_events WHERE task_id = ? AND kind = 'edited'", (tid,)
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+    assert (row["title"], row["body"]) == ("renamed", "body text")
+    assert edits == 1
+
+
+def test_patch_blank_title_is_still_refused_as_a_400(client):
+    """The domain-layer refusal keeps both its status and its message."""
+    tid = _make_task("keep me")
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"title": "   "})
+
+    assert r.status_code == 400
+    assert r.json()["detail"] == "title cannot be empty"

@@ -240,6 +240,16 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-title", [
+        _TASK_ID,
+        _arg("text", nargs="*", help="New title (a blank title is refused)"),
+        _bulk_ids("rename"),
+    ], help="Set a task's title (the dashboard's field editor, from the CLI)"),
+    _cmd("set-body", [
+        _TASK_ID,
+        _arg("text", nargs="*", help="New body text; with no text the body is cleared"),
+        _bulk_ids("rewrite"),
+    ], help="Set or clear a task's body"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task (does NOT stop the worker process)"),
     _cmd("reassign", [
         _TASK_ID,

@@ -4083,6 +4083,62 @@ def defer_due(conn: sqlite3.Connection, task_id: str, *, due_at: int) -> bool:
         return cur.rowcount == 1
 
 
+# --- Text fields (``title`` / ``body``) ---
+#
+# ONE writer for the two free-text columns. The CLI's ``set-title``/``set-body`` verbs and
+# the dashboard's field editor both come through ``patch_task_text``, so the blank-title
+# rule, the column strip and the ``edited`` audit event cannot drift apart between the two
+# surfaces (the plugin used to UPDATE these columns with its own SQL).
+
+def patch_task_text(
+    conn: sqlite3.Connection, task_id: str, *, title: Any = UNSET, body: Any = UNSET,
+    board: Optional[str] = None,
+) -> bool:
+    """Set a card's ``title`` and/or ``body``; returns False for an unknown id.
+
+    ``UNSET`` (the default) and ``None`` both mean "leave that field alone": ``None`` is
+    what the dashboard's payload uses for a field it was not sent, and the two spellings
+    must not diverge. A stored title is stripped, and whitespace-only is refused with
+    ``ValueError`` — a card with no title is unfindable. An empty ``body`` is a legal value
+    that CLEARS the column, which is the only way to drop a stale body.
+
+    Nothing else about the card moves: no status transition, no assignee change, and an
+    archived card stays editable (the dashboard always allowed that). One ``edited`` event
+    lands on the audit trail (payload NULL — field values never ride the event), and the
+    task-updated observer fires AFTER commit with field NAMES only.
+
+    ``board`` is the caller's own board when it resolved one from a request — the dashboard's
+    ``_board_conn`` does not pin the context-local board, so leaving it None there would
+    stamp the wrong board on the event. The CLI passes nothing and the observer's
+    ``get_current_board()`` fallback (the pinned board) applies.
+    """
+    fields: list[str] = []
+    if title is not UNSET and title is not None:
+        title = str(title).strip()
+        if not title:
+            raise ValueError("title cannot be empty")
+        fields.append("title")
+    if body is not UNSET and body is not None:
+        fields.append("body")
+    if not fields:
+        # Neither field asked for: no write, no audit event, no observer.
+        return True
+    with write_txn(conn):
+        if _task_status(conn, task_id) is None:
+            return False
+        sets, vals = [], []
+        if "title" in fields:
+            sets.append("title = ?")
+            vals.append(title)
+        if "body" in fields:
+            sets.append("body = ?")
+            vals.append(body)
+        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", (*vals, task_id))
+        _append_event(conn, task_id, "edited")
+    notify_task_updated(conn, task_id, fields, board=board)
+    return True
+
+
 # --- Board-level key/value bookkeeping (``kanban_meta``) ---
 #
 # ``due_waker_last_tick`` is the waker's heartbeat: the overdue diagnostic reads
