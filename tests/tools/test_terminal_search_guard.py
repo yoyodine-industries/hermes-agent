@@ -77,6 +77,7 @@ REFUSED = (
     pytest.param(REAL_SWEEP, "hermes_home", "the Hermes home", id="real-maintenance-sweep"),
     pytest.param(REAL_RECORD_LOOKUP, "hermes_home", "the Hermes home", id="real-record-lookup"),
     pytest.param("find / -name 'hermes_state.py' 2>/dev/null", "project", "filesystem root", id="find-root"),
+    pytest.param("find -L / -name 'hermes_state.py'", "project", "filesystem root", id="find-root-global-option"),
     pytest.param("grep -rn 'APR-0240' ~", "project", "whole home directory", id="grep-tilde"),
     pytest.param("grep -rn 'APR-0240' $HOME", "project", "whole home directory", id="grep-dollar-home"),
     pytest.param("grep -rn 'APR-0240' /Users", "project", "whole home and repo trees", id="grep-users"),

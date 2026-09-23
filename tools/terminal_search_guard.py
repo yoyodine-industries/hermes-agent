@@ -31,6 +31,10 @@ Deliberately string/argv-only: no filesystem walk, no script reading, nothing th
 block. A search hidden inside an *executed script file* is out of scope (the gateway
 guard reads referenced scripts; this one does not, by design). ``ls -R``, ``du -a`` and
 ``fd`` are likewise out of scope today — the spec table is where one more tool goes.
+
+Shell splitting and path resolution come from ``cron.lifecycle_guard``'s tokenizer and
+lenient resolver — the same helpers the gateway-lifecycle guard runs on every command —
+so there is one set of quoting/wrapper rules in the tree, not two.
 """
 
 import logging
@@ -62,6 +66,10 @@ _HOME_TOKEN_ROOTS = ("$HOME", "${HOME}")
 
 # ``find --help`` must not be read as a walk of ``.``.
 _HELP_ONLY_OPTIONS = frozenset({"--help", "--version"})
+
+# ``find``'s global options: they precede the path list, so the leading-operand scan
+# must step over them (``find -L / -name x`` walks ``/`` exactly like ``find / ...``).
+_FIND_GLOBAL_OPTIONS = frozenset({"-H", "-L", "-P"})
 
 
 class _SearchTool(NamedTuple):
@@ -178,6 +186,9 @@ def _search_invocation(segment: List[str]) -> Optional[SearchInvocation]:
         if token == "--":  # POSIX end-of-options: everything after names a root.
             operands.extend(tokens[index + 1:])
             break
+        if spec.roots_lead_expression and token in _FIND_GLOBAL_OPTIONS:
+            index += 1  # find: a global option still precedes the path list
+            continue
         if spec.roots_lead_expression and token.startswith(("-", "!", "(")):
             break  # find: the path list ended, this is the expression
         name, separator, attached = token.partition("=")
@@ -206,7 +217,14 @@ def _search_invocation(segment: List[str]) -> Optional[SearchInvocation]:
 
 
 def _hermes_home_directories() -> frozenset:
-    """The Hermes homes a worker may be sitting in: the active one and the shared ``~/.hermes``."""
+    """The Hermes homes a worker may be sitting in: the active one and the shared ``~/.hermes``.
+
+    The shared home is named as ``Path.home() / ".hermes"`` rather than through
+    ``get_hermes_home()`` on purpose: under a profile, ``get_hermes_home()`` is the
+    *lane's* home, and the shared tree — every lane's sessions, logs and workspaces —
+    is the one a ``.``-rooted walk burns through. State files still use
+    ``get_hermes_home()``; this is a search-root classification, not a state path.
+    """
     from hermes_constants import get_hermes_home
 
     try:
