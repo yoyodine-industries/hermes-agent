@@ -1,8 +1,7 @@
 """Persist acceptance with the same ownership snapshot as the terminal write."""
 from __future__ import annotations
 
-from hermes_cli.kanban_db_connect import write_txn
-from hermes_cli.kanban_pr_acceptance import _PR, collect_acceptance
+from hermes_cli.kanban_pr_acceptance import collect_acceptance
 
 
 def _snapshot(conn, task_id):
@@ -20,15 +19,11 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
         return False
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
-    match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
-    # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
-    if match and contract == match[1]:
-        with write_txn(conn):
-            if _snapshot(conn, task_id) != snapshot:
-                return False
-            conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
-        snapshot = (run_id, status, published_pr)
-        contract = published_pr
+    # The contract is the DECLARATION and never moves. Rebinding OWNER/REPO to the first
+    # published PR here froze the card into that head: a superseded PR (red, closed, or
+    # retargeted) then made completion unsatisfiable forever, with no verb to release it.
+    # The publication rides ``collect_acceptance``'s receipt instead, and "the PR belongs
+    # to the declared repository" is already the fence there.
     return snapshot, collect_acceptance(contract, published_pr)
 
 

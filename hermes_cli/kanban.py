@@ -207,6 +207,9 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+    # A worker must not relabel the fence that is holding it: the contract release is
+    # top-level only (the write itself is also refused at the DB layer).
+    "set-contract",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
@@ -333,6 +336,7 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
+    from hermes_cli.kanban_pr_acceptance import needs_repository_checks
 
     body = args.body
     body_file = getattr(args, "body_file", None)
@@ -382,6 +386,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _print_json(_task_to_dict(task))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if needs_repository_checks(task.completion_contract):
+            # One line, on the create output (D4-iii): a checks-backed contract cannot be
+            # satisfied by a repository that requires no checks, and the author is still the
+            # cheapest person to fix it (a completion attempt parks such a card).
+            print(f"  note: OWNER/REPO and PR-URL contracts require repository-required checks; "
+                  f"a repo with none configured can never complete — use local-only for non-CI "
+                  f"work (`hermes kanban set-contract {task_id} local-only --reason ...`, top-level only)")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
         if task.status == "ready" and task.assignee:
@@ -594,6 +605,23 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_contract(args: argparse.Namespace) -> int:
+    """Correct a task's completion contract: the release for a wrong or unsatisfiable one."""
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.set_contract(
+                conn, args.task_id, args.contract, reason=args.reason,
+                actor=getattr(args, "author", None) or _profile_author(),
+            )
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    print(f"Set completion contract on {args.task_id}: {args.contract} "
+          f"(recorded as contract_changed; a parked card stays parked — unblock it to resume)")
     return 0
 
 
@@ -930,9 +958,17 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
+            except kb.HallucinatedCardsError as phantom:
+                # The same refusal vocabulary as CompletionRefusal, but it stays an
+                # exception: callers already catch it, and it must not read as a clean "no".
+                fail_msg[tid] = f"cannot complete {tid} [{phantom.cause}]: {phantom}"
+                return False
             if not done:
-                # complete_task returns bare False for a dependency refusal too;
-                # name the open parents instead of claiming the id is unknown.
+                # A typed refusal names its own cause; a bare False (no such id, or a
+                # contract that cannot pass) must not be reported as a dependency problem.
+                if isinstance(done, kb.CompletionRefusal):
+                    fail_msg[tid] = f"cannot complete {tid} [{done.cause}]: {done.detail}"
+                    return False
                 blockers = kb.unsatisfied_parents(conn, tid)
                 if blockers:
                     detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
@@ -1320,6 +1356,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "set-contract": _cmd_set_contract,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

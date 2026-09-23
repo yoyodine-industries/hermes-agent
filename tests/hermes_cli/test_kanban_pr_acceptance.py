@@ -82,9 +82,14 @@ def test_pr_completion_requires_current_required_evidence(github):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
             ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
-            assert ok is (conclusion == "success")
+            # Success is still exactly True; a refusal is now a falsy CompletionRefusal
+            # (typed cause) rather than a bare False that no caller could interpret.
+            assert bool(ok) is (conclusion == "success")
+            assert ok is True or isinstance(ok, kb.CompletionRefusal)
             task = kb.get_task(conn, tid)
-            assert (task.status == "done") is ok
+            assert (task.status == "done") is bool(ok)
+            # Publication is recorded on the receipt; the declaration itself never moves.
+            assert task.completion_contract == "acme/repo"
             receipts = [json.loads(r[0]) for r in conn.execute(
                 "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))]
             assert receipts and receipts[-1]["head_sha"] == "a" * 40

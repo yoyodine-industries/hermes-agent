@@ -1277,9 +1277,18 @@ def create_task(
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
-    from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_pr_acceptance import needs_repository_checks, validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    if needs_repository_checks(completion_contract):
+        # Authoring hint: a checks-backed contract binds every completion to GitHub
+        # evidence, and one whose repository requires no checks can never be satisfied
+        # (complete_task parks the card rather than looping the worker).
+        _log.warning(
+            "completion_contract %s requires repository-required CI checks; a repository "
+            "with none can never satisfy it (use local-only, or `hermes kanban "
+            "set-contract` to release it)", completion_contract,
+        )
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1606,6 +1615,46 @@ def _set_task_override(
         conn.execute(sql, (*params, task_id))
         _append_event(conn, task_id, event_kind, payload)
     notify_task_updated(conn, task_id, changed_fields)
+    return True
+
+
+def set_contract(
+    conn: sqlite3.Connection, task_id: str, contract: str, *, reason: str,
+    actor: str = "user",
+) -> bool:
+    """Correct a task's completion contract — the release for a wrong or unsatisfiable one.
+
+    ``contract`` is ``local-only``, ``OWNER/REPO``, or an exact PR URL (same validation as
+    create). Appends ``contract_changed {old, new, reason, actor}``; a refusal writes no
+    event. ``reason`` is mandatory: re-declaring a contract changes what "green" means for
+    the card, so it has to be defensible from the event log alone. Terminal cards
+    (``done``/``archived``) are refused — their contract is frozen with the run that closed
+    them. A delegated ``delegate_task`` child cannot reach this: ``write_txn`` refuses the
+    mutation, deliberately, so a worker cannot relabel the fence holding it.
+    """
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+
+    value = validate_contract(contract)
+    why = (reason or "").strip()
+    if not why:
+        raise ValueError("set_contract requires a non-empty reason")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, completion_contract FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] in {"done", "archived"}:
+            raise RuntimeError(
+                f"cannot set completion contract on {row['status']} task {task_id}"
+            )
+        old = row["completion_contract"]
+        conn.execute("UPDATE tasks SET completion_contract = ? WHERE id = ?", (value, task_id))
+        _append_event(
+            conn, task_id, "contract_changed",
+            {"old": old, "new": value, "reason": why, "actor": actor or "user"},
+        )
+    notify_task_updated(conn, task_id, ("completion_contract",))
     return True
 
 
@@ -2666,6 +2715,8 @@ class HallucinatedCardsError(ValueError):
     weren't created by this worker (``.phantom``). A ``ValueError`` so tool
     error handlers treat it as recoverable."""
 
+    cause = "hallucinated_created_cards"
+
     def __init__(self, phantom: list[str], completing_task_id: str):
         self.phantom = list(phantom)
         self.completing_task_id = completing_task_id
@@ -2706,6 +2757,50 @@ class LiveClaimError(ValueError):
         )
 
 
+COMPLETION_REFUSAL_CAUSES = (
+    "unknown_id",                  # no such task on this board
+    "not_running",                 # status or run changed under the caller
+    "parent_gate_unsatisfied",     # a parent is not terminal yet
+    "acceptance_refusal",          # the PR acceptance receipt is not green
+    "record_acceptance_refusal",   # the card moved while its receipt was collected
+    "hallucinated_created_cards",  # created_cards names cards this worker did not create
+)
+
+
+class CompletionRefusal:
+    """Why :func:`complete_task` refused, as data instead of a bare ``False``.
+
+    Falsy, so every existing ``if not complete_task(...)`` caller keeps its meaning, while
+    the operator-facing surfaces can name the *cause* — a bool cannot tell a mistyped id
+    from a completion contract no retry can satisfy, and that ambiguity is how a card sits
+    un-completable with no signal. :class:`HallucinatedCardsError` stays an exception
+    (existing callers catch it) and carries the same cause name as a class attribute.
+    """
+
+    __slots__ = ("cause", "detail")
+
+    def __init__(self, cause: str, detail: str):
+        if cause not in COMPLETION_REFUSAL_CAUSES:
+            raise ValueError(f"unknown completion refusal cause: {cause!r}")
+        self.cause = cause
+        self.detail = detail
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"CompletionRefusal(cause={self.cause!r}, detail={self.detail!r})"
+
+
+# The one release for a wrong or unsatisfiable contract, named on every refusal and park a
+# contract caused: the operator is top-level, and a dispatched worker can only read its card.
+SET_CONTRACT_HINT = (
+    "A contract that no retry can satisfy is released by a top-level operator with "
+    "`hermes kanban set-contract <task_id> local-only|OWNER/REPO|<PR URL> --reason \"...\"` "
+    "(no board write from a dispatched worker — card the release instead)"
+)
+
+
 def _claim_is_live(trow) -> bool:
     """True when a ``running`` task's claim still protects a run: the worker process
     it spawned exists (PID + start-time fingerprint). A claim whose worker is gone,
@@ -2725,7 +2820,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
-) -> bool:
+) -> bool | CompletionRefusal:
     """``running|ready|blocked|review -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
@@ -2742,11 +2837,17 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+    A refusal is a falsy :class:`CompletionRefusal` naming its ``cause`` (see
+    :data:`COMPLETION_REFUSAL_CAUSES`) in ``detail`` terms a human can act on — an unknown
+    id and an unsatisfiable contract are different problems and must not read alike. When
+    the receipt proves the contract is UNSATISFIABLE (CI-backed, and the repository requires
+    no checks at all) the card is parked ``blocked`` with kind ``capability`` as well as
+    refused: a bare refusal only respawns the worker against a verdict no retry can change.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
-        return False
+        return _parent_gate_refusal(conn, task_id)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -2756,14 +2857,28 @@ def complete_task(
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
-        return False
+        # prepare_acceptance refuses for two different reasons; name the real one.
+        status = _task_status(conn, task_id)
+        if status is None:
+            return CompletionRefusal("unknown_id", f"no task {task_id} on this board")
+        return CompletionRefusal(
+            "not_running",
+            f"{task_id} is {status}: completion needs running|ready|blocked|review, and a "
+            f"running card also needs the caller to own its run (expected_run_id) or --force",
+        )
+    if _unsatisfiable_acceptance(acceptance):
+        return _park_unsatisfiable_contract(conn, task_id, acceptance)
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
-            return False
+            return _parent_gate_refusal(conn, task_id)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
+            receipt = acceptance[1]
+            if not receipt.get("ok"):
+                return _acceptance_refusal(receipt)
+            # Green receipt, refused write: the CARD moved (status/run/contract) mid-flight.
+            return _record_acceptance_refusal(task_id)
         trow = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
@@ -2792,7 +2907,10 @@ def complete_task(
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
-            return False
+            return CompletionRefusal(
+                "not_running",
+                f"{task_id} left a completable status while it was being closed",
+            )
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -2825,6 +2943,82 @@ def complete_task(
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
     return True
+
+
+def _parent_gate_refusal(conn: sqlite3.Connection, task_id: str) -> CompletionRefusal:
+    """Name the open parents — a caller cannot tell a live dependency from a mistyped id."""
+    blockers = unsatisfied_parents(conn, task_id)
+    detail = ", ".join(f"{pid} ({status})" for pid, status in blockers) or "an unfinished parent"
+    return CompletionRefusal(
+        "parent_gate_unsatisfied",
+        f"unsatisfied parent dependencies: {detail}; complete the parents first, or unlink a "
+        f"parent that is no longer a dependency",
+    )
+
+
+def _acceptance_refusal(receipt: dict) -> CompletionRefusal:
+    """Refuse a non-green PR acceptance receipt, naming the contract's release as well."""
+    detail = (f"PR acceptance {receipt.get('classification', 'unknown')}: "
+              f"{receipt.get('detail', '')} {receipt.get('recovery', '')}").strip()
+    return CompletionRefusal("acceptance_refusal", f"{detail} {SET_CONTRACT_HINT}")
+
+
+def _record_acceptance_refusal(task_id: str) -> CompletionRefusal:
+    """The receipt was collected against a card that then moved (status/run/contract)."""
+    return CompletionRefusal(
+        "record_acceptance_refusal",
+        f"{task_id} changed while its acceptance receipt was being collected; re-read the "
+        f"card and retry, or reclaim it if a rival took the run",
+    )
+
+
+def _unsatisfiable_acceptance(acceptance) -> bool:
+    """True when the receipt proves NO retry can pass.
+
+    ``collect_acceptance`` reports ``missing`` both for a check that has not appeared yet
+    (retryable) and for a repository that requires no checks at all. ``required == []`` is
+    the second case, which is permanent for this contract: nothing the worker does can make
+    a required check exist.
+    """
+    if acceptance is None:
+        return False
+    return acceptance[1].get("classification") == "missing" and acceptance[1].get("required") == []
+
+
+def _park_unsatisfiable_contract(
+    conn: sqlite3.Connection, task_id: str, acceptance,
+) -> CompletionRefusal:
+    """Record the receipt, park the card ``blocked``/``capability``, then refuse.
+
+    A plain refusal is not terminal: the dispatcher still sees a claimable card, respawns
+    the worker, and the same receipt comes back forever. Parking is what makes "this cannot
+    be satisfied" durable, and the reason carries the release (``set-contract``) so the
+    board itself says who can unstick it.
+    """
+    snapshot, receipt = acceptance
+    contract = snapshot[2]
+    from hermes_cli.kanban_pr_acceptance_store import _snapshot, record_acceptance
+
+    with write_txn(conn):
+        record_acceptance(conn, task_id, acceptance)
+        # ``record_acceptance`` returns the receipt's ``ok`` (False for every refusal), so
+        # "did the write land" is the snapshot comparison, never the return value.
+        landed = _snapshot(conn, task_id) == snapshot
+    if not landed:
+        return _record_acceptance_refusal(task_id)
+    reason = (
+        f"completion contract {contract} cannot be satisfied: "
+        f"{receipt.get('detail') or 'no repository-required checks are configured'} "
+        f"{SET_CONTRACT_HINT}."
+    )
+    parked = block_task(conn, task_id, reason=reason, kind="capability")
+    return CompletionRefusal(
+        "acceptance_refusal",
+        f"PR acceptance {receipt.get('classification', 'missing')}: "
+        f"{receipt.get('detail', '')} "
+        f"{'The card is parked blocked (capability) until the contract is released.' if parked else ''} "
+        f"{SET_CONTRACT_HINT}",
+    )
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."

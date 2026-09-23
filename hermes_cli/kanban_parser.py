@@ -257,6 +257,15 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-contract", [
+        _TASK_ID,
+        _arg("contract",
+             help="New completion contract: 'local-only', 'OWNER/REPO', or an exact GitHub PR URL"),
+        _arg("--reason", required=True,
+             help="Why the contract is changing (recorded on the contract_changed event; required)"),
+        _arg("--author", help="Author name recorded on the change (default: $HERMES_PROFILE or 'user')"),
+    ], help="Correct a task's completion contract — the release for a wrong or unsatisfiable one "
+            "(top-level only; refused on done/archived cards)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
