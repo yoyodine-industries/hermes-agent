@@ -4816,6 +4816,38 @@ async def _wait_for_pid_exit(pid: int, attempts: int, delay: float) -> bool:
     return False
 
 
+def _resolve_replace_exit_wait_budget() -> float:
+    """Seconds ``--replace`` waits for the incumbent gateway to exit before escalating to SIGKILL.
+
+    Sized from the same budget the incumbent's ``stop()`` may legally spend on in-flight cron work
+    (``cron_drain_timeout`` plus the cleanup reserve), plus the service-manager headroom and floor —
+    i.e. the leash its ``TimeoutStopSec`` gives it (:func:`resolve_systemd_timeout_stop_sec`). A
+    shorter fixed window SIGKILLs a cron job mid-write, which jobs.json then records as a permanent
+    failure. Both values come through the runner's own loaders, so an env override, a configured
+    ``0`` opt-out and a garbage value resolve exactly as the drain side resolves them.
+    """
+    from gateway.restart import (
+        DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
+        DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+        resolve_systemd_timeout_stop_sec,
+    )
+    try:
+        drain_timeout = GatewayConfigLoadersMixin._load_restart_drain_timeout()
+        cron_drain_timeout = GatewayConfigLoadersMixin._load_cron_drain_timeout()
+    except Exception:
+        logger.warning("Could not read drain timeouts for --replace; using defaults.", exc_info=True)
+        drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+        cron_drain_timeout = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
+    return float(resolve_systemd_timeout_stop_sec(drain_timeout, cron_drain_timeout))
+
+
+async def _wait_for_pid_exit_for(pid: int, timeout: float, delay: float = 0.5) -> bool:
+    """Wait up to ``timeout`` seconds for ``pid`` to exit — a cap, not a delay: it returns as soon
+    as the PID is gone, and only a process that outlives the whole budget reports False."""
+    import math
+    return await _wait_for_pid_exit(pid, max(1, int(math.ceil(float(timeout) / delay))), delay)
+
+
 async def _start_gateway_replace_existing_instance(existing_pid: int, replace: bool) -> bool:
     """Handle a live gateway PID under this HERMES_HOME: replace it (``--replace``) or refuse.
     Returns False when startup must abort (refused, permission denied, target still alive)."""
@@ -4864,8 +4896,13 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
         logger.error("Permission denied killing PID %d. Cannot replace.", existing_pid)
         _clear_takeover_marker_quiet()
         return False
-    # Up to 10s for SIGTERM, then SIGKILL.
-    if not await _wait_for_pid_exit(existing_pid, 20, 0.5):
+    # SIGTERM, then SIGKILL only once the incumbent's own drain budget is spent: a shorter fixed
+    # window (20 x 0.5s) SIGKILLs cron work the stop path may still be legally draining.
+    _exit_wait_budget = _resolve_replace_exit_wait_budget()
+    logger.info(
+        "Waiting up to %.0fs for gateway PID %d to exit before escalating to SIGKILL.",
+        _exit_wait_budget, existing_pid)
+    if not await _wait_for_pid_exit_for(existing_pid, _exit_wait_budget):
         logger.warning("Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.", existing_pid)
         old_gateway_exited = False
         try:
