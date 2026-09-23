@@ -14,6 +14,7 @@ Contract under test (maintenance-framework design sections 1.1-1.3):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime
@@ -121,6 +122,53 @@ def test_every_block_kind_enqueues_one_row_post_commit(kanban_home, kind):
         last_failure_error=None,
     )
     assert datetime.fromisoformat(row["enqueued_at"]).tzinfo is not None
+
+
+def _gate_fingerprint(task_id, status, block_kind, block_recurrences, last_failure_error):
+    """The DAG gate node's own recipe, restated verbatim.
+
+    This is ``scripts/kanban_unblocker_nodes.py::state_fingerprint`` (version
+    prefix ``FINGERPRINT_VERSION = "v1"``, ``\\x1f`` join, ``str(v or "")`` for
+    the string fields, ``str(v) if v is not None else ""`` for the recurrences).
+    The enqueue hook must reproduce these EXACT bytes or the queue's coalescing
+    key and the DAG's disposition key drift apart for the same card state.
+    """
+    parts = [
+        "v1",
+        str(task_id or ""),
+        str(status or ""),
+        str(block_kind or ""),
+        str(block_recurrences) if block_recurrences is not None else "",
+        str(last_failure_error or ""),
+    ]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def test_fingerprint_matches_the_gate_node_recipe():
+    # The hook's fingerprint must be byte-identical to the DAG gate's for the same
+    # state, including the "v1" version prefix.
+    assert kanban_unblocker_queue.state_fingerprint(
+        task_id="t_fake_wall", status="blocked", block_kind="transient",
+        block_recurrences=1, last_failure_error="provider billing 402",
+    ) == _gate_fingerprint(
+        "t_fake_wall", "blocked", "transient", 1, "provider billing 402",
+    )
+
+
+def test_fingerprint_distinguishes_none_from_zero_recurrences():
+    # The recurrences field is the one whose None/0 distinction the gate keeps:
+    # None (never blocked) must not collide with 0 (blocked then cleared).
+    none_fp = kanban_unblocker_queue.state_fingerprint(
+        task_id="t_x", status="blocked", block_kind="transient",
+        block_recurrences=None, last_failure_error=None,
+    )
+    zero_fp = kanban_unblocker_queue.state_fingerprint(
+        task_id="t_x", status="blocked", block_kind="transient",
+        block_recurrences=0, last_failure_error=None,
+    )
+    assert none_fp != zero_fp
+    assert none_fp == _gate_fingerprint("t_x", "blocked", "transient", None, None)
+    assert zero_fp == _gate_fingerprint("t_x", "blocked", "transient", 0, None)
 
 
 def test_dependency_block_fires_the_hook_post_commit(kanban_home, captured_hooks):

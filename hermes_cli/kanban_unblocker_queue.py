@@ -90,6 +90,12 @@ _DOMAIN_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
 #: unambiguous without escaping.
 _SEP = "\x1f"
 
+#: Fingerprint recipe version, shared with the DAG's gate node
+#: (``scripts/kanban_unblocker_nodes.py``). The version is the FIRST joined field,
+#: so a recipe change yields a different value for the same state rather than
+#: silently colliding with a disposition keyed on the old recipe.
+FINGERPRINT_VERSION = "v1"
+
 
 def kanban_unblocker_db_path() -> Path:
     """The kanban-unblocker queue store: ``<hermes home>/kanban/kanban-unblocker.db``."""
@@ -115,28 +121,24 @@ def state_fingerprint(
 ) -> str:
     """Hash of the state a disposition would act on.
 
-    Recipe (shared with the kanban-unblocker DAG's gate node): sha256 over the UTF-8 encoding
-    of ``task_id, status, block_kind, block_recurrences, last_failure_error``
-    joined by U+001F, each rendered with :func:`_field`. ``None`` and ``0`` are
-    distinct; a changed error string is a changed state, which is what lets a
-    re-blocked card with a NEW cause disposition again.
+    Recipe is the SAME bytes the DAG's gate node hashes (this is a shared
+    contract, not two recipes): sha256 over the UTF-8 encoding of the
+    ``FINGERPRINT_VERSION`` prefix then ``task_id, status, block_kind,
+    block_recurrences, last_failure_error``, joined by U+001F, each rendered with
+    the gate's own field rule (``str(value or "")`` for the string fields;
+    ``str(value) if value is not None else ""`` for ``block_recurrences`` so that
+    ``None`` and ``0`` stay distinct). A changed error string is a changed state,
+    which is what lets a re-blocked card with a NEW cause disposition again.
     """
-    body = _SEP.join(
-        _field(value)
-        for value in (task_id, status, block_kind, block_recurrences, last_failure_error)
-    )
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-
-def _field(value: Any) -> str:
-    """One fingerprint field: ``None`` -> empty string, ints canonicalised."""
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, int):
-        return str(value)
-    return str(value).strip() if isinstance(value, str) else str(value)
+    parts = [
+        FINGERPRINT_VERSION,
+        str(task_id or ""),
+        str(status or ""),
+        str(block_kind or ""),
+        str(block_recurrences) if block_recurrences is not None else "",
+        str(last_failure_error or ""),
+    ]
+    return hashlib.sha256(_SEP.join(parts).encode("utf-8")).hexdigest()
 
 
 def domain_for_board(board: Any) -> str:
