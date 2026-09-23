@@ -83,6 +83,7 @@ def collect_memory_status(
     status: Dict[str, Any] = {
         "pressure": "unknown", "gateway_rss_mb": None, "system_total_mb": None, "system_available_mb": None,
         "swap_used_mb": None, "sampled_at": None, "last_boot_unclean": False, "last_boot_suspected_oom": False,
+        "last_boot_exit_interrupted": False,
         # Identity of the CURRENT life (sentinel started_at): the dashboard keys
         # banner dismissal on it so acknowledging one OOM restart does not mute the NEXT.
         "boot_id": None,
@@ -106,6 +107,9 @@ def collect_memory_status(
     if sentinel:
         status["last_boot_unclean"] = bool(sentinel.get("prior_unclean_exit"))
         status["last_boot_suspected_oom"] = bool(sentinel.get("prior_suspected_oom"))
+        # A requested exit its supervisor cut short is not a death signal: it rides its own
+        # key so last_boot_unclean stays bound to unrequested deaths (banner + alarm).
+        status["last_boot_exit_interrupted"] = bool(sentinel.get("prior_exit_interrupted"))
         started_at = sentinel.get("started_at")
         status["boot_id"] = started_at if isinstance(started_at, str) and started_at else None
 

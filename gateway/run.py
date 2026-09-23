@@ -4964,6 +4964,20 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
         _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
 
+        # Stamp exit INTENT synchronously, before the async stop() task exists: a supervisor
+        # that SIGKILLs us mid-drain (launchd `kickstart -k`, --replace) makes mark_exited()
+        # unreachable, and without this the next boot files that wanted restart as an unclean
+        # OOM/SIGKILL death.  The reason records how we were asked to go.
+        _exit_request_reason = ("takeover" if planned_takeover
+                                else "planned_stop" if planned_stop else (sig_name or "signal"))
+
+        def _record_exit_intent() -> None:
+            from gateway.lifecycle_ledger import mark_exit_requested
+
+            mark_exit_requested(_exit_request_reason)
+
+        _best_effort(_record_exit_intent, "mark_exit_requested failed: %s")
+
         if planned_takeover:
             logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
         elif planned_stop:

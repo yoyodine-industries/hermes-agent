@@ -19,6 +19,7 @@ import pytest
 from gateway.lifecycle_ledger import (
     detect_unclean_exit,
     get_lifecycle_sentinel_path,
+    mark_exit_requested,
     mark_exited,
     read_prior_exit_label,
     record_startup,
@@ -250,3 +251,125 @@ def test_replace_handover_is_not_a_death_and_pid_reuse_is(tmp_path: Path, monkey
     assert detect_unclean_exit(home=tmp_path) is None
     _write_sentinel(tmp_path, {**live, "start_time": 4000.0})  # born after the claim → reuser → death
     assert detect_unclean_exit(home=tmp_path) is not None
+
+
+# ---------------------------------------------------------------------------
+# Exit intent: a requested exit its supervisor cut short is NOT a death
+# ---------------------------------------------------------------------------
+
+
+def test_mark_exit_requested_stamps_intent_on_own_sentinel(tmp_path: Path) -> None:
+    record_startup(home=tmp_path)
+    mark_exit_requested("planned_stop", home=tmp_path)
+    sentinel = _read_sentinel(tmp_path)
+    assert sentinel["exit_requested"] is True
+    assert sentinel["exit_request_reason"] == "planned_stop"
+    # The stamp must not disturb what identifies the life: the ownership guard and
+    # `boot_id` (dashboard banner dismissal) both read these.
+    assert (sentinel["phase"], sentinel["pid"]) == ("running", os.getpid())
+    assert sentinel["start_time"] and sentinel["started_at"]
+
+
+def test_mark_exit_requested_leaves_foreign_and_exited_sentinels_alone(tmp_path: Path) -> None:
+    """Only the owning, still-running life may record intent — same guard as mark_exited."""
+    _write_sentinel(tmp_path, {"phase": "running", "pid": _DEAD_PID, "start_time": 1000.0})
+    mark_exit_requested("planned_stop", home=tmp_path)
+    foreign = _read_sentinel(tmp_path)
+    assert "exit_requested" not in foreign
+    assert foreign["pid"] == _DEAD_PID
+
+    record_startup(home=tmp_path)
+    mark_exited(0, reason="graceful_shutdown", home=tmp_path)
+    mark_exit_requested("restart", home=tmp_path)
+    assert "exit_requested" not in _read_sentinel(tmp_path)
+
+
+def test_cut_short_requested_exit_is_interrupted_not_unclean(tmp_path: Path) -> None:
+    """A life that recorded exit intent and then died before mark_exited (launchd
+    `kickstart -k` SIGKILLs the drain) is an interrupted requested exit — `unclean`,
+    which the OOM verdict and the banner key on, stays reserved for deaths nothing
+    asked for."""
+    _write_sentinel(tmp_path, {
+        "phase": "running",
+        "pid": _DEAD_PID,
+        "start_time": 1000.0,
+        "started_at": "2026-07-11T04:30:00+00:00",
+        "exit_requested": True,
+        "exit_request_reason": "restart",
+    })
+
+    evidence = record_startup(home=tmp_path)
+    assert evidence is not None
+    assert evidence["exit_requested"] is True
+    assert evidence["exit_request_reason"] == "restart"
+
+    records = _exit_diag_records(tmp_path)
+    assert [r["tag"] for r in records] == ["gateway.previous_exit_interrupted"]
+    assert records[0]["exit_request_reason"] == "restart"
+    assert records[0]["prior_pid"] == _DEAD_PID
+
+    sentinel = _read_sentinel(tmp_path)
+    assert sentinel["prior_exit_interrupted"] is True
+    assert "prior_unclean_exit" not in sentinel
+    assert "prior_suspected_oom" not in sentinel
+
+
+def test_unrequested_death_stays_unclean_and_keeps_the_oom_verdict(tmp_path: Path) -> None:
+    """The complement of the test above: with no exit intent on the dead sentinel,
+    nothing changes — still unclean, still suspected_oom. Guards the new branch from
+    swallowing real deaths."""
+    _write_sentinel(tmp_path, {
+        "phase": "running",
+        "pid": _DEAD_PID,
+        "start_time": 1000.0,
+        "started_at": "2026-07-11T04:30:00+00:00",
+    })
+    # Last heartbeat shows near-exhausted memory → suspected OOM.
+    from gateway.shutdown_watchdog import get_loop_heartbeat_path
+
+    hb_path = get_loop_heartbeat_path(tmp_path)
+    hb_path.parent.mkdir(parents=True, exist_ok=True)
+    hb_path.write_text(json.dumps({
+        "pid": _DEAD_PID,
+        "updated_at": "2026-07-11T05:00:00+00:00",
+        "mem": {"mem_total_kib": 1024 * 1024, "mem_available_kib": 20 * 1024},
+    }), encoding="utf-8")
+
+    evidence = record_startup(home=tmp_path)
+    assert evidence is not None
+    assert evidence["exit_requested"] is False
+    assert evidence.get("suspected_oom") is True
+
+    assert [r["tag"] for r in _exit_diag_records(tmp_path)] == ["gateway.previous_unclean_exit"]
+    sentinel = _read_sentinel(tmp_path)
+    assert sentinel["prior_unclean_exit"] is True
+    assert sentinel["prior_suspected_oom"] is True
+    assert "prior_exit_interrupted" not in sentinel
+
+
+def test_memory_status_surfaces_interrupted_boot_without_an_unclean_alarm(tmp_path: Path) -> None:
+    """/api/status drives the OOM banner off last_boot_unclean: an interrupted requested
+    exit must reach the dashboard on its own key and leave the alarm key False."""
+    from gateway.memory_status import collect_memory_status
+
+    _write_sentinel(tmp_path, {
+        "phase": "running",
+        "pid": _DEAD_PID,
+        "start_time": 1000.0,
+        "started_at": "2026-07-11T04:30:00+00:00",
+        "exit_requested": True,
+        "exit_request_reason": "takeover",
+    })
+    record_startup(home=tmp_path)
+
+    status = collect_memory_status(home=tmp_path)
+    assert status["last_boot_exit_interrupted"] is True
+    assert status["last_boot_unclean"] is False
+    assert status["last_boot_suspected_oom"] is False
+
+
+def test_memory_status_reports_interrupted_flag_false_without_a_prior_life(tmp_path: Path) -> None:
+    """The key is present and False on a first boot — consumers never KeyError."""
+    from gateway.memory_status import collect_memory_status
+
+    assert collect_memory_status(home=tmp_path)["last_boot_exit_interrupted"] is False

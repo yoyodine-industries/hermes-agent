@@ -442,7 +442,10 @@ The response also carries two advisory resource blocks (they never affect the
   lifecycle ledger. Fields: `pressure` (`ok` / `elevated` / `critical` /
   `unknown`), `gateway_rss_mb`, `system_total_mb`, `system_available_mb`,
   `swap_used_mb`, `sampled_at`, `boot_id`, `last_boot_unclean`,
-  `last_boot_suspected_oom`. Pressure is `elevated` below 128 MiB (or 15%) of
+  `last_boot_exit_interrupted`, `last_boot_suspected_oom`. `last_boot_unclean` is
+  `true` only for a death nothing asked for (SIGKILL / OOM / VM loss); an exit the
+  gateway was asked to make but a supervisor killed mid-drain reports on
+  `last_boot_exit_interrupted` instead. Pressure is `elevated` below 128 MiB (or 15%) of
   available system memory and `critical` below 64 MiB (or 5%) — the same
   levels at which a subsequent unclean exit would be flagged as a suspected
   OOM kill. Heartbeats older than 150 seconds (or future-dated) keep their

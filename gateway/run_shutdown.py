@@ -1478,6 +1478,13 @@ class GatewayShutdownMixin:
         self._restart_detached = detached
         self._restart_via_service = via_service
         self._restart_task_started = True
+        # Record exit intent now: the drain below can be cut short (launchd `kickstart -k`
+        # SIGKILLs at ~20s while cron_drain_timeout waits 30s), and a death with no exit path
+        # would be filed by the next boot as unclean instead of the requested restart it is.
+        with _log_suppressed(logging.ERROR, "Failed to record gateway exit intent: %s"):
+            from gateway.lifecycle_ledger import mark_exit_requested
+
+            mark_exit_requested("restart")
         # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
         self._draining = True
 

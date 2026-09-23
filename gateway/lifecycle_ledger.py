@@ -6,7 +6,12 @@ death (SIGKILL, kernel OOM, VM death) runs no handler.  A sentinel at
 :func:`record_startup` finds ``phase == "running"`` from the previous life →
 unclean death, appended to the exit-diag log as ``gateway.previous_unclean_exit``
 and logged at WARNING; :func:`mark_exited` rewrites ``phase=exited`` on every
-clean exit path.  Best-effort: forensics must never affect the lifecycle.
+clean exit path.  :func:`mark_exit_requested` stamps exit INTENT as soon as the
+process is asked to exit, so a requested exit a supervisor cut short mid-drain
+(launchd ``kickstart -k`` SIGKILLs the drain; ``--replace``) is reported as
+``gateway.previous_exit_interrupted`` instead of an unclean death — the OOM verdict
+stays reserved for deaths nothing asked for.  Best-effort: forensics must never
+affect the lifecycle.
 """
 
 from __future__ import annotations
@@ -159,7 +164,14 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]
     evidence: Dict[str, Any] = {
         "prior_pid": sentinel.get("pid"), "prior_started_at": sentinel.get("started_at"),
         "prior_start_time": sentinel.get("start_time"),
+        # POSIX distinction: a death nothing asked for (SIGKILL / kernel OOM / VM loss — no
+        # handler can run) is unclean; an exit the process WAS asked to make (SIGTERM/SIGINT/
+        # SIGUSR1) that a supervisor cut short mid-drain is a requested exit the drain never
+        # finished.  Without this the two are indistinguishable to the next boot.
+        "exit_requested": bool(sentinel.get("exit_requested")),
     }
+    if sentinel.get("exit_request_reason"):
+        evidence["exit_request_reason"] = sentinel["exit_request_reason"]
     # Enrich with the last heartbeat: last proven liveness and memory at that moment.
     try:
         from gateway.shutdown_watchdog import get_loop_heartbeat_path
@@ -197,8 +209,11 @@ def check_state_db_integrity(home: Optional[Path] = None) -> str:
 
 
 def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None:
-    """Integrity-check the store, persist the exit-diag record, log at WARNING."""
-    # The death may have torn the store; this is the only moment we know to look.
+    """Integrity-check the store, persist the exit-diag record and log the verdict: an
+    interrupted *requested* exit at INFO (``gateway.previous_exit_interrupted``), an
+    unrequested death at WARNING (``gateway.previous_unclean_exit``)."""
+    # Either death can tear the store; this is the only moment we know to look.  The record's
+    # TAG — not the check — is what separates a cut-short requested exit from a death.
     verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
     if verdict not in ("ok", "absent"):
         logger.error(
@@ -206,6 +221,18 @@ def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None
             "missing until it is repaired. Run `hermes doctor`.",
             verdict,
         )
+    if evidence.get("exit_requested"):
+        # Not an OOM alarm: we were asked to exit and a supervisor SIGKILLed the drain.
+        _append_exit_diag(
+            {"ts": _now_iso(), "tag": "gateway.previous_exit_interrupted", "pid": os.getpid(), **evidence}, home)
+        logger.info(
+            "Previous gateway life (pid=%s, started_at=%s) exited on request (%s) without reaching its "
+            "exit path — an interrupted requested exit, not a death. last_heartbeat_at=%s suspected_oom=%s",
+            evidence.get("prior_pid"), evidence.get("prior_started_at"),
+            evidence.get("exit_request_reason") or "requested_exit",
+            evidence.get("last_heartbeat_at"), evidence.get("suspected_oom", False),
+        )
+        return
     _append_exit_diag({"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home)
     logger.warning(
         "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
@@ -238,13 +265,39 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
         # machine-readable copy (/api/status reads it to report an OOM restart).
         # Scoped to this life — the next clean exit or boot rewrites the sentinel.
         if evidence is not None:
-            claim["prior_unclean_exit"] = True
-            if evidence.get("suspected_oom"):
-                claim["prior_suspected_oom"] = True
+            if evidence.get("exit_requested"):
+                # A requested exit its supervisor cut short: reported on its own key, so
+                # /api/status (memory_status.last_boot_unclean) and the OOM banner stay quiet.
+                # prior_unclean_exit stays reserved for deaths nothing asked for.
+                claim["prior_exit_interrupted"] = True
+            else:
+                claim["prior_unclean_exit"] = True
+                if evidence.get("suspected_oom"):
+                    claim["prior_suspected_oom"] = True
         _write_sentinel(claim, home)
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
     return evidence
+
+
+def mark_exit_requested(reason: str = "requested_exit", home: Optional[Path] = None) -> None:
+    """Record exit INTENT on this life's sentinel the moment the process is asked to exit.
+
+    A requested exit whose drain a supervisor cuts short (launchd ``kickstart -k`` SIGKILLs
+    at ~20s; ``--replace`` takeovers) never reaches an exit path, so without this stamp the
+    next boot cannot tell it from an OOM/SIGKILL death and files a wanted restart as
+    ``unclean``.  Same ownership guard as :func:`mark_exited` — a sentinel another process
+    owns is left alone.  Never raises.
+    """
+    try:
+        sentinel = _read_json(get_lifecycle_sentinel_path(home))
+        if sentinel is None or sentinel.get("phase") != "running" or sentinel.get("pid") != os.getpid():
+            return
+        sentinel["exit_requested"] = True
+        sentinel["exit_request_reason"] = reason
+        _write_sentinel(sentinel, home)
+    except Exception:
+        logger.debug("Failed to record lifecycle exit intent", exc_info=True)
 
 
 def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdown", home: Optional[Path] = None) -> None:
