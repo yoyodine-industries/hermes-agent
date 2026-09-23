@@ -1,11 +1,11 @@
-"""The belt enqueue path: every block kind queues one row, post-commit.
+"""The kanban-unblocker enqueue path: every block kind queues one row, post-commit.
 
 Contract under test (maintenance-framework design sections 1.1-1.3):
 
 - ``block_task`` fires ``kanban_task_blocked`` AFTER the write txn commits, for
   EVERY kind — the dependency kind included (it used to fire inside the txn).
 - A first-party lifecycle observer (``hermes_cli.observability``) appends one
-  row to ``belt.db`` and returns: enqueue-only, no board write, no routing.
+  row to ``kanban-unblocker.db`` and returns: enqueue-only, no board write, no routing.
 - The queue coalesces on STATE: ``(task_id, state_fingerprint)`` is unique, so a
   re-fire over an unchanged card does not queue a second disposition.
 - A queue write failure can never break the block, and the board DB is never
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import belt_queue
+from hermes_cli import kanban_unblocker_queue
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli.plugins import get_plugin_manager
@@ -59,13 +59,13 @@ def captured_hooks(monkeypatch):
 
 
 def _bytes(conn) -> list[dict]:
-    """Every queued belt row, oldest first (a separate connection, like the dispatcher)."""
+    """Every queued kanban-unblocker row, oldest first (a separate connection, like the dispatcher)."""
     conn.row_factory = sqlite3.Row
-    return [dict(row) for row in conn.execute("SELECT * FROM belt_queue ORDER BY id")]
+    return [dict(row) for row in conn.execute("SELECT * FROM kanban_unblocker_queue ORDER BY id")]
 
 
-def _belt_rows() -> list[dict]:
-    path = belt_queue.belt_db_path()
+def _kanban_unblocker_rows() -> list[dict]:
+    path = kanban_unblocker_queue.kanban_unblocker_db_path()
     if not path.exists():
         return []
     conn = sqlite3.connect(str(path))
@@ -75,13 +75,13 @@ def _belt_rows() -> list[dict]:
         conn.close()
 
 
-def _clear_belt() -> None:
-    path = belt_queue.belt_db_path()
+def _clear_kanban_unblocker_queue() -> None:
+    path = kanban_unblocker_queue.kanban_unblocker_db_path()
     if not path.exists():
         return
     conn = sqlite3.connect(str(path))
     try:
-        conn.execute("DELETE FROM belt_queue")
+        conn.execute("DELETE FROM kanban_unblocker_queue")
         conn.commit()
     finally:
         conn.close()
@@ -99,15 +99,15 @@ def test_every_block_kind_enqueues_one_row_post_commit(kanban_home, kind):
     try:
         tid = kb.create_task(conn, title=f"t-{kind}", assignee="platform-worker")
         _block(conn, tid, kind)
-        rows = _belt_rows()
+        rows = _kanban_unblocker_rows()
     finally:
         conn.close()
 
-    assert len(rows) == 1, f"{kind}: expected exactly one belt row, got {rows}"
+    assert len(rows) == 1, f"{kind}: expected exactly one kanban-unblocker row, got {rows}"
     row = rows[0]
     assert row["task_id"] == tid
     assert row["block_kind"] == kind
-    assert row["domain"] == belt_queue.domain_for_board(row["board"])
+    assert row["domain"] == kanban_unblocker_queue.domain_for_board(row["board"])
     assert row["status"] == "queued"
     assert row["attempts"] == 0
     assert row["run_id"] is None
@@ -115,7 +115,7 @@ def test_every_block_kind_enqueues_one_row_post_commit(kanban_home, kind):
     # The row snapshots the COMMITTED state, so the fingerprint the DAG will
     # recompute is the one the queue recorded.
     expected = "todo" if kind == "dependency" else "blocked"
-    assert row["state_fingerprint"] == belt_queue.state_fingerprint(
+    assert row["state_fingerprint"] == kanban_unblocker_queue.state_fingerprint(
         task_id=tid, status=expected, block_kind=kind,
         block_recurrences=0 if kind == "dependency" else 1,
         last_failure_error=None,
@@ -142,8 +142,8 @@ def test_dependency_block_fires_the_hook_post_commit(kanban_home, captured_hooks
     assert durable_status == "todo"
     # The enqueue ran off durable state: the queue row's fingerprint is the
     # post-block state, not the pre-block one.
-    row = _belt_rows()[0]
-    assert row["state_fingerprint"] == belt_queue.state_fingerprint(
+    row = _kanban_unblocker_rows()[0]
+    assert row["state_fingerprint"] == kanban_unblocker_queue.state_fingerprint(
         task_id=tid, status="todo", block_kind="dependency",
         block_recurrences=0, last_failure_error=None,
     )
@@ -154,17 +154,17 @@ def test_refire_over_unchanged_state_does_not_queue_twice(kanban_home):
     try:
         tid = kb.create_task(conn, title="t", assignee="platform-worker")
         _block(conn, tid, "capability")
-        assert len(_belt_rows()) == 1
+        assert len(_kanban_unblocker_rows()) == 1
         # A re-fire (observer replay, dispatcher retry hint) over the same state
         # coalesces rather than queueing a second disposition.
-        belt_queue.enqueue_block(task_id=tid, board=kb.get_current_board(), reason="waiting")
-        assert len(_belt_rows()) == 1
+        kanban_unblocker_queue.enqueue_block(task_id=tid, board=kb.get_current_board(), reason="waiting")
+        assert len(_kanban_unblocker_rows()) == 1
 
         # A NEW cause is a new state, and does queue.
         conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", ("402 payment required", tid))
         conn.commit()
-        belt_queue.enqueue_block(task_id=tid, board=kb.get_current_board(), reason="waiting")
-        rows = _belt_rows()
+        kanban_unblocker_queue.enqueue_block(task_id=tid, board=kb.get_current_board(), reason="waiting")
+        rows = _kanban_unblocker_rows()
     finally:
         conn.close()
 
@@ -178,7 +178,7 @@ def test_queue_failure_never_breaks_the_block(kanban_home, monkeypatch):
     def _boom(*args, **kwargs):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(belt_queue, "_insert", _boom)
+    monkeypatch.setattr(kanban_unblocker_queue, "_insert", _boom)
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="platform-worker")
@@ -186,7 +186,7 @@ def test_queue_failure_never_breaks_the_block(kanban_home, monkeypatch):
         assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()
-    assert _belt_rows() == []
+    assert _kanban_unblocker_rows() == []
 
 
 def test_board_stays_writable_after_the_enqueue(kanban_home):
@@ -203,7 +203,7 @@ def test_board_stays_writable_after_the_enqueue(kanban_home):
         conn.close()
 
 
-def test_observability_dispatch_reaches_the_belt_queue(kanban_home, monkeypatch):
+def test_observability_dispatch_reaches_the_kanban_unblocker_queue(kanban_home, monkeypatch):
     """The block hook is consumed by a first-party projection, not by a plugin."""
     from hermes_cli import observability
     from hermes_cli.lifecycle import has_hook
@@ -222,31 +222,31 @@ def test_observability_dispatch_reaches_the_belt_queue(kanban_home, monkeypatch)
 
     # Clear what the live hook path queued, then drive the same projection
     # through the dispatch table with a broken sibling ahead of it.
-    _clear_belt()
-    monkeypatch.setattr(observability, "_PROJECTIONS", ("no_such_projection", "belt"))
+    _clear_kanban_unblocker_queue()
+    monkeypatch.setattr(observability, "_PROJECTIONS", ("no_such_projection", "kanban_unblocker"))
     observability.observe_lifecycle(
         "kanban_task_blocked", task_id=tid, board=board, reason="waiting",
     )
-    rows = _belt_rows()
+    rows = _kanban_unblocker_rows()
     assert len(rows) == 1
     assert rows[0]["task_id"] == tid
     assert observability.handles_hook("kanban_task_blocked") is True
 
 
 def test_domain_lookup_defaults_and_registry_override(kanban_home):
-    assert belt_queue.domain_for_board("ops") == "platform"
-    assert belt_queue.domain_for_board("research") == "research"
-    assert belt_queue.domain_for_board("financially") == "financially"
-    assert belt_queue.domain_for_board("some-unknown-board") == "platform"
-    assert belt_queue.domain_for_board(None) == "platform"
+    assert kanban_unblocker_queue.domain_for_board("ops") == "platform"
+    assert kanban_unblocker_queue.domain_for_board("research") == "research"
+    assert kanban_unblocker_queue.domain_for_board("financially") == "financially"
+    assert kanban_unblocker_queue.domain_for_board("some-unknown-board") == "platform"
+    assert kanban_unblocker_queue.domain_for_board(None) == "platform"
 
-    registry = belt_queue.domain_registry_path()
+    registry = kanban_unblocker_queue.domain_registry_path()
     registry.parent.mkdir(parents=True, exist_ok=True)
     registry.write_text(
-        json.dumps({**belt_queue.DEFAULT_BOARD_DOMAINS, "engines": "platform"}),
+        json.dumps({**kanban_unblocker_queue.DEFAULT_BOARD_DOMAINS, "engines": "platform"}),
         encoding="utf-8",
     )
-    assert belt_queue.domain_for_board("ENGINES") == "platform"
+    assert kanban_unblocker_queue.domain_for_board("ENGINES") == "platform"
 
     registry.write_text(json.dumps({"ops": "../../etc/passwd"}), encoding="utf-8")
-    assert belt_queue.domain_for_board("ops") == "platform"
+    assert kanban_unblocker_queue.domain_for_board("ops") == "platform"

@@ -1,4 +1,4 @@
-"""The belt queue: the realtime half of the maintenance framework.
+"""The kanban-unblocker queue: the realtime half of the maintenance framework.
 
 A card BLOCK is the trigger. A first-party lifecycle observer
 (``hermes_cli.observability``) calls :func:`enqueue_block`, which appends ONE row
@@ -6,7 +6,7 @@ to a dedicated SQLite store and returns. Enqueue-only by contract: no board
 write, no model call, no routing, no window gate — routing is cheap I/O and runs
 around the clock.
 
-Two stores, two writers. The queue lives in ``<hermes home>/kanban/belt.db``,
+Two stores, two writers. The queue lives in ``<hermes home>/kanban/kanban-unblocker.db``,
 NOT in the board DB, so an enqueue can never take a lock a board writer holds:
 the hook fires post-commit and a board write in flight (another process, or a
 caller inside its own txn) must not be able to deadlock it. The board is read
@@ -15,13 +15,13 @@ read-only and only to snapshot state; the board is never written here.
 Coalescing is keyed on STATE, not on the fact of a block: a unique index on
 ``(task_id, state_fingerprint)`` plus ``INSERT OR IGNORE`` is what makes a card
 that blocks six times a day with unchanged state produce ONE row. The
-fingerprint recipe (:func:`state_fingerprint`) is a shared contract — the belt
+fingerprint recipe (:func:`state_fingerprint`) is a shared contract — the kanban-unblocker
 DAG's gate node has to recompute the identical value, so the field order, the
 None encoding and the separator are part of the interface, not an internal
 detail.
 
 The board -> domain map is a static registry, not hook logic (see the design's
-section 1.3): a JSON object at ``<hermes home>/kanban/belt_domains.json`` with
+section 1.3): a JSON object at ``<hermes home>/kanban/kanban_unblocker_domains.json`` with
 the design's first cut as the built-in default. The registry's ROWS are the
 catalogue owner's; this module only implements the lookup, and the same lookup
 runs on the dispatch side, so both sides resolve a board to the same domain.
@@ -40,15 +40,15 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-#: Columns of ``belt_queue``, in the design's order (section 1.2).
-BELT_QUEUE_COLUMNS = (
+#: Columns of ``kanban_unblocker_queue``, in the design's order (section 1.2).
+KANBAN_UNBLOCKER_QUEUE_COLUMNS = (
     "task_id", "board", "assignee", "project_id", "domain", "block_kind",
     "reason", "last_failure_error", "source_status", "state_fingerprint",
     "enqueued_at", "status", "run_id", "attempts",
 )
 
 _SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS belt_queue (
+CREATE TABLE IF NOT EXISTS kanban_unblocker_queue (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id            TEXT NOT NULL,
     board              TEXT NOT NULL,
@@ -69,8 +69,8 @@ CREATE TABLE IF NOT EXISTS belt_queue (
 
 #: The coalescing key. A card in an unchanged state must not queue twice.
 _INDEX_SQL = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS belt_queue_state_uidx "
-    "ON belt_queue(task_id, state_fingerprint)"
+    "CREATE UNIQUE INDEX IF NOT EXISTS kanban_unblocker_queue_state_uidx "
+    "ON kanban_unblocker_queue(task_id, state_fingerprint)"
 )
 
 #: Design section 1.3 first cut; a registry file overrides or extends it and the
@@ -82,7 +82,7 @@ DEFAULT_BOARD_DOMAINS = {
 }
 DEFAULT_DOMAIN = "platform"
 
-#: Domains name a DAG (``maintenance-belt-<domain>.yaml``), so a value that is
+#: Domains name a DAG (``maintenance-kanban-unblocker-<domain>.yaml``), so a value that is
 #: not a path-safe slug is refused rather than resolved into a bogus file.
 _DOMAIN_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
 
@@ -91,18 +91,18 @@ _DOMAIN_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
 _SEP = "\x1f"
 
 
-def belt_db_path() -> Path:
-    """The belt queue store: ``<hermes home>/kanban/belt.db``."""
+def kanban_unblocker_db_path() -> Path:
+    """The kanban-unblocker queue store: ``<hermes home>/kanban/kanban-unblocker.db``."""
     from hermes_constants import get_hermes_home
 
-    return Path(get_hermes_home()) / "kanban" / "belt.db"
+    return Path(get_hermes_home()) / "kanban" / "kanban-unblocker.db"
 
 
 def domain_registry_path() -> Path:
     """The board -> domain registry the enqueue and the dispatcher share."""
     from hermes_constants import get_hermes_home
 
-    return Path(get_hermes_home()) / "kanban" / "belt_domains.json"
+    return Path(get_hermes_home()) / "kanban" / "kanban_unblocker_domains.json"
 
 
 def state_fingerprint(
@@ -115,7 +115,7 @@ def state_fingerprint(
 ) -> str:
     """Hash of the state a disposition would act on.
 
-    Recipe (shared with the belt DAG's gate node): sha256 over the UTF-8 encoding
+    Recipe (shared with the kanban-unblocker DAG's gate node): sha256 over the UTF-8 encoding
     of ``task_id, status, block_kind, block_recurrences, last_failure_error``
     joined by U+001F, each rendered with :func:`_field`. ``None`` and ``0`` are
     distinct; a changed error string is a changed state, which is what lets a
@@ -144,7 +144,7 @@ def domain_for_board(board: Any) -> str:
     name = (board or "").strip().lower()
     domain = _registry().get(name) or DEFAULT_BOARD_DOMAINS.get(name) or DEFAULT_DOMAIN
     if not _DOMAIN_RE.match(str(domain)):
-        logger.warning("belt: refusing non-slug domain %r for board %r", domain, name)
+        logger.warning("kanban-unblocker: refusing non-slug domain %r for board %r", domain, name)
         return DEFAULT_DOMAIN
     return str(domain)
 
@@ -157,10 +157,10 @@ def _registry() -> Dict[str, str]:
     except FileNotFoundError:
         return {}
     except Exception:
-        logger.warning("belt: unreadable domain registry %s", path, exc_info=True)
+        logger.warning("kanban-unblocker: unreadable domain registry %s", path, exc_info=True)
         return {}
     if not isinstance(raw, dict):
-        logger.warning("belt: domain registry %s is not a JSON object", path)
+        logger.warning("kanban-unblocker: domain registry %s is not a JSON object", path)
         return {}
     return {str(k).strip().lower(): v for k, v in raw.items()}
 
@@ -175,7 +175,7 @@ def enqueue_block(
     block_kind: Any = None,
     source_status: Any = None,
 ) -> Optional[int]:
-    """Append this block to the belt queue; return the row id, or None.
+    """Append this block to the kanban-unblocker queue; return the row id, or None.
 
     Re-reads the live Task row read-only (the hook payload is a hint, the row is
     the state) and never raises: the caller is a lifecycle observer, and a
@@ -184,7 +184,7 @@ def enqueue_block(
     try:
         state = _live_task_state(board, task_id)
         if state is None:
-            logger.warning("belt: no task row for %s on board %r", task_id, board)
+            logger.warning("kanban-unblocker: no task row for %s on board %r", task_id, board)
             return None
         resolved_kind = state["block_kind"] if state["block_kind"] is not None else block_kind
         fingerprint = state_fingerprint(
@@ -209,7 +209,7 @@ def enqueue_block(
         }
         return _insert(row)
     except Exception:
-        logger.warning("belt: enqueue failed for %s", task_id, exc_info=True)
+        logger.warning("kanban-unblocker: enqueue failed for %s", task_id, exc_info=True)
         return None
 
 
@@ -242,7 +242,7 @@ def _live_task_state(board: Any, task_id: str) -> Optional[Dict[str, Any]]:
 
 def _insert(row: Dict[str, Any]) -> Optional[int]:
     """INSERT OR IGNORE one queue row; None when the state is already queued."""
-    path = belt_db_path()
+    path = kanban_unblocker_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         **row,
@@ -261,25 +261,25 @@ def _insert(row: Dict[str, Any]) -> Optional[int]:
         except sqlite3.Error:
             # WAL is unavailable on some network filesystems; the queue still
             # works in the default journal mode.
-            logger.debug("belt: WAL unavailable on %s", path, exc_info=True)
+            logger.debug("kanban-unblocker: WAL unavailable on %s", path, exc_info=True)
         conn.execute(_SCHEMA_SQL)
         conn.execute(_INDEX_SQL)
-        columns = ", ".join(BELT_QUEUE_COLUMNS)
-        placeholders = ", ".join("?" for _ in BELT_QUEUE_COLUMNS)
+        columns = ", ".join(KANBAN_UNBLOCKER_QUEUE_COLUMNS)
+        placeholders = ", ".join("?" for _ in KANBAN_UNBLOCKER_QUEUE_COLUMNS)
         cur = conn.execute(
-            f"INSERT OR IGNORE INTO belt_queue ({columns}) VALUES ({placeholders})",
-            tuple(payload.get(column) for column in BELT_QUEUE_COLUMNS),
+            f"INSERT OR IGNORE INTO kanban_unblocker_queue ({columns}) VALUES ({placeholders})",
+            tuple(payload.get(column) for column in KANBAN_UNBLOCKER_QUEUE_COLUMNS),
         )
         if not cur.rowcount:
             # OR IGNORE also swallows a constraint violation. An ignored insert
             # with no matching row is a dropped enqueue, not a coalesce.
             queued = conn.execute(
-                "SELECT 1 FROM belt_queue WHERE task_id = ? AND state_fingerprint = ? LIMIT 1",
+                "SELECT 1 FROM kanban_unblocker_queue WHERE task_id = ? AND state_fingerprint = ? LIMIT 1",
                 (payload["task_id"], payload["state_fingerprint"]),
             ).fetchone()
             if queued is None:
                 logger.error(
-                    "belt: enqueue for %s was ignored with no matching queued row",
+                    "kanban-unblocker: enqueue for %s was ignored with no matching queued row",
                     payload["task_id"],
                 )
                 return None

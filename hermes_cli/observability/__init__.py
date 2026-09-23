@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 #: its own gating and may have per-event bookkeeping that is not a handler, e.g.
 #: the shared-metrics consent reconcile), while ``handles_hook`` answers for the
 #: caller's hot-path short-circuit.
-_PROJECTIONS = ("belt", "relay_shared_metrics")
+_PROJECTIONS = ("kanban_unblocker", "relay_shared_metrics")
 
 
 def _projection(module_name: str):
