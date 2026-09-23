@@ -620,6 +620,54 @@ def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
     return os.kill if hasattr(os, "kill") else None
 
 
+def _kill_group_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
+    """``os.killpg`` for the real signal path; ``None`` when it cannot be used.
+
+    A ``signal_fn`` hook models the per-pid primitive, so the group call is skipped
+    there — a group signal would escape the hook and reach real processes.
+    """
+    if signal_fn is not None:
+        return None
+    return getattr(os, "killpg", None)
+
+
+def _signal_worker(kill, pid: int, sig: int, *, group_kill=None) -> bool:
+    """Signal the worker's process GROUP when it has one, else the worker pid.
+
+    WHY (measured defect, 2026-09-23): every card worker is spawned with
+    ``start_new_session=True``, so the worker IS its own session and process-group
+    leader and everything it forks (tool shells, language servers) shares that
+    group. A per-pid signal reaps only the direct child: the grandchildren are
+    reparented to PID 1 — which on macOS never reaps them — and keep running after
+    the runtime kill, while the dispatcher clears ``worker_pid`` so nothing later
+    knows to look. Same class as the research-side unit wrapper
+    (``scripts/unit_bot_call.py::_kill_group``).
+
+    The group is signalled first and the per-pid signal is the fallback, so a group
+    call that cannot be made never leaves the worker behind. The
+    ``pgid != os.getpgid(0)`` guard keeps a group signal away from our own group.
+    """
+    killed_group = False
+    if group_kill is not None:
+        try:
+            pgid = os.getpgid(int(pid))
+            own_pgid = os.getpgid(0)
+        except (ProcessLookupError, OSError):
+            # Unverifiable guard → never risk a group signal; fall back to the pid.
+            pgid = own_pgid = None
+        if pgid is not None and pgid != own_pgid:
+            try:
+                group_kill(pgid, sig)
+                killed_group = True
+            except (ProcessLookupError, PermissionError):
+                pass
+    if not killed_group:
+        # Raises like the per-pid primitive always did, so callers keep their
+        # existing ``ProcessLookupError`` / ``OSError`` handling.
+        kill(int(pid), sig)
+    return True
+
+
 def _poll_worker_exit(pid: int) -> bool:
     """Poll ~5 s (10 x 0.5 s) for ``pid`` to die; True once it is gone."""
     for _ in range(10):
@@ -629,11 +677,11 @@ def _poll_worker_exit(pid: int) -> bool:
     return False
 
 
-def _sigkill(kill, pid: int) -> bool:
-    """Best-effort SIGKILL; True when the signal was delivered."""
+def _sigkill(kill, pid: int, *, group_kill=None) -> bool:
+    """Best-effort SIGKILL to the worker's group; True when a signal was delivered."""
     try:
         # signal.SIGKILL doesn't exist on Windows; SIGTERM maps to TerminateProcess.
-        kill(int(pid), getattr(signal, "SIGKILL", signal.SIGTERM))
+        _signal_worker(kill, pid, getattr(signal, "SIGKILL", signal.SIGTERM), group_kill=group_kill)
         return True
     except (ProcessLookupError, OSError):
         return False
@@ -663,9 +711,10 @@ def _terminate_reclaimed_worker(
     if kill is None:
         return info
 
+    group_kill = _kill_group_fn(signal_fn)
     info["termination_attempted"] = True
     try:
-        kill(int(pid), signal.SIGTERM)
+        _signal_worker(kill, pid, signal.SIGTERM, group_kill=group_kill)
     except ProcessLookupError:
         # Already gone = successful termination. Leaving terminated=False would
         # make the reclaim guard misread a dead worker as alive and defer forever.
@@ -678,7 +727,7 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
     if _kb._pid_alive(pid):
-        if not _sigkill(kill, pid):
+        if not _sigkill(kill, pid, group_kill=group_kill):
             return info
         info["sigkill"] = True
     info["terminated"] = not _kb._pid_alive(pid)
@@ -811,12 +860,13 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         killed = False
         kill = _kill_fn(signal_fn)
         if kill is not None:
+            group_kill = _kill_group_fn(signal_fn)
             with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
+                _signal_worker(kill, pid, signal.SIGTERM, group_kill=group_kill)
             # Short polling wait — no time.sleep on the write txn.
             _poll_worker_exit(pid)
             if _kb._pid_alive(pid):
-                killed = _sigkill(kill, pid)
+                killed = _sigkill(kill, pid, group_kill=group_kill)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):

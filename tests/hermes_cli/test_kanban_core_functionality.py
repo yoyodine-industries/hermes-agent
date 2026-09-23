@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -316,6 +318,93 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             conn.close()
     finally:
         _kb._pid_alive = original_alive
+
+
+def _alive(pid: int) -> bool:
+    """True while ``pid`` names a live process (signal-0 probe)."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_max_runtime_kill_reaps_the_workers_whole_process_group(kanban_home, tmp_path):
+    """A worker's forked grandchild is GONE after the runtime kill, not orphaned.
+
+    Card workers are spawned with ``start_new_session=True``, so the worker leads
+    its own process group and everything it forks (tool shells, language servers)
+    shares that group. The per-pid SIGTERM/SIGKILL reaped only the direct child: a
+    forked grandchild was reparented to PID 1 -- which on macOS never reaps a child
+    that does not exit -- and ran on, while the dispatcher cleared ``worker_pid`` so
+    nothing later knew to look. The assertion is on the GRANDCHILD's pid; the direct
+    child would look terminated either way.
+    """
+    pidfile = tmp_path / "grandchild.pid"
+    worker = tmp_path / "forking_worker.py"
+    worker.write_text(
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen(['/bin/sleep', '300'])\n"
+        "open(sys.argv[1], 'w').write(str(child.pid))\n"
+        "time.sleep(300)\n"
+    )
+
+    # Same shape as the spawn site: the worker is its own session/group leader.
+    proc = subprocess.Popen(
+        [sys.executable, str(worker), str(pidfile)], start_new_session=True,
+    )
+    grandchild = None
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline and not pidfile.exists():
+            time.sleep(0.05)
+        assert pidfile.exists(), "the worker never forked its grandchild"
+        grandchild = int(pidfile.read_text().strip())
+        assert proc.pid == os.getpgid(proc.pid), "the worker is not its own group leader"
+        assert _alive(grandchild)
+
+        conn = kbc.connect()
+        try:
+            tid = kb.create_task(
+                conn, title="forking worker", assignee="worker",
+                max_runtime_seconds=1,
+            )
+            kb.claim_task(conn, tid)
+            kbd._set_worker_pid(conn, tid, proc.pid)
+            old_started = int(time.time()) - 30
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET started_at = ? WHERE id = ?", (old_started, tid),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET started_at = ? "
+                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                    (old_started, tid),
+                )
+            # No signal_fn here: this drives the real os.kill / os.killpg path.
+            assert tid in kbd.enforce_max_runtime(conn)
+        finally:
+            conn.close()
+
+        assert not _alive(grandchild), (
+            f"grandchild {grandchild} outlived the runtime kill: only the direct "
+            "child was signalled, so the fork reparented to PID 1 and ran on while "
+            "the dispatcher had already cleared worker_pid"
+        )
+    finally:
+        # Exception-safe: a raise in cleanup would replace the assertion above.
+        for pid in (grandchild, proc.pid):
+            if pid:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except OSError:
+                    pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 
