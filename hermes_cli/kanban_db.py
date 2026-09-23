@@ -3319,11 +3319,10 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
-    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    _fire_task_hook(
+        "kanban_task_blocked", blocked_task, task_id, run_id,
+        reason=reason, block_kind=kind, source_status=source_status,
+    )
     return True
 
 
