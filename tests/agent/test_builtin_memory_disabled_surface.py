@@ -308,3 +308,67 @@ class TestInjectionEndToEnd:
 
         assert added == 1
         assert "hindsight_retain" in agent.valid_tool_names
+
+    def test_provider_tools_survive_a_platform_toolset_list_without_memory(self, hermes_home):
+        """Fleet shape end to end with real imports: ``platform_toolsets.cli`` without
+        ``memory`` (and the built-in memory tools off) goes through the real CLI toolset
+        loader, and the active provider's own tools still reach the agent.
+
+        Without this the session looks healthy while every ``memory_store`` call writes
+        nowhere: recall survives, writes are dropped on the floor."""
+        from types import SimpleNamespace
+
+        from agent.memory_manager import MemoryManager, inject_memory_provider_tools
+        from agent.memory_provider import MemoryProvider
+        from hermes_cli.tools_config import _get_platform_tools
+
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({
+                "memory": {
+                    "memory_enabled": False,
+                    "user_profile_enabled": False,
+                    "provider": "fake_store",
+                },
+                "platform_toolsets": {"cli": ["web", "file", "terminal"]},
+            }),
+            encoding="utf-8",
+        )
+        config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+        enabled_toolsets = sorted(_get_platform_tools(config, "cli"))
+        assert "memory" not in enabled_toolsets
+
+        class _Provider(MemoryProvider):
+            @property
+            def name(self):
+                return "fake_store"
+
+            def is_available(self):
+                return True
+
+            def initialize(self, session_id, **kwargs):
+                pass
+
+            def get_tool_schemas(self):
+                return [
+                    {
+                        "name": "memory_store",
+                        "description": "store",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ]
+
+        manager = MemoryManager()
+        manager.add_provider(_Provider())
+        agent = SimpleNamespace(
+            _memory_manager=manager,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=None,
+            tools=[],
+            valid_tool_names=set(),
+        )
+
+        added = inject_memory_provider_tools(agent)
+
+        assert added == 1
+        assert "memory_store" in agent.valid_tool_names

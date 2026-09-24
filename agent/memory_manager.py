@@ -76,15 +76,36 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     return schema if name and isinstance(name, str) else None
 
 
+def external_memory_providers(memory_manager: Any) -> List[Any]:
+    """Non-builtin providers registered on ``memory_manager`` (empty when none).
+
+    The provider's tools are its own surface, so they must not ride on the built-in ``memory``
+    toolset — that toolset gates the built-in file-based tool, which writes the MEMORY.md notes
+    block, a different store from the provider's.
+    """
+    return [p for p in getattr(memory_manager, "providers", None) or []
+            if getattr(p, "name", "") != "builtin"]
+
+
 def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]] = None,
-                                  *, memory_tool_present: bool = False) -> bool:
-    """Return whether external memory-provider tools should be exposed."""
+                                  *, memory_tool_present: bool = False, provider_present: bool = False) -> bool:
+    """Return whether external memory-provider tools should be exposed.
+
+    An active external provider (``provider_present``) exposes its tools on its own: the toolset
+    list is not consulted for them, so dropping the built-in ``memory`` toolset (a common way to
+    stop handing out the MEMORY.md trap) cannot silently take the provider's tools with it.
+    ``disabled_toolsets`` stays the hard off switch, a built-in ``memory`` tool that is present
+    stays a sufficient opt-in via ``memory_tool_present``, and an explicitly EMPTY list still means
+    no tools at all (#5544) — the provider opt-in sits below that case, not above it.
+    """
     if disabled_toolsets and "memory" in disabled_toolsets:
         return False
     if memory_tool_present or enabled_toolsets is None:
         return True
-    if not enabled_toolsets:
+    if not enabled_toolsets:  # `platform_toolsets.<platform>: []` — a surface with no tools (#5544)
         return False
+    if provider_present:
+        return True
     if "memory" in enabled_toolsets:
         return True
     try:
@@ -109,7 +130,9 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     tools = getattr(agent, "tools", None)
     present = isinstance(tools, (list, tuple)) and any(_tool_name(t) == "memory" for t in tools)
     enabled, disabled = getattr(agent, "enabled_toolsets", None), getattr(agent, "disabled_toolsets", None)
-    return memory_provider_tools_enabled(enabled, disabled, memory_tool_present=present)
+    providers = external_memory_providers(getattr(agent, "_memory_manager", None))
+    return memory_provider_tools_enabled(enabled, disabled, memory_tool_present=present,
+                                         provider_present=bool(providers))
 
 
 def inject_memory_provider_tools(agent: Any) -> int:
@@ -123,8 +146,7 @@ def inject_memory_provider_tools(agent: Any) -> int:
         # Say so once: a silent 0 leaves the provider looking "half on" with no clue which
         # config key (platform_toolsets / disabled_toolsets) gated it.
         # See #81014.
-        _providers = [p for p in getattr(memory_manager, "providers", None) or []
-                      if getattr(p, "name", "") != "builtin"]
+        _providers = external_memory_providers(memory_manager)
         if _providers:
             logger.info(
                 "Memory provider(s) %s configured but the 'memory' toolset is "

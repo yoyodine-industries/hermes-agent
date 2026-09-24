@@ -982,12 +982,18 @@ class TestMemoryToolToolsetGate:
         assert tools == []
         assert names == set()
 
-    def test_toolsets_without_memory_blocks_injection(self):
-        """Toolsets that don't include memory must suppress injection."""
+    def test_toolsets_without_memory_still_inject_provider_tools(self):
+        """An active external provider keeps its own tools when ``memory`` is absent.
+
+        The ``memory`` toolset name gates the built-in file-based tool (the MEMORY.md
+        notes block). Leaving it out of a positive toolset list is how a provider user
+        stops paying for that trap; it must not silently drop the provider's tools and
+        leave writes with nowhere to go. An explicit "no memory tools" stays available
+        as ``disabled_toolsets: ['memory']``, and an empty list still means no tools."""
         mgr = self._mgr_with_tools("fact_store")
         tools, names = self._run_memory_injection(["terminal", "web"], mgr)
-        assert tools == []
-        assert names == set()
+        assert "fact_store" in names
+        assert any(t["function"]["name"] == "fact_store" for t in tools)
 
     def test_no_memory_manager_no_injection(self):
         """Gate is moot without a memory manager."""
@@ -1134,10 +1140,17 @@ class TestSystemPromptGateParity:
         agent, _mgr, _p = self._agent_with_provider(disabled_toolsets=["memory"])
         assert memory_provider_tools_exposed(agent) is False
 
-    def test_tools_hidden_when_memory_not_in_enabled_toolsets(self):
+    def test_tools_exposed_when_memory_not_in_enabled_toolsets(self):
+        """An active external provider exposes its own tools without the built-in
+        ``memory`` toolset.
+
+        That toolset gates the built-in file-based tool (the MEMORY.md notes block);
+        dropping it is how a provider user stops paying for a store they do not want,
+        and it must not silently take ``memory_store``/``memory_recall`` with it.
+        ``disabled_toolsets: ['memory']`` stays the hard off switch."""
         from agent.memory_manager import memory_provider_tools_exposed
         agent, _mgr, _p = self._agent_with_provider(enabled_toolsets=["web_search"])
-        assert memory_provider_tools_exposed(agent) is False
+        assert memory_provider_tools_exposed(agent) is True
 
     def test_tools_exposed_when_memory_tool_already_present(self):
         """The built-in "memory" tool is a sufficient opt-in even when the
@@ -1169,3 +1182,34 @@ class TestSystemPromptGateParity:
         assert added == 1
         names = {t["function"]["name"] for t in agent.tools}
         assert "mnemosyne_remember" in names
+
+    def test_inject_and_notice_for_a_toolset_list_without_memory(self, caplog):
+        """Fleet shape: external provider active, ``memory`` absent from the platform
+        toolset list, no built-in memory tool.
+
+        The provider's tools must land, and the "gated off" notice must stay silent for
+        that session — while ``disabled_toolsets: ['memory']`` still withholds them and
+        says why. Both halves run through the real ``inject_memory_provider_tools``."""
+        import logging
+
+        from agent.memory_manager import inject_memory_provider_tools
+
+        agent, _mgr, _p = self._agent_with_provider(
+            enabled_toolsets=["web_search", "file", "terminal"], tools=[]
+        )
+        agent.valid_tool_names = set()
+        with caplog.at_level(logging.INFO, logger="agent.memory_manager"):
+            added = inject_memory_provider_tools(agent)
+
+        assert added == 1
+        assert "mnemosyne_remember" in {t["function"]["name"] for t in agent.tools}
+        assert "gated off" not in caplog.text
+
+        gated, _mgr2, _p2 = self._agent_with_provider(disabled_toolsets=["memory"], tools=[])
+        gated.valid_tool_names = set()
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="agent.memory_manager"):
+            blocked = inject_memory_provider_tools(gated)
+
+        assert blocked == 0
+        assert "gated off" in caplog.text
