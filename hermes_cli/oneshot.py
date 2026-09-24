@@ -169,6 +169,7 @@ def run_oneshot(
     usage_file: Optional[str] = None,
     resume: Optional[str] = None,
     reasoning: object = None,
+    max_tokens: int | None = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -189,6 +190,13 @@ def run_oneshot(
             "hermes -z: --provider requires --model (or HERMES_INFERENCE_MODEL). "
             "Pass both explicitly, or neither to use your configured defaults.\n"
         )
+        return 2
+
+    # --max-tokens caps the outgoing completion for this run. argparse types it as int, so a
+    # non-int is already rejected at parse time; reject non-positive caps before the stderr
+    # redirect (so the friendly message reaches the real stderr, not the /dev/null sink).
+    if max_tokens is not None and max_tokens <= 0:
+        sys.stderr.write("hermes -z: --max-tokens must be a positive integer.\n")
         return 2
 
     explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
@@ -225,6 +233,7 @@ def run_oneshot(
                 skills=skills,
                 resume=resume,
                 reasoning=reasoning,
+                max_tokens=max_tokens,
             )
         except BaseException as exc:  # noqa: BLE001
             # Capture anything escaping the agent (OSError from prompt_toolkit on a non-TTY pipe,
@@ -418,6 +427,7 @@ def _run_agent(
     skills: object = None,
     resume: Optional[str] = None,
     reasoning: object = None,
+    max_tokens: int | None = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn, run one conversation, and return
     ``(final_response, run_result)``. Imports are local to keep CLI startup cheap."""
@@ -490,6 +500,7 @@ def _run_agent(
             fallback_model=get_fallback_chain(cfg) or None,
             ephemeral_system_prompt=skills_prompt,
             reasoning_config=reasoning_config,
+            max_tokens=max_tokens,
             # The only interactive callback wired: no user sits at a terminal. Sudo prompts gate on
             # HERMES_INTERACTIVE (never set), hook approval via HERMES_ACCEPT_HOOKS=1, dangerous
             # commands via HERMES_YOLO_MODE=1, skill secret capture degrades gracefully.

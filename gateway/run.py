@@ -2118,6 +2118,10 @@ from gateway.run_inbound import GatewayInboundMixin
 from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
+from gateway.run_profile_fallback import (
+    driver_caller_label, log_profile_alias, log_profile_fallback,
+    owner_profile_label, profile_alias_from_roster,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     _reply_anchor_for_event,
@@ -4306,13 +4310,22 @@ class GatewayRunner(
             explicit_profile = name or None
             if not name:
                 name = get_active_profile_name() or "default"
+            elif not profile_exists(name):
+                # A bot-relay lane handle can arrive where a profile name is expected (a retired
+                # lane's source replayed from persisted routing). Alias it to the profile that
+                # serves the handle before reporting the name as missing.
+                alias = profile_alias_from_roster(name)
+                if alias and alias != name and profile_exists(alias):
+                    log_profile_alias(name, alias, source)
+                    name = alias
             profile_dir = get_profile_dir(name)
             if explicit_profile and not profile_exists(name):
-                logger.warning(
-                    "Profile %r does not exist for source %s/%s (guild_id=%s), "
-                    "falling back to global HERMES_HOME",
-                    explicit_profile, source.platform.value, source.chat_id,
-                    getattr(source, "guild_id", None))
+                log_profile_fallback(
+                    explicit_profile, source, explicit_profile=source.profile or None,
+                    owner_profile=owner_profile_label(
+                        self._transport_owner(source)
+                        if callable(getattr(source, "_transport_adapter_ref", None)) else None),
+                    caller=driver_caller_label())
                 return get_hermes_home()
             return profile_dir
         except ProfileRouteRejected:
@@ -4816,6 +4829,38 @@ async def _wait_for_pid_exit(pid: int, attempts: int, delay: float) -> bool:
     return False
 
 
+def _resolve_replace_exit_wait_budget() -> float:
+    """Seconds ``--replace`` waits for the incumbent gateway to exit before escalating to SIGKILL.
+
+    Sized from the same budget the incumbent's ``stop()`` may legally spend on in-flight cron work
+    (``cron_drain_timeout`` plus the cleanup reserve), plus the service-manager headroom and floor —
+    i.e. the leash its ``TimeoutStopSec`` gives it (:func:`resolve_systemd_timeout_stop_sec`). A
+    shorter fixed window SIGKILLs a cron job mid-write, which jobs.json then records as a permanent
+    failure. Both values come through the runner's own loaders, so an env override, a configured
+    ``0`` opt-out and a garbage value resolve exactly as the drain side resolves them.
+    """
+    from gateway.restart import (
+        DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
+        DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+        resolve_systemd_timeout_stop_sec,
+    )
+    try:
+        drain_timeout = GatewayConfigLoadersMixin._load_restart_drain_timeout()
+        cron_drain_timeout = GatewayConfigLoadersMixin._load_cron_drain_timeout()
+    except Exception:
+        logger.warning("Could not read drain timeouts for --replace; using defaults.", exc_info=True)
+        drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+        cron_drain_timeout = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
+    return float(resolve_systemd_timeout_stop_sec(drain_timeout, cron_drain_timeout))
+
+
+async def _wait_for_pid_exit_for(pid: int, timeout: float, delay: float = 0.5) -> bool:
+    """Wait up to ``timeout`` seconds for ``pid`` to exit — a cap, not a delay: it returns as soon
+    as the PID is gone, and only a process that outlives the whole budget reports False."""
+    import math
+    return await _wait_for_pid_exit(pid, max(1, int(math.ceil(float(timeout) / delay))), delay)
+
+
 async def _start_gateway_replace_existing_instance(existing_pid: int, replace: bool) -> bool:
     """Handle a live gateway PID under this HERMES_HOME: replace it (``--replace``) or refuse.
     Returns False when startup must abort (refused, permission denied, target still alive)."""
@@ -4864,8 +4909,13 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
         logger.error("Permission denied killing PID %d. Cannot replace.", existing_pid)
         _clear_takeover_marker_quiet()
         return False
-    # Up to 10s for SIGTERM, then SIGKILL.
-    if not await _wait_for_pid_exit(existing_pid, 20, 0.5):
+    # SIGTERM, then SIGKILL only once the incumbent's own drain budget is spent: a shorter fixed
+    # window (20 x 0.5s) SIGKILLs cron work the stop path may still be legally draining.
+    _exit_wait_budget = _resolve_replace_exit_wait_budget()
+    logger.info(
+        "Waiting up to %.0fs for gateway PID %d to exit before escalating to SIGKILL.",
+        _exit_wait_budget, existing_pid)
+    if not await _wait_for_pid_exit_for(existing_pid, _exit_wait_budget):
         logger.warning("Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.", existing_pid)
         old_gateway_exited = False
         try:

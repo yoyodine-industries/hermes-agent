@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_db_graph import decompose_triage_task
+from hermes_cli.kanban_db_graph import decompose_triage_task, spec_carrying_reason
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
@@ -286,6 +286,13 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
+        # The DB layer refuses a spec-carrying card; without this branch the
+        # operator would be told the card "moved out of triage" and go looking
+        # for a race instead of reading the refusal.
+        with kbc.connect_closing() as conn:
+            refusal = spec_carrying_reason(conn, task_id)
+        if refusal:
+            return DecomposeOutcome(task_id, False, refusal)
         return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
@@ -304,6 +311,14 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    # Decide the spec guard BEFORE the routing read and the aux call: a card we
+    # are going to refuse must not cost an LLM round-trip, and the refusal has to
+    # name itself instead of surfacing as "moved out of triage".
+    with kbc.connect_closing() as conn:
+        refusal = spec_carrying_reason(conn, task_id)
+    if refusal:
+        return DecomposeOutcome(task_id, False, refusal)
 
     routing = _load_routing()
     raw, reason = _call_aux(

@@ -4077,6 +4077,37 @@ def _sync_cli_session_id_from_agent(cli) -> None:
         cli.session_id = cli.agent.session_id
 
 
+def _kanban_wall_exit_code(result) -> "Optional[int]":
+    """Sentinel exit code for a kanban worker whose provider REFUSED the run.
+
+    ``None`` when there is nothing for the dispatcher to read: not a kanban worker
+    (``HERMES_KANBAN_TASK``, set by the dispatcher, is absent), a turn that did not
+    fail, or a failure class the board books as an ordinary crash.
+
+    The dispatcher reads the sentinel out of the worker's exit status: 75 tells it
+    the provider is throttling (release the card without counting a failure and
+    probe again later), 76 that the account is out of credit (park the card for the
+    human who can top it up). ``billing`` is deliberately NOT 75 — a quota window
+    clears on a clock, an empty account does not."""
+    if not (isinstance(result, dict) and result.get("failed")):
+        return None
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    try:
+        from hermes_cli.kanban_db import (
+            KANBAN_BILLING_EXHAUSTED_EXIT_CODE,
+            KANBAN_RATE_LIMIT_EXIT_CODE,
+        )
+    except Exception:
+        return None
+    reason = result.get("failure_reason")
+    if reason == "billing":
+        return KANBAN_BILLING_EXHAUSTED_EXIT_CODE
+    if reason == "rate_limit":
+        return KANBAN_RATE_LIMIT_EXIT_CODE
+    return None
+
+
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it.
@@ -4156,18 +4187,14 @@ def _run_quiet_single_query(cli, effective_query):
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
-    # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
-    # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases
-    # the task without counting a failure (a quota window must not trip the breaker).
+    # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on a
+    # provider wall exit with the sentinel the dispatcher reads: EX_TEMPFAIL for a
+    # rate-limit/quota window, 76 for a billing wall (HTTP 402) that parks the card.
+    # Neither counts a failure against the task (a provider wall must not trip the
+    # breaker).
     _exit_code = 0
     if isinstance(result, dict) and result.get("failed"):
-        _exit_code = 1
-        if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in ("rate_limit", "billing"):
-            try:
-                from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE
-                _exit_code = _RL_CODE
-            except Exception:
-                _exit_code = 1
+        _exit_code = _kanban_wall_exit_code(result) or 1
     sys.exit(_exit_code)
 
 
@@ -4487,6 +4514,13 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         cli._print_exit_summary(clear_screen=False)
     finally:
         _finalize_single_query(cli)
+    # Dispatcher workers take THIS path (``chat -q`` without ``-Q``), so a turn the
+    # provider refused has to leave through the sentinel the dispatcher reads — else
+    # the process just ends and the board files the refusal as a clean exit with no
+    # terminal kanban call, i.e. a protocol violation charged to the card.
+    _wall_exit = _kanban_wall_exit_code(getattr(cli, "_last_turn_result", None))
+    if _wall_exit is not None:
+        sys.exit(_wall_exit)
 
 
 def main(

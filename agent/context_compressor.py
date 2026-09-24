@@ -1264,16 +1264,38 @@ def evict_stale_outbound_tool_images(
     return _retire_stale_tool_result_images(api_messages, keep_newest=keep_newest)
 
 
-def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
-    """Shrink long string leaves in a tool-call arguments JSON blob, keeping it valid (providers 400 on malformed args)."""
+# String-leaf head used by the ordinary tool-call args shrink, and the wider head kept for
+# arguments whose leaves are AUTHORED PROSE that *is* the payload rather than bulk data to
+# reclaim — a teammate DM body (tools.bot_mode_dm.message_agent_tool). Cutting a DM body to
+# 200 chars destroyed the record of what was sent: the pruned list is PERSISTED
+# (session_db.archive_and_compact), so every later reader of that session saw 214 chars plus a
+# truncation marker, and a body re-sent from that record is refused by tools.dm_body_guard.
+# Bounded, so a pathological blob still shrinks.
+_DEFAULT_ARG_HEAD_CHARS = 200
+_PROSE_ARG_HEAD_CHARS = 4_000
+_PROSE_ARG_TOOLS = frozenset({"message_agent"})
+
+
+def _truncate_tool_call_args_json(args: str, head_chars: int = _DEFAULT_ARG_HEAD_CHARS) -> str:
+    """Shrink long string leaves in a tool-call arguments JSON blob, keeping it valid (providers 400 on malformed args).
+
+    Returns ``args`` itself when no leaf exceeds ``head_chars``: re-serializing identical content
+    rewrites the persisted bytes and breaks the prompt cache for no reclaim.
+    """
     try:
         parsed = json.loads(args)
     except (ValueError, TypeError):
         return args
 
+    changed = False
+
     def _shrink(obj: Any) -> Any:
+        nonlocal changed
         if isinstance(obj, str):
-            return obj[:head_chars] + "...[truncated]" if len(obj) > head_chars else obj
+            if len(obj) > head_chars:
+                changed = True
+                return obj[:head_chars] + "...[truncated]"
+            return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}
         if isinstance(obj, list):
@@ -1281,6 +1303,8 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
         return obj
 
     shrunken = _shrink(parsed)
+    if not changed:
+        return args
     # ensure_ascii=False keeps CJK/emoji from bloating into \uXXXX
     return json.dumps(shrunken, ensure_ascii=False)
 
@@ -2664,8 +2688,12 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             return False
         new_tcs = []
         for tc in msg["tool_calls"]:
-            args = tc.get("function", {}).get("arguments", "") if isinstance(tc, dict) else ""
-            new_args = _truncate_tool_call_args_json(args) if len(args) > 500 else args
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            args = fn.get("arguments", "") or ""
+            # A DM body's leaves are the payload, not bulk data: give them the prose head so the
+            # PERSISTED record (archive_and_compact) keeps what was actually sent.
+            head = _PROSE_ARG_HEAD_CHARS if fn.get("name") in _PROSE_ARG_TOOLS else _DEFAULT_ARG_HEAD_CHARS
+            new_args = _truncate_tool_call_args_json(args, head) if len(args) > 500 else args
             new_tcs.append(tc if new_args == args else {**tc, "function": {**tc["function"], "arguments": new_args}})
         modified = any(new is not old for new, old in zip(new_tcs, msg["tool_calls"]))
         if modified:

@@ -204,6 +204,18 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _err(msg, roster=teammates, peers=peers)
 
     body = str(message or "").strip()
+    # Send-path instrumentation (card t_d2ef0d15, 2026-09-23): a marker-less DM cut (the "incident"
+    # shape) has no upstream signature, so its cut site is unproven. Log the body length at the send
+    # path and flag a mid-word tail — the one tell that survives a silent cut — so the next occurrence
+    # is observable in one turn. Diagnostic only: never refuses (a "looks cut" heuristic cries wolf and
+    # gets bypassed), and the real refusal for marker-ended bodies stays below in dm_body_guard.
+    if body and body[-1].isalnum():
+        logger.warning(
+            "message_agent send-path: body ends mid-word (possible silent cut) len=%d target=%r tail=%r",
+            len(body), str(target or "")[:64], body[-40:],
+        )
+    else:
+        logger.info("message_agent send-path: body_len=%d target=%r", len(body), str(target or "")[:64])
     # Sender-side truncation guard (2026-09-12). Imported lazily because this module also
     # runs as a script, where the package path is not importable — the same convention the
     # bot_relay imports above follow. The length cap stays authoritative here; the guard

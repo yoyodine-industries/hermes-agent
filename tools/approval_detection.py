@@ -1378,8 +1378,13 @@ def _command_detection_variants(command: str):
     # Subshell `(cmd)` / brace-group `{ cmd; }` openers put `cmd` at a real command position the flat `_CMDPOS`
     # patterns can't see (adding `(`/`{` there would match quoted prose like `--title "(reboot)"`). Insert a newline
     # at each start the QUOTE-AWARE tokenizer found instead; this covers every `_CMDPOS` rule in one place.
-    marked = _mark_command_starts(grep_safe)
-    if marked != grep_safe and fresh(marked):
+    # The starts are read from the AUTHOR's text (quoted newlines masked, quoted grep operands blanked) for the
+    # same reason `faithful` below is: normalization turns `\"` into `"` and collapses `""`, which flips quote
+    # parity, and a start marked on that text lands INSIDE a quoted operand — `grep -rnE
+    # "\"(restart|shutdown|stop|reboot)\"|kind ==|handle_" f` marked `shutdown` out of a read-only grep pattern.
+    authors_text, _ = _grep_safe_detection_variant(_mask_quoted_newlines(command))
+    marked = _normalize_command_for_detection(_mark_command_starts(authors_text, marker=" \n"))
+    if fresh(marked):
         yield marked
     # Every variant above tracks quotes on NORMALIZED text, where `\"` has already become `"`. That
     # flips quote parity, so in `cat "f\"n.txt"; rm -rf /` the `; rm` start sat "inside" a phantom

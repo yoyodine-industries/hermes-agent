@@ -19,7 +19,7 @@ PRE_ARGPARSE_INHERITED_FLAGS: list[tuple[str, bool]] = [("--profile", True), ("-
 # snapshot lacks AND derivation regresses.
 _VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset({
     "-z", "--oneshot", "-m", "--model", "--provider", "--reasoning", "-t", "--toolsets",
-    "-r", "--resume", "-s", "--skills", "--usage-file", "--in",
+    "-r", "--resume", "-s", "--skills", "--usage-file", "--in", "--max-tokens",
 })
 _OPTIONAL_VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset({"-c", "--continue"})
 
@@ -135,6 +135,11 @@ def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
         "high, xhigh, max, or ultra. Overrides agent.reasoning_effort in "
         "config.yaml for this run only; the persistent level lives there "
         "(or per-model under agent.reasoning_overrides)."))
+    inherited(parser, "--max-tokens", default=None, type=int, metavar="N", help=(
+        "Output-token cap for this invocation (positive int). Overrides the "
+        "model's configured max_tokens for this run only; forwarded to the "
+        "provider where the route honors an explicit cap (e.g. the managed "
+        "local llama-server and Anthropic Messages). Applies to -z/--oneshot."))
     add("-t", "--toolsets", default=None,
         help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot and --tui.")
     add("--resume", "-r", metavar="SESSION", default=None, help=(
@@ -215,6 +220,9 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
         "Reasoning effort for this session: none, minimal, low, medium, "
         "high, xhigh, max, or ultra. Overrides agent.reasoning_effort for "
         "this run only (same levels as the /reasoning slash command)."))
+    inherited(chat_parser, "--max-tokens", default=SUPPRESS, type=int, metavar="N", help=(
+        "Output-token cap for this session (positive int). Overrides the "
+        "model's configured max_tokens for this run only."))
     inherited(chat_parser, "-s", "--skills", action="append", default=SUPPRESS,
               help="Preload one or more skills for the session (repeat flag or comma-separate)")
     # No `choices=` on --provider: user-defined providers from config.yaml `providers:` are valid

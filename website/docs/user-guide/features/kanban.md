@@ -328,12 +328,15 @@ are complete, or **`todo`** while any parent remains open. A `todo` task keeps
 its source-phase provenance and returns to `review` or `ready` automatically
 when the dependency gate clears. `unblock` never routes directly to `triage`.
 
-If you unblock a task and it later shows up in **`triage`**, the unblock is not
-what put it there. A subsequent *re-block for the same reason* did: after a task
-is blocked → unblocked → re-blocked for the same cause `BLOCK_RECURRENCE_LIMIT`
-times (default `2`), the unblock-loop breaker stops sending it back to `blocked`
-— where a cron would just keep unblocking it — and routes it to `triage` for a
-human decision. This is a deterministic DB guard, not an LLM judgment call, and
+If you unblock a task and it is later **parked in `blocked`** with an "unblock
+loop detected" note, a subsequent *re-block for the same reason* did it: after a
+task is blocked → unblocked → re-blocked for the same cause
+`BLOCK_RECURRENCE_LIMIT` times (default `2`), the unblock-loop breaker stops the
+cron ping-pong. The task stays in `blocked` — it is deliberately **not** moved to
+`triage`, which is the spec shelf and has no exit for a parked card — keeps its
+`kind` and recurrence count on the row, and emits `block_loop_detected` so the
+disposition sweep escalates it at recurrence ≥ 2 instead of requeueing it. This is
+a deterministic DB guard, not an LLM judgment call, and
 a task's body text cannot opt out of it: the recurrence counter deliberately
 survives each unblock (it resets only on a successful `complete`). To keep an
 unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
@@ -352,7 +355,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
-| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
+| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks park the card in `blocked` (never `triage`) with a `block_loop_detected` event. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
@@ -624,7 +627,7 @@ hermes dashboard        # "Kanban" tab appears in the nav, after "Skills"
 ### What the plugin gives you
 
 - A **Kanban** tab showing one column per status: `triage`, `todo`, `ready`, `running`, `blocked`, `done` (plus `archived` when the toggle is on).
-  - `triage` is the parking column for rough ideas. By default (`kanban.auto_decompose: true`), the dispatcher auto-runs the **decomposer** on tasks that land here. The built-in decomposer uses the `auxiliary.kanban_decomposer` model path, reads your profile roster (with descriptions), and fans the task out into a small graph of child tasks routed to the best-fit specialists. The original task stays alive as the parent of every child so its assignee (`kanban.orchestrator_profile`, or the active default profile when unset) wakes back up to judge completion when everything finishes. Flip the **Orchestration: Auto/Manual** pill at the top of the page (emerald = Auto, muted gray = Manual), or by editing `config.yaml` directly. Both modes coexist with `hermes kanban specify` - that's still available as a single-task spec rewrite when you don't want fan-out.
+  - `triage` is the shelf for rough ideas. By default (`kanban.auto_decompose: true`), the dispatcher auto-runs the **decomposer** on tasks that land here. The built-in decomposer uses the `auxiliary.kanban_decomposer` model path, reads your profile roster (with descriptions), and fans the task out into a small graph of child tasks routed to the best-fit specialists. The original task stays alive as the parent of every child so its assignee (`kanban.orchestrator_profile`, or the active default profile when unset) wakes back up to judge completion when everything finishes. The shelf is never a one-way door: besides the decomposer, `hermes kanban promote <id>` moves the card straight to `ready` and `hermes kanban complete <id>` closes it, and a card parked by the unblock-loop breaker lands in `blocked` (never here). A card that **carries a design spec is never decomposed**: fan-out would replace the body a designer wrote with a model's paraphrase of it, so the decomposer refuses it and records the refusal on the card. `spec-carrying` is mechanical and deliberately narrow — an explicit `FROZEN` marker in the title, body or a comment, or a comment authored by an identity other than the assignee. Write the marker on a card whose spec must survive being reassigned (a reassignment erases the comment clause's signal); the exits above stay available to a refused card. Flip the **Orchestration: Auto/Manual** pill at the top of the page (emerald = Auto, muted gray = Manual), or by editing `config.yaml` directly. Both modes coexist with `hermes kanban specify` - that's still available as a single-task spec rewrite when you don't want fan-out.
 - Cards show the task id, title, priority badge, tenant tag, assigned profile, comment/link counts, a **progress pill** (`N/M` children done when the task has dependents), and "created N ago". A per-card checkbox enables multi-select.
 - **Per-profile lanes inside Running** — toolbar checkbox toggles sub-grouping of the Running column by assignee.
 - **Live updates via WebSocket** — the plugin tails the append-only `task_events` table on a short poll interval; the board reflects changes the instant any profile (CLI, gateway, or another dashboard tab) acts. Reloads are debounced so a burst of events triggers a single refetch.
@@ -725,7 +728,7 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `POST` | `/tasks/bulk` | Apply the same patch (status / archive / assignee / priority) to every id in `ids`. Per-id failures reported without aborting siblings |
 | `POST` | `/tasks/:id/comments` | Append a comment |
 | `POST` | `/tasks/:id/specify` | Run the triage specifier — auxiliary LLM fleshes out the task body and promotes it from `triage` to `todo`. Returns `{ok, task_id, reason, new_title}`; `ok=false` with a human-readable reason on "not in triage" / no aux client / LLM error is a 200, not a 4xx |
-| `POST` | `/tasks/:id/decompose` | Run the kanban decomposer — auxiliary LLM produces a task graph and the helper atomically creates the children + links the root + flips `triage → todo`. Returns `{ok, task_id, reason, fanout, child_ids, new_title}`. Same 200-on-LLM-error convention as `/specify`. |
+| `POST` | `/tasks/:id/decompose` | Run the kanban decomposer — auxiliary LLM produces a task graph and the helper atomically creates the children + links the root + flips `triage → todo`. Returns `{ok, task_id, reason, fanout, child_ids, new_title}`. Same 200-on-LLM-error convention as `/specify`, and a card that carries a design spec is refused the same way (`ok=false` + the reason), before any LLM call. |
 | `GET` | `/profiles` | List installed profiles with their descriptions (consumed by the dashboard's profile-description editor and the orchestrator picker). |
 | `PATCH` | `/profiles/:name` | Set or clear a profile's description (user-authored — `description_auto: false`). Returns `{ok, profile, description}`. |
 | `POST` | `/profiles/:name/describe-auto` | Generate a description for a profile via `auxiliary.profile_describer`. Persists with `description_auto: true` so the dashboard can surface a "review" badge. |
@@ -803,7 +806,7 @@ hermes kanban assign <id> <profile>                    # or 'none' to unassign
 hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to a profile
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
         [--priority N]
-hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
+hermes kanban promote <id>...                          # move triage/todo/blocked tasks to ready
 hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
 hermes kanban link <parent_id> <child_id>
@@ -1082,7 +1085,7 @@ Workers receive `$HERMES_TENANT` and namespace their memory writes by prefix. Th
 
 ## Desktop notifications
 
-The Desktop app's Kanban plugin surfaces the same terminal events natively — no gateway platform required. While the Kanban board's live event socket is connected, each `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, or routed-to-triage (`block_loop_detected`) event raises an in-app toast with the worker's handoff (summary, block reason, or error) and an "Open Kanban" action. When you're away from the Hermes window, the same event also fires a native OS notification (gated by **Settings ▸ Notifications ▸ Plugin notifications**), so a task hitting a blocker while you're in another app still reaches you.
+The Desktop app's Kanban plugin surfaces the same terminal events natively — no gateway platform required. While the Kanban board's live event socket is connected, each `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, or loop-parked (`block_loop_detected`) event raises an in-app toast with the worker's handoff (summary, block reason, or error) and an "Open Kanban" action. When you're away from the Hermes window, the same event also fires a native OS notification (gated by **Settings ▸ Notifications ▸ Plugin notifications**), so a task hitting a blocker while you're in another app still reaches you.
 
 Coverage window: desktop notifications ride the live event stream, so they fire only while the app is running with the Kanban plugin enabled. Events that land while the app is closed are not replayed as notifications on next launch — use a gateway subscription (below) for delivery that must survive the app being closed.
 
@@ -1117,7 +1120,7 @@ For `notify+wake`, delivery completes only once the wake is admitted to the adap
 
 A "wake" forges a synthetic inbound message to the destination gateway agent so it takes a normal turn (reads the comment + result, reasons, replies) instead of getting a one-line passive notification. It only fires when the notifier runs inside a live gateway process; otherwise a `notify+wake` subscription still delivers its passive message, while a `wake`-only subscription does nothing in that process.
 
-**Which events wake.** The ones that hand a decision back to the origin: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `review_requested` (a worker finished the implementation and handed off via `kanban_request_review`) and `block_loop_detected` (the task was routed to `triage` after repeated blocks). `status`, `archived` and `unblocked` are delivered but never wake — they are bookkeeping transitions, not decisions. When a `completed` or `review_requested` event carries a summary, that handoff rides the wake turn, so the woken agent sees what the worker actually did.
+**Which events wake.** The ones that hand a decision back to the origin: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `review_requested` (a worker finished the implementation and handed off via `kanban_request_review`) and `block_loop_detected` (the task was parked in `blocked` after repeated blocks). `status`, `archived` and `unblocked` are delivered but never wake — they are bookkeeping transitions, not decisions. When a `completed` or `review_requested` event carries a summary, that handoff rides the wake turn, so the woken agent sees what the worker actually did.
 
 `--chat-type` (`dm` | `group` | `channel` | `thread`) records the originating chat's type so a woken turn resolves the operator's **real** session: `build_session_key` keys groups, channels, and threads differently from DMs, so an inaccurate `chat_type` would route the wake into a separate, context-less session. The `/kanban` auto-subscribe and slash-command paths capture this automatically — you only set it by hand when subscribing a chat from a script or cron. Omit it to leave an existing subscription unchanged (new subscriptions default to `dm`).
 
@@ -1221,7 +1224,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
 | `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
 | `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |
-| `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
+| `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). It stays in `blocked` — a cron-visible park a human must answer, which the disposition sweep escalates at recurrence ≥ 2 instead of requeueing — and deliberately does **not** route to `triage` (a parked card there had no exit). The event is what wakes subscribers, so the park is never silent. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
 | `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
 

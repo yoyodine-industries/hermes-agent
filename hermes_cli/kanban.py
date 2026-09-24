@@ -63,10 +63,11 @@ def _run_state_kwargs(args: argparse.Namespace, cmd: str) -> tuple[Optional[dict
     return ({} if st is None else {"state_type": st, "state_name": sn}), 0
 
 
-def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
-    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``."""
+def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``.
+    Omitted -> ``(None, None)`` so ``create_task`` can tell "default" from an explicit scratch."""
     if not value:
-        return ("scratch", None)
+        return (None, None)
     v = value.strip()
     if v in {"scratch", "worktree"}:
         return (v, None)
@@ -203,14 +204,19 @@ def kanban_command(args: argparse.Namespace) -> int:
 # --- Handlers ---
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
-    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
-        v = os.environ.get(env)
-        if v:
-            return v
+    """Best-effort author name for an interactive CLI call.
+
+    Order (see :func:`hermes_cli.profiles.resolve_acting_profile_name`):
+    ``HERMES_PROFILE_NAME`` -> ``HERMES_PROFILE`` -> the bound session profile
+    (``HERMES_SESSION_PROFILE``) -> the profile id derived from the active ``HERMES_HOME``
+    -> ``"user"``. A caller-supplied ``--author`` always wins (checked before this call).
+    The session step is what a gateway-hosted ``hermes kanban comment`` needs: its
+    ``HERMES_HOME`` is the DEFAULT root, so the home-derived name alone said
+    ``default`` for every served profile.
+    """
     try:
-        from hermes_cli.profiles import get_active_profile_name
-        return get_active_profile_name() or "user"
+        from hermes_cli.profiles import resolve_acting_profile_name
+        return resolve_acting_profile_name("user")
     except Exception:
         return "user"
 
@@ -956,13 +962,18 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failures: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
-            # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
+            # Report where it landed: dependency blocks -> todo; a tripped
+            # unblock-loop breaker PARKS the card in blocked (never triage, which
+            # has no exit for a parked card) so name the park explicitly.
             landed = kb.get_task(conn, tid)
             where = landed.status if landed else "blocked"
+            parked_at = (landed.block_recurrences or 0) if landed else 0
             if where == "todo":
                 return f"{tid} → todo (dependency wait){suffix}"
-            if where == "triage":
-                return f"{tid} → triage (unblock loop detected — needs a human decision){suffix}"
+            if where == "blocked" and parked_at >= kb.BLOCK_RECURRENCE_LIMIT:
+                return (f"{tid} → blocked, parked (unblock loop detected after "
+                        f"{parked_at} same-kind re-blocks — needs a human "
+                        f"decision){suffix}")
             return f"Blocked {tid}{suffix}{due_note}"
 
         def op(tid: str) -> bool:
@@ -1023,6 +1034,21 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                            lambda tid: failures.get(tid) or f"cannot schedule {tid}")
 
 
+def _triage_exit_hint(conn, tid: str) -> str:
+    """Suffix naming the supported exits when ``tid`` is sitting in ``triage``.
+
+    ``triage`` must never be a one-way door (D4): a guard that refuses a row in
+    that status still has to say which verb *does* apply, or the operator is back
+    to hand-written SQL on the live board. Empty string for any other status, so
+    a genuine unknown-id refusal stays honest.
+    """
+    row = kb.get_task(conn, tid)
+    if row is None or row.status != "triage":
+        return ""
+    return (f" — triage is not a dead end: release it with `hermes kanban promote {tid}` "
+            f"or close it with `hermes kanban complete {tid}`")
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
@@ -1035,7 +1061,8 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)"
+                                       + _triage_exit_hint(conn, tid))
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1099,13 +1126,13 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     author = _profile_author()
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
-    dry_run, force = bool(args.dry_run), bool(args.force)
+    dry_run = bool(args.dry_run)
 
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, force=force, dry_run=dry_run)
-            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run, "forced": force,
+            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
+            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
                             "reason": reason, "error": err})
 
     failed = [r for r in results if not r["promoted"]]

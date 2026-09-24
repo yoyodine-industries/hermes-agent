@@ -80,9 +80,15 @@ def _handle(name: str) -> str:
 
 
 def _roster(root: Path) -> list[tuple[str, Path]]:
-    """(name, dir) for the default profile + every named profile, sorted."""
+    """(name, dir) for the default profile + every named profile, sorted.
+
+    Dot-directories are skipped: ``profiles/.deleted`` is the rename tombstone
+    (``profiles.py`` moves the old dir there), never a lane -- enumerating it put
+    a phantom profile in the roster, and therefore in the sweep, the drain and
+    the managed-profile fingerprints.
+    """
     profiles = root / "profiles"
-    named = _swallow(lambda: [(c.name, c) for c in sorted(profiles.iterdir()) if c.is_dir()] if profiles.is_dir() else [], [])
+    named = _swallow(lambda: [(c.name, c) for c in sorted(profiles.iterdir()) if c.is_dir() and not c.name.startswith(".")] if profiles.is_dir() else [], [])
     return [("default", root), *named]
 
 

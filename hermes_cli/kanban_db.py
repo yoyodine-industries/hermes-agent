@@ -104,7 +104,7 @@ TERMINAL_STATUSES = {"done", "archived"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
-# Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
+# Same-reason block -> unblock -> re-block cycles before the task is parked for a human.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
@@ -304,6 +304,14 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # Worker exit "provider rate-limited": released WITHOUT counting a failure (the
 # breaker must never trip on a throttle). 75 == BSD EX_TEMPFAIL.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+# Worker exit "provider billing exhausted": the provider REFUSED the run on a
+# credit/billing wall (HTTP 402 "Insufficient Balance"), so no work was attempted.
+# Released without counting a failure like the throttle above, but PARKED instead
+# of re-queued: a quota window clears by itself, an empty account does not. 76 is
+# unused by the BSD sysexits convention and distinct from 75 so the dispatcher can
+# tell the two walls apart.
+KANBAN_BILLING_EXHAUSTED_EXIT_CODE = 76
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -1010,10 +1018,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
-    -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
-    -- successful completion — NOT on unblock (resetting on unblock is exactly
-    -- the amnesia that let the loop run unbounded).
+    -- BLOCK_RECURRENCE_LIMIT the task still lands in ``blocked`` (never
+    -- ``triage``) but is PARKED: the disposition sweep escalates it at
+    -- recurrence >= 2 instead of requeueing it, so a cron can't spin it
+    -- forever. Reset to 0 only on a successful completion — NOT on unblock
+    -- (resetting on unblock is exactly the amnesia that let the loop run
+    -- unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- Absolute epoch seconds at which a ``scheduled`` or time-fenced ``blocked``
     -- card becomes DUE. Set by ``schedule_task(due_at=...)`` /
@@ -1455,7 +1465,7 @@ def _refuse_unloadable_skills(skills: Any, assignee: Optional[str]) -> None:
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
-    workspace_kind: str = "scratch", workspace_path: Optional[str] = None,
+    workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 1,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
@@ -1479,6 +1489,8 @@ def create_task(
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
+    ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
+    an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1492,6 +1504,17 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    # A project-scoped board anchors every new task to its project's repo
+    # (deterministic worktree + branch) without each surface repeating it.
+    # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
+    # it must not be upgraded to a worktree in the board's repo (#106342).
+    if project_id is None and workspace_kind != "scratch":
+        try:
+            project_id = (_board_meta_for(board).get("project_id") or "").strip() or None
+        except Exception:
+            pass
+    if workspace_kind is None:
+        workspace_kind = "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -1501,14 +1524,6 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
-
-    # A project-scoped board anchors every new task to its project's repo
-    # (deterministic worktree + branch) without each surface repeating it.
-    if project_id is None:
-        try:
-            project_id = (_board_meta_for(board).get("project_id") or "").strip() or None
-        except Exception:
-            pass
 
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
@@ -2873,12 +2888,15 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
+    """``running|ready|blocked|review|triage -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval; with no active run the handoff fields survive via
-    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
-    ``metadata`` land on the closing run for :func:`build_worker_context`.
+    approval, and ``triage`` so a rough idea whose work already happened
+    elsewhere can be closed out instead of sitting on the spec shelf with no
+    exit (D4: ``complete`` is ``triage``'s explicit close). With no active run
+    the handoff fields survive via :func:`_synthesize_ended_run`. ``summary``
+    (defaults to ``result``) and ``metadata`` land on the closing run for
+    :func:`build_worker_context`.
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
@@ -2915,7 +2933,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'review', 'triage')
                 """
         params: tuple = (result, now, task_id)
         if expected_run_id is not None:
@@ -3260,15 +3278,18 @@ def block_task(
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
     due_at: Optional[int] = None, window_policy: Optional[str] = None,
 ) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``transient`` still counts toward the loop breaker
+    """``running``/``ready`` -> ``blocked`` (or ``todo`` for a dependency wait,
+    see :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition.
 
-    ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on the
+    ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on a plain
     ``blocked`` landing only: the due-card waker unblocks the card on the first
     dispatcher pass after that time, so a time-fenced hold releases without a
-    human touching it. It is meaningless on the ``todo`` (dependency) and
-    ``triage`` (loop-breaker) landings and is refused on the former."""
+    human touching it. It is meaningless on the ``todo`` (dependency) landing and
+    is refused on it. A loop-breaker PARK (``block_loop_detected``) is excluded
+    too — that card is waiting on a human decision, not a clock, so arming a wake
+    time would let it release itself and re-enter the loop the breaker just
+    stopped."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     if window_policy is not None and window_policy not in VALID_DUE_WINDOW_POLICIES:
@@ -3293,7 +3314,7 @@ def block_task(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
-        if new_status == "blocked" and due_at is not None:
+        if new_status == "blocked" and due_at is not None and event_kind == "blocked":
             set_sql += ",\n                       due_at = ?,\n                       due_window_policy = ?"
             params = (*params, int(due_at), window_policy or DEFAULT_DUE_WINDOW_POLICY)
             payload["due_at"] = int(due_at)
@@ -3319,11 +3340,10 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
-    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    _fire_task_hook(
+        "kanban_task_blocked", blocked_task, task_id, run_id,
+        reason=reason, block_kind=kind, source_status=source_status,
+    )
     return True
 
 
@@ -3340,7 +3360,13 @@ def _route_block(
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``BLOCK_RECURRENCE_LIMIT`` the task PARKS: it lands in ``blocked`` like any
+    other human ask, carrying ``block_recurrences``/``block_kind`` and a
+    ``block_loop_detected`` event, and stops being auto-requeued (the disposition
+    sweep escalates a card at recurrence >= 2). It deliberately does NOT route to
+    ``triage``: triage is the spec shelf, and a card parked there has no exit —
+    ``promote``/``unblock`` both refused it, so the only documented way out was
+    hand-written SQL against the live board.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
@@ -3350,7 +3376,10 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
+        # Park, don't stash: `blocked` is where a card waits for the human whose
+        # decision the breaker is asking for, and it is the only status with a
+        # documented exit for every other lane's tooling.
+        return "blocked", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
@@ -3619,33 +3648,41 @@ def request_changes(
 
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    force: bool = False, dry_run: bool = False,
+    dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished unless ``force``; ``dry_run`` only
+    """Operator promotion ``triage``/``todo``/``blocked`` -> ``ready`` with an
+    audit event. ``triage`` is accepted so the spec shelf is never a one-way
+    door: a rough idea that is already specified — or one you just judged
+    workable as it stands — has to be releasable without hand-written SQL. The
+    audit event records ``from_status`` so the departure from the shelf is
+    visible on the card. Refused while a parent is unfinished; ``dry_run`` only
     validates. Returns ``(ok, reason)``."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("triage", "todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'triage', 'todo' or 'blocked'"
         )
 
-    if not force:
-        parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?", (task_id,),
-        ).fetchall()
-        unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
-        if unsatisfied:
-            return False, (
-                f"unsatisfied parent dependencies: "
-                f"{', '.join(unsatisfied)} (use --force to override)"
-            )
+    # No override: claim_task demotes ready -> todo on an undone parent whichever
+    # writer set 'ready', so a forced promotion would only report a success the
+    # first claim silently reverts (#106195). The dependency itself is the knob.
+    parents = conn.execute(
+        "SELECT t.id, t.status FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ?", (task_id,),
+    ).fetchall()
+    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
+    if unsatisfied:
+        return False, (
+            f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
+            f"(the ready -> running claim re-checks parents, so promotion cannot "
+            f"bypass them; complete the parents or drop the link with "
+            f"`hermes kanban unlink <parent_id> {task_id}`)"
+        )
 
     if dry_run:
         return True, None
@@ -3653,12 +3690,13 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            "WHERE id = ? AND status IN ('triage', 'todo', 'blocked')", (task_id,),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
         _append_event(
-            conn, task_id, "promoted_manual", {"actor": actor, "reason": reason, "forced": force},
+            conn, task_id, "promoted_manual",
+            {"actor": actor, "reason": reason, "from_status": cur_status},
         )
 
     return True, None
