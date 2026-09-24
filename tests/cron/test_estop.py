@@ -525,3 +525,139 @@ def test_status_line_renders_deadman_and_allowlist(hermes_home):
     estop.engage(reason="ops", allow={"user_ids": [OPERATOR]}, ttl="45m")
     line = _estop_status_line()
     assert "ops" in line and OPERATOR in line and "deadman" in line
+
+
+# ── run identity + release cause (t_5abfda01) ────────────────────────────────
+#
+# A hold that comes back is worth exactly as much as the record of HOW it came back:
+# `lease_expiry` means the releasing run died before its exit path ran, and that is the one
+# state worth paging on. So the sentinel names the run that armed it, and every release
+# (deadman or caller) writes a dated record beside the sentinel it removed.
+
+RUN_ID = "20260923-2200-winddown"
+
+
+def test_run_id_round_trips_through_the_sentinel(hermes_home):
+    """"Which run armed this" must outlive the arming process — it is read off the sentinel."""
+    estop.engage(reason="update window", run_id=RUN_ID, ttl="45m")
+
+    assert estop.get_state()["run_id"] == RUN_ID
+    raw = json.loads((hermes_home / "ESTOP").read_text(encoding="utf-8"))
+    assert raw["run_id"] == RUN_ID
+
+
+def test_unidentified_arm_reports_no_run_rather_than_a_wrong_one(hermes_home):
+    """A hand-armed pause has no run; recording a stand-in would be a false provenance."""
+    estop.engage(reason="manual")
+    assert estop.get_state()["run_id"] is None
+
+
+def test_no_release_record_before_any_pause(hermes_home):
+    """The record is written by a RELEASE — a home that never held a pause reports nothing."""
+    assert estop.get_last_release() is None
+
+
+def test_release_records_the_cause_and_the_arming_run(hermes_home):
+    estop.engage(reason="update window", run_id=RUN_ID, ttl="45m")
+
+    assert estop.disengage(released_by="node") is True
+    record = estop.get_last_release()
+    assert record["released_by"] == "node"
+    assert record["run_id"] == RUN_ID
+    assert record["reason"] == "update window"
+    assert record["engaged_at"] and record["released_at"]
+    assert estop.is_engaged() is False
+
+
+def test_deadman_expiry_records_lease_expiry(hermes_home):
+    """The state worth paging on: the holder died and never reached its release."""
+    estop.engage(reason="update window", run_id=RUN_ID, ttl="45m")
+    (hermes_home / "ESTOP").write_text(
+        json.dumps({"reason": "update window", "run_id": RUN_ID, "expires_at": _stamp(-30)}),
+        encoding="utf-8")
+
+    assert estop.is_engaged() is False
+    record = estop.get_last_release()
+    assert record["released_by"] == "lease_expiry"
+    assert record["run_id"] == RUN_ID
+
+
+def test_a_caller_cannot_claim_lease_expiry(hermes_home):
+    """Only the deadman may write the paging state, and a refused cause must lift NOTHING."""
+    estop.engage(ttl="45m")
+
+    with pytest.raises(ValueError):
+        estop.disengage(released_by="lease_expiry")
+    assert estop.is_engaged() is True
+    assert estop.get_last_release() is None
+
+
+def test_release_records_land_beside_every_sentinel_removed(tmp_path, monkeypatch):
+    """A profile-home release also lifts the fleet root, so a reader at EITHER path sees it."""
+    root = tmp_path / "hermes-root"
+    profile = root / "profiles" / "ops"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    estop._logged_components.clear()
+    estop.engage(run_id=RUN_ID)
+    (root / "ESTOP").write_text(json.dumps({"run_id": "root-run"}), encoding="utf-8")
+
+    assert estop.disengage(released_by="node") is True
+    assert (profile / "ESTOP.release.json").exists()
+    assert (root / "ESTOP.release.json").exists()
+
+
+def test_cli_pause_records_the_arming_run(hermes_home, capsys):
+    from hermes_cli.subcommands.pause import cmd_pause
+
+    rc = cmd_pause(argparse.Namespace(
+        reason="update window", allow_user=None, allow_profile=None, ttl="45m", run_id=RUN_ID))
+    assert rc == 0
+    assert estop.get_state()["run_id"] == RUN_ID
+    assert RUN_ID in capsys.readouterr().out
+
+
+def test_cli_resume_records_its_cause(hermes_home, capsys):
+    from hermes_cli.subcommands.pause import cmd_resume
+
+    estop.engage(run_id=RUN_ID, ttl="45m")
+    assert cmd_resume(argparse.Namespace(by="on_exit")) == 0
+    record = estop.get_last_release()
+    assert record["released_by"] == "on_exit" and record["run_id"] == RUN_ID
+
+
+def test_cli_resume_defaults_to_manual(hermes_home, capsys):
+    """A bare `hermes resume` is not a node — claiming one would hide the exit-path signal."""
+    from hermes_cli.subcommands.pause import cmd_resume
+
+    estop.engage(ttl="45m")
+    assert cmd_resume(argparse.Namespace()) == 0
+    assert estop.get_last_release()["released_by"] == "manual"
+
+
+def test_cli_resume_rejects_an_unknown_cause_without_lifting(hermes_home, capsys):
+    from hermes_cli.subcommands.pause import cmd_resume
+
+    estop.engage(ttl="45m")
+    assert cmd_resume(argparse.Namespace(by="banana")) == 2
+    assert estop.is_engaged() is True, "a rejected --by must not half-release the pause"
+    assert "Invalid" in capsys.readouterr().out
+
+
+def test_status_line_surfaces_a_deadman_release(hermes_home):
+    """`hermes status` is where an operator looks: a deadman return must not look clean."""
+    from hermes_cli.status import _estop_last_release_line
+
+    estop.engage(run_id=RUN_ID, ttl="45m")
+    (hermes_home / "ESTOP").write_text(
+        json.dumps({"run_id": RUN_ID, "expires_at": _stamp(-30)}), encoding="utf-8")
+
+    assert estop.is_engaged() is False
+    line = _estop_last_release_line()
+    assert RUN_ID in line and "lease expiry" in line
+
+
+def test_status_line_reports_no_release_on_a_clean_home(hermes_home):
+    from hermes_cli.status import _estop_last_release_line
+
+    assert _estop_last_release_line() is None

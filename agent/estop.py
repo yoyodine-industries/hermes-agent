@@ -7,7 +7,8 @@ turns skip work; in-flight work is never killed. The check is one or two uncache
 JSON ``{"reason", "engaged_at", "expires_at", "allow"}``; a corrupt/empty file still
 counts as engaged (fail safe, e.g. ``touch ~/.hermes/ESTOP``).
 
-Two fields extend the primitive, both so an unattended hold cannot strand the fleet:
+Fields extend the primitive, so an unattended hold can neither strand the fleet nor come
+back anonymously:
 
 ``expires_at``
     A DEADMAN (ISO-8601). Past that instant the sentinel is NOT engaged, so a window
@@ -19,6 +20,16 @@ Two fields extend the primitive, both so an unattended hold cannot strand the fl
     Identity first: ``user_ids`` is the operator's authenticated id. ``profiles`` is a
     secondary key for a maintenance lane, because a profile name is whatever the
     operator happens to be chatting through at 00:00. Absent allowlist = nobody exempt.
+``run_id``
+    WHICH run armed the hold, so one found on disk can be traced to its armer rather than
+    to a timestamp. Absent for a hand-armed pause — never a fabricated stand-in.
+
+Every release also writes a dated record (``ESTOP.release.json``, beside the sentinel it
+removed) naming its CAUSE — ``node`` (a wind-down DAG node released it), ``on_exit`` (the
+run's exit path did), ``manual`` (an operator ran ``hermes resume``) or ``lease_expiry``
+(read via :func:`get_last_release`). Only the deadman may write ``lease_expiry``: it is the
+one cause that means the releasing run died before its exit path ran, so it is the one
+state worth paging on.
 
 Ported from gastownhall/gastown estop.go (MIT).
 """
@@ -38,6 +49,15 @@ from typing import Any, Optional
 from agent.file_safety import _hermes_home_path as _hermes_home, _hermes_root_path as _canonical_root
 
 SENTINEL_NAME = "ESTOP"
+
+# Release records are written BESIDE the sentinel they removed, so a reader at the profile home
+# and one at the fleet root each see how the last hold on their path came back.
+RELEASE_RECORD_NAME = "ESTOP.release.json"
+# Causes a CALLER may record. ``lease_expiry`` is deliberately absent: only the deadman writes it
+# (see :func:`disengage`), so a clean release can never masquerade as "the exit path never ran".
+RELEASE_CAUSES = ("node", "on_exit", "manual")
+LEASE_EXPIRY_CAUSE = "lease_expiry"
+DEFAULT_RELEASE_CAUSE = "manual"
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +104,19 @@ def _candidate_sentinel_paths() -> list:
         # Non-Path test doubles fail .resolve(); plain equality still dedupes.
         distinct = root != primary
     return [primary, root] if distinct else [primary]
+
+
+def _release_record_path(path: Path) -> Path:
+    """Where the record of ``path``'s release is written (beside the sentinel it removed)."""
+    return path.with_name(RELEASE_RECORD_NAME)
+
+
+def _normalize_run_id(run_id: Any) -> Optional[str]:
+    """The arming run's id as a non-empty stripped string, or None (a blank id is no id)."""
+    if run_id is None:
+        return None
+    text = str(run_id).strip()
+    return text or None
 
 
 def _read_payload(path: Path) -> Optional[dict]:
@@ -168,6 +201,10 @@ def _retire_expired(path: Path) -> None:
         _expired_logged[str(path)] = key
     if not first_report:
         return
+    payload = _read_payload(path)
+    # Recorded BEFORE the unlink and outside any failure path: the lift is already true (the
+    # stamp is in the past), so losing the bookkeeping must not also lose the record of it.
+    _write_release(path, LEASE_EXPIRY_CAUSE, None, payload)
     removed = False
     try:
         if _engagement_key(path) == key:
@@ -175,11 +212,37 @@ def _retire_expired(path: Path) -> None:
             removed = True
     except (OSError, AttributeError, TypeError, ValueError):
         pass
+    armed_by = payload.get("run_id") if payload else None
     logger.warning(
         "Global emergency stop at %s EXPIRED at its deadman TTL — the pause has lifted and "
-        "dispatch resumes. The sentinel %s; run `hermes pause --ttl <dur>` to re-arm.",
+        "dispatch resumes. The sentinel %s; run `hermes pause --ttl <dur>` to re-arm.%s",
         path, "was removed" if removed else "could not be removed (it stays inert)",
+        f" Armed by run {armed_by}." if armed_by else "",
     )
+
+
+def _write_release(path: Path, released_by: str, run_id: Any, payload: Optional[dict]) -> None:
+    """Record WHY a sentinel came back, beside the sentinel itself.
+
+    Best effort and never raises: the release has already happened by the time this runs, so a
+    failed bookkeeping write must not re-hold the pause. ``run_id`` wins over the sentinel's own
+    (a releasing node knows which run it is); the sentinel's arming run is the fallback.
+    """
+    armed = payload or {}
+    record = {
+        "released_by": released_by,
+        "released_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": _normalize_run_id(run_id) or _normalize_run_id(armed.get("run_id")),
+        "reason": armed.get("reason") or None,
+        "engaged_at": armed.get("engaged_at") or None,
+        "expires_at": armed.get("expires_at") or None,
+    }
+    try:
+        _release_record_path(path).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        logger.warning(
+            "Could not write the release record for %s (cause: %s) — the pause is lifted regardless.",
+            path, released_by)
 
 
 def is_engaged() -> bool:
@@ -206,13 +269,16 @@ def engage(
     allow: Optional[dict] = None,
     ttl: Any = None,
     expires_at: Any = None,
+    run_id: Any = None,
 ) -> Path:
     """Create the ESTOP sentinel. Idempotent; re-engaging rewrites the file.
 
     ``allow`` is ``{"user_ids": [...], "profiles": [...]}`` (either key optional, values
     coerced to strings); ``ttl`` accepts ``45m``/``90m``/``2h``/seconds and sets the
     deadman, or pass ``expires_at`` (ISO-8601 / aware datetime) directly. An unusable ttl
-    still engages — it never half-arms a pause — and is reported by the CLI.
+    still engages — it never half-arms a pause — and is reported by the CLI. ``run_id`` names
+    the run arming the hold (the wind-down DAG passes its own); a blank one is stored as
+    absent rather than invented.
     """
     path = sentinel_path()
     now = datetime.now(timezone.utc)
@@ -222,6 +288,9 @@ def engage(
         if seconds:
             expiry = now + timedelta(seconds=seconds)
     payload: dict = {"engaged_at": now.isoformat(), "reason": reason or None}
+    identity = _normalize_run_id(run_id)
+    if identity:
+        payload["run_id"] = identity
     if expiry is not None:
         payload["expires_at"] = expiry.isoformat()
     normalized_allow = _normalize_allow(allow)
@@ -236,27 +305,39 @@ def engage(
     return path
 
 
-def disengage() -> bool:
-    """Remove every visible sentinel (process-local and fleet-root)."""
+def disengage(released_by: str = DEFAULT_RELEASE_CAUSE) -> bool:
+    """Remove every visible sentinel (process-local and fleet-root), recording WHY.
+
+    ``released_by`` is one of :data:`RELEASE_CAUSES`. :data:`LEASE_EXPIRY_CAUSE` is reserved
+    for the deadman — a caller claiming it would erase the one state worth paging on — so it
+    raises ``ValueError`` and lifts NOTHING. A record is written beside each sentinel actually
+    removed, best effort: failing to write it never re-holds a pause that is already lifted.
+    """
+    if released_by not in RELEASE_CAUSES:
+        raise ValueError(
+            f"released_by must be one of {', '.join(RELEASE_CAUSES)} (got {released_by!r}); "
+            f"{LEASE_EXPIRY_CAUSE!r} is written only by the deadman path")
     lifted = False
     for path in _candidate_sentinel_paths():
+        payload = _read_payload(path)  # before the unlink: it carries the arming run's id
         try:
             path.unlink()
             lifted = True
         except (OSError, AttributeError):
             continue
+        _write_release(path, released_by, None, payload)
         with _log_lock:
             _expired_logged.pop(str(path), None)
     return lifted
 
 
 def get_state() -> Optional[dict]:
-    """``{"reason", "engaged_at", "expires_at", "allow"}`` or None when not engaged; an
-    unreadable/corrupt body still reports engaged with the fields None/{}. An expired
+    """``{"reason", "engaged_at", "expires_at", "allow", "run_id"}`` or None when not engaged;
+    an unreadable/corrupt body still reports engaged with the fields None/{}. An expired
     sentinel is NOT engaged."""
     if not is_engaged():
         return None
-    state = {"reason": None, "engaged_at": None, "expires_at": None, "allow": {}}
+    state = {"reason": None, "engaged_at": None, "expires_at": None, "allow": {}, "run_id": None}
     found = False
     for path in _candidate_sentinel_paths():
         try:
@@ -274,9 +355,28 @@ def get_state() -> Optional[dict]:
                 "engaged_at": payload.get("engaged_at") or None,
                 "expires_at": payload.get("expires_at") or None,
                 "allow": _normalize_allow(payload.get("allow")),
+                "run_id": _normalize_run_id(payload.get("run_id")),
             }
             break
     return state if found else None
+
+
+def get_last_release() -> Optional[dict]:
+    """How the LAST hold on this home came back, or None if no release was ever recorded.
+
+    ``{"released_by", "released_at", "run_id", "reason", "engaged_at", "expires_at"}``, read
+    from the record beside each candidate sentinel (newest ``released_at`` wins, so a profile
+    release that also lifted the fleet root still reports the most recent one). Diagnostics
+    only — never a gate: a missing or unreadable record is skipped, never guessed.
+    """
+    records = []
+    for path in _candidate_sentinel_paths():
+        payload = _read_payload(_release_record_path(path))
+        if payload and payload.get("released_by"):
+            records.append(payload)
+    if not records:
+        return None
+    return max(records, key=lambda record: str(record.get("released_at") or ""))
 
 
 def is_allowed(

@@ -100,6 +100,8 @@ def _estop_status_line():
     if state is None:
         return None
     detail = f" — reason: {state['reason']}" if state.get("reason") else ""
+    if state.get("run_id"):
+        detail += f"; armed by run {state['run_id']}"
     if state.get("expires_at"):
         detail += f"; auto-resumes {state['expires_at']} (deadman TTL)"
     allow = state.get("allow") or {}
@@ -108,6 +110,40 @@ def _estop_status_line():
     if who:
         detail += f"; allowed through: {', '.join(who)}"
     return f"⏸️  PAUSED (global emergency stop{detail}; `hermes resume` to lift)"
+
+
+# How the last hold ended, in words. `lease_expiry` is the one cause that means the releasing
+# run never reached its own release path, so it is flagged rather than merely reported.
+_RELEASE_CAUSE_LABELS = {
+    "node": "the wind-down node",
+    "on_exit": "the run's exit path",
+    "manual": "a manual `hermes resume`",
+    "lease_expiry": "the deadman lease expiry",
+}
+
+
+def _estop_last_release_line():
+    """How the LAST pause ended (`agent.estop.get_last_release`), or None if none ever held.
+
+    Not paused and no record means nothing to say. The line carries the release timestamp, so an
+    old deadman return cannot read as a fresh one; a clean release is informational, while a
+    lease expiry — the run died before its exit path ran — is flagged for paging.
+    """
+    try:
+        from agent.estop import get_last_release
+    except ImportError:
+        return None
+    record = get_last_release()
+    if not record:
+        return None
+    cause = str(record.get("released_by") or "unknown")
+    label = _RELEASE_CAUSE_LABELS.get(cause, cause)
+    run = f" (run {record['run_id']})" if record.get("run_id") else ""
+    at = record.get("released_at") or "an unrecorded time"
+    if cause == "lease_expiry":
+        return (f"⚠️  Last pause ended by {label} at {at}{run} — that run never released it; "
+                f"check its exit path.")
+    return f"⏹️  Last pause was released by {label} at {at}{run}."
 
 
 # --- Data tables driving the per-section renderers -------------------------
@@ -149,6 +185,10 @@ def _render_header(ctx):
     paused = _estop_status_line()
     if paused:
         _banner((paused,), Colors.YELLOW, Colors.BOLD)
+        return
+    released = _estop_last_release_line()
+    if released:
+        _banner((released,), Colors.YELLOW if released.startswith("⚠️") else Colors.DIM)
 
 
 def _render_environment(ctx):
