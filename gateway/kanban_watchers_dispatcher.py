@@ -138,7 +138,7 @@ class _KanbanDispatcher:
         return _board_slugs(self.kb)
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
-        path = self.kb.kanban_db_path(slug)
+        path = self.kb.board_db_path(slug)
         try:
             resolved = str(path.expanduser().resolve())
         except Exception:

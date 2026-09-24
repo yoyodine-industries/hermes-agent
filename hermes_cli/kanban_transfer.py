@@ -125,7 +125,7 @@ def export_board(
     if not kb.board_exists(slug):
         raise ValueError(f"board {slug!r} does not exist")
 
-    db_path = kb.kanban_db_path(slug)
+    db_path = kb.board_db_path(slug)
     if not db_path.exists():
         raise FileNotFoundError(f"board {slug!r} has no database at {db_path}")
 
@@ -345,9 +345,9 @@ def import_board(
     )
     # Bring the imported schema up to this install's version before the
     # relocation pass writes to it.
-    kb.init_db(board=target)
+    kb.init_db(db_path=kb.board_db_path(target))
 
-    with kbc.connect_closing(board=target) as conn:
+    with kbc.connect_closing(db_path=kb.board_db_path(target)) as conn:
         stats, warnings = _relocate_imported_rows(conn, target)
         counts = _count_rows(conn)
 
@@ -360,7 +360,7 @@ def import_board(
         "renamed": target != requested,
         "name": name,
         "path": str(kb.board_dir(target)),
-        "db_path": str(kb.kanban_db_path(target)),
+        "db_path": str(kb.board_db_path(target)),
         "source": {
             "board": manifest.get("board"),
             "exported_at": manifest.get("exported_at"),

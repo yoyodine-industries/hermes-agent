@@ -148,6 +148,106 @@ class TestPathResolution:
 
 
 # ---------------------------------------------------------------------------
+# Inventory enumeration vs the pin guard (card t_97dc6247, facet 1)
+# ---------------------------------------------------------------------------
+
+class TestInventoryIgnoresThePin:
+    """``_require_board_matches_pin`` guards user-directed board *selection*; it must
+    never fire for *inventory* enumeration, which resolves the real path of every
+    board. Regression: the guard made ``hermes kanban boards`` traceback in any
+    pinned session (every worker session is pinned).
+    """
+
+    def test_list_boards_ignores_the_pin(self, fresh_home, tmp_path, monkeypatch):
+        """Enumerating boards resolves each board's canonical path, not the pin."""
+        kb.create_board("atm10-server")
+        pin = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+
+        boards = kb.list_boards(include_archived=False)  # must not raise
+        by_slug = {b["slug"]: b for b in boards}
+        assert by_slug["default"]["db_path"] == str(fresh_home / "kanban.db")
+        assert by_slug["atm10-server"]["db_path"] == str(
+            fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
+        )
+        # No board may be reported as living at the pin.
+        assert {b["db_path"] for b in boards}.isdisjoint({str(pin)})
+
+    def test_read_board_metadata_reports_canonical_db_path_under_pin(
+        self, fresh_home, tmp_path, monkeypatch,
+    ):
+        """``read_board_metadata`` reports the board's own DB, even while pinned."""
+        kb.create_board("atm10-server")
+        pin = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+
+        assert kb.read_board_metadata("default")["db_path"] == str(fresh_home / "kanban.db")
+        assert kb.read_board_metadata("atm10-server")["db_path"] == str(
+            fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
+        )
+
+    def test_write_board_metadata_reports_canonical_db_path_under_pin(
+        self, fresh_home, tmp_path, monkeypatch,
+    ):
+        """The write side returns the same canonical path (never the pin)."""
+        kb.create_board("atm10-server")
+        pin = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+
+        meta = kb.write_board_metadata("atm10-server", name="ATM10")
+        assert meta["db_path"] == str(
+            fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
+        )
+
+
+# ---------------------------------------------------------------------------
+# `hermes kanban --board <foreign>` refuses under a pin (card t_97dc6247, facet 2)
+# ---------------------------------------------------------------------------
+
+class TestBoardFlagRefusesUnderPin:
+    """The ``--board`` flag is user-directed selection, so it gets the same guard as
+    ``board=`` — and the same message, with exit code 2."""
+
+    def _run(self, argv: list[str]) -> int:
+        import argparse
+
+        from hermes_cli import kanban as kc
+
+        parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+        sub = parser.add_subparsers(dest="command")
+        kc.build_parser(sub)
+        return kc.kanban_command(parser.parse_args(["kanban", *argv]))
+
+    def test_board_flag_refuses_a_foreign_board_under_pin(
+        self, fresh_home, monkeypatch, capsys,
+    ):
+        kb.create_board("ops")
+        kb.create_board("atm10-server")
+        pin = fresh_home / "kanban" / "boards" / "ops" / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+
+        rc = self._run(["--board", "atm10-server", "show", "t_deadbeef"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "atm10-server" in err, err  # names the board it refused
+        assert "ops" in err, err  # names the board it is pinned to
+
+    def test_board_flag_allows_the_pinned_board(self, fresh_home, monkeypatch):
+        """Naming your OWN board is not a refusal — the pin is not a ban on --board."""
+        kb.create_board("ops")
+        pin = fresh_home / "kanban" / "boards" / "ops" / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+
+        assert self._run(["--board", "ops", "boards"]) != 2
+
+    def test_board_flag_is_unguarded_when_unpinned(self, fresh_home):
+        """No pin -> no confinement: any existing board may be named."""
+        kb.create_board("atm10-server")
+
+        assert self._run(["--board", "atm10-server", "boards"]) != 2
+
+
+# ---------------------------------------------------------------------------
 # Current-board resolution
 # ---------------------------------------------------------------------------
 

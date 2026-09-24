@@ -347,7 +347,7 @@ def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
     slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
     db_path = (board_meta or {}).get("db_path")
     try:
-        return slug, str(Path(db_path).expanduser().resolve() if db_path else _kb.kanban_db_path(slug).resolve())
+        return slug, str(Path(db_path).expanduser().resolve() if db_path else _kb.board_db_path(slug).resolve())
     except Exception:
         return slug, f"slug:{slug}"
 

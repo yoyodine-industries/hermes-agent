@@ -256,7 +256,7 @@ class _Collector:
             slug = board_meta.get("slug") or kb.DEFAULT_BOARD
             db_path = board_meta.get("db_path")
             try:
-                resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(kb.kanban_db_path(slug).resolve())
+                resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(kb.board_db_path(slug).resolve())
             except Exception:
                 resolved_db_path = f"slug:{slug}"
             if resolved_db_path in seen_db_paths:

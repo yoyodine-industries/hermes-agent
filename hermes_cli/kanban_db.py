@@ -561,6 +561,18 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
 
 
+def board_db_path(board: Optional[str] = None) -> Path:
+    """Canonical on-disk ``kanban.db`` for ``board``, WITHOUT the pin-confinement guard.
+
+    Inventory and maintenance enumeration -- listing boards, reading board metadata,
+    export/import, cross-board counting, the dispatcher's worker pin -- resolves the
+    REAL path of each board through this. The guarded :func:`kanban_db_path` stays the
+    resolver for a user-directed ``board=`` (and the pin), where a worker naming a
+    foreign board must refuse loudly.
+    """
+    return _board_path(None, board, ("kanban.db",), "kanban.db")
+
+
 def workspaces_root(board: Optional[str] = None) -> Path:
     """Per-board scratch workspace root (``HERMES_KANBAN_WORKSPACES_ROOT`` wins);
     ``default`` keeps the legacy ``<root>/kanban/workspaces/``."""
@@ -621,7 +633,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    meta["db_path"] = str(kanban_db_path(slug))
+    meta["db_path"] = str(board_db_path(slug))
     return meta
 
 
@@ -655,7 +667,7 @@ def write_board_metadata(
     path.write_text(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
     )
-    meta["db_path"] = str(kanban_db_path(slug))
+    meta["db_path"] = str(board_db_path(slug))
     return meta
 
 

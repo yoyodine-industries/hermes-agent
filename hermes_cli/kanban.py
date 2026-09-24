@@ -173,6 +173,13 @@ def kanban_command(args: argparse.Namespace) -> int:
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
             return _err(f"kanban: board {normed!r} does not exist. "
                         f"Create it with `hermes kanban boards create {normed}`.")
+        # Confine --board the same way board= is confined inside a pinned session: a
+        # worker may only name its own board, and must refuse loudly otherwise instead
+        # of silently reading (or writing) a foreign board's DB.
+        try:
+            kb._require_board_matches_pin(normed)
+        except ValueError as exc:
+            return _err(f"kanban: {exc}", 2)
         board_scope = kb.scoped_current_board(normed)
 
     with board_scope:

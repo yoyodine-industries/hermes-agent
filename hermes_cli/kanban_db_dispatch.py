@@ -1869,7 +1869,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     board to one file) yields 0. Fails open per board.
     """
     try:
-        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+        current_path = str(_kb.board_db_path(board=board).expanduser().resolve())
     except Exception:
         current_path = None
     try:
@@ -1880,13 +1880,13 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
-            path = _kb.kanban_db_path(board=slug).expanduser()
+            path = _kb.board_db_path(board=slug).expanduser()
             resolved = str(path.resolve())
             if current_path is not None and resolved == current_path:
                 continue
             if not path.exists():
                 continue
-            other = _kbc.connect(board=slug)
+            other = _kbc.connect(db_path=path)
             try:
                 total += count_running_tasks(other)
             finally:
@@ -1956,6 +1956,11 @@ def dispatch_once(
         )
 
     try:
+        # Pin-aware ON PURPOSE: the tick lock and the WAL-checkpoint key both name the
+        # DB this tick actually touches, and under HERMES_KANBAN_DB that is the pin --
+        # keying them on the un-pinned board path would serialize unrelated pinned
+        # dispatchers and account the checkpoint against a DB nobody ticked.
+        # (See card t_97dc6247: the rest of the enumeration moved to board_db_path.)
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
         # Must not lose the tick — fall through to an unguarded dispatch.
@@ -2854,7 +2859,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             env[var] = override
     # Pin the board DB + workspaces root so the worker's kanban paths still
     # match after `hermes -p` rewrites HERMES_HOME (symlink / Docker layouts).
-    env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
+    env["HERMES_KANBAN_DB"] = str(_kb.board_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — defense-in-depth pin if a path is resolved without the
