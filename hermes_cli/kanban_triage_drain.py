@@ -378,7 +378,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         text = _report_text(report)
         print(text)
         if args.log:
-            with open(args.log, "a") as fh:
+            with open(args.log, "a", encoding="utf-8") as fh:
                 fh.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n{text}\n")
     return 0
 

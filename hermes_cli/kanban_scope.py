@@ -255,7 +255,7 @@ def _main(argv: list[str]) -> int:
 
     body = args.body
     if body.startswith("@"):
-        body = Path(body[1:]).read_text()
+        body = Path(body[1:]).read_text(encoding="utf-8")
 
     v = scope_verdict(body, threshold=args.threshold)
     import json

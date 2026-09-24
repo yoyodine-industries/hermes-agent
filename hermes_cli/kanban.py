@@ -216,7 +216,7 @@ def _profile_author() -> str:
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
-    "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
+    "init", "create", "swarm", "assign", "priority", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
@@ -615,6 +615,21 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    return 0
+
+
+def _cmd_priority(args: argparse.Namespace) -> int:
+    """Set the dispatch-priority tiebreaker (bigger = claimed first) on card(s)."""
+    level = int(args.level)
+    ids = _bulk_ids(args)
+    try:
+        with kbc.connect_closing() as conn:
+            missing = [tid for tid in ids if not kb.set_priority(conn, tid, level)]
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
+    if missing:
+        return _err(f"no such task: {', '.join(missing)}")
+    print(f"Set priority {level} on {', '.join(ids)}")
     return 0
 
 
@@ -1330,7 +1345,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
-    "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "assign": _cmd_assign, "set-model": _cmd_set_model, "priority": _cmd_priority,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
@@ -1366,6 +1381,7 @@ Common subcommands:
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
+  `priority <id> <n>`   Set the claim-order tiebreaker (bigger = claimed first)
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
   `context <id>`        Full worker-context dump
