@@ -628,6 +628,10 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
             sets.append("title = ?")
             vals.append(payload.title.strip())
         if payload.body is not None:
+            try:
+                kanban_db.refuse_truncated_body(payload.body)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             sets.append("body = ?")
             vals.append(payload.body)
         vals.append(task_id)

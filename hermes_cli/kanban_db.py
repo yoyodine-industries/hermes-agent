@@ -1218,6 +1218,39 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+# Markers a truncating writer leaves behind (agent runtimes cut long tool arguments and
+# mark the cut; the punctuation varies with the writer). They mean "this text is an
+# abbreviated fragment", which is the one thing a card body must never be: a spec that
+# stops mid-sentence reads exactly like a complete one, so the next worker plans against
+# half an operator directive. Measured on the live board: 16 card bodies and 30 comments
+# ended in one of these.
+TRUNCATION_MARKERS = (
+    "...[truncated]",
+    "\u2026[truncated]",
+    "... [truncated]",
+    "\u2026 [truncated]",
+)
+
+
+def refuse_truncated_body(text: Optional[str], *, field: str = "body") -> None:
+    """Refuse text whose last non-space characters are a truncation marker.
+
+    Only a TRAILING marker is refused. A body that *quotes* one mid-text (a defect
+    report, evidence, a sweep comment) is complete prose and stays legal, which is why
+    this is not a substring test. Raising beats stripping: silently dropping the marker
+    would store the fragment as if it were whole.
+    """
+    stripped = (text or "").rstrip()
+    for marker in TRUNCATION_MARKERS:
+        if stripped.endswith(marker):
+            raise ValueError(
+                f"{field} is truncated: it ends with {marker!r}, which marks text that an "
+                "upstream writer cut short. A card body must carry the complete text — "
+                "re-send it whole (move overflow into a comment) instead of storing the "
+                "fragment as the spec."
+            )
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1257,6 +1290,7 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    refuse_truncated_body(body)
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo
@@ -1681,6 +1715,7 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
+    refuse_truncated_body(body, field="comment body")
     if not author or not author.strip():
         raise ValueError("comment author is required")
     now = int(time.time())
@@ -3491,6 +3526,8 @@ def specify_triage_task(
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
+    if body is not None:
+        refuse_truncated_body(body)
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
