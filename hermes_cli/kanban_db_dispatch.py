@@ -378,6 +378,38 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     return f"{current_instantiation_epoch()}|{start}"
 
 
+def _fingerprint_matches(pid: Optional[int], started_at) -> Optional[bool]:
+    """Tri-state "is the live ``pid`` the worker fingerprinted by ``started_at``?"
+
+    ``started_at`` here is a boot-witness fingerprint (``"<epoch>|<start>"``) written by
+    ``_set_worker_pid``. True = provably our worker (epoch matches AND the start time agrees within the
+    drift tolerance); False = provably foreign (epoch differs, or the start time is beyond tolerance);
+    None = unprovable (start time unreadable, or the recorded value unparseable). Callers choose the
+    None fallback: liveness defers (holds the claim — never reap a possibly-live worker), kill
+    authority refuses to signal.
+
+    The start time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a
+    row that survives a reboot could match an unrelated process with the same PID and tick value; the
+    epoch catches that. On macOS the psutil ``create_time()`` reading drifts by ~1 s between claim-time
+    and a later liveness read (``kern.boottime`` adjustment, #117505), so the start-time comparison is
+    drift-tolerant (``start_time_fingerprints_match``), not exact — the exact-equality form previously
+    declared a live, mid-session worker "not alive" and discarded its finished work."""
+    from gateway.drain_control import current_instantiation_epoch
+    from gateway.status import get_process_start_time, start_time_fingerprints_match
+    if not pid:
+        return None
+    current_start = get_process_start_time(int(pid))
+    if current_start is None:
+        return None
+    recorded_epoch, sep, recorded_start = started_at.partition("|")
+    if not sep or recorded_epoch != current_instantiation_epoch():
+        return False
+    try:
+        return start_time_fingerprints_match(int(recorded_start), current_start)
+    except (TypeError, ValueError):
+        return None
+
+
 def _worker_alive(pid: Optional[int], started_at) -> bool:
     """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
     recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
@@ -385,11 +417,15 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
     a fingerprint keeps the existence answer: killing it is the pre-fingerprint behaviour and the row is
     rewritten with a fingerprint on its next spawn. An UNVERIFIED spawn also keeps the existence answer
     (a claim is never released beside a possibly-live worker) but ``_terminate_reclaimed_worker``
-    refuses to signal it."""
+    refuses to signal it. A fingerprint whose start time can no longer be read also defers (True): the
+    worker is possibly live, and a false "not alive" verdict would discard its finished work."""
     if not _kb._pid_alive(pid):
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
+    if isinstance(started_at, str) and "|" in started_at:
+        matched = _fingerprint_matches(pid, started_at)
+        return True if matched is None else matched
     return not _pid_recycled(pid, started_at)
 
 
@@ -397,13 +433,15 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
     recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+    boot witness was added) compares the start time only. A boot-witness fingerprint compares its epoch
+    and its start time drift-tolerantly (macOS ``kern.boottime`` adjustment, #117505); an unreadable or
+    unparseable one is refused (treated as foreign) so nothing is ever signalled by bare number."""
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        return not _fingerprint_matches(pid, started_at)
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:

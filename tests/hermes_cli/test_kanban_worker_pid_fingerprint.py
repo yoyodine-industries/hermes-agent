@@ -110,6 +110,59 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
     assert kbd._process_fingerprint(os.getpid()) == live_fingerprint
 
 
+def test_unreadable_start_time_defers_liveness_but_refuses_signal(board, monkeypatch):
+    """A live worker whose start time can no longer be read (psutil failure) is unprovable: liveness
+    defers (held, never declared ``not alive``, never counted a crash), while the recycled/kill
+    question still refuses to treat the PID as ours (nothing is signalled by bare number)."""
+    import gateway.status as status
+
+    conn = board
+    pid = os.getpid()
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: None)
+    recorded = "|1234567890"
+
+    assert kbd._worker_alive(pid, recorded) is True
+    assert kbd._pid_recycled(pid, recorded) is True
+
+
+def test_start_time_drift_within_tolerance_keeps_worker_alive(board, monkeypatch):
+    """macOS ``kern.boottime`` adjustment (#117505) drifts a live process's psutil start time by ~1 s
+    between claim-time and a later liveness read. The boot-witness comparison must tolerate that drift:
+    a live worker whose recorded start is off by 1 s is still OUR worker, never ``not alive`` — the
+    exact-equality form would count a crash and discard the finished work."""
+    import gateway.drain_control as drain_control
+    import gateway.status as status
+
+    conn = board
+    pid = os.getpid()
+    real_start = status.get_process_start_time(pid)
+    assert real_start is not None
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "")
+    recorded = f"|{real_start}"  # what _process_fingerprint persisted at spawn (epoch "" on macOS)
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: real_start + 100)  # +1.00 s
+
+    assert kbd._worker_alive(pid, recorded) is True
+    assert kbd._pid_recycled(pid, recorded) is False
+
+
+def test_start_time_drift_beyond_tolerance_is_foreign(board, monkeypatch):
+    """The same drift tolerance has a hard edge: a start time off by more than the 2 s window (e.g. a
+    genuinely recycled PID that started minutes later) is still foreign and reclaimed without a signal."""
+    import gateway.drain_control as drain_control
+    import gateway.status as status
+
+    conn = board
+    pid = os.getpid()
+    real_start = status.get_process_start_time(pid)
+    assert real_start is not None
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "")
+    recorded = f"|{real_start}"
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: real_start + 500)  # +5.00 s
+
+    assert kbd._worker_alive(pid, recorded) is False
+    assert kbd._pid_recycled(pid, recorded) is True
+
+
 def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeypatch):
     """Fingerprint capture fails for a new spawn: the row is NOT a legacy NULL row. A live PID under
     it is never SIGTERM/SIGKILLed by any reclaim/timeout path, and the claim is held (not released
