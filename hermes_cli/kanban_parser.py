@@ -333,7 +333,7 @@ _SPECS = [
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
-    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open (a still-running previous worker is not signalled — its re-spawn waits for it to exit)"),
+    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open (a still-running previous worker is not signalled — its re-spawn waits for it to exit)"),  # windows-footgun: ok (prose "open (" in a help string, not an open() call)
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

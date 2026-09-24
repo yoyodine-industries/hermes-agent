@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tools.thread_context import propagate_context_to_thread
 from tools.registry import registry, tool_error
+from tools.protected_instruction_command_guard import TOOL_EXECUTE_CODE, protected_instruction_block
 
 from hermes_time import get_timezone_name
 from tools.code_execution_env import _resolve_child_cwd, _resolve_child_python
@@ -701,6 +702,11 @@ def execute_code(
                 "it could complete (SIGTERM propagates to child processes). "
                 "Run the lifecycle command from a shell outside the gateway."
             )
+    blocked = protected_instruction_block(
+        text=code, tool=TOOL_EXECUTE_CODE, task_id=task_id or "default",
+    )
+    if blocked:
+        return blocked
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
