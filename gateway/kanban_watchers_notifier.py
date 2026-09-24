@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import re
 from functools import partial
 from pathlib import Path
@@ -242,8 +243,13 @@ class _Collector:
         if not self.active_platforms:
             logger.debug("kanban notifier: no connected adapters; skipping tick")
             return self.deliveries
-        # Poll each resolved DB path once: several slugs can map to one DB when
-        # HERMES_KANBAN_DB pins the board path.
+        # A HERMES_KANBAN_DB pin IS the board: kanban resolution refuses a foreign board=
+        # for a pinned session, so no enumerated slug is reachable — poll the pin once
+        # instead of walking boards this process cannot open.
+        if os.environ.get("HERMES_KANBAN_DB", "").strip():
+            self.collect_board(None)
+            return self.deliveries
+        # Poll each resolved DB path once: the 'current' symlink can alias slugs to one DB.
         kb = self.kb
         seen_db_paths: set[str] = set()
         for board_meta in _list_boards(kb):
@@ -308,7 +314,7 @@ class _Collector:
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
 
-    def collect_board(self, slug: str) -> None:
+    def collect_board(self, slug: Optional[str]) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
         if not self._board_has_subs(slug):
             return

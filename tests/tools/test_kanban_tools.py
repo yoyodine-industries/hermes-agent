@@ -1195,3 +1195,110 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# HERMES_KANBAN_DB confinement: board= may not retarget a pinned worker
+#
+# platform-stl ruling t_2c10072d (receipt /opt/hermes_sandbox/evidence/t_a73c075a/RECEIPT.md).
+# The dispatcher's pin is the worker-confinement primitive, and the pin OUTRANKS board= in
+# resolution — so a worker passing board=<foreign> used to READ AND WRITE ITS OWN BOARD while
+# its call reported the foreign one. Resolution refuses loudly instead, naming both boards.
+# ---------------------------------------------------------------------------
+
+FOREIGN_BOARD = "execution-windows"
+
+
+@pytest.fixture
+def pinned_worker(monkeypatch, tmp_path):
+    """A worker pinned to board ``ops`` by HERMES_KANBAN_DB, plus a second board on disk."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    kb._INITIALIZED_PATHS.clear()
+
+    ops_db = kb.board_dir("ops") / "kanban.db"
+    foreign_db = kb.board_dir(FOREIGN_BOARD) / "kanban.db"
+
+    # The foreign board exists before the pin is applied, opened by explicit path — the same
+    # way the dispatcher's own (pinless) opens reach a board.
+    conn = kbc.connect(foreign_db)
+    try:
+        foreign_tid = kb.create_task(conn, title="foreign task", assignee="other")
+    finally:
+        conn.close()
+
+    # The pin, exactly as the dispatcher injects it into a spawned worker.
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ops")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(ops_db))
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="pinned task", assignee="test-worker")
+        kb.claim_task(conn, tid)
+        run_id = kb._current_run_id(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    return {"task": tid, "foreign_task": foreign_tid, "db": ops_db, "foreign_db": foreign_db}
+
+
+def _comment_bodies(db_path, task_id):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect(db_path)
+    try:
+        return [c.body for c in kb.list_comments(conn, task_id)]
+    finally:
+        conn.close()
+
+
+def test_pinned_worker_naming_its_own_board_still_resolves(pinned_worker):
+    """board= equal to the pinned board is not a retarget: it must keep working."""
+    from tools import kanban_tools as kt
+    out = kt._handle_show({"board": "ops"})
+    assert json.loads(out)["task"]["id"] == pinned_worker["task"], out
+
+
+def test_pinned_worker_without_board_arg_stays_on_its_own_board(pinned_worker):
+    """Omitting board= keeps the pin, and the foreign board is not reachable by task id."""
+    from tools import kanban_tools as kt
+    out = kt._handle_show({})
+    assert json.loads(out)["task"]["id"] == pinned_worker["task"], out
+    foreign = json.loads(kt._handle_show({"task_id": pinned_worker["foreign_task"]}))
+    assert "error" in foreign, foreign
+
+
+def test_pinned_worker_board_arg_refuses_loudly_and_writes_nothing(pinned_worker):
+    """A foreign board= is refused at the resolution boundary, naming both boards, and the
+    write lands on neither board (the old code wrote it to the pinned one instead)."""
+    from tools import kanban_tools as kt
+    sentinel = "sentinel-should-never-land"
+    out = kt._handle_comment({
+        "task_id": pinned_worker["task"],
+        "board": FOREIGN_BOARD,
+        "body": sentinel,
+    })
+    d = json.loads(out)
+    assert "error" in d, out
+    assert FOREIGN_BOARD in d["error"], out
+    assert "ops" in d["error"], out
+    assert sentinel not in _comment_bodies(pinned_worker["db"], pinned_worker["task"])
+    assert sentinel not in _comment_bodies(pinned_worker["foreign_db"], pinned_worker["foreign_task"])
+
+
+def test_pinless_session_may_still_select_another_board(pinned_worker, monkeypatch):
+    """The guard is confinement, not a ban on board=: a top-level session carries no pin."""
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_list({"board": FOREIGN_BOARD}))
+    assert [t["id"] for t in d["tasks"]] == [pinned_worker["foreign_task"]], d

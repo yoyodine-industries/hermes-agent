@@ -106,7 +106,9 @@ def test_changes_requested_notify_wake_is_actionable_and_exactly_routed(tmp_path
 
     assert len(adapter.sent) == 1
     text = adapter.sent[0]["text"]
-    assert text.startswith(f"🛑 [default] Kanban {task_id} review requested changes/BLOCK: Tests need updates")
+    # A pinned session (HERMES_KANBAN_DB above) has no per-board identity to tag with: the
+    # notifier polls the pin itself, so there is no "[default] " prefix.
+    assert text.startswith(f"🛑 Kanban {task_id} review requested changes/BLOCK: Tests need updates")
     assert "reviewer @claude-qa → implementer @codex-cua" in text
     assert adapter.sent[0]["metadata"]["thread_id"] == "topic-7"
     assert len(adapter.handled) == 1

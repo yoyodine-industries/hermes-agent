@@ -3,7 +3,8 @@
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
 another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+file path and CONFINEMENT: a pinned session may only name its own board; any other ``board=``
+raises) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -504,9 +505,59 @@ def _board_path(
     return board_dir(slug) / leaf
 
 
+def _board_db_path_for_slug(slug: str) -> Path:
+    """The file ``board=slug`` resolves to with no env pin — the same rule
+    :func:`_board_path` applies for ``HERMES_KANBAN_DB`` (``default`` is the
+    back-compat ``<root>/kanban.db``, never ``boards/default/``)."""
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
+def _pinned_board_label(pin: Path) -> str:
+    """Name the pinned board in a refusal: its slug when the pin is a board DB, else the
+    raw path (a pin may be any file, e.g. a dry-run snapshot copy)."""
+    if pin.parent.parent == boards_root().expanduser().resolve():
+        return pin.parent.name
+    if pin == (kanban_home() / "kanban.db").expanduser().resolve():
+        return DEFAULT_BOARD
+    return str(pin)
+
+
+def _require_board_matches_pin(board: Optional[str]) -> None:
+    """Refuse an explicit ``board=`` that names a DIFFERENT board than the
+    ``HERMES_KANBAN_DB`` pin.
+
+    The pin is the dispatcher's worker-confinement primitive, and it OUTRANKS ``board=`` in
+    resolution: without this check a worker passing ``board=<foreign>`` reads and writes its
+    OWN board while the call reports the foreign one (measured 2026-09-24: an ``ops``-pinned
+    worker's ``kanban_comment(board="execution-windows")`` answered ``ok: true`` off a
+    cross-board id). Refusing loudly IS the confinement — the message names both boards.
+    Calls that omit ``board=``, or that name the pinned board itself, stay untouched.
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        return
+    pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if not pinned:
+        return
+    pin = Path(pinned).expanduser().resolve()
+    if _board_db_path_for_slug(slug).expanduser().resolve() == pin:
+        return
+    label = _pinned_board_label(pin)
+    raise ValueError(
+        f"board={slug!r} refused: this session is pinned to board {label!r} "
+        f"(HERMES_KANBAN_DB={pinned}). A pinned session may only name its own board on "
+        f"board=; drop board= to use the pin, or unset HERMES_KANBAN_DB in a top-level "
+        f"session to reach {slug!r}."
+    )
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
-    """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
+    """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers) and confines
+    an explicit ``board=`` to the pinned board (:func:`_require_board_matches_pin`);
     ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
+    _require_board_matches_pin(board)
     return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
 
 

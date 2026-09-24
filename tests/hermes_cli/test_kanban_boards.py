@@ -101,11 +101,50 @@ class TestPathResolution:
 
 
     def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+        """``HERMES_KANBAN_DB`` pins the file for any call that does not name a board."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+
+
+    def test_pin_refuses_a_foreign_board_by_name(self, fresh_home, tmp_path, monkeypatch):
+        """A pinned session may only name its own board (ruling t_2c10072d): a foreign slug
+        refuses loudly instead of being silently retargeted onto the pin."""
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        with pytest.raises(ValueError) as excinfo:
+            kb.kanban_db_path(board="ignored")
+        msg = str(excinfo.value)
+        assert "ignored" in msg
+        assert str(forced) in msg
+
+
+    def test_pin_allows_naming_the_pinned_board(self, fresh_home, monkeypatch):
+        """A worker naming its own board resolves normally — the pin is not a ban on board=."""
+        pin = fresh_home / "kanban" / "boards" / "ops" / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+        assert kb.kanban_db_path(board="ops") == pin
+
+
+    def test_pin_allows_the_default_board_spelling(self, fresh_home, monkeypatch):
+        """The default board's legacy path stays reachable by name, not only by omission."""
+        pin = fresh_home / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+        assert kb.kanban_db_path(board="default") == pin
+
+
+    def test_pin_ignores_an_empty_board_arg(self, fresh_home, tmp_path, monkeypatch):
+        """``board=""`` means 'the pin decides' — not a retarget attempt."""
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        assert kb.kanban_db_path(board="") == forced
+
+
+    def test_no_pin_leaves_board_selection_open(self, fresh_home):
+        """Without a pin a top-level session selects any board by name."""
+        assert kb.kanban_db_path(board="atm10-server") == (
+            fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
+        )
 
 
 # ---------------------------------------------------------------------------
