@@ -304,6 +304,22 @@ def _first_line(text: str, limit: int) -> str:
     return lines[0][:limit] if lines else text[:limit]
 
 
+def _limit_seconds(ev: Any) -> Optional[int]:
+    """``payload.limit_seconds`` when the event recorded a usable cap, else None."""
+    try:
+        limit = int(float(_payload(ev, "limit_seconds")))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return limit if limit > 0 else None
+
+
+def _fmt_timed_out(ev, n) -> tuple:
+    """Name the cap only when the event carries one: an unrecorded limit is not a 0-second cap."""
+    limit = _limit_seconds(ev)
+    return (f"⏱ {n.head} timed out (max_runtime={limit}s); will retry" if limit
+            else f"⏱ {n.head} timed out; will retry"), None, None
+
+
 def _fmt_completed(ev, n) -> tuple:
     # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
     wake_handoff = None
@@ -352,9 +368,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
         f"✖ {n.head} gave up after repeated spawn failures{_clip(ev, 'error', _NL, 200)}", None, None,
     ),
     "crashed": lambda ev, n: (f"✖ {n.head} worker crashed (pid gone); dispatcher will retry", None, None),
-    "timed_out": lambda ev, n: (
-        f"⏱ {n.head} timed out (max_runtime={int(_payload(ev, 'limit_seconds') or 0)}s); will retry", None, None,
-    ),
+    "timed_out": _fmt_timed_out,
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,

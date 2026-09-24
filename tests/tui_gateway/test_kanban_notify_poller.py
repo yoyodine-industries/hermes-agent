@@ -263,6 +263,19 @@ class TestFormatKanbanEventText:
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
+        assert "max_runtime" not in text, text
+
+    def test_timed_out_without_a_recorded_limit_names_no_cap(self):
+        """No ``limit_seconds`` must not read as an authoritative 0-second cap."""
+        ev = SimpleNamespace(kind="timed_out", payload={})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "timed out" in text
+        assert "max_runtime" not in text, text
+
+    def test_timed_out_with_a_recorded_limit_names_it(self):
+        ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": 900})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "max_runtime=900s" in text, text
 
 
 class TestNotificationPollerLoopKanbanWiring:

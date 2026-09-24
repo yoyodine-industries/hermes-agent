@@ -357,6 +357,55 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     assert "crashed" in adapter.sent[1]["text"].lower()
 
 
+def test_timed_out_notice_omits_a_cap_the_event_never_recorded(tmp_path, monkeypatch):
+    """A timeout with no recorded limit must not render as a 0-second cap.
+
+    The dispatcher carries ``limit_seconds`` only when it actually enforced a cap
+    (the NULL-cap path records none). The notifier read the absent value as 0 and
+    printed ``max_runtime=0s`` — an authoritative-looking number the run never had.
+    """
+    db_path = tmp_path / "timed-out-no-limit.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="no recorded cap", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="timed_out")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1, [d["text"] for d in adapter.sent]
+    text = adapter.sent[0]["text"]
+    assert "timed out" in text.lower()
+    assert "max_runtime" not in text, text
+
+
+def test_timed_out_notice_names_a_recorded_cap(tmp_path, monkeypatch):
+    """The cap the dispatcher recorded still reaches the message."""
+    db_path = tmp_path / "timed-out-cap.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="recorded cap", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="timed_out", payload={"limit_seconds": 900})
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1, [d["text"] for d in adapter.sent]
+    assert "max_runtime=900s" in adapter.sent[0]["text"], adapter.sent[0]["text"]
+
+
 def test_notifier_subscription_survives_done_reopen_until_archive(
     tmp_path, monkeypatch,
 ):

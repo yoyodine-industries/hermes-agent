@@ -271,10 +271,22 @@ def _kb_completed(task, payload: dict, title: str) -> str:
     return f" done — {title}{handoff}"
 
 
+def _kb_limit_seconds(payload: dict) -> int | None:
+    """``payload['limit_seconds']`` when the event recorded a usable cap, else None."""
+    raw = payload.get("limit_seconds")
+    if raw is None:
+        return None
+    try:
+        limit = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return limit if limit > 0 else None
+
+
 def _kb_timed_out(task, payload: dict, title: str) -> str:
-    with contextlib.suppress(TypeError, ValueError):
-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
-    return " timed out (max_runtime=0s); will retry"
+    """Name the cap only when the event carries one: an unrecorded limit is not a 0-second cap."""
+    limit = _kb_limit_seconds(payload)
+    return f" timed out (max_runtime={limit}s); will retry" if limit else " timed out; will retry"
 
 
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
