@@ -1976,16 +1976,46 @@ def dispatch_once(
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
-    """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
+    """Call ``spawn_fn`` in the shape its signature accepts.
+
+    Back-compat: older spawn_fn signatures (and test stubs) accept only
+    ``(task, workspace)``; pass ``board`` only when the callable supports it.
+
+    The shape is decided by BINDING the signature, never by calling and catching
+    a TypeError. A spawn callable starts a worker, so deciding its arity by
+    calling it invokes it twice when the shape is wrong, and the escaping second
+    ``TypeError`` is reported as ``<name>() takes N positional arguments but M
+    were given`` — naming neither the caller nor the real failure. Measured on
+    the ops board 2026-09-23: a harness handing the dispatcher a one-argument
+    ``spawn_fn`` made every card in a tick record ``spawn_failed: boom() takes 1
+    positional argument but 2 were given``, a function that exists nowhere in
+    the tree, and the fault then presented as a dispatcher defect.
+
+    A callable the dispatcher cannot call is now refused BEFORE it runs, and the
+    refusal names it. Adapting instead (calling ``spawn_fn(task)``) is not an
+    option: a one-argument spawn callable never receives the workspace, so
+    guessing a shape would place the worker in the wrong directory.
+    """
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
     except (TypeError, ValueError):
+        # Not introspectable (some builtins / C callables): keep the historical
+        # two-argument shape rather than refuse to spawn at all.
         return spawn_fn(task, workspace)
+    if "board" in sig.parameters:
+        return spawn_fn(task, workspace, board=board)
+    try:
+        sig.bind(task, workspace)
+    except TypeError as exc:
+        module = getattr(spawn_fn, "__module__", "") or ""
+        name = getattr(spawn_fn, "__qualname__", None) or repr(spawn_fn)
+        label = f"{module}.{name}" if module else name
+        raise TypeError(
+            f"spawn_fn {label} has signature {sig}, which the dispatcher cannot call: "
+            f"it calls spawn_fn(task, workspace) or spawn_fn(task, workspace, board=...)."
+        ) from exc
+    return spawn_fn(task, workspace)
 
 
 def _dispatch_lane_task(
