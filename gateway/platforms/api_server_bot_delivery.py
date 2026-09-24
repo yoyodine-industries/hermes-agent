@@ -524,6 +524,26 @@ async def sweep_loop(adapter: Any) -> None:
     root = _hermes_root(home)
     logger.info("[api_server] bot delivery drainer started (home=%s)", home)
 
+    # In-flight drain passes, at most one per tick. The tick SCHEDULES a pass
+    # and moves on: awaiting it here is what let a lane's long turn (minutes
+    # live) hold the whole loop open, so the next tick -- and every lane it
+    # would have re-scanned -- waited for the slowest lane's turn to finish.
+    passes: set[asyncio.Task] = set()
+
+    def _on_pass_done(task: asyncio.Task) -> None:
+        passes.discard(task)
+        if task.cancelled():
+            return
+        try:
+            drained = task.result()
+        except Exception:  # noqa: BLE001 - a done callback has no caller to raise to
+            # drain_once already logs every lane-level failure itself; a pass
+            # that failed outside a lane is still a bug worth the traceback.
+            logger.exception("[api_server] bot delivery drain pass failed")
+            return
+        if drained:
+            log_delivery_event("sweep_drained", None, drained=drained)
+
     async def tick() -> None:
         # Recover orphaned claims / expire over-age records in EVERY lane's
         # home first, so the drain below sees the real queue (and never
@@ -531,18 +551,30 @@ async def sweep_loop(adapter: Any) -> None:
         # roster, so a named lane's backlog is never invisible to the sweep.
         for _name, profile_home in _roster(root):
             delivery_queue.sweep_delivery_queue(profile_home)
-        drained = await drain_once(adapter, home)
-        if drained:
-            log_delivery_event("sweep_drained", None, drained=drained)
+        # Schedule the pass WITHOUT awaiting it: a record admitted to a lane
+        # with no turn of its own is then offered one on the NEXT tick, not
+        # after the slowest lane's turn completes. A lane still draining when
+        # the next pass starts is skipped by its own turn lock (_drain_profile
+        # acquires it with timeout_seconds=0), so overlapping passes never
+        # double-drain a lane.
+        task = asyncio.create_task(drain_once(adapter, home))
+        passes.add(task)
+        task.add_done_callback(_on_pass_done)
 
-    while True:
-        try:
-            # Tick BEFORE sleeping: a restart leaves its interrupted claims in
-            # claimed/ with senders still waiting, so recovery has to fire on
-            # start-up, not one sweep_seconds later.
-            await tick()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - a sweep failure must never kill the loop
-            logger.exception("[api_server] bot delivery sweep failed")
-        await asyncio.sleep(delivery_queue.sweep_seconds())
+    try:
+        while True:
+            try:
+                # Tick BEFORE sleeping: a restart leaves its interrupted claims in
+                # claimed/ with senders still waiting, so recovery has to fire on
+                # start-up, not one sweep_seconds later.
+                await tick()
+            except Exception:  # noqa: BLE001 - a sweep failure must never kill the loop
+                logger.exception("[api_server] bot delivery sweep failed")
+            await asyncio.sleep(delivery_queue.sweep_seconds())
+    except asyncio.CancelledError:
+        # Gateway shutdown: cancel every in-flight pass so its lane turns stop
+        # with it, and wait for them so no turn task outlives the loop.
+        for task in list(passes):
+            task.cancel()
+        await asyncio.gather(*list(passes), return_exceptions=True)
+        raise
