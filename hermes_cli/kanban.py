@@ -203,20 +203,26 @@ def kanban_command(args: argparse.Namespace) -> int:
 # --- Handlers ---
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
-    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
-        v = os.environ.get(env)
-        if v:
-            return v
+    """Best-effort author name for an interactive CLI call.
+
+    Order (see :func:`hermes_cli.profiles.resolve_acting_profile_name`):
+    ``HERMES_PROFILE_NAME`` -> ``HERMES_PROFILE`` -> the bound session profile
+    (``HERMES_SESSION_PROFILE``) -> the profile id derived from the active ``HERMES_HOME``
+    -> ``"user"``. A caller-supplied ``--author`` always wins (checked before this call).
+    The session step is what a gateway-hosted ``hermes kanban comment`` needs: its
+    ``HERMES_HOME`` is the DEFAULT root, so the home-derived name alone said
+    ``default`` for every served profile.
+    """
     try:
-        from hermes_cli.profiles import get_active_profile_name
-        return get_active_profile_name() or "user"
+        from hermes_cli.profiles import resolve_acting_profile_name
+        return resolve_acting_profile_name("user")
     except Exception:
         return "user"
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
+    "set-title", "set-body",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
@@ -618,6 +624,34 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _set_text_field(args: argparse.Namespace, field: str) -> int:
+    """``set-title``/``set-body``: the CLI door onto :func:`kanban_db.patch_task_text`, the
+    same writer the dashboard's field editor uses — so the blank-title rule, the column
+    strip and the ``edited`` audit event cannot diverge between the two surfaces.
+
+    A title has no meaningful empty value, so absent text goes in blank and the domain-layer
+    refusal is the answer; a blank ``body`` is the documented way to clear the body.
+    """
+    text = _joined_words(getattr(args, "text", None)) or ""
+    verb = "set-title" if field == "title" else "set-body"
+    try:
+        with kbc.connect_closing() as conn:
+            return _bulk_apply(_bulk_ids(args),
+                               lambda tid: kb.patch_task_text(conn, tid, **{field: text}),
+                               lambda tid: f"Set {field} on {tid}",
+                               lambda tid: f"cannot {verb} {tid} (unknown id)")
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
+
+
+def _cmd_set_title(args: argparse.Namespace) -> int:
+    return _set_text_field(args, "title")
+
+
+def _cmd_set_body(args: argparse.Namespace) -> int:
+    return _set_text_field(args, "body")
+
+
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
@@ -956,13 +990,18 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failures: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
-            # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
+            # Report where it landed: dependency blocks -> todo; a tripped
+            # unblock-loop breaker PARKS the card in blocked (never triage, which
+            # has no exit for a parked card) so name the park explicitly.
             landed = kb.get_task(conn, tid)
             where = landed.status if landed else "blocked"
+            parked_at = (landed.block_recurrences or 0) if landed else 0
             if where == "todo":
                 return f"{tid} → todo (dependency wait){suffix}"
-            if where == "triage":
-                return f"{tid} → triage (unblock loop detected — needs a human decision){suffix}"
+            if where == "blocked" and parked_at >= kb.BLOCK_RECURRENCE_LIMIT:
+                return (f"{tid} → blocked, parked (unblock loop detected after "
+                        f"{parked_at} same-kind re-blocks — needs a human "
+                        f"decision){suffix}")
             return f"Blocked {tid}{suffix}{due_note}"
 
         def op(tid: str) -> bool:
@@ -1023,6 +1062,28 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                            lambda tid: failures.get(tid) or f"cannot schedule {tid}")
 
 
+def _status_exit_hint(conn, tid: str) -> str:
+    """Suffix naming the supported exits when ``tid`` sits in a status a verb refuses it in.
+
+    A guard that refuses a row still has to name the verb that *does* apply, or the operator
+    is back to hand-written SQL on the live board. ``triage`` must never be a one-way door
+    (D4); ``review`` is not a block (so not unblockable) either, and its exits are back to
+    the implementer or over to a reviewer. Empty string for any other status, so a genuine
+    unknown-id refusal stays honest.
+    """
+    row = kb.get_task(conn, tid)
+    if row is None:
+        return ""
+    if row.status == "triage":
+        return (f" — triage is not a dead end: release it with `hermes kanban promote {tid}` "
+                f"or close it with `hermes kanban complete {tid}`")
+    if row.status == "review":
+        return (f" — review is not a dead end: release it with `hermes kanban reopen-review {tid}` "
+                f"(returns it to the implementer) or hand it to a reviewer with "
+                f"`hermes kanban reassign {tid} <reviewer>`")
+    return ""
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
@@ -1035,7 +1096,8 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)"
+                                       + _status_exit_hint(conn, tid))
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1331,6 +1393,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "set-title": _cmd_set_title, "set-body": _cmd_set_body,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
@@ -1361,6 +1424,7 @@ Common subcommands:
   `stats`               Per-status / per-assignee counts
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
+  `set-title <id> <text>` Rename; `set-body <id> [text]` sets the body (no text clears it)
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer

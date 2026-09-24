@@ -104,7 +104,7 @@ TERMINAL_STATUSES = {"done", "archived"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
-# Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
+# Same-reason block -> unblock -> re-block cycles before the task is parked for a human.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
@@ -304,6 +304,14 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # Worker exit "provider rate-limited": released WITHOUT counting a failure (the
 # breaker must never trip on a throttle). 75 == BSD EX_TEMPFAIL.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+# Worker exit "provider billing exhausted": the provider REFUSED the run on a
+# credit/billing wall (HTTP 402 "Insufficient Balance"), so no work was attempted.
+# Released without counting a failure like the throttle above, but PARKED instead
+# of re-queued: a quota window clears by itself, an empty account does not. 76 is
+# unused by the BSD sysexits convention and distinct from 75 so the dispatcher can
+# tell the two walls apart.
+KANBAN_BILLING_EXHAUSTED_EXIT_CODE = 76
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -1010,10 +1018,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
-    -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
-    -- successful completion — NOT on unblock (resetting on unblock is exactly
-    -- the amnesia that let the loop run unbounded).
+    -- BLOCK_RECURRENCE_LIMIT the task still lands in ``blocked`` (never
+    -- ``triage``) but is PARKED: the disposition sweep escalates it at
+    -- recurrence >= 2 instead of requeueing it, so a cron can't spin it
+    -- forever. Reset to 0 only on a successful completion — NOT on unblock
+    -- (resetting on unblock is exactly the amnesia that let the loop run
+    -- unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- Absolute epoch seconds at which a ``scheduled`` or time-fenced ``blocked``
     -- card becomes DUE. Set by ``schedule_task(due_at=...)`` /
@@ -2873,12 +2883,15 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
+    """``running|ready|blocked|review|triage -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval; with no active run the handoff fields survive via
-    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
-    ``metadata`` land on the closing run for :func:`build_worker_context`.
+    approval, and ``triage`` so a rough idea whose work already happened
+    elsewhere can be closed out instead of sitting on the spec shelf with no
+    exit (D4: ``complete`` is ``triage``'s explicit close). With no active run
+    the handoff fields survive via :func:`_synthesize_ended_run`. ``summary``
+    (defaults to ``result``) and ``metadata`` land on the closing run for
+    :func:`build_worker_context`.
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
@@ -2915,7 +2928,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'review', 'triage')
                 """
         params: tuple = (result, now, task_id)
         if expected_run_id is not None:
@@ -3260,15 +3273,18 @@ def block_task(
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
     due_at: Optional[int] = None, window_policy: Optional[str] = None,
 ) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``transient`` still counts toward the loop breaker
+    """``running``/``ready`` -> ``blocked`` (or ``todo`` for a dependency wait,
+    see :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition.
 
-    ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on the
+    ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on a plain
     ``blocked`` landing only: the due-card waker unblocks the card on the first
     dispatcher pass after that time, so a time-fenced hold releases without a
-    human touching it. It is meaningless on the ``todo`` (dependency) and
-    ``triage`` (loop-breaker) landings and is refused on the former."""
+    human touching it. It is meaningless on the ``todo`` (dependency) landing and
+    is refused on it. A loop-breaker PARK (``block_loop_detected``) is excluded
+    too — that card is waiting on a human decision, not a clock, so arming a wake
+    time would let it release itself and re-enter the loop the breaker just
+    stopped."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     if window_policy is not None and window_policy not in VALID_DUE_WINDOW_POLICIES:
@@ -3293,7 +3309,7 @@ def block_task(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
-        if new_status == "blocked" and due_at is not None:
+        if new_status == "blocked" and due_at is not None and event_kind == "blocked":
             set_sql += ",\n                       due_at = ?,\n                       due_window_policy = ?"
             params = (*params, int(due_at), window_policy or DEFAULT_DUE_WINDOW_POLICY)
             payload["due_at"] = int(due_at)
@@ -3340,7 +3356,13 @@ def _route_block(
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``BLOCK_RECURRENCE_LIMIT`` the task PARKS: it lands in ``blocked`` like any
+    other human ask, carrying ``block_recurrences``/``block_kind`` and a
+    ``block_loop_detected`` event, and stops being auto-requeued (the disposition
+    sweep escalates a card at recurrence >= 2). It deliberately does NOT route to
+    ``triage``: triage is the spec shelf, and a card parked there has no exit —
+    ``promote``/``unblock`` both refused it, so the only documented way out was
+    hand-written SQL against the live board.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
@@ -3350,7 +3372,10 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
+        # Park, don't stash: `blocked` is where a card waits for the human whose
+        # decision the breaker is asking for, and it is the only status with a
+        # documented exit for every other lane's tooling.
+        return "blocked", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
@@ -3621,17 +3646,21 @@ def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     force: bool = False, dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished unless ``force``; ``dry_run`` only
-    validates. Returns ``(ok, reason)``."""
+    """Operator promotion ``triage``/``todo``/``blocked`` -> ``ready`` with an
+    audit event. ``triage`` is accepted so the spec shelf is never a one-way
+    door: a rough idea that is already specified — or one you just judged
+    workable as it stands — has to be releasable without hand-written SQL. The
+    audit event records ``from_status`` so the departure from the shelf is
+    visible on the card. Refused while a parent is unfinished unless ``force``;
+    ``dry_run`` only validates. Returns ``(ok, reason)``."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("triage", "todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'triage', 'todo' or 'blocked'"
         )
 
     if not force:
@@ -3653,12 +3682,13 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            "WHERE id = ? AND status IN ('triage', 'todo', 'blocked')", (task_id,),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
         _append_event(
-            conn, task_id, "promoted_manual", {"actor": actor, "reason": reason, "forced": force},
+            conn, task_id, "promoted_manual",
+            {"actor": actor, "reason": reason, "forced": force, "from_status": cur_status},
         )
 
     return True, None
@@ -4051,6 +4081,62 @@ def defer_due(conn: sqlite3.Connection, task_id: str, *, due_at: int) -> bool:
             (int(due_at), task_id),
         )
         return cur.rowcount == 1
+
+
+# --- Text fields (``title`` / ``body``) ---
+#
+# ONE writer for the two free-text columns. The CLI's ``set-title``/``set-body`` verbs and
+# the dashboard's field editor both come through ``patch_task_text``, so the blank-title
+# rule, the column strip and the ``edited`` audit event cannot drift apart between the two
+# surfaces (the plugin used to UPDATE these columns with its own SQL).
+
+def patch_task_text(
+    conn: sqlite3.Connection, task_id: str, *, title: Any = UNSET, body: Any = UNSET,
+    board: Optional[str] = None,
+) -> bool:
+    """Set a card's ``title`` and/or ``body``; returns False for an unknown id.
+
+    ``UNSET`` (the default) and ``None`` both mean "leave that field alone": ``None`` is
+    what the dashboard's payload uses for a field it was not sent, and the two spellings
+    must not diverge. A stored title is stripped, and whitespace-only is refused with
+    ``ValueError`` — a card with no title is unfindable. An empty ``body`` is a legal value
+    that CLEARS the column, which is the only way to drop a stale body.
+
+    Nothing else about the card moves: no status transition, no assignee change, and an
+    archived card stays editable (the dashboard always allowed that). One ``edited`` event
+    lands on the audit trail (payload NULL — field values never ride the event), and the
+    task-updated observer fires AFTER commit with field NAMES only.
+
+    ``board`` is the caller's own board when it resolved one from a request — the dashboard's
+    ``_board_conn`` does not pin the context-local board, so leaving it None there would
+    stamp the wrong board on the event. The CLI passes nothing and the observer's
+    ``get_current_board()`` fallback (the pinned board) applies.
+    """
+    fields: list[str] = []
+    if title is not UNSET and title is not None:
+        title = str(title).strip()
+        if not title:
+            raise ValueError("title cannot be empty")
+        fields.append("title")
+    if body is not UNSET and body is not None:
+        fields.append("body")
+    if not fields:
+        # Neither field asked for: no write, no audit event, no observer.
+        return True
+    with write_txn(conn):
+        if _task_status(conn, task_id) is None:
+            return False
+        sets, vals = [], []
+        if "title" in fields:
+            sets.append("title = ?")
+            vals.append(title)
+        if "body" in fields:
+            sets.append("body = ?")
+            vals.append(body)
+        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", (*vals, task_id))
+        _append_event(conn, task_id, "edited")
+    notify_task_updated(conn, task_id, fields, board=board)
+    return True
 
 
 # --- Board-level key/value bookkeeping (``kanban_meta``) ---

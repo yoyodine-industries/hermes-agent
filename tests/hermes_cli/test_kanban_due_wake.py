@@ -388,7 +388,16 @@ def test_scheduled_card_without_a_due_time_is_not_reported(conn):
 
 
 def test_diagnostic_kind_is_published(conn):
-    assert "overdue_scheduled" in kd.DIAGNOSTIC_KINDS
+    """The kind a UI matches on is what the rule emits, not a detached table."""
+    tid = _task(conn)
+    kb.schedule_task(conn, tid, reason="armed", due_at=int(time.time()) - 7200)
+    task = _get(conn, tid)
+
+    diags = kd.compute_task_diagnostics(
+        task, kb.list_events(conn, tid), kb.list_runs(conn, tid),
+        config={"due_waker_last_tick": int(time.time())})
+
+    assert "overdue_scheduled" in [d.kind for d in diags]
     assert kd.DEFAULT_CONFIG["due_grace_seconds"] > 0
     assert kd.DEFAULT_CONFIG["due_stale_seconds"] > kd.DEFAULT_CONFIG["due_grace_seconds"]
 
