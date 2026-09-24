@@ -500,6 +500,26 @@ DEFAULT_CONFIG = {
     # 12-15K tokens). max_lines: max `limit` one read_file call may request before clamping.
     # max_line_length: per-line cap in read_file's line-numbered view (chars).
     "tool_output": {"max_bytes": 50000, "max_lines": 2000, "max_line_length": 2000},
+    # `hermes python` — the host's ONE interpreter resolver. Each role is a DECLARATION a
+    # caller makes about the job it is doing; the resolver asserts the version floor and
+    # every declared module before handing back a path, and a role that cannot satisfy its
+    # declaration exits non-zero naming the interpreter and the miss. Never a fallback.
+    #   runtime — callers that import the Hermes tree. `interpreter: ""` means "the
+    #     interpreter running this CLI", which satisfies the tree's own imports by
+    #     construction and survives a home migration, a uv upgrade and a version bump
+    #     without an edit; pin an absolute path here only when a second venv must win.
+    #   ops — fleet scripts with no Hermes imports. The shared ops venv, so ops tooling
+    #     does not die with the runtime venv it exists to service.
+    "python": {
+        "roles": {
+            "runtime": {"interpreter": "", "min_version": "3.11", "modules": ["yaml", "psutil"]},
+            "ops": {
+                "interpreter": "/opt/hermes_prod/shared-venv/bin/python3",
+                "min_version": "3.11",
+                "modules": ["yaml", "psutil"],
+            },
+        },
+    },
     # Tool loop guardrails nudge models that repeat failed/non-progressing tool calls. Soft warnings
     # are always on; hard stops are opt-in so interactive sessions keep flowing.
     "tool_loop_guardrails": {
