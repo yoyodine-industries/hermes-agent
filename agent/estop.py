@@ -191,7 +191,8 @@ def _retire_expired(path: Path) -> None:
     """Report a deadman expiry once, then remove the dead sentinel.
 
     The removal is guarded by a re-check of the engagement key, so a re-arm that lands
-    between the expiry read and the unlink loses nothing; any failure to remove is
+    between the expiry read and the unlink loses nothing and is not recorded as a release
+    (the hold came back, so there was no return to report); any failure to remove is
     swallowed (the pause is already lifted — the leftover file must never re-hold it,
     because :func:`_is_expired` stays True).
     """
@@ -202,12 +203,14 @@ def _retire_expired(path: Path) -> None:
     if not first_report:
         return
     payload = _read_payload(path)
-    # Recorded BEFORE the unlink and outside any failure path: the lift is already true (the
-    # stamp is in the past), so losing the bookkeeping must not also lose the record of it.
-    _write_release(path, LEASE_EXPIRY_CAUSE, None, payload)
     removed = False
     try:
         if _engagement_key(path) == key:
+            # Recorded only for the engagement actually being retired, and before the unlink:
+            # the lift is already true (the stamp is in the past), so losing the bookkeeping
+            # must not also lose the record of it — while a hold that re-armed is not a return
+            # and must not be recorded as one.
+            _write_release(path, LEASE_EXPIRY_CAUSE, payload)
             path.unlink()
             removed = True
     except (OSError, AttributeError, TypeError, ValueError):
@@ -221,18 +224,19 @@ def _retire_expired(path: Path) -> None:
     )
 
 
-def _write_release(path: Path, released_by: str, run_id: Any, payload: Optional[dict]) -> None:
+def _write_release(path: Path, released_by: str, payload: Optional[dict]) -> None:
     """Record WHY a sentinel came back, beside the sentinel itself.
 
-    Best effort and never raises: the release has already happened by the time this runs, so a
-    failed bookkeeping write must not re-hold the pause. ``run_id`` wins over the sentinel's own
-    (a releasing node knows which run it is); the sentinel's arming run is the fallback.
+    The record names the run that ARMED the hold (the sentinel's own ``run_id``, normalised on
+    the way in); a release has no run of its own to name, and inventing one would be a false
+    provenance. Best effort and never raises: the release has already happened by the time this
+    runs, so a failed bookkeeping write must not re-hold the pause.
     """
     armed = payload or {}
     record = {
         "released_by": released_by,
         "released_at": datetime.now(timezone.utc).isoformat(),
-        "run_id": _normalize_run_id(run_id) or _normalize_run_id(armed.get("run_id")),
+        "run_id": _normalize_run_id(armed.get("run_id")),
         "reason": armed.get("reason") or None,
         "engaged_at": armed.get("engaged_at") or None,
         "expires_at": armed.get("expires_at") or None,
@@ -325,7 +329,7 @@ def disengage(released_by: str = DEFAULT_RELEASE_CAUSE) -> bool:
             lifted = True
         except (OSError, AttributeError):
             continue
-        _write_release(path, released_by, None, payload)
+        _write_release(path, released_by, payload)
         with _log_lock:
             _expired_logged.pop(str(path), None)
     return lifted

@@ -535,6 +535,7 @@ def test_status_line_renders_deadman_and_allowlist(hermes_home):
 # (deadman or caller) writes a dated record beside the sentinel it removed.
 
 RUN_ID = "20260923-2200-winddown"
+SECOND_RUN = "20260923-2300-winddown"
 
 
 def test_run_id_round_trips_through_the_sentinel(hermes_home):
@@ -580,6 +581,36 @@ def test_deadman_expiry_records_lease_expiry(hermes_home):
     record = estop.get_last_release()
     assert record["released_by"] == "lease_expiry"
     assert record["run_id"] == RUN_ID
+
+
+def test_rearm_between_the_expiry_read_and_the_recheck_keeps_the_hold(hermes_home, monkeypatch):
+    """The retire's own re-check exists so a re-arm landing mid-retire loses nothing — and a
+    hold that is still live must not be reported as a deadman return either."""
+    estop.engage(reason="update window", run_id=RUN_ID, ttl="45m")
+    sentinel = hermes_home / "ESTOP"
+    sentinel.write_text(
+        json.dumps({"reason": "update window", "run_id": RUN_ID, "expires_at": _stamp(-30)}),
+        encoding="utf-8")
+
+    real_read = estop._read_payload
+    rearmed = []
+
+    def _read_dead_then_rearm(path):
+        payload = real_read(path)
+        if not rearmed:  # the re-arm lands between this read and the retire's key re-check
+            rearmed.append(1)
+            estop.engage(reason="second window", run_id=SECOND_RUN, ttl="45m")
+        return payload
+
+    monkeypatch.setattr(estop, "_read_payload", _read_dead_then_rearm)
+    estop._retire_expired(sentinel)
+
+    assert sentinel.exists(), "the re-armed hold must survive the deadman's retire"
+    assert estop.get_last_release() is None, (
+        "no hold came back here: a lease_expiry record would report a deadman return that "
+        "never happened")
+    assert estop.is_engaged() is True
+    assert estop.get_state()["run_id"] == SECOND_RUN
 
 
 def test_a_caller_cannot_claim_lease_expiry(hermes_home):
