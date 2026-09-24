@@ -2,7 +2,8 @@
 
 Pure functions that decide whether a command may run at all: workdir
 validation, the foreground long-lived/background-operator guidance, the
-supervised-gateway lifecycle block, and the Windows self-repo git guard.
+supervised-gateway lifecycle block, the Windows self-repo git guard, and the
+unbounded recursive-search block.
 Each ``*_block`` helper returns a finished JSON error string, or None when
 the command may proceed. Split out of tools/terminal_tool.py; the origin
 module re-imports every public helper so ``tools.terminal_tool.<name>``
@@ -287,3 +288,42 @@ def self_repo_block(
         return None
     logger.warning("Blocked self-repo git mutation (command: %s)", _safe_command_preview(command))
     return _blocked_json(msg, "blocked")
+
+
+def unbounded_search_block(
+    *,
+    command: str,
+    env: Any,
+    env_type: str,
+    cwd: str,
+    workdir: Optional[str],
+    session_key: str,
+) -> Optional[str]:
+    """Refuse a recursive search that nothing bounds and no narrow root contains.
+
+    ``find / -name x``, ``grep -rl pat ~``, or ``grep -rl pat .`` issued from the
+    Hermes home reads the whole tree: minutes of a full core for an answer a
+    depth-bounded or narrower search returns in seconds. Only a walk with no
+    ``-maxdepth``/``--max-depth`` and a broad root is refused — a named subtree
+    (project, workspace, anything below the home) passes in any form. Pure argv
+    inspection, no filesystem walk. Applies unconditionally (``force=True`` cannot
+    bypass it). Returns the JSON error string when blocked, else None.
+    """
+    from tools.terminal_search_guard import (
+        resolve_search_guard_cwd,
+        scan_unbounded_search,
+        unbounded_search_message,
+    )
+
+    guard_cwd = resolve_search_guard_cwd(
+        env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+    )
+    hit = scan_unbounded_search(command, guard_cwd)
+    if hit is None:
+        return None
+    tool, root_label = hit
+    logger.warning(
+        "Blocked unbounded recursive search rooted at %s (command: %s)",
+        root_label, _safe_command_preview(command),
+    )
+    return _blocked_json(unbounded_search_message(tool, root_label), "blocked")
