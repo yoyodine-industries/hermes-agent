@@ -1172,8 +1172,47 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+def _defer_crash_sweep(conn: sqlite3.Connection, row, pid: int, fingerprint) -> None:
+    """Hold a ``running`` task whose worker PID is still present but failed the fingerprint
+    guard, instead of releasing it for re-dispatch.
+
+    Releasing here is what produced the double-claim loop (#117505): the crash sweep declared
+    a live worker ``not alive`` and the dispatcher spawned a second worker beside the first,
+    orphaning the first worker's completion. We hold instead — the worker either completes
+    normally or its process exits and a later sweep reclaims it for real.
+
+    Called inside ``_reclaim_dead_workers``'s write txn. Records one ``reclaim_deferred``
+    event per ``RECLAIM_DEFER_GRACE_SECONDS`` so a held card doesn't spam an event per tick.
+    """
+    now = int(time.time())
+    last_deferred = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? AND kind = 'reclaim_deferred' "
+        "ORDER BY id DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    if last_deferred is not None and now - int(last_deferred["created_at"]) < _kb.RECLAIM_DEFER_GRACE_SECONDS:
+        return
+    run_id = _kb._current_run_id(conn, row["id"])
+    _kb._append_event(
+        conn, row["id"], "reclaim_deferred",
+        {
+            "reason": "pid_present_fingerprint_foreign",
+            "worker_pid": pid,
+            "worker_started_at": fingerprint,
+            "claim_lock": row["claim_lock"],
+        },
+        run_id=run_id,
+    )
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
-    """Release every host-local ``running`` task whose worker PID is dead."""
+    """Release every host-local ``running`` task whose worker PID is dead.
+
+    A PID that is still present in the process table is never reclaimed here even if the
+    fingerprint guard marks it foreign (macOS start-time drift, #117505): the crash sweep
+    reclaims only a PID that is actually gone, so a false "dead" verdict can no longer
+    double-claim a card whose worker is still alive.
+    """
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
@@ -1191,11 +1230,29 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
-            if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+            pid = int(row["worker_pid"])
+            fingerprint = _kb._row_get(row, "worker_started_at")
+            if _worker_alive(pid, fingerprint):
+                continue
+            # Reconciliation between the fingerprint guard and the process table:
+            # ``_worker_alive`` said "not alive", yet the PID is still present. On
+            # macOS the start-time witness drifts past tolerance while a worker is
+            # mid-session (#117505), so a "foreign" verdict is NOT proof the worker
+            # died. Releasing would hand the card to a second worker beside the first
+            # (the double-claim loop) and orphan the live worker's completion. Hold the
+            # claim instead: the worker completes normally, or its process exits and a
+            # later sweep reclaims it for real. The crash sweep therefore reclaims ONLY
+            # a PID that is gone from the process table; the fingerprint still guards
+            # kill authority (nothing is ever signalled by a bare, foreign number).
+            if _kb._pid_alive(pid):
+                _defer_crash_sweep(conn, row, pid, fingerprint)
                 continue
 
-            pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            # Capture the pre-reclaim fingerprint so a post-mortem can see exactly what
+            # the liveness guard compared - the UPDATE below NULLs both columns.
+            dead.event_payload["worker_pid"] = pid
+            dead.event_payload["worker_started_at"] = fingerprint
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(

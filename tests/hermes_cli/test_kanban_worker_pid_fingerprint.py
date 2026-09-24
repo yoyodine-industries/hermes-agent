@@ -202,3 +202,80 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+def test_live_pid_foreign_fingerprint_is_deferred_not_reclaimed(board, monkeypatch):
+    """The reconciliation: when the fingerprint guard says "foreign" but the process table still
+    shows a live PID (macOS start-time drift past tolerance, #117505), the crash sweep must HOLD
+    the claim rather than release it. Releasing is the double-claim loop: a second worker is
+    spawned beside the live one and the live worker's completion is orphaned."""
+    import gateway.drain_control as drain_control
+    import gateway.status as status
+
+    conn = board
+    pid = os.getpid()
+    real_start = status.get_process_start_time(pid)
+    assert real_start is not None
+    recorded = f"|{real_start}"
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "")
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: real_start + 500)  # +5 s
+
+    tid = kb.create_task(conn, title="drift", assignee="worker")
+    kb.claim_task(conn, tid)
+    old = int(time.time()) - 3600
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_started_at = ?, started_at = ?, claim_expires = ? WHERE id = ?",
+            (pid, recorded, old, old, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, started_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (pid, old, tid),
+        )
+
+    # Guard and process table disagree: fingerprint foreign, PID present.
+    assert kbd._worker_alive(pid, recorded) is False
+    assert kb._pid_alive(pid) is True
+
+    # No crash verdict: the claim is held, the worker_pid survives, the run is not ended.
+    assert kbd.detect_crashed_workers(conn) == []
+    task = kb.get_task(conn, tid)
+    assert task.status == "running"
+    assert task.worker_pid == pid
+    kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert "reclaim_deferred" in kinds
+
+
+def test_crash_record_captures_fingerprint_before_null(board, monkeypatch):
+    """A genuinely dead worker still books a crash, and the crash record (run metadata) carries the
+    worker_pid and worker_started_at the liveness guard actually compared - captured before the
+    reclaim NULLs both columns, so a post-mortem can see what the guard saw."""
+    conn = board
+    recorded = "|1234567890"
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    tid = kb.create_task(conn, title="dead", assignee="worker")
+    kb.claim_task(conn, tid)
+    old = int(time.time()) - 3600
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_started_at = ?, started_at = ?, claim_expires = ? WHERE id = ?",
+            (98765, recorded, old, old, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, started_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (98765, old, tid),
+        )
+
+    assert kbd.detect_crashed_workers(conn) == [tid]
+    task = kb.get_task(conn, tid)
+    assert task.status == "ready" and task.worker_pid is None
+
+    run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,)
+    ).fetchone()
+    meta = kb._json_dict(run["metadata"])
+    assert meta.get("worker_pid") == 98765
+    assert meta.get("worker_started_at") == recorded
