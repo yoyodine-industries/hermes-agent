@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.kanban_completion_gate import UnretrievableDeliverableError
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -730,6 +731,17 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"kanban_complete blocked: {empty_err}. Your task is still in-flight (no state "
                 f"change). Retry kanban_complete with a non-empty summary or result describing "
                 f"what was done.")
+        except UnretrievableDeliverableError as unretrievable:
+            # Last gate before the write: the handoff declares a deliverable nothing
+            # outside the producing tree can retrieve — the t_b579f394 shape, a
+            # scratch-tree commit and profile-scratch artifacts. The gate ran before
+            # the write txn, so the card was NOT mutated and the audit event already
+            # landed; without saying so the model reads the error as terminal and
+            # stalls instead of pushing the commit and retrying (#22923).
+            return tool_error(
+                f"kanban_complete blocked: {unretrievable}. Your task is still in-flight (no "
+                f"state change). Push the declared commit, attach the file to the card, or "
+                f"declare a durable path, then retry kanban_complete with the same handoff.")
         task = kb.get_task(conn, tid)
         if not ok:
             # complete_task reports every refusal as bare False; a reopened or

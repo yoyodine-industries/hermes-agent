@@ -2742,6 +2742,13 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+    Finally the declared deliverable must be retrievable from outside the
+    producing workspace: a claimed revision resolving in no checkout, or an
+    artifact path that is ephemeral, missing or relative, raises
+    :class:`~hermes_cli.kanban_completion_gate.UnretrievableDeliverableError`
+    before the write (``force=True`` overrides it, recording
+    ``deliverable_gate_forced``) — see
+    :mod:`hermes_cli.kanban_completion_gate`.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2753,6 +2760,11 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # Last gate before the write: what this completion DECLARES must be reachable
+    # from outside the tree that produced it (a scratch-tree commit or a
+    # profile-scratch artifact dies with the workspace — t_b579f394).
+    from hermes_cli.kanban_completion_gate import gate_completion
+    gate_completion(conn, task_id, result=result, summary=summary, metadata=metadata, force=force)
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:

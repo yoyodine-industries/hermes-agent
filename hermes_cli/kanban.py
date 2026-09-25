@@ -22,6 +22,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_completion_gate import UnretrievableDeliverableError
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -929,6 +930,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
+                return False
+            except UnretrievableDeliverableError as unretrievable:
+                # The declared deliverable is not retrievable from outside the producing
+                # workspace (t_b579f394). Nothing was written; name the fix rather than
+                # letting the traceback read as a crash.
+                fail_msg[tid] = (f"cannot complete {tid}: {unretrievable} The card was not "
+                                 f"changed — push the commit, attach the file to the card, or "
+                                 f"declare a durable path, then re-run (or --force to override).")
                 return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
