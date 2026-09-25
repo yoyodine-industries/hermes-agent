@@ -713,6 +713,8 @@ class Task:
     worker_pid: Optional[int] = None
     last_failure_error: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
+    # 'explicit' | 'default' | None (legacy row; see task_max_runtime_source).
+    max_runtime_source: Optional[str] = None
     last_heartbeat_at: Optional[int] = None
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
@@ -760,8 +762,8 @@ _TASK_REQUIRED_COLUMNS = (
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
-    "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "max_runtime_seconds", "max_runtime_source", "last_heartbeat_at", "current_run_id",
+    "workflow_template_id", "current_step_key", "max_retries", "session_id", "completion_contract",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -905,6 +907,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
+    -- Provenance of max_runtime_seconds: 'explicit' (a caller set the cap) or 'default'
+    -- (stamped from kanban.default_max_runtime_seconds at create time). NULL = legacy row,
+    -- where the value decides: set = explicit, NULL = bounded by the dispatcher default.
+    max_runtime_source   TEXT,
     last_heartbeat_at    INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
@@ -1267,8 +1273,13 @@ def create_task(
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
     ``idempotency_key``: an existing non-archived task with the key is returned
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
-    SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
-    worker model (provider requires model); ``reasoning_effort`` is independent.
+    SIGTERMs and re-queues; omitted, the resolved
+    ``kanban.default_max_runtime_seconds`` is stamped with
+    ``max_runtime_source='default'`` so the card is bounded on the board rather
+    than only at kill time (a card that passes its own cap keeps
+    ``source='explicit'`` and is never overwritten). ``model_override``/
+    ``provider_override`` pin the worker model (provider requires model);
+    ``reasoning_effort`` is independent.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
@@ -1314,6 +1325,21 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
+    # Materialize the fleet default cap at CREATE time (D3/D4 of ops t_e7d0ee8f): a card
+    # that passes no cap of its own is stamped with the resolved
+    # ``kanban.default_max_runtime_seconds`` and flagged ``source='default'``, so a NULL cap
+    # on the board means "row older than this change" and the enforcement path can tell a
+    # human's cap from the dispatcher's. With the config key absent nothing is stamped
+    # (grandfather: NULL rows stay unbounded, exactly as before).
+    max_runtime_source: Optional[str] = None
+    if max_runtime_seconds is not None:
+        max_runtime_source = "explicit"
+    else:
+        default_cap = _configured_default_max_runtime_seconds()
+        if default_cap is not None:
+            max_runtime_seconds = default_cap
+            max_runtime_source = "default"
+
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
@@ -1356,17 +1382,17 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
+                        max_runtime_seconds, max_runtime_source,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
-                        _opt_int(max_runtime_seconds),
+                        _opt_int(max_runtime_seconds), max_runtime_source,
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
@@ -1789,6 +1815,104 @@ def _task_rows(conn: sqlite3.Connection, table: str, task_id: str, order: str) -
     ).fetchall()
 
 
+def task_max_runtime_source(task: Any) -> Optional[str]:
+    """Provenance of a card's wall-clock cap: ``'explicit'`` or ``'default'``.
+
+    The column wins whenever it is set. On a legacy row (pre-column) the VALUE
+    decides instead: a cap someone set means ``'explicit'``, a NULL cap means
+    the value came from the dispatcher's resolved default — which may itself be
+    absent, in which case the card is unbounded and no cap is enforced at all.
+
+    Accepts a :class:`Task` or a raw ``tasks`` row so the dispatcher's SQL path
+    and the workspace/context builders cannot drift apart on this rule.
+    """
+    if isinstance(task, sqlite3.Row):
+        def _get(name: str) -> Any:
+            return task[name] if name in task.keys() else None
+    else:
+        def _get(name: str) -> Any:
+            return getattr(task, name, None)
+
+    source = (_get("max_runtime_source") or "").strip().lower()
+    if source in ("explicit", "default"):
+        return source
+    return "explicit" if _get("max_runtime_seconds") is not None else "default"
+
+
+# Author stamped on dispatcher-authored notices. Deliberately not a profile
+# name, so a CAP line is never read back as a worker's own report.
+CAP_COMMENT_AUTHOR = "kanban-dispatcher"
+
+# First line of a checkpoint comment (D9 of ops t_e7d0ee8f). Detection is a
+# string test on the stored body — no inference, no model in the loop.
+CHECKPOINT_MARKER = "CHECKPOINT"
+
+
+def checkpoint_comment_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Newest comment whose FIRST non-empty line starts with ``CHECKPOINT``.
+
+    Deterministic: the first line of the comment decides, so prose below it can
+    say anything. Bodies are read from the DB (the worker context truncates long
+    comments, the table does not) and a cap notice can therefore state whether
+    the killed attempt left resumable state behind.
+    """
+    rows = conn.execute(
+        "SELECT id, body FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        for line in (row["body"] or "").splitlines():
+            if not line.strip():
+                continue
+            if line.strip().upper().startswith(CHECKPOINT_MARKER):
+                return int(row["id"])
+            break
+    return None
+
+
+def cap_comment_body(
+    *,
+    kind: str,
+    run_id: Optional[int],
+    elapsed_seconds: int,
+    limit_seconds: Optional[int],
+    source: Optional[str],
+    checkpoint_id: Optional[int],
+    reason: Optional[str] = None,
+) -> str:
+    """The CAP notice posted when a worker is killed by its cap or reclaimed.
+
+    ``kind`` is ``'wall'`` (the wall-clock cap expired) or ``'reclaim'`` (the
+    claim was reclaimed with no verdict). Line 1 is the readable report, line 2
+    the deterministic ``key=value`` form the disposition sweep can grep, line 3
+    the checkpoint verdict and line 4 the resume instruction (D10 of ops
+    t_e7d0ee8f) — so a killed attempt's loss is never silent and its successor
+    knows where to start.
+    """
+    limit_txt = f"{int(limit_seconds)}s" if limit_seconds is not None else "none"
+    source_txt = source or "none"
+    run_txt = int(run_id) if run_id is not None else 0
+    verb = "exhausted" if kind == "wall" else "reclaimed"
+    headline = (
+        f"CAP: run {run_txt} {verb} at {int(elapsed_seconds)}s "
+        f"(limit {limit_txt}, source={source_txt})"
+    )
+    if reason:
+        headline += f"; reason={reason}"
+    checkpoint_line = (
+        f"checkpoint: present (comment {int(checkpoint_id)})"
+        if checkpoint_id is not None
+        else "checkpoint: absent"
+    )
+    return "\n".join([
+        headline + ".",
+        f"CAP kind={kind} source={source_txt} limit={limit_txt} "
+        f"elapsed={int(elapsed_seconds)}s run={run_txt}",
+        checkpoint_line,
+        "NEXT: resume from the newest CHECKPOINT comment; do not restart.",
+    ])
+
+
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     return [Comment.from_row(r) for r in _task_rows(conn, "task_comments", task_id, "created_at ASC")]
 
@@ -1989,6 +2113,21 @@ def _first_line(text: Optional[str], limit: int) -> str:
 def _opt_int(value: Any) -> Optional[int]:
     """``int(value)`` or ``None`` when ``value`` is ``None`` (NULL column passthrough)."""
     return int(value) if value is not None else None
+
+
+def _configured_default_max_runtime_seconds() -> Optional[int]:
+    """Read ``kanban.default_max_runtime_seconds`` through the dispatcher's resolver.
+
+    One reader for the key (``hermes_cli.kanban_db_dispatch`` owns the config
+    shape), imported lazily because that module imports this one at import time.
+    ``None`` = the key is absent or invalid: nothing is stamped at create time
+    and a NULL-cap row stays unbounded, i.e. the pre-key behaviour.
+    """
+    try:
+        from hermes_cli.kanban_db_dispatch import configured_default_max_runtime_seconds
+        return configured_default_max_runtime_seconds()
+    except Exception:
+        return None
 
 
 def _json_or_null(obj: Any) -> Optional[str]:
@@ -3980,6 +4119,60 @@ def schedule_task(
 
 # --- Worker context builder (what a spawned worker sees) ---
 
+def _ctx_budget(
+    lines: list[str], task: Task, conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    """State the card's runtime budget where the worker can act on it (D11).
+
+    Cap + provenance, the lane's turn ceiling, how long this attempt has been
+    running, and the checkpoint duty that makes a cap kill survivable. Rendered
+    only when a budget exists, so a grandfathered unbounded card's context is
+    unchanged.
+    """
+    source = task_max_runtime_source(task)
+    limit = resolve_default_max_runtime_seconds(task.max_runtime_seconds, source)
+    turns = resolve_default_max_turns(task.assignee)
+    if limit is None and turns is None:
+        return
+    lines.append("## Budget")
+    if limit is not None:
+        lines.append(
+            f"Wall-clock cap: {limit}s (source: {source}). A dispatcher tick SIGTERMs this "
+            "worker once the cap has elapsed, so treat it as a hard deadline, not a target."
+        )
+    if turns is not None:
+        lines.append(
+            f"Turn ceiling: {turns} tool iterations per turn (`--max-turns`) — a long loop "
+            "is interrupted, so do not plan on unbounded iteration."
+        )
+    if task.current_run_id is not None:
+        started: Optional[int] = None
+        if conn is not None:
+            try:
+                row = conn.execute(
+                    "SELECT started_at FROM task_runs WHERE id = ?", (task.current_run_id,),
+                ).fetchone()
+                if row is not None and row[0] is not None:
+                    started = int(row[0])
+            except Exception:
+                started = None
+        if started is None and task.started_at:
+            started = int(task.started_at)
+        if started:
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(started))
+            lines.append(
+                f"This attempt: run {task.current_run_id}, started {stamp} "
+                f"({max(0, int(time.time()) - started)}s ago)."
+            )
+    lines.append(
+        "Checkpoint duty: before the cap, post ONE short `kanban_comment` whose FIRST LINE is "
+        "`CHECKPOINT` — what is done, what remains, the exact next action, and the paths/commits. "
+        "If the cap kills this attempt, the notice left on the card says whether a checkpoint was "
+        "found, and the next attempt resumes from it instead of re-discovering everything."
+    )
+    lines.append("")
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Everything a worker should read about its task: header, body,
     attachments, prior attempts, done-parent handoffs, the assignee's recent
@@ -3992,6 +4185,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    _ctx_budget(lines, task, conn)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
@@ -4046,11 +4240,13 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
     if task.max_runtime_seconds is not None:
+        runtime_source = task_max_runtime_source(task)
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
+            source=runtime_source,
         )
         effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
-        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
+        lines.append(f"Max runtime: {task.max_runtime_seconds}s (source: {runtime_source})")
         if effective_terminal_timeout:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
@@ -4486,6 +4682,10 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+)
+from hermes_cli.kanban_db_dispatch import (  # noqa: E402,F811
+    resolve_default_max_runtime_seconds,
+    resolve_default_max_turns,
 )
 
 

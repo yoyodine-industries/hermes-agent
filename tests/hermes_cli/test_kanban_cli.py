@@ -12,6 +12,7 @@ import pytest
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -63,13 +64,18 @@ def test_kanban_show_json_includes_runtime_limit(kanban_home):
         bounded_id = kb.create_task(
             conn, title="bounded task", max_runtime_seconds=2700
         )
+        # No explicit cap: the resolved ``kanban.default_max_runtime_seconds`` is
+        # stamped at create time with its provenance, so "unbounded" is no longer
+        # the default shape of a new card (ops t_e7d0ee8f D3/D4).
         uncapped_id = kb.create_task(conn, title="uncapped task")
 
     bounded = json.loads(kc.run_slash(f"show {bounded_id} --json"))
     uncapped = json.loads(kc.run_slash(f"show {uncapped_id} --json"))
 
     assert bounded["task"]["max_runtime_seconds"] == 2700
-    assert uncapped["task"]["max_runtime_seconds"] is None
+    assert bounded["task"]["max_runtime_source"] == "explicit"
+    assert uncapped["task"]["max_runtime_seconds"] == kbd.DEFAULT_MAX_RUNTIME_SECONDS
+    assert uncapped["task"]["max_runtime_source"] == "default"
 
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):

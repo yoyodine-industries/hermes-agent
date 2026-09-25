@@ -196,15 +196,22 @@ def _insert_decomposed_child(
         child_ws_path = None
     new_id = _new_task_id()
     body = child.get("body")
+    # Same create-time materialization as ``create_task`` (D3 of ops t_e7d0ee8f): a decomposer
+    # child is a newly created card, and a NULL cap there would read as a legacy row and break
+    # the "no newly created card has a NULL cap" invariant the operator measures.
+    from hermes_cli.kanban_db import _configured_default_max_runtime_seconds
+    child_cap = _configured_default_max_runtime_seconds()
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, "
+        " max_runtime_seconds, max_runtime_source) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
             root_row["tenant"], now, (author or "decomposer"),
+            child_cap, "default" if child_cap is not None else None,
         ),
     )
     _append_event(

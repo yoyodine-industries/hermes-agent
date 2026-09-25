@@ -646,12 +646,19 @@ def heartbeat_worker(
 
 
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
-    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
+    """Terminate workers whose wall-clock cap has elapsed.
 
-    SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
-    task's source phase so the next tick re-spawns the same kind of worker —
-    unless the circuit breaker already gave up, leaving it blocked. Host-local
-    only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+    The cap is ``tasks.max_runtime_seconds`` when the card set one, else the
+    resolved ``kanban.default_max_runtime_seconds`` — so a card with a NULL cap
+    (every card created before that key existed) is bounded without a data
+    migration, and a card is unbounded only while the key is absent. A killed
+    card is reported as ``timed_out`` with ``limit_seconds`` +
+    ``max_runtime_source`` + ``checkpoint_present``, gets a dispatcher-authored
+    ``CAP`` comment naming the checkpoint it left behind, and returns to its
+    source phase so the next tick re-spawns it — unless the circuit breaker
+    already gave up, which parks it ``blocked`` (typed for the fleet default).
+    Host-local only (same reasoning as ``detect_crashed_workers``).
+    ``signal_fn`` is a test hook.
     """
     timed_out: list[str] = []
     now = int(time.time())
@@ -660,10 +667,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.max_runtime_source, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status = 'running' "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -671,10 +678,14 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
+        source = _kb.task_max_runtime_source(row)
+        limit = resolve_default_max_runtime_seconds(row["max_runtime_seconds"], source)
+        if limit is None:
+            # No cap anywhere: the grandfather case, unchanged behaviour.
+            continue
         # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
         # so retries must be measured from the active task_runs row.
         elapsed = now - int(row["active_started_at"])
-        limit = int(row["max_runtime_seconds"])
         if elapsed < limit:
             continue
 
@@ -701,6 +712,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        # The card's own failure record carries the deterministic cap stamp; a
+        # fleet-default cap is also the typed, recoverable park reason below.
+        cap_error = f"cap={limit}s source={source} elapsed={int(elapsed)}s"
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -712,10 +726,15 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 (retry_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
+                # Checkpoint verdict BEFORE the notice is written, so the notice
+                # reports what the killed attempt left behind, not itself.
+                checkpoint_id = _kb.checkpoint_comment_id(conn, tid)
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
+                    "max_runtime_source": source,
+                    "checkpoint_present": checkpoint_id is not None,
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
@@ -724,6 +743,16 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     error=error, metadata=payload,
                 )
                 _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
+                # Never a silent loss: the killed attempt's state and the resume
+                # instruction are on the card, where the re-spawned worker reads
+                # them (D10 of ops t_e7d0ee8f).
+                _kb.add_comment(
+                    conn, tid, _kb.CAP_COMMENT_AUTHOR,
+                    _kb.cap_comment_body(
+                        kind="wall", run_id=run_id, elapsed_seconds=int(elapsed),
+                        limit_seconds=limit, source=source, checkpoint_id=checkpoint_id,
+                    ),
+                )
                 timed_out.append(tid)
         # Outside the write_txn above because ``_record_task_failure`` opens its
         # own. If the breaker trips this flips the task to ``blocked`` and emits
@@ -731,11 +760,19 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         if cur.rowcount == 1:
             _record_task_failure(
                 conn, tid,
-                error=error,
+                error=cap_error,
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+                # Only a card bounded by the FLEET default is a mis-scoped card we can name a
+                # deterministic kind for, and typing it is what keeps the disposition sweep
+                # from requeueing the same block forever. An explicit-cap trip keeps the
+                # pre-change untyped park that ``block_task``/the supervisor classifies.
+                block_kind="needs_input" if source == "default" else None,
+                event_payload_extra={
+                    "pid": pid, "sigkill": killed, "retry_status": retry_status,
+                    "max_runtime_source": source, "limit_seconds": limit,
+                },
             )
     return timed_out
 
@@ -1345,6 +1382,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    block_kind: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1357,6 +1395,12 @@ def _record_task_failure(
     ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
+
+    ``block_kind``: the deterministic type of the park this trip causes (e.g.
+    ``'needs_input'`` for a card bounded by the fleet default cap). Callers
+    that cannot name a kind pass nothing and the block stays untyped — a
+    non-NULL ``block_kind`` is never cleared by a later untyped trip, so the
+    unblock-loop signal survives.
 
     ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
     #114720) — nothing about the card ran, so the run and event are recorded
@@ -1417,27 +1461,39 @@ def _record_task_failure(
 
         # Spawn path (release_claim) is still running and also clears claim
         # state; the timeout/crash path already did.
+        block_error = error
+        if block_kind:
+            # A typed park states WHY in the card's own record: the failure
+            # count that tripped it plus the deterministic fix, so neither a
+            # sweep nor a human has to infer it from other rows.
+            block_error = (
+                f"{error}; cap exhausted {failures}x — card is mis-scoped: "
+                "split it or grant an explicit max_runtime_seconds"
+            )[:500]
         conn.execute(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
+            + "block_kind = COALESCE(?, block_kind), "
             + "consecutive_failures = ?, last_failure_error = ? "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
+            (block_kind, failures, block_error, task_id),
         )
         payload = {
             "failures": failures,
             "effective_limit": effective_limit,
             "limit_source": limit_source,
-            "error": error,
+            "error": block_error,
             "trigger_outcome": outcome,
             "retry_status": retry_status,
         }
+        if block_kind:
+            payload["block_kind"] = block_kind
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
-                conn, task_id, outcome="gave_up", status="gave_up", error=error,
+                conn, task_id, outcome="gave_up", status="gave_up", error=block_error,
                 metadata={
                     "failures": failures,
                     "trigger_outcome": outcome,
@@ -1841,6 +1897,121 @@ def configured_max_in_progress() -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return ival if ival >= 1 else None
+
+
+# --- Card runtime budget: wall-clock cap + lane turn ceiling (ops t_e7d0ee8f) ---
+
+# Per-card wall-clock cap (seconds) the dispatcher enforces when a card sets none of its own.
+# A card that expires is SIGTERMed, requeued once, then blocked typed. The value mirrors the
+# shipped ``kanban.default_max_runtime_seconds`` default; config always wins, and an absent/invalid
+# key (configured -> None) means "no cap", i.e. exactly the behaviour before this key existed.
+DEFAULT_MAX_RUNTIME_SECONDS = 1200
+
+# Lane turn ceiling passed to every worker as ``--max-turns`` (tool iterations inside ONE turn),
+# resolved exact-profile-id -> role suffix after the last '-' -> 'default'. Mirrors the shipped
+# ``kanban.default_max_turns`` table (test_kanban_runtime_budget pins the pair against drift);
+# it is the fallback for a fleet whose config key is missing, so ``--max-turns`` stays bounded.
+DEFAULT_MAX_TURNS = {
+    "default": 60,
+    "worker": 60,
+    "coder": 120,
+    "stl": 120,
+    "sme": 120,
+    "yoyodine-majordomo": 120,
+}
+
+
+def configured_default_max_runtime_seconds() -> Optional[int]:
+    """Read ``kanban.default_max_runtime_seconds``; None when unset/invalid.
+
+    Same shape as :func:`configured_max_in_progress`. ``None`` is the
+    grandfather case: a card with no cap of its own stays unbounded.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("default_max_runtime_seconds")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        ival = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= 1 else None
+
+
+def configured_default_max_turns() -> Optional[dict]:
+    """Read ``kanban.default_max_turns`` (lane -> turns); None when unset/invalid.
+
+    Only positive int values under non-empty string keys survive, so a partly
+    broken table degrades to the shipped default for the keys it lost.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("default_max_turns")
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    table: dict[str, int] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        try:
+            ival = int(value)
+        except (TypeError, ValueError):
+            continue
+        if ival >= 1:
+            table[key.strip()] = ival
+    return table or None
+
+
+def resolve_default_max_runtime_seconds(
+    card_value: Optional[int], source: Optional[str],
+) -> Optional[int]:
+    """The wall-clock cap a worker is actually given, or None when unbounded.
+
+    An ``explicit`` per-card value wins and is never overridden. Every other
+    card — a ``'default'``-sourced stamp, or a legacy NULL row — follows the
+    configured default, so an operator retune (or removal) moves the whole
+    fleet. ``source`` is :func:`hermes_cli.kanban_db.task_max_runtime_source`'s
+    answer; a raw row may pass ``'explicit'``/``'default'``/None.
+    """
+    if source == "explicit":
+        try:
+            explicit = int(card_value) if card_value is not None else None
+        except (TypeError, ValueError):
+            explicit = None
+        if explicit is not None and explicit >= 1:
+            return explicit
+    return configured_default_max_runtime_seconds()
+
+
+def resolve_default_max_turns(
+    assignee: Optional[str], card_value: Optional[int] = None,
+) -> Optional[int]:
+    """Turn ceiling for a lane: exact profile id -> role suffix -> ``default``.
+
+    ``card_value`` (a per-card explicit value) always wins. ``None`` means "not
+    configured" and callers omit ``--max-turns`` rather than guessing one.
+    """
+    if card_value is not None:
+        try:
+            explicit = int(card_value)
+        except (TypeError, ValueError):
+            explicit = 0
+        if explicit >= 1:
+            return explicit
+    table = configured_default_max_turns() or DEFAULT_MAX_TURNS
+    key = (assignee or "").strip()
+    if key and key in table:
+        return table[key]
+    if "-" in key:
+        suffix = key.rsplit("-", 1)[-1]
+        if suffix in table:
+            return table[suffix]
+    return table.get("default")
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
@@ -2545,13 +2716,25 @@ def _resolve_hermes_argv() -> list[str]:
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
+    *,
+    source: Optional[str] = None,
 ) -> Optional[str]:
     """Return a worker-scoped TERMINAL_TIMEOUT override, if needed.
 
-    When ``max_runtime_seconds`` exceeds the terminal tool's default timeout,
-    raise only the child's default so a long command isn't killed by the
+    When an EXPLICIT ``max_runtime_seconds`` exceeds the terminal tool's default
+    timeout, raise only the child's default so a long command isn't killed by the
     generic terminal default first.
+
+    ``source`` is the cap's provenance
+    (:func:`hermes_cli.kanban_db.task_max_runtime_source`). Only an
+    ``'explicit'`` cap raises it: materializing the fleet default on every card
+    would otherwise lift every worker's terminal timeout from the 180-300 s
+    default to ``cap - grace``, and one hung command could then eat the whole
+    card budget before the cap ever fires (D5 of ops t_e7d0ee8f). A call that
+    cannot name a source gets no override.
     """
+    if source != "explicit":
+        return None
     if max_runtime_seconds is None:
         return None
     try:
@@ -2704,7 +2887,22 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    # The worker's own view of its budget (D7/D8 of ops t_e7d0ee8f), resolved here so the
+    # dispatcher and the worker cannot disagree about the cap: ``--run-budget`` is the
+    # wall-clock ceiling the dispatcher SIGTERMs at, and the agent injects a one-shot wrap-up
+    # notice at 80% of it; ``--max-turns`` bounds ONE turn's tool loop so a stall cannot eat
+    # the whole cap without ever producing a tool-free turn. Both are ``chat``-subcommand
+    # flags (hermes_cli/_parser.py), so they ride AFTER ``chat``.
+    budget_flags: list[str] = []
+    max_turns = resolve_default_max_turns(task.assignee)
+    if max_turns is not None:
+        budget_flags.extend(["--max-turns", str(int(max_turns))])
+    run_budget = resolve_default_max_runtime_seconds(
+        task.max_runtime_seconds, _kb.task_max_runtime_source(task),
+    )
+    if run_budget is not None:
+        budget_flags.extend(["--run-budget", str(int(run_budget))])
+    cmd.extend(["chat", *budget_flags, "-q", f"work kanban task {task.id}"])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd
@@ -2843,13 +3041,29 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).
-    # Only set when enabled so non-goal tasks keep a clean env.
+    # Only set when enabled so non-goal tasks keep a clean env. A goal card with no
+    # per-card ceiling gets the lane's turn ceiling (same N as --max-turns), so the
+    # judge loop is bounded by the same deterministic number as the tool loop.
     if task.goal_mode:
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
-        if task.goal_max_turns is not None:
-            env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+        goal_turns = resolve_default_max_turns(task.assignee, task.goal_max_turns)
+        if goal_turns is not None:
+            env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(goal_turns))
+    # The resolved budget in the worker's own environment (D11 of ops t_e7d0ee8f): a worker
+    # can read its cap and turn ceiling without re-deriving them from config.
+    worker_cap = resolve_default_max_runtime_seconds(
+        task.max_runtime_seconds, _kb.task_max_runtime_source(task),
+    )
+    if worker_cap is not None:
+        env["HERMES_KANBAN_MAX_RUNTIME_SECONDS"] = str(int(worker_cap))
+    worker_max_turns = resolve_default_max_turns(task.assignee)
+    if worker_max_turns is not None:
+        env["HERMES_KANBAN_MAX_TURNS"] = str(int(worker_max_turns))
+    timeout_source = _kb.task_max_runtime_source(task)
     for var in ("TERMINAL_TIMEOUT", "TERMINAL_MAX_FOREGROUND_TIMEOUT"):
-        override = _worker_terminal_timeout_env(task.max_runtime_seconds, env.get(var))
+        override = _worker_terminal_timeout_env(
+            task.max_runtime_seconds, env.get(var), source=timeout_source,
+        )
         if override is not None:
             env[var] = override
     # Pin the board DB + workspaces root so the worker's kanban paths still

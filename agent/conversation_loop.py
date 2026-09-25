@@ -76,6 +76,30 @@ RUN_BUDGET_WRAPUP_NOTICE = (
     "(answer/JSON/summary) from the state you already have, completing only mandatory writes."
 )
 
+# Appended to the wrap-up notice ONLY for a dispatcher-spawned kanban worker
+# (HERMES_KANBAN_TASK set), where running out of budget means being SIGTERMed by
+# the card's cap: the successor attempt starts from scratch unless this one
+# leaves a durable checkpoint behind. Cost is stated rather than hidden — the
+# notice is conditional (approach to the cap only, not every card), it is re-sent
+# on the remaining turns, and most durable state is the work's own commits/files.
+RUN_BUDGET_CHECKPOINT_NOTICE = (
+    "Before you finish, post ONE short checkpoint with `kanban_comment`: what is done, "
+    "what remains, the exact next action, and the paths/commits — make the FIRST LINE "
+    "exactly `CHECKPOINT` so the dispatcher can find it without guessing. The next attempt "
+    "resumes from that comment instead of re-discovering everything. Do not stall to the "
+    "last second; the budget is a hard cap."
+)
+
+
+def run_budget_wrapup_notice() -> str:
+    """The wrap-up notice for this process: base text, plus the kanban checkpoint
+    duty when a dispatcher-spawned worker is the one running out of budget."""
+    import os  # local: this module imports os late, for the interactive path
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return f"{RUN_BUDGET_WRAPUP_NOTICE}\n\n{RUN_BUDGET_CHECKPOINT_NOTICE}"
+    return RUN_BUDGET_WRAPUP_NOTICE
+
 
 def _midturn_request_pressure_tokens(
     agent: Any, api_messages: List[Dict[str, Any]], effective_system: str, approx_tokens: int
@@ -130,6 +154,7 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
     ):
         return False
     from agent.context_compressor import _DB_PERSISTED_MARKER
+    notice = run_budget_wrapup_notice()
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "tool":
             # Only the current tool-result tail is mutable; an older turn may already be
@@ -138,10 +163,10 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
                 return False
             existing = msg.get("content", "")
             if isinstance(existing, str):
-                msg["content"] = existing + f"\n\n{RUN_BUDGET_WRAPUP_NOTICE}"
+                msg["content"] = existing + f"\n\n{notice}"
             else:  # multimodal content blocks — append a text block
                 try:
-                    msg["content"] = [*(existing or []), {"type": "text", "text": RUN_BUDGET_WRAPUP_NOTICE}]
+                    msg["content"] = [*(existing or []), {"type": "text", "text": notice}]
                 except Exception:
                     return False
             agent._run_budget_wrapup_injected = True

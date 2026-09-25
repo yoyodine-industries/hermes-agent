@@ -1863,6 +1863,27 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Per-card wall-clock cap (seconds) the dispatcher enforces when the card sets none of its
+        # own: expiry SIGTERMs the worker, requeues ONCE, then blocks the card typed (mis-scoped).
+        # None = no cap, i.e. prepend-to-this-key behaviour, where cards stayed unbounded. A per-card
+        # tasks.max_runtime_seconds always wins and is never overwritten. Anything stamped from this
+        # default carries max_runtime_source='default' so the two cases stay distinguishable on the
+        # board and in the timed_out payload.
+        "default_max_runtime_seconds": 1200,
+        # Turn ceiling handed to every worker as `--max-turns` (tool iterations inside ONE turn),
+        # resolved by lane: exact profile id -> role suffix after the last '-' -> 'default'. Bounds a
+        # stalled worker so it cannot burn the whole wall-clock cap inside a single tool loop. A
+        # per-card goal_max_turns still wins for goal-mode cards. None = hermes' own agent.max_turns.
+        # Kept identical to DEFAULT_MAX_TURNS in hermes_cli/kanban_db_dispatch.py (pinned by
+        # tests/hermes_cli/test_kanban_runtime_budget.py).
+        "default_max_turns": {
+            "default": 60,
+            "worker": 60,
+            "coder": 120,
+            "stl": 120,
+            "sme": 120,
+            "yoyodine-majordomo": 120,
+        },
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

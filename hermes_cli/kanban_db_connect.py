@@ -824,6 +824,10 @@ _LATER_TASK_COLUMNS = (
     # Per-task override for the consecutive-failure circuit breaker; NULL =
     # ``kanban.failure_limit`` config, then ``DEFAULT_FAILURE_LIMIT``.
     ("max_retries", "max_retries INTEGER"),
+    # Provenance of ``max_runtime_seconds``: 'explicit' (a caller/human set the cap) or 'default'
+    # (stamped from ``kanban.default_max_runtime_seconds``). NULL on legacy rows, where the value
+    # itself decides: set = explicit, NULL = bounded by the dispatcher default.
+    ("max_runtime_source", "max_runtime_source TEXT"),
     ("model_override", "model_override TEXT"),
     ("provider_override", "provider_override TEXT"),
     ("reasoning_effort", "reasoning_effort TEXT"),
