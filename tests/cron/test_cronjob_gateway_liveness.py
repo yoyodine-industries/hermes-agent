@@ -57,6 +57,11 @@ def _create_job() -> dict:
     )
 
 
+def _list_jobs() -> dict:
+    from tools.cronjob_tools import cronjob
+
+    return json.loads(cronjob(action="list"))
+
 class TestCreateSurfacesGatewayLiveness:
     def test_create_with_gateway_running_has_no_warning(self, hermes_env):
         with patch_liveness(provider="builtin", pids=[12345]) as patches:
@@ -161,12 +166,23 @@ class _LivenessPatches:
     ``_builtin_gateway_liveness`` would otherwise short-circuit to True
     and mask the pid-scan behavior under test. Pass ``lock_active=True``
     to exercise the lock-first path itself.
+
+    The two host-process witnesses read HOST-WIDE state (the host-role
+    rendezvous record and the per-home runtime record), so they are pinned
+    the same way and for the same reason: they must answer for the code
+    under test, never for a real gateway on the machine running the suite.
+    ``host_gateway``/``runtime_pid`` state what a live gateway would report;
+    ``blind_witnesses=True`` makes both unreadable.
     """
 
-    def __init__(self, *, provider, pids, lock_active=False):
+    def __init__(self, *, provider, pids, lock_active=False, host_gateway=None,
+                 runtime_pid=None, blind_witnesses=False):
         self._provider = provider
         self._pids = pids
         self._lock_active = lock_active
+        self._host_gateway = host_gateway
+        self._runtime_pid = runtime_pid
+        self._blind_witnesses = blind_witnesses
 
     def __enter__(self):
         from unittest.mock import patch
@@ -202,14 +218,48 @@ class _LivenessPatches:
                 return_value=self._lock_active,
             )
         )
+        if self._blind_witnesses:
+            self._stack.enter_context(
+                patch(
+                    "hermes_cli.gateway.host_multiplexer_serving",
+                    side_effect=OSError("host-role record unreadable"),
+                )
+            )
+            self._stack.enter_context(
+                patch(
+                    "gateway.status.get_runtime_status_running_pid",
+                    side_effect=OSError("runtime record unreadable"),
+                )
+            )
+        else:
+            self._stack.enter_context(
+                patch(
+                    "hermes_cli.gateway.host_multiplexer_serving",
+                    return_value=self._host_gateway,
+                )
+            )
+            self._stack.enter_context(
+                patch(
+                    "gateway.status.get_runtime_status_running_pid",
+                    return_value=self._runtime_pid,
+                )
+            )
         return self
 
     def __exit__(self, *exc):
         return self._stack.__exit__(*exc)
 
 
-def patch_liveness(*, provider, pids, lock_active=False):
-    return _LivenessPatches(provider=provider, pids=pids, lock_active=lock_active)
+def patch_liveness(*, provider, pids, lock_active=False, host_gateway=None,
+                   runtime_pid=None, blind_witnesses=False):
+    return _LivenessPatches(
+        provider=provider,
+        pids=pids,
+        lock_active=lock_active,
+        host_gateway=host_gateway,
+        runtime_pid=runtime_pid,
+        blind_witnesses=blind_witnesses,
+    )
 
 
 class TestRuntimeLockFirstLiveness:
@@ -300,6 +350,7 @@ class TestRuntimeLockFirstLiveness:
             assert cron_cli._builtin_gateway_liveness() is True
 
     def test_no_multiplexer_and_no_pids_is_still_false(self):
+        """Both host-process witnesses answer "no live gateway" → absence is provable."""
         from unittest.mock import patch
 
         import hermes_cli.cron as cron_cli
@@ -312,7 +363,70 @@ class TestRuntimeLockFirstLiveness:
                 "hermes_cli.gateway.named_profile_served_by_running_multiplexer",
                 return_value=False,
             ),
+            # Pinned for the same reason the lock probe is: these read host-wide state, so on
+            # a machine that runs a real gateway they would answer for THAT process.
+            patch("hermes_cli.gateway.host_multiplexer_serving", return_value=None),
+            patch("gateway.status.get_runtime_status_running_pid", return_value=None),
         ):
             assert cron_cli._builtin_gateway_liveness() is False
 
 
+
+class TestHostProcessLiveness:
+    """A host-owned gateway is not "not a satellite" (blind-guard class).
+
+    ``named_profile_served_by_running_multiplexer`` answers the narrow "is this a SATELLITE of
+    the default's multiplexer" and is hard-False for ``default`` — the profile that owns the
+    shared host process — so a probe that read its False as "no gateway" reported a healthy
+    gateway as absent. Measured on the live host while this failed: ``GET /health`` 200, the
+    launchd gateway PID alive for hours, ``gateway_state.json`` naming that same PID, and
+    ``cronjob(action="create")`` still answering ``gateway_running: false`` with a "will NOT
+    fire" warning — an absence the probe had no evidence for.
+    """
+
+    def test_live_host_process_counts_as_alive_for_default(self, hermes_env):
+        """The regression, through the tool: default profile, blind pid scan, live host record."""
+        _create_job()  # a listed job is what would be reported inert
+        with patch_liveness(provider="builtin", pids=[], host_gateway=object()):
+            result = _list_jobs()
+
+        assert result["gateway_running"] is True
+        assert "warning" not in result
+
+    def test_live_host_process_is_alive_without_pid_scan(self, hermes_env):
+        import hermes_cli.cron as cron_cli
+
+        with patch_liveness(provider="builtin", pids=[], host_gateway=object()):
+            assert cron_cli._builtin_gateway_liveness() is True
+
+    def test_runtime_record_alone_counts_as_alive(self, hermes_env):
+        """The status.py fallback: a host record nobody can read, but a live runtime record."""
+        import hermes_cli.cron as cron_cli
+
+        with patch_liveness(provider="builtin", pids=[], runtime_pid=4242):
+            assert cron_cli._builtin_gateway_liveness() is True
+
+    def test_unreadable_witnesses_are_unknown_never_absent(self, hermes_env):
+        """A probe that cannot see the gateway reports unknown, not "not running"."""
+        import hermes_cli.cron as cron_cli
+
+        with patch_liveness(provider="builtin", pids=[], blind_witnesses=True):
+            assert cron_cli._builtin_gateway_liveness() is None
+
+    def test_unreadable_witnesses_warn_about_nothing(self, hermes_env):
+        """…and the tool says nothing either way rather than declaring the jobs inert."""
+        _create_job()
+        with patch_liveness(provider="builtin", pids=[], blind_witnesses=True):
+            result = _list_jobs()
+
+        assert result["gateway_running"] is None
+        assert "warning" not in result
+
+    def test_both_witnesses_reporting_no_owner_is_false(self, hermes_env):
+        """The #87033 warning must survive: a proven absence still says so."""
+        _create_job()
+        with patch_liveness(provider="builtin", pids=[]):
+            result = _list_jobs()
+
+        assert result["gateway_running"] is False
+        assert result.get("warning"), "the model must still be told the jobs won't fire"

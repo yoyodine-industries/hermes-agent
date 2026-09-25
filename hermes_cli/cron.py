@@ -60,12 +60,50 @@ def _builtin_gateway_liveness() -> Optional[bool]:
         if find_gateway_pids():
             return True
         if not named_profile_served_by_running_multiplexer():
-            return False
+            # "Not a served satellite" is not "no gateway". That helper answers the NARROWER
+            # satellite question and is hard-False for `default` — the profile that owns the
+            # shared host process — so believing it reported a live gateway as down, and at
+            # create time told the user their jobs would never fire. Judge the host process by
+            # the records it wrote itself before ever reporting an absence.
+            return _host_process_liveness()
         # List/create and status require a fresh heartbeat from the satellite's own store.
         from cron.jobs import get_ticker_heartbeat_age
         return _ticker_age_is_fresh(get_ticker_heartbeat_age())
     except Exception:
         return None
+
+
+def _host_process_liveness() -> Optional[bool]:
+    """Does a live gateway own this host? True / False (absence proven) / None (unreadable).
+
+    Two Hermes-owned witnesses, both written by the gateway itself and both proving identity
+    (PID + create time, or a token-authenticated endpoint answer) instead of trusting a bare
+    PID: the host-role rendezvous record via ``host_multiplexer_serving`` — the ONE witness that
+    is also true for `default`, and the one ``hermes gateway status`` reads — and the per-home
+    runtime status record through the shared ``gateway.status`` reader that
+    ``find_gateway_pids`` already falls back to.
+
+    Absence is reported only when BOTH witnesses answered and both named no live gateway. A
+    witness that could not be read leaves the verdict unknown, so a blind probe can never
+    claim the gateway is absent — the failure mode that suppresses the very monitoring the
+    warning asks for.
+    """
+    answered = False
+    try:
+        from hermes_cli.gateway import host_multiplexer_serving
+        if host_multiplexer_serving() is not None:
+            return True
+        answered = True
+    except Exception:
+        pass
+    try:
+        from gateway.status import get_runtime_status_running_pid
+        if get_runtime_status_running_pid() is not None:
+            return True
+        answered = True
+    except Exception:
+        pass
+    return False if answered else None
 
 
 def _warn_if_gateway_not_running() -> None:
