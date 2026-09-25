@@ -1,6 +1,8 @@
 """Tests for agent/insights.py — InsightsEngine analytics and reporting."""
 
 import time
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from hermes_state import SessionDB
@@ -639,6 +641,121 @@ class TestEdgeCases:
         assert "~$0.0046" in terminal_text
         assert "~$0.00 estimated" not in gateway_text
         assert "~$0.0046 estimated" in gateway_text
+
+
+# =========================================================================
+# Peak-window pricing: stored rows are priced at their OWN instant
+# =========================================================================
+#
+# deepseek bills 2x inside Mon-Fri 01:00-04:00 + 06:00-10:00 UTC (the schedule
+# pinned in tests/agent/test_usage_pricing.py). Insights prices rows it did not
+# just record, so handing the engine the wall clock makes the SAME row report a
+# different cost depending on the hour the report runs in — the defect these pin.
+
+_MILLION = 1_000_000
+# 1M in + 1M out + 1M cache-read on deepseek-flash: $0.753 off-peak, $1.506 peak.
+_OFF_PEAK_USD = 0.753
+_PEAK_USD = 1.506
+_MODEL = "deepseek-flash"
+
+
+def _recent_weekday_hour(hour: int) -> datetime:
+    """A recent weekday ``hour``:00Z — in the past and inside a 30-day report window.
+
+    Derived from the clock instead of a pinned date so the assertions hold whenever the
+    suite runs; the walk back is at most a week.
+    """
+    now = datetime.now(timezone.utc)
+    moment = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    for _ in range(8):
+        if moment.isoweekday() <= 5 and moment <= now:
+            return moment
+        moment -= timedelta(days=1)
+    raise AssertionError("no recent weekday instant")  # pragma: no cover
+
+
+_PEAK_AT = _recent_weekday_hour(2)       # inside 01:00-04:00 UTC
+_OFF_PEAK_AT = _PEAK_AT.replace(hour=5)  # same weekday, the gap between the two windows
+
+
+def _freeze_pricing_clock(monkeypatch, when: datetime) -> None:
+    """Freeze the pricing engine's wall clock — the only 'now' the engine reads."""
+    import agent.usage_pricing as usage_pricing
+
+    monkeypatch.setattr(usage_pricing, "_UTC_NOW", lambda: when)
+
+
+def _deepseek_session(db, session_id: str, *, recorded_at: datetime) -> None:
+    """A deepseek session whose 1M/1M/1M usage row was recorded at ``recorded_at``.
+
+    Neither cost_status nor cost_source is written, so the per-model row takes Insights'
+    estimate-from-tokens fallback (``_accumulate``) rather than a stored figure.
+    """
+    db.create_session(session_id=session_id, source="cli", model=_MODEL)
+    db.update_token_counts(session_id, input_tokens=_MILLION, output_tokens=_MILLION, cache_read_tokens=_MILLION,
+                           model=_MODEL, billing_provider="deepseek", api_call_count=1)
+    ts = recorded_at.timestamp()
+    db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (ts, session_id))
+    db._conn.execute("UPDATE session_model_usage SET first_seen = ?, last_seen = ? WHERE session_id = ?",
+                     (ts, ts, session_id))
+    db._conn.commit()
+
+
+def _report_at(db, monkeypatch, when: datetime):
+    with monkeypatch.context() as patch:
+        _freeze_pricing_clock(patch, when)
+        return InsightsEngine(db).generate(days=30)
+
+
+class TestStoredUsageIsPricedAtItsOwnInstant:
+    """The report clock must never price history: same rows, two report hours, one answer."""
+
+    def test_fallback_model_row_is_priced_at_its_own_first_seen(self, db, monkeypatch):
+        _deepseek_session(db, "peak", recorded_at=_PEAK_AT)
+
+        for when in (_PEAK_AT, _OFF_PEAK_AT):
+            report = _report_at(db, monkeypatch, when)
+
+            assert [m["cost"] for m in report["models"]] == [pytest.approx(_PEAK_USD)], when
+            assert report["overview"]["estimated_cost"] == pytest.approx(_PEAK_USD), when
+
+    def test_off_peak_row_is_not_inflated_by_a_peak_hour_report(self, db, monkeypatch):
+        _deepseek_session(db, "off", recorded_at=_OFF_PEAK_AT)
+
+        for when in (_PEAK_AT, _OFF_PEAK_AT):
+            report = _report_at(db, monkeypatch, when)
+
+            assert [m["cost"] for m in report["models"]] == [pytest.approx(_OFF_PEAK_USD)], when
+
+    def test_report_payload_is_identical_at_both_report_hours(self, db, monkeypatch):
+        _deepseek_session(db, "peak", recorded_at=_PEAK_AT)
+        _deepseek_session(db, "off", recorded_at=_OFF_PEAK_AT)
+
+        at_peak = _report_at(db, monkeypatch, _PEAK_AT)
+        at_off = _report_at(db, monkeypatch, _OFF_PEAK_AT)
+
+        # Same rows, two report hours: nothing cost-bearing may move. The two sessions share
+        # one model row, so $1.506 (peak) + $0.753 (off-peak) is the whole breakdown.
+        assert at_peak["models"] == at_off["models"]
+        assert at_peak["overview"]["estimated_cost"] == pytest.approx(2.259)
+        assert at_off["overview"]["estimated_cost"] == pytest.approx(2.259)
+        assert at_peak["overview"]["unknown_cost_sessions"] == at_off["overview"]["unknown_cost_sessions"]
+        assert at_peak["overview"]["included_cost_sessions"] == at_off["overview"]["included_cost_sessions"]
+
+    def test_session_row_is_priced_at_its_own_started_at(self, db, monkeypatch):
+        """`_compute_overview`'s per-session estimate prices the row at the session's own
+        started_at, whatever hour the report is generated at."""
+        _deepseek_session(db, "peak", recorded_at=_PEAK_AT)
+        row = InsightsEngine(db)._get_sessions(time.time() - 30 * 86400)[0]
+        assert row["started_at"] == pytest.approx(_PEAK_AT.timestamp())
+
+        for when in (_PEAK_AT, _OFF_PEAK_AT):
+            with monkeypatch.context() as patch:
+                _freeze_pricing_clock(patch, when)
+                cost, status = _estimate_cost(row)
+
+            assert cost == pytest.approx(_PEAK_USD), when
+            assert status == "estimated", when
 
 
 
