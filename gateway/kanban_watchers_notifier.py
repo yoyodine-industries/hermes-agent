@@ -304,9 +304,15 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        # A failure notice is rendered against the card as it stands NOW, so read its newest run
+        # row: an event claimed after a restart must not read as the board's current state.
+        from hermes_cli.kanban_notice import FAILURE_KINDS
+        latest_run = (self.kb.latest_run(conn, sub["task_id"])
+                      if any(getattr(ev, "kind", None) in FAILURE_KINDS for ev in events) else None)
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
+                "task": task, "latest_run": latest_run, "board": slug}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -435,22 +441,32 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
 
 def _fmt_gave_up(ev, n) -> tuple:
     # The dispatcher auto-blocked the task after ``failures`` consecutive non-success attempts
-    # (spawn failure, crash, or timeout alike): it is now Blocked and waiting for a human.
-    failures = _payload(ev, "failures")
-    count = f"it failed {int(failures)} times in a row" if failures else "it kept failing"
-    last = _clip(ev, "error", " (last: {})", 160)
-    return (
-        f"⛔ {n.head} is now blocked: {count}{last}. Fix the cause, then `hermes kanban unblock "
-        f"{n.task_id}` (or `hermes kanban reassign {n.task_id}`). Logs: `hermes kanban log {n.task_id}`.",
-        None, None,
-    )
+    # (spawn failure, crash, or timeout alike). The notice names the failed run and the card's
+    # state at delivery, because it can arrive minutes late on a cursor that lagged.
+    return f"⛔ {n.head} — {_failure_body(ev, n, 'gave_up')}", None, None
 
 
 def _fmt_timed_out(ev, n) -> tuple:
-    limit = int(_payload(ev, "limit_seconds") or 0)
-    minutes = max(1, round(limit / 60)) if limit else 0
-    span = f"its {minutes}-minute limit" if minutes else "its time limit"
-    return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
+    return f"⏱ {n.head} — {_failure_body(ev, n, 'timed_out')}", None, None
+
+
+def _fmt_crashed(ev, n) -> tuple:
+    return f"✖ {n.head} — {_failure_body(ev, n, 'crashed')}", None, None
+
+
+def _failure_body(ev, n, kind: str) -> str:
+    """Failure-notice body from the shared renderer — one wording for both delivery surfaces.
+
+    The renderer reads the card's CURRENT status (``n.task``, ``n.latest_run``, both taken at
+    claim time) so a notice whose run has already been superseded reports that instead of
+    implying the card is still down.
+    """
+    from hermes_cli import kanban_notice as _kb_notice
+    return _kb_notice.failure_notice_text(
+        kind, getattr(ev, "payload", None) or {},
+        task=n.task, task_id=n.task_id, event_ts=getattr(ev, "created_at", None),
+        event_run_id=getattr(ev, "run_id", None), latest_run=getattr(n, "latest_run", None),
+    )
 
 
 # archived / unblocked are claimed (so the cursor advances past them) but
@@ -460,9 +476,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "completed": _fmt_completed,
     "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
     "gave_up": _fmt_gave_up,
-    "crashed": lambda ev, n: (
-        f"✖ {n.head} — its worker stopped unexpectedly; it will be retried automatically.", None, None,
-    ),
+    "crashed": _fmt_crashed,
     "timed_out": _fmt_timed_out,
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
@@ -489,6 +503,8 @@ class _KanbanNotification:
         self.sub_fail_counts = sub_fail_counts
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
+        # Newest run row at claim time: the current state a failure notice must state.
+        self.latest_run = d.get("latest_run")
         self.board_slug = d.get("board")
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]

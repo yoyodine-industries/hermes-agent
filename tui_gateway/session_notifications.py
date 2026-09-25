@@ -311,27 +311,27 @@ def _kb_completed(task, payload: dict, title: str) -> str:
     return f" done — {title}{handoff}"
 
 
-def _kb_timed_out(task, payload: dict, title: str) -> str:
-    with contextlib.suppress(TypeError, ValueError):
-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
-    return " timed out (max_runtime=0s); will retry"
-
-
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
+# A None formatter means the body comes from hermes_cli.kanban_notice — the one renderer both
+# delivery surfaces share for the failure kinds, so a delayed notice cannot read as current state.
 _KANBAN_EVENT_FORMATTERS = {
     "completed": ("✔", _kb_completed),
     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
-    "gave_up": ("✖", lambda t, p, title: " gave up after repeated spawn failures"
-                + (f"\n{str(p.get('error'))[:200]}" if p.get("error") else "")),
-    "crashed": ("✖", lambda t, p, title: " worker crashed (pid gone); dispatcher will retry"),
-    "timed_out": ("⏱", _kb_timed_out),
+    "gave_up": ("✖", None),
+    "crashed": ("✖", None),
+    "timed_out": ("⏱", None),
     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
 }
 
 
-def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
+def _format_kanban_event_text(sub: dict, task, ev, board_slug: str, latest_run=None) -> Optional[str]:
     """Single-line notification text for one kanban event; wording mirrors gateway/kanban_watchers.py (reads the same
-    as on Telegram). None for silent kinds."""
+    as on Telegram). None for silent kinds.
+
+    ``latest_run`` is the card's newest run row as read at delivery: a failure notice is rendered
+    from the event and the card as it stands NOW, so a crash already superseded by a newer run
+    says so instead of reading as the board's current state.
+    """
     if (entry := _KANBAN_EVENT_FORMATTERS.get(getattr(ev, "kind", ""))) is None:
         return None
     glyph, fmt = entry
@@ -339,6 +339,14 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     title = (getattr(task, "title", None) or task_id)[:120]
     who = getattr(task, "assignee", None) or ""
     prefix = f"{glyph} " + (f"[{board_slug}] " if board_slug else "") + (f"@{who} " if who else "")
+    if fmt is None:
+        from hermes_cli import kanban_notice as _kb_notice
+        body = _kb_notice.failure_notice_text(
+            getattr(ev, "kind", ""), getattr(ev, "payload", None) or {},
+            task=task, task_id=task_id, event_ts=getattr(ev, "created_at", None),
+            event_run_id=getattr(ev, "run_id", None), latest_run=latest_run,
+        )
+        return f"{prefix}Kanban {task_id} — {body}"
     return f"{prefix}Kanban {task_id}{fmt(task, getattr(ev, 'payload', None) or {}, title)}"
 
 
@@ -380,10 +388,15 @@ def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
             if not events:
                 continue
             task = _kb.get_task(conn, sub["task_id"])
+            # A failure notice is rendered against the card as it stands NOW: read the newest
+            # run row so a crash already superseded by a newer run can say so.
+            from hermes_cli.kanban_notice import FAILURE_KINDS as _failure_kinds
+            latest_run = (_kb.latest_run(conn, sub["task_id"])
+                          if any(getattr(ev, "kind", "") in _failure_kinds for ev in events) else None)
             from gateway.kanban_watchers_notifier import diagnostic_event
             from gateway.warning_notifications import DiagnosticText
             for ev in events:
-                text = _format_kanban_event_text(sub, task, ev, slug)
+                text = _format_kanban_event_text(sub, task, ev, slug, latest_run)
                 if text:
                     texts.append(DiagnosticText(text) if diagnostic_event(ev) else text)
             # Unsubscribe only on archive: ``done`` is reversible in review/controller flows, so keeping the sub lets a

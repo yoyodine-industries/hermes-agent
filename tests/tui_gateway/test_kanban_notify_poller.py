@@ -347,3 +347,52 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True
+
+
+class TestLateFailureNoticeReportsTheCardAsItStandsNow:
+    """A failure event delivered after the card moved on must not read as its current state.
+
+    The subscription cursor can lag the board by minutes (a closed desktop
+    session, a gateway restart), and the dispatcher respawns a crashed task
+    within seconds — so the crash notice routinely lands while the retry is
+    already running. Replay that cycle here: only the crash event is claimable,
+    and the card it describes is not the card the reader has.
+    """
+
+    @staticmethod
+    def _crash_then_retry(tid: str) -> tuple:
+        """Close a crashed run, then claim the card again: the state that escapes a naive notice."""
+        conn = kbc.connect()
+        try:
+            assert kb.claim_task(conn, tid) is not None
+            crashed_run = kb.get_task(conn, tid).current_run_id
+            with kb.write_txn(conn):
+                kb._end_run(conn, tid, outcome="crashed", error="pid 4242 not alive")
+                kb._append_event(
+                    conn, tid, "crashed", {"pid": 4242, "retry_status": "ready"}, run_id=crashed_run,
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, claim_expires = NULL"
+                    " WHERE id = ?", (tid,),
+                )
+            assert kb.claim_task(conn, tid) is not None
+            current = kb.get_task(conn, tid)
+            assert current.status == "running"
+            assert current.current_run_id != crashed_run
+            return crashed_run, current.current_run_id
+        finally:
+            conn.close()
+
+    def test_crash_notice_names_the_failed_run_and_the_card_that_is_running(self):
+        tid = _create_subscribed_task()
+        crashed_run, live_run = self._crash_then_retry(tid)
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1, texts
+        text = str(texts[0])
+        assert f"run {crashed_run} ended " in text
+        assert "card: running since " in text
+        assert f"(run {live_run})" in text
+        # The wording this replaces claimed a retry as though the reader were waiting on it.
+        assert "dispatcher will retry" not in text

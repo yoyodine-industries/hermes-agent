@@ -322,9 +322,10 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # First crash delivered.
+    # First crash delivered — the notice names the run and the card's state at delivery.
     assert len(adapter.sent) == 1
-    assert "stopped unexpectedly" in adapter.sent[0]["text"].lower()
+    assert "crashed (pid gone)" in adapter.sent[0]["text"].lower()
+    assert "card:" in adapter.sent[0]["text"]
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
@@ -352,7 +353,52 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"Second crashed event should also notify; got {len(adapter.sent)} "
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
-    assert "stopped unexpectedly" in adapter.sent[1]["text"].lower()
+    assert "crashed (pid gone)" in adapter.sent[1]["text"].lower()
+
+
+def test_late_crash_notice_reports_the_card_as_it_stands_now(tmp_path, monkeypatch):
+    """A crash notice claimed after the respawn must state the card, not the dead run.
+
+    The cursor can lag the board (a gateway restart, an offline chat) and the
+    dispatcher respawns a crashed task within seconds, so the notice routinely
+    arrives while the retry is running. Read late, "it will be retried" told the
+    reader to wait on a retry that had already happened.
+    """
+    db_path = tmp_path / "late-crash-state.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="late crash", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        # Run 1 dies: the board closes the run, stamps the crash event, requeues the card.
+        assert kb.claim_task(conn, tid) is not None
+        crashed_run = kb.get_task(conn, tid).current_run_id
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed", error="pid 4242 not alive")
+            kb._append_event(
+                conn, tid, "crashed", {"pid": 4242, "retry_status": "ready"}, run_id=crashed_run,
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, claim_expires = NULL"
+                " WHERE id = ?", (tid,),
+            )
+        # ...and the dispatcher respawns it before the notice is delivered.
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.get_task(conn, tid).current_run_id != crashed_run
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, [d["text"] for d in adapter.sent]
+    text = adapter.sent[0]["text"]
+    assert f"run {crashed_run} ended " in text
+    assert "card: running since " in text
+    assert "will be retried" not in text
 
 
 def test_notifier_subscription_survives_done_reopen_until_archive(
