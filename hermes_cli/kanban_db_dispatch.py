@@ -23,6 +23,7 @@ from typing import Callable
 from typing import Iterable
 from typing import Mapping
 from typing import Optional
+from typing import Tuple
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
@@ -363,19 +364,64 @@ def _pid_alive(pid: Optional[int]) -> bool:
 # the live PID) but NEVER signalled — missing process identity is refusal, not permission (#99558).
 UNVERIFIED_WORKER_FINGERPRINT = "unverified"
 
+# Canonical spawn-identity fingerprint — the ONE place its grammar is stated:
+#
+#     hermes-worker-fp/1|<boot witness>|<start value>
+#
+#   boot witness  ``gateway.drain_control.current_instantiation_epoch()``: the boot identity that
+#                 changes on every reboot / container recreate. ``-`` when the platform has none
+#                 (macOS and Windows have no ``/proc`` and no ``boot_id``) — never an empty field, so
+#                 the value can never read as a number behind a dangling separator.
+#   start value   ``gateway.status.get_process_start_time(pid)``: the platform's own per-process start
+#                 reading — clock ticks since boot on Linux, centiseconds since the epoch on
+#                 macOS/Windows. The units differ by platform, which is exactly why this is a
+#                 FINGERPRINT, compared for identity, and never parsed as a timestamp.
+#
+# ``unverified`` above is the third form; a bare integer is the pre-boot-witness legacy form. The
+# pre-canonical two-field ``<boot>|<start>`` reads through the same comparison as the canonical form,
+# with an empty witness normalised to ``-`` (``_fingerprint_parts``) — so a row already in flight when
+# this form landed still identifies its own live worker.
+WORKER_FINGERPRINT_FORM = "hermes-worker-fp/1"
+ABSENT_BOOT_WITNESS = "-"
+
 
 def _process_fingerprint(pid: int) -> Optional[str]:
-    """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
-    time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
+    """Restart-stable identity of a live process, in the canonical form stated above. The start
+    reading alone is relative to THIS boot on Linux (``/proc/<pid>/stat`` field 22), so a row that
     survives a reboot could match an unrelated process with the same PID and the same tick value;
     ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
-    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable."""
+    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable.
+
+    This is an IDENTITY TOKEN, not a timestamp: it is written to ``worker_started_at`` and compared
+    with :func:`_fingerprint_parts` + ``gateway.status.start_time_fingerprints_match``. It must never
+    be published under a timestamp key (see :func:`_set_worker_pid`)."""
     from gateway.drain_control import current_instantiation_epoch
     from gateway.status import get_process_start_time
     start = get_process_start_time(int(pid))
     if start is None:
         return None
-    return f"{current_instantiation_epoch()}|{start}"
+    return f"{WORKER_FINGERPRINT_FORM}|{current_instantiation_epoch() or ABSENT_BOOT_WITNESS}|{start}"
+
+
+def _fingerprint_parts(started_at: Any) -> Optional[Tuple[str, str]]:
+    """``(boot witness, start value)`` of a recorded fingerprint, or ``None`` for every other shape
+    (legacy integer, ``unverified``, NULL).
+
+    Both string forms read here: the canonical ``hermes-worker-fp/1|<boot>|<start>`` and the
+    pre-canonical two-field ``<boot>|<start>``. An empty witness (a row written on a platform without
+    a boot identity, before the canonical form) normalises to ``ABSENT_BOOT_WITNESS`` so an in-flight
+    row still compares equal to the value a live read produces after an upgrade."""
+    if not isinstance(started_at, str):
+        return None
+    fragments = started_at.split("|")
+    if fragments[0] == WORKER_FINGERPRINT_FORM:
+        fragments = fragments[1:]
+    if len(fragments) != 2:
+        return None
+    boot, start = fragments
+    if not start:
+        return None
+    return (boot or ABSENT_BOOT_WITNESS), start
 
 
 def _worker_alive(pid: Optional[int], started_at) -> bool:
@@ -396,14 +442,37 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
 def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
-    recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+    recycled; the UNVERIFIED marker is always foreign. A fingerprint in either string form compares
+    the boot witness exactly and the start reading with the documented drift tolerance; a legacy
+    integer fingerprint (rows written before the boot witness was added) compares the start reading
+    only, and an unreadable shape is foreign — never evidence of ownership."""
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
+    parts = _fingerprint_parts(started_at)
+    if parts is not None:
+        from gateway.status import start_time_fingerprints_match
+        current = _process_fingerprint(int(pid))
+        current_parts = _fingerprint_parts(current) if current is not None else None
+        if current_parts is None:
+            return True
+        boot, start = parts
+        current_boot, current_start = current_parts
+        # The boot witness is exact — a different boot is a different incarnation — but the start
+        # reading is compared with the documented drift tolerance, never for string equality: the same
+        # reading can drift between spawn and a later liveness read (#117505), and a drift must not
+        # read as a recycled PID. (The int path below is the same idea; it predates the witness.)
+        if boot != current_boot:
+            return True
+        try:
+            return not start_time_fingerprints_match(current_start, start)
+        except (TypeError, ValueError):
+            return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        # A two-field string that reached here is malformed (an empty start reading).
+        return True
+    # A legacy integer fingerprint compares the start reading only.
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
@@ -1461,16 +1530,29 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
     decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
     persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
-    whose bare-PID kill authority a new spawn must not inherit."""
-    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+    whose bare-PID kill authority a new spawn must not inherit.
+
+    The ``spawned`` event keeps the two apart: ``started_at`` is the spawn INSTANT in epoch seconds —
+    the same value and form as ``task_runs.started_at`` — and ``worker_fingerprint`` is the identity
+    token above. The fingerprint is never published under ``started_at``: an identity token under a
+    ``*_at`` key is what made a reader parse ``|179036519519`` as a mangled float (t_1e6a58c3)."""
+    fingerprint = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                     (int(pid), started_at, task_id))
+                     (int(pid), fingerprint, task_id))
         run_id = _kb._current_run_id(conn, task_id)
+        spawn_instant = int(time.time())
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+                         (int(pid), fingerprint, run_id))
+            row = conn.execute("SELECT started_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+            try:
+                spawn_instant = int(_kb._row_get(row, "started_at"))
+            except (TypeError, ValueError):
+                pass  # no readable claim instant: the clock at spawn is the next best answer
+        _kb._append_event(conn, task_id, "spawned",
+                          {"pid": int(pid), "started_at": spawn_instant, "worker_fingerprint": fingerprint},
+                          run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
