@@ -133,6 +133,45 @@ class CostResult:
     notes: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class PeakSchedule:
+    """A provider's peak-pricing calendar riding on its published off-peak rates.
+
+    ``_SNAPSHOTS`` quotes the vendor's OFF-PEAK list price; a call that falls in
+    one of ``windows_utc`` on one of ``weekdays`` bills EVERY token class at
+    ``multiplier`` x that price. ``windows_utc`` are ``[start, end)`` hours in UTC
+    and ``weekdays`` are ISO day numbers (Mon=1..Sun=7), so 10:00 is already
+    off-peak and a weekend is off-peak all day.
+    """
+
+    providers: tuple[str, ...] = ()
+    multiplier: Decimal = Decimal("1")
+    weekdays: tuple[int, ...] = ()
+    windows_utc: tuple[tuple[int, int], ...] = ()
+    source_url: Optional[str] = None
+
+    def applies_at(self, when: datetime) -> bool:
+        """True when ``when`` falls inside a peak window (a naive instant reads as UTC)."""
+        moment = when if when.tzinfo is not None else when.replace(tzinfo=timezone.utc)
+        moment = moment.astimezone(timezone.utc)
+        return moment.isoweekday() in self.weekdays and any(
+            start <= moment.hour < end for start, end in self.windows_utc
+        )
+
+    @property
+    def window_label(self) -> str:
+        """The calendar in words, derived from ``weekdays``/``windows_utc`` (never
+        hand-written, so the label cannot drift from the rule it describes):
+        ``Mon-Fri 01:00-04:00 + 06:00-10:00 UTC``."""
+        if not self.weekdays or not self.windows_utc:
+            return "no peak window"
+        days = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+        span = (days[self.weekdays[0] - 1] if len(self.weekdays) == 1
+                else f"{days[self.weekdays[0] - 1]}-{days[self.weekdays[-1] - 1]}")
+        windows = " + ".join(f"{start:02d}:00-{end:02d}:00" for start, end in self.windows_utc)
+        return f"{span} {windows} UTC"
+
+
 _UTC_NOW = lambda: datetime.now(timezone.utc)
 _INCLUDED_ENTRY = PricingEntry(
     input_cost_per_million=_ZERO, output_cost_per_million=_ZERO, cache_read_cost_per_million=_ZERO,
@@ -256,6 +295,38 @@ for _provider, _url, _version, _rows in _SNAPSHOTS:
         for _model in ((_models,) if isinstance(_models, str) else _models):
             _OFFICIAL_DOCS_PRICING[(_provider, _model)] = _entry
 del _SNAPSHOTS, _provider, _url, _version, _rows, _models, _rates, _entry, _model
+
+# The deepseek snapshot row above quotes the provider's OFF-PEAK list price, and
+# this is the peak calendar that rides on it: 2x for every token class inside the
+# windows below, off-peak everywhere else. DeepSeek publishes the schedule, the
+# engine has to apply it — quoting an off-peak rate for a peak call understated
+# the provider bill by half.
+#
+# The same values are pinned in yaan-telemetry/telemetry.py as PEAK_MULTIPLIER /
+# PEAK_WEEKDAYS / PEAK_WINDOWS_UTC: that report re-prices already-recorded usage
+# from its own venv and cannot import this module. If one copy moves, move both
+# in the same change — tests on both sides assert they agree.
+_PEAK_SCHEDULES: tuple[PeakSchedule, ...] = (
+    PeakSchedule(
+        providers=("deepseek",),
+        multiplier=Decimal("2"),
+        weekdays=(1, 2, 3, 4, 5),
+        windows_utc=((1, 4), (6, 10)),
+        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+    ),
+)
+
+
+def _peak_schedule_for(provider: Optional[str]) -> Optional[PeakSchedule]:
+    """The peak calendar a billing-route provider's rates attract, if any.
+
+    Keyed on the RESOLVED billing-route provider, so a relay or aggregator route
+    (openrouter, fireworks) keeps its own card and never inherits the vendor's
+    calendar.
+    """
+    name = (provider or "").lower()
+    return next((schedule for schedule in _PEAK_SCHEDULES if name.startswith(schedule.providers)), None)
+
 
 # GPT-6 Astra uses whole-request pricing above the 272K prompt tier.  Keep this
 # account-gated model out of generic static catalogs, but retain published billing
@@ -635,7 +706,16 @@ def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
 def estimate_usage_cost(
     model_name: str, usage: CanonicalUsage, *, provider: Optional[str] = None,
     base_url: Optional[str] = None, api_key: Optional[str] = None,
+    at: Optional[datetime] = None,
 ) -> CostResult:
+    """Estimated USD cost of one usage record, peak calendar included.
+
+    ``at`` is the instant the usage was actually billed. Live estimation (the
+    per-API-call path) leaves it unset and the clock is used; a re-pricing pass
+    over recorded history must pass that record's own timestamp — a peak-window
+    call priced at the wall clock after the window closed is the wrong number,
+    not a rounding difference.
+    """
     from providers import get_provider_profile
     profile = get_provider_profile(provider or '')
     reported = profile.get_usage_cost(model_name, usage) if profile else None
@@ -656,6 +736,14 @@ def estimate_usage_cost(
     if not entry:
         return _unknown_cost("none")
 
+    # Peak calendar (e.g. DeepSeek's 2x windows): the entry carries the off-peak
+    # list price, so a call inside the schedule prices every class at the
+    # multiplier. ``priced_at`` is the usage's own instant when the caller knows
+    # it, the clock otherwise.
+    schedule = _peak_schedule_for(route.provider)
+    priced_at = at if at is not None else _UTC_NOW()
+    peak = schedule if schedule is not None and schedule.applies_at(priced_at) else None
+
     # Whole-request context tier (e.g. Gemini Pro >200k prompts): above the
     # threshold the *_above rates apply to the entire request; None falls back.
     above = entry.tier_threshold_tokens is not None and usage.prompt_tokens > entry.tier_threshold_tokens
@@ -674,9 +762,12 @@ def estimate_usage_cost(
             if tokens:
                 return _unknown_cost(entry.source, *note)
             continue
+        if peak is not None:
+            rate = rate * peak.multiplier
         amount += Decimal(tokens) * rate / _ONE_MILLION
     if entry.request_cost is not None and usage.request_count:
-        amount += Decimal(usage.request_count) * entry.request_cost
+        request_cost = entry.request_cost * peak.multiplier if peak is not None else entry.request_cost
+        amount += Decimal(usage.request_count) * request_cost
 
     notes: list[str] = []
     status: CostStatus = "estimated"
@@ -685,6 +776,10 @@ def estimate_usage_cost(
         status = "included"
         label = "included"
         notes.append(_INCLUDED_NOTE)
+
+    if peak is not None:
+        # Never silently inflate a figure: the caller sees why it is 2x the card.
+        notes.append(f"peak-window rate x{peak.multiplier} applied ({peak.window_label})")
 
     if route.provider == "openrouter":
         notes.append("OpenRouter cost is estimated from the models API until reconciled.")

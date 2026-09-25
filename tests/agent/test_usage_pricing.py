@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -902,3 +903,145 @@ def test_anthropic_fast_response_without_a_fast_rate_is_unknown():
     result = estimate_usage_cost("claude-sonnet-4-6", _anthropic_usage("fast"), provider="anthropic")
     assert result.amount_usd is None
     assert result.status == "unknown"
+
+
+# --- the DeepSeek peak-window schedule ---------------------------------------
+#
+# ``_SNAPSHOTS``' deepseek row quotes the provider's OFF-PEAK list price; a call
+# the schedule marks as peak bills every token class at 2x. The same values are
+# pinned in yaan-telemetry/telemetry.py as PEAK_MULTIPLIER / PEAK_WEEKDAYS /
+# PEAK_WINDOWS_UTC (a separate venv that re-prices already-recorded usage), so
+# the assertions below are the drift alarm for BOTH copies: if one moves, move
+# both. Read them together with tests/test_telemetry.py::
+#   test_peak_constants_are_pinned_to_the_pricing_engine_rule.
+_SCHEDULE_MULTIPLIER = Decimal("2")
+_SCHEDULE_WEEKDAYS = (1, 2, 3, 4, 5)
+_SCHEDULE_WINDOWS_UTC = ((1, 4), (6, 10))
+# 2026-09-21 is a Monday; 2026-09-26/27 the following Saturday/Sunday.
+_MONDAY = datetime(2026, 9, 21, tzinfo=timezone.utc)
+_SATURDAY = datetime(2026, 9, 26, tzinfo=timezone.utc)
+_SUNDAY = datetime(2026, 9, 27, tzinfo=timezone.utc)
+# 1M in + 1M out + 1M cache-read = $0.753 at the off-peak Flash rates
+# ($0.15 / $0.60 / $0.003 per M); exactly 2x inside a peak window.
+_FLASH_OFF_PEAK = Decimal("0.753")
+_FLASH_USAGE = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+
+
+def _at(hour, minute=0, day=_MONDAY):
+    return day.replace(hour=hour, minute=minute)
+
+
+def _deepseek_cost(when=None, *, model="deepseek-flash", usage=_FLASH_USAGE, **kwargs):
+    return estimate_usage_cost(model, usage, provider="deepseek", **({"at": when} if when is not None else {}), **kwargs)
+
+
+def test_peak_schedule_is_pinned_to_the_telemetry_copy():
+    from agent.usage_pricing import _peak_schedule_for
+
+    schedule = _peak_schedule_for("deepseek")
+    assert schedule is not None
+    assert schedule.multiplier == _SCHEDULE_MULTIPLIER
+    assert schedule.weekdays == _SCHEDULE_WEEKDAYS
+    assert schedule.windows_utc == _SCHEDULE_WINDOWS_UTC
+    # Only the vendor's own route carries the rule: another provider's card (or a
+    # relay's) is its own, so it must not inherit DeepSeek's calendar.
+    assert _peak_schedule_for("fireworks") is None
+    assert _peak_schedule_for("openrouter") is None
+    assert _peak_schedule_for(None) is None
+
+
+@pytest.mark.parametrize(("hour", "minute", "peak"), [
+    (0, 59, False),   # Mon 00:59 — off-peak
+    (1, 0, True),     # Mon 01:00 — window opens
+    (3, 59, True),    # Mon 03:59 — last peak minute of the first window
+    (4, 0, False),    # Mon 04:00 — window closes
+    (5, 59, False),   # Mon 05:59 — the gap between windows
+    (6, 0, True),     # Mon 06:00 — second window opens
+    (9, 59, True),    # Mon 09:59 — last peak minute of the second window
+    (10, 0, False),   # Mon 10:00 — window closes
+    (14, 0, False),
+    (23, 59, False),
+])
+def test_peak_window_boundaries(hour, minute, peak):
+    """The windows are [start, end) in UTC — 04:00 and 10:00 are already off-peak."""
+    result = _deepseek_cost(_at(hour, minute))
+
+    assert result.amount_usd == _FLASH_OFF_PEAK * (_SCHEDULE_MULTIPLIER if peak else Decimal("1"))
+
+
+@pytest.mark.parametrize(("usage", "off_peak_usd"), [
+    (CanonicalUsage(input_tokens=1_000_000), Decimal("0.15")),
+    (CanonicalUsage(output_tokens=1_000_000), Decimal("0.60")),
+    (CanonicalUsage(cache_read_tokens=1_000_000), Decimal("0.003")),
+])
+def test_peak_multiplier_covers_every_token_class(usage, off_peak_usd):
+    """Input, output and cache-read all attract the same 2x — not just input."""
+    off_peak = _deepseek_cost(_at(4, 0), usage=usage)
+    peak = _deepseek_cost(_at(6, 0), usage=usage)
+
+    assert off_peak.amount_usd == off_peak_usd
+    assert peak.amount_usd == off_peak_usd * _SCHEDULE_MULTIPLIER
+
+
+def test_peak_schedule_covers_every_deepseek_row_not_just_flash():
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+    off_peak = _deepseek_cost(_at(4, 0), model="deepseek-v4-pro", usage=usage)
+    peak = _deepseek_cost(_at(6, 0), model="deepseek-v4-pro", usage=usage)
+
+    # $0.66 / $1.98 / $0.022 per M for V4-Pro, priced off the same provider rule.
+    assert off_peak.amount_usd == Decimal("0.66") + Decimal("1.98") + Decimal("0.022")
+    assert peak.amount_usd == off_peak.amount_usd * _SCHEDULE_MULTIPLIER
+
+
+def test_weekend_is_off_peak_all_day():
+    for day in (_SATURDAY, _SUNDAY):
+        for hour in (2, 7, 9):
+            assert _deepseek_cost(_at(hour, day=day)).amount_usd == _FLASH_OFF_PEAK
+
+
+def test_peak_multiplier_is_scoped_to_the_deepseek_route():
+    peak_instant = _at(2, 0)
+    result = estimate_usage_cost(
+        "gpt-5.6-luna", CanonicalUsage(input_tokens=1_000_000), provider="openai", at=peak_instant,
+    )
+
+    assert result.amount_usd == Decimal("1.00")
+    assert not any("peak" in note for note in result.notes)
+
+
+def test_timestamps_are_judged_in_utc():
+    """A naive instant reads as UTC; an aware one is converted, not truncated."""
+    from zoneinfo import ZoneInfo
+
+    # 22:00 EDT Sunday == 02:00 UTC Monday — inside the first window.
+    eastern = datetime(2026, 9, 20, 22, 0, tzinfo=ZoneInfo("America/New_York"))
+
+    assert _deepseek_cost(datetime(2026, 9, 21, 2, 0)).amount_usd == _FLASH_OFF_PEAK * _SCHEDULE_MULTIPLIER
+    assert _deepseek_cost(datetime(2026, 9, 21, 4, 0)).amount_usd == _FLASH_OFF_PEAK
+    assert _deepseek_cost(eastern).amount_usd == _FLASH_OFF_PEAK * _SCHEDULE_MULTIPLIER
+
+
+def test_live_estimation_prices_at_now_and_history_can_pass_its_own_instant(monkeypatch):
+    """Default = the clock (live per-call estimation); ``at=`` re-prices a call at
+    the instant it actually ran, which is the only correct way to re-price a
+    recorded peak-window call after the window closed."""
+    import agent.usage_pricing as usage_pricing
+
+    monkeypatch.setattr(usage_pricing, "_UTC_NOW", lambda: _at(2, 0))
+    assert _deepseek_cost().amount_usd == _FLASH_OFF_PEAK * _SCHEDULE_MULTIPLIER
+
+    monkeypatch.setattr(usage_pricing, "_UTC_NOW", lambda: _at(4, 0))
+    assert _deepseek_cost().amount_usd == _FLASH_OFF_PEAK
+    # ...and the recorded call's own 02:00 instant still prices at the peak rate.
+    assert _deepseek_cost(_at(2, 0)).amount_usd == _FLASH_OFF_PEAK * _SCHEDULE_MULTIPLIER
+
+
+def test_peak_result_says_the_multiplier_was_applied():
+    peak = _deepseek_cost(_at(6, 0))
+    off_peak = _deepseek_cost(_at(10, 0))
+
+    assert any(
+        note.startswith("peak-window rate x2 applied (Mon-Fri 01:00-04:00 + 06:00-10:00 UTC)")
+        for note in peak.notes
+    ), peak.notes
+    assert not any("peak" in note for note in off_peak.notes)
