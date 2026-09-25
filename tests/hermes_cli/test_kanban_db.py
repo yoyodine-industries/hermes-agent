@@ -1545,9 +1545,16 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
 # launchd jobs, and other detached processes routinely run with a stripped
 # $PATH that doesn't include the venv's bin/, so a bare `["hermes", ...]`
 # spawn fails with FileNotFoundError and the task gets stuck. The resolver
-# prefers the interpreter-bound module form (exactly this install; a PATH
-# shim could be attacker-planted or belong to another install, #111569) and
-# only falls back to the PATH shim when ``hermes_cli`` is not importable.
+# prefers the argv bound to THIS install (a PATH shim could be attacker-planted
+# or belong to another install, #111569) and only falls back to the PATH shim
+# when ``hermes_cli`` is not importable.
+#
+# Being "this install" is not enough on its own: a worker's cwd is its task
+# workspace, and ``-m`` resolves the module from the CHILD's sys.path (cwd
+# first), so a workspace shipping its own ``hermes_cli/`` package became the
+# worker's entry point, and an interpreter without this install's site mapping
+# died with ModuleNotFoundError. The argv must therefore carry the install
+# root explicitly.
 # ---------------------------------------------------------------------------
 
 
@@ -1562,10 +1569,42 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kbd._resolve_hermes_argv() == kbd._module_hermes_argv()
+    assert kbd._resolve_hermes_argv()[0] == sys.executable
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+
+
+def test_hermes_install_root_holds_this_module():
+    """The derived root must be the tree this module was imported from, so the
+    child runs the same code as the parent — not a same-named package found
+    later on its own sys.path."""
+    import os
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    root = kbd._hermes_install_root()
+    assert root
+    assert os.path.isfile(os.path.join(root, "hermes_cli", "kanban_db_dispatch.py"))
+    assert os.path.isfile(os.path.join(root, "hermes_cli", "main.py"))
+
+
+def test_module_hermes_argv_binds_the_install_root(monkeypatch):
+    """The argv carries this install's root and never relies on ``-m``
+    resolution; with no derivable root it keeps the previous module form."""
+    import sys
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    root = kbd._hermes_install_root()
+    argv = kbd._module_hermes_argv()
+    assert argv[0] == sys.executable
+    assert argv[1] == "-c"
+    assert f"sys.path.insert(0, {root!r})" in argv[2]
+    assert "runpy.run_module('hermes_cli.main'" in argv[2]
+
+    monkeypatch.setattr(kbd, "_hermes_install_root", lambda: None)
+    assert kbd._module_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+
 
 
 
@@ -1591,6 +1630,40 @@ def test_resolve_hermes_argv_module_actually_runs():
     r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
+        f"stderr={r.stderr[:200]!r}"
+    )
+
+
+def test_worker_spawn_runs_this_install_not_the_workspace(tmp_path):
+    """A task workspace carrying its own ``hermes_cli/`` package (a checkout)
+    must not become the worker's entry point: the spawned argv runs THIS
+    install even with that package sitting in the child's cwd.
+
+    Measured on the pre-fix argv (2026-09-25): ``-m hermes_cli.main`` executed
+    such a workspace's ``main.py`` and never imported this install — same
+    resolution path that made an interpreter without the install's site
+    mapping die with ``ModuleNotFoundError``.
+    """
+    import subprocess
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    shadow = tmp_path / "hermes_cli"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("")
+    (shadow / "main.py").write_text(
+        "import sys\n"
+        "print('WORKSPACE-SHADOW-RAN')\n"
+        "if __name__ == '__main__':\n"
+        "    sys.exit(7)\n"
+    )
+
+    argv = kbd._module_hermes_argv()
+    r = subprocess.run(
+        argv + ["--version"], cwd=tmp_path, capture_output=True, text=True, timeout=60
+    )
+    assert "WORKSPACE-SHADOW-RAN" not in (r.stdout + r.stderr)
+    assert r.returncode == 0, (
+        f"install-bound spawn failed from a workspace cwd (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
     )
 

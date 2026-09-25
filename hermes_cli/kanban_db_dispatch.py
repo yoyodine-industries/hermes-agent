@@ -2442,10 +2442,51 @@ def _rotate_worker_log(
         pass
 
 
+def _hermes_install_root() -> Optional[str]:
+    """Directory that holds the ``hermes_cli`` package of THIS running install.
+
+    Derived from the module now executing — never from the child's cwd, a
+    hardcoded path, or an inherited ``PYTHONPATH``, the exact inputs that let
+    a spawn resolve a *different* tree (#111569). ``abspath`` (not
+    ``realpath``) keeps the tree this module was actually loaded from, so a
+    symlinked checkout still resolves to itself. ``None`` when the package has
+    no plain filesystem root (frozen app, zipimport, namespace layout) — the
+    caller then keeps the module form.
+    """
+    origin = globals().get("__file__")
+    if not origin:
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.abspath(origin)))
+    return root if os.path.isdir(os.path.join(root, "hermes_cli")) else None
+
+
 def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
-    return [sys.executable, "-m", "hermes_cli.main"]
+    """Install-bound Hermes CLI invocation (``hermes_cli.main`` is the
+    console-script target — there is no top-level ``hermes`` package).
+
+    ``-m`` resolves the module from the CHILD's ``sys.path``, where the cwd
+    comes first: a workspace carrying its own ``hermes_cli/`` (a checkout)
+    makes the worker run that tree instead of this install, and an
+    interpreter without this install's site mapping (a bare store Python, a
+    rebuilt venv) dies with ``ModuleNotFoundError``. Both were measured on
+    2026-09-25. So bind the child to this install explicitly: same
+    interpreter, ambient import path dropped, THIS install's root first, then
+    the module. Same shape as ``hermes_cli._launchers.runtime_command``, which
+    gateway launches are booted with; kept local because ``_launchers``
+    imports the PM store layer.
+    """
+    root = _hermes_install_root()
+    if root is None:
+        return [sys.executable, "-m", "hermes_cli.main"]
+    bootstrap = (
+        "import os, runpy, sys; "
+        "os.environ.pop('PYTHONPATH', None); "
+        "os.environ.pop('PYTHONHOME', None); "
+        "os.environ.pop('VIRTUAL_ENV', None); "
+        f"sys.path.insert(0, {root!r}); "
+        "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
+    )
+    return [sys.executable, "-c", bootstrap]
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -2509,11 +2550,11 @@ def _hermes_path_argv(path: str) -> list[str]:
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
+    same-directory file), then the running interpreter bound to THIS install
+    (``_module_hermes_argv``; also covers shim-less cron, systemd ``User=``,
+    launchd), then ``which("hermes")`` (Windows: safe PATH search, batch shims
+    fall back to the install-bound form) only when ``hermes_cli`` is not
+    importable. The module argv must win over PATH: a PATH-first lookup
     lets an attacker-planted ``hermes`` shadow the running install (#111569).
     Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
     sits below ``gateway`` in the dependency order.
