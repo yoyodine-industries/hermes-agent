@@ -152,6 +152,15 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    capacity_hold: Optional[str] = None
+    """The capacity limit that refused EVERY spawn this tick, else ``None``:
+    ``"host_max_in_progress"`` (running workers across all boards reached
+    ``kanban.max_in_progress``) or ``"board_max_spawn"`` (this board's own
+    concurrency cap). Set by :func:`_tick_spawn_budget`, which returns BEFORE
+    the lane loop, so every per-task bucket stays empty on such a tick — which
+    is why a saturated fleet used to read exactly like a broken profile
+    (#111910). A full fleet is the designed steady state: the queue drains as
+    running workers finish, so callers treat this as capacity, not as fault."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -166,6 +175,7 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    capacity: Optional[str] = None
     for res in results:
         if res is None:
             continue
@@ -177,10 +187,91 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.capacity_hold:
+            capacity = res.capacity_hold
+        # The deferrals a full fleet used to hide altogether. Without these the
+        # warning printed bare in exactly the case it fired most often: every
+        # lane at its cap, so no guard had refused anything to report.
+        for _field, _label in (
+            ("skipped_per_profile_capped", "per_profile_capped"),
+            ("skipped_unassigned", "unassigned"),
+            ("skipped_nonspawnable", "nonspawnable"),
+        ):
+            _rows = getattr(res, _field, None)
+            if _rows:
+                counts[_label] = counts.get(_label, 0) + len(_rows)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
+    if capacity:
+        parts.append(f"at_capacity={capacity}")
     return ", ".join(parts)
+
+
+# Holds that mean a human may have to act on a refused spawn, as opposed to
+# "the fleet is simply full". A tick whose ONLY hold is capacity cannot mask a
+# fault: capacity is the designed steady state, and it clears as workers finish.
+_NON_CAPACITY_HOLD_FIELDS = (
+    "respawn_guarded",
+    "rate_limited",
+    "skipped_locked",
+    "memory_pressure",
+    "auto_blocked",
+)
+
+# "dispatcher stuck" warn throttle. A fault repeats every 5 minutes; a fleet
+# that is merely FULL is throttled to hourly so saturation cannot train the
+# reader to ignore the alarm.
+STUCK_WARN_THROTTLE_SECONDS = 300
+CAPACITY_STUCK_WARN_THROTTLE_SECONDS = 3600
+
+# Advice clauses for the zero-spawn warning, shared by the CLI daemon and the
+# embedded gateway dispatcher so the two copies cannot drift apart. Each is a
+# sentence fragment WITHOUT trailing punctuation; the callers add theirs.
+_STUCK_REMEDY = (
+    "Check profile health (venv, PATH, credentials) and "
+    "`hermes kanban list --status ready`"
+)
+_CAPACITY_REMEDY = (
+    "The fleet is at capacity, so the queue drains as running workers finish; "
+    "raise `kanban.max_in_progress` only if the backlog warrants more "
+    "concurrency (`hermes kanban list --status running`)"
+)
+
+
+def capacity_hold_reason(results: Iterable[Optional["DispatchResult"]]) -> str:
+    """Name the capacity hold that explains a zero-spawn tick, else ``""``.
+
+    ``"host_max_in_progress"`` / ``"board_max_spawn"`` (the tick was refused
+    before it examined any task) or ``"max_in_progress_per_profile"`` (every row
+    the lane loop examined was deferred by the per-profile cap). ``""`` is
+    returned as soon as ANY result also reports a hold a human may have to act
+    on, so a saturated fleet can never mask a real fault.
+    """
+    holds: set[str] = set()
+    for res in results:
+        if res is None:
+            continue
+        if any(getattr(res, _field, None) for _field in _NON_CAPACITY_HOLD_FIELDS):
+            return ""
+        if res.capacity_hold:
+            holds.add(res.capacity_hold)
+        elif res.skipped_per_profile_capped:
+            holds.add("max_in_progress_per_profile")
+    for name in ("host_max_in_progress", "board_max_spawn", "max_in_progress_per_profile"):
+        if name in holds:
+            return name
+    return ""
+
+
+def stuck_warning_remedy(capacity_hold: str = "") -> str:
+    """Advice clause for the zero-spawn "dispatcher stuck" warning.
+
+    A full fleet gets its own remedy: "check profile health" is contradicted by
+    workers visibly running, which is what taught the reader to ignore the
+    alarm. Both warning copies print this, so they cannot drift apart.
+    """
+    return _CAPACITY_REMEDY if capacity_hold else _STUCK_REMEDY
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2185,12 +2276,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.capacity_hold = "board_max_spawn"
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_hold = "host_max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

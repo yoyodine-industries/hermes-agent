@@ -304,14 +304,25 @@ class GatewayKanbanWatchersMixin:
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+                # A fleet that is merely at capacity is not a broken profile:
+                # same reason in the message, its own (hourly) throttle and its
+                # own remedy, so saturation cannot train the reader to ignore
+                # the alarm the way it did on 2026-09-25 (#111910).
+                capacity_held = _kbd.capacity_hold_reason(
+                    res for _slug, res in (results or [])
+                )
+                throttle = (
+                    _kbd.CAPACITY_STUCK_WARN_THROTTLE_SECONDS if capacity_held
+                    else _kbd.STUCK_WARN_THROTTLE_SECONDS
+                )
+                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= throttle:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
                     logger.warning(
                         "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned.%s Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks, f" Last tick held back: {held}." if held else "",
+                        "%d consecutive ticks but 0 workers spawned.%s %s.",
+                        bad_ticks,
+                        f" Last tick held back: {held}." if held else "",
+                        _kbd.stuck_warning_remedy(capacity_held),
                     )
                     last_warn_at = now
             except asyncio.CancelledError:

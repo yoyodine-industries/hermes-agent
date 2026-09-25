@@ -219,18 +219,29 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
-        # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
+        # Warn once per HEALTH_WINDOW bad ticks. A fleet that is merely at
+        # capacity is not a broken profile: same reason in the message, its own
+        # (hourly) throttle and its own remedy (#111910).
+        capacity_held = kbd.capacity_hold_reason([res])
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
-            if now - health_state["last_warn_at"] >= 300:
+            throttle = (
+                kbd.CAPACITY_STUCK_WARN_THROTTLE_SECONDS if capacity_held
+                else kbd.STUCK_WARN_THROTTLE_SECONDS
+            )
+            if now - health_state["last_warn_at"] >= throttle:
                 held = kbd.describe_suppression([res])
                 held = f" Last tick held back: {held}." if held else ""
+                remedy = kbd.stuck_warning_remedy(capacity_held)
+                if not capacity_held:
+                    remedy += (
+                        " / `hermes kanban list --status blocked` for recent "
+                        "spawn_failed tasks."
+                    )
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
                     f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
+                    f"successfully.{held} {remedy}",
                     file=sys.stderr, flush=True,
                 )
                 health_state["last_warn_at"] = now
