@@ -2220,11 +2220,19 @@ def _tick_spawn_budget(
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed rows of one lane in dispatch order.
+
+    A card other cards WAIT ON gates live work, and that is already a fact of
+    the board's links: rank it ahead of a card that gates nothing. The filing
+    discipline this implies is binding - work blocked on a card is linked to
+    that card as its child.
+    """
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
-        f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "SELECT t.id, t.assignee FROM tasks t "
+        "WHERE t.status = ? AND t.claim_lock IS NULL "
+        "ORDER BY (EXISTS (SELECT 1 FROM task_links l WHERE l.parent_id = t.id)) DESC, "
+        "t.priority DESC, t.created_at ASC",
+        (status,),
     ).fetchall()
 
 

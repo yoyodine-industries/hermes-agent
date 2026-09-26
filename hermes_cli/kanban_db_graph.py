@@ -22,6 +22,30 @@ def inherit_creator_origin(
     _inherit_notify_subs(conn, task_id, (creator_task_id,), created_at=created_at)
 
 
+def chain_priority(conn: sqlite3.Connection, parents: tuple[str, ...]) -> int:
+    """Maximum priority along the transitive parent chain (0 when there is none).
+
+    Read before the creation transaction: the chain's urgency is declared once,
+    by whoever filed the chain head, and every leg inherits it.
+    """
+    best = 0
+    seen: set[str] = set()
+    frontier = [str(pid) for pid in parents if pid]
+    while frontier:
+        pid = frontier.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        row = conn.execute("SELECT priority FROM tasks WHERE id = ?", (pid,)).fetchone()
+        if row is not None:
+            best = max(best, int(row["priority"] or 0))
+        for link in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (pid,),
+        ).fetchall():
+            frontier.append(str(link["parent_id"]))
+    return best
+
+
 def initial_task_state(
     conn: sqlite3.Connection, parents: tuple[str, ...], initial_status: str,
     triage: bool, tenant: Optional[str],
@@ -115,7 +139,7 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, priority "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
@@ -196,14 +220,20 @@ def _insert_decomposed_child(
         child_ws_path = None
     new_id = _new_task_id()
     body = child.get("body")
+    # Explicit priority, never the column DEFAULT: a decomposed child is not a
+    # lane of its own, it continues the root's chain, so it inherits the root's
+    # urgency (R2) — and an INSERT that omits the column would take the DEFAULT,
+    # which is 1 on a fresh board and 0 on a board whose tasks table predates
+    # the change, i.e. the same decompose would file into two different lanes.
     conn.execute(
         "INSERT INTO tasks "
-        "(id, title, body, assignee, status, workspace_kind, "
+        "(id, title, body, assignee, status, priority, workspace_kind, "
         " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
+            _canonical_assignee(child.get("assignee")), int(root_row["priority"] or 0),
+            child_ws_kind, child_ws_path,
             root_row["tenant"], now, (author or "decomposer"),
         ),
     )

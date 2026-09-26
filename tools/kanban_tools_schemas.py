@@ -406,8 +406,12 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Defaults to HERMES_TENANT env if set."
         )),
         "priority": _prop("integer", (
-                "Dispatcher tiebreaker. Higher = picked sooner "
-                "when multiple ready tasks share an assignee."
+                "Dispatcher lane. Higher = picked sooner when multiple ready "
+                "tasks compete: P0=3, P1=2, P2=1, P3=0. Default 1 — "
+                "P2, the normal lane; omit it unless the card is genuinely "
+                "more or less urgent than the queue it is joining. A card "
+                "created under 'parents' keeps the highest priority on its "
+                "parent chain."
         )),
         "workspace_kind": {
             "type": "string",

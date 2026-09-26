@@ -82,7 +82,10 @@ _TASK_ID = _arg("task_id")
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
-_PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
+_PRIORITY = _arg(
+    "--priority", type=int, default=1,
+    help="Dispatcher lane: P0=3 P1=2 P2=1 P3=0; unset = P2 (normal)",
+)
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),

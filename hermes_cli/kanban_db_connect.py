@@ -777,7 +777,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
 _BASE_TASK_COLUMNS = (
     ("body", "body TEXT"),
     ("assignee", "assignee TEXT"),
-    ("priority", "priority INTEGER DEFAULT 0"),
+    ("priority", "priority INTEGER DEFAULT 1"),
     ("created_by", "created_by TEXT"),
     ("started_at", "started_at INTEGER"),
     ("completed_at", "completed_at INTEGER"),

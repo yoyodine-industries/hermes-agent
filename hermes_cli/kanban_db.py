@@ -878,7 +878,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     body                 TEXT,
     assignee             TEXT,
     status               TEXT NOT NULL,
-    priority             INTEGER DEFAULT 0,
+    priority             INTEGER DEFAULT 1,  -- P0=3 P1=2 P2=1 P3=0; unset = P2 (normal)
     created_by           TEXT,
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
@@ -1256,7 +1256,7 @@ def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
-    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
+    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 1,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
@@ -1271,6 +1271,11 @@ def create_task(
 
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+    ``priority`` is the dispatcher lane (P0=3, P1=2, P2=1, P3=0) and defaults to
+    ``1`` — the normal lane — so a card filed without one is not born in the
+    bottom lane. A card filed under ``parents`` stores the maximum priority
+    along its transitive parent chain: a chain leg may be raised, never filed
+    below the chain it continues.
     ``idempotency_key``: an existing non-archived task with the key is returned
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
@@ -1282,7 +1287,7 @@ def create_task(
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
-    from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
+    from hermes_cli.kanban_db_graph import chain_priority, initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
@@ -1318,6 +1323,11 @@ def create_task(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
     parents = tuple(p for p in parents if p)
+    # A chain leg inherits its chain's urgency (transitive through
+    # ``task_links``): urgency is declared once, by whoever filed the chain
+    # head, and the filer of a follow-up leg needs no integer trick to be
+    # schedulable at all — nor may it silently drop the chain to the floor.
+    priority = max(int(priority or 0), chain_priority(conn, parents))
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
