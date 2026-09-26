@@ -588,6 +588,19 @@ def command_line_runs_inline_source(tokens: list[str]) -> bool:
     return inline_source_flag_index(tokens) is not None
 
 
+def _command_line_tokens(command: str | None) -> list[str]:
+    """Quote-aware tokens of *command*, case PRESERVED (the operand-taking ``-X``/``-W``/``-Q`` must
+    not be conflated with the operand-less ``-x``/``-w``/``-q``). A bare ``split()`` is the last
+    resort for an unbalanced quote: the tokenizer never raises. Shared by the identity matcher and
+    the inline-source probe so both read the same argv."""
+    if not command:
+        return []
+    try:
+        return shlex.split(command, posix=False)
+    except ValueError:
+        return command.split()
+
+
 def _gateway_command_subcommand(command: str | None) -> str | None:
     """Hermes gateway lifecycle subcommand from a command line, or None. No loose substring matches
     (``"gateway" in cmdline`` also matched ``gateway status`` / ``python -m tui_gateway``): needs a
@@ -596,10 +609,7 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     argv since ``_apply_profile_override`` removes them before argparse."""
     if not command:
         return None
-    try:
-        raw_tokens = shlex.split(command, posix=False)
-    except ValueError:
-        raw_tokens = command.split()
+    raw_tokens = _command_line_tokens(command)
     # Strip surrounding quotes, normalize slashes + case per token.
     cased_tokens = [t.strip("\"'").replace("\\", "/") for t in raw_tokens]
     tokens = [t.lower() for t in cased_tokens]
@@ -795,10 +805,15 @@ def _record_matches_live_gateway_pid(
 ) -> bool:
     """True when a live PID still identifies as this gateway record. The live command line wins (a
     stale record's argv must not make a recycled PID count as a gateway; with ``expected_home`` it
-    must also belong to that profile — or serve it as the host multiplexer); unreadable cmdline
-    (Windows/EACCES) -> persisted record."""
+    must also belong to that profile — or serve it as the host multiplexer); a command line that
+    cannot testify (unreadable on Windows/EACCES, or an interpreter running INLINE SOURCE — this
+    install's own launcher and ``gateway restart`` start the gateway as ``python -I -c <src>``, where
+    everything after ``-c`` is the inline program's data and not that process's identity, #107002) ->
+    the persisted record decides."""
     live_cmdline = _read_process_cmdline(pid)
     if not live_cmdline:
+        return _record_looks_like_gateway(record)
+    if command_line_runs_inline_source(_command_line_tokens(live_cmdline)):
         return _record_looks_like_gateway(record)
     if not looks_like_gateway_runtime_command_line(live_cmdline):
         return False

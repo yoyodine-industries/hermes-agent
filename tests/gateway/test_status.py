@@ -374,6 +374,61 @@ class TestGatewayRuntimeStatus:
                 == 139
             ), cmdline
 
+    def test_runtime_status_running_pid_accepts_inline_source_launcher(self, monkeypatch):
+        """A gateway started through this install's own launcher
+        (``<python> -I -c <bootstrap> gateway run``) has no readable argv identity:
+        everything after ``-c`` is the inline program's data, not this process's
+        (#107002). The command line cannot testify, so the record's own evidence
+        decides — exactly as it does for an unreadable one. Without that fallback a
+        healthy gateway reads as absent and every consumer keyed on it (cron status,
+        served profiles, the migration confirmation) reports "no gateway"."""
+        payload = {
+            "pid": 42,
+            "gateway_state": "running",
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "gateway", "run"],
+            "start_time": 1000,
+        }
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 1000)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda pid: (
+                "/usr/bin/python3 -I -c \"import runpy;runpy.run_path("
+                "'/opt/hermes/hermes_cli/main.py')\" gateway run --replace"
+            ),
+        )
+
+        assert status.get_runtime_status_running_pid(payload) == 42
+
+    def test_runtime_status_running_pid_rejects_inline_source_without_a_gateway_record(
+        self, monkeypatch
+    ):
+        """The inline-source fallback reads the RECORD, never the command line: a
+        record whose argv is not a gateway runtime proves nothing, so a stale
+        record's PID recycled onto an unrelated ``python -c`` script still reads as
+        dead."""
+        payload = {
+            "pid": 42,
+            "gateway_state": "running",
+            "kind": "hermes-gateway",
+            "argv": ["/usr/bin/python3", "-c", "print(1)"],
+            "start_time": 1000,
+        }
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 1000)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda pid: (
+                "/usr/bin/python3 -I -c \"import runpy;runpy.run_path("
+                "'/opt/hermes/hermes_cli/main.py')\" gateway run --replace"
+            ),
+        )
+
+        assert status.get_runtime_status_running_pid(payload) is None
+
 
     def test_command_line_belongs_to_profile_normalizes_separators(self):
         """A Windows argv renders HERMES_HOME with backslashes while the
