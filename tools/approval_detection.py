@@ -206,6 +206,12 @@ def detect_hardline_command(command: str) -> tuple:
 
 
 # ---- Dangerous command patterns -----------------------------------------------------------
+# The gateway-lifecycle reason key. One constant, used by the textual rule below AND by the
+# resolved-target rung at the end of `detect_dangerous_command`: the rung detects the same act keyed on
+# its TARGET (a signal to the live gateway pid, or the host's bounce carrier), and the operator's
+# existing consent for this foot-gun is stored by reason key. Minting a second key for the same act
+# would make the two spellings behave differently in `-q`, which is how a guard starts losing.
+_GATEWAY_LIFECYCLE_DESCRIPTION = "stop/restart hermes gateway (kills running agents)"
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
@@ -339,7 +345,7 @@ DANGEROUS_PATTERNS = [
      "dynamic shell word may expand to arbitrary program execution flag"),
     # Gateway lifecycle: stopping/restarting the gateway kills all running agents. Global flags
     # between `hermes` and `gateway` (`hermes -p ade gateway restart`) are allowed so a profile flag can't slip past.
-    (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
+    (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(stop|restart)\b', _GATEWAY_LIFECYCLE_DESCRIPTION),
     (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
     # Docker/Podman daemon redirect — global flags or env that point the CLI at a DIFFERENT (often remote) daemon:
     # `docker -H ssh://prod stop app` looks local but operates on remote infra, so any redirect requires approval
@@ -1513,6 +1519,35 @@ def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
     return contains_gateway_lifecycle_command(command)
 
 
+def _targets_live_gateway(command: str) -> bool:
+    """Whether *command* signals the LIVE gateway process, or invokes its bounce carrier.
+
+    Branches A-D of ``DANGEROUS_PATTERNS`` key on the SPELLING of the act (`hermes gateway restart`,
+    `pkill … hermes … gateway`); the spelling the fleet actually reached for — a bare signal to the pid
+    the gateway is running as — carries no gateway token, so this rung keys on the TARGET instead,
+    resolved at scan time through Hermes' own identity ladder (``gateway.status.get_running_pid`` /
+    ``hermes_cli.gateway.find_gateway_pids``). Delegates to ``cron.lifecycle_guard`` so the terminal
+    tool, ``execute_code``, cron creation and this approval layer all read one implementation, and so a
+    command the guard blocks cannot be auto-approved here.
+
+    FAIL-OPEN AND TOTAL: this sits in front of every terminal command, so an unavailable guard, a
+    failed resolution or a rung that raises is "not flagged" — never an unhandled traceback. It runs
+    after every textual pattern, so a command that already has a reason key keeps it, and immediately
+    BEFORE the shell-splice rung below — that rung delegates to the same guard, so it would otherwise
+    stamp these cases with the splice key instead of the gateway-lifecycle key the operator has
+    already granted.
+    """
+    try:
+        from cron.lifecycle_guard import command_targets_live_gateway
+    except Exception:
+        return False
+    try:
+        return bool(command_targets_live_gateway(command))
+    except Exception:
+        logger.warning("resolved-target gateway rung failed; treating as not flagged", exc_info=True)
+        return False
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check dangerous patterns -> (is_dangerous, pattern_key, description)."""
     if _command_parser_limit_exceeded(command):
@@ -1535,6 +1570,13 @@ def detect_dangerous_command(command: str) -> tuple:
     normalized = _normalize_command_for_detection(command)
     for description, _ in _execution_flag_findings(normalized):
         return (True, description, description)
+    # Mechanism rung: the same act keyed on its TARGET — a signal to the live gateway pid
+    # (`kill -USR1 <pid>`, `kill -TERM <pid>`) or the host's bounce carrier
+    # (`hermes_update_nodes.py bounce`). These spellings carry no hermes/gateway token, so no rule
+    # above can see them; they are the act the guard exists to cover. Same reason key as the textual
+    # rule so the grant the operator already made for this act applies to every spelling of it.
+    if _targets_live_gateway(command):
+        return (True, _GATEWAY_LIFECYCLE_DESCRIPTION, _GATEWAY_LIFECYCLE_DESCRIPTION)
     if _is_shell_token_spliced_gateway_lifecycle(command):
         return (True, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION)
     return (False, None, None)

@@ -2233,3 +2233,103 @@ class TestLifecycleGuardLaunchctlParity:
             "launchctl print system/com.apple.WindowServer",
         ):
             assert contains_gateway_lifecycle_command(cmd) is False, cmd
+
+
+class TestResolvedTargetGatewayRung:
+    """The approval layer keys on the TARGET of the act, not only on its spelling.
+
+    A bare signal to the pid the gateway runs as carries no hermes/gateway token, so no textual rule
+    could see it; the rung resolves the operand through ``cron.lifecycle_guard`` (one implementation
+    shared with the terminal tool, ``execute_code`` and cron creation) and reports the SAME reason key
+    as the textual gateway-lifecycle rule, so consent already granted for that act covers every
+    spelling of it instead of only the one the fleet happened to use.
+    """
+
+    HOST_PID = 17285
+    HOST_CMDLINE = (
+        "/Users/hermes_user/.hermes/tools/python-3.14.12/bin/python3 -I -c import sys, runpy; "
+        "sys.argv = ['/Users/hermes_user/.hermes/hermes-agent/hermes_cli/main.py', 'gateway', 'run']"
+    )
+    CARRIER = "python3 /Users/hermes_user/.hermes/yoyoflow/scripts/hermes_update_nodes.py bounce"
+
+    @pytest.fixture
+    def live_gateway(self, monkeypatch):
+        import cron.lifecycle_guard as lifecycle_guard
+
+        monkeypatch.setattr(
+            lifecycle_guard,
+            "_live_gateway_identities",
+            lambda: ((self.HOST_PID, "python3", self.HOST_CMDLINE),),
+        )
+
+    def test_mechanism_spellings_share_the_textual_rule_reason_key(self, live_gateway):
+        textual_key = approval_detection.detect_dangerous_command("hermes gateway restart")[1]
+        assert textual_key == "stop/restart hermes gateway (kills running agents)"
+        for command in (
+            f"kill -USR1 {self.HOST_PID}",
+            f"kill -TERM {self.HOST_PID}",
+            f"kill {self.HOST_PID}",
+            "pkill -f hermes_cli",
+            self.CARRIER,
+            "hermes_update_nodes bounce",
+        ):
+            dangerous, key, description = approval_detection.detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert key == textual_key, command
+            assert description == textual_key, command
+
+    def test_commands_with_their_own_reason_keep_it(self, live_gateway):
+        """Ordering contract: a command the textual table already covers keeps its own key, so no
+        pre-existing approval (allowlist entries are keyed by reason) changes meaning."""
+        dangerous, key, _ = approval_detection.detect_dangerous_command(
+            "launchctl kickstart -k system/ai.hermes.gateway"
+        )
+        assert dangerous is True
+        assert key == "stop/restart hermes launchd service (kills running agents)"
+
+    def test_rung_fires_only_with_a_resolvable_target(self, monkeypatch):
+        import cron.lifecycle_guard as lifecycle_guard
+
+        monkeypatch.setattr(lifecycle_guard, "_live_gateway_identities", lambda: ())
+        # The carrier is command-shaped, so it does not depend on a resolvable target; the resolved-target
+        # half of the rung is what must stay silent when nothing resolves.
+        for command in (f"kill -USR1 {self.HOST_PID}", f"kill -0 {self.HOST_PID}",
+                        "pkill -f hermes_cli", "pkill -f not-the-gateway",
+                        "hermes_update_nodes.py outcome-finalize 69 completed"):
+            dangerous, key, _ = approval_detection.detect_dangerous_command(command)
+            assert not (dangerous and key == "stop/restart hermes gateway (kills running agents)"), command
+
+    def test_a_raising_rung_is_not_flagged(self, monkeypatch):
+        import cron.lifecycle_guard as lifecycle_guard
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("rung exploded")
+
+        monkeypatch.setattr(lifecycle_guard, "command_targets_live_gateway", explode)
+        assert approval_detection.detect_dangerous_command(f"kill -USR1 {self.HOST_PID}") == (False, None, None)
+
+    def test_an_unavailable_guard_is_not_flagged(self, monkeypatch):
+        """Fail-open: the approval layer must not turn a broken import into a refusal."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "cron.lifecycle_guard":
+                raise ImportError("guard unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        assert approval_detection.detect_dangerous_command(f"kill -USR1 {self.HOST_PID}") == (False, None, None)
+
+    def test_rung_never_reads_a_value_as_a_command(self, live_gateway):
+        """A pid or pattern in a VALUE position is data. Only the executed command is read, so
+        documentation about the act is not the act."""
+        for command in (
+            f"grep -n 'kill -USR1 {self.HOST_PID}' notes.md",
+            f"echo kill -TERM {self.HOST_PID}",
+            "git commit -m 'document the bounce carrier'",
+            'import hermes_update_nodes as hun\nbounce = hun.bounce(inputs.get("update"))',
+        ):
+            dangerous, key, _ = approval_detection.detect_dangerous_command(command)
+            assert not (dangerous and key == "stop/restart hermes gateway (kills running agents)"), command

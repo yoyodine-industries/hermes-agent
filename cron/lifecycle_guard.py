@@ -72,7 +72,8 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 # yet terminate it (#113667). Token-aware rather than a line regex: option VALUES are never read as
 # targets (`pkill -u <user> chrome`), `-f` cmdline patterns are judged as patterns, and other image
 # names (`taskkill /F /IM agent-browser.exe`) stay available. Numeric-PID kills are out of scope:
-# the explicit PID / `proc_*` id IS the ownership-scoped route the rejection points to.
+# the explicit PID / `proc_*` id IS the ownership-scoped route the rejection points to — with ONE
+# exception, the live gateway's own pid, which Branch F below resolves and blocks.
 _INTERPRETER_IMAGE_RE = re.compile(r"^pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
 _HOST_INTERPRETER_NAME = Path(sys.executable).name.lower() if sys.executable else ""
 _KILLER_VALUE_OPTIONS = {
@@ -218,6 +219,272 @@ def contains_host_interpreter_kill(text: str) -> bool:
             if kill_verb_present and _segment_names_host_interpreter(tokens, _NAME_ENUMERATORS):
                 return True
     return False
+
+
+# Branch F: the same act keyed on its TARGET instead of on its spelling. Branches A-D need a
+# hermes/gateway token in the command; Branch E reaches the interpreter IMAGE but deliberately leaves
+# explicit PIDs alone. Neither covers the act the fleet actually reached for: a bare signal to the pid
+# the gateway is running as — `kill -USR1 <pid>` / `kill -TERM <pid>` terminates the process hosting
+# this guard and every agent session inside it, and carries no hermes/gateway token at all (#113667
+# follow-on, measured on this host 2026-09-27).
+#
+# So this rung resolves the target at scan time through Hermes' OWN identity ladder
+# (`gateway.status.get_running_pid`, `hermes_cli.gateway.find_gateway_pids`) and compares:
+#   * `kill [-SIGNAL] <pid>` whose pid IS a live gateway pid. The no-op probe `kill -0 <pid>` asks
+#     whether a process exists without signalling it, so it stays unflagged; `kill -l` signals nobody.
+#   * `pkill`/`killall` (and a `pgrep -f <pattern>` feed into a killer, Branch E's shape) whose operand
+#     ERE actually matches a live gateway's process name or, with `-f`, its command line.
+#   * the host's bounce carrier `hermes_update_nodes[.py] bounce` — the same act through a wrapper.
+#     Command-shaped only: the module must be the EXECUTED word (or an interpreter's script operand)
+#     and `bounce` its first argument, so a yoyoflow `code:` reference (`hun.bounce(...)`), a comment
+#     or prose never matches.
+#
+# FAIL-OPEN AND TOTAL: this sits in front of every terminal command and every cron job, so a failed
+# import, a failed resolution, an unreadable command line or no resolvable gateway is "not flagged" —
+# never a block, never a traceback. Text with no candidate token never reaches a process scan (each
+# scan is ~50 ms), because the prefilter rejects the overwhelming majority of text for free.
+_GATEWAY_TARGETING_TOKEN_RE = re.compile(r"(?i)\b(?:kill|killall|pkill|pgrep|hermes_update_nodes)\b")
+_BOUNCE_CARRIER_MODULE = "hermes_update_nodes"
+_BOUNCE_CARRIER_SUBCOMMAND = "bounce"
+# `kill` options that consume a value (a signal), so the value is never read as a pid.
+_KILL_SIGNAL_VALUE_OPTIONS = frozenset({"-s", "--signal", "-n"})
+# `kill -l` enumerates signal names; it delivers nothing.
+_KILL_LIST_OPTIONS = frozenset({"-l", "-L", "--list", "--table"})
+_GATEWAY_NAME_KILLERS = frozenset({"pkill", "killall"})
+_GATEWAY_NAME_ENUMERATORS = frozenset({"pgrep"})
+
+
+def _live_gateway_identities() -> tuple:
+    """``(pid, name, cmdline)`` for every live gateway process on this host.
+
+    Resolved from Hermes' own identity ladder — ``gateway.status.get_running_pid`` (the profile this
+    process serves) plus ``hermes_cli.gateway.find_gateway_pids`` (every profile) — never from a
+    pattern guess. Each step is independently guarded: an import failure, a resolution failure or an
+    unreadable command line drops that source/pid, and the rung then has nothing to match. That is the
+    fail-open direction this guard must take. Never raises.
+    """
+    pids: set[int] = set()
+    try:
+        from gateway.status import get_running_pid
+
+        own_pid = get_running_pid()
+        if isinstance(own_pid, int) and own_pid > 0:
+            pids.add(own_pid)
+    except Exception:
+        logger.debug("gateway pid resolution (own profile) failed", exc_info=True)
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+
+        pids.update(pid for pid in (find_gateway_pids() or ()) if isinstance(pid, int) and pid > 0)
+    except Exception:
+        logger.debug("gateway pid resolution (fleet scan) failed", exc_info=True)
+    identities: list[tuple] = []
+    for pid in sorted(pids):
+        try:
+            # gateway.status owns this host's process-identity reads; a second reader is how the two
+            # come to disagree about which process the gateway is.
+            from gateway.status import _read_process_cmdline
+
+            cmdline = _read_process_cmdline(pid) or ""
+        except Exception:
+            logger.debug("gateway cmdline unreadable for pid %s", pid, exc_info=True)
+            continue
+        if not cmdline:
+            continue
+        # The name is argv[0]'s basename, i.e. what `comm` reports — it models pkill's name-vs-cmdline
+        # matching, and gateway IDENTITY is not decided here: that is the canonical matchers inside
+        # get_running_pid/find_gateway_pids. (AGENTS.md: never infer process identity from argv
+        # substrings; this reads none.)
+        identities.append((pid, _executable_name(cmdline.split(None, 1)[0]).lower(), cmdline))
+    return tuple(identities)
+
+
+def _delivers_signal(spelling: Optional[str]) -> bool:
+    """False only for the no-op probe signal 0 (``kill -0 <pid>`` / ``-s 0`` / ``--signal 0``), which
+    asks whether a process exists without signalling it. *spelling* is None when the invocation named
+    no signal at all: `kill <pid>` delivers the default SIGTERM, which is exactly the act to block."""
+    if spelling is None:
+        return True
+    value = spelling.strip().strip("\"'").lstrip("-").strip().lower()
+    if value.startswith("sig"):
+        value = value[3:]
+    return value not in ("", "0")
+
+
+def _kill_operands(args: list[str]) -> list[str]:
+    """The pid operands of a ``kill`` invocation, or ``[]`` when it signals nobody.
+
+    `kill -l` lists signal names and the signal itself is an option argument, so neither is ever read
+    as a pid.
+    """
+    operands: list[str] = []
+    signal: Optional[str] = None
+    options = True
+    position = 0
+    while position < len(args):
+        token = args[position]
+        if options and token == "--":
+            options = False
+            position += 1
+            continue
+        if options and token in _KILL_LIST_OPTIONS:
+            return []
+        if options and token.startswith("--signal="):
+            signal = token.split("=", 1)[1]
+            position += 1
+            continue
+        if options and token in _KILL_SIGNAL_VALUE_OPTIONS:
+            signal = args[position + 1] if position + 1 < len(args) else ""
+            position += 2
+            continue
+        if options and token.startswith("-s") and len(token) > 2:
+            signal = token[2:]
+            position += 1
+            continue
+        if options and token.startswith("-") and len(token) > 1:
+            signal = token[1:]
+            position += 1
+            continue
+        operands.append(token)
+        position += 1
+    return operands if _delivers_signal(signal) else []
+
+
+def _name_killer_operands(name: str, args: list[str]) -> tuple:
+    """``(operands, full_cmdline, exact)`` for a pkill/pgrep/killall invocation.
+
+    Option values are consumed so a value is never read as a target; `-f`/`--full` selects the command
+    line as the subject; killall matches the whole name unless `-r` makes it an ERE.
+    """
+    exact = name == "killall" and not any(token in ("-r", "--regexp") for token in args)
+    if any(token in ("-x", "--exact") for token in args):
+        exact = True
+    full_cmdline = name in ("pkill", "pgrep") and any(token in ("-f", "--full") for token in args)
+    operands: list[str] = []
+    position = 0
+    while position < len(args):
+        token = args[position]
+        if token == "--":
+            operands += args[position + 1:]
+            break
+        if token in _KILLER_VALUE_OPTIONS[name]:
+            position += 2
+            continue
+        if not token.startswith("-"):
+            operands.append(token)
+        position += 1
+    return operands, full_cmdline, exact
+
+
+def _operand_matches_identity(operand: str, identity: tuple, *, full_cmdline: bool, exact: bool) -> bool:
+    """pkill/pgrep/killall operand semantics against one resolved process.
+
+    An operand that is not a valid ERE selects no process at all, so it is not a match.
+    """
+    _, name, cmdline = identity
+    subject = cmdline if full_cmdline else name
+    text = operand.strip().strip("\"'")
+    if not subject or not text:
+        return False
+    try:
+        pattern = re.compile(text)
+    except re.error:
+        return False
+    if exact:
+        return pattern.fullmatch(subject) is not None
+    return pattern.search(subject) is not None
+
+
+def _is_bounce_carrier(name: str, args: list[str]) -> bool:
+    """``hermes_update_nodes[.py] bounce`` — the host's bounce carrier, which performs the same act as
+    `hermes gateway restart` through a wrapper. The module must be the EXECUTED word, or the script
+    operand of an interpreter that runs it, and `bounce` its first argument."""
+    if name in (_BOUNCE_CARRIER_MODULE, _BOUNCE_CARRIER_MODULE + ".py"):
+        return bool(args) and args[0] == _BOUNCE_CARRIER_SUBCOMMAND
+    if not _is_interpreter_image(name):
+        return False
+    script = _BOUNCE_CARRIER_MODULE + ".py"
+    for position, token in enumerate(args):
+        if _executable_name(token).lower() != script:
+            continue
+        following = args[position + 1] if position + 1 < len(args) else ""
+        return following == _BOUNCE_CARRIER_SUBCOMMAND
+    return False
+
+
+def _segment_resolved_targets(tokens: list[str], *, kill_verb_present: bool) -> tuple:
+    """``(carrier, pids, patterns)`` for one tokenized segment: what it would signal.
+
+    Only the executable at the wrapper-peeled position is read. Branch E also reads the first killer
+    token ANYWHERE in a segment (`xargs kill`); here that fallback is deliberately absent, because a pid
+    operand or an operand ERE is a *value*, and reading values as commands is how a guard starts
+    blocking its own documentation.
+    """
+    index = _executed_command_index(tokens)
+    if index is None:
+        return False, set(), []
+    name = _executable_name(tokens[index]).lower().removesuffix(".exe")
+    args = tokens[index + 1:]
+    if _is_bounce_carrier(name, args):
+        return True, set(), []
+    if name == "kill":
+        pids = {int(operand) for operand in _kill_operands(args) if operand.isdigit()}
+        return False, pids, []
+    if name in _GATEWAY_NAME_KILLERS:
+        operands, full_cmdline, exact = _name_killer_operands(name, args)
+        return False, set(), [(operand, full_cmdline, exact) for operand in operands]
+    if name in _GATEWAY_NAME_ENUMERATORS and kill_verb_present:
+        # `kill $(pgrep -f 'gateway run')` / `pgrep -f … | xargs kill`: the feed only matters when the
+        # same text also runs a killer, exactly as Branch E reads its enumerators.
+        operands, full_cmdline, exact = _name_killer_operands(name, args)
+        return False, set(), [(operand, full_cmdline, exact) for operand in operands]
+    return False, set(), []
+
+
+def command_targets_live_gateway(text: str) -> bool:
+    """Branch F entrypoint: *text* delivers a signal to the LIVE gateway process, or invokes its bounce
+    carrier. Total by construction — the resolver is fail-open and the whole body is guarded, because
+    this runs in front of every terminal command and every cron job."""
+    try:
+        return _command_targets_live_gateway(text)
+    except Exception:
+        logger.warning("resolved-target gateway rung failed; treating as not flagged", exc_info=True)
+        return False
+
+
+def _command_targets_live_gateway(text: str) -> bool:
+    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    # Cheap gate first: no candidate token in the whole text, no tokenizing and no process scan.
+    if not text or not _GATEWAY_TARGETING_TOKEN_RE.search(normalized):
+        return False
+    kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
+    pids: set[int] = set()
+    patterns: list[tuple] = []  # (operand, full_cmdline, exact)
+    for segment in _iter_command_segments(normalized):
+        joined = " ".join(segment)
+        stripped = _ARGV_LIST_PUNCTUATION.sub(" ", joined)
+        for tokens in ([segment, stripped.split()] if stripped != joined else [segment]):
+            carrier, segment_pids, segment_patterns = _segment_resolved_targets(
+                tokens, kill_verb_present=kill_verb_present
+            )
+            if carrier:
+                return True
+            pids |= segment_pids
+            patterns += segment_patterns
+    if not pids and not patterns:
+        return False
+    identities = _live_gateway_identities()
+    if not identities:
+        # No gateway resolves (none running, or its identity is unreadable): nothing to target.
+        return False
+    if pids.intersection(pid for pid, _, _ in identities):
+        return True
+    return any(
+        _operand_matches_identity(operand, identity, full_cmdline=full_cmdline, exact=exact)
+        for operand, full_cmdline, exact in patterns
+        for identity in identities
+    )
+
 
 # Every branch uses `[^\n]*` between verb and label so matches cannot span unrelated lines. A POSIX
 # backslash-newline continuation is therefore collapsed to a space before matching (as the shell
@@ -395,7 +662,9 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     Python source); profile-flag form; the same regex on each shell-tokenized segment with quotes/
     escapes resolved (closes splice bypasses like ``kick"start"`` / ``kick\\start``);
     order-independent launchctl pass. Single choke point for every recursion level of
-    ``_contains_unsafe_gateway_action``.
+    ``_contains_unsafe_gateway_action``. Branch E and Branch F add token/resolution passes that a
+    raw-text regex cannot express: killers aimed at the interpreter image, and killers whose TARGET
+    resolves to the live gateway (a bare pid signal, or the bounce carrier).
 
     That second pass exists because a real shell resolves quote-splicing (``kick"start"``) and
     backslash-escaping (``kick\\start``) into one literal word — ``kickstart`` — before the command ever
@@ -451,7 +720,24 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # "gui/$uid/$label"`), so neither the same-span regex nor same-segment tokenization sees verb and label
     # together. Check "verb anywhere AND label anywhere" instead.
     # Branch E (#113667): killers aimed at the interpreter image itself carry no hermes/gateway token.
-    return _contains_launchctl_gateway_lifecycle(normalized) or contains_host_interpreter_kill(normalized)
+    # Branch F: the same act keyed on its TARGET — a signal to a live gateway pid, or the host's bounce
+    # carrier. Guarded a second time here (the rung is already total): this is the choke point every
+    # tool surface and every cron-creation path calls, so a rung failure must degrade to "not flagged"
+    # rather than raise in front of an unrelated command.
+    return (
+        _contains_launchctl_gateway_lifecycle(normalized)
+        or contains_host_interpreter_kill(normalized)
+        or _targets_live_gateway(normalized)
+    )
+
+
+def _targets_live_gateway(text: str) -> bool:
+    """Branch F at the choke point — fail-open on any failure, including a replaced rung."""
+    try:
+        return bool(command_targets_live_gateway(text))
+    except Exception:
+        logger.warning("resolved-target gateway rung failed; treating as not flagged", exc_info=True)
+        return False
 
 
 # Whole-walk work limits. The per-file cap and depth bound above limit one read, not the walk: a
