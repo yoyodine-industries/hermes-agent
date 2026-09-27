@@ -152,6 +152,11 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    deferred_host_capped: list[str] = field(default_factory=list)
+    """Task ids the HOST-wide worker budget (``kanban.max_in_progress``) left
+    unspawned this tick, head of line first. The board did not choose this and
+    its own queue looks idle, so the tick has to say it out loud — see
+    :class:`HostCapStarvationClock`."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -175,6 +180,10 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.deferred_host_capped:
+            # The HOST budget held these back: no per-card refusal of their own,
+            # so without this the tick reads like an idle queue.
+            counts["host_cap_deferred"] = counts.get("host_cap_deferred", 0) + len(res.deferred_host_capped)
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
@@ -1930,6 +1939,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    host_budget_share: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1953,6 +1963,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            host_budget_share=host_budget_share,
         )
 
     try:
@@ -2165,6 +2176,7 @@ def _tick_spawn_budget(
     max_spawn: Optional[int],
     max_in_progress: Optional[int],
     board: Optional[str],
+    host_budget_share: Optional[int] = None,
 ) -> tuple[bool, Optional[int]]:
     """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
 
@@ -2173,6 +2185,13 @@ def _tick_spawn_budget(
     by N every tick. ``max_in_progress`` is a HOST-level cap: running workers on
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
+    ``host_budget_share`` is this board's slice of the FREE host slots for this
+    tick, allocated across the boards by the gateway dispatcher
+    (``gateway.kanban_watchers_dispatcher.host_budget_shares``): the host cap
+    still bounds the fleet, and the share stops one board's queue from taking
+    the slots every other board is waiting for. ``None`` = no share was
+    allocated, which is every single-board caller (the CLI daemon and
+    ``hermes kanban dispatch``).
     """
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
@@ -2191,10 +2210,26 @@ def _tick_spawn_budget(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            # The HOST budget is full. This board's refusal is not its own doing
+            # and its queue looks idle from the outside, so name what the cap
+            # deferred: the tick has to be reportable (HostCapStarvationClock).
+            result.deferred_host_capped = spawnable_pending_ids(conn)
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
+
+    # This board's SHARE of the host budget, handed out by the gateway
+    # dispatcher. 0 means more boards had startable work than there were free
+    # slots, so this board waits a tick: a rotation, not a fault, and recorded
+    # the same way so a board that keeps losing the race is still visible.
+    if host_budget_share is not None:
+        share = max(int(host_budget_share), 0)
+        if share <= 0:
+            result.deferred_host_capped = spawnable_pending_ids(conn)
+            return False, None
+        if spawn_budget is None or spawn_budget > share:
+            spawn_budget = share
 
     # Memory-pressure guard: a static cap can't see the host's actual state.
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
@@ -2222,10 +2257,169 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, priority FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+
+
+def _spawnable_lane_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Ready (and, when enabled, review) rows a worker could start, head first.
+
+    "Spawnable" is the dispatcher's own gate as far as a read-only pass can
+    apply it: review rows only when review dispatch is on, and never a card
+    without an assignee or assigned to a profile this host cannot spawn — those
+    wait for ROUTING, not for a free slot.
+    """
+    rows = _lane_rows(conn, "ready")
+    if review_dispatch_enabled():
+        rows = rows + _lane_rows(conn, "review")
+    profile_exists = _profile_exists_fn()
+    if profile_exists is None:
+        return [row for row in rows if row["assignee"]]
+    return [row for row in rows if row["assignee"] and profile_exists(row["assignee"])]
+
+
+def spawnable_pending_ids(conn: sqlite3.Connection) -> list[str]:
+    """Ids of this board's spawnable cards waiting for a worker, head of line first.
+
+    Everything named here is something a free slot would really have started,
+    which is what makes a host-cap deferral reportable: "6 cards were ready and
+    nothing could start" is actionable, "the queue is non-empty" is not.
+    """
+    return [row["id"] for row in _spawnable_lane_rows(conn)]
+
+
+def head_of_line_priority(conn: sqlite3.Connection) -> Optional[int]:
+    """Priority of the card this board would spawn next, or ``None``.
+
+    This lineage has no age-aware effective priority: ``_lane_rows`` orders a
+    lane by ``priority DESC, created_at ASC``, so the head card's own priority
+    IS the priority of the work this board would start next — ranking boards by
+    it ranks them by exactly the order their own cards will be spawned in.
+
+    ``None`` means nothing on this board could be started by a worker. A caller
+    allocating a SHARED budget must still visit such a board (reclaim,
+    promotion, decomposition and health work is board-local); it just cannot
+    rank it.
+    """
+    rows = _spawnable_lane_rows(conn)
+    if not rows:
+        return None
+    return int(rows[0]["priority"])
+
+
+def _current_board_label() -> str:
+    """The board a board-less tick resolves to (standalone daemon), never raising."""
+    try:
+        return str(_kb.get_current_board() or _kb.DEFAULT_BOARD)
+    except Exception:
+        return _kb.DEFAULT_BOARD
+
+
+def total_running_all_boards() -> Optional[int]:
+    """Running tasks across EVERY board — the host's whole occupancy.
+
+    This is the number a caller subtracts from the host cap to find the free
+    slots, so a partial answer is worse than none: ``None`` means at least one
+    board could not be read and the caller must fall back to its previous
+    behaviour instead of handing out slots it cannot prove are free. Boards are
+    matched by resolved DB path, so ``HERMES_KANBAN_DB`` (every board pinned to
+    one file) is counted once, exactly like ``count_running_tasks_other_boards``.
+    """
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        return None
+    seen: set[str] = set()
+    total = 0
+    for meta in boards:
+        slug = meta.get("slug") or _kb.DEFAULT_BOARD
+        try:
+            path = _kb.kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if resolved in seen or not path.exists():
+                continue
+            seen.add(resolved)
+            conn = _kbc.connect(board=slug)
+            try:
+                total += count_running_tasks(conn)
+            finally:
+                with contextlib.suppress(Exception):
+                    conn.close()
+        except Exception:
+            # Unknown occupancy: refuse to allocate rather than under-count.
+            return None
+    return total
+
+
+HEALTH_HOST_CAP_DEFER_SECONDS = 3600.0
+"""How long ONE board may stay deferred by the host budget before it is reported."""
+
+
+def host_cap_deferral_message(
+    board: Optional[str], task_id: str, age_seconds: float, waiting: int
+) -> str:
+    """Operator-facing line for a board that keeps losing the host budget."""
+    minutes = int(max(age_seconds, 0.0) // 60)
+    where = f"kanban dispatcher[{board}]" if board else "kanban dispatcher"
+    return (
+        f"{where}: board {board or '?'} has been deferred by the host-wide "
+        f"kanban.max_in_progress budget for {minutes}m — {waiting} card(s) waiting, "
+        f"head of line {task_id}. Another board holds the slots that this board's "
+        f"queue is waiting for: raise kanban.max_in_progress, or accept the wait."
+    )
+
+
+class HostCapStarvationClock:
+    """Ages host-budget deferral per board and names the starvation.
+
+    ``kanban.max_in_progress`` is HOST-wide: every board draws from one budget,
+    so a board that loses the race has no refusal of its own, no error, and
+    nothing in its own DB — it looks exactly like an idle board. This clock
+    turns that tick-level fact into a line the operator can act on once the
+    deferral stops being transient (``defer_seconds``, default one hour).
+
+    Per BOARD, not per card: the head of line rotates, and a clock that reset
+    with it would never fire on a board starved for hours. The clock runs while
+    a board keeps appearing in a deferred tick and restarts as soon as the board
+    spawns or is not deferred, because an old deferral is not evidence of a
+    current problem. A tick that records the cap without naming a card (nothing
+    spawnable) is left alone: unproven starvation is not a warning.
+    """
+
+    def __init__(self, defer_seconds: float = HEALTH_HOST_CAP_DEFER_SECONDS) -> None:
+        self.defer_seconds = float(defer_seconds)
+        self._since: dict[str, float] = {}
+
+    def reset(self) -> None:
+        """Forget every clock (a paused dispatcher defers nothing)."""
+        self._since.clear()
+
+    def observe(self, board_results, now: Optional[float] = None) -> Optional[str]:
+        """The one starvation line that is due, or ``None``. Never raises."""
+        at = time.time() if now is None else float(now)
+        waiting: dict[str, int] = {}
+        heads: dict[str, str] = {}
+        for slug, result in board_results or ():
+            deferred = list(getattr(result, "deferred_host_capped", None) or [])
+            if not deferred:
+                continue
+            key = str(slug or "?")
+            waiting[key] = len(deferred)
+            heads.setdefault(key, str(deferred[0]))
+            self._since.setdefault(key, at)
+        for key in [k for k in self._since if k not in waiting]:
+            self._since.pop(key, None)
+        overdue = [
+            (key, at - since)
+            for key, since in self._since.items()
+            if at - since > self.defer_seconds
+        ]
+        if not overdue:
+            return None
+        key, age = max(overdue, key=lambda entry: entry[1])
+        return host_cap_deferral_message(key, heads.get(key, "?"), age, waiting.get(key, 0))
 
 
 def _any_spawnable_review(
@@ -2292,6 +2486,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    host_budget_share: Optional[int] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2305,6 +2500,7 @@ def _dispatch_once_locked(
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+        host_budget_share=host_budget_share,
     )
     if not may_spawn:
         return result
@@ -2924,6 +3120,10 @@ def run_daemon(
     """
     import threading
 
+    # The host budget is raced by every board; a single-board daemon cannot
+    # share it, but it can still say when its OWN queue keeps losing the race.
+    host_cap_clock = HostCapStarvationClock()
+
     if stop_event is None:
         stop_event = threading.Event()
 
@@ -2954,6 +3154,9 @@ def run_daemon(
             if on_tick is not None:
                 with contextlib.suppress(Exception):
                     on_tick(res)
+            starved = host_cap_clock.observe([(_current_board_label(), res)])
+            if starved:
+                _kb._log.warning("%s", starved)
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback
