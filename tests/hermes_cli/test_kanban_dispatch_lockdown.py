@@ -96,6 +96,28 @@ def test_a_starved_lane_is_refused_on_every_board(kanban_home, all_assignees_spa
     assert spawns == [], "neither board may spawn a starved lane's card"
 
 
+# ── the suppression line names the MODE, not just the bucket ────────────────
+
+
+def test_a_scoped_hold_is_named_lockdown_in_the_suppression_line(
+    kanban_home, all_assignees_spawnable,
+):
+    """§6.4a: the tick's line has to say WHICH hold starved the card.
+
+    A scoped lockdown and a TOTAL halt fill the same bucket and write the same task-event
+    kind; only the mode separates "the lanes off the allowlist are parked" from "everything
+    is parked". Reading the wrong one sends the operator to profile health for a stop.
+    """
+    _arm_lockdown(["default"])
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="starved", assignee="yoyoflow")
+        res = kbd.dispatch_once(conn, spawn_fn=_spawn_recorder([]))
+
+    assert res.skipped_lockdown == [(tid, "yoyoflow")]
+    assert res.lockdown_mode == estop.MODE_LOCKDOWN
+    assert "lockdown=1 (yoyoflow x1)" in kbd.describe_suppression([res])
+
+
 # ── C3 + C4: an allowlisted lane is admitted wherever the card sits ─────────
 
 
@@ -149,6 +171,10 @@ def test_a_total_pause_spawns_nothing_on_any_board(kanban_home, all_assignees_sp
         tid = kb.create_task(conn, title="total halt card", assignee="default")
         res = kbd.dispatch_once(conn, spawn_fn=_spawn_recorder([]))
         assert res.spawned == [] and res.skipped_lockdown == [(tid, "default")]
+        # The mode travels with the bucket: a total halt must not report itself as a
+        # lane-scoped lockdown (§6.4a).
+        assert res.lockdown_mode == estop.MODE_ESTOP
+        assert "estop=1 (default x1)" in kbd.describe_suppression([res])
 
     with kbc.connect(board="ops") as conn:
         tid = kb.create_task(conn, title="total halt ops card", assignee="default")

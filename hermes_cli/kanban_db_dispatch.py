@@ -138,6 +138,14 @@ class DispatchResult:
     entry is recorded on the card as a ``skipped_lockdown`` task event (one row per card per
     engagement), because the silent non-spawn this bucket replaces is exactly how three
     consecutive train failures went unseen."""
+    lockdown_mode: Optional[str] = None
+    """``mode`` of the estop hold that filled :attr:`skipped_lockdown` (``"estop"`` /
+    ``"lockdown"``, from :mod:`agent.estop`), or None when the tick held no lane. The CLAUSE's
+    name, not the bucket's: ``estop`` is a TOTAL halt (every lane starves) and ``lockdown`` a
+    scoped one (only the lanes off the allowlist starve), and the suppression line has to say
+    which — a total pause reported as a lane-scoped stop sends the reader to profile health
+    while a stop is what is holding the queue (v3 §6.4a). Left None a result renders as the
+    bucket's own name, as it did before this field existed."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -163,6 +171,12 @@ class DispatchResult:
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
 
 
+# ``agent.estop.MODE_ESTOP``'s value, spelled here so the suppression line stays a pure reader
+# of the results handed to it (no estop import on the CLI daemon's warning path): the mode it
+# compares against arrived on the result from the same module.
+_ESTOP_MODE = "estop"
+
+
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
@@ -174,6 +188,11 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     otherwise report a bare zero-spawn count while ``hermes kanban tail`` is the
     only place the guard reason is written (#111910).
 
+    The DEFCON bucket's NAME is the hold's MODE: ``estop=2 (...)`` when the tick was under a
+    TOTAL halt, ``lockdown=2 (...)`` when a scoped hold starved the lanes off its allowlist.
+    A total halt that reads as a scoped one sends the reader to profile health while the stop
+    is what is holding the queue (v3 §6.4a).
+
     Naming every hold matters more than brevity: a line reading ``active_pr=3``
     while 400 ready rows sit in ``skipped_per_profile_capped`` — or 12 in
     ``skipped_nonspawnable`` — is not a report. It is how a starved board and a
@@ -181,6 +200,7 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """
     counts: dict[str, int] = {}
     held_lanes: dict[str, int] = {}
+    held_modes: set[str] = set()
     pressure: Optional[str] = None
     for res in results:
         if res is None:
@@ -201,6 +221,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
         for _task_id, who in res.skipped_lockdown:
             lane = str(who or "").strip() or "(unassigned)"
             held_lanes[lane] = held_lanes.get(lane, 0) + 1
+            if res.lockdown_mode:
+                held_modes.add(res.lockdown_mode)
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
@@ -210,7 +232,11 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
         # sends the reader to profile health instead of the stop (v3 §6.4a). The
         # per-card record is the ``skipped_lockdown`` task event.
         named = ", ".join(f"{lane} x{n}" for lane, n in sorted(held_lanes.items()))
-        parts.append(f"lockdown={sum(held_lanes.values())} ({named})")
+        # One TOTAL-halt tick among the aggregated results names the clause ``estop=``: the
+        # wider hold is the one a reader must not miss. A result that never reached the gate
+        # (mode unset) keeps the bucket's own name.
+        bucket = _ESTOP_MODE if _ESTOP_MODE in held_modes else "lockdown"
+        parts.append(f"{bucket}={sum(held_lanes.values())} ({named})")
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
@@ -2487,6 +2513,9 @@ def _dispatch_once_locked(
     result = DispatchResult()
     # The lane gate for THIS tick: one read, threaded into every decision below.
     estop_state = _estop_state_for_tick()
+    # ... and the mode it read travels with the bucket it fills, so the starvation line can
+    # name a TOTAL halt `estop=` instead of every hold `lockdown=` (v3 §6.4a).
+    result.lockdown_mode = getattr(estop_state, "mode", None)
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
