@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import signal
@@ -26,6 +27,8 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -129,6 +132,12 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_lockdown: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, assignee)`` deferred because a lane-scoped DEFCON lockdown holds that
+    LANE. Board placement is not a factor: the same card spawns or not on ANY board. Each
+    entry is recorded on the card as a ``skipped_lockdown`` task event (one row per card per
+    engagement), because the silent non-spawn this bucket replaces is exactly how three
+    consecutive train failures went unseen."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2027,6 +2036,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    estop_state: Optional[Any] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2040,6 +2050,16 @@ def _dispatch_lane_task(
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
+        return False
+    # Lane-scoped DEFCON gate: under a lockdown only the profiles on the estop
+    # sentinel's allowlist may start work, and under a bare pause (mode estop)
+    # nobody may. BOARD IS NOT A TERM — the same card is refused on every board,
+    # which is what makes this lane-scoped instead of a board exemption. Placed
+    # before every other guard so ``dry_run`` sees exactly the same decision, and
+    # recorded on the card as a ``skipped_lockdown`` event (not once per tick,
+    # see :func:`_record_lockdown_events`) because a silent non-spawn is a defect.
+    if not _lane_admitted(estop_state, assignee, board):
+        result.skipped_lockdown.append((task_id, assignee))
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
@@ -2253,20 +2273,72 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+_ESTOP_IMPORT_WARNED = False
+
+
+def _estop_module():
+    """``agent.estop``, or None when it cannot be imported — logged once, FAIL-OPEN.
+
+    Deliberately fail-open: an import error in the gate must never halt the fleet's dispatch
+    (the shipped cron/turn readers take the same view), but it must never be silent either —
+    the operator has to know the gate is not in force.
+    """
+    global _ESTOP_IMPORT_WARNED
+    try:
+        from agent import estop  # noqa: PLC0415 - optional-runtime import, guarded by design
+        return estop
+    except Exception as exc:  # pragma: no cover - import guard
+        if not _ESTOP_IMPORT_WARNED:
+            _ESTOP_IMPORT_WARNED = True
+            logger.error(
+                "kanban dispatch: agent.estop is unavailable (%s) — the lane-scoped DEFCON "
+                "gate is NOT in force this tick", exc,
+            )
+        return None
+
+
+def _estop_state_for_tick() -> Optional[Any]:
+    """The tick's ONE estop read, or None when the gate is unavailable (fail-open).
+
+    Read once and threaded down through every lane decision so one tick can never see two
+    different modes (a re-arm landing mid-tick must not half-gate the board).
+    """
+    estop = _estop_module()
+    if estop is None:
+        return None
+    try:
+        return estop.read_state()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("kanban dispatch: could not read the ESTOP sentinel (%s)", exc)
+        return None
+
+
+def _lane_admitted(estop_state: Optional[Any], assignee: str, board: Optional[str]) -> bool:
+    """May this LANE start work under the tick's estop state? True when no gate is in force."""
+    if estop_state is None:
+        return True
+    estop = _estop_module()
+    if estop is None:
+        return True
+    return bool(estop.work_admitted(assignee, board=board, state=estop_state))
+
+
 def _any_spawnable_review(
     conn: sqlite3.Connection,
     review_rows: list[sqlite3.Row],
     *,
     per_profile_cap: Optional[int] = None,
     per_profile_running: Optional[dict[str, int]] = None,
+    estop_state: Optional[Any] = None,
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
     Unavailable profile metadata retains the historic fail-open behavior. A
     review row that :func:`_dispatch_lane_task` would refuse this tick — its
-    assignee already at the per-profile cap, or respawn-guarded — cannot
-    consume the reservation, so it must not withhold capacity from an
-    otherwise ready task (one such row would pin ``ready_budget`` to 0).
+    assignee already at the per-profile cap, respawn-guarded, or held by a
+    lane-scoped DEFCON lockdown — cannot consume the reservation, so it must not
+    withhold capacity from an otherwise ready task (one such row would pin
+    ``ready_budget`` to 0).
     """
     if not review_rows:
         return False
@@ -2277,6 +2349,9 @@ def _any_spawnable_review(
         if not assignee:
             continue
         if profile_exists is not None and not profile_exists(assignee):
+            continue
+        # Board is deliberately None: it is not a term in the admission predicate, the LANE is.
+        if not _lane_admitted(estop_state, assignee, None):
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
@@ -2298,6 +2373,68 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
         if profile_exists is not None and not profile_exists(name):
             return None
     return name
+
+
+def _record_lockdown_events(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    estop_state: Optional[Any],
+    *,
+    dry_run: bool,
+    board: Optional[str],
+) -> None:
+    """Record ONE ``skipped_lockdown`` event per held card per ENGAGEMENT.
+
+    Visibility is the requirement: a card a lane-scoped stop refused must say so ON THE CARD,
+    naming the profile, because a silent non-spawn is the defect this replaces. The dispatcher
+    refuses the same card on every tick, so the dedupe key is the sentinel's engagement
+    identity (``mtime_ns:size`` of the body): a re-arm earns a fresh row, a long hold does not
+    become a firehose. The newest such event per card is read in ONE query for the whole tick,
+    never one query per held card.
+
+    ``dry_run`` writes nothing — the bucket still fills, so a dry run reports the same
+    decision without touching the board.
+    """
+    if dry_run or estop_state is None or not result.skipped_lockdown:
+        return
+    estop = _estop_module()
+    if estop is None:
+        return
+    task_ids = sorted({task_id for task_id, _profile in result.skipped_lockdown})
+    placeholders = ", ".join("?" for _ in task_ids)
+    newest: dict[str, dict] = {}
+    # ASC + overwrite keeps the NEWEST row per card in one pass over the whole tick's set.
+    for row in conn.execute(
+        "SELECT task_id, payload FROM task_events "
+        f"WHERE kind = 'skipped_lockdown' AND task_id IN ({placeholders}) "
+        "ORDER BY id ASC",
+        task_ids,
+    ):
+        data = _kb._json_or(row["payload"], {})
+        if isinstance(data, dict):
+            newest[row["task_id"]] = data
+    engagement = estop.engagement_key()
+    reasons = [hold.get("reason") for hold in estop_state.holds if hold.get("reason")]
+    common = {
+        "engagement": engagement,
+        "mode": estop_state.mode,
+        "board": board,
+        "owners": sorted(estop_state.owners),
+        "allow_profiles": sorted(estop_state.allow_profiles),
+        "reason": reasons[-1] if reasons else None,
+    }
+    with _kb.write_txn(conn):
+        for task_id, profile in result.skipped_lockdown:
+            last = newest.get(task_id)
+            if (
+                isinstance(last, dict)
+                and last.get("engagement") == engagement
+                and last.get("profile") == profile
+            ):
+                continue
+            _kb._append_event(
+                conn, task_id, "skipped_lockdown", dict(common, profile=profile),
+            )
 
 
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
@@ -2324,6 +2461,8 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    # The lane gate for THIS tick: one read, threaded into every decision below.
+    estop_state = _estop_state_for_tick()
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
@@ -2366,12 +2505,14 @@ def _dispatch_once_locked(
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        estop_state=estop_state,
     ):
         ready_budget = max(spawn_budget - 1, 0)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        estop_state=estop_state,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2404,6 +2545,7 @@ def _dispatch_once_locked(
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
+    _record_lockdown_events(conn, result, estop_state, dry_run=dry_run, board=board)
     return result
 
 

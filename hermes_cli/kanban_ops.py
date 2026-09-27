@@ -105,6 +105,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_lockdown": [
+                {"task_id": tid, "assignee": who}
+                for (tid, who) in res.skipped_lockdown
+            ],
             "auto_assigned_default": res.auto_assigned_default,
             "respawn_guarded": [
                 {"task_id": tid, "reason": reason}
@@ -139,6 +143,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    if res.skipped_lockdown:
+        # Named, not counted: a lane-starved card is the operator's whole visibility into
+        # which profile the stop is holding back.
+        held = ", ".join(f"{tid} ({who})" for tid, who in res.skipped_lockdown)
+        print(f"Skipped (lane held by the emergency stop): {held}")
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
     if res.skipped_nonspawnable:

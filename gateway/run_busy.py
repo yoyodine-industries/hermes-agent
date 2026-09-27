@@ -973,9 +973,19 @@ class GatewayBusySessionMixin:
         from agent import estop
         args = (event.get_command_args() or "").strip()
         if args.lower() in {"off", "resume", "stop", "disengage"}:
-            if estop.disengage():
+            # Releases THIS holder's holds only, and never claims a resume while a co-holder's
+            # scope is still live — the fleet is not resumed just because ours is gone.
+            result = estop.release()
+            if result.released:
+                if result.remaining:
+                    return (
+                        f"▶️ Your hold is released, but the fleet is still held by "
+                        f"{', '.join(result.remaining_owners)} — that scope stands."
+                    )
                 return "▶️ Resumed — new work is accepted again."
-            return "Hermes wasn't paused."
+            if result.stale:
+                return f"⛔ {result.message}"
+            return f"Hermes wasn't paused ({result.message})."
         state = estop.get_state()
         if state is not None and not args:
             suffix = f" (reason: {state.get('reason')})" if state.get("reason") else ""

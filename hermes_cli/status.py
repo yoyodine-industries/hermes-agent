@@ -90,23 +90,41 @@ def _effective_provider_label() -> str:
 
 
 def _estop_status_line():
-    """One-line pause banner for `hermes status`, or None when not paused."""
+    """The emergency-stop banner for `hermes status`, or None when nothing holds.
+
+    Renders the EFFECTIVE state, not one hold: the scope (a total hold wins over any number
+    of lockdowns), how many holds are live and who owns them, which lanes a lockdown admits,
+    the union turn allowlist, the earliest deadman, and any fail-SAFE read defect — an
+    unreadable sentinel is a total halt, and the operator must be able to see that it is not
+    a deliberate one.
+    """
     try:
-        from agent.estop import get_state
+        from agent.estop import read_state
     except ImportError:
         return None
-    state = get_state()
-    if state is None:
+    try:
+        state = read_state()
+    except Exception:  # pragma: no cover - defensive
         return None
-    detail = f" — reason: {state['reason']}" if state.get("reason") else ""
-    if state.get("expires_at"):
-        detail += f"; auto-resumes {state['expires_at']} (deadman TTL)"
-    allow = state.get("allow") or {}
-    who = list(allow.get("user_ids") or []) + [
-        f"profile:{name}" for name in (allow.get("profiles") or [])]
-    if who:
-        detail += f"; allowed through: {', '.join(who)}"
-    return f"⏸️  PAUSED (global emergency stop{detail}; `hermes resume` to lift)"
+    if not state.engaged:
+        return None
+    if state.total:
+        detail = " — TOTAL halt, no exemptions"
+    else:
+        lanes = ", ".join(sorted(state.allow_profiles)) or "(none)"
+        detail = f" — lockdown, lanes admitted: {lanes}"
+    reason = next((hold.get("reason") for hold in state.holds if hold.get("reason")), None)
+    if reason:
+        detail += f" — reason: {reason}"
+    detail += f"; holds: {len(state.holds)} [{', '.join(state.owners) or 'unknown'}]"
+    deadmen = sorted(hold["expires_at"] for hold in state.holds if hold.get("expires_at"))
+    if deadmen:
+        detail += f"; next deadman {deadmen[0]}"
+    if state.allow_user_ids:
+        detail += f"; users served: {', '.join(sorted(state.allow_user_ids))}"
+    if state.defect:
+        detail += f"; DEFECT: {state.defect}"
+    return f"⏸️  PAUSED (global emergency stop{detail}; `hermes resume` releases your hold)"
 
 
 # --- Data tables driving the per-section renderers -------------------------

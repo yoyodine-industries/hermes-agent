@@ -285,6 +285,31 @@ def fire_overdue_jobs(
         if _estop_check_paused("cron-misfire", logger):
             return 0
 
+    # A LOCKDOWN is not a halt here either — but this sweep force-FIRES overdue jobs, so it
+    # is gated per LANE, not skipped wholesale. The sweep only ever reads the store of the
+    # profile this process serves (``load_jobs()`` below), so ONE lane decision covers it: a
+    # held lane's overdue jobs stay overdue for a sweep after the lift instead of being
+    # fired through a stop that holds them.
+    with contextlib.suppress(ImportError):
+        from agent.estop import read_state as _estop_read_state
+        from agent.estop import work_admitted as _estop_work_admitted
+        from cron.scheduler_tick import _lockdown_report_once, _tick_lane
+
+        _estop_state = _estop_read_state()
+        if _estop_state.engaged and not _estop_state.total:
+            _lane = _tick_lane()
+            if not _estop_work_admitted(_lane, state=_estop_state):
+                from agent.estop import engagement_key as _estop_engagement_key
+
+                _lockdown_report_once(
+                    "cron-misfire", _estop_engagement_key(), logger,
+                    "Misfire sweep held by the lane-scoped lockdown — profile '%s' is not on "
+                    "the allowlist (admitted: %s); overdue jobs stay due until it lifts",
+                    _lane or "(unresolved)",
+                    ", ".join(sorted(_estop_state.allow_profiles)) or "(none)",
+                )
+                return 0
+
     from datetime import datetime
 
     if isinstance(provider, InProcessCronScheduler):
