@@ -9,13 +9,20 @@ process and ``status``/``start`` report false positives.
 
 from __future__ import annotations
 
+import base64
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from gateway.status import (
     gateway_spawn_intent_subcommand as spawn_intent,
+    inline_bootstrap_argv,
     looks_like_gateway_command_line as matches,
     looks_like_gateway_runtime_command_line as matches_runtime,
 )
+from hermes_cli import _launchers, venv_sync
+from hermes_cli.update_cmd_windows import _hermes_holder_subcommand
 
 
 ACCEPT = [
@@ -163,5 +170,101 @@ ATOMIC_DESKTOP = (
 def test_accepts_atomic_desktop_gateway():
     assert matches(ATOMIC_DESKTOP) is True
     assert matches_runtime(ATOMIC_DESKTOP) is True
+
+
+# ---------------------------------------------------------------------------
+# Hermes' OWN inline bootstraps are the exception to #107002 (#124318)
+# ---------------------------------------------------------------------------
+# The store launcher (``_launchers.runtime_command``, also the Windows updater's relaunch), the
+# published launcher script (POSIX shell launcher and the Windows ``.cmd`` base64 wrapper) and the
+# ``venv_sync`` re-entry all run ``python -I -c <source> …`` with the entry point IN that process,
+# so their argv IS the process's identity. Readers hand the matcher different strings: ``/proc``,
+# psutil and ``ps`` space-join argv (the source splits across tokens), Windows CIM reports the
+# CreateProcess line (``list2cmdline``).
+
+ROOT = Path("/opt/Hermes Agent/hermes-agent")
+PY = "/opt/venv/bin/python3"
+_LAUNCHER_SCRIPT = _launchers._launcher_script("hermes", ROOT, None)
+_JOINS = {"space-joined": " ".join, "windows": subprocess.list2cmdline}
+
+
+def _forms(argv: list[str]) -> dict[str, list[str]]:
+    return {
+        "store-launcher": _launchers.runtime_command(ROOT, argv, python=Path(PY)),
+        "launcher-script": [PY, "-I", "-c", _LAUNCHER_SCRIPT, *argv],
+        "cmd-launcher": [
+            PY,
+            "-I",
+            "-c",
+            f"import base64; exec(base64.b64decode('{base64.b64encode(_LAUNCHER_SCRIPT.encode()).decode()}'))",
+            *argv,
+        ],
+        "venv-reentry": venv_sync.relaunch_command(
+            Path(PY),
+            ROOT,
+            [str(ROOT / "hermes_cli" / "main.py"), *argv],
+            ["/old/python", "-m", "hermes_cli.main", *argv],
+            "hermes_cli.main",
+        ),
+    }
+
+
+@pytest.mark.parametrize("join", _JOINS)
+@pytest.mark.parametrize("form", _forms([]))
+def test_accepts_gateway_behind_hermes_own_inline_bootstrap(form: str, join: str) -> None:
+    cmd = _JOINS[join]([str(t) for t in _forms(["gateway", "run", "--replace"])[form]])
+    assert matches(cmd) is True
+    assert matches_runtime(cmd) is True
+    assert _hermes_holder_subcommand(cmd) == "gateway"
+
+
+# The shape the LaunchDaemon gateway actually runs today (macOS, measured on a live pid): the
+# interpreter with ``-I``, ``-c`` and venv_sync's re-entry source carrying the argv INSIDE it —
+# there is no trailing argv to read.
+LIVE_SHIM: str = " ".join([
+    PY,
+    "-I",
+    "-c",
+    "import sys, runpy; sys.path.insert(0, '/opt/Hermes Agent/hermes-agent'); "
+    "sys.argv = ['/opt/Hermes Agent/hermes-agent/hermes_cli/main.py', 'gateway', 'run', '--replace']; "
+    "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)",
+])
+
+
+def test_accepts_the_live_venv_sync_shim_cmdline() -> None:
+    assert matches(LIVE_SHIM) is True
+    assert matches_runtime(LIVE_SHIM) is True
+    assert _hermes_holder_subcommand(LIVE_SHIM) == "gateway"
+    assert inline_bootstrap_argv(LIVE_SHIM.split()) == [
+        PY, "-m", "hermes_cli.main", "gateway", "run", "--replace",
+    ]
+
+
+INLINE_BOOTSTRAP_NEGATIVE = [
+    # The detached restart watcher CARRIES a gateway command it spawns LATER (#107002): identity
+    # must not be read off data. Same for a program whose source merely mentions a gateway.
+    ('python -c "import os, sys, time; pid = int(sys.argv[1])" 40688 python -m hermes_cli.main gateway run', None),
+    ("python -c \"print('hermes gateway run')\"", None),
+    # Prose, not a command line.
+    ('git commit -m "hermes gateway restart"', None),
+    # A real (non-run) gateway invocation is a holder, never a gateway RUNTIME.
+    ("python -m hermes_cli.main gateway status", "gateway"),
+]
+
+
+@pytest.mark.parametrize("cmd, holder", INLINE_BOOTSTRAP_NEGATIVE)
+def test_inline_bootstrap_recognition_does_not_widen(cmd: str, holder) -> None:
+    assert matches(cmd) is False
+    assert matches_runtime(cmd) is False
+    assert _hermes_holder_subcommand(cmd) == holder
+
+
+@pytest.mark.parametrize("join", _JOINS)
+def test_inline_bootstrap_argv_is_identity_only_for_the_process_running_it(join: str) -> None:
+    store = [str(t) for t in _launchers.runtime_command(ROOT, ["gateway", "run"], python=Path(PY))]
+    chat = _JOINS[join]([str(t) for t in _launchers.runtime_command(ROOT, ["chat"], python=Path(PY))])
+    watcher = _JOINS[join]([PY, "-c", "import os, sys, time\npid = int(sys.argv[1])\n", "1234", *store])
+    assert matches(chat) is False and _hermes_holder_subcommand(chat) == "chat"
+    assert matches(watcher) is False and _hermes_holder_subcommand(watcher) is None
 
 

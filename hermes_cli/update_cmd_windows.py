@@ -240,6 +240,15 @@ def _hermes_holder_subcommand(cmdline: str) -> str | None:
         tokens = shlex.split(cmdline, posix=False)
     except Exception:
         tokens = cmdline.split()
+    # ``python -c <src> … -m hermes_cli.main <subcommand>``: the entry token belongs to the argv the
+    # inline source carries for a LATER spawn, not to this holder (#107002) -- unless the source is a
+    # Hermes bootstrap running the entry point in this process (#124318).
+    from gateway.status import command_line_runs_inline_source, inline_bootstrap_argv
+    normalized = [t.strip('"').replace("\\", "/") for t in tokens]
+    if command_line_runs_inline_source(normalized):
+        tokens = inline_bootstrap_argv(normalized)
+        if tokens is None:
+            return None
 
     def _is_entry(i: int, token: str) -> bool:
         low = token.lower().strip('"')
@@ -248,11 +257,6 @@ def _hermes_holder_subcommand(cmdline: str) -> str | None:
 
     entry_idx = next((i for i, token in enumerate(tokens) if _is_entry(i, token)), None)
     if entry_idx is None:
-        return None
-    # ``python -c <src> … -m hermes_cli.main <subcommand>``: the entry token belongs to the argv the
-    # inline source carries for a LATER spawn, not to this holder (#107002).
-    from gateway.status import command_line_runs_inline_source
-    if command_line_runs_inline_source([t.strip('"').replace("\\", "/") for t in tokens]):
         return None
     value_flags = _holder_value_flags()
     i = entry_idx + 1
