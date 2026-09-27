@@ -559,9 +559,21 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     real dispatcher accounting, ``consecutive_failures`` stays put, the breaker
     never parks the card as a bare ``blocked``, the run is tagged
     ``infrastructure`` and the guard spaces the retries. A control spawn
-    failure on the same card still counts."""
+    failure on the same card still counts.
+
+    The refusing topology is STATED, not inherited, on every host: the refusal
+    lives behind ``tools/process_registry._IS_LINUX`` (only a managed systemd
+    gateway can be unable to create a user scope), so on macOS the helper
+    returns ``mode="in_process"`` before the probe, ``_restart_safe_worker_argv``
+    hands the argv back, and the fall-through to the control path reads as a
+    CHARGED card — the test failing on a host fact it never claimed to test.
+    Pinning the host gate beside the ``INVOCATION_ID``/supervision/probe patches
+    keeps the real verdict and the real accounting exercised (and asserted) on
+    every host instead of skipping off the non-Linux ones.
+    """
     import tools.process_registry as process_registry
 
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
