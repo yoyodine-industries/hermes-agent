@@ -165,9 +165,15 @@ hermes kanban --board atm10-server create "Restart ATM server" --assignee ops
 # Change which board is "current" for subsequent calls.
 hermes kanban boards switch atm10-server
 hermes kanban boards show             # who's active right now?
+hermes kanban boards show atm10-server --json   # any board, machine-readable
 
 # Rename the display name (the slug is immutable — it's the directory name).
 hermes kanban boards rename atm10-server "ATM10 (Prod)"
+
+# Give the board a card-priority policy (see "Board priority policy"), or clear it.
+hermes kanban boards set-priority-policy atm10-server \
+    --module ~/policies/priority_bands.py --function band_birth
+hermes kanban boards set-priority-policy atm10-server   # no --module = clear
 
 # Archive (default) — moves the board's dir to boards/_archived/<slug>-<ts>/.
 # Recoverable by moving the dir back.
@@ -190,6 +196,62 @@ Slugs are validated: lowercase alphanumerics + hyphens + underscores, 1-64
 chars, must start with alphanumeric. Uppercase input is auto-downcased.
 Anything else (slashes, spaces, dots, `..`) is rejected at the CLI layer
 so path-traversal tricks can't name a board.
+
+### Board priority policy (`priority_policy`)
+
+A card's priority is decided **at birth**. The board's policy runs inside the task
+INSERT, so a row never exists outside its band and no filing surface can put one there
+afterwards: the tool verbs, the CLI, a triage decomposer and another lane's agent all
+reach that one INSERT. A policy wired anywhere else is a policy that can be walked
+around, and re-prioritising after the fact means every reader sees the wrong value until
+something sweeps the board and re-derives what the right one was.
+
+The numbers live on the board, not in the kernel. `board.json` names a module:
+
+```json
+{
+  "slug": "ops",
+  "priority_policy": {"module": "/abs/path/priority_bands.py", "function": "band_birth"}
+}
+```
+
+The callable is invoked as `fn(requested, assignee, board, title, body)` and returns a
+record. `applied` is the value the card is stored with. The record is attached VERBATIM
+to the `created` event under `priority_policy`, and only when the value actually moved —
+so extra keys a policy returns (`tier`, `qualification`, whichever provenance it wants to
+leave) are recorded with the card, and a card the policy left alone keeps the event shape
+it has always had.
+
+Set it with `hermes kanban boards set-priority-policy <slug> --module <abs .py>
+[--function <name>]`, read it back with `hermes kanban boards show <slug> [--json]`. The
+module must be an absolute path to a `.py` file — a path is read from disk on each
+filing, so an edited or redeployed policy takes effect without restarting whatever filed
+the card, and a relative path would resolve against whichever working directory the filer
+happened to have. The CLI loads the module before writing it, so a typo is refused once
+at wiring time instead of quietly disabling banding on that board afterwards.
+
+A board with no `priority_policy` key does nothing at all: the caller's `--priority` is
+stored byte for byte, the module is never loaded, and the `created` event carries no
+`priority_policy` key.
+
+Failure is **open**, and visible. A policy that is configured but unusable — the file is
+gone, it raises on import, the named function is missing, the call raises, or the record
+carries no usable `applied` — never fails the filing: the card keeps the priority its
+filer asked for, one warning naming the module is logged per process, and the `created`
+event carries `{"status": "unavailable", "policy": "<module>:<function>", "error": "..."}`. A configured-but-broken policy
+is a wiring mistake the operator has to see, while a policy that is simply not configured
+is a legitimate state, not an error — so the two are recorded differently and neither one
+can stop a card from being filed. The kill switch is clearing the key (one write); rows
+already stored keep their values.
+
+The policy is host-local code, loaded and called in process: no subprocess and no sandbox.
+That is a trade made deliberately — it is code the operator wired, and a filing is on the
+hot path of every lane.
+
+The policy decides birth, not edits. `hermes kanban edit --priority` and the dashboard's
+priority field write what they are asked for: a band table's own re-balancing pass moves
+existing cards on purpose, and policing the write path there would fight it. Re-checking
+a card's band after the fact is that pass's job, not the birth seam's.
 
 ### Managing boards from the dashboard
 
@@ -1391,7 +1453,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 | Kind | Payload | When |
 |---|---|---|
-| `created` | `{assignee, status, parents, tenant}` | Task inserted. `run_id` is `NULL`. |
+| `created` | `{assignee, status, parents, tenant, priority_policy?}` | Task inserted. `run_id` is `NULL`. `priority_policy` appears only when the board's policy MOVED the value, and carries that policy's own record verbatim — the band the card was born in, with whatever provenance the policy returns. An unusable configured policy records `{"status": "unavailable", "policy": "<module>:<function>", "error": "..."}` there instead. |
 | `promoted` | — | `todo → ready` because all parents hit `done`. `run_id` is `NULL`. |
 | `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |

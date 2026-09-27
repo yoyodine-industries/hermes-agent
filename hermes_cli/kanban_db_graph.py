@@ -181,7 +181,8 @@ def _insert_decomposed_child(
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
     """
     from hermes_cli.kanban_db import (
-        _new_task_id, _canonical_assignee, _append_event,
+        _new_task_id, _canonical_assignee, _append_event, _apply_board_priority_policy,
+        board_for_connection,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
@@ -196,19 +197,37 @@ def _insert_decomposed_child(
         child_ws_path = None
     new_id = _new_task_id()
     body = child.get("body")
+    child_assignee = _canonical_assignee(child.get("assignee"))
+    # THE SECOND WRITER. A decomposed child is born here rather than through
+    # ``create_task``, so the board's policy has to be reached from THIS insert too: wired
+    # into one writer only, a fan-out would put every child on the board outside its band
+    # while the root's own card looked correctly banded. The board is resolved from THIS
+    # connection - a caller holding a ``--board`` override is not on the current board,
+    # and reading the ambient one would band the children by somebody else's table. The
+    # policy sees the fan-out as of this transaction's start, which is what the caller
+    # already exposed.
+    priority, policy_provenance = _apply_board_priority_policy(
+        0, assignee=child_assignee, board=board_for_connection(conn),
+        title=child["title"].strip(), body=body if isinstance(body, str) else None,
+    )
     conn.execute(
         "INSERT INTO tasks "
-        "(id, title, body, assignee, status, workspace_kind, "
+        "(id, title, body, assignee, status, priority, workspace_kind, "
         " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
+            child_assignee, priority, child_ws_kind, child_ws_path,
             root_row["tenant"], now, (author or "decomposer"),
         ),
     )
     _append_event(
-        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
+        conn, new_id, "created",
+        {
+            "by": author or "decomposer",
+            "from_decompose_of": root_id,
+            **({"priority_policy": policy_provenance} if policy_provenance else {}),
+        },
     )
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
     return new_id

@@ -122,15 +122,53 @@ def _cmd_boards_switch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _describe_priority_policy(spec: Optional[dict]) -> str:
+    if not spec:
+        return "none (cards keep the priority their filer asks for)"
+    return f"{spec['module']} :: {spec['function']}()"
+
+
 def _cmd_boards_show(args: argparse.Namespace) -> int:
-    current = kb.get_current_board()
-    meta = kb.read_board_metadata(current)
-    counts = _board_task_counts(current)
-    print(f"Current board: {current}\n  Display name: {meta.get('name', '')}")
+    # ``show`` takes an optional slug and defaults to the current board, which is what the
+    # ``boards current`` alias has always meant.
+    args.slug = args.slug or kb.get_current_board()
+    normed, rc = _board_slug_arg(args, "show", must_exist=True)
+    if rc:
+        return rc
+    slug = str(normed)
+    meta = kb.read_board_metadata(slug)
+    counts = _board_task_counts(slug)
+    try:
+        policy = kb.board_priority_policy(slug)
+    except Exception as exc:
+        # Reportable, not fatal: a malformed spec is exactly what a reader needs to see,
+        # and ``create_task`` is where it refuses cards.
+        policy = None
+        malformed = str(exc)
+    else:
+        malformed = ""
+    if _json_out(args, {
+        "slug": slug,
+        "name": meta.get("name", ""),
+        "description": meta.get("description", ""),
+        "db_path": meta["db_path"],
+        "counts": counts,
+        "tasks": sum(counts.values()),
+        "priority_policy": policy,
+        "priority_policy_error": malformed or None,
+    }):
+        return 0
+    print(f"Board: {slug}" + ("  (current)" if slug == kb.get_current_board() else ""))
+    print(f"  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}\n"
           f"  Tasks:        {sum(counts.values())} total" + (f" ({_fmt_counts(counts)})" if counts else ""))
+    if malformed:
+        print("  Priority policy: CONFIGURED BUT UNUSABLE - filings on this board fail:")
+        print(f"    {malformed}")
+    else:
+        print(f"  Priority policy: {_describe_priority_policy(policy)}")
     return 0
 
 
@@ -152,6 +190,34 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_set_priority_policy(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-priority-policy", must_exist=True)
+    if rc:
+        return rc
+    from hermes_cli import kanban_priority_policy as kpp
+
+    if not args.module:
+        kb.write_board_metadata(normed, priority_policy="")
+        print(f"Board {normed!r} priority policy cleared.\n"
+              f"  Cards keep the priority their filer asks for.")
+        return 0
+    spec = {"module": args.module, "function": args.function or kpp.DEFAULT_FUNCTION}
+    try:
+        # Validate by LOADING it: the CLI runs where the wiring is being written, so a
+        # typo'd path or a missing callable is refused here, once, instead of failing
+        # every filing on the board afterwards. Nothing is written on refusal.
+        normalised = kpp.normalize_spec(spec) or spec
+        kpp.load_callable(normalised)
+    except kpp.PolicyError as exc:
+        return _err(f"kanban boards set-priority-policy: {exc} — nothing written", 2)
+    kb.write_board_metadata(normed, priority_policy=normalised)
+    print(f"Board {normed!r} priority policy set to "
+          f"{normalised['module']} :: {normalised['function']}().\n"
+          f"  Cards filed on this board are born in the band it assigns them; a policy "
+          f"that cannot be used fails the filing rather than landing an unbanned card.")
     return 0
 
 
@@ -209,6 +275,7 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-priority-policy": _cmd_boards_set_priority_policy,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

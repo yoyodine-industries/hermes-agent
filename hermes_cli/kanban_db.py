@@ -580,14 +580,55 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     return meta
 
 
+def board_priority_policy(board: Optional[str] = None) -> Optional[dict]:
+    """The normalised ``priority_policy`` for ``board``, or ``None`` when it has none.
+
+    The read-only half of the birth seam: what a policy's spec actually resolves to,
+    validated exactly as ``create_task`` validates it, so a caller can report or assert
+    a board's wiring without filing a card. Raises ``PolicyError`` for a configured but
+    unusable spec - the same refusal a filing would get.
+    """
+    from hermes_cli import kanban_priority_policy as policy
+
+    raw = read_board_metadata(board if board else get_current_board()).get(policy.POLICY_KEY)
+    return policy.normalize_spec(raw)
+
+
+def board_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """The slug of the board ``conn`` is open against, or ``None`` when it cannot be told.
+
+    A filing must be banded by the board its OWN connection belongs to: a caller holding
+    a ``--board`` override is not on ``get_current_board()``, and ``HERMES_KANBAN_DB`` can
+    pin a database no board claims (workers are spawned with exactly that). So the slug is
+    read off the open file's path, never off the ambient current board.
+    """
+    path = ""
+    for _seq, name, file in conn.execute("PRAGMA database_list"):
+        if name == "main" and file:
+            path = file
+    if not path:
+        return None
+    try:
+        resolved = Path(path).resolve()
+        if resolved == (kanban_home() / "kanban.db").resolve():
+            return DEFAULT_BOARD
+        rel = resolved.relative_to(boards_root().resolve())
+    except (OSError, ValueError):
+        return None
+    return rel.parts[0] if len(rel.parts) > 1 else None
+
+
 def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+    priority_policy: Optional[Any] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
+    "" = clear (``project_id`` is not validated here). ``priority_policy``: ``None`` =
+    unchanged, "" = clear, else the spec stored as given (validated on the read side, by
+    ``kanban_priority_policy.normalize_spec``)."""
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
     meta = read_board_metadata(slug)
@@ -603,6 +644,16 @@ def write_board_metadata(
     for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
         if value is not None:
             meta[key] = str(value) if value else None
+    if priority_policy is not None:
+        from hermes_cli import kanban_priority_policy as _policy
+
+        # A spec is an object, so it cannot ride the string-coercing loop above, and a
+        # clear removes the key outright rather than leaving a null behind: an unwired
+        # board.json must read exactly as it did before anything was set.
+        if priority_policy:
+            meta[_policy.POLICY_KEY] = priority_policy
+        else:
+            meta.pop(_policy.POLICY_KEY, None)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -1331,6 +1382,17 @@ def create_task(
         if row:
             return row["id"]
 
+    # THE BIRTH SEAM. A card's priority is a property of its routes, and the one moment at
+    # which that holds for EVERY filing surface - the tool verb, the CLI, a decomposer,
+    # another lane's agent - is the INSERT: they all reach it, so a board-scoped policy
+    # applied here cannot be routed around. The row does not exist yet, so no reader can
+    # ever see the unbanded value, and nothing has to re-derive what the right value was.
+    # With no ``priority_policy`` on the board this is inert: ``priority`` passes through
+    # untouched and the card carries exactly the event it carried before.
+    priority, policy_provenance = _apply_board_priority_policy(
+        priority, assignee=assignee, board=board, title=title, body=body,
+    )
+
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -1398,6 +1460,10 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        # The policy's own record, verbatim, and only on a card it moved:
+                        # an unchanged card and every board without a policy keep the
+                        # event payload they have always written.
+                        **({"priority_policy": policy_provenance} if policy_provenance else {}),
                     },
                 )
                 if task_status == "blocked":
@@ -1430,6 +1496,47 @@ def create_task(
 
 def _board_meta_for(board: Optional[str]) -> dict:
     return read_board_metadata(board if board else get_current_board())
+
+
+def _apply_board_priority_policy(
+    requested: int, *, assignee: Optional[str], board: Optional[str],
+    title: str, body: Optional[str],
+) -> tuple[int, Optional[dict]]:
+    """``(priority, provenance)`` for a card being created, policy applied at birth.
+
+    ``provenance`` is ``None`` - and ``requested`` comes back unchanged - when the board
+    carries no ``priority_policy``, which is what keeps this seam inert for every board
+    that never opted in. When a policy IS configured it decides the stored value, and the
+    policy's own record rides back for the ``created`` event, so a banding decision can be
+    read back off the card.
+
+    Nothing here may fail a filing. The policy is consulted through
+    ``kanban_priority_policy.priority_for_create``, which answers an unusable policy with
+    the caller's value plus an ``unavailable`` record instead of an exception: a broken
+    policy must be VISIBLE, not fatal. The numbers (lane ordering, the band table, the
+    clauses) belong to the policy module; this module owns the moment and the seam.
+    """
+    from hermes_cli import kanban_priority_policy as policy
+
+    try:
+        spec = _board_meta_for(board).get(policy.POLICY_KEY)
+    except Exception:
+        # A board whose metadata cannot be read has no policy to honour; the
+        # ``project_id``/``default_workdir`` reads below degrade the same way.
+        return requested, None
+    if spec is None:
+        return requested, None
+    verdict = policy.priority_for_create(
+        requested,
+        assignee=assignee or "",
+        board=board or get_current_board(),
+        title=title,
+        body=body or "",
+        spec=spec,
+    )
+    if verdict is None:
+        return requested, None
+    return verdict.applied, verdict.record
 
 
 def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -> Optional[str]:

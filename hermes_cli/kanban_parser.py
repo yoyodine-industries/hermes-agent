@@ -115,13 +115,24 @@ _BOARD_SPECS = [
                   "Default is to move it to boards/_archived/ so it's recoverable."),
     ], aliases=["remove", "delete"], help="Archive (default) or delete a board"),
     _cmd("switch", [_SLUG], aliases=["use"], help="Set the active board for subsequent CLI calls"),
-    _cmd("show", aliases=["current"], help="Print the currently-active board slug"),
+    _cmd("show", [
+        _arg("slug", nargs="?", help="Board to show (default: the current board)"),
+        _json_flag(help="Emit one JSON object instead of the human block"),
+    ], aliases=["current"], help="Show a board's metadata, task counts and priority policy"),
     _cmd("rename", [_SLUG, _arg("name", help="New display name")],
          help="Change a board's human-readable display name (slug is immutable)"),
     _cmd("set-default-workdir", [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-priority-policy", [
+        _SLUG,
+        _arg("--module", help="Absolute path to the .py module that owns this board's "
+                              "priority policy"),
+        _arg("--function", help="Callable in that module, invoked as "
+                                "(requested, assignee, board, title, body). "
+                                "Omit for the default."),
+    ], help="Set (or clear, by omitting --module) the board's card-priority policy"),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
