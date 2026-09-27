@@ -167,13 +167,20 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
     ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
+    skipped_per_profile_capped=3, skipped_nonspawnable=12, skipped_unassigned=1,
+    lockdown=2 (research-sme x2), memory_pressure=critical`` — the respawn-guard
+    reasons counted per task plus EVERY tick-level hold. Feeds the "dispatcher
+    stuck" warnings of the CLI daemon and the embedded gateway dispatcher, which
+    otherwise report a bare zero-spawn count while ``hermes kanban tail`` is the
+    only place the guard reason is written (#111910).
+
+    Naming every hold matters more than brevity: a line reading ``active_pr=3``
+    while 400 ready rows sit in ``skipped_per_profile_capped`` — or 12 in
+    ``skipped_nonspawnable`` — is not a report. It is how a starved board and a
+    correctly idle one came to read the same (2026-09-26).
     """
     counts: dict[str, int] = {}
+    held_lanes: dict[str, int] = {}
     pressure: Optional[str] = None
     for res in results:
         if res is None:
@@ -184,9 +191,26 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        for bucket, bucket_rows in (
+            ("skipped_per_profile_capped", res.skipped_per_profile_capped),
+            ("skipped_nonspawnable", res.skipped_nonspawnable),
+            ("skipped_unassigned", res.skipped_unassigned),
+        ):
+            if bucket_rows:
+                counts[bucket] = counts.get(bucket, 0) + len(bucket_rows)
+        for _task_id, who in res.skipped_lockdown:
+            lane = str(who or "").strip() or "(unassigned)"
+            held_lanes[lane] = held_lanes.get(lane, 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    if held_lanes:
+        # The lane-scoped DEFCON gate is a POLICY hold, not a fault: without this the
+        # "dispatcher stuck" line for a fully-held tick reads like an idle queue and
+        # sends the reader to profile health instead of the stop (v3 §6.4a). The
+        # per-card record is the ``skipped_lockdown`` task event.
+        named = ", ".join(f"{lane} x{n}" for lane, n in sorted(held_lanes.items()))
+        parts.append(f"lockdown={sum(held_lanes.values())} ({named})")
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
