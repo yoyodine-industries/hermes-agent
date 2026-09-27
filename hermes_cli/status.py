@@ -89,17 +89,23 @@ def _effective_provider_label() -> str:
     return provider_label(effective)
 
 
+# Fallback wording for the held-card clause when the census module cannot be imported AT ALL.
+# Kept in step with ``hermes_cli.kanban_holds.UNREADABLE``: a broken census must not borrow the
+# reading "nothing is held" (v3 §6.9).
+_HELD_CARDS_UNREADABLE = "held cards: unreadable"
+
+
 def _estop_status_line():
     """The emergency-stop banner for `hermes status`, or None when nothing holds.
 
     Renders the EFFECTIVE state, not one hold: the scope (a total hold wins over any number
     of lockdowns), how many holds are live and who owns them, which lanes a lockdown admits,
-    the union turn allowlist, the earliest deadman, and any fail-SAFE read defect — an
-    unreadable sentinel is a total halt, and the operator must be able to see that it is not
-    a deliberate one.
+    the union turn allowlist, the earliest deadman, how many cards the stop is HOLDING, and
+    any fail-SAFE read defect — an unreadable sentinel is a total halt, and the operator must
+    be able to see that it is not a deliberate one.
     """
     try:
-        from agent.estop import read_state
+        from agent.estop import engagement_key, read_state
     except ImportError:
         return None
     try:
@@ -122,9 +128,30 @@ def _estop_status_line():
         detail += f"; next deadman {deadmen[0]}"
     if state.allow_user_ids:
         detail += f"; users served: {', '.join(sorted(state.allow_user_ids))}"
+    detail += _held_cards_detail(state, engagement_key)
     if state.defect:
         detail += f"; DEFECT: {state.defect}"
     return f"⏸️  PAUSED (global emergency stop{detail}; `hermes resume` releases your hold)"
+
+
+def _held_cards_detail(state, engagement_key) -> str:
+    """``; held cards: 3 (defcon: 2, ops: 1) — held lanes: yoyoflow x2`` (v3 §6.9).
+
+    The count is read from the boards' own ``skipped_lockdown`` task events under the CURRENT
+    engagement key, so it answers "how many cards does THIS stop hold" and not "how many events
+    has any stop ever written". Renderer and failure wording live in
+    :mod:`hermes_cli.kanban_holds`; the two surfaces that show it (this banner and the
+    ``hermes doctor`` row) share one clause so they cannot disagree.
+    """
+    try:
+        from hermes_cli.kanban_holds import census, clause
+    except Exception:
+        return f"; {_HELD_CARDS_UNREADABLE}"
+    try:
+        held = census(engagement=engagement_key())
+    except Exception:
+        return f"; {_HELD_CARDS_UNREADABLE}"
+    return "; " + clause(held, total_hold=bool(state.total))
 
 
 # --- Data tables driving the per-section renderers -------------------------
