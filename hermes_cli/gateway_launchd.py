@@ -6,6 +6,7 @@ intercepting the moved code.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import contextlib
 import json
@@ -28,15 +29,41 @@ def get_launchd_label() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
+# Every launchd location that can hold a Hermes gateway job, with the kind its plist loads as. ONE
+# table: gateway discovery, the dashboard/uninstall plist scans and system-daemon adoption all read it,
+# so a location can never be taught to one of them only.
+LAUNCHD_AGENT = "agent"
+LAUNCHD_DAEMON = "daemon"
+
+
+def launchd_plist_dirs() -> list[tuple[str, Path]]:
+    """``(kind, dir)`` for every launchd location that can supervise a Hermes gateway on this host."""
+    return [
+        (LAUNCHD_AGENT, Path.home() / "Library" / "LaunchAgents"),
+        (LAUNCHD_AGENT, Path("/Library/LaunchAgents")),
+        (LAUNCHD_DAEMON, Path("/Library/LaunchDaemons")),
+    ]
+
+
+def launchd_domains_for_kind(kind: str) -> tuple[str, ...]:
+    """The ``launchctl`` domains a plist of ``kind`` loads into, in probe order: a LaunchAgent is
+    per-user (``gui/<uid>`` with an Aqua session, else ``user/<uid>``), a root-owned LaunchDaemon is
+    machine-wide ``system``. Both LaunchAgents dirs are per-user domains, so they share ``agent``."""
+    if kind == LAUNCHD_DAEMON:
+        return ("system",)
+    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    return (f"gui/{uid}", f"user/{uid}")
+
+
 def _probe_launchd_domain_for_label(label: str) -> str:
     """Launchd domain managing ``label`` (uncached): ``gui/<uid>`` (Aqua), then ``user/<uid>``
-    (Background/SSH), else the ``launchctl managername`` heuristic. Sibling profiles may live in
-    different domains, so never reuse the cached ``_launchd_domain()`` for another label."""
-    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
-    gui_domain, user_domain = f"gui/{uid}", f"user/{uid}"
+    (Background/SSH), then ``system`` (a root-owned LaunchDaemon), else the ``launchctl managername``
+    heuristic. Sibling profiles may live in different domains, so never reuse the cached
+    ``_launchd_domain()`` for another label."""
+    gui_domain, user_domain = launchd_domains_for_kind(LAUNCHD_AGENT)
 
     launchctl_errors = (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError)
-    for domain in (gui_domain, user_domain):
+    for domain in (*launchd_domains_for_kind(LAUNCHD_AGENT), *launchd_domains_for_kind(LAUNCHD_DAEMON)):
         try:
             subprocess.run(["launchctl", "print", f"{domain}/{label}"], check=True, timeout=5, capture_output=True)
             return domain
@@ -592,6 +619,10 @@ def refresh_launchd_plist_if_needed() -> bool:
 
 
 def launchd_install(force: bool = False, *, start_now: bool = True):
+    job = _unowned_launchd_job()
+    if job is not None:
+        _acknowledge_unowned_launchd_supervision("install", job)
+        return
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
     # Loading the plist starts the gateway (RunAtLoad), so a no-start install writes it without
@@ -657,6 +688,9 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
 
 
 def launchd_uninstall():
+    job = _unowned_launchd_job()
+    if job is not None:
+        _refuse_unowned_launchd_management("uninstall", job)
     plist_path = _gw().get_launchd_plist_path()
     # Captured: uninstalling an already-unloaded job is fine — don't print Boot-out failed: 3.
     subprocess.run(
@@ -669,6 +703,10 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    job = _unowned_launchd_job()
+    if job is not None:
+        _acknowledge_unowned_launchd_supervision("start", job)
+        return
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
 
@@ -719,7 +757,301 @@ def _launchd_ok(message: str) -> None:
     _gw()._clear_launchd_unsupported_marker()
 
 
+# ── A job launchd owns but this install does not ──────────────────────────────
+# A gateway can be supervised from a plist this install never wrote: /Library/LaunchDaemons is
+# root-owned and loads into the machine-wide `system` domain (same for /Library/LaunchAgents). launchd
+# is the authority on supervision, so such a job must still be REPORTED as this profile's gateway —
+# while every verb that would need root to boot out/kickstart it, or that would leave a second
+# definition for the same label loaded at login, refuses instead of pretending (the double-serve trap).
+
+
+def _read_launchd_plist(plist_path) -> dict | None:
+    """Parsed plist dict, or None when the file is missing, unreadable, malformed or not a dict. One
+    hand-edited operator plist must skip — not abort — the scan: ``ExpatError`` is NOT a ValueError."""
+    import plistlib
+    from xml.parsers.expat import ExpatError
+
+    try:
+        with open(plist_path, "rb") as fh:
+            data = plistlib.load(fh)
+    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError, EOFError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _gateway_job_argv(data: dict) -> list[str] | None:
+    """``ProgramArguments`` when they run a Hermes gateway, else None. Identity comes from the canonical
+    matcher, never an argv substring: a plist that sits at our label but runs anything else is a foreign
+    job this install must not adopt."""
+    from gateway.status import looks_like_gateway_runtime_command_line
+
+    argv = data.get("ProgramArguments")
+    if not isinstance(argv, list) or not argv:
+        return None
+    tokens = [str(part) for part in argv]
+    return tokens if looks_like_gateway_runtime_command_line(shlex.join(tokens)) else None
+
+
+def _job_belongs_to_this_install(data: dict, argv: list[str]) -> bool:
+    """True when the job IS this install's gateway (D3), not a lookalike.
+
+    A pinned ``HERMES_HOME`` decides: it must be this install's root, or a profile home under it, so a
+    daemon pointed at another user's tree (or another sandbox's) stays untouched — the fail-closed rule
+    ``legacy_launchd_labels_for_install`` uses. Only a plist that pins no home at all falls back to its
+    program living in this install's own tree."""
+    from hermes_constants import get_default_hermes_root
+
+    env = data.get("EnvironmentVariables")
+    pinned = str(env.get("HERMES_HOME") or "").strip() if isinstance(env, dict) else ""
+    if pinned:
+        try:
+            root = get_default_hermes_root().resolve()
+            resolved = Path(pinned).expanduser().resolve()
+        except OSError:
+            return False
+        return resolved == root or root in resolved.parents
+
+    tree = Path(_gw().PROJECT_ROOT)
+    for token in argv:
+        if not token.startswith("/"):
+            continue
+        try:
+            path = Path(token).resolve()
+        except OSError:
+            continue
+        if path == tree or tree in path.parents:
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class LaunchdGatewayJob:
+    """A launchd job in a canonical location this install can claim as its own gateway.
+
+    ``loaded_domains`` is launchd's answer, never the plist's directory: empty means launchd runs no
+    process for it, and more than one means two supervisors are racing for the same bot tokens."""
+
+    label: str
+    kind: str
+    plist_path: Path
+    loaded_domains: tuple[str, ...]
+    pid: int | None
+
+    @property
+    def domain(self) -> str:
+        """Domain launchd supervises it in, else the canonical one for its kind."""
+        return self.loaded_domains[0] if self.loaded_domains else launchd_domains_for_kind(self.kind)[0]
+
+    @property
+    def is_daemon(self) -> bool:
+        return self.kind == LAUNCHD_DAEMON
+
+    @property
+    def is_own_plist(self) -> bool:
+        """True when this plist IS the file ``get_launchd_plist_path()`` writes — the only definition
+        this install may rewrite, boot out or bootstrap."""
+        return self.plist_path == _gw().get_launchd_plist_path()
+
+    @property
+    def conflicting_domains(self) -> tuple[str, ...]:
+        """Both domains when launchd loads the label twice, else ()."""
+        return self.loaded_domains if len(self.loaded_domains) > 1 else ()
+
+
+def _loaded_domain_pids(label: str) -> list[tuple[str, int | None]]:
+    """``(domain, pid)`` for every domain that loads ``label``, in canonical probe order. A wedged or
+    absent launchctl skips its domain — that is not proof the job is unloaded."""
+    pairs: list[tuple[str, int | None]] = []
+    for domain in (*launchd_domains_for_kind(LAUNCHD_AGENT), *launchd_domains_for_kind(LAUNCHD_DAEMON)):
+        try:
+            loaded, pid = _gw()._launchd_print_service_pid(domain, label)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+        if loaded:
+            pairs.append((domain, pid))
+    return pairs
+
+
+def launchd_gateway_job(label: str | None = None) -> LaunchdGatewayJob | None:
+    """The launchd job supervising ``label`` for THIS install in any canonical location, else None.
+
+    Discovery is launchd's, not the filesystem's: a plist is accepted only when its
+    ``ProgramArguments`` are a Hermes gateway and it belongs to this install, then the domain comes from
+    ``launchctl print`` (``gui/<uid>``, ``user/<uid>``, then ``system``). A same-label plist that fails
+    that test is a foreign job: not ours to report, never ours to manage.
+    """
+    label = label or _gw().get_launchd_label()
+    candidates: list[tuple[str, Path]] = []
+    for kind, plist_dir in launchd_plist_dirs():
+        plist_path = Path(plist_dir) / f"{label}.plist"
+        data = _read_launchd_plist(plist_path)
+        if data is None:
+            continue
+        argv = _gateway_job_argv(data)
+        if argv is None or not _job_belongs_to_this_install(data, argv):
+            continue
+        candidates.append((kind, plist_path))
+    if not candidates:
+        return None
+
+    loaded = _loaded_domain_pids(label)
+    kind, plist_path = next(
+        ((k, p) for k, p in candidates if any(domain in launchd_domains_for_kind(k) for domain, _ in loaded)),
+        candidates[0],
+    )
+    pid = next((domain_pid for _domain, domain_pid in loaded if domain_pid is not None), None)
+    if pid is None and not loaded:
+        # macOS-26 per-user domains answer `launchctl print` with an error even for a loaded job, so the
+        # domain-agnostic `launchctl list` is the last word on supervision — the fallback the detached
+        # fleet probes already use.
+        pid = _gw()._launchctl_supervised_pid(label)
+    return LaunchdGatewayJob(
+        label=label,
+        kind=kind,
+        plist_path=plist_path,
+        loaded_domains=tuple(domain for domain, _domain_pid in loaded),
+        pid=pid,
+    )
+
+
+def launchd_supervising_gateway_job(label: str | None = None) -> LaunchdGatewayJob | None:
+    """The canonical job launchd is RUNNING a process for, else None (status, and the pre-run check)."""
+    job = launchd_gateway_job(label)
+    return job if job is not None and job.pid is not None else None
+
+
+def _print_launchd_root_remedy(job: LaunchdGatewayJob) -> None:
+    """The exact commands that DO work for a job this install cannot manage — root's."""
+    target = f"{job.domain}/{job.label}"
+    print(f"  Definition: {job.plist_path}")
+    print(f"  launchd:    {target}")
+    print("  Reload the definition (needs root):")
+    print(f"    sudo launchctl bootout {target} && sudo launchctl bootstrap {job.domain} {job.plist_path}")
+    print("  Start it now (needs root):")
+    print(f"    sudo launchctl kickstart -k {target}")
+
+
+def _unowned_launchd_job() -> LaunchdGatewayJob | None:
+    """The job for this label this install must not manage; the caller then refuses for its verb.
+
+    Two cases: a label launchd loads in more than one domain — two supervisors racing for the same bot
+    tokens — which exits here, and a job whose plist is not our own agent file (a root-owned
+    LaunchDaemon, or a root-owned agent in ``/Library/LaunchAgents``), which is returned so the verb can
+    refuse with the right words. None means the ordinary case: act normally."""
+    job = launchd_gateway_job()
+    if job is None:
+        return None
+    if job.conflicting_domains:
+        print(f"✗ launchd loads {job.label} in more than one domain: {', '.join(job.conflicting_domains)}")
+        print("  Two supervisors would race for the same bot tokens — refusing to act until one is unloaded.")
+        for domain in job.conflicting_domains:
+            print(f"    launchctl print {domain}/{job.label}")
+        sys.exit(1)
+    return None if job.is_own_plist else job
+
+
+def _acknowledge_unowned_launchd_supervision(verb: str, job: LaunchdGatewayJob) -> None:
+    """``start``/``install`` asked for a supervised gateway this install cannot manage itself.
+
+    Never writes a competing ``~/Library/LaunchAgents/<label>.plist``: beside a daemon job for the same
+    label both load at boot, and the two gateways fight over the same bot tokens."""
+    where = "a root-owned launchd daemon" if job.is_daemon else "a root-owned launchd agent"
+    print(f"This gateway is defined by {where}, which `hermes gateway {verb}` cannot manage:")
+    _print_launchd_root_remedy(job)
+    if job.pid is None:
+        print("✗ launchd supervises no process for it, and only root can start it.")
+        sys.exit(1)
+    print(f"✓ launchd is supervising it (PID {job.pid}).")
+    print("  No LaunchAgent was written for the same label — a second definition would serve it twice.")
+
+
+def _refuse_unowned_launchd_management(verb: str, job: LaunchdGatewayJob) -> None:
+    """``stop``/``uninstall`` cannot take down a job whose definition this install does not own.
+
+    A SIGTERM buys nothing — ``KeepAlive`` relaunches the daemon — and this install holds neither the
+    plist to boot out nor root to do it with, so say that instead of printing a false ✓."""
+    where = "a root-owned launchd daemon" if job.is_daemon else "a root-owned launchd agent"
+    print(f"✗ The gateway is supervised by {where} — `hermes gateway {verb}` cannot {verb} it.")
+    _print_launchd_root_remedy(job)
+    print("  KeepAlive would relaunch it after any SIGTERM, so taking it down is root's call.")
+    print("  Graceful restart without root: hermes gateway restart")
+    sys.exit(1)
+
+
+def _print_launchd_last_exit_status(domain: str, label: str) -> None:
+    """Report launchd's own last exit status for the job — the supervisor's account of the previous
+    incarnation, which is what a crash-loop diagnosis needs."""
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"{domain}/{label}"],
+            timeout=5, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return
+    for line in (result.stdout or "").splitlines():
+        if "last exit code" in line:
+            print(f"  launchd: {line.strip()}")
+            return
+
+
+def _restart_unowned_launchd_job(job: LaunchdGatewayJob) -> None:
+    """Restart a gateway launchd supervises from a plist this install does not own, without root.
+
+    Graceful only: hand the live process back to launchd (SIGUSR1 drain, so in-flight runs finish) and
+    verify launchd put a FRESH pid in the SAME domain. Bootout/bootstrap/kickstart all need root and the
+    definition is not ours to rewrite, so a failure ends here, loudly, with the commands that do work —
+    never a fall-through to a foreground ``run_gateway`` (that stamps this CLI's pid and wedges every
+    KeepAlive respawn, #110637)."""
+    label, domain, old_pid = job.label, job.domain, job.pid
+    if old_pid is None:
+        print(f"✗ launchd supervises no process for {domain}/{label}, and only root can start it.")
+        _print_launchd_root_remedy(job)
+        sys.exit(1)
+    if _gw().probe_gateway_loop_liveness(old_pid) == _gw().GATEWAY_LOOP_WEDGED:
+        # A wedged event loop cannot answer SIGUSR1: a bounded SIGTERM → SIGKILL is the only way out, and
+        # launchd's own respawn is the restart.
+        print(f"⚠ Gateway PID {old_pid} event loop is unresponsive — skipping drain and forcing a bounded stop...")
+        _gw()._escalate_wedged_gateway(old_pid)
+    else:
+        wait_budget = _gw()._get_restart_exit_wait_budget()
+        print(f"→ Stopping gateway (PID {old_pid}) — draining in-flight runs (up to {wait_budget:.0f}s)...")
+        from hermes_cli.update_cmd_drain_report import drain_progress_reporter
+
+        if not _gw()._graceful_restart_via_sigusr1(
+            old_pid, wait_budget, on_progress=drain_progress_reporter(budget_s=wait_budget)
+        ):
+            print(f"⚠ Gateway drain timed out after {wait_budget:.0f}s — launchd restarts it on exit")
+    if not _gw()._wait_for_launchd_service_pid(label, old_pid, timeout=15.0, domain=domain):
+        print(f"✗ launchd is not supervising a new process for {domain}/{label} after the drain.")
+        _print_launchd_root_remedy(job)
+        sys.exit(1)
+    _launchd_ok("✓ Service restart requested")
+    _print_launchd_last_exit_status(domain, label)
+
+
+def _print_unowned_launchd_status(job: LaunchdGatewayJob) -> None:
+    """Status for a job whose definition this install does not own — the domain launchd supervises it
+    in, and who may change it."""
+    if job.conflicting_domains:
+        print(f"⚠ launchd loads {job.label} in more than one domain: {', '.join(job.conflicting_domains)}")
+        print("  Two supervisors would race for the same bot tokens — unload one.")
+    where = "root-owned launchd daemon" if job.is_daemon else "root-owned launchd agent"
+    print(f"  Definition is a {where} ({job.domain}/{job.label}), not this install's to rewrite.")
+    if job.pid is None:
+        print("✗ launchd supervises no process for it")
+        _print_launchd_root_remedy(job)
+        return
+    print(f"✓ Gateway is supervised by launchd (PID {job.pid})")
+    print("  Auto-start at boot and auto-restart on crash are available.")
+    print("  Restart gracefully without root: hermes gateway restart")
+    print("  Change the definition or stop it as root:")
+    print(f"    sudo launchctl bootout {job.domain}/{job.label}")
+
+
 def launchd_stop():
+    job = _unowned_launchd_job()
+    if job is not None:
+        _refuse_unowned_launchd_management("stop", job)
     target = f"{_launchd_domain()}/{get_launchd_label()}"
     _gw()._mark_planned_stop()
     # bootout unloads the definition so KeepAlive doesn't respawn; `hermes gateway start` re-bootstraps.
@@ -758,6 +1090,12 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    job = _unowned_launchd_job()
+    if job is not None:
+        # launchd supervises it from a plist that is not ours: nothing below (plist refresh, kickstart,
+        # bootout/bootstrap) can work without root, and all of it would target the wrong definition.
+        _restart_unowned_launchd_job(job)
+        return
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
@@ -882,6 +1220,9 @@ def wait_for_launchd_gateway_supervision(
 def launchd_status(deep: bool = False):
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
+    # A job launchd supervises from a plist this install did not write (a root-owned daemon) IS this
+    # profile's gateway: report it as such instead of judging the missing agent plist.
+    job = launchd_gateway_job(label)
     try:
         result = subprocess.run(["launchctl", "list", label], timeout=10, **_gw()._CAPTURE_TEXT)
         service_listed = result.returncode == 0
@@ -902,39 +1243,46 @@ def launchd_status(deep: bool = False):
     # Marker from a 5/125 bootstrap/kickstart failure explains *why* launchd can't supervise.
     launchd_unsupported = _gw()._launchd_unsupported_marker_exists()
 
-    print(f"Launchd plist: {plist_path}")
-    if _gw().launchd_plist_is_current():
-        print("✓ Service definition matches the current Hermes install")
+    unowned_job = job if job is not None and not job.is_own_plist else None
+    print(f"Launchd plist: {unowned_job.plist_path if unowned_job is not None else plist_path}")
+    if unowned_job is not None:
+        # The definition is not this install's to rewrite, so the agent-path staleness check would be
+        # wrong twice over: it compares a file launchd does not hold, and `hermes gateway start` cannot
+        # load the one it does. Report the job launchd is actually running instead.
+        _print_unowned_launchd_status(unowned_job)
     else:
-        print("⚠ Service definition is stale relative to the current Hermes install")
-        print("  Run: hermes gateway start")
-
-    if not service_listed:
-        print("✗ Gateway service is not loaded")
-        print("  Service definition exists locally but launchd has not loaded it.")
-        print("  Run: hermes gateway start")
-        if fallback_pid:
-            print(f"  Note: a detached gateway process is running (PID {fallback_pid})")
-    elif launchd_pid is not None:
-        print(f"✓ Gateway is supervised by launchd (PID {launchd_pid})")
-        print("  Auto-start at login and auto-restart on crash are available.")
-        if launchd_unsupported:
-            print("  (launchd domain was previously unavailable but is now working)")
-    elif launchd_unsupported:
-        print("⚠ Gateway service is registered but launchd is not supervising it")
-        print("  launchd cannot manage the gateway on this macOS version.")
-        if fallback_pid:
-            print(f"✓ Detached fallback process is running (PID {fallback_pid})")
-            print("  Cron jobs will fire. Stop with: hermes gateway stop")
+        if _gw().launchd_plist_is_current():
+            print("✓ Service definition matches the current Hermes install")
         else:
-            print("✗ No fallback process is running")
+            print("⚠ Service definition is stale relative to the current Hermes install")
             print("  Run: hermes gateway start")
-        print("  ⚠ Auto-start at login and auto-restart on crash are NOT available.")
-    else:
-        print("✓ Gateway service is registered with launchd")
-        print(list_output)
-        if fallback_pid:
-            print(f"  Detached gateway process is running (PID {fallback_pid})")
+
+        if not service_listed:
+            print("✗ Gateway service is not loaded")
+            print("  Service definition exists locally but launchd has not loaded it.")
+            print("  Run: hermes gateway start")
+            if fallback_pid:
+                print(f"  Note: a detached gateway process is running (PID {fallback_pid})")
+        elif launchd_pid is not None:
+            print(f"✓ Gateway is supervised by launchd (PID {launchd_pid})")
+            print("  Auto-start at login and auto-restart on crash are available.")
+            if launchd_unsupported:
+                print("  (launchd domain was previously unavailable but is now working)")
+        elif launchd_unsupported:
+            print("⚠ Gateway service is registered but launchd is not supervising it")
+            print("  launchd cannot manage the gateway on this macOS version.")
+            if fallback_pid:
+                print(f"✓ Detached fallback process is running (PID {fallback_pid})")
+                print("  Cron jobs will fire. Stop with: hermes gateway stop")
+            else:
+                print("✗ No fallback process is running")
+                print("  Run: hermes gateway start")
+            print("  ⚠ Auto-start at login and auto-restart on crash are NOT available.")
+        else:
+            print("✓ Gateway service is registered with launchd")
+            print(list_output)
+            if fallback_pid:
+                print(f"  Detached gateway process is running (PID {fallback_pid})")
 
     if deep:
         log_file = _gw().get_hermes_home() / "logs" / "gateway.log"

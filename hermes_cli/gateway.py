@@ -1559,6 +1559,22 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
         )
 
     if is_macos():
+        from hermes_cli.gateway_launchd import launchd_gateway_job
+
+        job = launchd_gateway_job()
+        if job is not None:
+            # launchd's own answer: the job's existence and supervised pid, not a plist-path probe.
+            # The scope names the domain, so a root-owned system daemon is never described as a manual
+            # foreground run (its agent-path plist does not exist, and that probe alone said "not
+            # installed"). See #41403.
+            scope = "system daemon" if job.is_daemon else job.domain
+            return GatewayRuntimeSnapshot(
+                manager=f"launchd ({scope})",
+                service_installed=True,
+                service_running=job.pid is not None,
+                gateway_pids=gateway_pids,
+                service_scope=f"launchd ({scope})",
+            )
         return GatewayRuntimeSnapshot(
             manager="launchd",
             service_installed=get_launchd_plist_path().exists(),
@@ -1582,8 +1598,19 @@ def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
         return
     print()
     pids_line = f"  PID(s): {_format_gateway_pids(snapshot.gateway_pids, limit=None)}"
+    from hermes_cli.gateway_launchd import launchd_gateway_job
+
+    job = launchd_gateway_job() if is_macos() else None
+    if job is not None and job.pid is None:
+        # A launchd job for THIS install defines the gateway but runs nothing: the live process is the
+        # anomaly, and this install can neither stop it in launchd nor rewrite the definition without root.
+        print(f"⚠ Gateway process is running for this profile, but launchd ({job.domain}) supervises none")
+        print(pids_line)
+        print(f"  Definition: {job.plist_path} — root-owned, so launchd's verdict is the one that counts.")
+        print(f"  Root starts the supervised gateway: sudo launchctl kickstart -k {job.domain}/{job.label}")
+        print("  A stray process must exit first; this install cannot boot a root-owned job out.")
     # Managed detached fallback (launchd exit-5 path) vs. a genuinely manual run.
-    if _launchd_unsupported_marker_exists():
+    elif _launchd_unsupported_marker_exists():
         print("⚠ Gateway is running as a detached fallback process — launchd cannot supervise it")
         print(pids_line)
         print("  Auto-start at login and auto-restart on crash are NOT available.")
@@ -4756,11 +4783,16 @@ def _is_service_running() -> bool:
     """Check if the gateway service is currently running."""
     if supports_systemd_services():
         return _systemd_unit_is_active(False) or _systemd_unit_is_active(True)
-    if is_macos() and get_launchd_plist_path().exists():
-        try:
-            return _launchd_service_registered(get_launchd_label(), timeout=10)
-        except subprocess.TimeoutExpired:
-            return False
+    if is_macos():
+        from hermes_cli.gateway_launchd import launchd_supervising_gateway_job
+
+        if launchd_supervising_gateway_job() is not None:
+            return True  # launchd runs a process for a job of THIS install, plist location aside
+        if get_launchd_plist_path().exists():
+            try:
+                return _launchd_service_registered(get_launchd_label(), timeout=10)
+            except subprocess.TimeoutExpired:
+                return False
     # Windows "installed" doesn't mean "running"; like manual runs, a live gateway process decides.
     return len(find_gateway_pids()) > 0
 
@@ -4962,11 +4994,20 @@ def _block_until_terminated() -> None:
 
 def _installed_service_kind_for(windows) -> str | None:
     """``"systemd"`` / ``"launchd"`` when the unit/plist exists, else ``"windows"`` iff ``windows()``
-    (a thunk so it runs last, like every caller's original ladder), else None."""
+    (a thunk so it runs last, like every caller's original ladder), else None.
+
+    ``"launchd"`` also covers a job launchd supervises from a plist this install did not write — a
+    root-owned ``/Library/LaunchDaemons`` daemon — because that job IS this profile's gateway: reporting
+    None there made every verb fall through to a foreground run (#41403)."""
     if _systemd_unit_installed():
         return "systemd"
-    if is_macos() and get_launchd_plist_path().exists():
-        return "launchd"
+    if is_macos():
+        if get_launchd_plist_path().exists():
+            return "launchd"
+        from hermes_cli.gateway_launchd import launchd_gateway_job
+
+        if launchd_gateway_job() is not None:
+            return "launchd"
     return "windows" if windows() else None
 
 
@@ -4986,6 +5027,30 @@ def _stop_installed_service(system: bool) -> bool:
         return True
     except (subprocess.CalledProcessError, *((RuntimeError,) if kind == "windows" else ())):
         return False
+
+
+def _holding_supervisor_for_live_gateway() -> str | None:
+    """Name of the supervisor holding a live gateway for this profile, else None.
+
+    A supervisor owns the respawn: starting a gateway from here would stamp this CLI's PID on the
+    profile and wedge every respawn (#110637). Either launchd runs a process for a job of THIS install
+    (our own agent plist, or a root-owned ``system`` daemon) or the live process declares an external
+    supervisor.
+    """
+    if is_macos():
+        from hermes_cli.gateway_launchd import launchd_supervising_gateway_job
+
+        job = launchd_supervising_gateway_job()
+        if job is not None:
+            return f"launchd ({'system daemon' if job.is_daemon else job.domain})"
+
+    from gateway.status import get_running_pid
+    from hermes_cli.gateway_supervised_restart import gateway_declares_external_supervisor
+
+    pid = get_running_pid()
+    if pid and gateway_declares_external_supervisor(pid):
+        return "an external supervisor"
+    return None
 
 
 def _refuse_from_inside_gateway(verb: str, reason: str) -> None:
@@ -5457,6 +5522,19 @@ def _cmd_restart(args):
     if supervised_pid and gateway_declares_external_supervisor(supervised_pid):
         restart_externally_supervised_gateway(supervised_pid)
         return
+
+    # Last door before the foreground run (#110637): whatever routed us here, a supervisor still holding
+    # the live gateway owns the respawn, so a `gateway run` from this CLI would stamp its own PID as the
+    # profile's gateway and wedge every respawn. Refuse — never start a second gateway behind a
+    # supervisor's back.
+    holder = _holding_supervisor_for_live_gateway()
+    if holder is not None:
+        _print_lines(
+            "", f"✗ Refusing to start a foreground gateway — {holder} supervises the live gateway.",
+            "  Restart it through the supervisor:  hermes gateway restart",
+            "  Inspect what launchd holds:        hermes gateway status",
+        )
+        sys.exit(1)
 
     if stop_profile_gateway():
         print("✓ Stopped gateway for this profile")

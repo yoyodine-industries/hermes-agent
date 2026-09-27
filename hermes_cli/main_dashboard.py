@@ -228,16 +228,13 @@ def _try_restart_systemd_service(svc_name: str, cgroup_path: str | None = None) 
     return False
 
 
-# launchd plist directories that can supervise a ``hermes dashboard`` / ``hermes serve`` backend on
-# macOS, with the launchctl domain their jobs load into (LaunchAgents: ``gui/<uid>`` or ``user/<uid>``,
-# probed per label like the gateway helpers; LaunchDaemons: ``system``). Both LaunchAgents dirs are
-# per-user domains, so they share the ``agent`` kind.
+# launchd plist locations that can supervise a ``hermes dashboard`` / ``hermes serve`` backend on macOS.
+# The table itself lives in ``gateway_launchd`` (D1), which also resolves and adopts the jobs in it: a
+# second copy here could be taught a location the gateway discovery never learns.
 def _launchd_plist_dirs() -> list[tuple[str, Path]]:
-    return [
-        ("agent", Path.home() / "Library" / "LaunchAgents"),
-        ("agent", Path("/Library/LaunchAgents")),
-        ("daemon", Path("/Library/LaunchDaemons")),
-    ]
+    from hermes_cli.gateway_launchd import launchd_plist_dirs
+
+    return launchd_plist_dirs()
 
 
 def _loaded_launchd_backend_jobs(
