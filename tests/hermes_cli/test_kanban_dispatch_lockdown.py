@@ -272,3 +272,73 @@ def test_a_co_holders_scope_still_holds_the_lane(kanban_home, all_assignees_spaw
     estop.release(owner="operator")
     assert estop.is_engaged() is True
     assert operator.exists()
+
+
+# ── the record is a property of the HOLD, not of the scan position ──────────
+#
+# The lane scan records a hold only for the candidates the tick actually VISITS, so every way
+# a tick can stop before reaching a held card left it unrecorded: the cap, memory pressure,
+# the ready lane's review reservation, a budget a higher-ranked admitted card consumed. The
+# acceptance probe runs ONE tick — the very tick whose budget can swallow the scan — so each
+# case below FAILS without the pre-budget sweep (§6.10).
+
+
+def test_a_capped_tick_still_records_the_hold(kanban_home, all_assignees_spawnable):
+    """The cap returns the tick before ANY candidate is scanned."""
+    _arm_lockdown(["default"])
+    spawns = []
+
+    with kbc.connect() as conn:
+        busy = kb.create_task(conn, title="busy", assignee="default")
+        assert kb.claim_task(conn, busy) is not None
+        held = kb.create_task(conn, title="starved behind the cap", assignee="yoyoflow")
+        res = kbd.dispatch_once(conn, spawn_fn=_spawn_recorder(spawns), max_spawn=1)
+
+        assert res.spawned == [] and spawns == []
+        assert res.skipped_lockdown == [(held, "yoyoflow")]
+        events = _events(conn, held)
+        assert len(events) == 1 and events[0]["profile"] == "yoyoflow"
+        fetched = kb.get_task(conn, held)
+        assert fetched is not None and fetched.status == "ready", "held, never lost"
+
+
+def test_the_review_reservation_does_not_hide_a_hold(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """The reservation pins ``ready_budget`` to 0: the ready loop breaks before the scan."""
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config", lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    _arm_lockdown(["default"])
+    spawns = []
+
+    with kbc.connect() as conn:
+        held = kb.create_task(conn, title="starved behind the reservation", assignee="yoyoflow")
+        # The held lane's own handoff, reviewed by an admitted lane: a review row with real
+        # provenance, so the review loop really dispatches it (no hand-parked status).
+        review = kb.create_task(conn, title="review me", assignee="yoyoflow")
+        assert kb.request_review(conn, review, summary="handoff", reviewer="default") is True
+        res = kbd.dispatch_once(conn, spawn_fn=_spawn_recorder(spawns), max_spawn=1)
+
+        assert [t for t, _who, _ws in res.spawned] == [review], "an admitted lane still spawns"
+        assert res.skipped_lockdown == [(held, "yoyoflow")]
+        assert len(_events(conn, held)) == 1
+
+
+def test_a_budget_spent_before_the_held_card_still_records_the_hold(
+    kanban_home, all_assignees_spawnable,
+):
+    """One shared slot, taken by a higher-ranked admitted card: the loop breaks on it."""
+    _arm_lockdown(["default"])
+    spawns = []
+
+    with kbc.connect() as conn:
+        admitted = kb.create_task(conn, title="admitted", assignee="default", priority=10)
+        held = kb.create_task(conn, title="starved behind the budget", assignee="yoyoflow")
+        res = kbd.dispatch_once(conn, spawn_fn=_spawn_recorder(spawns), max_spawn=1)
+
+        assert [t for t, _who, _ws in res.spawned] == [admitted]
+        assert res.skipped_lockdown == [(held, "yoyoflow")]
+        assert len(_events(conn, held)) == 1

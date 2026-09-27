@@ -2109,7 +2109,9 @@ def _dispatch_lane_task(
     # recorded on the card as a ``skipped_lockdown`` event (not once per tick,
     # see :func:`_record_lockdown_events`) because a silent non-spawn is a defect.
     if not _lane_admitted(estop_state, assignee, board):
-        result.skipped_lockdown.append((task_id, assignee))
+        # Set-wise: the pre-budget sweep may have noted this same card already
+        # (:func:`_note_lockdown_hold`), so a hold is never double-counted.
+        _note_lockdown_hold(result, task_id, assignee)
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
@@ -2487,6 +2489,61 @@ def _record_lockdown_events(
             )
 
 
+def _note_lockdown_hold(result: DispatchResult, task_id: str, assignee: str) -> None:
+    """Note one held ``(card, lane)`` — once per tick, whatever seam saw it.
+
+    Two seams report a hold (the pre-budget sweep and the lane scan) and both see the SAME
+    card, so the bucket is a SET: :func:`describe_suppression` counts entries, and a
+    duplicate would double-count one hold in the starvation line.
+    """
+    entry = (task_id, assignee)
+    if entry not in result.skipped_lockdown:
+        result.skipped_lockdown.append(entry)
+
+
+def _lockdown_sweep(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    estop_state: Optional[Any],
+    *,
+    dry_run: bool = False,
+    board: Optional[str] = None,
+) -> None:
+    """Record EVERY ready/review card a lane-scoped gate holds, whatever the budget does.
+
+    The scan in :func:`_dispatch_lane_task` records a hold only for the candidates THIS tick
+    actually visits, so a held card is silently unrecorded whenever no candidate exists at
+    all: the board or host concurrency cap, memory pressure, the ready lane's review
+    reservation (``ready_budget = 0``), or a budget a higher-ranked admitted card consumed
+    first. The arm banner promises the opposite (every other lane's cards and jobs are HELD
+    and recorded, never silently skipped), and the probe that reads the record runs a single
+    tick — the very tick whose budget can swallow the scan.
+
+    So the record is a property of the HOLD, not of the scan position: enumerate the lane,
+    ask the SAME admission predicate, write through :func:`_record_lockdown_events`. Called
+    after the reclaim phase (a row promoted to ``ready`` by this tick is swept too) and
+    before :func:`_tick_spawn_budget`, i.e. before every early return. No gate in force, no
+    query; ``dry_run`` fills the same bucket and writes no row.
+
+    ``review`` rows are swept even when review dispatch is disabled: the LANE is still not
+    admitted, and the record must not hinge on an unrelated config flag.
+    """
+    if estop_state is None:
+        return
+    # Same precedence as the scan: a lane that is not a real profile is bucketed
+    # ``skipped_nonspawnable`` there, so it must never also count as lockdown-held.
+    profile_exists = _profile_exists_fn()
+    for status in ("ready", "review"):
+        for row in _lane_rows(conn, status):
+            assignee = row["assignee"]
+            if not assignee or _lane_admitted(estop_state, assignee, board):
+                continue
+            if profile_exists is not None and not profile_exists(assignee):
+                continue
+            _note_lockdown_hold(result, row["id"], assignee)
+    _record_lockdown_events(conn, result, estop_state, dry_run=dry_run, board=board)
+
+
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
 # lock hold and stall a sibling dispatcher's tick.
@@ -2520,6 +2577,10 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    # Record EVERY held card BEFORE the budget can return early, so a tick that spawns
+    # nothing (cap, memory pressure, review reservation, budget consumed) still says why
+    # per card. After the reclaim phase, so a row promoted this tick is swept too.
+    _lockdown_sweep(conn, result, estop_state, dry_run=dry_run, board=board)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
