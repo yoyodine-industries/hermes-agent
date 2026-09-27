@@ -10,10 +10,18 @@ re-armed stop therefore reports the cards it holds today, not the union of every
 ever armed.
 
 Read-only by construction: each store is opened ``mode=ro`` through
-:mod:`hermes_cli.sqlite_safe_read` (POSIX-lock safe; no sidecars, no schema pass, never creates
-a missing store) and every read failure is REPORTED as ``unreadable`` rather than raised — a
-status line must survive a board it cannot read, and it must not quietly report a board it
+:mod:`hermes_cli.sqlite_safe_read` (POSIX-lock safe; no schema pass; never creates a missing
+store; no write to the database — the store's bytes are measured sha256-identical across a census
+of the four live boards) and every read failure is REPORTED as ``unreadable`` rather than raised —
+a status line must survive a board it cannot read, and it must not quietly report a board it
 could not read as holding nothing.
+
+The census's one on-disk effect is SQLite's, and it is NOT "no sidecars": the first read of a WAL
+store whose ``-wal``/``-shm`` were reaped recreates both files, exactly as any other reader of
+that store does (measured on the quiet ``defcon`` and ``ops`` boards, which gained both while
+their stores stayed byte-identical). They outlive this connection — a read-only close does not
+unlink them; a later read-write opener's last close reclaims them — so the census adds those two
+sidecar files without writing the database.
 """
 
 from __future__ import annotations
@@ -149,8 +157,10 @@ def _board_census(board: str, path: Path, engagement: str) -> HeldBoard:
     if not path.exists():
         return HeldBoard(board=board, cards=0)
     try:
-        # ``mode=ro`` + the tracking registry: no sidecar creation, no schema pass, and no
+        # ``mode=ro`` + the tracking registry: no schema pass, no write to the store, and no
         # raw-file read that could cancel a live connection's POSIX locks elsewhere in-process.
+        # A WAL store whose ``-wal``/``-shm`` were reaped gets both back on this first read —
+        # SQLite's own sidecar churn, not a store write (see the module docstring).
         conn = sqlite_safe_read.connect_tracked(
             f"file:{path}?mode=ro", tracking_path=path, uri=True, timeout=_LOCK_TIMEOUT_SECONDS,
         )
