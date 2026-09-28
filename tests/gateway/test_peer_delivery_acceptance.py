@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from types import SimpleNamespace
@@ -536,3 +537,270 @@ def test_drain_invariant_n_keys_free_lock_n_turns_exactly_once(adapter, home):
     assert replay["replayed"] is True
     assert len(adapter.calls) == before, "a replay never starts a second turn"
     assert q.queue_depth(home, profile) == 0
+
+
+# ── fairness of the tick's budget (ops t_59de8ea2 / t_adecd536) ─────────────────
+#
+# drain_once spends ONE time budget (SWEEP_DRAIN_BUDGET_SECONDS, 60 s) and a drained
+# record runs a full agent turn inline (measured 359-566 s), so the first lane with
+# traffic spent the whole tick. The roster order is stable, so every lane behind it was
+# skipped -- no claim attempt, no log line -- on every tick, forever.
+
+class _TurnClock:
+    """A monotonic clock a fake turn charges, so a tick's budget is exact.
+
+    ``drain_once`` measures its budget with ``time.monotonic``; charging the clock a
+    fixed cost per turn makes "this turn ran past the deadline" a statement instead of
+    a wall-clock race, and keeps these tests off real sleeps.
+    """
+
+    def __init__(self, cost: float = 1.0) -> None:
+        self.now = 0.0
+        self.cost = cost
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def charge_turn(self) -> None:
+        self.now += self.cost
+
+
+@pytest.fixture()
+def turn_clock(adapter, monkeypatch):
+    """Give the drainer a clock whose advance is exactly one turn's cost."""
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    clock = _TurnClock()
+    inner = adapter._run_agent
+
+    async def _run_agent(*args, **kwargs):
+        clock.charge_turn()
+        return await inner(*args, **kwargs)
+
+    monkeypatch.setattr(drain, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(adapter, "_run_agent", _run_agent)
+    return clock
+
+
+@pytest.fixture(autouse=True)
+def _fresh_roster_rotation():
+    """Every test walks the roster from its head: the rotation is module state.
+
+    Without this a test that asserts an order would inherit the offset another test
+    left behind, so the assertion would depend on file order.
+    """
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    drain._roster_offset = 0
+    yield
+    drain._roster_offset = 0
+
+
+def _admit(profile_home, index, message, *, target_profile, sender_profile="lane-alpha"):
+    """One queued record in ``profile_home``'s own queue (no HTTP round trip)."""
+    record = q.admit(
+        profile_home,
+        sender_profile=sender_profile,
+        target_profile=target_profile,
+        target_session_id="sess-1",
+        idempotency_key=q.validate_idempotency_key(f"auto:fair:{index}"),
+        fingerprint="fp",
+        delivery_id=f"{index:032x}",
+        message=message,
+    )
+    assert record is not None, "an admitted record is on disk"
+    return record
+
+
+def test_rotate_roster_is_pure_and_wraps():
+    """The rotation helper is the unit that makes the walk start where it must."""
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    roster = ["a", "b", "c"]
+    assert drain._rotate_roster(roster, 0) == ["a", "b", "c"]
+    assert drain._rotate_roster(roster, 1) == ["b", "c", "a"]
+    assert drain._rotate_roster(roster, 2) == ["c", "a", "b"]
+    assert drain._rotate_roster(roster, 4) == ["b", "c", "a"], "wraps past the end"
+    assert drain._rotate_roster([], 3) == []
+    assert roster == ["a", "b", "c"], "the roster handed in is never re-ordered"
+
+
+def test_drain_rotates_the_roster_so_a_budget_skipped_lane_leads_the_next_pass(
+        adapter, home, turn_clock):
+    """A lane the spent budget cut off at the tail leads the pass after it.
+
+    The head lane still holds a queued record here, so the second pass has to choose
+    between the lane that has just run and the lane the budget starved: without the
+    rotation it picks the head lane again, which is the starvation that left
+    platform-worker and the research lanes unreached (ops t_59de8ea2 / t_adecd536).
+    """
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    profile = adapter._bot_send_target_profile(home)
+    lane = "lane-beta"
+    lane_home = home / "profiles" / lane
+    _admit(home, 1, "head one", target_profile=profile)
+    _admit(home, 2, "head two", target_profile=profile)
+    tail = _admit(lane_home, 3, "tail one", target_profile=lane)
+    turn_clock.cost = 1.0  # one turn costs more than a whole tick
+
+    # Pass 1: the head lane's turn spends the budget, so the tail lane is skipped.
+    assert asyncio.run(drain.drain_once(adapter, home, budget_seconds=0.5)) == 1
+    assert [call["user_message"] for call in adapter.calls] == ["head one"]
+    assert q.read_record(lane_home, tail["delivery_id"])["status"] == q.STATUS_QUEUED
+
+    # Pass 2 starts one position further along, so the skipped lane leads it.
+    assert asyncio.run(drain.drain_once(adapter, home, budget_seconds=0.5)) == 1
+    assert [call["user_message"] for call in adapter.calls] == ["head one", "tail one"], (
+        "the lane the budget skipped must lead the next pass, not wait behind the "
+        "lane that already ran")
+    assert q.queue_depth(home, profile) == 1, (
+        "the head lane keeps its own backlog for a later pass")
+    assert q.read_record(lane_home, tail["delivery_id"])["status"] == q.STATUS_DELIVERED
+
+
+def test_drain_takes_at_most_one_record_per_lane_per_pass(adapter, home, turn_clock):
+    """One record per lane per pass: a backlog cannot be spent in front of the rest.
+
+    Two lanes with two records each and a budget with room for all four turns. The walk
+    gives each lane one turn before it returns to the first, so the order interleaves
+    lanes -- first-come drained lane by lane, which is how a deep backlog consumed the
+    whole tick.
+    """
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    profile = adapter._bot_send_target_profile(home)
+    lane = "lane-beta"
+    lane_home = home / "profiles" / lane
+    _admit(home, 1, "alpha one", target_profile=profile)
+    _admit(home, 2, "alpha two", target_profile=profile)
+    _admit(lane_home, 3, "beta one", target_profile=lane)
+    _admit(lane_home, 4, "beta two", target_profile=lane)
+    turn_clock.cost = 1.0
+
+    assert asyncio.run(drain.drain_once(adapter, home, budget_seconds=100.0)) == 4
+    assert [call["user_message"] for call in adapter.calls] == [
+        "alpha one", "beta one", "beta two", "alpha two"], (
+        "each lane takes one record per pass: neither lane may take a second turn "
+        "before the other lane's first")
+    assert q.queue_depth(home, profile) == 0
+    assert q.queue_depth(lane_home, lane) == 0
+
+
+def test_drain_names_every_lane_the_spent_budget_could_not_reach(
+        adapter, home, turn_clock, caplog):
+    """Each unreached lane is logged with its queued depth -- the skip was silent.
+
+    A silent skip is why the starved cohort read as an idle sweep: the tick logged
+    ``actions=0`` while two lanes held a backlog behind the first lane.
+    """
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    profile = adapter._bot_send_target_profile(home)
+    _admit(home, 1, "head one", target_profile=profile)
+    _admit(home, 2, "head two", target_profile=profile)
+    for index, lane in enumerate(("lane-beta", "lane-gamma"), start=3):
+        _admit(home / "profiles" / lane, index, f"{lane} payload", target_profile=lane)
+    turn_clock.cost = 1.0
+
+    caplog.set_level(logging.INFO, logger="tools.bot_delivery_queue")
+    assert asyncio.run(drain.drain_once(adapter, home, budget_seconds=0.5)) == 1
+
+    lines = [record.getMessage() for record in caplog.records
+             if "drain_budget_exhausted" in record.getMessage()]
+    assert len(lines) == 2, "one line per lane the budget could not reach"
+    named = sorted(line.split("target=")[1].split()[0] for line in lines)
+    assert named == ["lane-beta", "lane-gamma"]
+    assert all("queued=1" in line for line in lines), (
+        "each line carries why it was skipped: the lane's queued depth")
+
+
+def test_drain_keeps_the_head_claim_and_the_two_skip_logs(
+        adapter, home, turn_clock, caplog):
+    """No regression: head-first claim, ``drain_deferred``, ``drain_nothing_claimable``."""
+    from gateway.platforms import api_server_bot_delivery as drain
+
+    profile = adapter._bot_send_target_profile(home)
+    first = _admit(home, 1, "first payload", target_profile=profile)
+    _admit(home, 2, "second payload", target_profile=profile)
+    turn_clock.cost = 1.0
+
+    # (a) the OLDEST record is claimed first, and a free slot drains the backlog.
+    assert asyncio.run(drain.drain_once(adapter, home)) == 2
+    assert [call["user_message"] for call in adapter.calls] == [
+        "first payload", "second payload"]
+    assert q.read_record(home, first["delivery_id"])["status"] == q.STATUS_DELIVERED
+
+    # (b) a HELD slot is deferred, never fought for: the record stays queued.
+    waiting = _admit(home, 3, "held payload", target_profile=profile)
+    caplog.set_level(logging.INFO, logger="tools.bot_delivery_queue")
+    with _hold_turn_lock(home):
+        assert asyncio.run(drain.drain_once(adapter, home)) == 0
+    assert "drain_deferred" in caplog.text and "reason=slot_held" in caplog.text
+    assert q.read_record(home, waiting["delivery_id"])["status"] == q.STATUS_QUEUED
+
+    # (c) a lane that still lists a queued record whose claim comes back empty is
+    #     named, not passed over in silence (a record claimed elsewhere but left in
+    #     the queue dir is exactly that state).
+    caplog.clear()
+    queued_file = q.delivery_root(home) / q.QUEUE_DIR / f"{waiting['delivery_id']}.json"
+    payload = json.loads(queued_file.read_text())
+    payload["status"] = q.STATUS_RUNNING
+    queued_file.write_text(json.dumps(payload))
+    assert q.queued_target_profiles(home) == [profile]
+    assert asyncio.run(drain.drain_once(adapter, home)) == 0
+    assert "drain_nothing_claimable" in caplog.text
+    assert "reason=claim_empty_while_queued" in caplog.text
+    assert "queued=1" in caplog.text
+
+
+def test_the_drained_lane_holds_its_turn_lock_across_claim_and_turn(
+        adapter, home, monkeypatch):
+    """The claim, the None check and the WHOLE turn run inside the lane's lock.
+
+    The flock IS the lane's busy signal (what makes a concurrent in-call delivery see
+    ``slot_held`` and take a receipt instead of starting a turn). A drained turn runs
+    for minutes (measured 359-566 s), so a drain that released the lock after claiming
+    -- or after the turn -- admits a second turn alongside a live one for the same
+    profile. Probed with the real lock from inside both seams.
+    """
+    from gateway.platforms import api_server_bot_delivery as drain
+    from tools.bot_mode_probe import _hermes_root
+    from tools.bot_relay import TurnBusyError, acquire_turn_lock
+
+    profile = adapter._bot_send_target_profile(home)
+    root = _hermes_root(home)
+    _admit(home, 1, "locked payload", target_profile=profile)
+
+    seen: list[str] = []
+
+    def _probe(where: str) -> None:
+        try:
+            with acquire_turn_lock(root, profile, timeout_seconds=0):
+                seen.append(f"{where}:free")
+        except TurnBusyError:
+            seen.append(f"{where}:busy")
+
+    real_claim = q.claim_next
+    real_run = adapter._run_agent
+
+    def _claim(*args, **kwargs):
+        _probe("claim")
+        return real_claim(*args, **kwargs)
+
+    async def _run_agent(*args, **kwargs):
+        _probe("turn")
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(q, "claim_next", _claim)
+    monkeypatch.setattr(adapter, "_run_agent", _run_agent)
+
+    assert asyncio.run(drain.drain_once(adapter, home)) == 1
+    assert seen == ["claim:busy", "turn:busy"], (
+        "the lane's turn lock must be held across the claim AND the whole turn: "
+        "releasing it early lets a concurrent delivery start a second turn beside a "
+        "live one")
+
+    # And the lock is free again once the pass is over, so the next caller is admitted.
+    with acquire_turn_lock(root, profile, timeout_seconds=0):
+        pass
