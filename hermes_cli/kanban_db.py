@@ -1278,6 +1278,9 @@ def create_task(
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_consent_gate import (
+        ConsentRefused, evaluate as _consent_evaluate, refusal_message as consent_refusal_message,
+    )
 
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
@@ -1285,6 +1288,15 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # Admission door of the consent gate (ruling, card t_e31d9241): a card that
+    # ASSERTS operator consent with no reference behind it is refused here,
+    # before any row is written -- the claim is a false statement in the record
+    # and every downstream reader (dispatcher, lanes, disposition sweep) acts on
+    # it. A card that merely DECLARES itself consent-gated is filable: proposing
+    # work is legal, and the RUN door holds it (kanban_db_dispatch).
+    _consent = _consent_evaluate(title, body)
+    if _consent.trigger == "claim" and _consent.refused:
+        raise ConsentRefused(consent_refusal_message(None, _consent))
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo

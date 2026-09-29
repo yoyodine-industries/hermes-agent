@@ -2038,6 +2038,16 @@ def _dispatch_lane_task(
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
+    # Consent gate (RUN door): a card that asserts consent it cannot show, or
+    # that declares itself consent-gated with nothing behind it, is refused the
+    # spawn and parked needs_input. Reported on the guard channel so
+    # ``hermes kanban tail`` shows why this card stopped; the parking itself is
+    # the durable record (event + one comment + block).
+    consent_reason = check_consent_guard(conn, task_id, dry_run=dry_run)
+    if consent_reason is not None:
+        result.respawn_guarded.append((task_id, consent_reason))
+        return False
+
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -2100,6 +2110,82 @@ def _dispatch_lane_task(
         ):
             result.auto_blocked.append(claimed.id)
         return False
+
+
+def check_consent_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    dry_run: bool = False,
+    approvals_db: Optional[str] = None,
+) -> Optional[str]:
+    """The RUN door of the consent gate: refuse a run that claims consent it cannot show.
+
+    Deterministic, like :func:`check_respawn_guard` -- one regex pass over the
+    card's own text plus a read-only lookup in the approvals store
+    (``hermes_cli/kanban_consent_gate.py``; ruling: card ``t_e31d9241``).
+
+    Returns a reason string when the card must not run, else ``None``. A refused
+    card is PARKED ``blocked``/``needs_input`` with one durable comment naming
+    the cause and the moves -- never merely skipped: a skipped-but-ready card
+    loops silently every tick, and a spawned consent-gated card is the defect
+    this gate exists to stop. ``dry_run`` reports the refusal without writing.
+    """
+    from hermes_cli import kanban_consent_gate as _cg
+
+    row = conn.execute(
+        "SELECT title, body, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in ("ready", "review"):
+        return None
+    verdict = _cg.evaluate(row["title"], row["body"], approvals_db=approvals_db)
+    if not verdict.refused:
+        return None
+    reason = f"consent-refused:{verdict.cause}"
+    if dry_run:
+        return reason
+    _park_for_consent(conn, task_id, verdict)
+    return reason
+
+
+def _park_for_consent(conn: sqlite3.Connection, task_id: str, verdict) -> None:
+    """Record the refusal on the card, then hold it (``needs_input`` is sticky).
+
+    The event dedupe keeps ONE comment per distinct cause: the guard runs every
+    tick, and a comment per tick would bury the board. A store outage, or a
+    failed write, must never take the dispatcher down with it -- the next tick
+    retries, and the card is not spawned either way.
+    """
+    from hermes_cli import kanban_consent_gate as _cg
+
+    payload = {
+        "cause": verdict.cause,
+        "trigger": verdict.trigger,
+        "refs": [r.ref for r in verdict.refs],
+    }
+    try:
+        with _kb.write_txn(conn):
+            last = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'consent_refused' "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if last is None or last["payload"] != _kb._json_or_null(payload):
+                _kb._append_event(conn, task_id, "consent_refused", payload)
+                _kb.add_comment(
+                    conn, task_id, "dispatcher",
+                    "CONSENT REFUSED before the run (not spawned).\n\n"
+                    + _cg.refusal_message(task_id, verdict),
+                )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: consent refusal could not be recorded for %s", task_id, exc_info=True,
+        )
+    try:
+        _kb.block_task(conn, task_id, reason=f"consent: {verdict.cause}", kind="needs_input")
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: consent refusal could not park %s", task_id, exc_info=True,
+        )
 
 
 def _apply_default_assignee(
