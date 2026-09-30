@@ -88,38 +88,74 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
     )
 
 
-_yaml_load_fn = None
+_yaml_backend_pair = None
+
+
+def _yaml_backend():
+    """``(safe_load, YAMLError)`` from ``hermes_yaml``, resolved once per process.
+
+    Imported lazily, and OUTSIDE every recovery handler: an engine that cannot be imported is an
+    environment fault, and no caller may turn it into a parsed-empty answer.
+    """
+    global _yaml_backend_pair
+    if _yaml_backend_pair is None:
+        from hermes_yaml import YAMLError, safe_load
+        _yaml_backend_pair = (safe_load, YAMLError)
+    return _yaml_backend_pair
 
 
 def yaml_load(content: str):
     """Parse YAML with the shared safe loader, imported lazily."""
-    global _yaml_load_fn
-    if _yaml_load_fn is None:
-        from hermes_yaml import safe_load
-        _yaml_load_fn = safe_load
-    return _yaml_load_fn(content)
+    load, _ = _yaml_backend()
+    return load(content)
+
+
+def _flat_frontmatter(yaml_content: str) -> Dict[str, Any]:
+    """Recover ``key: value`` pairs from frontmatter that is not valid YAML.
+
+    Top-level lines only, and the first occurrence wins. An indented ``description:`` belongs to
+    the mapping above it: letting it through overwrote the real top-level key with a nested value,
+    and the read is flat only because the document never parsed, so it must not invent structure.
+    """
+    recovered: Dict[str, Any] = {}
+    for line in yaml_content.strip().split("\n"):
+        if not line or line[0] in " \t#-":
+            continue
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        key = key.strip()
+        if key and key not in recovered:
+            recovered[key] = value.strip()
+    return recovered
 
 
 def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     """Parse YAML frontmatter from markdown; returns (frontmatter_dict, body).
-    Malformed YAML falls back to key:value line splitting. A leading UTF-8 BOM
-    (Windows editors) is stripped first or it would defeat the ``---`` fence check."""
+
+    Frontmatter that is not valid YAML falls back to :func:`_flat_frontmatter`. A MISSING YAML
+    ENGINE is not that case: it is an environment fault, raised as
+    ``hermes_yaml.YamlEngineUnavailable`` and never recovered from, because a flat read of a
+    nested block reports a nested key as a top-level one — a different answer, not a lesser one.
+
+    A leading UTF-8 BOM (Windows editors) is stripped first or it would defeat the ``---`` fence
+    check.
+    """
     content = content.removeprefix("\ufeff")
     end_match = re.search(r"\n---\s*\n", content[3:]) if content.startswith("---") else None
     if not end_match:
         return {}, content
     yaml_content = content[3 : end_match.start() + 3]
     body = content[end_match.end() + 3 :]
+    load, yaml_error = _yaml_backend()
     frontmatter: Dict[str, Any] = {}
     try:
-        parsed = yaml_load(yaml_content)
+        parsed = load(yaml_content)
         if isinstance(parsed, dict):
             frontmatter = parsed
-    except Exception:
-        for line in yaml_content.strip().split("\n"):
-            if ":" in line:
-                key, value = line.split(":", 1)
-                frontmatter[key.strip()] = value.strip()
+    except yaml_error:
+        logger.debug("Frontmatter did not parse as YAML; recovering flat top-level keys")
+        frontmatter = _flat_frontmatter(yaml_content)
     return frontmatter, body
 
 

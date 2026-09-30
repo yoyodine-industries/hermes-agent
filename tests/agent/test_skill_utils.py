@@ -1,8 +1,13 @@
 """Tests for agent/skill_utils.py."""
 
 
+import os
+
 import pytest
 
+from hermes_yaml import YAMLError, YamlEngineUnavailable
+
+from agent import skill_utils
 from agent.skill_utils import (
     get_disabled_skill_names,
     get_external_skills_dirs,
@@ -335,4 +340,131 @@ class TestBOMToleranceSiblingSites:
         fm = _split_frontmatter("\ufeff---\nname: bp\n---\nbody")
         assert fm is not None
         assert fm.get("name") == "bp"
+
+
+# ── parse_frontmatter: a missing YAML engine is not content ────────────────
+
+NESTED_DESCRIPTION_SKILL = (
+    "---\n"
+    "name: google-workspace\n"
+    "description: Set up Google Workspace credentials for mail and calendar access.\n"
+    "metadata:\n"
+    "  required_credential_files:\n"
+    "    - path: credentials.json\n"
+    "      description: GCP OAuth client secret downloaded from the cloud console.\n"
+    "---\n"
+    "\n"
+    "# Google Workspace\n"
+)
+
+
+class TestFrontmatterEngineFailureIsNotContent:
+    """A YAML engine that cannot be imported must never be reported as a parse result.
+
+    The defect this covers: ``parse_frontmatter`` caught EVERY exception, so a missing engine
+    (an ``ImportError`` raised while importing ``hermes_yaml``) took the malformed-content path
+    and returned a flattened top-level dict. Its callers then read ``metadata`` as a str and the
+    nested ``description:`` as if it were the skill's own description — a confident wrong answer
+    produced by nothing but the interpreter the consumer happened to run under.
+    """
+
+    def test_nested_duplicate_description_keeps_the_nested_truth(self):
+        frontmatter, body = parse_frontmatter(NESTED_DESCRIPTION_SKILL)
+        assert frontmatter["description"] == (
+            "Set up Google Workspace credentials for mail and calendar access."
+        )
+        nested = frontmatter["metadata"]["required_credential_files"][0]
+        assert nested["description"] == (
+            "GCP OAuth client secret downloaded from the cloud console."
+        )
+        assert body == "# Google Workspace\n"
+
+    @pytest.mark.parametrize("engine_failure", [ImportError, YamlEngineUnavailable])
+    def test_engine_failure_raises_instead_of_flattening(self, engine_failure, monkeypatch):
+        # Both shapes the engine can fail in: the lazy import of ``hermes_yaml`` itself, and an
+        # importable ``hermes_yaml`` whose engine is absent (safe_load raises the named error).
+        def broken_load(_content):
+            raise engine_failure("ruamel.yaml is not importable in /nonexistent/python")
+
+        monkeypatch.setattr(skill_utils, "_yaml_backend_pair", (broken_load, YAMLError))
+        with pytest.raises(engine_failure):
+            parse_frontmatter(NESTED_DESCRIPTION_SKILL)
+
+    def test_flat_recovery_is_top_level_only_and_first_wins(self):
+        # Genuinely malformed YAML (unquoted colon in a value, then a duplicate top-level key)
+        # still recovers — but the nested duplicate can no longer overwrite the real top-level
+        # key, which is what made the flattened read look like a nested one.
+        malformed = (
+            "---\n"
+            "name: broken\n"
+            "description: Recovered: keep this one\n"
+            "metadata:\n"
+            "  description: nested, must not win\n"
+            "name: duplicate, must not win either\n"
+            "---\n"
+            "\n"
+            "# Body\n"
+        )
+        frontmatter, _ = parse_frontmatter(malformed)
+        assert frontmatter["description"] == "Recovered: keep this one"
+        assert frontmatter["name"] == "broken"
+        assert frontmatter["metadata"] == ""
+
+
+class TestHermesYamlEngineGuard:
+    """``hermes_yaml`` imports where ruamel.yaml cannot, and refuses to parse there.
+
+    Forcing the dependency import to fail is the only honest way to prove this: the module must
+    still import (so callers can ask ``engine_available()`` and catch one named error) and every
+    operation that needs the engine must raise rather than return a document.
+    """
+
+    def test_engine_absent_refuses_to_parse_and_names_the_interpreter(self, tmp_path):
+        import subprocess
+        import sys
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        probe = tmp_path / "probe_engine_absent.py"
+        probe.write_text(
+            "import importlib.abc\n"
+            "import sys\n"
+            "\n"
+            "\n"
+            "class _BlockRuamel(importlib.abc.MetaPathFinder):\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'ruamel' or name.startswith('ruamel.'):\n"
+            "            raise ImportError('ruamel blocked by the engine-absent probe')\n"
+            "        return None\n"
+            "\n"
+            "\n"
+            "sys.meta_path.insert(0, _BlockRuamel())\n"
+            "import hermes_yaml\n"
+            "\n"
+            "print('engine_available=%r' % hermes_yaml.engine_available())\n"
+            "print('engine_name=%r' % hermes_yaml.ENGINE)\n"
+            "try:\n"
+            "    hermes_yaml.safe_load('a: 1')\n"
+            "except hermes_yaml.YamlEngineUnavailable as exc:\n"
+            "    message = str(exc)\n"
+            "    print('raised=YamlEngineUnavailable')\n"
+            "    print('names_interpreter=%r' % (sys.executable in message))\n"
+            "    print('names_ruamel=%r' % ('ruamel' in message))\n"
+            "else:\n"
+            "    print('raised=none')\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [sys.executable, str(probe)],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            env={**os.environ, "PYTHONPATH": repo_root},
+            check=True,
+        )
+        assert "engine_available=False" in completed.stdout
+        assert "engine_name=''" in completed.stdout
+        assert "raised=YamlEngineUnavailable" in completed.stdout
+        assert "names_interpreter=True" in completed.stdout
+        assert "names_ruamel=True" in completed.stdout
+
 
