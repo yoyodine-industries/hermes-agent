@@ -113,16 +113,19 @@ def test_config_defaults_ship_the_budget_keys(kanban_home):
     assert DEFAULT_CONFIG["kanban"]["default_max_turns"] == kbd.DEFAULT_MAX_TURNS
     table = kbd.configured_default_max_turns()
     assert table == kbd.DEFAULT_MAX_TURNS
-    assert (table["default"], table["worker"], table["coder"], table["stl"]) == (60, 60, 120, 120)
+    assert (table["default"], table["worker"], table["coder"], table["stl"]) == (120, 60, 120, 120)
+    assert table["_fallback"] == 60
+    assert "yoyodine-majordomo" not in table
 
 
 def test_turn_ceiling_resolution_prefers_exact_id_then_suffix(kanban_home):
-    """Lane -> turns: exact profile id beats the role suffix, then ``default``."""
+    """Lane -> turns: exact profile id beats the role suffix, then ``_fallback``."""
     assert kbd.resolve_default_max_turns("yoyodine-platform-worker") == 60
     assert kbd.resolve_default_max_turns("yoyodine-platform-coder") == 120
     assert kbd.resolve_default_max_turns("yoyodine-platform-stl") == 120
-    assert kbd.resolve_default_max_turns("yoyodine-majordomo") == 120   # exact-id override
-    assert kbd.resolve_default_max_turns("unknown-lane") == 60          # 'default'
+    assert kbd.resolve_default_max_turns("default") == 120              # the seat: exact profile-id match
+    assert kbd.resolve_default_max_turns("yoyodine-majordomo") == 60    # dead handle -> no key, no suffix
+    assert kbd.resolve_default_max_turns("unknown-lane") == 60          # '_fallback'
     assert kbd.resolve_default_max_turns("yoyodine-platform-worker", 7) == 7  # per-card wins
 
 
@@ -296,7 +299,7 @@ def test_explicit_cap_trip_keeps_the_park_untyped(kanban_home, monkeypatch):
 def test_worker_argv_carries_the_lane_budget(kanban_home, monkeypatch, tmp_path):
     coder = _spawn_task(kb, assignee="yoyodine-platform-coder")
     worker = _spawn_task(kb, assignee="yoyodine-platform-worker")
-    majordomo = _spawn_task(kb, assignee="yoyodine-majordomo")
+    seat = _spawn_task(kb, assignee="default")
 
     def _flag(cmd, name):
         assert name in cmd, f"{name} missing from {cmd}"
@@ -304,12 +307,12 @@ def test_worker_argv_carries_the_lane_budget(kanban_home, monkeypatch, tmp_path)
 
     coder_cmd = kbd._worker_argv(coder, "yoyodine-platform-coder", None)
     worker_cmd = kbd._worker_argv(worker, "yoyodine-platform-worker", None)
-    majordomo_cmd = kbd._worker_argv(majordomo, "yoyodine-majordomo", None)
+    seat_cmd = kbd._worker_argv(seat, "default", None)
 
     assert _flag(coder_cmd, "--max-turns") == "120"
     assert _flag(coder_cmd, "--run-budget") == str(kbd.DEFAULT_MAX_RUNTIME_SECONDS)
     assert _flag(worker_cmd, "--max-turns") == "60"
-    assert _flag(majordomo_cmd, "--max-turns") == "120"
+    assert _flag(seat_cmd, "--max-turns") == "120"
     # Both flags live on the `chat` subcommand, so they must ride after it.
     assert coder_cmd.index("--max-turns") > coder_cmd.index("chat")
 
@@ -339,7 +342,7 @@ def test_worker_argv_parses_through_the_real_cli(kanban_home, monkeypatch, tmp_p
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
     args = parser.parse_args(captured["cmd"][3:])
-    assert args.max_turns == 60          # elias -> unknown lane -> 'default'
+    assert args.max_turns == 60          # elias -> unknown lane -> '_fallback'
     assert args.run_budget == 900.0      # explicit per-card cap wins
 
 

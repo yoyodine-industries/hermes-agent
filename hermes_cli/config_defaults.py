@@ -1877,12 +1877,15 @@ DEFAULT_CONFIG = {
         # Kept identical to DEFAULT_MAX_TURNS in hermes_cli/kanban_db_dispatch.py (pinned by
         # tests/hermes_cli/test_kanban_runtime_budget.py).
         "default_max_turns": {
-            "default": 60,
+            # The seat's key IS its profile id ('default'), so it needs no suffix rule. The catch-all
+            # for an assignee matching no key and no role suffix is '_fallback' -- a name that cannot
+            # collide with a profile id or a suffix, precisely BECAUSE 'default' is a real lane here.
+            "default": 120,
             "worker": 60,
             "coder": 120,
             "stl": 120,
             "sme": 120,
-            "yoyodine-majordomo": 120,
+            "_fallback": 60,
         },
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.

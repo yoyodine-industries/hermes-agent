@@ -1908,17 +1908,24 @@ def configured_max_in_progress() -> Optional[int]:
 DEFAULT_MAX_RUNTIME_SECONDS = 1200
 
 # Lane turn ceiling passed to every worker as ``--max-turns`` (tool iterations inside ONE turn),
-# resolved exact-profile-id -> role suffix after the last '-' -> 'default'. Mirrors the shipped
+# resolved exact-profile-id -> role suffix after the last '-' -> '_fallback'. Mirrors the shipped
 # ``kanban.default_max_turns`` table (test_kanban_runtime_budget pins the pair against drift);
 # it is the fallback for a fleet whose config key is missing, so ``--max-turns`` stays bounded.
+# '_fallback' is NOT the seat's key: the seat is the profile id 'default', which is an exact match,
+# so the catch-all must be a distinct name or the guard is widened to the seat's ceiling.
 DEFAULT_MAX_TURNS = {
-    "default": 60,
+    "default": 120,
     "worker": 60,
     "coder": 120,
     "stl": 120,
     "sme": 120,
-    "yoyodine-majordomo": 120,
+    "_fallback": 60,
 }
+
+# Lane key used when an assignee matches no exact profile id and no role suffix. Distinct from
+# 'default' on purpose: 'default' is the ops-head seat's real profile id, so reusing it here would
+# silently raise the catch-all from 60 to the seat's 120 for every unknown assignee.
+_FALLBACK_KEY = "_fallback"
 
 
 def configured_default_max_runtime_seconds() -> Optional[int]:
@@ -1991,10 +1998,14 @@ def resolve_default_max_runtime_seconds(
 def resolve_default_max_turns(
     assignee: Optional[str], card_value: Optional[int] = None,
 ) -> Optional[int]:
-    """Turn ceiling for a lane: exact profile id -> role suffix -> ``default``.
+    """Turn ceiling for a lane: exact profile id -> role suffix -> ``_fallback``.
 
     ``card_value`` (a per-card explicit value) always wins. ``None`` means "not
     configured" and callers omit ``--max-turns`` rather than guessing one.
+
+    ``_fallback`` is deliberately NOT the key a real lane resolves to: the ops-head
+    seat's profile id is ``default``, so keying the catch-all ``default`` would hand
+    every unknown assignee the seat's ceiling and defeat the guard.
     """
     if card_value is not None:
         try:
@@ -2011,7 +2022,7 @@ def resolve_default_max_turns(
         suffix = key.rsplit("-", 1)[-1]
         if suffix in table:
             return table[suffix]
-    return table.get("default")
+    return table.get(_FALLBACK_KEY)
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
