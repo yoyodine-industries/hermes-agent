@@ -188,10 +188,15 @@ class DispatchResult:
     tick before spawning, so telemetry/CLI/dashboard can show the dispatcher
     acting on the fallback rule rather than explicit assignments."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
-    """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
-    Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
-    on multi-lane setups, NOT operator-actionable; tracked apart so health
-    telemetry can tell "stuck" from "correctly idle"."""
+    """Ready task ids whose assignee names no live Hermes profile and is not a
+    DECLARED control-plane assignee (``kanban.control_plane_assignees``). This is a
+    DEFECT signal, not a steady state: the 2026-10-02 finding (ops/t_5b9dbe02)
+    measured 15 rows parked here silently while health telemetry described the
+    board as "correctly idle". Two nodes now act on it — ``create_task`` refuses the
+    write for an undeclared non-profile assignee, and the skip branch in
+    ``_dispatch_lane_task`` files ONE deduped escalation card per
+    ``(board, assignee)`` bucket. A DECLARED control-plane pull lane stays exempt:
+    its skip is the expected steady state."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -2237,6 +2242,89 @@ def _file_stall_escalation(
     return task_id
 
 
+def _file_nonspawnable_escalation(
+    conn: sqlite3.Connection, *, board: Optional[str], assignee: str,
+) -> Optional[str]:
+    """File ONE deduped escalation card for a non-spawnable assignee bucket.
+
+    ``create_task`` refuses a card whose assignee names no live profile; this is
+    the BELT for rows already on a board and anything that still gets in. A card
+    bucketed ``skipped_nonspawnable`` sits in ``ready`` forever — a silent failure —
+    so the bucket now ACTS: one escalation card per ``(board, assignee)`` bucket,
+    routed by the SAME deterministic resolver the starved-queue escalation uses
+    (``_stall_escalation_assignee``), deduped across ticks by the idempotency key
+    ``kanban-nonspawnable:{board}:{assignee}``.
+
+    Names DECLARED in ``kanban.control_plane_assignees`` are EXEMPT: for a declared
+    control-plane pull lane / probe fixture the skip is the expected steady state,
+    not a defect. Failing to file must never break a tick — every error is logged
+    and swallowed, exactly as ``_file_stall_escalation``.
+    """
+    bucket = board or _kb.DEFAULT_BOARD
+    try:
+        declared = _kb.control_plane_assignee_names()
+    except Exception:  # noqa: BLE001 — an unreadable declaration claims nothing
+        declared = frozenset()
+    if assignee in declared:
+        return None
+    seat = _stall_escalation_assignee([assignee])
+    if seat is None:
+        # No routable seat for this home: say so loudly rather than filing a card
+        # that can never be spawned. This is the one path that stays a log line.
+        _kb._log.error(
+            "kanban dispatch: board %r has card(s) on non-spawnable assignee %r and "
+            "no escalation seat resolves — set kanban.orchestrator_profile or "
+            "kanban.default_assignee to a live profile",
+            bucket, assignee,
+        )
+        return None
+    ready_ids = [
+        row["id"] for row in conn.execute(
+            "SELECT id FROM tasks WHERE status = 'ready' AND assignee = ? "
+            "ORDER BY created_at, id", (assignee,),
+        )
+    ]
+    body = "\n".join([
+        f"Board {bucket!r}: {len(ready_ids)} card(s) are `ready` on assignee "
+        f"{assignee!r}, which names no live Hermes profile — the dispatcher can never "
+        f"spawn them, so they would sit in `ready` forever.",
+        "",
+        f"ready_cards: {', '.join(ready_ids[:40])}"
+        + (f" (+{len(ready_ids) - 40} more)" if len(ready_ids) > 40 else ""),
+        "",
+        "This is a DEFECT signal, not a steady state (2026-10-02 finding, "
+        "ops/t_5b9dbe02). Deterministic routing: the bucket's assignee decides the "
+        "seat, and this card is filed to that seat once per (board, assignee).",
+        "Remedy: reassign the cards to a live profile, or — only for a declared "
+        "control-plane pull lane / probe fixture — add the name to "
+        "kanban.control_plane_assignees.",
+    ])
+    key = f"kanban-nonspawnable:{bucket}:{assignee}"
+    try:
+        task_id = _kb.create_task(
+            conn,
+            title=f"kanban: card(s) on non-spawnable assignee {assignee!r} on {bucket}",
+            body=body,
+            assignee=seat,
+            created_by="kanban-dispatcher",
+            board=board,
+            idempotency_key=key,
+            workspace_kind="scratch",
+        )
+    except Exception as exc:  # noqa: BLE001 — never break the tick over reporting
+        _kb._log.error(
+            "kanban dispatch: could not file the nonspawnable escalation for board "
+            "%r assignee %r (%s): %s", bucket, assignee, type(exc).__name__, exc,
+        )
+        return None
+    _kb._log.warning(
+        "kanban dispatch: board %r has %d ready card(s) on non-spawnable assignee "
+        "%r; escalated to %s as %s",
+        bucket, len(ready_ids), assignee, seat, task_id,
+    )
+    return task_id
+
+
 @dataclass
 class _StallTracker:
     """Per-board consecutive-stall bookkeeping (process-local, like the
@@ -2598,6 +2686,12 @@ def _dispatch_lane_task(
                 if (last is None or last["kind"] != "skipped_nonspawnable"
                         or last["payload"] != _kb._json_or_null({"assignee": assignee})):
                     _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
+            # ...and ACT (standing rule: no silent failures). The per-task event
+            # names the strand to `show`/`tail`; this files ONE deduped escalation
+            # card per (board, assignee) bucket so a human seat OWNS it. Declared
+            # control-plane names are exempt inside the helper; errors are swallowed
+            # there too, so a filing failure can never break the tick.
+            _file_nonspawnable_escalation(conn, board=board, assignee=assignee)
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.

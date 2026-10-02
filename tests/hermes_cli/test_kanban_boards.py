@@ -311,6 +311,12 @@ class TestCLI:
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
+        # The create-time assignee gate refuses a non-live, undeclared assignee, and
+        # this test's fixture assignee "dev" is not a profile in a bare HERMES_HOME --
+        # declare it, exactly as a probe fixture must be (card t_c8ff9bc1).
+        (tmp_path / "config.yaml").write_text(
+            "kanban:\n  control_plane_assignees: [\"dev\"]\n", encoding="utf-8",
+        )
         assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
         assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
 
