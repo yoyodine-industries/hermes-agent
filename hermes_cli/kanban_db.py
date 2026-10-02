@@ -1252,6 +1252,107 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+#: Per-home declaration of NON-profile assignees (``kanban.control_plane_assignees``).
+#: Empty by default; an unreadable config declares NOTHING (fail-closed), the same
+#: discipline as ``kanban.dispatch_profiles`` in ``kanban_db_dispatch``.
+_CONTROL_PLANE_ASSIGNEES_KEY = "control_plane_assignees"
+
+
+def _control_plane_assignees_from_config() -> frozenset[str]:
+    """Read ``kanban.control_plane_assignees`` for THIS home; fail-closed.
+
+    A card's assignee is normally a LIVE Hermes profile id because the dispatcher
+    spawns ``hermes -p <assignee>``. A control-plane pull lane (a Claude Code
+    terminal that claims via ``claim_task``) and a probe/fixture assignee are the
+    one legal exception; the producer DECLARES them here once, converting an
+    accident into a decision.
+
+    Returns the empty set when the key is absent (the default), when it is present
+    but empty, and when the config cannot be read — the user layer is read WITHOUT
+    the ``DEFAULT_CONFIG`` merge (whose placeholder would make the key look present
+    in every home), matching ``_dispatch_profile_allowlist``.
+    """
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+
+        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+    except Exception as exc:  # noqa: BLE001 — a corrupt config must not widen the gate
+        _log.warning(
+            "kanban: could not read kanban.%s (%s: %s) — this home declares NO "
+            "non-profile assignee until the config is readable",
+            _CONTROL_PLANE_ASSIGNEES_KEY, type(exc).__name__, exc,
+        )
+        return frozenset()
+    if not isinstance(kanban, dict) or _CONTROL_PLANE_ASSIGNEES_KEY not in kanban:
+        return frozenset()
+    raw = kanban[_CONTROL_PLANE_ASSIGNEES_KEY]
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return frozenset()
+    names = [str(n) for n in raw] if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    from hermes_cli.profiles import normalize_profile_name
+
+    declared: set[str] = set()
+    for n in names:
+        try:
+            declared.add(normalize_profile_name(n))
+        except ValueError:
+            continue
+    return frozenset(declared)
+
+
+def control_plane_assignee_names() -> frozenset[str]:
+    """Declared non-profile assignees legal for this home (see the reader above)."""
+    return _control_plane_assignees_from_config()
+
+
+def unknown_assignee_refusal(assignee: Optional[str]) -> Optional[str]:
+    """Legible refusal for a non-live, undeclared assignee; ``None`` when legal.
+
+    The predicate is the SAME one the dispatcher consults —
+    ``hermes_cli.profiles.profile_exists``, normalized via
+    ``normalize_profile_name`` — so create-time and dispatch-time can never
+    disagree about which names are spawnable. ``None``/empty is legal (the
+    dispatcher's ``default_assignee`` fills it in); a live profile is legal; a name
+    DECLARED in ``kanban.control_plane_assignees`` is legal. Everything else is
+    refused, fail-closed.
+    """
+    if not assignee:
+        return None
+    from hermes_cli.profiles import (
+        list_profile_names, normalize_profile_name, profile_exists,
+    )
+
+    try:
+        canon = normalize_profile_name(assignee)
+    except ValueError:
+        return (
+            f"assignee {assignee!r} is not a valid profile name — every card must "
+            f"name a live Hermes profile id"
+        )
+    if canon in control_plane_assignee_names():
+        return None
+    if profile_exists(canon):
+        return None
+    import difflib
+
+    live = sorted(list_profile_names())
+    neighbours = difflib.get_close_matches(canon, live, n=3, cutoff=0.4)
+    hint = (
+        f" nearest live profile(s): {', '.join(repr(n) for n in neighbours)}."
+        if neighbours else ""
+    )
+    shown = ", ".join(repr(n) for n in live[:20])
+    if len(live) > 20:
+        shown += f" (+{len(live) - 20} more)"
+    return (
+        f"assignee {canon!r} is not a live Hermes profile and is not declared in "
+        f"kanban.control_plane_assignees, so no dispatcher would ever spawn it "
+        f"(the card would sit in `ready` forever).{hint} Live profile(s): {shown}. "
+        f"Assign a live profile, or — only for a genuine control-plane pull lane or "
+        f"probe fixture — declare the name once in kanban.control_plane_assignees."
+    )
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1289,6 +1390,14 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    # CREATE-TIME ENFORCEMENT (ruling §4 on ops/t_5b9dbe02): a card whose assignee
+    # names no live profile is a silent strand — the dispatcher buckets it
+    # `skipped_nonspawnable` on every tick and it never runs. Refuse the write HERE,
+    # at the one path every producer reaches, with a legible error naming the handle
+    # and the live set. The declared escape is `kanban.control_plane_assignees`.
+    _assignee_refusal = unknown_assignee_refusal(assignee)
+    if _assignee_refusal is not None:
+        raise ValueError(_assignee_refusal)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:

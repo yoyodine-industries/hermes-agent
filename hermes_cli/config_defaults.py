@@ -1932,6 +1932,17 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
+        # Non-profile assignees this home DECLARES legal (list or comma-separated string).
+        # A card's assignee is normally a live Hermes profile id; create_task REFUSES an
+        # assignee that names no live profile, because the dispatcher could never spawn
+        # it and the card would sit in `ready` forever (ops/t_5b9dbe02). A
+        # control-plane pull lane (e.g. a Claude Code terminal that claims via
+        # `claim_task`) or a probe/fixture assignee is the one legal exception, and it is
+        # legal only when declared here. Default empty = fail-closed; an ABSENT key, an
+        # empty list, and an unreadable config all declare nothing. Names declared here
+        # are also EXEMPT from the dispatcher's non-spawnable escalation card, since for
+        # a declared control-plane lane the skip is the expected steady state.
+        "control_plane_assignees": [],
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

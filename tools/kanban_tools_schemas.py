@@ -400,10 +400,12 @@ KANBAN_CREATE_SCHEMA = _schema(
     {
         "title": _prop("string", "Short task title (required)."),
         "assignee": _prop("string", (
-                "Profile name that should execute this task "
-                "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                "Required — tasks without an assignee are never "
-                "dispatched."
+                "Profile name that should execute this task, and it MUST be a live "
+                "profile id — a card whose assignee names no live profile is "
+                "REFUSED at creation (the dispatcher could never spawn it). A "
+                "genuine control-plane pull lane or probe fixture must be declared "
+                "once in `kanban.control_plane_assignees`. Required — tasks "
+                "without an assignee are never dispatched."
         )),
         "body": _prop("string", (
                 "Opening post: full spec, acceptance criteria, "
