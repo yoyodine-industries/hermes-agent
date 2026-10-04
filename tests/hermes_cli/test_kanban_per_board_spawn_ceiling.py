@@ -9,8 +9,7 @@ warns and is ignored, a board capped below its running count spawns nothing
 (never killing a worker), and a spawn the ceiling held back is recorded as
 ``deferred_board_capped`` in the tick result and the run output.
 
-These tests exercise the REAL worktree modules (the ``_dispatch`` / ``_tree``
-precondition is asserted in ``test_imports_resolve_to_this_tree``).
+These tests exercise the REAL worktree modules.
 """
 
 from __future__ import annotations

@@ -520,14 +520,15 @@ class _KanbanDispatcher:
         # slot count could not be read): every board keeps its whole-budget
         # behaviour. Otherwise a board with work that drew no slot gets 0, not
         # ``None`` — it must not spend the slots the other boards were given.
-        shares = host_budget_shares(free, with_work)
         if self.settings.max_spawn_by_board:
-            # A per-board ceiling is configured: recompute by ascending ceiling
+            # A per-board ceiling is configured: allocate by ascending ceiling
             # so a capped board's slack reaches the next one instead of being
             # stranded on the head.
             shares = host_budget_shares_by_ceiling(
                 free, with_work, self.settings.max_spawn_by_board
             )
+        else:
+            shares = host_budget_shares(free, with_work)
         results: list[tuple[str, Optional[object]]] = []
         for slug in order:
             share = shares.get(slug, 0) if (free is not None and slug in with_work) else None
