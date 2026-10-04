@@ -20,6 +20,7 @@ from tools.skills_tool import (
     skill_view,
     MAX_DESCRIPTION_LENGTH,
 )
+from hermes_yaml import YamlEngineUnavailable
 
 
 def _make_skill(
@@ -276,6 +277,47 @@ class TestFindAllSkills:
 
         assert [s["name"] for s in skills] == ["knowledge-brain"]
         assert skills[0]["category"] == "linked"
+
+
+class TestSkillsListingEngineFault:
+    """An unavailable YAML engine must surface as a skill-load error, not an empty listing.
+
+    ``_find_all_skills`` wrapped ``_parse_frontmatter`` in a broad ``except Exception`` and
+    logged the fault at DEBUG: on an engine-less interpreter every skill silently vanished and
+    ``skills_list`` answered ``success: true, skills: []`` — "no skills found" standing in for a
+    broken environment. The engine fault must reach the tool layer, which turns it into an error
+    body naming the engine.
+    """
+
+    @pytest.mark.parametrize("engine_failure", [ImportError, YamlEngineUnavailable])
+    def test_engine_fault_surfaces_as_skill_load_error(self, tmp_path, monkeypatch, engine_failure):
+        _make_skill(tmp_path, "skill-a")
+
+        def _raise(_content):
+            raise engine_failure("ruamel.yaml is not importable in /nonexistent/python")
+
+        monkeypatch.setattr(skills_tool_module, "_parse_frontmatter", _raise)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            result = json.loads(skills_list())
+
+        assert result["success"] is False
+        assert "ruamel" in result["error"]
+        assert result.get("skills") != []  # never the "empty listing" reading
+
+    def test_non_engine_parse_error_still_skips_that_skill(self, tmp_path, monkeypatch):
+        # The engine clause is narrower than the old blanket: an ordinary parse failure on one
+        # file still drops only that file, leaving the rest of the listing intact.
+        _make_skill(tmp_path, "skill-a")
+
+        def _raise(_content):
+            raise ValueError("ordinary content bug")
+
+        monkeypatch.setattr(skills_tool_module, "_parse_frontmatter", _raise)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            result = json.loads(skills_list())
+
+        assert result["success"] is True
+        assert result["skills"] == []
 
 
 # ---------------------------------------------------------------------------

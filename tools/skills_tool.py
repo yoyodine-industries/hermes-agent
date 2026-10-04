@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
+from hermes_yaml import YamlEngineUnavailable
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
@@ -30,6 +31,12 @@ from tools.skills_tool_dedup import (  # noqa: F401
 from tools.skill_provenance import is_background_review
 
 logger = logging.getLogger(__name__)
+
+# An unavailable YAML engine is an ENVIRONMENT fault, never a skill's content. The broad
+# ``except Exception`` below would otherwise log it at DEBUG and let every skill silently vanish
+# from the listing ("No skills found"), which reads as a bad skill tree rather than a broken
+# interpreter. Re-raise it so ``skills_list`` answers with a skill-load error naming the engine.
+_ENGINE_FAULT_ERRORS = (YamlEngineUnavailable, ImportError)
 
 # Per-session discovery cache: {cache_key: (signature, timestamp, skills_list)}. Signature =
 # per-dir max mtime of the dir and its immediate children (add/remove inside a category does
@@ -218,6 +225,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                                "category": _get_category_from_path(skill_md)})
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
+            except _ENGINE_FAULT_ERRORS:
+                # Environment fault, not this skill's content: surface it instead of letting the
+                # whole tree silently disappear from the listing.
+                raise
             except Exception as e:
                 logger.debug("Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True)
     # Keyed by the signature computed BEFORE the scan: a write racing the scan changes the

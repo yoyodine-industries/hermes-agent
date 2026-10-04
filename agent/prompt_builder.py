@@ -28,9 +28,17 @@ from agent.skill_utils import (
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
+from hermes_yaml import YamlEngineUnavailable
 from utils import atomic_json_write, file_signature
 
 logger = logging.getLogger(__name__)
+
+# An unavailable YAML engine (missing ``ruamel.yaml``) is an ENVIRONMENT fault, never skill
+# content — the same class ``hermes_yaml`` raises rather than returning a document. Every
+# broad ``except Exception`` on a skills surface would otherwise downgrade it to "skill missing"
+# or "compatible with no description", which is a different answer, not a lesser one. These
+# surfaces re-raise it so the fault reaches a caller that can name the engine.
+_ENGINE_FAULT_ERRORS = (YamlEngineUnavailable, ImportError)
 
 
 # Default read deadline for context files (SOUL.md, AGENTS.md, .cursorrules,
@@ -1234,7 +1242,12 @@ def _build_snapshot_entry(skill_file: Path, skills_dir: Path, frontmatter: dict,
 
 
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
-    """Read a SKILL.md once -> (is_compatible, frontmatter, description); errors yield (True, {}, "")."""
+    """Read a SKILL.md once -> (is_compatible, frontmatter, description).
+
+    A content/read error yields ``(True, {}, "")`` so one odd file cannot kill the prompt build.
+    An UNAVAILABLE YAML ENGINE does not: that is an environment fault, not this skill's content,
+    and it propagates so it can never be reported as a compatible skill with no description.
+    """
     try:
         raw = skill_file.read_text(encoding="utf-8-sig")
         frontmatter, _ = parse_frontmatter(raw)
@@ -1242,6 +1255,8 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter) or not skill_matches_apps(frontmatter):
             return False, frontmatter, extract_skill_description(frontmatter)
         return True, frontmatter, extract_skill_description(frontmatter)
+    except _ENGINE_FAULT_ERRORS:
+        raise
     except Exception as e:
         logger.warning("Failed to parse skill file %s: %s", skill_file, e)
         return True, {}, ""
@@ -1324,6 +1339,8 @@ def _read_category_descriptions(root: Path, log_fmt: str) -> dict[str, str]:
             if cat_desc:
                 rel = desc_file.relative_to(root)
                 found["/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"] = str(cat_desc).strip().strip("'\"")
+        except _ENGINE_FAULT_ERRORS:
+            raise
         except Exception as e:
             logger.debug(log_fmt, desc_file, e)
     return found
@@ -1343,6 +1360,8 @@ def _collect_extra_skills(
                 continue
             claimed.add(fm_name)
             skills_by_category.setdefault(entry["category"], []).append((fm_name, f"{desc_prefix}{entry['description']}".strip()))
+        except _ENGINE_FAULT_ERRORS:
+            raise
         except Exception as e:
             logger.debug(log_fmt, skill_file, e)
 
