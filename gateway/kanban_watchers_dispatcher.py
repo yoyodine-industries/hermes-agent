@@ -44,25 +44,45 @@ def order_boards_by_head_priority(priorities: dict) -> list:
     return ranked + unranked
 
 
-def host_budget_shares(
-    free: Optional[int], boards_in_order: list, ceilings: Optional[dict] = None
-) -> dict:
+def host_budget_shares(free: Optional[int], boards_in_order: list) -> dict:
     """How many new workers each board may start this tick, from one budget.
 
     ``free`` is the host-wide free slot count at the start of the tick;
     ``None`` (no cap derived, or the count could not be read) hands out no
     shares at all, so a caller keeps its whole-budget behaviour instead of
     allocating slots nobody proved were free. Every board with startable work
-    takes ONE guaranteed slot in visit order until the budget is gone.
+    takes ONE guaranteed slot in visit order until the budget is gone; the
+    remainder goes to the board visited first, which keeps the head of line
+    ranked first inside a tick without letting it eat the whole budget.
+    """
+    if free is None or not boards_in_order:
+        return {}
+    shares: dict[str, int] = {}
+    remaining = int(free)
+    for slug in boards_in_order:
+        if remaining <= 0:
+            break
+        shares[slug] = 1
+        remaining -= 1
+    if remaining > 0:
+        head = boards_in_order[0]
+        shares[head] = shares.get(head, 0) + remaining
+    return shares
 
-    The remainder is then handed out by ascending CEILING: a board that named a
-    ``kanban.max_spawn_by_board`` ceiling may not be given more than it can use,
-    so the surplus flows to the next board instead of being stranded on the head
-    (which is what left a capped board below its own ceiling while the capped
-    head held the rest). An unnamed board has no ceiling, so the surplus still
-    reaches it; when NO ceilings are configured every ceiling is unbounded and
-    the ordering reduces to the visit order, which reproduces the historical
-    allocation byte-for-byte (the head takes the whole remainder).
+
+def host_budget_shares_by_ceiling(
+    free: Optional[int], boards_in_order: list, ceilings: Optional[dict] = None
+) -> dict:
+    """``host_budget_shares`` with per-board ``kanban.max_spawn_by_board`` ceilings.
+
+    The remainder is handed out by ascending CEILING: a board that named a
+    ceiling may not be given more than it can use, so the surplus flows to the
+    next board instead of being stranded on the head (which is what left a
+    capped board below its own ceiling while the capped head held the rest). An
+    unnamed board has no ceiling, so the surplus still reaches it; with no
+    ceilings configured every board is unbounded, the ordering reduces to the
+    visit order, and the allocation is the historical one exactly (the head
+    takes the whole remainder).
     """
     if free is None or not boards_in_order:
         return {}
@@ -482,12 +502,15 @@ class _KanbanDispatcher:
         The host-wide budget is SHARED, not raced. Boards are visited in
         head-of-line priority order rotated one board per tick, and the free
         host slots are handed out one guaranteed slot per board with startable
-        work, the remainder by ascending ``kanban.max_spawn_by_board`` ceiling
-        so a capped board's surplus flows on instead of being stranded. Each
-        board may then start at most its share this tick, so a board with a deep
-        queue can no longer take the slot another board's queue is waiting for.
-        A board deferred by the host budget for over an hour is reported
+        work, the remainder to the board visited first. Each board may then
+        start at most its share this tick, so a board with a deep queue can no
+        longer take the slot another board's queue is waiting for. A board
+        deferred by the host budget for over an hour is reported
         (``HostCapStarvationClock``).
+
+        When ``kanban.max_spawn_by_board`` names a ceiling, the remainder is
+        handed out by ascending ceiling instead, so a capped board's surplus
+        flows on rather than being stranded on the head.
         """
         priorities = self._head_of_line_priorities()
         order = self.board_visit_order(priorities)
@@ -497,9 +520,14 @@ class _KanbanDispatcher:
         # slot count could not be read): every board keeps its whole-budget
         # behaviour. Otherwise a board with work that drew no slot gets 0, not
         # ``None`` — it must not spend the slots the other boards were given.
-        shares = host_budget_shares(
-            free, with_work, ceilings=self.settings.max_spawn_by_board
-        )
+        shares = host_budget_shares(free, with_work)
+        if self.settings.max_spawn_by_board:
+            # A per-board ceiling is configured: recompute by ascending ceiling
+            # so a capped board's slack reaches the next one instead of being
+            # stranded on the head.
+            shares = host_budget_shares_by_ceiling(
+                free, with_work, self.settings.max_spawn_by_board
+            )
         results: list[tuple[str, Optional[object]]] = []
         for slug in order:
             share = shares.get(slug, 0) if (free is not None and slug in with_work) else None

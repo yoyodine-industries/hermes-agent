@@ -283,12 +283,17 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
 
     ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
     skipped_per_profile_capped=3, skipped_nonspawnable=12, skipped_unassigned=1,
-    lockdown=2 (research-sme x2), memory_pressure=critical, host_cap_deferred=3,
-    board_cap_deferred=2`` — the respawn-guard
+    lockdown=2 (research-sme x2), memory_pressure=critical`` — the respawn-guard
     reasons counted per task plus EVERY tick-level hold. Feeds the "dispatcher
     stuck" warnings of the CLI daemon and the embedded gateway dispatcher, which
     otherwise report a bare zero-spawn count while ``hermes kanban tail`` is the
     only place the guard reason is written (#111910).
+
+    Held-back work that no per-card refusal explains is named too: the host-wide
+    ``host_cap_deferred`` and the board's own ``board_cap_deferred`` (its
+    ``kanban.max_spawn_by_board`` ceiling, or the global ``kanban.max_spawn``).
+    Both would otherwise read as an idle queue for the same reason the
+    respawn-guard reasons above would.
 
     Naming every hold matters more than brevity: a line reading ``active_pr=3``
     while 400 ready rows sit in ``skipped_per_profile_capped`` — or 12 in

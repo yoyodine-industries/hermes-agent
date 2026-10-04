@@ -189,14 +189,14 @@ def test_share_allocation_is_identical_without_ceilings():
 def test_share_allocation_flows_the_surplus_by_ceiling():
     # The DoD scenario: ops may hold 2, so it is served first and defcon takes
     # the rest instead of stranding 8 slots on the head.
-    assert kwd.host_budget_shares(10, ["defcon", "ops"], {"defcon": 10, "ops": 2}) == {
+    assert kwd.host_budget_shares_by_ceiling(10, ["defcon", "ops"], {"defcon": 10, "ops": 2}) == {
         "defcon": 8,
         "ops": 2,
     }
     # A capped board releases what it cannot use; unbounded boards take the rest.
-    assert kwd.host_budget_shares(10, ["a", "b"], {"a": 2}) == {"a": 2, "b": 8}
+    assert kwd.host_budget_shares_by_ceiling(10, ["a", "b"], {"a": 2}) == {"a": 2, "b": 8}
     # A tight budget still gives one guaranteed slot per board with work.
-    assert kwd.host_budget_shares(2, ["a", "b"], {"a": 5, "b": 5}) == {"a": 1, "b": 1}
+    assert kwd.host_budget_shares_by_ceiling(2, ["a", "b"], {"a": 5, "b": 5}) == {"a": 1, "b": 1}
 
 
 # ---------------------------------------------------------------------------

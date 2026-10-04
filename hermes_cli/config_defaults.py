@@ -1890,9 +1890,24 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
-        # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
-        # sdlc-review skill. Disable where every review is done manually from the dashboard.
+        # Auto-claim tasks in the review column and spawn the assigned profile with the review
+        # skills named in ``review_skills``. Disable where every review is done manually from the
+        # dashboard.
         "review_dispatch": True,
+        # Skills injected into an auto-claimed REVIEW run on top of the card's own list. Each name
+        # must resolve for the assignee's profile: an unresolved one is SKIPPED and recorded on the
+        # card, never handed to the worker (its preload loader raises on an unknown name and the run
+        # dies at INIT). [] disables the injection entirely.
+        "review_skills": ["sdlc-review"],
+        # Skills injected into EVERY card's run (not just review runs), resolved per LANE at
+        # claim time: a lane-pattern -> skill-names mapping with "*" as the default floor, so a
+        # lane bucket ADDS to the floor. Also accepts a flat list (treated as the floor). Each
+        # name must resolve for the assignee's profile: an unresolved one is SKIPPED and recorded
+        # on the card, never handed to the worker (its preload loader raises on an unknown name
+        # and the run dies at INIT). {} disables the layer; review_skills stays a superset on
+        # review runs. The directive such a skill carries is what makes a lane use the sanctioned
+        # yoyodine verbs instead of hand-rolling.
+        "injected_skills": {},
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
@@ -1934,6 +1949,28 @@ DEFAULT_CONFIG = {
         # ignored with a warning (never fatal, never silently ineffective). Default empty = no
         # overrides. Only the gateway dispatcher (the production scheduler) resolves this map.
         "max_spawn_by_board": {},
+        # Order the READY lane by three passes (designated reach, lane reach, fill) instead of one
+        # straight priority walk, so a lane whose cards are merely ordinarily ranked cannot be
+        # starved by another lane's designated backlog. True = fair lane ordering (the default);
+        # false restores the pre-fairness order exactly. Ruling:
+        # t_b2865b89 (spawn-slot fairness); implementation is _lane_fair_ready_order.
+        "lane_fair_spawn": True,
+        # Slots the READY lane's designated tranche (priority >= TRANCHE_FLOOR) holds back for the
+        # ordinary lanes while spawnable ordinary work waits — the ceiling is
+        # max(ready_budget - designated_pool_reserve, 0). 1 = at most one slot is reserved so a
+        # designated backlog can never take every slot from ordinary work. 0 = no ceiling (the
+        # tranche may fill the whole budget), never below 0.
+        "designated_pool_reserve": 1,
+        # ``max_runtime_seconds`` stamped onto a card that carries NONE, at CLAIM time, so every
+        # running slot recycles within a bounded wall clock and the runtime sweep
+        # (``enforce_max_runtime``) can always reap it — a NULL cap is never reaped, so the tick
+        # budget can otherwise sit at 0 for hours. 0 = no stamp (the pre-existing behaviour).
+        # A card's own value always wins, and an explicit 0 the author set stays unlimited (that
+        # column is the author's opt-out, so the stamp is a COALESCE). The DEFAULTED cap reaches the
+        # sweep ONLY: ``_worker_terminal_timeout_env`` raises a worker's ``TERMINAL_TIMEOUT`` from
+        # the card's EXPLICIT cap alone, so a scheduling default can never silently raise every
+        # lane's terminal command timeout. Ruling: t_b2865b89 (spawn-slot fairness) §4.
+        "default_max_runtime_seconds": 7200,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
@@ -1946,6 +1983,22 @@ DEFAULT_CONFIG = {
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.
         "auto_decompose_per_tick": 3,
+        # Arm a bounded GOAL LOOP on a card whose run died of ITERATION-budget exhaustion, at its
+        # next dispatch. Such a run is proof the card's work does not fit one run's iteration budget
+        # (a ``max_runtime_seconds`` wall is a different failure and is not armed), so the retry is
+        # shaped to continue across turns instead of walking back into the same wall. The trigger is
+        # the ``last_failure_error`` the failed run itself recorded — a column read, no inference —
+        # and ``hermes kanban edit <id> --no-goal`` clears the arm. False = never auto-arm (cards
+        # then need an explicit ``--goal``).
+        "goal_arm_on_budget_death": True,
+        # Turn budget written with that arm (``goal_max_turns``, same column ``--goal-max-turns``
+        # sets). Kept small on purpose: a card that could not finish in 5 continued turns is a card
+        # that needs a human, not a longer loop.
+        "goal_arm_turns": 5,
+        # ``max_runtime_seconds`` written beside the arm WHEN THE CARD CARRIES NONE, so a card that
+        # was previously unbounded cannot loop without a wall. A value the card already carries
+        # always wins (COALESCE), so this only fills a gap.
+        "goal_arm_max_runtime_seconds": 7200,
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
