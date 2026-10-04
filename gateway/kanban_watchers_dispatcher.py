@@ -116,6 +116,72 @@ def host_budget_shares_by_ceiling(
     return shares
 
 
+def host_budget_shares_by_priority(
+    free: Optional[int], cards: list, capacities: Optional[dict] = None
+) -> dict:
+    """Allocate the free host budget by GLOBAL CARD PRIORITY, not board rotation.
+
+    ``cards`` is one ``(priority, slug)`` pair per startable card on every board
+    that has work, supplied board-by-board in VISIT order (``board_visit_order``:
+    head-of-line rank, rotated inside a priority band) and, within a board, in
+    that board's own dispatch order (``priority DESC, created_at ASC``).
+
+    The planner works band by band, highest ``priority`` first, and hands out
+    the free slots ONE AT A TIME, round-robin across the boards that have cards
+    in the band — so a 999999 card on ANY board outranks every 999000 card on
+    every board, and equal-priority work is interleaved between boards instead
+    of one board's whole queue being served first (that interleave is what makes
+    the rotation tie-break in ``board_visit_order`` real). A board never takes
+    more than it can still use: ``capacities[slug]`` is its per-board ceiling
+    (``kanban.max_spawn_by_board`` or ``kanban.max_spawn``) minus what is already
+    running on it, so a board at its ceiling neither consumes nor strands slots
+    further down the list. ``None`` means unbounded.
+
+    This is the fix for the rotation defect: the old allocation gave one
+    guaranteed slot per board in ROTATION order and the whole remainder to the
+    rotation head, so ``with_work[0]`` — not the priority column — chose who took
+    the bulk. Boards that draw no slot are simply absent from the result; the
+    per-board dispatch records that as ``deferred_host_capped``, never a silent
+    idle.
+    """
+    if free is None or not cards:
+        return {}
+    caps = dict(capacities or {})
+    # Preserve the caller's (rotated board) order for the round-robin, and count
+    # each board's cards inside each priority band.
+    band_order: dict[int, list] = {}
+    counts: dict[tuple, int] = {}
+    for priority, slug in cards:
+        band = int(priority)
+        slots = band_order.setdefault(band, [])
+        if slug not in slots:
+            slots.append(slug)
+        counts[(band, slug)] = counts.get((band, slug), 0) + 1
+
+    shares: dict[str, int] = {}
+    remaining = int(free)
+    for band in sorted(band_order, reverse=True):
+        slugs = band_order[band]
+        while remaining > 0:
+            progressed = False
+            for slug in slugs:
+                if remaining <= 0:
+                    break
+                left = counts.get((band, slug), 0)
+                if left <= 0:
+                    continue
+                cap = caps.get(slug)
+                if cap is not None and shares.get(slug, 0) >= max(int(cap), 0):
+                    continue
+                shares[slug] = shares.get(slug, 0) + 1
+                counts[(band, slug)] = left - 1
+                remaining -= 1
+                progressed = True
+            if not progressed:
+                break
+    return shares
+
+
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
 
@@ -382,20 +448,70 @@ class _KanbanDispatcher:
         """``{slug: head-of-line priority or None}`` — one probe per board."""
         return {slug: self.head_of_line_priority(slug) for slug in self._board_slugs()}
 
-    def board_visit_order(self, priorities: Optional[dict] = None, *, rotate: bool = True) -> list:
-        """This tick's board order: head-of-line rank, rotated by one board.
+    def _board_work_snapshot(self) -> dict:
+        """One read-only connect per board: its spawnable cards + running count.
 
-        Rotation moves only where the order STARTS, so the priority rank inside
-        a tick is untouched and every board still gets a turn.
+        Returns ``{slug: (rows, running)}`` for every dispatchable board, where
+        ``rows`` is the board's spawnable cards in its own dispatch order
+        (``priority DESC, created_at ASC``) and ``running`` is how many workers
+        it already has. A board that cannot be read maps to ``None``: a RANKING
+        MISS, never a failed tick — the board keeps its own reclaim, promotion,
+        decomposition and health pass, it just takes no new slots.
+
+        This is the read behind the global work list: the tick ranks EVERY
+        card on EVERY board by priority, so it needs the rows themselves, not
+        just each board's head priority.
+        """
+        snapshot: dict = {}
+        for slug in self._board_slugs():
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                rows = _kbd().spawnable_rows(conn)
+                running = int(_kbd().count_running_tasks(conn))
+                snapshot[slug] = (rows, running)
+            except Exception:
+                snapshot[slug] = None
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+        return snapshot
+
+    def board_visit_order(self, priorities: Optional[dict] = None, *, rotate: bool = True) -> list:
+        """This tick's board order: head-of-line rank, rotated WITHIN priority bands.
+
+        The RANK is never disturbed: a board whose head card has a higher
+        priority is visited first, so the top of the global work list is offered
+        first (the rotation defect this replaces let the rotation head — not the
+        priority column — take the bulk of the host budget). Rotation moves only
+        where an EQUAL-priority band STARTS, so boards whose queues share a
+        priority still round-robin instead of the alphabetically-first one taking
+        every tick. Boards with no startable work keep their turn last, so
+        reclaim, promotion, decomposition and health still run for every board.
         """
         if priorities is None:
             priorities = self._head_of_line_priorities()
         order = order_boards_by_head_priority(priorities)
-        if rotate and len(order) > 1:
-            offset = self.rotation_cursor % len(order)
+        ranked = [slug for slug in order if priorities.get(slug) is not None]
+        unranked = [slug for slug in order if priorities.get(slug) is None]
+        if rotate and len(ranked) > 1:
+            offset = self.rotation_cursor
             self.rotation_cursor += 1
-            return order[offset:] + order[:offset]
-        return order
+            rotated: list = []
+            start = 0
+            while start < len(ranked):
+                end = start
+                while end < len(ranked) and priorities[ranked[end]] == priorities[ranked[start]]:
+                    end += 1
+                band = ranked[start:end]
+                if len(band) > 1:
+                    pivot = offset % len(band)
+                    band = band[pivot:] + band[:pivot]
+                rotated.extend(band)
+                start = end
+            return rotated + unranked
+        return ranked + unranked
 
     def free_host_budget(self) -> Optional[int]:
         """Host-wide free worker slots at the start of a tick, or ``None``.
@@ -499,35 +615,46 @@ class _KanbanDispatcher:
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs.
 
-        The host-wide budget is SHARED, not raced. Boards are visited in
-        head-of-line priority order rotated one board per tick, and the free
-        host slots are handed out one guaranteed slot per board with startable
-        work, the remainder to the board visited first. Each board may then
-        start at most its share this tick, so a board with a deep queue can no
-        longer take the slot another board's queue is waiting for. A board
-        deferred by the host budget for over an hour is reported
-        (``HostCapStarvationClock``).
+        The host-wide budget is SHARED and allocated in GLOBAL PRIORITY ORDER.
+        Every startable card on every dispatchable board is ranked by the same
+        ``priority DESC`` column the dispatcher already orders one board by, and
+        the free host slots are handed out down that ONE list, bounded by each
+        board's remaining ``kanban.max_spawn_by_board`` / ``kanban.max_spawn``
+        capacity and still by ``kanban.max_in_progress_per_profile`` inside the
+        board's own pass. So a 999999 card anywhere runs before any 999000 card
+        anywhere. A board is still visited for reclaim, promotion, decomposition
+        and health whether or not it won a slot; only the SPAWN allocation moves.
 
-        When ``kanban.max_spawn_by_board`` names a ceiling, the remainder is
-        handed out by ascending ceiling instead, so a capped board's surplus
-        flows on rather than being stranded on the head.
+        Rotation survives only as the tie-break INSIDE one priority band
+        (``board_visit_order``), so equal-priority work still round-robins. A
+        board whose cards drew no slot reports itself exactly as before
+        (``deferred_host_capped`` / ``HostCapStarvationClock``) — never a silent
+        idle. ``free is None`` (uncapped, or the free count could not be read)
+        keeps every board's whole-budget behaviour.
         """
-        priorities = self._head_of_line_priorities()
+        snapshot = self._board_work_snapshot()
+        priorities: dict = {}
+        for slug, work in snapshot.items():
+            rows = work[0] if work is not None else []
+            priorities[slug] = int(rows[0]["priority"]) if rows else None
         order = self.board_visit_order(priorities)
         with_work = [slug for slug in order if priorities.get(slug) is not None]
         free = self.free_host_budget()
-        # ``free is None`` = no allocation was possible (uncapped, or the free
-        # slot count could not be read): every board keeps its whole-budget
-        # behaviour. Otherwise a board with work that drew no slot gets 0, not
-        # ``None`` — it must not spend the slots the other boards were given.
-        shares = host_budget_shares(free, with_work)
-        if self.settings.max_spawn_by_board:
-            # A per-board ceiling is configured: recompute by ascending ceiling
-            # so a capped board's slack reaches the next one instead of being
-            # stranded on the head.
-            shares = host_budget_shares_by_ceiling(
-                free, with_work, self.settings.max_spawn_by_board
-            )
+        shares: dict = {}
+        if free is not None:
+            # Capacity = the board's ceiling minus what it is already running,
+            # so a board at its ceiling neither consumes nor strands a slot the
+            # global list would hand to the next board down.
+            capacities: dict = {}
+            cards: list = []
+            for slug in with_work:
+                rows, running = snapshot[slug]  # type: ignore[misc]
+                ceiling = self.settings.max_spawn_for_board(slug)
+                capacities[slug] = (
+                    None if ceiling is None else max(int(ceiling) - int(running), 0)
+                )
+                cards.extend((int(row["priority"]), slug) for row in rows)
+            shares = host_budget_shares_by_priority(free, cards, capacities)
         results: list[tuple[str, Optional[object]]] = []
         for slug in order:
             share = shares.get(slug, 0) if (free is not None and slug in with_work) else None

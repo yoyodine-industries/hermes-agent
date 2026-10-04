@@ -4064,6 +4064,17 @@ def spawnable_pending_ids(conn: sqlite3.Connection) -> list[str]:
     return [row["id"] for row in _spawnable_lane_rows(conn)]
 
 
+def spawnable_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """This board's spawnable cards (``id``/``assignee``/``priority``), head first.
+
+    The gateway dispatcher allocates the host budget by ranking EVERY card on
+    EVERY board (``gateway.kanban_watchers_dispatcher.host_budget_shares_by_priority``),
+    so it needs the board's own ``priority DESC, created_at ASC`` row order — the
+    same order :func:`spawnable_pending_ids` projects to ids. Read-only.
+    """
+    return _spawnable_lane_rows(conn)
+
+
 def head_of_line_priority(conn: sqlite3.Connection) -> Optional[int]:
     """Priority of the card this board would spawn next, or ``None``.
 
