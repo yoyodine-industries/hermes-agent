@@ -11,7 +11,7 @@ import contextlib
 import os
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,19 +44,29 @@ def order_boards_by_head_priority(priorities: dict) -> list:
     return ranked + unranked
 
 
-def host_budget_shares(free: Optional[int], boards_in_order: list) -> dict:
+def host_budget_shares(
+    free: Optional[int], boards_in_order: list, ceilings: Optional[dict] = None
+) -> dict:
     """How many new workers each board may start this tick, from one budget.
 
     ``free`` is the host-wide free slot count at the start of the tick;
     ``None`` (no cap derived, or the count could not be read) hands out no
     shares at all, so a caller keeps its whole-budget behaviour instead of
     allocating slots nobody proved were free. Every board with startable work
-    takes ONE guaranteed slot in visit order until the budget is gone; the
-    remainder goes to the board visited first, which keeps the head of line
-    ranked first inside a tick without letting it eat the whole budget.
+    takes ONE guaranteed slot in visit order until the budget is gone.
+
+    The remainder is then handed out by ascending CEILING: a board that named a
+    ``kanban.max_spawn_by_board`` ceiling may not be given more than it can use,
+    so the surplus flows to the next board instead of being stranded on the head
+    (which is what left a capped board below its own ceiling while the capped
+    head held the rest). An unnamed board has no ceiling, so the surplus still
+    reaches it; when NO ceilings are configured every ceiling is unbounded and
+    the ordering reduces to the visit order, which reproduces the historical
+    allocation byte-for-byte (the head takes the whole remainder).
     """
     if free is None or not boards_in_order:
         return {}
+    caps = dict(ceilings or {})
     shares: dict[str, int] = {}
     remaining = int(free)
     for slug in boards_in_order:
@@ -64,9 +74,25 @@ def host_budget_shares(free: Optional[int], boards_in_order: list) -> dict:
             break
         shares[slug] = 1
         remaining -= 1
-    if remaining > 0:
-        head = boards_in_order[0]
-        shares[head] = shares.get(head, 0) + remaining
+    if remaining <= 0:
+        return shares
+    position = {slug: index for index, slug in enumerate(boards_in_order)}
+    # Ascending ceiling, then visit order: the most constrained board is served
+    # first, the head wins ties (and therefore takes an unbounded remainder).
+    by_ceiling = sorted(
+        boards_in_order,
+        key=lambda slug: (caps.get(slug, float("inf")), position[slug]),
+    )
+    for slug in by_ceiling:
+        if remaining <= 0:
+            break
+        allocated = shares.get(slug, 0)
+        ceiling = caps.get(slug)
+        room = remaining if ceiling is None else max(int(ceiling) - allocated, 0)
+        give = min(remaining, room)
+        if give > 0:
+            shares[slug] = allocated + give
+            remaining -= give
     return shares
 
 
@@ -87,6 +113,75 @@ class _DispatcherSettings:
     max_in_progress_per_profile: Optional[int]
     lane_fair_spawn: bool = True
     designated_pool_reserve: int = 1
+    # Per-board spawn ceilings (board slug -> positive int) from
+    # ``kanban.max_spawn_by_board``. A board named here uses its own ceiling
+    # instead of the global ``max_spawn``; every other board keeps ``max_spawn``.
+    max_spawn_by_board: dict = field(default_factory=dict)
+
+    def max_spawn_for_board(self, slug: str) -> Any:
+        """The spawn ceiling to apply to *slug* this tick.
+
+        Resolution lives here, at the per-tick call site, so the budget function
+        (``_tick_spawn_budget``) stays pure and every board agrees on the
+        precedence: a board named in ``kanban.max_spawn_by_board`` uses its own
+        value, any other board keeps the global ``kanban.max_spawn``.
+        """
+        if slug in self.max_spawn_by_board:
+            return self.max_spawn_by_board[slug]
+        return self.max_spawn
+
+
+def _parse_max_spawn_by_board(kanban_cfg: dict, kb: Any) -> dict:
+    """Parse ``kanban.max_spawn_by_board``: board slug -> positive-int ceiling.
+
+    Boards not named keep the global ``kanban.max_spawn``, so this map is purely
+    additive. A non-mapping value, a value below 1, and a slug that names no
+    board in the inventory are each IGNORED with a warning — a typo must be
+    visible, never fatal and never silently ineffective. An unreadable board
+    inventory leaves the map as configured: an entry for a board nothing serves
+    simply never matches, so a read failure can never drop a real ceiling.
+    """
+    raw = kanban_cfg.get("max_spawn_by_board")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning(
+            "kanban dispatcher: kanban.max_spawn_by_board=%r is not a mapping; ignoring", raw
+        )
+        return {}
+    known: Optional[set] = None
+    try:
+        known = {b.get("slug") or kb.DEFAULT_BOARD for b in kb.list_boards()}
+    except Exception:  # noqa: BLE001 - an unreadable inventory is not fatal
+        logger.debug(
+            "kanban dispatcher: could not enumerate boards to validate max_spawn_by_board",
+            exc_info=True,
+        )
+    parsed: dict[str, int] = {}
+    for slug, value in raw.items():
+        key = str(slug).strip()
+        try:
+            ceiling = int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.max_spawn_by_board[%r]=%r; ignoring", slug, value
+            )
+            continue
+        if not key or ceiling < 1:
+            logger.warning(
+                "kanban dispatcher: kanban.max_spawn_by_board[%r]=%r must name a board with a "
+                "positive ceiling; ignoring", slug, value
+            )
+            continue
+        if known is not None and key not in known:
+            logger.warning(
+                "kanban dispatcher: kanban.max_spawn_by_board names unknown board %r; ignoring", key
+            )
+            continue
+        parsed[key] = ceiling
+    if parsed:
+        logger.info("kanban dispatcher: max_spawn_by_board=%s", parsed)
+    return parsed
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -102,6 +197,11 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     max_spawn = kanban_cfg.get("max_spawn")
     if max_spawn is not None:
         logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
+
+    # Per-board overrides of the ceiling above (operator ask: skew bandwidth to
+    # one board without a second host-wide dial). Parsed once at boot alongside
+    # the rest; every other board keeps ``max_spawn``.
+    max_spawn_by_board = _parse_max_spawn_by_board(kanban_cfg, kb)
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
     # out. Explicit config wins; otherwise a memory-derived default (unbounded
@@ -176,6 +276,9 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # dispatcher module so every entry point agrees on the defaults.
         lane_fair_spawn=_fair_lane_spawn,
         designated_pool_reserve=_designated_pool_reserve,
+        # Per-board overrides of max_spawn (slug -> ceiling); unnamed boards keep
+        # max_spawn. Resolved per tick by max_spawn_for_board().
+        max_spawn_by_board=max_spawn_by_board,
     )
 
 
@@ -338,7 +441,15 @@ class _KanbanDispatcher:
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
-        kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        # ``interval`` is not a dispatch_once kwarg, and the per-board ceiling is
+        # resolved here (once per tick) rather than passed as the raw map: the
+        # board gets its own value from kanban.max_spawn_by_board, or the global
+        # kanban.max_spawn when it is not named.
+        kwargs = {
+            k: v for k, v in asdict(self.settings).items()
+            if k not in ("interval", "max_spawn_by_board")
+        }
+        kwargs["max_spawn"] = self.settings.max_spawn_for_board(slug)
         if host_budget_share is not None:
             kwargs["host_budget_share"] = int(host_budget_share)
         try:
@@ -371,10 +482,11 @@ class _KanbanDispatcher:
         The host-wide budget is SHARED, not raced. Boards are visited in
         head-of-line priority order rotated one board per tick, and the free
         host slots are handed out one guaranteed slot per board with startable
-        work, the remainder to the board visited first. Each board may then
-        start at most its share this tick, so a board with a deep queue can no
-        longer take the slot another board's queue is waiting for. A board
-        deferred by the host budget for over an hour is reported
+        work, the remainder by ascending ``kanban.max_spawn_by_board`` ceiling
+        so a capped board's surplus flows on instead of being stranded. Each
+        board may then start at most its share this tick, so a board with a deep
+        queue can no longer take the slot another board's queue is waiting for.
+        A board deferred by the host budget for over an hour is reported
         (``HostCapStarvationClock``).
         """
         priorities = self._head_of_line_priorities()
@@ -385,7 +497,9 @@ class _KanbanDispatcher:
         # slot count could not be read): every board keeps its whole-budget
         # behaviour. Otherwise a board with work that drew no slot gets 0, not
         # ``None`` — it must not spend the slots the other boards were given.
-        shares = host_budget_shares(free, with_work)
+        shares = host_budget_shares(
+            free, with_work, ceilings=self.settings.max_spawn_by_board
+        )
         results: list[tuple[str, Optional[object]]] = []
         for slug in order:
             share = shares.get(slug, 0) if (free is not None and slug in with_work) else None

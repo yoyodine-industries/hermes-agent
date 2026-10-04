@@ -262,6 +262,13 @@ class DispatchResult:
     unspawned this tick, head of line first. The board did not choose this and
     its own queue looks idle, so the tick has to say it out loud — see
     :class:`HostCapStarvationClock`."""
+    deferred_board_capped: list[str] = field(default_factory=list)
+    """Task ids this board's OWN spawn ceiling left unspawned this tick, head of
+    line first. The ceiling is the board's ``kanban.max_spawn_by_board`` value,
+    or the global ``kanban.max_spawn`` for a board that is not named. A ceiling
+    can be deliberate (skewing bandwidth to another board), so this is NOT a
+    starvation signal like :attr:`deferred_host_capped` — but from the outside
+    the queue still looks idle, so the tick names what the ceiling held back."""
     skipped_board_disabled: bool = False
     """True when the tick refused to run AT ALL: the board it resolved to is not
     dispatch-enabled (an estate/rehearsal board, ``board.json`` ``"dispatch":
@@ -276,7 +283,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
 
     ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
     skipped_per_profile_capped=3, skipped_nonspawnable=12, skipped_unassigned=1,
-    lockdown=2 (research-sme x2), memory_pressure=critical`` — the respawn-guard
+    lockdown=2 (research-sme x2), memory_pressure=critical, host_cap_deferred=3,
+    board_cap_deferred=2`` — the respawn-guard
     reasons counted per task plus EVERY tick-level hold. Feeds the "dispatcher
     stuck" warnings of the CLI daemon and the embedded gateway dispatcher, which
     otherwise report a bare zero-spawn count while ``hermes kanban tail`` is the
@@ -308,6 +316,11 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             # The HOST budget held these back: no per-card refusal of their own,
             # so without this the tick reads like an idle queue.
             counts["host_cap_deferred"] = counts.get("host_cap_deferred", 0) + len(res.deferred_host_capped)
+        if res.deferred_board_capped:
+            # The board's OWN ceiling held these back: like the host cap, no
+            # per-card refusal exists, so a capped board would otherwise read
+            # exactly like an idle one.
+            counts["board_cap_deferred"] = counts.get("board_cap_deferred", 0) + len(res.deferred_board_capped)
         for bucket, bucket_rows in (
             ("skipped_per_profile_capped", res.skipped_per_profile_capped),
             ("skipped_nonspawnable", res.skipped_nonspawnable),
@@ -3782,6 +3795,11 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            # The board is at its OWN ceiling (its per-board value, or the
+            # global max_spawn). Nothing starts until it drains, and from the
+            # outside the queue looks idle — name what the ceiling held back so
+            # the tick is reportable, never a silent no-op.
+            result.deferred_board_capped = spawnable_pending_ids(conn)
             return False, None
         spawn_budget = max_spawn - running_count
 

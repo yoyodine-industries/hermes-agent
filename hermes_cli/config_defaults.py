@@ -1926,6 +1926,14 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Per-board spawn ceiling overrides (operator ask: skew bandwidth to one board without a
+        # second host-wide dial). Mapping of board slug -> positive int: a board named here may
+        # never have more than N tasks 'running' at once (running + this tick's spawns), instead of
+        # the global kanban.max_spawn. Every board not named keeps kanban.max_spawn unchanged.
+        # An entry whose slug names no existing board, or whose value is not a positive int, is
+        # ignored with a warning (never fatal, never silently ineffective). Default empty = no
+        # overrides. Only the gateway dispatcher (the production scheduler) resolves this map.
+        "max_spawn_by_board": {},
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
