@@ -2887,6 +2887,21 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Run-scoped temp root (card t_497f3bcc): a dispatched worker's shells must not write
+    # temp / pytest basetemps into the shared account temp root (measured 17 GiB there, 98%
+    # of it the pytest basetemp store). apply_scratch_tmp_env respects a set TMPDIR, so this
+    # sticks for the whole worker tree. The dir is a TOP-LEVEL entry of the profile scratch
+    # so the existing 24h-idle prune reaps it — a nested parent would stay warm forever and
+    # the leak would just move.
+    home = env.get("HERMES_HOME") or ""
+    run_id = getattr(task, "current_run_id", None)
+    if home and run_id is not None:
+        run_tmp = os.path.join(home, "cache", "scratch", f"kanban-run-{task.id}-{run_id}")
+        try:
+            os.makedirs(run_tmp, mode=0o700, exist_ok=True)
+            env["TMPDIR"] = env["TMP"] = env["TEMP"] = run_tmp
+        except OSError:
+            pass
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"
