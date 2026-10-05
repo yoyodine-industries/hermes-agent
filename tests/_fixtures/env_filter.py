@@ -194,6 +194,15 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    # The ask a dispatcher-spawned worker shell exports is honoured by the
+    # create seam's ``_resolve_operator_ask``, so every card a test creates
+    # comes back carrying an ``Operator-ask:`` stamp: cards read as
+    # ask-carrying, the above-tranche / priority-floor doors return early
+    # instead of refusing, and a genuinely green suite reads red in the one
+    # place it is naturally run.  ``HERMES_KANBAN_ADVISORY_SKILLS`` rides the
+    # same worker shell and changes skill resolution the same way.
+    "HERMES_KANBAN_OPERATOR_ASK",
+    "HERMES_KANBAN_ADVISORY_SKILLS",
     # Pytest is routinely launched from a delegated worker.  The worker
     # lineage marker must not make parent-state tests run as delegated
     # children; tests that exercise child behavior set it explicitly.
