@@ -5,11 +5,12 @@ import builtins
 from functools import lru_cache, wraps
 import io
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import shutil
 import sqlite3
 import sys
 import threading
+
 
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
@@ -44,6 +45,53 @@ def _contains(path: str, prefix: str) -> bool:
     if path == prefix:
         return True
     return prefix.startswith(path) if path == os.sep else prefix.startswith(path + os.sep)
+
+
+_RUN_SCRATCH_MARKERS = ("cache", "scratch")
+
+
+def is_run_scratch(absolute, roots, *, ancestors=False) -> bool:
+    """True when *absolute* lies in a guarded root's own ``cache/scratch`` subtree.
+
+    That subtree is the TEST RUNNER's temp space, not Hermes state. A dispatched kanban
+    worker gets ``TMPDIR``/``TMP``/``TEMP`` pointed at
+    ``<HERMES_HOME>/cache/scratch/kanban-run-<task>-<run>`` (``kanban_db_dispatch``) and
+    the conftest deliberately keeps it, so pytest's basetemp and every ``tempfile``
+    default land here on purpose — refusing them would fail the very run the run root
+    exists to keep off the shared account temp root. Two layouts occur and both are
+    exempt: ``<root>/cache/scratch/...`` (a home that IS the guarded root) and
+    ``<root>/profiles/<lane>/cache/scratch/...`` (a profile home under the production
+    root). Nothing else under a guarded root is loosened: sessions, kanban stores,
+    memories and config stay protected.
+
+    With ``ancestors=True`` the structural directories ON THE WAY to a scratch subtree
+    are also matched (``<root>/cache``; ``<root>/profiles``, ``<root>/profiles/<lane>``,
+    ``<root>/profiles/<lane>/cache``). Resolving or ``mkdir(parents=True)``-ing a scratch
+    path stats/creates exactly those, so refusing them would fail the scratch write one
+    level above where it starts. Callers should only grant that form for metadata reads
+    and non-destructive calls — a DELETE of ``<root>/cache`` is still refused.
+
+    Accepts path-likes; returns False for anything not lexically under a root.
+    """
+    normalized = _normcase(os.fspath(absolute))
+    for root in roots:
+        root = _normcase(os.fspath(root))
+        try:
+            parts = PurePath(normalized).relative_to(PurePath(root)).parts
+        except ValueError:
+            continue
+        if parts[:2] == _RUN_SCRATCH_MARKERS:
+            return True
+        if len(parts) >= 4 and parts[0] == "profiles" and parts[2:4] == _RUN_SCRATCH_MARKERS:
+            return True
+        if ancestors and parts:
+            if parts in (("cache",), ("profiles",)):
+                return True
+            if len(parts) == 2 and parts[0] == "profiles":
+                return True
+            if len(parts) == 3 and parts[0] == "profiles" and parts[2] == "cache":
+                return True
+    return False
 
 
 class HomeIOGuard:
@@ -101,10 +149,18 @@ class HomeIOGuard:
                 if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
                     return
             # Check the lexical path first: resolving must not probe a protected
-            # tree merely to decide that the original path was forbidden.
-            for root in roots:
-                if _within(absolute, root):
-                    self.refuse(value)
+            # tree merely to decide that the original path was forbidden. The run's own
+            # scratch (TMPDIR from the dispatcher) is the test runner's temp space, not
+            # Hermes state, so it is exempt; so are the structural dirs on the way to it,
+            # for metadata reads and non-destructive calls only (resolution and
+            # ``mkdir(parents=True)`` touch those). Everything else under a root refuses.
+            scratch_path = is_run_scratch(absolute, roots) or (
+                (metadata or not destructive)
+                and is_run_scratch(absolute, roots, ancestors=True))
+            if not scratch_path:
+                for root in roots:
+                    if _within(absolute, root):
+                        self.refuse(value)
             if resolved is None:
                 resolved = _normcase(os.path.realpath(absolute))
             if metadata and resolved in roots:
@@ -113,9 +169,12 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(resolved, prefix):
                     return
-            for root in roots:
-                if _within(resolved, root):
-                    self.refuse(value)
+            if not (scratch_path or is_run_scratch(resolved, roots) or (
+                    (metadata or not destructive)
+                    and is_run_scratch(resolved, roots, ancestors=True))):
+                for root in roots:
+                    if _within(resolved, root):
+                        self.refuse(value)
         finally:
             self.checking.active = False
 
