@@ -89,3 +89,70 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
             conn.close()
     finally:
         mgr._hooks = saved
+
+
+# --- the blocked-card trigger is the SINGLE store function (card t_64412a4a) --------
+# The escalation of a blocked card is fired from ``kanban_db.block_task``, which is
+# the ONE store function every caller routes through. Wiring it into a caller instead
+# (the CLI, or the kanban tool) would leave the other path blocking a card and
+# registering nothing - the backdoor this change exists to close. These cases fail if
+# that coverage is ever lost, by driving BOTH entry points and counting the fires.
+
+
+def _running_card(title: str) -> str:
+    """A claimed card, so a block is an admitted running->blocked transition."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title=title, assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        return tid
+
+
+def test_block_hook_carries_the_block_kind(kanban_home, captured_hooks):
+    """A consumer must be able to decide from the payload alone - no board re-read."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="needs a decision", kind="needs_input") is True
+    finally:
+        conn.close()
+
+    fired = [e for e in captured_hooks if e[0] == "kanban_task_blocked"]
+    assert len(fired) == 1
+    kw = fired[0][1]
+    assert kw["task_id"] == tid
+    assert kw["assignee"] == "worker"
+    assert kw["block_kind"] == "needs_input"
+    assert kw["reason"] == "needs a decision"
+    assert "board" in kw
+
+
+def test_both_block_entry_points_fire_exactly_one_hook(kanban_home, captured_hooks):
+    """The CLI and the kanban tool each block through ``block_task``: one fire apiece."""
+    import argparse
+
+    from hermes_cli import kanban as kanban_cli
+    from tools import kanban_tools
+
+    # (a) the CLI entry point: `hermes kanban block <id> --kind needs_input <reason>`
+    cli_id = _running_card("cli-blocked")
+    args = argparse.Namespace(task_id=cli_id, ids=None,
+                              reason=["needs", "an", "operator", "decision"],
+                              kind="needs_input")
+    assert kanban_cli._cmd_block(args) == 0
+
+    # (b) the kanban TOOL entry point a dispatched worker calls
+    tool_id = _running_card("tool-blocked")
+    kanban_tools._handle_block({"task_id": tool_id, "reason": "needs a capability",
+                                "kind": "capability"})
+
+    fired = [e for e in captured_hooks if e[0] == "kanban_task_blocked"]
+    by_task: dict = {}
+    for _event, kw in fired:
+        by_task.setdefault(kw["task_id"], []).append(kw)
+
+    assert set(by_task) == {cli_id, tool_id}, "both entry points must reach the store function"
+    assert len(by_task[cli_id]) == 1, "the CLI path fires exactly once"
+    assert len(by_task[tool_id]) == 1, "the tool path fires exactly once"
+    assert by_task[cli_id][0]["block_kind"] == "needs_input"
+    assert by_task[tool_id][0]["block_kind"] == "capability"
