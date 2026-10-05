@@ -91,16 +91,59 @@ def _effective_provider_label() -> str:
 
 
 def _estop_status_line():
-    """One-line pause banner for `hermes status`, or None when not paused."""
+    """The emergency-stop banner for `hermes status`, or None when nothing holds.
+
+    Renders the EFFECTIVE state, not one hold: the scope (a total hold wins over any number
+    of lockdowns), how many holds are live and who owns them, which lanes a lockdown admits,
+    the union turn allowlist, the earliest deadman, and any fail-SAFE read defect — an
+    unreadable sentinel is a total halt, and the operator must be able to see that it is not
+    a deliberate one.
+    """
     try:
-        from agent.estop import get_state
+        from agent.estop import DEFECT_UNVERIFIED, STANDING_ADMITTED_LANES, read_state
     except ImportError:
         return None
-    state = get_state()
-    if state is None:
+    try:
+        state = read_state()
+    except Exception:  # pragma: no cover - defensive
         return None
-    reason = state.get("reason")
-    return f"⏸️  PAUSED (global emergency stop{f' — reason: {reason}' if reason else ''}; `hermes resume` to lift)"
+    if not state.engaged:
+        return None
+    if state.total:
+        floor = ", ".join(sorted(STANDING_ADMITTED_LANES))
+        detail = f" — TOTAL halt (standing platform floor: {floor}; every other lane held)"
+    else:
+        lanes = ", ".join(sorted(state.allow_profiles)) or "(none)"
+        detail = f" — lockdown, lanes admitted: {lanes}"
+    reason = next((hold.get("reason") for hold in state.holds if hold.get("reason")), None)
+    if reason:
+        detail += f" — reason: {reason}"
+    owners = ", ".join(state.owners) or "unknown"
+    detail += f"; holds: {len(state.holds)} [{owners}]"
+    # D10: name the HANDLES (bounded) so a human can pick the one hold to release, and mark
+    # the holds nobody could be attributed — those read as a TOTAL halt and only the
+    # operator's own resume clears them.
+    shown = list(state.holds)[:4]
+    if shown:
+        handles = ", ".join(
+            f"{hold['handle']}" + ("" if hold.get("verified", True) else " (UNVERIFIED)")
+            for hold in shown
+        )
+        extra = len(state.holds) - len(shown)
+        detail += f"; handles: {handles}" + (f" (+{extra} more)" if extra > 0 else "")
+        detail += "; `hermes resume --handle <H>` releases one"
+    deadmen = sorted(hold["expires_at"] for hold in state.holds if hold.get("expires_at"))
+    if deadmen:
+        detail += f"; next deadman {deadmen[0]}"
+    if state.allow_user_ids:
+        detail += f"; users served: {', '.join(sorted(state.allow_user_ids))}"
+    if state.defect:
+        if state.defect == DEFECT_UNVERIFIED:
+            detail += ("; DEFECT: a hold carries no valid provenance — TOTAL halt, and only the "
+                       "operator's own `hermes resume` clears it")
+        else:
+            detail += f"; DEFECT: {state.defect}"
+    return f"⏸️  PAUSED (global emergency stop{detail}; `hermes resume` releases your hold)"
 
 
 # --- Data tables driving the per-section renderers -------------------------

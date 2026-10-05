@@ -166,16 +166,21 @@ class TestFireOverdueJobs:
         assert provider.wait_fired(timeout=10)
         assert provider.fired == [job["id"]]
 
-    def test_estop_skips_sweep_and_next_sweep_after_resume_catches_up(
+    def test_estop_holds_the_sweep_for_a_non_floor_lane_and_resume_catches_up(
         self, tmp_cron_dir, tmp_path, monkeypatch
     ):
-        """`hermes pause` must silence the backstop too — otherwise it force-fires every job
-        that ESTOP held back. Nothing to unwind: the first sweep after `hermes resume`
-        catches up through the ordinary claim_fire path."""
+        """`hermes pause` must not let the backstop force-fire a HELD lane's jobs. Nothing to
+        unwind: the first sweep after `hermes resume` catches up through the ordinary
+        claim_fire path. The lane is PINNED so the outcome does not depend on whichever
+        profile happens to be serving the process."""
         from agent import estop
+        from cron import scheduler_tick
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(scheduler_tick, "_tick_lane", lambda: "research-stl")
         estop._logged_components.clear()
+        estop._lockdown_logged.clear()
+        estop._floor_logged.clear()
         job = create_job(prompt="p", schedule="every 1h")
         _park_in_past(job["id"], minutes=30)
         parked_at = get_job(job["id"])["next_run_at"]
@@ -187,6 +192,28 @@ class TestFireOverdueJobs:
         assert get_job(job["id"])["next_run_at"] == parked_at  # nothing claimed or re-armed
 
         estop.disengage()
+        assert fire_overdue_jobs(provider) == 1
+        assert provider.wait_fired()
+        assert provider.fired == [job["id"]]
+
+    def test_estop_lets_the_sweep_fire_the_standing_platform_floor(
+        self, tmp_cron_dir, tmp_path, monkeypatch
+    ):
+        """The floor keeps working under a total hold — the housekeeping backstop included, so
+        a critical job that was already due is not left behind by the panic button."""
+        from agent import estop
+        from cron import scheduler_tick
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(scheduler_tick, "_tick_lane", lambda: "platform-coder")
+        estop._logged_components.clear()
+        estop._lockdown_logged.clear()
+        estop._floor_logged.clear()
+        job = create_job(prompt="p", schedule="every 1h")
+        _park_in_past(job["id"], minutes=30)
+        provider = RecordingProvider()
+
+        estop.engage(reason="runaway fan-out")
         assert fire_overdue_jobs(provider) == 1
         assert provider.wait_fired()
         assert provider.fired == [job["id"]]

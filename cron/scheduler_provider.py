@@ -276,14 +276,54 @@ def fire_overdue_jobs(
     concurrent late external retry is de-duplicated by the store CAS; waits out
     ``cron.misfire_grace_minutes`` so the external retry gets first right. Returns jobs dispatched.
     """
-    # `hermes pause` ESTOP: skip the sweep entirely. No state to unwind — the
-    # next housekeeping pass after `hermes resume` catches overdue work up
-    # through the existing claim_fire path. Distinct component name from the
-    # ticker's "cron" so the log-once mechanism fires independently.
+    # `hermes pause` ESTOP: only a component with NO standing-floor work skips the sweep
+    # wholesale (halt_entirely). This sweep carries the floor too, so under a TOTAL hold it
+    # RUNS and is refused per LANE below, exactly like the ticker. No state to unwind either
+    # way — the next housekeeping pass after `hermes resume` catches overdue work up through
+    # the existing claim_fire path. Distinct component name from the ticker's "cron" so the
+    # log-once mechanism fires independently.
     with contextlib.suppress(ImportError):
-        from agent.estop import check_paused as _estop_check_paused
-        if _estop_check_paused("cron-misfire", logger):
+        from agent.estop import halt_entirely as _estop_halt_entirely
+        if _estop_halt_entirely("cron-misfire", logger):
             return 0
+
+    # A LOCKDOWN is not a halt here either — and neither is a TOTAL hold, which admits only
+    # the standing platform floor. This sweep force-FIRES overdue jobs, so it is gated per
+    # LANE, not skipped wholesale. The sweep only ever reads the store of the profile this
+    # process serves (``load_jobs()`` below), so ONE lane decision covers it: a held lane's
+    # overdue jobs stay overdue for a sweep after the lift instead of being fired through a
+    # stop that holds them.
+    with contextlib.suppress(ImportError):
+        from agent.estop import read_state as _estop_read_state
+        from agent.estop import work_admitted as _estop_work_admitted
+        from cron.scheduler_tick import _lockdown_report_once, _tick_lane
+
+        _estop_state = _estop_read_state()
+        if _estop_state.engaged:
+            _lane = _tick_lane()
+            if not _estop_work_admitted(_lane, state=_estop_state):
+                from agent.estop import STANDING_ADMITTED_LANES
+
+                from agent.estop import engagement_key as _estop_engagement_key
+
+                if _estop_state.total:
+                    _lockdown_report_once(
+                        "cron-misfire", _estop_engagement_key(), logger,
+                        "Misfire sweep held by the TOTAL emergency stop — profile '%s' is not "
+                        "a standing platform lane (floor: %s); overdue jobs stay due until it "
+                        "lifts",
+                        _lane or "(unresolved)",
+                        ", ".join(sorted(STANDING_ADMITTED_LANES)),
+                    )
+                else:
+                    _lockdown_report_once(
+                        "cron-misfire", _estop_engagement_key(), logger,
+                        "Misfire sweep held by the lane-scoped lockdown — profile '%s' is not on "
+                        "the allowlist (admitted: %s); overdue jobs stay due until it lifts",
+                        _lane or "(unresolved)",
+                        ", ".join(sorted(_estop_state.allow_profiles)) or "(none)",
+                    )
+                return 0
 
     from datetime import datetime
 

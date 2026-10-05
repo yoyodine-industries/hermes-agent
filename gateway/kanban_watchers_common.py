@@ -98,16 +98,21 @@ def _gc_retention_days() -> int:
 
 
 def _kanban_dispatch_allowed() -> bool:
-    """False while the global emergency stop (`hermes pause`) is engaged.
+    """False only while the dispatcher must stop ENTIRELY — never for a lane-scoped hold.
 
+    A lane-scoped ``lockdown`` is NOT a halt at this seam, and neither is a TOTAL ``estop``:
+    the dispatcher RUNS and refuses per LANE (``agent.estop.work_admitted``), so the standing
+    platform floor keeps spawning while every other lane's cards are deferred and RECORDED on
+    the card. Halting the whole tick here would turn a scoped (or floored total) hold into the
+    fleet-wide stop this seam exists to avoid.
     Checked every tick before spawning, so a pause applies on the next tick;
     in-flight workers are never touched. Fails open if estop is unimportable.
     """
     try:
-        from agent.estop import check_paused
+        from agent.estop import halt_entirely
     except ImportError:
         return True
-    return not check_paused("kanban", logger)
+    return not halt_entirely("kanban", logger)
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
