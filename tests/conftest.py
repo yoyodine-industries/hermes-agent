@@ -119,6 +119,7 @@ if _HERMES_EXPORTED_TMP:
     del os.environ[SCRATCH_DIR_MARKER_ENV]
 
 from hermes_state_guard import _real_platform_state_root
+from tests.home_io_guard import is_run_scratch
 
 _real_test_root = _real_platform_state_root() or (Path.home() / ".hermes").resolve()
 _guarded_tmp_roots = [_real_test_root]
@@ -129,7 +130,13 @@ for _key in SCRATCH_TMP_ENV_VARS:
     _value = os.environ.get(_key)
     if _value:
         _path = Path(_value).expanduser().resolve()
-        if any(_path.is_relative_to(_root) for _root in _guarded_tmp_roots):
+        # A temp var the DISPATCHER pointed at the run's OWN scratch
+        # (<HERMES_HOME>/cache/scratch/kanban-run-…) survives: it is the run-scoped temp
+        # root hermes-agent's own suite must honor (card t_65161ea2), not Hermes state to
+        # scrub. Every OTHER guarded path — sessions, config, stores — keeps being
+        # stripped, and Hermes' own marker-tagged export was already dropped above.
+        if (any(_path.is_relative_to(_root) for _root in _guarded_tmp_roots)
+                and not is_run_scratch(_path, _guarded_tmp_roots)):
             del os.environ[_key]
 tempfile.tempdir = None  # re-resolve after stripping guarded temp directories
 os.environ.setdefault("TMPDIR", tempfile.gettempdir())
