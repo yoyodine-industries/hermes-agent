@@ -3,6 +3,89 @@
 import concurrent.futures
 import contextlib
 
+# job id -> the engagement key whose deferral was already reported. Pruned when the
+# engagement changes, so the map is bounded by the number of due jobs, not by uptime.
+_LOCKDOWN_REPORTED: dict = {}
+
+
+def _lockdown_report_once(key: str, engagement: str, logger, message: str, *args) -> bool:
+    """Log ``message`` once per ``(key, engagement)``; True when this call logged it.
+
+    The dedupe every lockdown deferral shares: a refused card/job is refused on every tick,
+    so an unconditional write would be a firehose — and a re-arm (new engagement) must be
+    reported again, because it is a new decision.
+    """
+    if _LOCKDOWN_REPORTED.get(key) == engagement:
+        return False
+    _LOCKDOWN_REPORTED[key] = engagement
+    logger.warning(message, *args)
+    return True
+
+
+def _tick_lane() -> "str | None":
+    """The profile whose cron store this tick serves — the LANE a lockdown keys on.
+
+    A cron job carries no profile field: the STORE is the profile (the ticker enters
+    ``_profile_cron_scope(home)`` once per profile), so the tick's lane is the job's lane.
+    ``None`` when it cannot be resolved, which grants nothing under a lockdown.
+    """
+    try:
+        from hermes_cli.profiles import current_profile_name
+    except ImportError:
+        return None
+    try:
+        return current_profile_name()
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _apply_lockdown_lane_gate(due_jobs: list, estop_state, logger) -> tuple:
+    """``(admitted, held_count)`` — the LANE-scoped DEFCON gate for cron.
+
+    Under ``lockdown`` only the lanes on the sentinel's allowlist may fire: their jobs run,
+    every other lane's job is HELD — never fired, never silently skipped. Under a TOTAL hold
+    the same gate runs, with one difference in WHICH lanes pass: the standing platform floor
+    (:data:`agent.estop.STANDING_ADMITTED_LANES`) is admitted and the hold's own allowlist is
+    ignored, so the critical jobs that keep the host alive survive the panic button.
+
+    A held job is left due (the caller advances only the admitted ids), so it fires on the
+    first tick after the lift instead of losing its slot, and the deferral is logged once per
+    engagement naming the job and its profile. BOARD IS NOT A TERM: the same job is treated
+    alike on any board.
+    """
+    if estop_state is None or not estop_state.engaged:
+        return due_jobs, 0
+    from agent.estop import STANDING_ADMITTED_LANES, engagement_key, work_admitted
+
+    lane = _tick_lane()
+    engagement = engagement_key()
+    for job_id in [key for key, seen in _LOCKDOWN_REPORTED.items() if seen != engagement]:
+        _LOCKDOWN_REPORTED.pop(job_id, None)
+    admitted: list = []
+    for job in due_jobs:
+        if work_admitted(lane, state=estop_state):
+            admitted.append(job)
+            continue
+        job_id = str(job.get("id") or job.get("name") or "?")
+        if estop_state.total:
+            _lockdown_report_once(
+                f"job:{job_id}", engagement, logger,
+                "Cron job %s held by the TOTAL emergency stop — profile '%s' is not a "
+                "standing platform lane (floor: %s); it stays due and fires on the first tick "
+                "after the lift",
+                job_id, lane or "(unresolved)",
+                ", ".join(sorted(STANDING_ADMITTED_LANES)),
+            )
+        else:
+            _lockdown_report_once(
+                f"job:{job_id}", engagement, logger,
+                "Cron job %s held by the lane-scoped lockdown — profile '%s' is not on the "
+                "allowlist (admitted: %s); it stays due and fires on the first tick after the lift",
+                job_id, lane or "(unresolved)",
+                ", ".join(sorted(estop_state.allow_profiles)) or "(none)",
+            )
+    return admitted, len(due_jobs) - len(admitted)
+
 
 def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None):
     from hermes_cli.backend_retirement import retirement
@@ -37,11 +120,19 @@ def _tick_admitted(
         return 0
 
     try:
-        # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
+        # `hermes pause` ESTOP: only a component with NO standing-floor work halts wholesale
+        # (halt_entirely). The cron tick carries the floor, so under a TOTAL hold it RUNS and
+        # refuses per JOB lane below — the critical jobs that keep the host alive must not be
+        # parked by the stop meant to protect it. In-flight runs are never touched.
         with contextlib.suppress(ImportError):
-            from agent.estop import check_paused as _estop_check_paused
-            if _estop_check_paused("cron", _sched.logger):
+            from agent.estop import halt_entirely as _estop_halt_entirely
+            if _estop_halt_entirely("cron", _sched.logger):
                 return 0
+
+        _estop_state = None
+        with contextlib.suppress(ImportError):
+            from agent.estop import read_state as _estop_read_state
+            _estop_state = _estop_read_state()
 
         if can_dispatch is not None and not can_dispatch():
             _sched.logger.debug("Cron dispatch paused while gateway drains existing work")
@@ -61,10 +152,13 @@ def _tick_admitted(
 
         due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
+        # Lane-scoped lockdown gate: the sweep above still sees every due job (it is about
+        # in-flight runs, not admission); only DISPATCH is scoped to the allowlisted lanes.
+        due_jobs, _lockdown_held = _apply_lockdown_lane_gate(due_jobs, _estop_state, _sched.logger)
 
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
-            if verbose:
+            if verbose and not _lockdown_held:
                 # Idle tick: skip config load + pool partitioning entirely (#33612 — the gateway ticker
                 # calls tick(verbose=False) every 60s, so idle ticks previously fell through to
                 # load_config()). Still run the post-tick MCP orphan sweep: main intentionally sweeps on
@@ -80,6 +174,8 @@ def _tick_admitted(
         # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
         # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
         # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
+        # A job HELD by the lane-scoped lockdown is deliberately absent: leaving it due is what
+        # makes it fire on the first tick after the lift instead of losing its period.
         _sched.advance_next_runs([job["id"] for job in due_jobs])
 
         _max_workers = _sched._resolve_max_parallel_workers()
