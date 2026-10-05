@@ -893,6 +893,7 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
+    from hermes_cli import kanban_gate_invariants as _gate_inv
     ids, rc = _require_ids(args)
     if rc:
         return rc
@@ -906,6 +907,24 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     metadata, rc = _parse_metadata_flag(raw_meta)
     if rc:
         return rc
+    raw_evidence = getattr(args, "evidence", None)
+    if raw_evidence:
+        # The evidence gate's CLI door: a completion declares WHAT backs it. Parsed here so a
+        # malformed declaration is a caller error at the prompt, not a refusal mid-sweep.
+        if len(ids) > 1:
+            return _err("kanban: --evidence is per-task and can't be used with multiple ids "
+                        "(the same evidence cannot back N cards). Complete one at a time.", 2)
+        from hermes_cli import kanban_gate_invariants as _gate_inv
+        try:
+            declared = json.loads(raw_evidence) if isinstance(raw_evidence, str) else raw_evidence
+        except ValueError as exc:
+            return _err(f"kanban: --evidence is not valid JSON: {exc}", 2)
+        try:
+            _gate_inv.parse_evidence(declared)
+        except _gate_inv.EvidenceRefused as exc:
+            return _err(f"kanban: --evidence: {exc}", 2)
+        metadata = dict(metadata or {})
+        metadata["evidence"] = declared
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
@@ -929,6 +948,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
+                return False
+            except _gate_inv.GateRefused as gate_err:
+                # An invariant refusal (evidence / assignee / dependency): the seam names the
+                # invariant and the honest path, so it reads as a refusal, not a failed close.
+                fail_msg[tid] = (f"cannot complete {tid} [{gate_err.invariant}"
+                                 + (f"/{getattr(gate_err, 'cause', '')}" if getattr(gate_err, "cause", None) else "")
+                                 + f"]: {gate_err}")
                 return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
@@ -979,8 +1005,11 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_gate_invariants as _gate_inv
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
+    raw_waits = getattr(args, "waits_on", None) or ""
+    waits_on = [p.strip() for p in str(raw_waits).replace(" ", ",").split(",") if p.strip()]
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
@@ -1001,8 +1030,15 @@ def _cmd_block(args: argparse.Namespace) -> int:
             return f"Blocked {tid}{suffix}"
 
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+            waits_on=waits_on))
+        try:
+            return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        except _gate_inv.GateRefused as gate_err:
+            # Invariant C refused the block (a named dependency with no edge, or a waits_on
+            # pointer that does not exist): nothing was written, and the message names the fix.
+            print(f"cannot block [{gate_err.invariant}]: {gate_err}", file=sys.stderr)
+            return 1
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:

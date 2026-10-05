@@ -302,7 +302,16 @@ _SPECS = [
                   '"tests_run": 12}\'). Stored on the closing run.'),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
-                  "even without owning its run (closes the worker's run)."),
+                  "even without owning its run (closes the worker's run). Also waives the "
+                  "evidence gate, and the waiver is recorded on the card."),
+        _arg("--evidence",
+             help='The evidence this completion rests on, as JSON: '
+                  '\'{"class": "run", "run": {"store": "yoyoflow", "id": 123}}\' | '
+                  '\'{"class": "probe", "probe": {"at": "...", "result": "ok", '
+                  '"observations": [...]}}\' | '
+                  '\'{"class": "none", "why": "skill edit, no run behind it"}\'. Required by '
+                  'the completion gate: class "run"/"probe" is resolved against the run store '
+                  'and must be green; class "none" states why the work has no run.'),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
@@ -322,6 +331,11 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--waits-on", dest="waits_on",
+             help="Comma-separated card ids this card WAITS ON: each becomes a parent edge, so "
+                  "the board resumes the card when they finish. A kind='dependency' block "
+                  "whose reason names a card without this is REFUSED (a prose-only wait is "
+                  "invisible to the dependency machinery)."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,

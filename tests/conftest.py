@@ -35,6 +35,20 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+
+# ── Task-completion evidence gate: the suite declares `measure` ─────────────
+# The completion gate (``hermes_cli/kanban_gate_invariants.py``) refuses a completion that
+# declares no evidence class. Its kernel default is ``refuse`` — correct for a real board,
+# where a lane knows what backs its own claim. The suite is not a real board: these tests
+# close cards with no run and no artifact behind them by the hundred, and every one of them
+# would have to declare a class that means nothing. So the suite makes the same declaration a
+# migrating board makes in its own registry (``kanban/evidence_gate``): ``measure``.
+#
+# The refusal is NOT untested by this — the gate's own tests arm ``refuse`` explicitly
+# (tests/hermes_cli/test_kanban_gate_invariants.py), and so does every test of the refusal
+# vocabulary. ``setdefault``, never an assignment: a test that sets the variable itself wins.
+os.environ.setdefault("HERMES_KANBAN_EVIDENCE_GATE", "measure")
+
 # Every test file runs in its own process, and in a checkout without an install stamp
 # get_version_info() shells out to git 7 times (~0.55 s per process in a large local
 # clone; a whole local suite run spent ~48 CPU-minutes there). Seed the shape a shallow

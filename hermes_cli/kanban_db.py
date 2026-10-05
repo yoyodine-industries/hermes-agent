@@ -1365,6 +1365,14 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    if assignee:
+        # INVARIANT B at its earliest door (design record platform-stl t_6747232b): an assignee
+        # that resolves to no profile on disk and to no declared pull lane can never be spawned
+        # and never reports a failure - the card strands silently. Measured before this seam:
+        # 361 rows on handles that resolve nowhere, 15 cards stranded on two retired lanes.
+        # The refusal names both honest paths (assign a real profile, or declare the lane).
+        from hermes_cli import kanban_gate_invariants as _gates
+        _gates.gate_assignee(assignee, board=board, where="kanban_create")
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1622,9 +1630,15 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str], *,
+                board: Optional[str] = None) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
+    if profile:
+        # INVARIANT B at the re-rank door: the same refusal as the create seam, so a card
+        # cannot be moved onto a dead handle after it exists (design record t_6747232b).
+        from hermes_cli import kanban_gate_invariants as _gates
+        _gates.gate_assignee(profile, board=board, where="kanban assign")
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -2833,6 +2847,11 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # INVARIANT A (design record platform-stl t_6747232b): the transition itself demands the
+    # evidence behind the claim. Runs AFTER the landed proof gate, which owns the landed claim
+    # and refuses for its own, clause-specific reasons; this one covers every other completion.
+    from hermes_cli import kanban_gate_invariants as _gates
+    _gates.gate_completion_evidence(conn, task_id, metadata, force=force)
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
@@ -3288,6 +3307,7 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    waits_on: Iterable[str] = (),
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3305,6 +3325,15 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    # INVARIANT C at the write door (design record platform-stl t_6747232b): a block that names
+    # the card it waits on must carry the EDGE, not just the prose. The board resumes a card on
+    # its PARENTS finishing, so a prose-only wait is invisible to that machinery - the card sits
+    # blocked after the work it named shipped, and only a human reading the reason takes it off
+    # the shelf (measured: t_9e9ea756). `waits_on` is the structured form: it creates the edge.
+    # A kind='dependency' block whose reason names a card, with no edge and no waits_on, is
+    # refused with the fix in the message. Nothing is written by a refusal.
+    from hermes_cli import kanban_gate_invariants as _gates
+    declared_parents = _gates.gate_dependency(conn, task_id, reason, kind, waits_on)
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3339,8 +3368,10 @@ def block_task(
         # ``dependency`` only waits on incomplete parents. A worker filing that
         # kind with none open would park in ``todo`` and ``recompute_ready``
         # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
+        # ``needs_input`` so it is sticky until a human unblocks. A ``waits_on``
+        # declaration counts as an open parent even before its edge exists - the
+        # edges are written just below, inside this same function.
+        if kind == "dependency" and not declared_parents and _parents_satisfied(conn, task_id):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
@@ -3371,10 +3402,21 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
+    # The ``waits_on`` edges land HERE, after the transition, never before it: ``link_tasks``
+    # demotes a ``ready`` child to ``todo`` when its new parent is not terminal, and the block's
+    # own guarded UPDATE above only matches ``running``/``ready`` - linking first would make the
+    # block match nothing and return False. Post-transition the child is already exactly where
+    # the link would have put it, so the link only records the edge (and its ``linked`` event).
+    for parent_id in declared_parents:
+        try:
+            link_tasks(conn, parent_id, task_id)
+        except (ValueError, sqlite3.Error) as exc:
+            # Never silent: the block landed, the edge it declared did not, and the card says
+            # so in its own history (the dependency family in `kanban gates report` also names
+            # it, because a blocked card that names a card with no edge is a violation).
+            with write_txn(conn):
+                _append_event(conn, task_id, "dependency_edge_refused",
+                              {"parent": parent_id, "error": str(exc)})
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
