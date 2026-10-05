@@ -5,6 +5,7 @@ canonical Bot Chat session on a Bot-Mode-managed install, and must refuse to
 deliver from anywhere else even if a schema leaks.
 """
 
+import hashlib
 import json
 import os
 import shlex
@@ -277,6 +278,11 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     assert result["status"] == "queued"
     assert result["to"] == "@researcher"
     assert result["process_id"] == "proc_test1234"
+    # P9(a)/§1.2: the ack is a RECEIPT — additive to the historical status "sent".
+    assert result["result"] == "receipt"
+    assert len(result["delivery_id"]) == 64  # content-addressed, never a send_id
+    assert result["detail"] == "accepted and queued — do NOT resend; receipt is retained"
+    assert "do NOT wait" in result["guidance"]
 
     assert len(calls) == 1
     call = calls[0]
@@ -289,13 +295,14 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     command = call["command"]
     mode, dm_file, transport_argv = _runner_parts(command)
     assert mode == "query-file"
+    assert result["delivery_id"] == hashlib.sha256(str(Path(dm_file).resolve()).encode()).hexdigest()
     assert transport_argv == [
         "hermes",
         "-p",
         "researcher",
         "chat",
         "--in",
-        "~",
+        str(home / "profiles" / "researcher"),
         "-c",
         "Bot Chat",
         "--create-if-missing",
@@ -473,8 +480,13 @@ def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, m
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "query-file"
     assert transport_argv[0] == str(hermes_entry)
-    assert transport_argv[1:] == ["-p", "researcher", "chat", "--in", "~", "-c", "Bot Chat",
-                                  "--create-if-missing", "-Q"]
+    # §1.2 profile-scope: the delivery turn's ``-c "Bot Chat"`` lookup is scoped to the
+    # profile's OWN home, not the shared ``~`` — which resolves to the DEFAULT profile's
+    # workspace and its desktop-held live session, so a named-profile delivery failed as
+    # target_busy instead of landing in the target's own Bot Chat.
+    assert transport_argv[1:] == ["-p", "researcher", "chat", "--in",
+                                  str(home / "profiles" / "researcher"),
+                                  "-c", "Bot Chat", "--create-if-missing", "-Q"]
 
     result2 = json.loads(
         bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
@@ -601,6 +613,81 @@ def test_live_dm_runner_retry_never_reexecutes_failed_claim(tmp_path, monkeypatc
     assert dm_file.read_text(encoding="utf-8") == "hello"
 
 
+def test_local_delivery_without_live_owner_admits_to_durable_queue(
+    tmp_path, monkeypatch, capsys
+):
+    """A local delivery with no live owner is durably queued, never run as a
+    record-less CLI turn. The runner's stdout is a retained receipt and the record
+    is readable from the queue store; the temp payload is cleared after admission."""
+    from tools import bot_delivery_queue as delivery_queue
+    from tools import bot_live_delivery as live
+
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: None)
+    monkeypatch.setattr(bot_mode_dm, "_LIVE_WAIT_SECONDS", 0)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("must not launch a CLI turn"))
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("hello", encoding="utf-8")
+    argv = ["hermes", "-p", "researcher"]
+
+    assert bot_mode_dm._run_delivery(argv, str(dm_file), stdin_file=False) == 0
+
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "queued"
+    assert receipt["result"] == "receipt"
+    assert len(receipt["delivery_id"]) == 64
+
+    # the message now lives durably in the queue record; the temp payload is cleared
+    assert not dm_file.exists()
+    target_home = home / "profiles" / "researcher"
+    record = delivery_queue.read_record(target_home, receipt["delivery_id"])
+    assert record is not None
+    assert record["status"] == "queued"
+    assert record["target_profile"] == "researcher"
+    assert record["sender_profile"] == "default"
+    assert "hello" in record["message"]
+
+
+def test_local_queued_delivery_survives_sweep_then_drains(
+    tmp_path, monkeypatch, capsys
+):
+    """Criterion C: a local delivery queued while the lane is mid-turn is held by
+    the sweep (never expired, attempts==0) and delivered on a later free turn."""
+    from tools import bot_delivery_queue as delivery_queue
+    from tools import bot_live_delivery as live
+
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: None)
+    monkeypatch.setattr(bot_mode_dm, "_LIVE_WAIT_SECONDS", 0)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("must not launch a CLI turn"))
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("hello", encoding="utf-8")
+
+    assert bot_mode_dm._run_delivery(["hermes", "-p", "researcher"], str(dm_file), stdin_file=False) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    did = receipt["delivery_id"]
+    target_home = home / "profiles" / "researcher"
+
+    # the sweep never expires a record that was never offered to a turn
+    assert delivery_queue.sweep_delivery_queue(target_home) == 0
+    held = delivery_queue.read_record(target_home, did)
+    assert held is not None
+    assert held["status"] == "queued"
+    assert held["attempts"] == 0
+
+    # on a later free turn the drain claims it and records the terminal outcome
+    claimed = delivery_queue.claim_next(target_home, target_profile="researcher", lease_ok=True)
+    assert claimed is not None and claimed["delivery_id"] == did
+    settled = delivery_queue.settle(
+        target_home, did, status=delivery_queue.STATUS_DELIVERED, reply="got it"
+    )
+    assert settled["status"] == "delivered"
+    assert settled["reply"] == "got it"
+    assert settled["attempts"] >= 1
+
+
 # ── plaintext tempfile lifecycle ─────────────────────────────────────────────
 
 
@@ -627,9 +714,9 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     assert not dm_file.exists()
 
 
-def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
-    """#100523: the CLI's single-owner lease refusal is a delivery FAILURE the
-    sender can read, not a raw exit-1 with the payload silently gone."""
+def test_delivery_runner_reports_live_owner_hold_as_receipt(tmp_path, capsys):
+    """#100523 + §5.2/P12: the CLI's single-owner hold on a DELIVERY turn is a RECEIPT —
+    the payload is accepted and retained, so the sender must not resend."""
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("hi", encoding="utf-8")
     child = tmp_path / "owned.py"
@@ -644,9 +731,16 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
         [sys.executable, str(child), "-p", "ops"], str(dm_file), stdin_file=False
     )
 
-    assert returncode == 1
+    assert returncode == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["reason"] == "target_busy"
+    assert payload["object"] == "hermes.peer.send_result"
+    assert payload["result"] == "receipt"
+    assert payload["status"] == "queued"
+    assert payload["status_detail"] == "live_owner_present"
+    assert payload["attempts"] == 0 and payload["busy"] is True
+    assert payload["reason"] is None and payload["error"] is None
+    assert "target_busy" not in json.dumps(payload["reason"])
+    assert "NOT delivered" not in json.dumps(payload)
 
 
 def test_local_turn_reemits_empty_stdout_for_a_bare_silence_marker(tmp_path, capsys):
@@ -752,6 +846,41 @@ def test_real_delivery_command_round_trip_carries_author(tmp_path):
     assert not dm_file.exists()
 
 
+@pytest.mark.parametrize("args", [[], ["--run-delivery"], ["--run-delivery", "bad", "x"]])
+def test_delivery_main_rejects_invalid_cli(args):
+    assert bot_mode_dm._delivery_main(args) == 2
+
+
+@pytest.mark.parametrize("mode", ["stdin", "query-file"])
+def test_delivery_main_runs_valid_cli_and_unlinks(tmp_path, mode):
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("secret", encoding="utf-8")
+    observed = tmp_path / "observed.txt"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import pathlib, sys\n"
+        "source = sys.stdin if sys.argv[1] == '-' else open(sys.argv[1], encoding='utf-8')\n"
+        "with source:\n"
+        "    pathlib.Path(sys.argv[2]).write_text(source.read(), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    source_arg = "-" if mode == "stdin" else str(dm_file)
+
+    returncode = bot_mode_dm._delivery_main(
+        [
+            "--run-delivery",
+            mode,
+            str(dm_file),
+            sys.executable,
+            str(child),
+            source_arg,
+            str(observed),
+        ]
+    )
+
+    assert returncode == 0
+    assert observed.read_text(encoding="utf-8") == "secret"
+    assert not dm_file.exists()
 
 
 def test_delivery_main_maps_launch_exception_to_one_and_unlinks(tmp_path, monkeypatch):

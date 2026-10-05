@@ -116,6 +116,19 @@ SESSION_COORDINATION_UNAVAILABLE = "SESSION_COORDINATION_UNAVAILABLE"
 # enforcement without this file changing.
 PER_SESSION_EXCLUSIVE_SUBMIT = True
 
+# The DELIVERY flag (§5.2/P12): a delivery turn -- one whose payload the receiver's durable
+# queue has already accepted and will re-offer -- reports a live-owner hold as a RECEIPT
+# instead of the plain refusal. Only delivery turns set this marker (the delivery transport
+# sets it on the child's environment), so ordinary turns keep the refusal vocabulary.
+DELIVERY_TURN_ENV = "HERMES_DELIVERY_TURN"
+
+
+def is_delivery_turn(explicit: Optional[bool] = None) -> bool:
+    """Whether this turn is a DELIVERY turn: the explicit flag, else the env marker."""
+    if explicit is not None:
+        return bool(explicit)
+    return os.environ.get(DELIVERY_TURN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 class ActiveSessionRefusal(str):
     """Refusal message (a ``str``, so callers are untouched) with a machine-readable ``reason``."""
@@ -132,6 +145,36 @@ def format_refusal_stderr(message: str) -> str:
     """Keep the refusal contract across the one-shot CLI subprocess boundary."""
     reason = getattr(message, "reason", "")
     return f"hermes-refusal-reason: {reason}\n{message}" if reason else str(message)
+
+
+class DeliveryHold(str):
+    """A DELIVERY turn's live-owner HOLD (a ``str``, so callers are untouched) — not a failure.
+
+    It keeps the refusal vocabulary (``reason`` is still ``SESSION_NOT_OWNED``, so the one-shot
+    CLI contract and every existing caller are unchanged) while marking itself as a hold: the
+    delivery layer maps it to a RECEIPT (§5.2/P12) — the payload is accepted and retained, this
+    turn did not run, and the sender must not resend.
+    """
+
+    reason: str
+    delivery = True
+
+    def __new__(cls, message: str, *, reason: str, session_id: str = "",
+                owner_surface: str = "", owner_pid: Any = None) -> "DeliveryHold":
+        obj = super().__new__(cls, message)
+        obj.reason = reason
+        obj.session_id = session_id
+        obj.owner_surface = owner_surface
+        obj.owner_pid = owner_pid
+        return obj
+
+
+def delivery_hold_message(key: str, existing: dict[str, Any]) -> str:
+    """Wording for a delivery retained behind a live owner (§5.2 — held, never refused)."""
+    surface = str(existing.get("surface") or "another surface")
+    return (f"Session {key} is held live by {surface}. This delivery is ACCEPTED and retained "
+            "for that owner: it is queued behind the live session and runs when the slot frees. "
+            "Do not resend — a receipt is retained.")
 
 
 def _is_same_writer(entry: dict[str, Any], metadata: Optional[dict[str, Any]]) -> bool:
@@ -295,7 +338,17 @@ def _valid_process_start(v: Any) -> bool:
 
 
 def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
-    atomic_json_write(path, {"entries": entries}, indent=None, sort_keys=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"entries": entries}, fh, sort_keys=True)
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _process_start_time(pid: int) -> Optional[float]:
@@ -482,6 +535,7 @@ def _lease_entry(
 def try_acquire_active_session(
     *, session_id: str, surface: str, config: Any, metadata: Optional[dict[str, Any]] = None,
     registry_home: str | Path | None = None, track_liveness: bool = False,
+    delivery: Optional[bool] = None,
 ) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
     """Acquire an active-session slot: ``(lease, None)`` or ``(None, ActiveSessionRefusal)``.
 
@@ -554,6 +608,23 @@ def try_acquire_active_session(
                     entries[index] = entry
                     _write_entries(state_path, entries)
                     return lease, None
+                if is_delivery_turn(delivery):
+                    # §5.2/P12: for a DELIVERY turn this live owner is not a refusal — the
+                    # payload is durably queued and will be re-offered, so report a HOLD that
+                    # the delivery layer turns into a receipt. Non-delivery callers fall through
+                    # to the unchanged SESSION_NOT_OWNED refusal below.
+                    _write_entries(state_path, entries)
+                    logger.info(
+                        "Delivery held behind live owner of %s: pid=%s surface=%s",
+                        key, existing.get("pid"), existing.get("surface"),
+                    )
+                    return None, DeliveryHold(
+                        delivery_hold_message(key, existing),
+                        reason=SESSION_NOT_OWNED,
+                        session_id=key,
+                        owner_surface=str(existing.get("surface") or ""),
+                        owner_pid=existing.get("pid"),
+                    )
                 return refuse(
                     session_already_owned_message(key, existing), SESSION_NOT_OWNED,
                     "Refused active session %s: already held by pid=%s surface=%s",
@@ -634,6 +705,52 @@ def transfer_active_session(
             return False
         _write_entries(state_path, entries)
         lease.session_id = new_session_id
+        return True
+
+
+# Registry writes on every poll tick would be pure churn: a consumer only has to prove it is
+# still consuming well inside the window others use to judge it dead.
+LEASE_TOUCH_INTERVAL_SECONDS = 60.0
+
+
+def touch_active_session_lease(
+    lease_id: str, *, registry_home: str | Path | None = None,
+    live_session_id: Optional[str] = None, interval: float = LEASE_TOUCH_INTERVAL_SECONDS,
+    force: bool = False,
+) -> bool:
+    """Renew a live consumer's ``updated_at`` stamp, proving it is still consuming.
+
+    A lease is a mailbox destination only while its consumer proves it is consuming
+    (``tools.bot_live_delivery``): the stamp separates "this pane is polling" from "this pane's
+    process is alive but nothing is listening". Renewal requires the entry to still belong to
+    THIS process and, when given, to still be pinned to ``live_session_id`` — a stale session
+    record must not keep a lease (or its successor's) destination warm. Returns True when the
+    entry is present, ours, correctly pinned, and its stamp is current.
+    """
+    key = str(lease_id or "")
+    if not key:
+        return False
+    state_path, lock_path = _lease_paths(registry_home=registry_home)
+    now = time.time()
+    with _FileLock(lock_path):
+        loaded = _read_live_entries(
+            state_path, track_liveness=True,
+            warn="Active-session registry is unavailable; cannot renew a live consumer lease",
+        )
+        if loaded is None:
+            return False
+        entries = loaded[1]
+        own = next((e for e in entries if str(e.get("lease_id") or "") == key), None)
+        if own is None or _registry_pid(own.get("pid")) != os.getpid():
+            return False
+        if live_session_id is not None and str(
+            (own.get("metadata") or {}).get("live_session_id") or ""
+        ) != str(live_session_id):
+            return False
+        if not force and now - (_optional_float(own.get("updated_at")) or 0.0) < interval:
+            return True
+        own["updated_at"] = now
+        _write_entries(state_path, entries)
         return True
 
 
