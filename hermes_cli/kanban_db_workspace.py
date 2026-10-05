@@ -432,9 +432,11 @@ def _cleanup_worktree_workspace(
         if not wp.is_dir():
             return
         common = _git_common_dir(wp)
-        if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
-        repo_root = common.parent
+        if common is None or not _is_linked_worktree_checkout(wp):
+            return  # not a linked worktree of a repo — never guess
+        # A normal checkout's common dir is ``<repo>/.git``; a bare canonical
+        # mirror's common dir IS the mirror dir, so anchor removal on it.
+        repo_root = common.parent if common.name == ".git" else common
         if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
             return  # never remove the main checkout
         if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
@@ -675,6 +677,69 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _git_is_bare_repo(path: Path) -> bool:
+    """True iff *path* is a bare repository with no worktree of its own.
+
+    A bare canonical mirror is a legal ``git worktree add`` anchor, but it has
+    no ``--show-toplevel``, so :func:`_git_toplevel` cannot see it.
+    """
+    out = _kb._git_out(path, "rev-parse", "--is-bare-repository")
+    return out is not None and out.strip() == "true"
+
+
+def _repo_anchor_for(path: Path) -> Optional[Path]:
+    """Return the repo a worktree can be anchored on at *path*.
+
+    A normal checkout anchors on its working-tree root; a **bare canonical
+    mirror** anchors on the mirror directory itself. ``None`` when *path* is
+    neither.
+    """
+    root = _git_toplevel(path)
+    if root is not None:
+        return root
+    if _git_is_bare_repo(path):
+        try:
+            return path.expanduser().resolve(strict=False)
+        except OSError:
+            return path.expanduser()
+    return None
+
+
+def _board_anchor_repo(board: Optional[str]) -> Optional[Path]:
+    """The board's ``default_workdir`` as an anchor repo, or ``None``.
+
+    Lets a per-card worktree target live OUTSIDE the repo (e.g. under the
+    owning profile's work dir) while still sharing the canonical clone's
+    object store. Accepts a normal checkout or a bare canonical mirror.
+    """
+    board_slug = board if board else _kb.get_current_board()
+    try:
+        board_default = (
+            _kb.read_board_metadata(board_slug).get("default_workdir") or ""
+        ).strip()
+    except Exception:
+        return None
+    if not board_default:
+        return None
+    anchor = Path(board_default).expanduser()
+    if not anchor.is_absolute():
+        return None
+    return _repo_anchor_for(anchor)
+
+
+def _mirror_anchored_worktree(
+    mirror: Path, task_id: str, branch_name: str
+) -> tuple[Path, str]:
+    """Materialize ``<mirror>.worktrees/<task-id>`` off a bare canonical mirror.
+
+    The worktree is a SIBLING of the mirror dir: a bare anchor has no working
+    tree to hold ``.worktrees/``, so the per-card tree cannot live inside it.
+    """
+    target = mirror.with_name(mirror.name + ".worktrees") / task_id
+    _ensure_git_worktree(mirror, target, branch_name)
+    return target, branch_name
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -704,9 +769,13 @@ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
-    every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
-    instead of the dispatcher's incidental CWD (whatever dir the gateway was
-    launched from); with no anchor configured we fail loudly rather than guess."""
+    every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``,
+    or ``<mirror>.worktrees/<id>`` for a bare canonical mirror) instead of the
+    dispatcher's incidental CWD (whatever dir the gateway was launched from);
+    with no anchor configured we fail loudly rather than guess. An explicit
+    ``workspace_path`` may sit OUTSIDE any repo (e.g. under the owning
+    profile's work dir): it is anchored on the board's ``default_workdir``
+    clone/mirror when its parent is not itself inside a repo."""
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -724,12 +793,15 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"board {board_slug!r} default_workdir {board_default!r} is not "
                 "absolute; use an absolute path to a git repo"
             )
-        repo_root = _git_toplevel(anchor)
+        repo_root = _repo_anchor_for(anchor)
         if repo_root is None:
             raise ValueError(
                 f"task {task.id} has workspace_kind=worktree but board "
-                f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
+                f"{board_slug!r} default_workdir {board_default!r} is not a git repo "
+                "(neither a working-tree checkout nor a bare canonical mirror)"
             )
+        if _git_is_bare_repo(repo_root):
+            return _mirror_anchored_worktree(repo_root, task.id, branch_name)
         return _anchored_worktree(repo_root, task.id, branch_name)
 
     requested = Path(task.workspace_path).expanduser()
@@ -749,12 +821,14 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         # verbatim, so siblings all point here). Reusing it would run this task
         # on the other task's branch — silent cross-task provenance corruption,
         # unsafe under concurrency — so fall back to our own worktree.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        fallback_root = _repo_root_for_worktree_target(requested.parent) or _board_anchor_repo(board)
         if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
-            if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
+            if _git_is_bare_repo(fallback_root):
+                fallback, _ = _mirror_anchored_worktree(fallback_root, task.id, branch_name)
+            else:
+                fallback = fallback_root / ".worktrees" / task.id
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
+            return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
         return requested_resolved, actual_branch or branch_name
@@ -765,10 +839,20 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
+        # A per-card worktree may legitimately sit OUTSIDE any repo — e.g.
+        # under the owning profile's work dir — anchored on the board's
+        # canonical clone/mirror so the object store stays shared.
+        repo_root = _board_anchor_repo(board)
+    if repo_root is None:
         raise ValueError(
-            f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
-            "and does not point at a git repo root"
+            f"task {task.id} worktree path {task.workspace_path!r} is not inside a git "
+            "repo, does not point at a git repo root, and the board has no "
+            "default_workdir anchor repo"
         )
+    if _path_key(requested_resolved) == _path_key(repo_root):
+        # The requested path IS the anchor repo (typically a bare canonical
+        # mirror): materialize the sibling worktree instead of in-place.
+        return _mirror_anchored_worktree(repo_root, task.id, branch_name)
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 
