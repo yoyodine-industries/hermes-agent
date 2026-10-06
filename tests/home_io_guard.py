@@ -32,6 +32,14 @@ _INTERPRETER_PREFIXES = tuple({
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
 
+# The install-layout manifest the bundle builder writes BESIDE the checkout
+# (<checkout-parent>/manifest.json — the payload's "relative layout" descriptor).
+# hermes_bootstrap reads it at import (pm/environments.payload_venv), so a plain
+# import of gateway.run probes this path; that probe is install layout, not Hermes
+# state. Derived exactly the way the checkout root above is: tests/ -> repo root ->
+# the checkout's parent, which is the directory hermes_bootstrap probes.
+_INSTALL_MANIFEST = Path(__file__).resolve().parents[2] / "manifest.json"
+
 
 def _within(path: str, prefix: str) -> bool:
     """``Path(path).is_relative_to(prefix)`` for two normalized, case-folded absolute strings."""
@@ -123,6 +131,13 @@ class HomeIOGuard:
                     raise AssertionError("TEST BUG: untracked dir_fd in guarded filesystem I/O")
                 candidate = os.path.join(os.fspath(parent), candidate)
             absolute = _normcase(os.path.abspath(candidate))
+            # The checkout's install-layout manifest (the bundle builder's payload descriptor,
+            # written beside the tree) is not Hermes state: hermes_bootstrap probes it at import.
+            # Admit a READ/METADATA probe of exactly that path — and never a write. The compare is
+            # exact (never a prefix) and lexical: resolving would re-enter the guard's own wrapped
+            # os.lstat and recurse.
+            if not destructive and absolute == _normcase(os.fspath(_INSTALL_MANIFEST)):
+                return
             # /proc/<pid>/fd/N is descriptor inspection (deleted-WAL holder scans stat the magic
             # link to compare inode identity); resolving it names whatever file that fd holds,
             # which is not I/O against the home.

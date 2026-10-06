@@ -198,6 +198,24 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 
 
+def test_install_manifest_beside_the_checkout_is_not_hermes_state():
+    """The bundle builder writes <payload>/manifest.json BESIDE the checkout, and
+    hermes_bootstrap probes it at import (pm/environments.payload_venv). That is
+    install layout, not Hermes state: a READ/METADATA probe of exactly that one
+    path is admitted, while a WRITE to it and every sibling path stay refused —
+    the line moves by one exact path, never to a directory prefix."""
+    from tests.home_io_guard import HomeIOGuard
+
+    manifest = PROJECT_ROOT.parent / "manifest.json"
+    guard = HomeIOGuard(lambda: [PROJECT_ROOT.parent])
+    guard.check(manifest)
+    guard.check(manifest, metadata=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(manifest, destructive=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(PROJECT_ROOT.parent / "state.db")
+
+
 def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     """A Hermes-launched shell hands pytest TMPDIR=<home>/cache/scratch (tagged by
     HERMES_SCRATCH_DIR). With that home guarded, honoring it would put the session
