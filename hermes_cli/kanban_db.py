@@ -2,8 +2,13 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. Board resolution: ``board=`` arg — and the in-process ``--board`` scope — > ``HERMES_KANBAN_DB``
+(pins the ACTIVE board's file path for a spawned worker; honoured only when no board is named) >
+``HERMES_KANBAN_BOARD`` > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into
+workers. An EXPLICIT board name always wins: no ambient pin may shadow it, so every board resolves to
+exactly one store. A named board that is not registered RAISES :class:`BoardResolutionError` (naming
+the board) rather than falling back to the current board or handing back a would-be path — an unknown,
+unregistered or ambiguous board is refused, never guessed (2026-09-27, card t_d867ddbd).
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -24,7 +29,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from toolsets import get_toolset_names
 
@@ -101,6 +106,9 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 # --- Constants ---
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+# ``blocked`` stays a RECOGNISED token (so the CLI/schema reject nothing before the seam
+# can answer) and is REFUSED at the create seam: a card is never created blocked
+# (operator ruling 2026-09-27; see ``CREATED_BLOCKED_TOKEN`` near ``create_task``).
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
@@ -230,9 +238,9 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+    "timed_out", "goal_armed", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "skipped_nonspawnable", "skipped_self_review", "skipped_lockdown",
 )
 
 
@@ -493,27 +501,250 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
-def _board_path(
-    env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
-) -> Path:
-    """Shared resolver: ``env_var`` override, else legacy ``<root>/<default_parts>``
-    for the ``default`` board, else ``board_dir(slug)/leaf``."""
-    if env_var:
-        override = os.environ.get(env_var, "").strip()
-        if override:
-            return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
+def board_is_registered(board: Optional[str] = None) -> bool:
+    """``board`` exists because someone REGISTERED it, not because a filing minted it.
+
+    ``default`` is always registered. Every other slug is registered iff its
+    directory carries ``board.json`` — ``create_board`` always writes that file,
+    while the filing path's creating connect() (``kanban_db_path(create=True)``)
+    mints only ``kanban.db``. So this is the probe a FILING uses to refuse a slug
+    nobody registered; it is STRICTER than :func:`board_exists`, which admits a
+    minted store.
+
+    Same invariant :func:`board_is_archived_stub` relies on, and for the same
+    reason: a directory with no ``board.json`` is a mint, never a board somebody
+    created. Measured 2026-09-29 — the phantom ``yoyodine-majordomo`` board (a lane
+    display handle, never a profile id) held three real cards and carried only
+    ``kanban.db``, no ``board.json``.
+    """
+    slug = _slug_or_default(board)
+    if slug == DEFAULT_BOARD:
+        return True
+    try:
+        return (board_dir(slug) / "board.json").exists()
+    except OSError:
+        return False
+
+
+class BoardResolutionError(ValueError):
+    """A board could not be resolved to exactly ONE store, so nothing was resolved.
+
+    Raised instead of guessing. Canonical board resolution never falls back to the
+    current board, never falls back to ``default``, and never hands back a would-be
+    path under ``boards/<slug>/`` for a board nobody registered: a caller that asked
+    for a board by name gets that board's store or a refusal naming the board.
+
+    Subclasses ``ValueError`` so the CLI surfaces it as a usage error. Callers that
+    mean "does this board exist" ask :func:`board_exists` instead — that is the
+    probe; this is the refusal.
+    """
+
+
+def unregistered_board_refusal(slug: str) -> str:
+    """THE refusal text for a caller-named board nobody registered.
+
+    ONE definition, read by BOTH doors into a store — the filing path
+    (:func:`board_for_fired_card`) and the tool board resolver
+    (``tools.kanban_tools._board``) — so the two messages cannot drift apart. A
+    duplicated string here is a drift bug: the doors would then disagree about
+    which slug is refused and why.
+    """
+    return (
+        f"refusing to file on board {slug!r}: no board by that name is "
+        f"registered under {boards_root()} (no board.json). A filing never "
+        f"mints a board, so a name-shaped slug — a lane handle or a profile "
+        f"display name — cannot silently become an estate. Register it with "
+        f"`hermes kanban boards create {slug}`, or omit `board` to file on "
+        f"the source card's board (else {DEFAULT_BOARD!r})."
+    )
+
+
+def _require_registered_board(board: str) -> str:
+    """Normalise an explicit board name and refuse it unless it is REGISTERED.
+
+    The ONE chokepoint an explicit caller-supplied slug passes through before a
+    creating ``connect()`` can turn it into a store. ``board=None``/empty never
+    reaches here — that means "the active board" and keeps the ambient chain.
+    """
+    normed = _require_slug(str(board))
+    if not board_is_registered(normed):
+        raise BoardResolutionError(unregistered_board_refusal(normed))
+    return normed
+
+
+def assert_board_registered(board: Optional[str]) -> Optional[str]:
+    """Refuse a caller-named board that is not REGISTERED; return its normalised slug.
+
+    ``None``/empty means "the active board" and is returned unchanged (``None``),
+    so the ambient chain (env pin -> current -> default) still applies to a
+    source-less call. An explicit name must resolve to a registered board or raise
+    :class:`BoardResolutionError` — the *same* refusal the filing path raises — so
+    no handler reachable from a caller-supplied slug can MINT a store: the creating
+    seam (:func:`kanban_db_connect.connect`) would otherwise satisfy any
+    slug-shaped string by writing ``boards/<slug>/``, which is how a lane display
+    handle silently became an estate. Callers that meant a probe ask
+    :func:`board_is_registered` instead.
+    """
+    if not board:
+        return None
+    return _require_registered_board(str(board))
+
+
+def _pinned_active_store(
+    env_var: str, leaf: str, default_parts: tuple[str, ...],
+) -> Optional[Path]:
+    """The store ``env_var`` pins for the ACTIVE board, or ``None`` when unset.
+
+    The pin exists so a spawned worker's kanban paths still match the dispatcher's
+    after ``hermes -p`` rewrites ``HERMES_HOME`` (symlink / Docker layouts), so it is
+    consulted only when the caller named NO board — an explicit ``board=`` argument
+    always wins (a pin that outranked it made every board resolve to one store).
+
+    It stays a WORKER PIN by design, not a general path switch: the host tests and
+    the fleet's grooming scripts legitimately point it at a store whose filename is
+    not ``kanban.db`` (``apiserver.db``, ``triage-wake.db``, ...), and the 2026-09-27
+    clobber's destination was a perfectly-shaped ``boards/<slug>/kanban.db`` — so a
+    shape check on this pin buys nothing against the incident class while breaking
+    36 tests that use the documented channel. What guards a WRITE is the destination
+    guard, not a filename.
+    """
+    override = os.environ.get(env_var, "").strip()
+    if not override:
+        return None
+    return Path(override).expanduser()
+
+
+def _scoped_board_slug() -> Optional[str]:
+    """The in-process board NAME scope (``--board`` routing / a tool's scoped board), or
+    ``None``. A NAME the caller typed, so it outranks the ambient path pin exactly as a
+    ``board=`` argument does — without this, ``--board ops`` inside a pinned worker still
+    addressed the worker's own store (measured 2026-09-27: "no such task")."""
+    raw = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if not raw:
+        return None
+    return _normalize_board_slug(raw)
+
+
+def _store_path_for_slug(slug: str, default_parts: tuple[str, ...], leaf: str) -> Path:
+    """The ONE layout rule for a board's canonical path: legacy ``<root>/<default_parts>``
+    for the ``default`` board, else ``board_dir(slug)/leaf``. Takes an already-normalised
+    slug and asks no questions — :func:`_board_path` is what decides WHICH slug (and
+    refuses an unregistered one); metadata readers that must not raise call this directly."""
     if slug == DEFAULT_BOARD:
         return kanban_home().joinpath(*default_parts)
     return board_dir(slug) / leaf
 
 
-def kanban_db_path(board: Optional[str] = None) -> Path:
-    """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
-    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
-    return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
+def _board_path(
+    env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
+    *, create: bool = False,
+) -> Path:
+    """THE board-path resolver — every per-board path function goes through it.
+
+    One decision, in this order: an EXPLICIT ``board=`` name (resolved on its own, so
+    no ambient pin can shadow it) -> the in-process ``--board`` scope -> the ``env_var``
+    pin for the active board -> ``HERMES_KANBAN_BOARD``/``<root>/kanban/current`` ->
+    ``default`` -> the legacy ``<root>/<default_parts>`` layout for the ``default``
+    board, else ``board_dir/leaf``.
+
+    A named board that is not registered raises :class:`BoardResolutionError`; an empty
+    name means "the active board", which is the only case where a pin applies.
+
+    ``create=True`` is the WRITING seam (``connect``/``init_db``/``repair`` re-opening a
+    board whose store is gone, regression #23833): the named board's own canonical store
+    is returned even when nothing is registered yet. It is still only ever THAT board's
+    file under ``boards_root()`` — never another board's store, never an arbitrary path.
+    """
+    slug = _normalize_board_slug(board)  # never repairs a malformed slug
+    if slug is None:
+        # A NAME the caller scoped in-process (`--board`, a tool's board) is a name they
+        # typed, so it outranks the ambient path pin, which is only a fallback for
+        # "whichever board is active here".
+        slug = _scoped_board_slug()
+    if slug is None:
+        if env_var:
+            pinned = _pinned_active_store(env_var, leaf, default_parts)
+            if pinned is not None:
+                return pinned
+        slug = get_current_board()
+    if not create and slug != DEFAULT_BOARD and not board_exists(slug):
+        raise BoardResolutionError(
+            f"no board {slug!r} under {boards_root()}: refusing to resolve a {leaf} path "
+            f"for a board that is not registered (never falls back to the current board "
+            f"{get_current_board()!r} or {DEFAULT_BOARD!r}). Register it with "
+            f"`hermes kanban boards create {slug}`, or ask board_exists() if you meant a probe; "
+            f"the creating seams (`connect`/`init_db`/`repair`) pass create=True."
+        )
+    return _store_path_for_slug(slug, default_parts, leaf)
+
+
+def kanban_db_path(board: Optional[str] = None, *, create: bool = False) -> Path:
+    """``kanban.db`` path. A named ``board`` always resolves to that board's own store
+    (the ``HERMES_KANBAN_DB`` pin is honoured only when no board is named, and only for
+    the board ``HERMES_KANBAN_BOARD`` agrees with); ``default`` -> ``<root>/kanban.db``
+    (back-compat), else the board dir. An unregistered board raises
+    :class:`BoardResolutionError` rather than resolving to a would-be path — pass
+    ``create=True`` from a seam that is about to CREATE that board's own store."""
+    return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db", create=create)
+
+
+def source_board_for_task(task_id: Optional[str]) -> Optional[str]:
+    """The board holding ``task_id``, probed across every registered board.
+
+    A card fired from another card lands on the SAME board as the card that fired
+    it, so the source card's board is read from the board STORES (a fact) rather
+    than from any pin or name in the callers' environment. ``None`` when the id
+    names no card on any board; the caller then keeps the ambient board.
+    """
+    if not task_id:
+        return None
+    try:
+        # Lazy: kanban_register imports this module at module level, so the probe
+        # is imported here rather than at the top (no import cycle).
+        from hermes_cli.kanban_register import find_card_board
+        return find_card_board(task_id)
+    except Exception:
+        return None
+
+
+def board_for_fired_card(explicit: Optional[str] = None, *,
+                         source_task_id: Optional[str] = None) -> Optional[str]:
+    """The board a newly FIRED card lands on: explicit > SOURCE CARD > ambient.
+
+    THE RULE (operator standing order, 2026-09-29): a card fired from another card
+    lands on the SAME board as the card that fired it. The SOURCE card's board
+    therefore outranks the ambient board - ``HERMES_KANBAN_BOARD`` / the
+    ``<root>/kanban/current`` pointer - which is a property of the CALLING PROCESS,
+    not of the work, and is only a fallback for a filing with NO source card: a
+    loop, a cron row, a sweep. It can be stale or simply wrong (measured
+    2026-09-29: three cards fired from a defcon card landed on a lane-named board
+    nobody grooms, invisibly to every board that gets read). The source card's
+    board is the work's own estate, so it wins unconditionally.
+
+    The same rule is the one the yaan-platform resolver states as "the source
+    card's board outranks ``registry.kanban-unblocker.domain_map``"; here the
+    fallback it outranks is the ambient board rather than that row.
+
+    An EXPLICIT board must resolve to a REGISTERED board or the filing is REFUSED
+    (:class:`BoardResolutionError`) — a filing never MINTs a board. The creating
+    connect() would otherwise satisfy any slug-shaped string by writing a store
+    under ``boards/<slug>/``, which is how a lane display handle silently became
+    an estate (measured 2026-09-29: the phantom ``yoyodine-majordomo`` board
+    collected three real cards). A name-shaped slug is exactly the case this
+    refusal exists for: registration is deliberate (``create_board`` writes
+    ``board.json``), minting is not, so a caller that means a board registers it
+    first or omits ``board`` to inherit the source/default board.
+
+    Returns ``None`` when neither an explicit board nor a source board applies,
+    which is what keeps the ambient chain (``env pin -> current -> default``)
+    byte-for-byte as it was for every source-less caller.
+    """
+    if explicit:
+        # The ONE refusal (shared with the tool board resolver via
+        # :func:`unregistered_board_refusal`) — a duplicated message would let the
+        # two doors into a store drift.
+        return _require_registered_board(str(explicit))
+    return source_board_for_task(source_task_id)
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -539,6 +770,40 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     return _board_path(None, board, ("kanban", "logs"), "logs")
 
 
+def board_for_store_path(path: Any) -> Optional[str]:
+    """The slug of the board whose canonical store IS ``path``, else ``None``.
+
+    The single layout->board rule (``<root>/kanban.db`` = ``default``, else
+    ``<root>/kanban/boards/<slug>/<leaf>``), shared by :func:`board_for_connection`
+    and by anything that must ask "is this file a board store, and whose?".
+    """
+    if not path:
+        return None
+    try:
+        resolved = Path(path).resolve()
+        if resolved == (kanban_home() / "kanban.db").resolve():
+            return DEFAULT_BOARD
+        rel = resolved.relative_to(boards_root().resolve())
+    except (OSError, ValueError):
+        return None
+    return rel.parts[0] if len(rel.parts) > 1 else None
+
+
+def board_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """The slug of the board ``conn`` is open against, or ``None`` when it cannot be told.
+
+    A filing must be bounded by the board its OWN connection belongs to: a caller holding
+    a ``--board`` override is not on ``get_current_board()``, and ``HERMES_KANBAN_DB`` can
+    pin a database no board claims (workers are spawned with exactly that). So the slug is
+    read off the open file's path, never off the ambient current board.
+    """
+    path = ""
+    for _seq, name, file in conn.execute("PRAGMA database_list"):
+        if name == "main" and file:
+            path = file
+    return board_for_store_path(path)
+
+
 def board_metadata_path(board: Optional[str] = None) -> Path:
     """``board.json`` path — display metadata only; the directory slug is the identity."""
     return board_dir(_slug_or_default(board)) / "board.json"
@@ -547,6 +812,79 @@ def board_metadata_path(board: Optional[str] = None) -> Path:
 def _default_board_display_name(slug: str) -> str:
     """``atm10-server`` -> ``Atm10 Server``."""
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
+
+
+def _board_dispatch_flag(value: Any = True) -> bool:
+    """Coerce a ``board.json`` ``dispatch`` value to the admission bool.
+
+    Absent, ``None`` or an unrecognised value means ADMITTED (``True``), so every
+    board that predates the key keeps dispatching. Only an explicit false-y value
+    (``false``, ``0``, ``"off"`` ...) takes a board out of the dispatch set.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return True
+
+
+def board_is_archived_stub(slug: str) -> bool:
+    """A board DIRECTORY with no ``board.json`` whose slug has an ``_archived`` copy.
+
+    The measured resurrection (card t_17c9c847): a live worker's env pins its
+    board's store path, so the moment that board is archived the worker's next
+    ``connect(create=True)`` (its own auto-heartbeat, a tool call) mints an EMPTY
+    store back at the archived slug's directory. The mint carries no
+    ``board.json``, so :func:`read_board_metadata` synthesizes ``archived=False``
+    and :func:`list_boards` admits it — the archive is undone by the very worker
+    it was clearing away. A directory that lacks the metadata of an archived slug
+    is that mint, never a board somebody created (``create_board`` always writes
+    ``board.json``), so it is not admitted to the dispatch set.
+    """
+    try:
+        if (board_dir(slug) / "board.json").exists():
+            return False
+    except Exception:
+        return False
+    root = boards_root() / "_archived"
+    if not root.is_dir():
+        return False
+    prefix = f"{slug}-"
+    try:
+        for child in root.iterdir():
+            if not child.name.startswith(prefix):
+                continue
+            # ``<slug>-<epoch>`` (and ``<slug>-<epoch>-<n>`` on a rapid re-archive).
+            if child.name[len(prefix):].split("-")[0].isdigit():
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def board_dispatch_enabled(board: Optional[str] = None) -> bool:
+    """May the dispatcher serve ``board``? ``False`` for an estate/scratch board.
+
+    The one chokepoint read by the dispatcher's board enumeration
+    (:func:`list_dispatch_boards`) AND by its per-tick spawn guard
+    (``kanban_db_dispatch.dispatch_once``), so an estate board is safe by
+    construction — including from a CLI ``hermes kanban --board <estate> dispatch``
+    that bypasses enumeration entirely (card t_17c9c847).
+
+    Fails CLOSED for a resurrected archived stub: a minted directory is not a
+    board, so re-opening an archived slug's path cannot re-admit it.
+    """
+    slug = _slug_or_default(board)
+    if board_is_archived_stub(slug):
+        return False
+    try:
+        return bool(read_board_metadata(slug).get("dispatch", True))
+    except Exception:
+        return True
 
 
 def read_board_metadata(board: Optional[str] = None) -> dict:
@@ -564,6 +902,12 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "project_id": None,
         "created_at": None,
         "archived": False,
+        # Dispatch admission (estate/rehearsal boards): absent => True, so every
+        # board that predates the key is unchanged. ``False`` now reaches the
+        # dispatcher's own board enumeration AND its per-tick spawn path, so a
+        # rehearsal estate is safe by construction rather than by remembering to
+        # archive it (card t_17c9c847).
+        "dispatch": True,
     }
     try:
         p = board_metadata_path(slug)
@@ -576,7 +920,15 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    meta["db_path"] = str(kanban_db_path(slug))
+    # Normalise the flag: a hand-edited ``"false"``/``0`` is falsy-by-string and
+    # would otherwise read as admitted. Anything except an explicit false-y value
+    # admits the board (fail-open on admission only for a missing/garbled key,
+    # which is what keeps every existing board dispatchable).
+    meta["dispatch"] = _board_dispatch_flag(meta.get("dispatch"))
+    # The board's OWN canonical store, by layout — never the ambient pin: this reader
+    # must not raise (it runs while a board is still being created) and must not answer
+    # another board's store, which is exactly what the pin used to make it do.
+    meta["db_path"] = str(_store_path_for_slug(slug, ("kanban.db",), "kanban.db"))
     return meta
 
 
@@ -584,10 +936,20 @@ def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+    priority_policy: Optional[Any] = None, operator_register: Optional[str] = None,
+    dispatch: Optional[bool] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
+    "" = clear (``project_id`` is not validated here). ``priority_policy``: ``None`` =
+    unchanged, "" = clear, else the spec stored as given (validated on the read side, by
+    ``kanban_priority_policy.normalize_spec``). ``operator_register``: ``None`` =
+    unchanged, "" = clear, else the card id of the register for this board - the anchor
+    ``hermes kanban rollup`` walks when no register is named; validated here because a
+    reader must never have to (``kanban_register.parse_ref``). ``dispatch``: ``None`` =
+    unchanged (and the synthesized ``True`` default is NOT materialized, so a board
+    that never touched the key keeps its ``board.json`` byte-identical); ``False``
+    marks an estate/scratch board the dispatcher must not serve."""
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
     meta = read_board_metadata(slug)
@@ -600,9 +962,38 @@ def write_board_metadata(
             meta[key] = str(value)
     if archived is not None:
         meta["archived"] = bool(archived)
+    if dispatch is not None:
+        meta["dispatch"] = bool(dispatch)
+    elif meta.get("dispatch") is True:
+        # ``read_board_metadata`` synthesizes ``dispatch: True``; an unchanged
+        # board must not gain the key on an unrelated write (rename, workdir...).
+        meta.pop("dispatch", None)
     for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
         if value is not None:
             meta[key] = str(value) if value else None
+    if operator_register is not None:
+        from hermes_cli import kanban_register as _register
+
+        register_id = str(operator_register).strip()
+        if not register_id:
+            meta.pop(_register.META_KEY, None)
+        elif not _register.is_task_id(register_id):
+            raise ValueError(
+                f"operator_register must be a card id ('t_' + hex), got {operator_register!r}; "
+                "nothing was written"
+            )
+        else:
+            meta[_register.META_KEY] = register_id
+    if priority_policy is not None:
+        from hermes_cli import kanban_priority_policy as _policy
+
+        # A spec is an object, so it cannot ride the string-coercing loop above, and a
+        # clear removes the key outright rather than leaving a null behind: an unwired
+        # board.json must read exactly as it did before anything was set.
+        if priority_policy:
+            meta[_policy.POLICY_KEY] = priority_policy
+        else:
+            meta.pop(_policy.POLICY_KEY, None)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -610,20 +1001,26 @@ def write_board_metadata(
     path.write_text(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
     )
-    meta["db_path"] = str(kanban_db_path(slug))
+    meta["db_path"] = str(_store_path_for_slug(slug, ("kanban.db",), "kanban.db"))
     return meta
 
 
 def create_board(
     slug: str, *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, default_workdir: Optional[str] = None,
-    project_id: Optional[str] = None,
+    project_id: Optional[str] = None, dispatch: Optional[bool] = None,
 ) -> dict:
-    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
+    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata).
+
+    ``dispatch=False`` births an ESTATE/scratch board the dispatcher never serves
+    (card t_17c9c847): the flag is written into ``board.json`` at creation, so the
+    board is undispatchable by construction rather than by a teardown somebody has
+    to remember.
+    """
     normed = _require_slug(slug)
     meta = write_board_metadata(
         normed, name=name, description=description, icon=icon, color=color,
-        default_workdir=default_workdir, project_id=project_id,
+        default_workdir=default_workdir, project_id=project_id, dispatch=dispatch,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -632,7 +1029,12 @@ def create_board(
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
     """Metadata for every board: ``default`` first (always present), then
-    ``boards/<slug>/`` dirs holding a ``kanban.db`` or ``board.json``, sorted."""
+    ``boards/<slug>/`` dirs holding a ``kanban.db`` or ``board.json``, sorted.
+
+    A resurrected archived STUB — a minted directory with no ``board.json`` whose
+    slug already has an ``_archived`` copy — is NOT a board and is skipped here,
+    so the phantom a pinned worker re-creates cannot re-enter any enumeration
+    (:func:`board_is_archived_stub`, card t_17c9c847)."""
     entries = [read_board_metadata(DEFAULT_BOARD)]
     seen = {DEFAULT_BOARD}
     root = boards_root()
@@ -646,12 +1048,30 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 continue
             if not normed or normed in seen or not _dir_holds_board(child):
                 continue
+            if board_is_archived_stub(normed):
+                continue
             meta = read_board_metadata(normed)
             if meta.get("archived") and not include_archived:
                 continue
             entries.append(meta)
             seen.add(normed)
     return entries
+
+
+def list_dispatch_boards() -> list[dict]:
+    """Live boards the DISPATCHER may serve: non-archived AND dispatch-enabled.
+
+    The dispatcher's own board enumeration (card t_17c9c847). :func:`list_boards`
+    stays the full inventory for the CLI and the dashboard, so an estate board is
+    still VISIBLE on the board list — it is simply never spawned from. Both halves
+    are load-bearing: the ``dispatch`` flag closes the gap the archived-only filter
+    left (``"each board has its own ... dispatcher loop"``), and
+    :func:`board_dispatch_enabled` fails closed for a resurrected archived stub.
+    """
+    return [
+        meta for meta in list_boards(include_archived=False)
+        if board_dispatch_enabled(meta.get("slug") or DEFAULT_BOARD)
+    ]
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
@@ -688,6 +1108,19 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     shutil.rmtree(d)
     return {"slug": normed, "action": "deleted", "new_path": ""}
 
+
+def board_priority_policy(board: Optional[str] = None) -> Optional[dict]:
+    """The normalised ``priority_policy`` for ``board``, or ``None`` when it has none.
+
+    The read-only half of the birth seam: what a policy's spec actually resolves to,
+    validated exactly as ``create_task`` validates it, so a caller can report or assert
+    a board's wiring without filing a card. Raises ``PolicyError`` for a configured but
+    unusable spec - the same refusal a filing would get.
+    """
+    from hermes_cli import kanban_priority_policy as policy
+
+    raw = read_board_metadata(board if board else get_current_board()).get(policy.POLICY_KEY)
+    return policy.normalize_spec(raw)
 
 # --- Data classes ---
 
@@ -738,6 +1171,13 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Absolute epoch seconds at which a ``scheduled`` card becomes due. The
+    # dispatcher tick wakes it (``kanban_due.wake_due_cards``) -- no external
+    # cron is involved. NULL = parked with no wake time.
+    due_at: Optional[int] = None
+    # VALID_DUE_WINDOW_POLICIES; NULL reads as "defer". Decides whether a due
+    # time landing inside a reserved execution band defers the wake or not.
+    due_window_policy: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -767,11 +1207,12 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "due_at",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "due_window_policy",
 )
 
 
@@ -972,7 +1413,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Absolute epoch seconds at which a ``scheduled`` or time-fenced ``blocked``
+    -- card becomes DUE. Set by ``schedule_task(due_at=...)`` /
+    -- ``hermes kanban schedule --due`` and by ``block_task(due_at=...)`` /
+    -- ``hermes kanban block --due``. The dispatcher tick wakes every due card
+    -- itself (``kanban_due.wake_due_cards``) so a time-gated card needs no
+    -- external cron. NULL = parked with no wake time (a wait on an unknown
+    -- moment, woken by a human/unblock).
+    due_at               INTEGER,
+    -- One of VALID_DUE_WINDOW_POLICIES; NULL reads as 'defer'. Decides what the
+    -- waker does when the due time falls inside a reserved execution band:
+    -- 'defer' holds the wake until the band closes, 'ambient' wakes anyway.
+    due_window_policy    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1069,6 +1522,28 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- The designation ledger: the cards ALLOWED to hold a reserved-tranche priority, one row per
+-- designated card (R3 - no new database, the board's own store). ``hermes kanban defcon`` is
+-- the only writer, and the opt-in tranche storage guard refuses a tranche value on a card with
+-- no live row here. ``priority`` is the card's ORDINARY priority: what ``revoke`` restores.
+CREATE TABLE IF NOT EXISTS priority_designations (
+    task_id       TEXT PRIMARY KEY,
+    board         TEXT NOT NULL,
+    priority      INTEGER NOT NULL,
+    authority     TEXT,
+    reason        TEXT NOT NULL,
+    designated_at TEXT NOT NULL,
+    revoked_at    TEXT
+);
+
+-- Board-level key/value bookkeeping that is not a task (the due-card waker's
+-- last-tick heartbeat; see kanban_db.record_due_waker_tick). One row per key,
+-- upserted in place -- never a log.
+CREATE TABLE IF NOT EXISTS kanban_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -1126,6 +1601,12 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+#: Live-profile roster cache: ``(expires_at_monotonic, names)``. A create is not a
+#: hot path but a drain can file cards in a loop, so the roster listing is cached
+#: briefly rather than re-listed per card. Short TTL keeps a newly created profile
+#: usable without restarting the gateway.
+_LIVE_PROFILE_CACHE: tuple[float, Optional[set[str]]] = (0.0, None)
+_LIVE_PROFILE_TTL_SECONDS = 30.0
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],
@@ -1252,6 +1733,890 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+# ---------------------------------------------------------------------------
+# Born-blocked cards are REFUSED at the create path (operator ruling 2026-09-27)
+#
+# A card born ``blocked`` carries no block_kind and no reason: it hides work from the
+# dispatcher (which only picks up ``ready``), leaves a row no reader can diagnose, and
+# does not even hold - the next ``recompute_ready`` promotes it, so the flag buys a card
+# with no blocker AND a status that lies. Measured when this landed: 51 created-blocked
+# rows on ``ops``, 1 on ``defcon`` (``task_events.kind='blocked'`` + payload
+# ``reason='initial_status'``). The ruling is absolute - no board, caller or
+# configuration may make a new one. So this seam refuses the attempt, escalates it, and
+# files the deviation against the creating lane BY NAME; nothing is inserted.
+#
+# The bypass (a raw ``INSERT INTO tasks`` with ``status='blocked'``) is deliberately NOT
+# closed by an INSERT trigger: an unconditional trigger would also refuse a legitimate
+# board restore / ``boards import``, which replays the legacy born-blocked rows. That
+# class is REPORTED instead by the created-blocked regression watch (card t_9ad5e246),
+# which files any created-blocked row appearing after this refusal landed. Design record:
+# platform-stl card t_5c89c04e.
+# ---------------------------------------------------------------------------
+
+# The token stays RECOGNISED on every surface (schema enum, CLI choices) and is refused
+# HERE, so the caller is answered with the two legitimate moves instead of argparse's
+# bare "invalid choice: 'blocked'".
+CREATED_BLOCKED_TOKEN = "blocked"
+BORN_BLOCKED_DEVIATION_PREFIX = "DEVIATION (born-blocked refused)"
+BORN_BLOCKED_GUARD_IDENTITY = "kanban-create-guard"
+
+BORN_BLOCKED_ALTERNATIVES = (
+    "Legitimate move 1 - WAITING on other work: create the card normally with its dependency "
+    "edges - parents=[...] on kanban_create, or `hermes kanban create <title> --parent <id>`. "
+    "The card is born `todo` and promotes itself when every parent is done; the parked state "
+    "names what it waits on, so nothing is hidden. "
+    "Legitimate move 2 - a REAL BLOCK found in the course of work: create the card normally, "
+    "then block it with a kind and a reason - kanban_block(kind=\"dependency\", "
+    "reason=\"...\") (or needs_input / capability / transient), or `hermes kanban block <id> "
+    "\"<reason>\" --kind <k>`. A blocked card must always name its blocker."
+)
+
+#: THE PROSE REVISION - the fix for STALENESS, not for the prose (card t_d152a4c9).
+#:
+#: Both carriers below embed instructive prose (the corrected CLI moves), and a deviation row
+#: is DURABLE and PUBLIC. The rows the first live probe minted (t_35fe9e40, t_ae48ce83,
+#: 2026-09-27) keep the PRE-FIX text forever - `hermes kanban add` and a `block --reason` flag,
+#: neither of which exists (re-verified live 2026-10-02: `hermes kanban add` answers "'add' is
+#: not a `hermes kanban` command", and `block`'s reason is POSITIONAL). Nothing on those rows
+#: said which revision of the prose they were written from, so a stale row was
+#: indistinguishable from a current one, and a lane that read one learned two commands that do
+#: not exist.
+#:
+#: So the prose stays instructive - it is what makes the reprimand actionable - and every
+#: emission now STAMPS the revision it was written from:
+#:
+#:   * ``created_blocked_refusal_message`` (the refusal every surface returns verbatim), and
+#:   * ``file_born_blocked_deviation`` (the deviation row body),
+#:
+#: both carry :data:`BORN_BLOCKED_PROSE_MARKER`, and :func:`born_blocked_prose_revision` reads
+#: it back. UNMARKED TEXT IS THE r1 GENERATION - minted before this stamp existed - and reads
+#: as ``None``: stale by construction, never silently "current". A marker naming a DIFFERENT
+#: revision is equally detectable, so a row that outlives a prose change is self-identifying
+#: rather than quietly wrong.
+#:
+#: BUMP THE REVISION whenever ``BORN_BLOCKED_ALTERNATIVES`` (or any other prose either carrier
+#: embeds) changes. An enforcement record is EVIDENCE and is never rewritten in place: the two
+#: pre-fix rows were ANNOTATED in thread with the corrected commands, exactly as this constant
+#: expects the next stale generation to be.
+BORN_BLOCKED_PROSE_REVISION = "r2"
+
+#: The rendered marker, parsed back by :func:`born_blocked_prose_revision`.
+BORN_BLOCKED_PROSE_MARKER = f"[born-blocked prose revision: {BORN_BLOCKED_PROSE_REVISION}]"
+
+_BORN_BLOCKED_PROSE_RE = re.compile(r"\[born-blocked prose revision: (r\d+)\]")
+
+
+def born_blocked_prose_revision(text: Optional[str]) -> Optional[str]:
+    """The prose revision a refusal message or deviation body was written from.
+
+    ``None`` means the text carries no marker at all - the r1 (pre-stamp) generation, i.e.
+    stale by construction. A marker naming a DIFFERENT revision is equally detectable: the
+    prose may have moved (a verb repaired, a flag dropped) since that text was written, so a
+    reader must never treat it as current. This is the whole point of the stamp - an
+    enforcement record outlives the revision that wrote it (card t_d152a4c9).
+    """
+    if not text:
+        return None
+    match = _BORN_BLOCKED_PROSE_RE.search(text)
+    return match.group(1) if match else None
+
+
+def born_blocked_prose_is_current(text: Optional[str]) -> bool:
+    """True only when ``text`` carries THIS revision's marker (see the constant above)."""
+    return born_blocked_prose_revision(text) == BORN_BLOCKED_PROSE_REVISION
+
+
+class CreatedBlockedRefused(ValueError):
+    """``initial_status='blocked'`` was refused by the create seam.
+
+    A ``ValueError`` so every surface reports it as a validation refusal (the
+    ``kanban_create`` tool prints ``kanban_create: <message>``; the CLI funnels the same
+    text) rather than an internal error.
+
+    Attributes: ``lane`` (the naming creator), ``title`` (the refused title),
+    ``deviation_task_id`` (the public deviation row filed against the lane) and
+    ``deviation_error`` (why filing it failed - the refusal never depends on it).
+    """
+
+    def __init__(self, message, *, lane="", title="",
+                 deviation_task_id=None, deviation_error=None):
+        super().__init__(message)
+        self.lane = lane or ""
+        self.title = title or ""
+        self.deviation_task_id = deviation_task_id
+        self.deviation_error = deviation_error
+
+
+def created_blocked_refusal_message(
+    title, lane, deviation_task_id=None, deviation_error=None,
+) -> str:
+    """The refusal text; returned verbatim by every surface (tool, CLI, kernel)."""
+    who = lane or "an unidentified caller"
+    lines = [
+        f"refused: a card is never created blocked (initial_status='blocked'). "
+        f"Attempted title {title!r}, creator {who}. NOTHING WAS CREATED - no task row, "
+        f"no event, and no blocked event carrying reason='initial_status'.",
+        "Why: a born-blocked card carries no block_kind and no reason, so it hides the "
+        "work from the dispatcher and from every reader, and the flag does not even hold - "
+        "the next recompute_ready() promotes it, leaving a card whose status lies. "
+        "Operator ruling 2026-09-27; design record platform-stl card t_5c89c04e.",
+        BORN_BLOCKED_ALTERNATIVES,
+    ]
+    if deviation_task_id:
+        lines.append(
+            f"Enforcement: the attempt is escalated and the deviation is filed on this "
+            f"board against the creating lane by name - task {deviation_task_id}. "
+            f"Fix the call, not the guard."
+        )
+    else:
+        lines.append(
+            "Enforcement: the deviation row could NOT be filed"
+            + (f" ({deviation_error})" if deviation_error else "")
+            + " - the refusal stands regardless; report this to platform-stl."
+        )
+    lines.append(
+        f"{BORN_BLOCKED_PROSE_MARKER} - the revision of the enforcement prose above. "
+        f"A message or deviation row that carries an OLDER marker, or none at all, is "
+        f"STALE: check a command against `hermes kanban --help` before following it."
+    )
+    return " ".join(lines)
+
+
+def _born_blocked_deviation_key(board, lane, title) -> str:
+    """One durable deviation row per distinct violation - never a card per retry."""
+    from hashlib import sha1
+
+    digest = sha1((title or "").strip().encode("utf-8")).hexdigest()[:12]
+    return f"born-blocked-refused:{board or ''}:{lane or 'unknown'}:{digest}"
+
+
+def file_born_blocked_deviation(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, lane: Optional[str] = None,
+    title: str = "", tenant: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """File the public deviation row for a refused born-blocked attempt.
+
+    Returns ``(task_id, error)`` - exactly one of which is set. Never raises: the
+    refusal must not depend on its own side effect, so a filing failure is carried in
+    the refusal message (and on the exception) instead of being swallowed or turning
+    the refusal into an error.
+    """
+    who = (lane or "").strip()
+    assignee = _canonical_assignee(who) if who else None
+    if not assignee:
+        # An unidentified caller still gets a public row; the ops head owns the chase.
+        assignee = "default"
+    attempt = " ".join((title or "").split())[:120] or "(untitled)"
+    body = "\n".join([
+        "**Enforcement record - a born-blocked card was REFUSED at the create path.**",
+        "",
+        f"* **creator lane (by name):** `{who or 'unidentified caller - row filed to default'}`",
+        f"* **attempted title:** `{attempt}`",
+        "* **enforcement action:** REFUSED. Nothing was created - no task row, no `created` "
+        "event, and no `blocked` event carrying `reason='initial_status'`.",
+        "* **standard:** a card is never created blocked (`initial_status='blocked'`); "
+        "operator ruling 2026-09-27, design record platform-stl `t_5c89c04e`.",
+        f"* **what to do instead:** {BORN_BLOCKED_ALTERNATIVES}",
+        f"* **enforcement prose revision:** `{BORN_BLOCKED_PROSE_REVISION}` "
+        f"{BORN_BLOCKED_PROSE_MARKER} - the revision of the enforcement prose this row was "
+        f"written from. A row carrying an OLDER marker, or none at all, is STALE - check a "
+        f"command against `hermes kanban --help` before following it (the two pre-fix rows "
+        f"`t_35fe9e40` and `t_ae48ce83` are annotated in thread for exactly this reason).",
+        "",
+        "This row is the escalation of the attempt AND the public reprimand: filed on the "
+        "board the attempt targeted, against the creating lane by name, in the open.",
+        "",
+        "The lane owns the correction: (a) the **fix** - a parent edge for waiting, and "
+        "`hermes kanban block <id> \"<reason>\" --kind <k>` for a real block, never a "
+        "born-blocked card; "
+        "(b) the **cost** - a born-blocked create is refused, and repeats collapse onto this "
+        "same row; (c) the **acceptance** - reply on this card naming which of the two moves "
+        "the lane used, and re-run the call.",
+    ])
+    try:
+        tid = create_task(
+            conn,
+            title=f"{BORN_BLOCKED_DEVIATION_PREFIX}: {who or 'unidentified lane'} "
+                  f"attempted {attempt!r}",
+            body=body,
+            assignee=assignee,
+            board=board,
+            tenant=tenant,
+            created_by=BORN_BLOCKED_GUARD_IDENTITY,
+            idempotency_key=_born_blocked_deviation_key(board, who, title),
+        )
+    except Exception as exc:  # the record's failure must never replace the refusal
+        return None, f"{type(exc).__name__}: {exc}"
+    return str(tid), None
+
+
+def _refuse_created_blocked(
+    conn: sqlite3.Connection, *, board: Optional[str], lane: Optional[str], title: str,
+    tenant: Optional[str] = None,
+) -> CreatedBlockedRefused:
+    """File the deviation, then build the refusal. The refusal is unconditional."""
+    deviation_id, deviation_error = file_born_blocked_deviation(
+        conn, board=board, lane=lane, title=title, tenant=tenant)
+    return CreatedBlockedRefused(
+        created_blocked_refusal_message(title, lane, deviation_id, deviation_error),
+        lane=lane or "", title=title or "",
+        deviation_task_id=deviation_id, deviation_error=deviation_error,
+    )
+
+
+# THE ABOVE-TRANCHE GUARD (operator ruling 2026-09-28; design record platform-stl t_6ce41549)
+#
+# The operator's asks and SEVs hold the RESERVED TOP TRANCHÉ (kanban_priority_policy:
+# TRANCHE_FLOOR..TRANCHE_TOP, and MAX_PRIORITY == TRANCHE_TOP). Nothing else is admitted above
+# them, and no row anywhere carries a value above the ceiling. Two doors broke that, both of
+# them board-independent, so the guard is board-independent too (neither of them is gated on a
+# board's ``priority_policy``, which is exactly why every board was open):
+#
+#   * the FILING door: ``create_task`` clamped an out-of-domain request to the ordinary edge
+#     only on a board that carries a policy; on a board with none the value landed verbatim;
+#   * the RE-RANK door: ``edit_task --priority 1100000`` was likewise inert, and it is how the
+#     class actually got created (measured 2026-09-28: 52 rows above the ceiling on ``defcon``,
+#     47 of them at 1100000, plus 1 on ``ops`` - 10 of the 52 carry a live designation, none
+#     carries an ask stamp, so the operator's asks were being outranked by plain lane work).
+#
+# The predicate is the card's OWN MARKER, read deterministically and never inferred from a
+# value. A card that carries none may not claim a value above the ceiling; a card that carries
+# one is the operator's ask (or a declared SEV1) and is never refused - it is landed at the top
+# of the scale, TRANCHE_TOP, because the scale still ends there.
+#
+# The repair half is ``demote_above_tranche`` below: a row already above the ceiling is LOWERED
+# (into its class ceiling) rather than argued with, board-locally, once per dispatcher tick.
+# ---------------------------------------------------------------------------------------------
+
+def _resolve_operator_ask(conn: sqlite3.Connection, *, board: Optional[str] = None,
+                          parents: Any = (), body: Optional[str] = "",
+                          serves: Any = None) -> Any:
+    """The :class:`~hermes_cli.kanban_register.AskRef` a filing is stamped with, or ``None``.
+
+    Reads only what the caller and THIS board can answer: an explicit ``serves``, the
+    worker-session env, the body's own stamp, then the parents - never another board's
+    rows, except through the cross-board probe that resolves a reference naming a card
+    elsewhere (the case this whole feature exists for, and only for a ref the caller
+    named outright). Nothing here may fail a FILING: a reference that names no card is
+    warned about and carried into the ``created`` event as ``operator_ask_unresolved``,
+    so it is visible to the roll-up and to whoever reads the card, rather than fatal.
+
+    Restored from the pre-update carrier (card ``t_ac98fc08``) after the 2026-09-29 04:48
+    ``hermes-update`` R5 round-trip left this seam a documented stand-in returning ``None``.
+    """
+    from hermes_cli import kanban_register as reg
+
+    if serves is not None and reg.parse_ref(serves) is None:
+        # A malformed reference is a CALLER error, refused here before any write: a
+        # guessed id would poison the roll-up, and the caller is the only one who can
+        # fix it. (Syntactically valid but unknown ids stay a warning - see below.)
+        raise ValueError(
+            f"serves must be a card id or <register>/<ask>, got {serves!r}; a card id "
+            f"is 't_' + hex (e.g. t_fc615201). Nothing was created."
+        )
+    env = os.environ.get(reg.ENV_VAR)
+    try:
+        ref = reg.resolve_for_create(
+            conn, board=board, parents=parents, body=body, explicit=serves, env=env,
+            find_card=reg.find_card_board if (serves or env) else None,
+        )
+    except Exception as exc:  # pragma: no cover - defensive; a filing outranks a stamp
+        _log.warning("operator-ask resolution failed for a filing: %s", exc)
+        return None
+    if ref is not None and ref.unresolved:
+        _log.warning(
+            "no operator-ask stamp on this filing: %r does not resolve to an operator ask "
+            "(a register card id, or a card in service of one) - the card is filed "
+            "un-stamped and reported by `hermes kanban rollup`",
+            ref.unresolved,
+        )
+    return ref
+
+
+def operator_ask_event(ask_ref, ask_pair: Optional[tuple[str, str]]) -> dict:
+    """The ``created`` event fields recording the ask, or ``{}`` on a card with none."""
+    if ask_ref is None:
+        return {}
+    if ask_pair:
+        return {"operator_ask": f"{ask_pair[0]}/{ask_pair[1]}", "operator_ask_source": ask_ref.source}
+    if ask_ref.unresolved:
+        return {"operator_ask_unresolved": ask_ref.unresolved}
+    return {}
+
+
+#: The identity every deviation row carries - the guard, never the filer.
+ABOVE_TRANCHE_GUARD_IDENTITY = "kanban-priority-guard"
+
+#: Prefix of the public deviation rows this guard files (one per distinct violation).
+ABOVE_TRANCHE_DEVIATION_PREFIX = "PRIORITY OVER-CLAIM (above the reserved tranche)"
+
+#: A DECLARED SEV1 line, byte-identical in convention to the fleet's band module
+#: (``yaan-platform/scripts/kanban_priority_bands.py::SEV1_DECLARATION_RE``): a labelled line,
+#: never a value - an undeclared card sitting at the top is an over-claim, not an SEV.
+#:
+#: The two alternations are DATA because the storage guard has to read the same line in SQL
+#: (``_sql_tranche_entitlement``): SQLite has no regular expressions, so the guard's test is a
+#: second reading of this one line. They are pinned against each other by
+#: ``tests/hermes_cli/test_kanban_above_tranche_refusal.py::
+#: test_the_storage_guard_admits_exactly_the_markers_the_doors_admit``, because a guard that
+#: disagrees with the doors is how the whole ``defcon`` board stopped dispatching on
+#: 2026-10-01 (the guard refused the repair pass's own write and the tick died with it).
+SEV1_LABELS = ("severity", "sev", "critical", "priority[- ]class")
+SEV1_VALUES = ("sev[- ]?1", "critical")
+
+SEV1_DECLARATION_RE = re.compile(
+    r"(?im)^[ \t>*\-]*(%s)[ \t]*[:=][ \t]*(%s)\b"
+    % ("|".join(SEV1_LABELS), "|".join(SEV1_VALUES)))
+
+#: The SEV1 line as the STORAGE GUARD reads it (``_sql_tranche_entitlement``): upper-cased
+#: prefixes and values, in the same order. Fewer terms than the regex's alternatives because GLOB
+#: is a wildcard match - ``SEV`` reaches ``SEVERITY`` through the wildcard after it, and
+#: ``PRIORITY`` covers ``priority[- ]class`` the same way. Wider on both axes is deliberate: a
+#: guard that admits MORE than the doors write costs nothing (see that function), and a guard
+#: that admits less is an aborted dispatcher tick.
+_SQL_SEV1_LABELS = ("SEV", "CRITICAL", "PRIORITY")
+_SQL_SEV1_VALUES = ("SEV1", "SEV-1", "SEV 1", "CRITICAL")
+
+#: The ``Operator-ask: <register>/<ask>`` line the register writes
+#: (``kanban_register._STAMP_RE``): one line, no matter how long the body is.
+_ASK_STAMP_RE = re.compile(r"^[ \t]*Operator-ask:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
+
+
+def sev1_declared(text: Optional[str]) -> bool:
+    """Is a SEV1 DECLARED on a labelled line in *text*? (the fleet's SEV marker)"""
+    return bool(SEV1_DECLARATION_RE.search(text or ""))
+
+
+def above_tranche_marker(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+    task_id: Optional[str] = None, title: Optional[str] = "", body: Optional[str] = "",
+    ask_ref: Optional[Any] = None,
+) -> str:
+    """Which MARKER admits this card above the reserved tranche - ``""`` when it has none.
+
+    Read-only, and the same answer for a filing (title/body/``ask_ref``) and for a row that
+    already exists (``task_id`` reads the designation ledger). Deterministic order, so the
+    record is reproducible: the filing's own ask reference, then the register's stamp, then a
+    live designation, then a declared SEV1.
+    """
+    ref = ask_ref
+    if ref is not None and not getattr(ref, "unresolved", "") and getattr(ref, "register", None):
+        # The source is part of the label: an explicit `serves=`, the worker's env, a body
+        # stamp and a parent chain are different evidence, and the record must say which.
+        return "operator-ask-ref:%s" % (getattr(ref, "source", "") or "ref")
+    if _ASK_STAMP_RE.search(body or ""):
+        return "operator-ask-stamp"
+    if task_id and is_priority_designated(conn, task_id, board=board):
+        return "designation"
+    if sev1_declared("%s\n%s" % (title or "", body or "")):
+        return "sev1"
+    return ""
+
+
+def tranche_entitlement(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, task_id: Optional[str] = None,
+    title: Optional[str] = "", body: Optional[str] = "",
+) -> str:
+    """The card's OWN evidence that it may hold a reserved-tranche priority - ``""`` if none.
+
+    THE PREDICATE THE STORAGE GUARD IMPLEMENTS IN SQL (see ``_sql_tranche_entitlement``), and the
+    one every door that may WRITE INTO the band has to read, because door 3 aborts the write
+    otherwise and an abort inside the dispatcher's reclaim phase takes the whole board's
+    dispatching down with it (measured 2026-10-01: ``defcon`` spawned nothing for 6.5 hours).
+
+    Why the card's OWN evidence, and nothing inherited. R2's marker is "the card's own evidence:
+    an operator-ask ref, a live designation, or a declared SEV1 line", and a database trigger can
+    only read the row it is about to write: it cannot walk a parent chain, cannot resolve a
+    register reference that lives on another board, and cannot re-derive anything. The one
+    inherited form the wider resolver (``above_tranche_marker``) also accepts - an ask inherited
+    from a parent - is materialised on the card at birth: the create seam stamps every filing
+    that resolved an ask, from any source, in the same INSERT (``apply_stamp``; see
+    ``create_task``). A row that carries no stamp of its own therefore carries no ask, and door 2
+    and the repair pass no longer treat one as tranche-entitled - they answer what the storage
+    layer will accept, so the two can never disagree about the same row.
+
+    Returns the marker's NAME, in the resolver's order, so the record says which evidence
+    admitted the row: ``"operator-ask-stamp"``, ``"designation"`` or ``"sev1"``.
+    """
+    if _ASK_STAMP_RE.search(body or ""):
+        return "operator-ask-stamp"
+    if task_id and is_priority_designated(conn, task_id, board=board):
+        return "designation"
+    if sev1_declared("%s\n%s" % (title or "", body or "")):
+        return "sev1"
+    return ""
+
+
+def _sql_tranche_entitlement(ident: str, title: str, body: str) -> str:
+    """The storage layer's reading of :func:`tranche_entitlement`, over one row.
+
+    ``ident`` / ``title`` / ``body`` are SQL expressions naming the row's columns
+    (``NEW.id`` / ``NEW.title`` / ``NEW.body`` inside a trigger; bound parameters in the test that
+    pins this against :func:`tranche_entitlement`).
+
+    Two readings of one line, and they are not the same text, so the SHAPE matters:
+
+    * the register's stamp is read by its KEYWORD (``INSTR(body, 'Operator-ask:')``). That is a
+      superset of the register's own line regex - it does not require the line to start with the
+      keyword - and it is a superset in the direction that matters: a guard may admit MORE than
+      the doors write (the evidence it reads is text in the card's own row, so whoever can write
+      the row can write the stamp line too), and may never admit LESS, because less is an abort
+      inside the dispatcher's reclaim phase and an aborted tick dispatches nothing at all
+      (measured 2026-10-01: 6.5 h, 452 ready cards, zero spawns on ``defcon``).
+    * the declared SEV1 line is read the same way, as ``label ... [: or =] ... value`` with only
+      the ORDER required. The line-anchored form is NOT expressible here: GLOB's ``[...]`` class
+      has no zero-repetition form (``[ \\t]*`` in GLOB means "one space or tab, then anything"),
+      so "a line that begins with optional indentation" cannot be written at all - and the live
+      boards do carry an indented declaration (measured 2026-10-02: 1 of 47 is
+      ``'    Severity: SEV1'``), which the anchored form would miss and the pass would then abort
+      on.
+    """
+    nl = "char(10)"
+    framed = "UPPER(COALESCE(%s, '') || %s || COALESCE(%s, '') || %s)" % (title, nl, body, nl)
+    word_end = "[^A-Za-z0-9_]*"
+    designation = ("EXISTS (SELECT 1 FROM priority_designations d WHERE d.task_id = %s "
+                   "AND d.revoked_at IS NULL)" % ident)
+    stamp = "INSTR(COALESCE(%s, ''), 'Operator-ask:') > 0" % body
+    sev1 = " OR ".join(
+        "%s GLOB ('*%s*[:=]*%s%s')" % (framed, label, value, word_end)
+        for label in _SQL_SEV1_LABELS for value in _SQL_SEV1_VALUES)
+    return "((%s) OR (%s) OR (%s))" % (stamp, designation, sev1)
+
+
+ABOVE_TRANCHE_ALTERNATIVES = (
+    "Legitimate move 1 - file it INSIDE the domain: any value up to %d (the maximum band top) "
+    "is accepted as filed, and that is where a lane's own work belongs. "
+    "Legitimate move 2 - if the card IS the operator's ask (a card under the register, or one "
+    "filed in service of it) or a DECLARED SEV1, CARRY THE MARKER and it is admitted into the "
+    "reserved tranche at %d: pass `serves=` / write the `Operator-ask: <register>/<ask>` line / "
+    "declare `Severity: SEV1` on a labelled line. "
+    "Legitimate move 3 - a card that must RANK inside the tranche is DESIGNATED, and that is a "
+    "host/operator act: `hermes kanban defcon designate <id> --reason ...` (see "
+    "hermes_cli/kanban_register.py)."
+)
+
+
+class AboveTrancheRefused(ValueError):
+    """Raised when a filing or a re-rank claims a value above the reserved tranche.
+
+    Carries the structured facts a caller needs to fix the call rather than the guard:
+    ``lane`` (the filing lane, by name), ``attempted_priority``, ``board``, ``marker`` (always
+    empty on this path), ``deviation_task_id`` (the public refusal row) and ``deviation_error``.
+    """
+
+    def __init__(self, message: str, *, lane: str = "", title: str = "",
+                 attempted_priority: int = 0, board: str = "", ceiling: int = 0,
+                 deviation_task_id: Optional[str] = None,
+                 deviation_error: Optional[str] = None):
+        super().__init__(message)
+        self.lane = lane or ""
+        self.title = title or ""
+        self.attempted_priority = int(attempted_priority or 0)
+        self.board = board or ""
+        self.ceiling = int(ceiling or 0)
+        self.deviation_task_id = deviation_task_id
+        self.deviation_error = deviation_error
+
+
+def above_tranche_refusal_message(
+    title, lane, attempted_priority, ceiling, deviation_task_id=None, deviation_error=None,
+) -> str:
+    """The refusal text; returned verbatim by every surface (tool, CLI, kernel)."""
+    who = lane or "an unidentified caller"
+    return " ".join([
+        f"refused: priority {int(attempted_priority)} is above the reserved top tranche "
+        f"({int(ceiling)} is the maximum). Attempted title {title!r}, filer {who}. "
+        f"NOTHING WAS CREATED - no task row and no event.",
+        "Why: the operator's asks and SEVs hold the reserved top tranche "
+        "(operator ruling 2026-09-28), nothing else is admitted above them, and a lane's own "
+        "work outranking an ask is what the ruling ends. The value is not clamped silently: a "
+        "hand-lift above the ceiling is the door that put 52 rows over the ask band on `defcon` "
+        "(measured 2026-09-28).",
+        ABOVE_TRANCHE_ALTERNATIVES % (_ordinary_edge(), ceiling),
+    ] + ([
+        f"Enforcement: the attempt is escalated and the deviation is filed on this board "
+        f"against the filing lane by name - task {deviation_task_id}. Fix the call, not the "
+        f"guard."
+    ] if deviation_task_id else [
+        "Enforcement: the deviation row could NOT be filed"
+        + (f" ({deviation_error})" if deviation_error else "")
+        + " - the refusal stands regardless; report this to platform-stl."
+    ]))
+
+
+def _ordinary_edge() -> int:
+    """The ordinary domain's edge, read through the policy module (never a second copy)."""
+    return int(_policy_module().ORDINARY_MAX)
+
+
+def _above_tranche_deviation_key(board, lane, priority, title) -> str:
+    """One durable deviation row per distinct violation - never a card per retry."""
+    from hashlib import sha1
+
+    digest = sha1((title or "").strip().encode("utf-8")).hexdigest()[:12]
+    return f"above-tranche-refused:{board or ''}:{lane or 'unknown'}:{int(priority)}:{digest}"
+
+
+def file_above_tranche_deviation(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, lane: Optional[str] = None,
+    title: Optional[str] = "", attempted_priority: int = 0, tenant: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """File the public refusal row for an above-tranche attempt. Returns ``(task_id, error)``.
+
+    Never raises: the refusal must not depend on its own side effect, so a filing failure is
+    carried in the refusal message (and on the exception) instead of being swallowed or turning
+    the refusal into an error. The row is filed against the FILING LANE by name.
+    """
+    policy = _policy_module()
+    who = (lane or "").strip()
+    assignee = _canonical_assignee(who) if who else None
+    if not assignee:
+        # An unidentified caller still gets a public row; the ops head owns the chase.
+        assignee = "default"
+    attempt = " ".join((title or "").split())[:120] or "(untitled)"
+    body = "\n".join([
+        "**Enforcement record - a filing above the reserved tranche was REFUSED at the "
+        "create path.**",
+        "",
+        f"* **filing lane (by name):** `{who or 'unidentified caller - row filed to default'}`",
+        f"* **attempted priority:** `{int(attempted_priority)}` "
+        f"(the ceiling is `{policy.MAX_PRIORITY}`, the reserved tranche is "
+        f"`{policy.TRANCHE_FLOOR}..{policy.TRANCHE_TOP}`)",
+        f"* **attempted title:** `{attempt}`",
+        "* **enforcement action:** REFUSED. Nothing was created - no task row and no `created` "
+        "event.",
+        "* **standard:** the operator's asks and SEVs hold the reserved top tranche; nothing "
+        "else is admitted above them (operator ruling 2026-09-28, design record platform-stl "
+        "`t_6ce41549`).",
+        f"* **what to do instead:** {ABOVE_TRANCHE_ALTERNATIVES % (policy.ORDINARY_MAX, policy.TRANCHE_TOP)}",
+        "",
+        "This row is the escalation of the attempt AND the public reprimand: filed on the board "
+        "the attempt targeted, against the filing lane by name, in the open.",
+        "",
+        "The lane owns the correction: (a) the **fix** - file inside the domain, carry the ask "
+        "marker if the card IS the operator's ask or a declared SEV1, or ask the ops head to "
+        "designate it; (b) the **cost** - an above-tranche filing is refused, and repeats "
+        "collapse onto this same row; (c) the **acceptance** - reply on this card naming which "
+        "of the three moves the lane used, and re-run the call.",
+    ])
+    try:
+        tid = create_task(
+            conn,
+            title=f"{ABOVE_TRANCHE_DEVIATION_PREFIX}: {who or 'unidentified lane'} attempted "
+                  f"p{int(attempted_priority)} on {attempt!r}",
+            body=body,
+            assignee=assignee,
+            board=board,
+            tenant=tenant,
+            created_by=ABOVE_TRANCHE_GUARD_IDENTITY,
+            idempotency_key=_above_tranche_deviation_key(board, who, attempted_priority, title),
+        )
+    except Exception as exc:  # the record's failure must never replace the refusal
+        return None, f"{type(exc).__name__}: {exc}"
+    return str(tid), None
+
+
+def _refuse_above_tranche(
+    conn: sqlite3.Connection, *, board: Optional[str], lane: Optional[str],
+    title: Optional[str], attempted_priority: int, tenant: Optional[str] = None,
+) -> AboveTrancheRefused:
+    """File the deviation, then build the refusal. The refusal is unconditional."""
+    policy = _policy_module()
+    deviation_id, deviation_error = file_above_tranche_deviation(
+        conn, board=board, lane=lane, title=title,
+        attempted_priority=attempted_priority, tenant=tenant)
+    return AboveTrancheRefused(
+        above_tranche_refusal_message(
+            title, lane, attempted_priority, policy.MAX_PRIORITY,
+            deviation_id, deviation_error),
+        lane=lane or "", title=title or "", attempted_priority=attempted_priority,
+        board=board or "", ceiling=policy.MAX_PRIORITY,
+        deviation_task_id=deviation_id, deviation_error=deviation_error,
+    )
+
+
+def apply_above_tranche_guard(
+    conn: sqlite3.Connection, requested: int, applied: int, *, board: Optional[str] = None,
+    lane: Optional[str] = None, title: Optional[str] = "", body: Optional[str] = "",
+    ask_ref: Optional[Any] = None, tenant: Optional[str] = None,
+) -> tuple[int, Optional[dict]]:
+    """The create seam's above-tranche half: ``(priority, record)``.
+
+    Reads the REQUESTED value (not the board policy's output) so a wired board's clamp cannot
+    silently absorb an over-claim, and runs for every board - the ceiling is not a board's
+    property, it is the scale's. A clean filing comes back with the applied value and ``None``,
+    so a correctly filed card keeps today's byte-identical event.
+    """
+    policy = _policy_module()
+    ceiling = int(policy.MAX_PRIORITY)
+    asked = int(requested)
+    if asked <= ceiling:
+        return int(applied), None
+    marker = above_tranche_marker(
+        conn, board=board, title=title, body=body, ask_ref=ask_ref)
+    if not marker:
+        raise _refuse_above_tranche(
+            conn, board=board, lane=lane, title=title, attempted_priority=asked,
+            tenant=tenant,
+        )
+    return ceiling, {
+        "above_tranche": {
+            "requested": asked,
+            "applied": ceiling,
+            "marker": marker,
+            "reason": "carries the %s marker: admitted into the reserved tranche at its top "
+                      "(%d); the scale ends there" % (marker, ceiling),
+            "bounds": [int(policy.TRANCHE_FLOOR), ceiling],
+        },
+    }
+
+
+def _merge_policy_record(record: Optional[dict], extra: Optional[dict]) -> Optional[dict]:
+    """Merge the above-tranche record into the one the ``created`` event carries, or ``None``.
+
+    When the above-tranche door placed the card, the ordinary-domain clamp clause (if the board
+    policy had one) no longer describes what happened - it would carry a second, contradicting
+    ``applied`` value - so it is dropped rather than left to be read as the outcome.
+    """
+    if not extra:
+        return record
+    merged = dict(record or {})
+    merged.update(extra)
+    if "above_tranche" in merged:
+        merged["applied"] = merged["above_tranche"]["applied"]
+        merged["clamped"] = True
+        merged.pop("domain", None)
+    return merged
+
+
+def _refuse_above_tranche_rerank(
+    conn: sqlite3.Connection, task_id: str, priority: int, *, board: Optional[str] = None,
+) -> None:
+    """Door 2b: a RE-RANK above the ceiling is refused unless the CARD carries a marker.
+
+    Deliberately not gated on the board's ``priority_policy``, unlike the ordinary-domain door
+    above it: the board-gated version is inert everywhere the domain is unwired, and the
+    hand-lift it would have caught is how 52 rows came to sit over the asks on ``defcon``
+    (measured 2026-09-28). The refusal names the card, the ceiling and the three legitimate
+    moves; the card's own lane already owns it, so no deviation row is filed - the caller is
+    standing at the card.
+    """
+    policy = _policy_module()
+    value = int(priority)
+    if value <= int(policy.MAX_PRIORITY):
+        return
+    slug = board or board_for_connection(conn)
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError("no such task %s on this board" % task_id)
+    ask_ref = _resolve_operator_ask(
+        conn, board=slug, parents=(task_id,), body=row["body"] or "", serves=None,
+    )
+    marker = above_tranche_marker(
+        conn, board=slug, task_id=task_id, title=row["title"] or "", body=row["body"] or "",
+        ask_ref=ask_ref,
+    )
+    if marker:
+        return
+    raise AboveTrancheRefused(
+        " ".join([
+            f"refused: priority {value} is above the reserved top tranche "
+            f"({int(policy.MAX_PRIORITY)} is the maximum) and {task_id} carries no "
+            f"operator-ask/SEV marker, so the re-rank would put plain lane work over the "
+            f"operator's asks. Nothing was written.",
+            "Why: the operator's asks and SEVs hold the reserved top tranche (operator ruling "
+            "2026-09-28); a non-ask card already above it is lowered, not argued with, and "
+            "every board carries the same ceiling because the hand-lift is door-inert "
+            "nowhere. A card that must rank in the tranche is DESIGNATED - "
+            "`hermes kanban defcon designate <id> --reason ...`.",
+            ABOVE_TRANCHE_ALTERNATIVES % (int(policy.ORDINARY_MAX), int(policy.TRANCHE_TOP)),
+        ]),
+        attempted_priority=value, board=slug or "", ceiling=int(policy.MAX_PRIORITY),
+    )
+
+
+def demote_above_tranche(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, reason: str = "",
+) -> list[dict]:
+    """THE REPAIR PASS: lower every row holding a value above the ceiling into its class ceiling.
+
+    Deterministic, idempotent, board-local, and keyed on the SAME predicate the STORAGE guard
+    reads (``tranche_entitlement`` - the row's own evidence, which is the only evidence a trigger
+    can see):
+
+    * a row carrying that evidence (the register's stamp - which every ask-filed card carries -
+      a live designation, or a declared SEV1) belongs INSIDE the reserved tranche, so it is
+      lowered to ``TRANCHE_TOP``: the top of the scale, but not above it;
+    * anything else is the class the ruling bans above the asks, so it is lowered to
+      ``ORDINARY_MAX`` - exactly where the create door files a card that claims too much today.
+
+    Each lowering is recorded on the card as a ``priority_demoted`` event, so the repair is
+    visible to the lane whose card moved, and a clean board costs one SELECT. Returns the ledger
+    (``task_id``, ``was``, ``now``, ``marker``) for the tick that ran it.
+
+    THE LANDING VALUE IS THE STORAGE GUARD'S PREDICATE (``tranche_entitlement``), not a wider
+    reading of the same row: a value written into the reserved band on evidence the guard cannot
+    see is a write the guard aborts, and an abort here used to take the whole board's dispatching
+    with it (2026-10-01). A row whose marker is only inherited - an ask on an ancestor, which
+    every card born under an ask carries in its own body as the register's stamp - is therefore
+    landed in the ordinary domain, which is also where the guard will accept it.
+
+    ONE ROW CANNOT STOP THE REST. Each lowering is its own transaction, and a refused write is
+    reported as a ledger row carrying ``error`` (with ``now`` ``None``) instead of raising: this
+    pass is a best-effort repair of an invariant that is already broken, and the rows after a
+    refused one still deserve the repair. A ledger row with an ``error`` is NOT a success - the
+    dispatcher records it and logs it.
+    """
+    policy = _policy_module()
+    slug = board or board_for_connection(conn) or ""
+    ceiling = int(policy.MAX_PRIORITY)
+    ordinary = int(policy.ORDINARY_MAX)
+    rows = conn.execute(
+        "SELECT id, priority, assignee, title, body FROM tasks "
+        "WHERE priority > ? AND status != 'archived' ORDER BY priority DESC, created_at ASC",
+        (ceiling,),
+    ).fetchall()
+    ledger: list[dict] = []
+    for row in rows:
+        marker = tranche_entitlement(
+            conn, board=slug, task_id=row["id"], title=row["title"] or "",
+            body=row["body"] or "",
+        )
+        now = ceiling if marker else ordinary
+        was = int(row["priority"])
+        if now == was:
+            continue
+        try:
+            with write_txn(conn):
+                conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (now, row["id"]))
+                _append_event(conn, row["id"], "priority_demoted", {
+                    "from": was,
+                    "to": now,
+                    "ceiling": ceiling,
+                    "marker": marker,
+                    "reason": reason or (
+                        "above the reserved tranche: %s" % (
+                            "marker %s - lowered to the tranche top" % marker if marker
+                            else "no operator-ask/SEV marker - lowered into the ordinary domain")),
+                })
+        except sqlite3.Error as exc:
+            # Not swallowed: the row is returned with the refusal and logged at ERROR, and the
+            # rest of the pass continues (one unrepairable row must not strand every other one).
+            detail = "%s: %s" % (type(exc).__name__, exc)
+            _log.error(
+                "kanban: the above-tranche repair could not lower %s on board %s (%s -> %s, "
+                "marker %r): %s",
+                row["id"], slug or "-", was, now, marker, detail,
+            )
+            ledger.append({"task_id": row["id"], "was": was, "now": None, "marker": marker,
+                           "error": detail})
+            continue
+        ledger.append({"task_id": row["id"], "was": was, "now": now, "marker": marker})
+    return ledger
+
+#: Per-home declaration of NON-profile assignees (``kanban.control_plane_assignees``).
+#: Empty by default; an unreadable config declares NOTHING (fail-closed), the same
+#: discipline as ``kanban.dispatch_profiles`` in ``kanban_db_dispatch``.
+_CONTROL_PLANE_ASSIGNEES_KEY = "control_plane_assignees"
+
+
+def _control_plane_assignees_from_config() -> frozenset[str]:
+    """Read ``kanban.control_plane_assignees`` for THIS home; fail-closed.
+
+    A card's assignee is normally a LIVE Hermes profile id because the dispatcher
+    spawns ``hermes -p <assignee>``. A control-plane pull lane (a Claude Code
+    terminal that claims via ``claim_task``) and a probe/fixture assignee are the
+    one legal exception; the producer DECLARES them here once, converting an
+    accident into a decision.
+
+    Returns the empty set when the key is absent (the default), when it is present
+    but empty, and when the config cannot be read — the user layer is read WITHOUT
+    the ``DEFAULT_CONFIG`` merge (whose placeholder would make the key look present
+    in every home), matching ``_dispatch_profile_allowlist``.
+    """
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+
+        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+    except Exception as exc:  # noqa: BLE001 — a corrupt config must not widen the gate
+        _log.warning(
+            "kanban: could not read kanban.%s (%s: %s) — this home declares NO "
+            "non-profile assignee until the config is readable",
+            _CONTROL_PLANE_ASSIGNEES_KEY, type(exc).__name__, exc,
+        )
+        return frozenset()
+    if not isinstance(kanban, dict) or _CONTROL_PLANE_ASSIGNEES_KEY not in kanban:
+        return frozenset()
+    raw = kanban[_CONTROL_PLANE_ASSIGNEES_KEY]
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return frozenset()
+    names = [str(n) for n in raw] if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    from hermes_cli.profiles import normalize_profile_name
+
+    declared: set[str] = set()
+    for n in names:
+        try:
+            declared.add(normalize_profile_name(n))
+        except ValueError:
+            continue
+    return frozenset(declared)
+
+
+def control_plane_assignee_names() -> frozenset[str]:
+    """Declared non-profile assignees legal for this home (see the reader above)."""
+    return _control_plane_assignees_from_config()
+
+
+def unknown_assignee_refusal(assignee: Optional[str]) -> Optional[str]:
+    """Legible refusal for a non-live, undeclared assignee; ``None`` when legal.
+
+    The predicate is the SAME one the dispatcher consults —
+    ``hermes_cli.profiles.profile_exists``, normalized via
+    ``normalize_profile_name`` — so create-time and dispatch-time can never
+    disagree about which names are spawnable. ``None``/empty is legal (the
+    dispatcher's ``default_assignee`` fills it in); a live profile is legal; a name
+    DECLARED in ``kanban.control_plane_assignees`` is legal. Everything else is
+    refused, fail-closed.
+    """
+    if not assignee:
+        return None
+    from hermes_cli.profiles import (
+        list_profile_names, normalize_profile_name, profile_exists,
+    )
+
+    try:
+        canon = normalize_profile_name(assignee)
+    except ValueError:
+        return (
+            f"assignee {assignee!r} is not a valid profile name — every card must "
+            f"name a live Hermes profile id"
+        )
+    if canon in control_plane_assignee_names():
+        return None
+    if profile_exists(canon):
+        return None
+    import difflib
+
+    live = sorted(list_profile_names())
+    neighbours = difflib.get_close_matches(canon, live, n=3, cutoff=0.4)
+    hint = (
+        f" nearest live profile(s): {', '.join(repr(n) for n in neighbours)}."
+        if neighbours else ""
+    )
+    shown = ", ".join(repr(n) for n in live[:20])
+    if len(live) > 20:
+        shown += f" (+{len(live) - 20} more)"
+    return (
+        f"assignee {canon!r} is not a live Hermes profile and is not declared in "
+        f"kanban.control_plane_assignees, so no dispatcher would ever spawn it "
+        f"(the card would sit in `ready` forever).{hint} Live profile(s): {shown}. "
+        f"Assign a live profile, or — only for a genuine control-plane pull lane or "
+        f"probe fixture — declare the name once in kanban.control_plane_assignees."
+    )
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1266,11 +2631,16 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    serves: Optional[str] = None,
+    allow_off_board_ask: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
-    forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+    forces ``triage``; ``initial_status="blocked"`` is REFUSED - a card is never
+    created blocked (see ``created_blocked_refusal_message`` and the guard section
+    above this function). Use a parent edge to wait, or ``block_task`` with a kind to
+    park a real blocker.
     ``idempotency_key``: an existing non-archived task with the key is returned
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
@@ -1281,18 +2651,121 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    ``serves``: the operator ask this card is filed in service of, as ``<register>``
+    or ``<register>/<ask>`` - see ``hermes_cli/kanban_register.py``. The card is
+    stamped in its body at this seam (the one moment every filing surface reaches);
+    omitting it still inherits an ask from the body, the worker's session env or the
+    parents, in that order.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
-    from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_pr_acceptance import needs_repository_checks, validate_contract
+    from hermes_cli.kanban_register import (
+        OFF_BOARD_ASK_EVENT, apply_stamp, guard_new_ask_home, normalise_body,
+    )
+    from hermes_cli.kanban_consent_gate import (
+        ConsentRefused, evaluate as _consent_evaluate, refusal_message as consent_refusal_message,
+    )
 
     completion_contract = validate_contract(completion_contract)
+    if needs_repository_checks(completion_contract):
+        # Authoring hint: a checks-backed contract binds every completion to GitHub
+        # evidence, and one whose repository requires no checks can never be satisfied
+        # (complete_task parks the card rather than looping the worker).
+        _log.warning(
+            "completion_contract %s requires repository-required CI checks; a repository "
+            "with none can never satisfy it (use local-only, or `hermes kanban "
+            "set-contract` to release it)", completion_contract,
+        )
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    # THE CONTRACT-VERIFICATION SEAM (card t_b58332a4). A card born with an
+    # ``OWNER/REPO`` / PR-URL contract on a repository that requires NO status
+    # checks can never clear: the acceptance gate returns ``classification=missing``
+    # with ``required=[]`` and complete_task parks it with its work already done.
+    # Resolve the target repository's required-checks state HERE -- the one moment
+    # every filing surface reaches -- and fall back deterministically.  The read is
+    # a provider read; "cannot determine" is treated as "no required checks" and
+    # said out loud in the reason (see hermes_cli/kanban_contract_resolve.py).
+    # ``landed`` (the deploy-proof class) never enters this path, so a card that
+    # carries a deployed unit keeps its deploy-proof gate untouched.
+    contract_resolution = None
+    if needs_repository_checks(completion_contract):
+        # A missing/stale resolver module must never fail a FILING (card
+        # t_b58332a4 review item B): an ImportError here would refuse every
+        # OWNER/REPO card, which is worse than the park this seam prevents. Keep
+        # the declared contract and warn -- the module is enrolled by the landing
+        # carrier (t_386051b8).
+        try:
+            from hermes_cli import kanban_contract_resolve as _contracts
+        except Exception as _import_exc:
+            _log.warning("contract resolution unavailable, keeping declared "
+                         "completion_contract %s: %s", completion_contract, _import_exc)
+            _contracts = None
+        if _contracts is not None:
+            _contract_profile_home = None
+            try:
+                from hermes_cli.kanban_pr_acceptance import _assignee_profile_home
+                _contract_profile_home = _assignee_profile_home(assignee)
+            except Exception:
+                _contract_profile_home = None
+            try:
+                contract_resolution = _contracts.resolve_contract_at_set(
+                    completion_contract, profile_home=_contract_profile_home)
+            except Exception as _resolve_exc:  # a resolution fault must never fail a filing
+                _log.warning("contract resolution skipped for %s: %s", completion_contract, _resolve_exc)
+                contract_resolution = None
+            if contract_resolution is not None and contract_resolution.changed:
+                _log.warning("completion_contract %s -> %s: %s", completion_contract,
+                             contract_resolution.contract, contract_resolution.reason)
+                completion_contract = contract_resolution.contract
+    # CREATE-TIME ENFORCEMENT (ruling §4 on ops/t_5b9dbe02): a card whose assignee
+    # names no live profile is a silent strand — the dispatcher buckets it
+    # `skipped_nonspawnable` on every tick and it never runs. Refuse the write HERE,
+    # at the one path every producer reaches, with a legible error naming the handle
+    # and the live set. The declared escape is `kanban.control_plane_assignees`.
+    _assignee_refusal = unknown_assignee_refusal(assignee)
+    if _assignee_refusal is not None:
+        raise ValueError(_assignee_refusal)
+    # INVARIANT D at its earliest door (operator ruling 2026-10-05, card t_5bbf4e80): the
+    # card's ATTRIBUTION (`created_by`) must name a LIVE fleet identity. A card filed under a
+    # DELETED profile is MISATTRIBUTED -- its provenance points at nothing and no lane can be
+    # asked to own it (yoyoflow_postmortem_file.py stamped the retired `yoyodine-majordomo`).
+    # Sibling of the approvals door's RETIRED_ORIGINS refusal (t_ae2bc8e2): the same producer
+    # defect, caught at the board's write seam. A DENYLIST -- a non-profile producer origin
+    # (pr-evergreen, deploy-train, sdlc, ...) is not a profile and passes.
+    from hermes_cli import kanban_gate_invariants as _gates_creator
+    _gates_creator.gate_created_by(created_by, board=board, where="kanban_create")
     if not title or not title.strip():
         raise ValueError("title is required")
+    # Admission door of the consent gate (ruling, card t_e31d9241): a card that
+    # ASSERTS operator consent with no reference behind it is refused here,
+    # before any row is written -- the claim is a false statement in the record
+    # and every downstream reader (dispatcher, lanes, disposition sweep) acts on
+    # it. A card that merely DECLARES itself consent-gated is filable: proposing
+    # work is legal, and the RUN door holds it (kanban_db_dispatch).
+    _consent = _consent_evaluate(title, body)
+    if _consent.trigger == "claim" and _consent.refused:
+        raise ConsentRefused(consent_refusal_message(None, _consent))
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    if initial_status == CREATED_BLOCKED_TOKEN:
+        # The seam every caller reaches: refuse BEFORE any write (no task row, no event,
+        # no created-blocked regression signature), escalate the attempt, file the
+        # deviation against the creating lane by name, then raise. Nothing is inserted
+        # for the refused attempt itself - the deviation row is a separate, deliberate
+        # public record (see the guard section above ``create_task``).
+        raise _refuse_created_blocked(
+            conn, board=board, lane=created_by, title=title, tenant=tenant,
+        )
+    if assignee:
+        # INVARIANT B at its earliest door (design record platform-stl t_6747232b): an assignee
+        # that resolves to no profile on disk and to no declared pull lane can never be spawned
+        # and never reports a failure - the card strands silently. Measured before this seam:
+        # 361 rows on handles that resolve nowhere, 15 cards stranded on two retired lanes.
+        # The refusal names both honest paths (assign a real profile, or declare the lane).
+        from hermes_cli import kanban_gate_invariants as _gates
+        _gates.gate_assignee(assignee, board=board, where="kanban_create")
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1303,7 +2776,16 @@ def create_task(
         except Exception:
             pass
     if workspace_kind is None:
+        # A board ``default_workdir`` names the repo this board works under:
+        # default to worktree so cards share one object store instead of each
+        # cloning it. An explicit ``--workspace scratch`` still opts out above.
         workspace_kind = "scratch"
+        try:
+            board_default = (_board_meta_for(board).get("default_workdir") or "").strip()
+        except Exception:
+            board_default = ""
+        if board_default:
+            workspace_kind = "worktree"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -1331,6 +2813,51 @@ def create_task(
         if row:
             return row["id"]
 
+    # THE BIRTH SEAM. A board-scoped policy applied here cannot be routed around: the tool
+    # verb, the CLI, a decomposer and another lane's agent all reach this INSERT.
+    requested_priority = int(priority)
+    priority, policy_provenance = _apply_board_priority_policy(
+        priority, assignee=assignee, board=board, title=title, body=body,
+    )
+
+    # THE OPERATOR-ASK SEAM (card t_8ca4b5a0, operator ask 2026-09-27). Applies at the
+    # SAME moment and for the SAME reason as the priority policy above: every filing
+    # surface reaches this INSERT, so a reference stamped here cannot be routed around
+    # by a caller that forgot - which is the whole point, because the register tree's
+    # failure mode was exactly "nobody remembered". A worker inherits the ask its own
+    # card serves (the dispatcher exports it), a child inherits its parents', a
+    # redirect/decomposition inherits the body's, and a filer may name one outright.
+    # With no ask in play this is inert: the body goes in byte-identical and the created
+    # event keeps exactly the payload it carried before. Resolution reads only THIS
+    # board's connection (parents and the board's designation); a reference that names
+    # another board is taken at face value and reported by the roll-up.
+    ask_ref = _resolve_operator_ask(
+        conn, board=board or board_for_connection(conn), parents=parents, body=body,
+        serves=serves,
+    )
+
+    # THE ASK-HOME DOOR (card t_abefe660, operator ask 2026-10-04). A card that IS an
+    # operator ask - one that will be stamped `Operator-ask: <register>/<own id>`, i.e. a
+    # NEW ask - must be created on the register's OWN board, or its register's roll-up
+    # never sees it. Refused LOUDLY here, before any write: a silent redirect hides the
+    # lane's mistake and a warn is not read. A card that only INHERITS an ask id by
+    # lineage is not gated (pr-evergreen, reconcile, hazard/census and the escalation
+    # machinery file off-board envelopes by inheritance). The hatch (`allow_off_board_ask`
+    # or HERMES_KANBAN_ALLOW_OFF_BOARD_ASK=1) admits a deliberate cross-board filing and
+    # returns a record the created txn writes as a task_events row.
+    ask_off_board = guard_new_ask_home(
+        ask_ref, board=board or board_for_connection(conn), title=title,
+        allow_off_board=allow_off_board_ask, caller=created_by,
+    )
+
+    # THE ABOVE-TRANCHE DOOR (operator ruling 2026-09-28, card t_6ce41549). Applies at the same
+    # seam, on the REQUESTED value and for EVERY board.
+    priority, above_tranche_record = apply_above_tranche_guard(
+        conn, requested_priority, priority, board=board, lane=created_by, title=title,
+        body=body, ask_ref=ask_ref, tenant=tenant,
+    )
+    policy_provenance = _merge_policy_record(policy_provenance, above_tranche_record)
+
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -1356,6 +2883,16 @@ def create_task(
                     if not branch_name:
                         branch_name = _project_branch_name(project_obj, task_id, title)
 
+                # The stamp rides the INSERT: the card carries its ask from birth, in the
+                # same transaction that creates the row, so no reader ever sees an
+                # in-service card without it and no second writer has to add it later.
+                # With NO ask pair the body is STILL normalised (card t_4576e74f): a bytes
+                # body passed through verbatim landed as a BLOB, and the decompose seam
+                # dropped a non-str body entirely - so both no-ask fallbacks share
+                # ``normalise_body`` (the public name for the register module's lossy
+                # ``_text``) instead of each deciding for itself.
+                ask_pair = ask_ref.for_card(task_id) if ask_ref is not None else None
+                card_body = apply_stamp(body, *ask_pair) if ask_pair else normalise_body(body)
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -1369,7 +2906,7 @@ def create_task(
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        task_id, title.strip(), body, assignee, task_status, priority,
+                        task_id, title.strip(), card_body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
@@ -1379,7 +2916,7 @@ def create_task(
                     ),
                 )
                 for pid in parents:
-                    _link(conn, pid, task_id)
+                    _link(conn, pid, task_id, cause="create")
                 _append_event(
                     conn,
                     task_id,
@@ -1398,8 +2935,30 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        # The policy's own record, verbatim, and only on a card it moved: an
+                        # unchanged card and every board without a policy keep the event
+                        # payload they have always written.
+                        **(operator_ask_event(ask_ref, ask_pair)),
+                        **({"priority_policy": policy_provenance} if policy_provenance else {}),
                     },
                 )
+                # The measured reason travels WITH the card (card t_b58332a4): the author
+                # sees WHY a declared repo contract became local-only, rather than
+                # discovering a silent downgrade.  Only written when the contract moved.
+                if contract_resolution is not None and contract_resolution.changed:
+                    _append_event(
+                        conn, task_id, "contract_changed",
+                        {
+                            "old": contract_resolution.declared,
+                            "new": contract_resolution.contract,
+                            "reason": contract_resolution.reason,
+                            "actor": created_by or "user",
+                        },
+                    )
+                # The hatch's own record, so an off-board NEW ask that was let through on
+                # purpose is visible on the card rather than silent (a row naming the caller).
+                if ask_off_board is not None:
+                    _append_event(conn, task_id, OFF_BOARD_ASK_EVENT, ask_off_board)
                 if task_status == "blocked":
                     _append_event(
                         conn,
@@ -1432,6 +2991,816 @@ def _board_meta_for(board: Optional[str]) -> dict:
     return read_board_metadata(board if board else get_current_board())
 
 
+def _apply_board_priority_policy(
+    requested: int, *, assignee: Optional[str], board: Optional[str],
+    title: str, body: Optional[str],
+) -> tuple[int, Optional[dict]]:
+    """``(priority, provenance)`` for a card being created, policy applied at birth.
+
+    ``provenance`` is ``None`` - and ``requested`` comes back unchanged - when the board
+    carries no ``priority_policy``, which is what keeps this seam inert for every board
+    that never opted in. When a policy IS configured it decides the stored value, and the
+    policy's own record rides back for the ``created`` event, so a banding decision can be
+    read back off the card.
+
+    Nothing here may fail a filing. The policy is consulted through
+    ``kanban_priority_policy.priority_for_create``, which answers an unusable policy with
+    the caller's value plus an ``unavailable`` record instead of an exception: a broken
+    policy must be VISIBLE, not fatal. The numbers (lane ordering, the band table, the
+    clauses) belong to the policy module; this module owns the moment and the seam.
+    """
+    from hermes_cli import kanban_priority_policy as policy
+
+    try:
+        spec = _board_meta_for(board).get(policy.POLICY_KEY)
+    except Exception:
+        # A board whose metadata cannot be read has no policy to honour; the
+        # ``project_id``/``default_workdir`` reads below degrade the same way.
+        return requested, None
+    if spec is None:
+        return requested, None
+    verdict = policy.priority_for_create(
+        requested,
+        assignee=assignee or "",
+        board=board or get_current_board(),
+        title=title,
+        body=body or "",
+        spec=spec,
+    )
+    if verdict is None:
+        return requested, None
+    # R1: the domain bounds every wired board, whatever the policy answered - including a
+    # policy that could not be used, whose verdict is the filer's own value. The clamp is
+    # merged into that same record, so the event carries it and no second provenance key is
+    # invented. (``create_task`` and the decomposer both arrive here, so a fan-out is bounded
+    # by the same one call a filing makes.)
+    #
+    # The board's FLOOR rides the clamp so a value the policy lifted to a floor ON the tranche
+    # boundary (``TRANCHE_FLOOR``) is admitted instead of clamped back into the ordinary domain.
+    # It is read here, once; a floor that cannot be read degrades to ``None`` because this seam
+    # is fail-open by contract (no create may fail on a policy's account) and a missing floor
+    # only costs the boundary lift its exemption - the card still lands, in-domain.
+    floor = None
+    if policy.board_is_wired(spec):
+        try:
+            floor = policy.board_floor(spec, board or get_current_board())
+        except Exception:
+            floor = None
+    return policy.clamp_to_domain(verdict.applied, verdict.record, floor)
+
+
+# --- the priority DOMAIN: the storage guard and the designation door ----------------------
+#
+# A card is filed inside the ordinary domain (R1); a wired board REFUSES a re-rank outside it
+# (door 2); a raw SQL write into the reserved tranche is refused by a trigger (door 3); and
+# ``hermes kanban defcon`` is the one writer that may put a card there (door 4). The numbers
+# live in ``kanban_priority_policy`` - this block owns only WHERE they are enforced.
+
+#: The board-level storage guard's triggers, by name. Per-DB and opt-in: they exist on a board
+#: only while that board carries a ``priority_policy`` (see ``sync_priority_tranche_guard``).
+PRIORITY_TRANCHE_TRIGGERS = (
+    "tasks_priority_tranche_guard_insert",
+    "tasks_priority_tranche_guard_update",
+)
+
+
+def _policy_module():
+    from hermes_cli import kanban_priority_policy as policy
+
+    return policy
+
+
+def priority_tranche_trigger_ddl(floor: Optional[int] = None) -> tuple:
+    """DDL for the storage guard: refuse a reserved-tranche priority, and a below-floor one.
+
+    The bound lives in the DATABASE rather than in a caller because the fleet's own authoring
+    skill documents raw SQL as its re-rank lever - a kernel-level bound alone would be advice.
+    Opt-in per board, applied by the same wiring step that writes ``priority_policy``, so an
+    unwired board and every test board stay byte-identical.
+
+    ``floor`` is a board's floor (``kanban_priority_policy.board_floor``) and adds one clause
+    to each trigger: a write that lands a card BELOW the floor is refused too. Two properties
+    of that clause are deliberate and both are visible in the DDL below:
+
+    * it fires on a CHANGE only (``NEW.priority <> OLD.priority``), because a no-op write that
+      re-sets a value already below the floor must not abort - a generic field-update path on a
+      pre-existing below-floor card would otherwise break, which is exactly the state a board
+      is in while its tail is being drained;
+    * it is BAKED IN at arm time, so a board whose floor changed is re-armed by its wiring
+      action (``sync_priority_tranche_guard``) rather than by a redeploy of the module it reads
+      - a stored trigger cannot re-read a file. ``floor is None`` renders the DDL this function
+      has always rendered, byte for byte.
+
+    The tranche clause's PREDICATE is the marker set the doors read
+    (``tranche_entitlement``): the value is refused unless the row carries its OWN evidence -
+    a live designation, the register's stamp line, or a declared SEV1 line. It used to read the
+    designation ledger alone, which is the narrower reading, and that disagreement is what took
+    the whole ``defcon`` board's dispatching down on 2026-10-01: the repair pass lowered a
+    marker-carrying row to the tranche top, the guard refused its own class's write, and the abort
+    propagated out of the reclaim phase before any spawn.
+    """
+    policy = _policy_module()
+    # A board's declared floor is a legitimate value even when it sits ON the tranche boundary:
+    # a row written AT the floor is the board's own declaration, so the tranche clause must not
+    # fire on it. Only ``TRANCHE_FLOOR`` is a floor inside the tranche band (``board_floor``
+    # refuses every other in-tranche value), so only it needs the exclusion - every other floor,
+    # and ``None``, renders this clause byte for byte as it always did.
+    on_tranche_boundary = floor is not None and int(floor) == policy.TRANCHE_FLOOR
+    live = (
+        "NEW.priority BETWEEN %d AND %d AND NOT (%s)%s"
+        % (policy.TRANCHE_FLOOR, policy.TRANCHE_TOP,
+           _sql_tranche_entitlement("NEW.id", "NEW.title", "NEW.body"),
+           " AND NEW.priority <> %d" % int(floor) if on_tranche_boundary else "")
+    )
+    message = ("priority %d-%d is DESIGNATED, never requested: use 'hermes kanban defcon "
+               "designate'" % (policy.TRANCHE_FLOOR, policy.TRANCHE_TOP))
+    # The message is prose and carries a quote (the verb the caller should run); a SQL string
+    # literal ends at the first one, so double it before it goes into the DDL.
+    message = message.replace("'", "''")
+    change = ""
+    insert_floor = ""
+    if floor is not None:
+        # A CHANGE guard, not a state guard: a no-op write that re-sets a value already below
+        # the floor must not abort, or every generic field-update path on a pre-existing
+        # below-floor card would break while that board's tail is being drained.
+        #
+        # The two arms are INDEPENDENT and each is parenthesised: ``A AND B OR C`` parses as
+        # ``(A AND B) OR C`` (AND binds tighter), which is the intent - but only because no value
+        # can be both inside the tranche band and below the floor. Written out, the arms cannot
+        # re-associate if a later clause is added, and a reader does not have to know SQLite's
+        # precedence to see that the floor clause is not scoped by the tranche test.
+        change = "(NEW.priority <> OLD.priority AND NEW.priority < %d)" % int(floor)
+        # An INSERT has no OLD row, so there the floor clause is a state clause: a card may not
+        # be born below the floor either.
+        insert_floor = "(NEW.priority < %d)" % int(floor)
+        # Both clauses sit in ONE trigger per event, so the refusal has to say WHICH one fired:
+        # a value inside the reserved tranche is the designation message, anything else is the
+        # floor's. (A caller that read the wrong remedy out of a refusal is worse off than one
+        # that read no remedy at all.) ``floor is None`` renders the literal this function has
+        # always rendered, byte for byte.
+        floor_message = ("priority is below this board's floor %d: no card may sit there - file "
+                         "it on its own board, or use the designation door if it must outrank "
+                         "this board" % int(floor))
+        message = ("CASE WHEN NEW.priority BETWEEN %d AND %d THEN '%s' ELSE '%s' END"
+                   % (policy.TRANCHE_FLOOR, policy.TRANCHE_TOP, message,
+                      floor_message.replace("'", "''")))
+    else:
+        # No floor: the argument is the tranche literal, quoted exactly as before.
+        message = "'%s'" % message
+    body = "BEGIN\n  SELECT RAISE(ABORT, %s);\nEND;" % message
+    if floor is not None:
+        when_insert = "(%s) OR %s" % (live, insert_floor)
+        when_update = "(%s) OR %s" % (live, change)
+    else:
+        when_insert = when_update = live
+    return (
+        "CREATE TRIGGER IF NOT EXISTS %s\nBEFORE INSERT ON tasks\nFOR EACH ROW\nWHEN %s\n%s"
+        % (PRIORITY_TRANCHE_TRIGGERS[0], when_insert, body),
+        "CREATE TRIGGER IF NOT EXISTS %s\nBEFORE UPDATE OF priority ON tasks\nFOR EACH ROW\n"
+        "WHEN %s\n%s" % (PRIORITY_TRANCHE_TRIGGERS[1], when_update, body),
+    )
+
+
+def _connect_board(board: Optional[str] = None):
+    """A connection to *board*'s own DB (open/init belongs to the connect module)."""
+    from hermes_cli import kanban_db_connect as kbc
+
+    return kbc.connect_closing(board=board)
+
+
+def priority_tranche_guards(conn: sqlite3.Connection) -> list:
+    """The storage-guard triggers present on this connection's DB (``[]`` when unarmed)."""
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
+        PRIORITY_TRANCHE_TRIGGERS,
+    ).fetchall()
+    return sorted(row["name"] for row in rows)
+
+
+def _board_priority_floor(board: Optional[str] = None) -> Optional[int]:
+    """The floor *board*'s policy states, or ``None`` when that board has none.
+
+    Read at the WIRING moment rather than per write: the floor is baked into the armed
+    triggers, so nothing on the write path has to load a policy file. Unusable wiring raises
+    :class:`PolicyError`, which is what stops a board being armed with a floor nobody can read.
+    """
+    policy = _policy_module()
+    slug = board if board else get_current_board()
+    spec = _board_meta_for(board).get(policy.POLICY_KEY)
+    if not policy.board_is_wired(spec):
+        return None
+    return policy.board_floor(spec, slug)
+
+
+def arm_priority_tranche_guard(board: Optional[str] = None) -> list:
+    """Apply the storage guard to *board*; the triggers present afterwards.
+
+    RE-ARMING REPLACES the triggers rather than leaving them alone. The board's floor is baked
+    into the DDL, so a wiring action has to be able to put a different floor in place - a
+    ``CREATE TRIGGER IF NOT EXISTS`` on its own would silently keep whatever floor the board
+    was first armed with. Dropping first is what makes ``set-priority-policy`` idempotent AND
+    able to follow a changed floor.
+    """
+    _assert_not_delegated_child_mutation(kanban_db_path(board=board))
+    floor = _board_priority_floor(board)
+    with _connect_board(board) as conn:
+        for name in PRIORITY_TRANCHE_TRIGGERS:
+            conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+        for statement in priority_tranche_trigger_ddl(floor):
+            conn.execute(statement)
+        return priority_tranche_guards(conn)
+
+
+def disarm_priority_tranche_guard(board: Optional[str] = None) -> list:
+    """Drop the storage guard from *board* - the unwired board's behaviour, exactly."""
+    _assert_not_delegated_child_mutation(kanban_db_path(board=board))
+    with _connect_board(board) as conn:
+        for name in PRIORITY_TRANCHE_TRIGGERS:
+            conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+        return priority_tranche_guards(conn)
+
+
+def sync_priority_tranche_guard(board: Optional[str] = None) -> str:
+    """Make *board*'s storage guard follow its ``priority_policy`` key; returns its state.
+
+    ``"armed"`` when the board is wired (guard in place), ``"unarmed"`` when it is not (no
+    guard, so the board behaves exactly as it did before this seam existed). The wiring action
+    calls this, so the guard can never drift from the key that turns the domain on.
+    """
+    policy = _policy_module()
+    spec = _board_meta_for(board).get(policy.POLICY_KEY)
+    if policy.board_is_wired(spec):
+        arm_priority_tranche_guard(board)
+        return "armed"
+    disarm_priority_tranche_guard(board)
+    return "unarmed"
+
+
+def _refuse_priority_outside_domain(conn: sqlite3.Connection, priority: int, *,
+                                    board: Optional[str] = None,
+                                    task_id: Optional[str] = None) -> None:
+    """Door 2: a re-rank outside the ordinary domain is REFUSED - on EVERY board.
+
+    Refused rather than clamped, because a deliberate re-rank is a deliberate act and silently
+    altering it hides the caller's bug - which is also what keeps a sweep from writing a bogus
+    target.
+
+    THE DOMAIN HALF IS UNCONDITIONAL (operator standard, card t_ecbfb34b): the domain is the
+    KERNEL's, not a board's, so a value outside ``ORDINARY_MIN..ORDINARY_MAX`` cannot be stored
+    whether or not the board carries a ``priority_policy``. The original gating left every
+    unwired board open, which is how ``defcon`` came to hold 101 rows at 1100000.
+
+    ABOVE THE CEILING is the CEILING DOOR's call, not this one's.
+    ``_refuse_above_tranche_rerank`` runs first on the same edit and refuses every card that
+    carries no marker, so a value over
+    ``MAX_PRIORITY`` arriving here has already been let through by the marker rule ("only the
+    marker exempts a card"): the lift of a designated or stamped card, which the repair pass
+    (``demote_above_tranche``) then brings back into the tranche. Re-deciding it here would leave
+    that exemption unreachable, since no marked value above the ceiling could ever pass both
+    doors. What this door owns, and still refuses, is the ordinary card placed over the asks and
+    a reserved-band value reached WITHOUT a marker: a card that carries one (a live designation,
+    the register's ask stamp, or a declared SEV1) may be placed inside
+    ``TRANCHE_FLOOR..TRANCHE_TOP`` - the same predicate the create seam and the repair pass read.
+
+    THE BOARD'S OWN FLOOR is read BEFORE the tranche branch, and a row AT it is admitted WITHOUT
+    a marker: placing a card on its floor is the board's own act, not a request for the reserved
+    band. That is what makes a floor ON the tranche boundary (``TRANCHE_FLOOR``) usable - the one
+    floor inside the band - while every OTHER value in the reserved tranche stays designation-only,
+    on every board. The floor read is deliberately NOT wrapped: a floor the board's wiring cannot
+    answer is unusable wiring and surfaces here, exactly as :func:`board_floor` documents.
+
+    The FLOOR stays the BOARD's bound, and stays gated on its policy: it is the fleet band
+    table's clause, not the scale's.
+    """
+    policy = _policy_module()
+    value = int(priority)
+    slug: Optional[str] = None
+    spec: Any = None
+    try:
+        slug = board_for_connection(conn) or board
+        spec = _board_meta_for(slug).get(policy.POLICY_KEY)
+    except Exception:
+        # "Cannot tell which board this is" stays inert for the FLOOR half: a metadata read
+        # that failed must not become a refusal. The domain half below does not need it.
+        spec = None
+    # ABOVE THE CEILING: ``_refuse_above_tranche_rerank`` already ran on this same edit and let a
+    # marker-carrying card through, so a value over ``MAX_PRIORITY`` reaching this door IS that
+    # lift and must not be re-refused here. Handled first of all, so a value over the ceiling never
+    # touches the floor admission below.
+    if value > int(policy.MAX_PRIORITY):
+        return
+    # THE BOARD'S OWN FLOOR, read BEFORE the tranche branch: a row AT the floor is the board's own
+    # declaration, admitted without a marker. Read only for a wired board; a floor the wiring
+    # cannot answer surfaces as unusable wiring (not wrapped), and an unwired board has no floor
+    # half to enforce.
+    floor: Optional[int] = None
+    if policy.board_is_wired(spec):
+        floor = policy.board_floor(spec, slug or "")
+    if not policy.in_ordinary(value):
+        if floor is not None and value == floor:
+            return
+        # Inside the reserved tranche, the band the asks and SEVs hold: reachable only by a card
+        # carrying its OWN evidence, read by the SAME predicate the storage guard enforces
+        # (``tranche_entitlement``) - not by the new value merely landing in the band, and not by
+        # evidence inherited from an ancestor the trigger cannot see. Answering the guard's own
+        # question is what keeps this door's "allowed" from becoming the database's "aborted".
+        in_tranche = policy.in_tranche(value)
+        marker = ""
+        if in_tranche and task_id:
+            text = _task_text(conn, task_id)
+            marker = tranche_entitlement(
+                conn, board=slug, task_id=task_id, title="", body=text,
+            )
+        if not (in_tranche and marker):
+            raise policy.PriorityOutOfDomain(
+                "priority %d is outside the ordinary domain (%d..%d): %s"
+                % (value, policy.ORDINARY_MIN, policy.ORDINARY_MAX, policy.domain_reason(value))
+            )
+    if floor is not None and value < floor:
+        raise policy.PriorityOutOfDomain(
+            "priority %d is below this board's floor %d: cards on %s are filed at the top "
+            "band (%d..%d) - file it on its own board, or use the designation door if it must "
+            "outrank them" % (value, floor, slug or "this board", floor, policy.ORDINARY_MAX)
+        )
+
+
+def _task_text(conn: sqlite3.Connection, task_id: str) -> str:
+    """``title + body`` of an existing card, or ``""`` - the marker's own evidence."""
+    row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return ""
+    return "%s\n%s" % ((row["title"] or ""), (row["body"] or ""))
+
+
+def priority_designation(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """The card's designation row - live or revoked - or ``None``."""
+    row = conn.execute(
+        "SELECT task_id, board, priority, authority, reason, designated_at, revoked_at "
+        "FROM priority_designations WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def is_priority_designated(conn: sqlite3.Connection, task_id: str, *,
+                           board: Optional[str] = None) -> bool:
+    """Is *task_id* in the reserved tranche BY DESIGNATION? (the guard's predicate)
+
+    The exemption the storage guard and the fleet's sweep both read: a row here, not revoked,
+    is what makes a tranche priority legitimate for one card - and nothing else does.
+    """
+    sql = "SELECT 1 FROM priority_designations WHERE task_id = ? AND revoked_at IS NULL"
+    params: list = [task_id]
+    if board:
+        sql += " AND board = ?"
+        params.append(board)
+    return conn.execute(sql, params).fetchone() is not None
+
+
+def _designation_stamp(now: object = None) -> str:
+    """An ISO-8601 UTC stamp: the ledger's two stamp columns are TEXT, so the audit reads them."""
+    return str(now) if now else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def designate_priority(conn: sqlite3.Connection, task_id: str, *, reason: str,
+                       authority: Optional[str] = None, board: Optional[str] = None,
+                       now: object = None, nested: bool = False) -> dict:
+    """The designation door: ledger row FIRST, then the card into the reserved tranche.
+
+    In that order because the storage guard refuses a tranche value with no live designation -
+    the trigger is what makes "only this door" true rather than advisory. The ledger keeps the
+    card's ordinary priority, so revoke returns the card exactly to the rest it left instead of
+    to a value re-derived afterwards.
+
+    ``nested`` is the gate lift's opt-in: the relation invariant is held INSIDE the txn that
+    created the edge (``_link``) or wrote the re-rank (``edit_task``), so the door has to run
+    under an open outer transaction. It is explicit - never inferred from
+    ``conn.in_transaction`` - because every other caller must keep failing loudly on an
+    accidental nest. This is the one door whose whole effect is rows in the caller's own txn:
+    no post-commit side effect can fire while an outer txn can still roll back.
+    """
+    policy = _policy_module()
+    _assert_not_delegated_child_mutation(kanban_db_path(board=board))
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("a designation needs a reason (it is the audit answer)")
+    current = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if current is None:
+        raise ValueError("no such task %s on this board" % task_id)
+    slug = board or board_for_connection(conn) or get_current_board()
+    stamp = _designation_stamp(now)
+    with write_txn(conn, allow_nested=nested):
+        conn.execute(
+            "INSERT INTO priority_designations "
+            "(task_id, board, priority, authority, reason, designated_at, revoked_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL) "
+            "ON CONFLICT(task_id) DO UPDATE SET board = excluded.board, "
+            "priority = excluded.priority, authority = excluded.authority, "
+            "reason = excluded.reason, designated_at = excluded.designated_at, revoked_at = NULL",
+            (task_id, slug, int(current["priority"]), authority, reason, stamp),
+        )
+        conn.execute(
+            "UPDATE tasks SET priority = ? WHERE id = ?", (policy.DESIGNATED_PRIORITY, task_id),
+        )
+        _append_event(conn, task_id, "reprioritized", {
+            "priority": policy.DESIGNATED_PRIORITY, "designation": "designated",
+            "authority": authority, "reason": reason,
+        })
+    return {
+        "task_id": task_id, "board": slug, "priority": policy.DESIGNATED_PRIORITY,
+        "restore_priority": int(current["priority"]), "authority": authority, "reason": reason,
+        "designated_at": stamp, "revoked_at": None,
+    }
+
+
+def _release_designation_rows(conn: sqlite3.Connection, task_id: str, *, reason: str = "",
+                              cause: str = "revoke", now: object = None) -> Optional[dict]:
+    """Release a card's LIVE designation inside the CALLER's open txn; ``None`` if it holds none.
+
+    THE ONE RELEASE. Two writers now retire a designation - the operator door
+    (``revoke_priority_designation``) and the archive seam (withdrawal IS the revoke,
+    t_c80646d1) - so the clamp that keeps the armed storage guard from holding the exit
+    shut, the ``reprioritized`` event and the retained designation reason/authority are
+    decided HERE and nowhere else. The caller owns the transaction and any post-commit
+    work (the door's gate lift); nothing here opens one, so it composes into ``archive_task``
+    without nesting.
+    """
+    row = priority_designation(conn, task_id)
+    if row is None or row["revoked_at"]:
+        return None
+    policy = _policy_module()
+    stored = int(row["priority"])
+    # The floor is read FIRST so the clamp admits a floor ON the tranche boundary: releasing a
+    # designation whose stored value is exactly the board's declared floor returns the card to
+    # that floor rather than clamping it down into the ordinary domain.
+    floor, floor_error = None, None
+    try:
+        floor = _board_priority_floor(row["board"])
+    except Exception as exc:
+        floor_error = " ".join(str(exc).split()) or exc.__class__.__name__
+    restore, _ = policy.clamp_to_domain(stored, None, floor)
+    if floor is not None and restore < floor:
+        restore = int(floor)
+    correction = None
+    if restore != stored:
+        correction = {
+            "stored": stored,
+            "applied": restore,
+            "floor": floor,
+            "reason": (policy.domain_reason(stored) if not policy.in_ordinary(stored)
+                       else "below the board's floor %d" % floor),
+        }
+    reason = (reason or "").strip()
+    stamp = _designation_stamp(now)
+    conn.execute("UPDATE priority_designations SET revoked_at = ? WHERE task_id = ?",
+                 (stamp, task_id))
+    conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (restore, task_id))
+    payload = {"priority": restore, "designation": "revoked", "reason": reason}
+    if cause != "revoke":
+        # Name the seam on the event: the register's audit reads causes, and an archive-driven
+        # release must be distinguishable from the operator door in the card's own history.
+        payload["cause"] = cause
+    if correction is not None:
+        payload["correction"] = correction
+    if floor_error is not None:
+        payload["floor_unavailable"] = floor_error
+    _append_event(conn, task_id, "reprioritized", payload)
+    return {
+        "task_id": task_id, "board": row["board"], "restored_priority": restore,
+        "stored_priority": stored, "correction": correction,
+        "authority": row["authority"], "reason": row["reason"],
+        "designated_at": row["designated_at"], "revoked_at": stamp, "revoke_reason": reason,
+    }
+
+
+def revoke_priority_designation(conn: sqlite3.Connection, task_id: str, *, reason: str = "",
+                                now: object = None) -> Optional[dict]:
+    """Leave the tranche: annotate the row, restore the card's own ordinary priority.
+
+    ``None`` when the card carries no LIVE designation - revoking is a no-op on a card that was
+    never designated, never a silent re-rank of an ordinary card. The row keeps the DESIGNATION's
+    reason and authority (that is what the audit query reads); the revoke's own reason and
+    authority ride the ``reprioritized`` event, so nothing about the act is lost.
+
+    THE RESTORED VALUE IS CLAMPED (door 5). The ledger records the priority the card held when
+    it was designated - whatever that was, including a value that is not legal on the board by
+    the time someone revokes. On this fleet 18 of the live rows hold a RESERVED-TRANCHE value,
+    hand written by raw SQL before any guard existed; writing one back would be refused by the
+    armed storage guard inside the very transaction that sets ``revoked_at``, so the designation
+    could never be released at all - the guard would hold the exit shut. The restore is
+    therefore clamped to what the board allows AFTER the revocation: inside the ordinary domain
+    (so never a tranche value), and never below a floored board's floor. When the clamp moves
+    the value the correction rides the ``reprioritized`` event AND the returned row, so a
+    ledger that no longer means what it says is visible rather than silent.
+
+    A floor that cannot be READ does not stop the revoke: the domain clamp above is
+    unconditional, so nothing here can write a tranche value back, and the unreadable floor is
+    recorded on the event rather than swallowed. A revoke must never abort on the number the
+    ledger happens to hold.
+
+    THE GATE HALF runs after the release, in its own txn (see THE GATE INVARIANT below). The
+    ledger's value is where the card RESTS, not what it may HOLD: a gate that still holds
+    designated work is re-lifted by the relation, with the ``reprioritized`` gate event naming
+    the child - so a revoke never leaves the board out of order, and never silently either.
+    The lifts ride the returned row (``gate_lifts``) when there are any.
+    """
+    _assert_not_delegated_child_mutation(kanban_db_path())
+    row = priority_designation(conn, task_id)
+    if row is None or row["revoked_at"]:
+        return None
+    with write_txn(conn):
+        record = _release_designation_rows(conn, task_id, reason=reason, now=now)
+    if record is None:  # lost a race with another releaser between the look and the txn
+        return None
+    # Door 5 released the designation. The GATE half is applied immediately after, in its own
+    # txn: a card that still holds designated work cannot sit in the ordinary band, so the
+    # release runs first and the floor is re-applied - the two events say both happened, and
+    # neither the release nor the floor can leave a stored graph out of order.
+    gate_lifts = lift_gate_chain(conn, task_id, cause="revoke", board=record["board"])
+    if gate_lifts:
+        record["gate_lifts"] = gate_lifts
+    return record
+
+# --------------------------------------------------------------------------------------------
+# THE GATE INVARIANT - a card must never rank below a card it gates.
+#
+# Operator directive, 2026-09-29 (card t_ef547958). Priority picks the SPAWN ORDER and nothing
+# else; a gated card waits in `todo` until its parent is `done`. So a gate filed low does not
+# merely run late - it freezes every card behind it, whatever those cards were designated. Three
+# gates at p=0 were holding cards at p=999999 in the reserved tranche, and the operator spent an
+# evening hand-lifting them. The fleet enforced the band CENTRE at the create seam and nothing at
+# all about RELATIONS, because a relation is created after birth and a policy never sees it.
+#
+# THE RULE. For every edge parent -> child over `task_links`, `parent.priority >= child.priority`
+# holds while the parent is not terminal. The requirement is TRANSITIVE and it is a MAXIMUM: a
+# card's gate floor is the highest priority among the OPEN work it still gates, walking down only
+# through open nodes - a `done` intermediary waits for nothing, so nothing behind it is waiting on
+# this card either. ``gate_need()`` is that one definition; everything else here calls it.
+#
+# WHERE IT LIVES, AND WHY NOT IN THE POLICY MODULE. ``kanban_priority_policy`` says a value is
+# "decided at birth, not corrected afterwards", and the card asked for that premise to be either
+# extended or corrected. It is CORRECTED, on one ground: a policy is a pure function of the FILING
+# (``fn(requested, assignee, board, title, body)``) and it owns a board's BANDS. This rule needs
+# the GRAPH, which no filing argument carries, and it bounds EVERY board whether or not one is
+# wired - exactly as the priority DOMAIN does. So it sits with the domain, in the kernel, and the
+# policy module's contract is unchanged: a policy still decides the value a card is BORN with and
+# still decides nothing afterwards. The relation floor is applied AROUND the policy's verdict,
+# never inside it, and the two never share a code path.
+#
+# THE SEAMS (relations change after birth, so one seam cannot hold this):
+#   * ``_link`` - the ONE edge primitive (``create_task``, ``link_tasks`` and the triage
+#     decomposer all insert edges through it): a new edge can leave the parent below the card it
+#     now gates, so the child's whole ancestor chain is re-decided, nearest first.
+#   * ``edit_task`` - a re-rank changes a VALUE in both directions: raising a card above its
+#     parents lifts them, and a parent lowered under its own children is lifted back to its gate
+#     floor in the same write, because the alternative is a stored state that breaks the
+#     invariant until somebody notices.
+#   * ``revoke_priority_designation`` - leaving the tranche writes the ledger's ordinary value
+#     back, and a card that still gates designated work must not stay there: the release runs
+#     first, the floor is applied after it, and the two events say so between them.
+# Nothing else needs a seam: completing, archiving or unlinking only RELAXES the invariant - a
+# closed parent constrains nobody, which is why the walk stops at one.
+#
+# THE LIFT IS ONE-WAY. It raises. It never lowers, never demotes the gated card and never refuses
+# a filing: demoting or rejecting the child would hide the gate instead of honouring it, and
+# "never demote or block the gated card" is the directive. ``min(need, MAX_PRIORITY)`` is the only
+# bound - a child left above the scale's top by an unguarded raw write is capped, and the cap is
+# RECORDED (``capped_from``) rather than written silently. ``demote_above_tranche`` owns that
+# other half.
+#
+# THE RESERVED TRANCHE. A gate whose child holds 999999 must itself hold 999999, which is inside
+# the band that is "designated, never requested". The lift takes the designation route the door
+# already provides - ledger row FIRST (the storage guard aborts a tranche value with no live
+# designation, so the order is the door's, not a choice made here), ``authority="gate-lift"`` and
+# a reason naming the CHILD - and then writes the exact value, because 990000 is the
+# designation's own value and the invariant needs the child's. A parent of designated work is a
+# ladder case by definition; the alternative the card offered (cap at ORDINARY_MAX and report)
+# would leave every reserved-band card held by a gate that reports itself as permanently
+# unsatisfiable, which is the freeze the directive exists to remove. Every tranche lift is named
+# in its event (``tranche``) and counted in the reconcile record, so the reserved band EXPANDING
+# is never silent. ``revoke`` remains the release door: it restores the ledger's ordinary value
+# and the floor is re-applied immediately after, so the invariant outlives the release.
+#
+# THE PASS. Seams hold every write that goes through them; nothing holds a value written around
+# them (the fleet's raw-SQL re-rank lever, a restored backup). ``reconcile_gate_priorities()`` is
+# the deterministic pass that normalises those and STATES its counts - it is what the board-sweep
+# DAG runs, so the answer to "is the invariant held" is a run record, never a card comment.
+# --------------------------------------------------------------------------------------------
+
+#: The authority every lift records, on the event and on the designation it may need: one string
+#: for "the RELATION moved this card - not a lane, not the operator, not a band".
+GATE_AUTHORITY = "gate-lift"
+
+#: A parent in one of these states holds nothing: the invariant is over the work that is still
+#: WAITING, so a terminal parent is never lifted and a walk never descends through one.
+GATE_TERMINAL_STATUSES = ("done", "archived")
+
+
+def _gate_children(conn: sqlite3.Connection, task_id: str) -> list:
+    """The card's children - ``(id, priority, status)`` - in id order, so the walk is stable."""
+    return conn.execute(
+        "SELECT c.id AS id, c.priority AS priority, c.status AS status "
+        "  FROM task_links l JOIN tasks c ON c.id = l.child_id "
+        " WHERE l.parent_id = ? ORDER BY c.id",
+        (task_id,),
+    ).fetchall()
+
+
+def gate_need(conn: sqlite3.Connection, task_id: str) -> Optional[tuple]:
+    """``(value, gate_id)`` - the priority ``task_id`` MUST hold, and the open card that sets it.
+
+    ``None`` is the negative case and the reason this is safe to call everywhere: a card with no
+    children - or whose children are all delivered - gates nothing that is still waiting, so it
+    has no floor and nothing can touch it.
+
+    The walk descends through OPEN nodes only: a ``done`` intermediary is delivered work, and
+    nothing behind it is waiting on this card either, so the chain stops there. Cycle-safe
+    (``seen`` starts with the card itself - a graph that somehow closed a loop still terminates),
+    and the answer is the MAXIMUM over open descendants, since a card with several children must
+    outrank all of them. Ties break on the lowest card id so the record is REPRODUCIBLE rather
+    than merely correct.
+    """
+    best_value: Optional[int] = None
+    best_id: Optional[str] = None
+    seen = {task_id}
+    stack = [task_id]
+    while stack:
+        node = stack.pop()
+        for row in _gate_children(conn, node):
+            child_id = row["id"]
+            if child_id in seen:
+                continue
+            seen.add(child_id)
+            if row["status"] in GATE_TERMINAL_STATUSES:
+                continue
+            value = int(row["priority"] or 0)
+            if best_value is None or value > best_value or (
+                    value == best_value and str(child_id) < str(best_id)):
+                best_value, best_id = value, child_id
+            stack.append(child_id)
+    if best_value is None:
+        return None
+    return best_value, best_id
+
+
+def _gate_ancestors_nearest_first(conn: sqlite3.Connection, task_id: str) -> list:
+    """``task_id``, then its parents, then theirs - the order the lift must run in.
+
+    Nearest first because a lift only RAISES: repairing an edge changes the requirement of every
+    card above it, so one pass in this order leaves each card holding the number the settled graph
+    needs. The card itself is included - it may be a parent of something too. Breadth-first with a
+    seen-set, so a diamond or a cycle cannot repeat or hang.
+    """
+    order: list = []
+    seen = {task_id}
+    frontier = [task_id]
+    while frontier:
+        nxt: list = []
+        for node in frontier:
+            order.append(node)
+            for row in conn.execute(
+                    "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                    (node,)):
+                parent = row["parent_id"]
+                if parent in seen:
+                    continue
+                seen.add(parent)
+                nxt.append(parent)
+        frontier = nxt
+    return order
+
+
+def _gate_designation_reason(gate_id: str, gate_priority: int, cause: str) -> str:
+    """The ladder's audit answer: WHICH card this one gates, and which seat asked for the lift."""
+    return ("gate lift: this card gates %s at %d, so it cannot rank below it (cause: %s)"
+            % (gate_id, int(gate_priority), cause))
+
+
+def _gate_lift_one(conn: sqlite3.Connection, task_id: str, *, need: tuple, cause: str,
+                   board: Optional[str] = None) -> Optional[dict]:
+    """Raise ONE card to its gate floor. Returns the lift record, or ``None`` when it is already
+    there / terminal / gone.
+
+    Never lowers (a card above its floor is left alone), never refuses, and never writes a value
+    above the scale's top without recording it.
+    """
+    policy = _policy_module()
+    need_value, need_id = int(need[0]), need[1]
+    row = conn.execute("SELECT priority, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] in GATE_TERMINAL_STATUSES:
+        return None
+    before = int(row["priority"] or 0)
+    target = min(need_value, int(policy.MAX_PRIORITY))
+    if target <= before:
+        return None
+    slug = board or board_for_connection(conn) or ""
+    tranche = target >= int(policy.TRANCHE_FLOOR)
+    if tranche:
+        # Ledger row FIRST: the armed storage guard aborts a tranche value with no live
+        # designation, so the designation door opens before this writes the value.
+        designate_priority(conn, task_id, reason=_gate_designation_reason(need_id, need_value, cause),
+                           authority=GATE_AUTHORITY, board=slug or None, nested=True)
+        if target != int(policy.DESIGNATED_PRIORITY):
+            with write_txn(conn, allow_nested=True):
+                conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (target, task_id))
+    else:
+        with write_txn(conn, allow_nested=True):
+            conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (target, task_id))
+    payload = {
+        "priority": target,
+        "before": before,
+        "cause": cause,
+        "gate": need_id,
+        "gate_priority": need_value,
+        "tranche": tranche,
+    }
+    if target != need_value:
+        payload["capped_from"] = need_value
+    _append_event(conn, task_id, "reprioritized", payload)
+    return {
+        "task_id": task_id, "board": slug, "before": before, "now": target, "cause": cause,
+        "gate": need_id, "gate_priority": need_value, "tranche": tranche,
+        "capped_from": need_value if target != need_value else None,
+        "designation": _gate_designation_reason(need_id, need_value, cause) if tranche else None,
+    }
+
+
+def lift_gate_chain(conn: sqlite3.Connection, task_id: str, *, cause: str = "edit",
+                    board: Optional[str] = None) -> list:
+    """THE SEAM: hold the invariant for everything ``task_id`` changed, nearest first.
+
+    Call it inside the txn that made the change - after an edge is inserted, after a re-rank is
+    written - so the stored state is never observably wrong: a reader either sees the edge and the
+    floor together, or neither. The card itself is re-decided first (an edit can leave it under
+    its own children), then each ancestor in turn, each against the graph as it stands by then.
+    Returns the lifts it made, oldest first; an empty list is the normal, clean case.
+    """
+    slug = board or board_for_connection(conn) or ""
+    lifts: list = []
+    for node in _gate_ancestors_nearest_first(conn, task_id):
+        if _task_status(conn, node) in GATE_TERMINAL_STATUSES:
+            continue
+        need = gate_need(conn, node)
+        if need is None:
+            continue
+        record = _gate_lift_one(conn, node, need=need, cause=cause, board=slug)
+        if record is not None:
+            lifts.append(record)
+    return lifts
+
+
+def gate_violations(conn: sqlite3.Connection) -> list:
+    """Every edge whose parent ranks below the card it gates - the invariant, MEASURED.
+
+    The measurement is the graph, never a remembered number: this is what the pass reports before
+    and after, so "0" is a query result rather than a claim.
+    """
+    rows = conn.execute(
+        "SELECT l.parent_id AS parent_id, l.child_id AS child_id, "
+        "       p.priority AS parent_priority, c.priority AS child_priority, "
+        "       p.status AS parent_status "
+        "  FROM task_links l "
+        "  JOIN tasks p ON p.id = l.parent_id "
+        "  JOIN tasks c ON c.id = l.child_id "
+        " WHERE p.status NOT IN ('done', 'archived') AND p.priority < c.priority "
+        " ORDER BY l.parent_id, l.child_id",
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def reconcile_gate_priorities(conn: sqlite3.Connection, *, board: Optional[str] = None,
+                              cause: str = "reconcile") -> dict:
+    """THE PASS: raise every gate on this board to the cards it still holds, and state the counts.
+
+    Deterministic and idempotent - a second run over an unchanged board lifts nothing and returns
+    the same zero, which is the property that makes it safe to run on a schedule. It works from
+    the VIOLATIONS rather than from every card, so a clean board costs one query. A lift that
+    raises is recorded in ``failed`` and the pass continues: one un-liftable card must not hide
+    the state of the other fifty. ``violations_after`` is re-measured from the graph - if it is
+    not 0 the record says so instead of the pass claiming success.
+    """
+    before = gate_violations(conn)
+    lifts: list = []
+    failed: list = []
+    for row in before:
+        try:
+            lifts.extend(lift_gate_chain(conn, row["parent_id"], cause=cause, board=board))
+        except Exception as exc:  # one card must not abort the sweep
+            failed.append({"task_id": row["parent_id"], "edge": [row["parent_id"], row["child_id"]],
+                           "error": "%s: %s" % (type(exc).__name__, exc)})
+    after = gate_violations(conn)
+    return {
+        "board": board or board_for_connection(conn) or "",
+        "violations_before": len(before),
+        "violations": before,
+        "lifts": lifts,
+        "lifts_total": len(lifts),
+        "tranche_lifts": len([l for l in lifts if l.get("tranche")]),
+        "failed": failed,
+        "violations_after": len(after),
+        "remaining": after,
+    }
+
 def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -> Optional[str]:
     from hermes_cli import projects_db as _pdb
 
@@ -1441,11 +3810,24 @@ def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -
         return None
 
 
-def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def _link(conn: sqlite3.Connection, parent_id: str, child_id: str, *,
+          cause: str = "link") -> None:
+    """Insert one edge, then hold the gate invariant that edge creates.
+
+    This is the ONE edge primitive: ``create_task`` (parents passed at filing), ``link_tasks`` and
+    the triage decomposer all arrive here, which is why the seam sits here rather than three times
+    above it. The edge is written first and the lift runs in the same transaction, so the stored
+    graph is never observably "an edge whose parent ranks below the card it gates"; either the
+    caller's write commits with the lift or neither does.
+
+    ``cause`` is only the record's answer to "which seat asked for this" (``create`` / ``link`` /
+    ``decompose``); the rule is the same in all three and it never depends on the caller.
+    """
     conn.execute(
         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
         (parent_id, child_id),
     )
+    lift_gate_chain(conn, child_id, cause=cause)
 
 
 def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]:
@@ -1550,9 +3932,15 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str], *,
+                board: Optional[str] = None) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
+    if profile:
+        # INVARIANT B at the re-rank door: the same refusal as the create seam, so a card
+        # cannot be moved onto a dead handle after it exists (design record t_6747232b).
+        from hermes_cli import kanban_gate_invariants as _gates
+        _gates.gate_assignee(profile, board=board, where="kanban assign")
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -1615,6 +4003,46 @@ def _set_task_override(
     return True
 
 
+def set_contract(
+    conn: sqlite3.Connection, task_id: str, contract: str, *, reason: str,
+    actor: str = "user",
+) -> bool:
+    """Correct a task's completion contract — the release for a wrong or unsatisfiable one.
+
+    ``contract`` is ``local-only``, ``OWNER/REPO``, or an exact PR URL (same validation as
+    create). Appends ``contract_changed {old, new, reason, actor}``; a refusal writes no
+    event. ``reason`` is mandatory: re-declaring a contract changes what "green" means for
+    the card, so it has to be defensible from the event log alone. Terminal cards
+    (``done``/``archived``) are refused — their contract is frozen with the run that closed
+    them. A delegated ``delegate_task`` child cannot reach this: ``write_txn`` refuses the
+    mutation, deliberately, so a worker cannot relabel the fence holding it.
+    """
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+
+    value = validate_contract(contract)
+    why = (reason or "").strip()
+    if not why:
+        raise ValueError("set_contract requires a non-empty reason")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, completion_contract FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] in {"done", "archived"}:
+            raise RuntimeError(
+                f"cannot set completion contract on {row['status']} task {task_id}"
+            )
+        old = row["completion_contract"]
+        conn.execute("UPDATE tasks SET completion_contract = ? WHERE id = ?", (value, task_id))
+        _append_event(
+            conn, task_id, "contract_changed",
+            {"old": old, "new": value, "reason": why, "actor": actor or "user"},
+        )
+    notify_task_updated(conn, task_id, ("completion_contract",))
+    return True
+
+
 def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optional[str]) -> bool:
     """Set (empty clears; ``"none"`` pins thinking OFF) the per-task reasoning
     effort. Independent of the model override so clearing one never resets the
@@ -1662,7 +4090,7 @@ def link_tasks(
             raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
-        _link(conn, parent_id, child_id)
+        _link(conn, parent_id, child_id, cause="link")
         # If child was ready but parent is not yet terminal, demote child to todo
         # (archived counts as terminal, matching _parents_satisfied/recompute_ready).
         if _task_status(conn, parent_id) not in ("done", "archived"):
@@ -1952,12 +4380,58 @@ def _append_event(
     )
 
 
+# Terminal run outcomes that are NOT failures: the attempt ended deliberately —
+# a success, a handoff, or a park the card's own workflow chose. A failure
+# streak and its corrective text describe a FAILED ATTEMPT, never the card, so
+# one of these must retire both when it closes a run. Otherwise a stale
+# rate-limit / auth wall left by an earlier attempt keeps
+# ``kanban_db_dispatch.check_respawn_guard`` from ever spawning the recovered
+# card — the chicken-and-egg where the spawn that would clear the wall is the
+# spawn the wall blocks.
+#
+# A POSITIVE allow-list on purpose: a newly added FAILURE outcome can never
+# clear the streak by accident (fail closed). ``reclaimed`` is deliberately
+# absent — a reclaimed/orphaned run is not a success, and ``complete_task``
+# reconciles that case itself.
+_NON_FAILURE_RUN_OUTCOMES = frozenset({
+    "completed",
+    "review_requested",
+    "changes_requested",
+    "blocked",
+    "dependency_wait",
+    "scheduled",
+})
+
+
+def _clear_failure_streak(conn: sqlite3.Connection, task_id: str) -> None:
+    """Retire ``consecutive_failures`` / ``last_failure_error`` for a non-failure outcome.
+
+    A bare UPDATE that must run inside the caller's transaction — unlike
+    ``kanban_db_dispatch._clear_failure_counter``, which opens its own and so
+    cannot be called from here. The failed attempt's diagnosis survives on its
+    ``task_runs.error`` and its ``gave_up`` / ``timed_out`` / ... event; only
+    the task-row copy the respawn guard reads is retired.
+    """
+    conn.execute(
+        "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL WHERE id = ?",
+        (task_id,),
+    )
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
+    keep_attached: bool = False,
 ) -> Optional[int]:
     """Close the active run (``status`` defaults to ``outcome``) and clear
     ``current_run_id``; None when no run was active (never-claimed task).
+
+    ``keep_attached=True`` closes the run but leaves it as the card's owner.
+    A review handoff is the case: the run ENDS (it handed off), yet the worker
+    that filed it must keep the licence to return, re-block or re-request the
+    card. Clearing ``current_run_id`` there hands the implementer a card it can
+    no longer act on — the wedge the named-reviewer refusal exists to prevent,
+    reached through the back door.
 
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
@@ -1982,7 +4456,10 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if not keep_attached:
+        conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if outcome in _NON_FAILURE_RUN_OUTCOMES:
+        _clear_failure_streak(conn, task_id)
     return run_id
 
 
@@ -2021,16 +4498,24 @@ _UNSET: Any = object()
 def _end_or_synthesize_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, status: str,
     summary: Optional[str] = None, metadata: Optional[dict] = None, synthesize: bool,
-    profile: Any = _UNSET,
+    profile: Any = _UNSET, keep_attached: bool = False,
 ) -> Optional[int]:
     """:func:`_end_run`; when no run was active and ``synthesize`` holds, record a
     zero-duration run instead so the handoff fields survive in attempt history.
     ``profile`` overrides the profile read off the task row for the synthesized
     run — transitions that reassign the task (e.g. review handoff) pass the
-    acting profile captured before the rewrite."""
-    run_id = _end_run(conn, task_id, outcome=outcome, status=status, summary=summary, metadata=metadata)
+    acting profile captured before the rewrite. ``keep_attached`` is
+    :func:`_end_run`'s: the closed run stays the card's owner (review handoff)."""
+    run_id = _end_run(conn, task_id, outcome=outcome, status=status, summary=summary,
+                      metadata=metadata, keep_attached=keep_attached)
     if run_id is None and synthesize:
         run_id = _synthesize_ended_run(conn, task_id, outcome=outcome, summary=summary, metadata=metadata, profile=profile)
+        # ``_end_run`` was a no-op (never-claimed task), so its failure-streak
+        # clear never ran; do it on the synthesized path too. A reclaimed run
+        # can leave the streak set on a card that is NOT claimed when a human
+        # requests review / blocks it, and the guard would then wedge the card.
+        if outcome in _NON_FAILURE_RUN_OUTCOMES:
+            _clear_failure_streak(conn, task_id)
     return run_id
 
 
@@ -2458,7 +4943,10 @@ def release_stale_claims(
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
-        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
+        # ``not_dead``, not ``alive``: an unprovable worker must HOLD its claim too. Releasing it
+        # beside a process that may still be running is how a duplicate is spawned next to it
+        # (#123811); the worker's own fence still lets it close the card.
+        if (host_local and row["worker_pid"] and _worker_not_dead(row["worker_pid"], started_at)
                 and not heartbeat_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
@@ -2669,10 +5157,82 @@ def _scan_prose_for_phantom_ids(conn: sqlite3.Connection, text: str) -> list[str
     return _missing_task_ids(conn, dict.fromkeys(_TASK_ID_PROSE_RE.findall(text)))
 
 
+def _prose_ref_search_boards(conn: sqlite3.Connection) -> list[str]:
+    """Board slugs a completion-time prose scan searched, in a deterministic order.
+
+    The board ``conn`` is open against comes first (read off the file's path via
+    :func:`board_for_connection` — never the ambient current board, which a
+    ``--board`` override or a worker's injected pin may disagree with), then every
+    other registered board by slug.
+    """
+    here = board_for_connection(conn)
+    slugs: list[str] = [here] if here else []
+    for meta in list_boards(include_archived=False):
+        slug = meta.get("slug")
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    return slugs
+
+
+def _missing_task_ids_everywhere(
+    conn: sqlite3.Connection, ids: Iterable[str],
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """Which of ``ids`` no REACHABLE board carries, and which a SIBLING board does.
+
+    A completion summary may legitimately name a card on another board — a
+    cross-board handoff is normal — so a real card must never be recorded as a
+    fabrication. Measured 2026-09-29 (card t_89626ce6): a verified ops-board child
+    was written to ``suspected_hallucinated_references`` because the scan only knew
+    the completing board.
+
+    Sibling stores are opened READ-ONLY and only when the store file already
+    exists, so a scan can never create a stray ``<slug>.db``.
+
+    Returns ``(phantoms, boards_searched, matched)``: ids absent from EVERY board,
+    the slugs actually consulted (for the durable payload), and ``{id: slug}`` for
+    ids a sibling board carries.
+    """
+    ordered = list(dict.fromkeys(ids))
+    missing = _missing_task_ids(conn, ordered)
+    here = board_for_connection(conn)
+    # ``here`` is the connection already in hand; only genuine siblings are opened below.
+    boards_searched = [here] if here else []
+    if not missing:
+        return [], boards_searched, {}
+
+    matched: dict[str, str] = {}
+    for slug in _prose_ref_search_boards(conn):
+        if not missing or slug == here:
+            continue
+        store = _store_path_for_slug(slug, ("kanban.db",), "kanban.db")
+        try:
+            if not store.is_file():
+                continue
+            sibling = sqlite3.connect(store.resolve().as_uri() + "?mode=ro", uri=True)
+        except (OSError, sqlite3.Error):
+            continue
+        try:
+            sibling.row_factory = sqlite3.Row
+            sibling.text_factory = _lossy_text
+            boards_searched.append(slug)
+            still = _missing_task_ids(sibling, missing)
+            carried = set(missing) - set(still)
+            for tid in carried:
+                matched[tid] = slug
+            missing = still
+        except sqlite3.Error:
+            continue
+        finally:
+            sibling.close()
+    return missing, boards_searched, matched
+
+
 class HallucinatedCardsError(ValueError):
     """``complete_task`` refused: ``created_cards`` has ids that don't exist or
     weren't created by this worker (``.phantom``). A ``ValueError`` so tool
     error handlers treat it as recoverable."""
+
+    cause = "hallucinated_created_cards"
 
     def __init__(self, phantom: list[str], completing_task_id: str):
         self.phantom = list(phantom)
@@ -2695,37 +5255,548 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class ProofGateError(ValueError):
+    """``complete_task`` refused: the card is authored ``landed`` and its handoff's proof
+    does not cover the deployed artifact — a run dated before the landing, no run at all,
+    or an artifact that is not the bytes the handoff declared. ``.clause`` names the clause
+    (see ``hermes_cli/kanban_proof_gate.py``), the audit event
+    ``completion_blocked_proof_gate`` carries the resolved facts, and the task itself is
+    NOT mutated. A ``ValueError`` so tool error handlers treat it as recoverable."""
+
+    cause = "proof_gate"
+
+    def __init__(self, task_id: str, verdict):
+        from hermes_cli.kanban_proof_gate import render
+
+        self.task_id = task_id
+        self.clause = getattr(verdict, "cause", None) or "proof_gate"
+        self.cause = self.clause
+        self.detail = getattr(verdict, "detail", "")
+        self.facts = getattr(verdict, "facts", {})
+        super().__init__(render(task_id, verdict))
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
 class LiveClaimError(ValueError):
-    """``complete_task`` refused: the task is ``running`` under a live claim and
-    the caller neither owns its run (``expected_run_id``) nor passed ``force``.
-    Completing anyway would close the worker's run row underneath a process
-    that is still executing. A ``ValueError`` so tool error handlers treat it
-    as recoverable."""
+    """``complete_task`` refused: the task is ``running`` under a claim that may still
+    protect a live run, and the caller neither owns its run (``expected_run_id``)
+    nor passed ``force``. Completing anyway would close the worker's run row
+    underneath a process that is still executing. A ``ValueError`` so tool error
+    handlers treat it as recoverable. ``verdict`` carries the tri-state liveness
+    answer (``alive`` / ``unknown``) so a caller can render the right escape
+    (see :func:`live_claim_refusal`)."""
 
-    def __init__(self, task_id: str):
-        super().__init__(
-            f"{task_id} is running under a live worker claim; pass expected_run_id "
-            "(worker ownership) or force=True (explicit operator override) instead "
-            "of closing the live run"
+    def __init__(self, task_id: str, *, verdict: str = "alive",
+                 run_id: Optional[int] = None, detail: Optional[str] = None):
+        # ``verdict`` defaults to the proven-live answer (``WORKER_ALIVE``), which is resolved at
+        # call time in :func:`live_claim_refusal`; the literal keeps this default off the
+        # dispatch import that lands at the bottom of the module.
+        self.task_id = task_id
+        self.verdict = verdict
+        self.run_id = run_id
+        super().__init__(detail or live_claim_refusal(task_id, verdict=verdict, run_id=run_id))
+
+
+def live_claim_refusal(task_id: str, *, verdict: str, run_id: Optional[int] = None) -> str:
+    """The ONE refusal text for a transition refused because the claim may protect a run.
+
+    ``verdict`` is the tri-state liveness answer. ``alive`` is proof that a worker
+    process owns the run, so both escapes are offered (own the run, or force).
+    ``unknown`` is the cannot-certify case and must NOT offer ``force``: forcing
+    there closes the very run the fence exists to protect, which is how a live
+    worker's run was closed underneath it (#123811). The run-naming escape is
+    offered in both cases — it is the one that is always safe.
+    """
+    if verdict == WORKER_UNKNOWN:
+        owns = (f"Pass expected_run_id={int(run_id)} (your run id)" if run_id
+                else "Pass expected_run_id (your run id)")
+        return (
+            f"{task_id} is running and the worker's process identity cannot be read on this host, "
+            f"so the claim may be live. Nothing was written. {owns} "
+            f"to close the run you hold; do NOT force this card — a live "
+            f"worker's run would be closed underneath it."
         )
+    return (
+        f"{task_id} is running under a live worker claim; pass expected_run_id "
+        "(worker ownership) or force=True (explicit operator override) instead "
+        "of closing the live run"
+    )
+
+
+def live_row_refusal(conn: sqlite3.Connection, task_id: str, *, caller_run_id: Optional[int] = None,
+                     verb: str = "complete") -> str:
+    """Why a transition was refused, read from the LIVE row — never from ``last_failure_error``.
+
+    ``tasks.last_failure_error`` is durable and describes a run that is OVER. Presenting it as the
+    current reason is how a two-day-old crash string answered a live call and sent the operator
+    chasing a stale run (#123811). The live row answers instead: what the card IS now, which run
+    owns it, and whether the caller's own run is superseded by a newer attempt or was closed by the
+    infrastructure — in which case the way back is named. Crash text is quoted only as history, and
+    labelled as such.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return (f"could not {verb} {task_id}: no such card "
+                "(unknown id, stale run, or already terminal)")
+    parts = [f"could not {verb} {task_id}: the live row is status={getattr(task, 'status', '?')}"]
+    owner = _opt_int(getattr(task, "current_run_id", None))
+    if owner is not None:
+        parts.append(f"run {owner} owns it")
+        if caller_run_id is not None and int(caller_run_id) != owner:
+            parts.append(
+                f"your run {int(caller_run_id)} is SUPERSEDED by it — a newer attempt owns the "
+                f"card, so closing it from here would land on that attempt"
+            )
+    else:
+        parts.append("no run owns it")
+        disowned = _newest_disowned_run(conn, task_id)
+        if disowned is not None:
+            parts.append(
+                f"run {disowned} was closed by the INFRASTRUCTURE, not by its worker (a reclaim), "
+                f"so this attempt is recoverable: pass expected_run_id={disowned} and the "
+                f"transition is recorded as a recovery"
+            )
+    history = (getattr(task, "last_failure_error", None) or "").strip()
+    if history:
+        parts.append(f"for history only — NOT the current reason: {history!r}")
+    return "; ".join(parts)
+
+
+def _claim_liveness(trow) -> str:
+    """Tri-state liveness of a ``running`` task's claim: ``alive`` / ``dead`` / ``unknown``.
+
+    ``dead`` means nothing protects the run: the task is not running, holds no claim
+    lock, recorded no worker process, or its worker process is proven gone/recycled.
+    ``unknown`` means the claim may still protect a live worker whose identity cannot
+    be certified (see ``kanban_db_dispatch._worker_liveness``). TTL expiry is
+    deliberately not consulted: ``reclaim_stale_tasks`` extends, not reclaims, the claim
+    of a live worker, so the process is the liveness authority here too.
+    """
+    if (trow is None or trow["status"] != "running" or trow["claim_lock"] is None
+            or not _row_get(trow, "worker_pid")):
+        return WORKER_DEAD
+    return _worker_liveness(_row_get(trow, "worker_pid"), _row_get(trow, "worker_started_at"))
+
+
+COMPLETION_REFUSAL_CAUSES = (
+    "unknown_id",                  # no such task on this board
+    "not_running",                 # status or run changed under the caller
+    "parent_gate_unsatisfied",     # a parent is not terminal yet
+    "acceptance_refusal",          # the PR acceptance receipt is not green
+    "record_acceptance_refusal",   # the card moved while its receipt was collected
+    "hallucinated_created_cards",  # created_cards names cards this worker did not create
+    "deferral_not_a_child",        # deferred_children names a card that is not this card's child
+    "deferral_needs_reason",       # a deferral must say WHY the child is not carrying this DoD
+)
+
+
+class CompletionRefusal:
+    """Why :func:`complete_task` refused, as data instead of a bare ``False``.
+
+    Falsy, so every existing ``if not complete_task(...)`` caller keeps its meaning, while
+    the operator-facing surfaces can name the *cause* — a bool cannot tell a mistyped id
+    from a completion contract no retry can satisfy, and that ambiguity is how a card sits
+    un-completable with no signal. :class:`HallucinatedCardsError` stays an exception
+    (existing callers catch it) and carries the same cause name as a class attribute.
+    """
+
+    __slots__ = ("cause", "detail")
+
+    def __init__(self, cause: str, detail: str):
+        if cause not in COMPLETION_REFUSAL_CAUSES:
+            raise ValueError(f"unknown completion refusal cause: {cause!r}")
+        self.cause = cause
+        self.detail = detail
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"CompletionRefusal(cause={self.cause!r}, detail={self.detail!r})"
+
+
+# The one release for a wrong or unsatisfiable contract, named on every refusal and park a
+# contract caused: the operator is top-level, and a dispatched worker can only read its card.
+SET_CONTRACT_HINT = (
+    "A contract that no retry can satisfy is released by a top-level operator with "
+    "`hermes kanban set-contract <task_id> local-only|OWNER/REPO|<PR URL> --reason \"...\"` "
+    "(no board write from a dispatched worker — card the release instead)"
+)
 
 
 def _claim_is_live(trow) -> bool:
-    """True when a ``running`` task's claim still protects a run: the worker process
-    it spawned exists (PID + start-time fingerprint). A claim whose worker is gone,
-    or a library/CLI claim that never spawned one, has no run to protect. TTL expiry
-    is deliberately not consulted: ``reclaim_stale_tasks`` extends, not reclaims, the
-    claim of a live worker, so the process is the liveness authority here too."""
-    return bool(
-        trow["status"] == "running"
-        and trow["claim_lock"] is not None
-        and trow["worker_pid"]
-        and _worker_alive(trow["worker_pid"], trow["worker_started_at"])
+    """True when a ``running`` task's claim is PROVEN to protect a live worker process.
+
+    This is the predicate that REFUSES a transition. An unprovable (``unknown``) claim is
+    deliberately not enough to refuse — see :func:`_close_run_fence` — but it IS enough to
+    keep the claim from being released (:func:`_worker_not_dead`, used by
+    ``release_stale_claims`` / ``_reclaim_dead_workers``).
+    """
+    return _claim_liveness(trow) == WORKER_ALIVE
+
+
+def _run_guard_sql(run_id: Optional[int]) -> tuple[str, tuple]:
+    """The run-ownership CAS every run-closing UPDATE carries.
+
+    ``run_id`` is the run the caller read inside this transaction — the one it named, or the
+    card's active run when it named none. A card with NO active run is matched by
+    ``current_run_id IS NULL``. The guard is what stops a transition landing on a run the caller
+    never read; without it a stale actor's write silently closes its successor's run, which is how
+    a run was requeued while its worker held it (#123811).
+
+    A caller that NAMES a run is admitted on the SUPERSEDED/UN-OWNED split: while
+    ``current_run_id`` is NULL **and its run is the card's newest**, the write lands. That is the
+    half an infrastructure reclaim creates — it NULLs ``current_run_id`` and closes the run
+    underneath a worker that is still executing, and exact equality alone fenced that worker, the
+    only legitimate owner, out of its own card permanently. A SUPERSEDED caller (a newer run
+    exists, so ``MAX(id)`` is not its run) is still refused by the same clause.
+    """
+    if run_id is None:
+        return " AND current_run_id IS NULL", ()
+    return (
+        " AND (current_run_id = ? OR (current_run_id IS NULL AND ? = ("
+        "SELECT MAX(id) FROM task_runs WHERE task_id = tasks.id)))",
+        (int(run_id), int(run_id)),
     )
+
+
+def _close_run_fence(
+    trow, task_id: str, *, expected_run_id: Optional[int], force: bool,
+) -> tuple[bool, str, str, tuple]:
+    """The ONE fence for closing a run: ``(allowed, verdict, guard_sql, guard_params)``.
+
+    ``verdict`` is the tri-state answer that decided it (``""`` when the caller named the
+    run, so the liveness question was never asked). Callers render their own refusal text;
+    an ``unknown`` verdict must render one that offers ``expected_run_id`` and NOT ``force``
+    (:func:`live_claim_refusal`).
+
+    Both directions live here so no path can check one and silently skip the other:
+
+    * the caller NAMED a run — admitted, and the UPDATE is made conditional on it, so a
+      mismatch is refused by the write instead of landing on a successor's run;
+    * the caller named NONE — the claim's liveness decides. A claim PROVEN to protect a
+      live worker is refused (something else owns the run). Anything else is admitted WITH
+      the guard: refusing on an unprovable claim would turn away the worker that owns the
+      card, and the guard already keeps the write off any run the caller did not read.
+    """
+    if trow is None:
+        # Let the UPDATE decide (it cannot match a missing task); never invent a refusal.
+        return True, "", *_run_guard_sql(expected_run_id)
+    current_run_id = _row_get(trow, "current_run_id")
+    if force:
+        return True, "", *_run_guard_sql(
+            int(expected_run_id) if expected_run_id is not None else current_run_id)
+    if expected_run_id is not None:
+        return True, "", *_run_guard_sql(int(expected_run_id))
+    verdict = _claim_liveness(trow)
+    if verdict == WORKER_ALIVE:
+        return False, verdict, "", ()
+    return True, "", *_run_guard_sql(current_run_id)
+# Reasons a run row's ``metadata['reason']`` can carry that mean the run was abandoned by an
+# INFRASTRUCTURE event rather than finished by its worker: a reclaim (orphan reconciliation,
+# stale-claim TTL, crash sweep) or the runtime limit. Written by the reclaim paths in
+# ``kanban_db_dispatch``. A fence that deletes or rewrites history must find one of these before it
+# may proceed — an attempt the worker itself recorded is never "falsified evidence".
+DISOWNED_RUN_REASONS = frozenset({
+    "orphaned_running",
+    "stale_lock",
+    "crashed_worker",
+    "timed_out",
+    "ttl_expired_worker_alive",
+    "heartbeat_stale_worker_alive",
+})
+
+
+def _run_was_disowned(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> bool:
+    """True when the recorded run itself says an infrastructure event abandoned it.
+
+    Reads ``task_runs.metadata['reason']`` — written by every reclaim path — and accepts only
+    :data:`DISOWNED_RUN_REASONS`. A run closed by the worker (or by anything else) is NOT
+    disowned, and every recovery that would rewrite or drop its record must then do nothing.
+    """
+    if not run_id:
+        return False
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(run_id), task_id),
+    ).fetchone()
+    if row is None:
+        return False
+    raw = _row_get(row, "metadata")
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    reason = parsed.get("reason")
+    if not reason or reason not in DISOWNED_RUN_REASONS:
+        return False
+    # Terminal-only, and never the spawner's record: a ``spawn_failed`` run is the HOST's evidence
+    # that it refused to start an attempt, and the respawn cooldown reads it. Overwriting that row
+    # would erase a cooldown and let a failing card spin, so the premise excludes it by name.
+    state = conn.execute(
+        "SELECT outcome, status FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(run_id), task_id),
+    ).fetchone()
+    if state is None:
+        return False
+    if _row_get(state, "status") == "running" or _row_get(state, "outcome") == "spawn_failed":
+        return False
+    return True
+
+
+def _newest_disowned_run(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Id of the card's NEWEST run when it is proven abandoned by infrastructure, else ``None``.
+
+    "The card's last run" is the row that stands as its last word on the attempt. It is NOT
+    ``tasks.current_run_id``: an infrastructure reclaim NULLs that column and leaves the abandoned
+    row standing, which is exactly why one authority decides whether that row is disowned.
+    """
+    newest = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    run_id = _opt_int(_row_get(newest, "id")) if newest is not None else None
+    return run_id if _run_was_disowned(conn, task_id, run_id) else None
+
+
+def _reconcile_owned_run(
+    conn: sqlite3.Connection, task_id: str, *, disowned_run_id: Optional[int], summary: str = "",
+) -> Optional[int]:
+    """Record the empty ``completed`` run a recovery owes the attempt history.
+
+    ``summary=""`` is deliberate and is the whole point: the recovery attributes NOTHING to the
+    worker — no prose, no metadata about work, and ``started_at == ended_at`` (via
+    :func:`_synthesize_ended_run`) so elapsed stats are not inflated either. The caller holds the
+    transaction; the failure counter is cleared by :func:`_synthesize_empty_completion_run` outside it.
+    """
+    return _synthesize_ended_run(
+        conn, task_id, outcome="completed", summary=summary,
+        metadata={
+            "recovery": "reclaim",
+            "recovered_from_run_id": _opt_int(disowned_run_id),
+            "infra_reclaimed": True,
+        },
+    )
+
+
+def _synthesize_empty_completion_run(
+    conn: sqlite3.Connection, task_id: str, *, disowned_run_id: Optional[int] = None,
+) -> Optional[int]:
+    """The empty completion run that stops an abandoned attempt standing as the card's last word.
+
+    A reclaim closes the abandoned run as a FAILURE (``reclaimed`` / ``crashed`` / ``timed_out``).
+    When the card then completes with no handoff fields of its own, that failed row is the attempt
+    history's last word — "the card ran on a worker that crashed" beside a delivered artifact — and
+    the reclaim also left ``consecutive_failures`` incremented against a worker that never failed.
+    This records the recovery honestly (see :func:`_reconcile_owned_run`); the CALLER clears that
+    falsified counter after its transaction commits (``complete_task`` already does on success —
+    ``_clear_failure_counter`` opens its own transaction and must never run under an open one).
+
+    GUARDED, in both directions. It refuses unless the run it is reconciling is PROVEN disowned
+    (:func:`_run_was_disowned`, :data:`DISOWNED_RUN_REASONS`): history that a worker recorded is not
+    ours to rewrite. It also refuses beside a live claim — a card whose worker is still running is
+    mid-attempt, not recovered. Returns the synthesized run id, or ``None`` when it did nothing.
+    """
+    if disowned_run_id is None:
+        # "The card's last run": the row that would stand as its last word on the attempt. It is
+        # NOT ``tasks.current_run_id`` — a terminal run leaves that NULL, which is exactly why the
+        # abandoned row survives a completion unless something reconciles it.
+        disowned_run_id = _newest_disowned_run(conn, task_id)
+        if disowned_run_id is None:
+            return None
+    if not _run_was_disowned(conn, task_id, disowned_run_id):
+        return None
+    trow = conn.execute(
+        "SELECT status, claim_lock, worker_pid, worker_started_at, current_run_id FROM tasks "
+        "WHERE id = ?", (task_id,),
+    ).fetchone()
+    if trow is not None and _claim_is_live(trow):
+        return None
+    run_id = _reconcile_owned_run(conn, task_id, disowned_run_id=disowned_run_id, summary="")
+    _append_event(
+        conn, task_id, "recovery_reconciled",
+        {"disowned_run_id": _opt_int(disowned_run_id), "synthesized_run_id": _opt_int(run_id)},
+        run_id=run_id,
+    )
+    return run_id
+
+
+# --- the closure floor: a completing card's DoD-carrying children --------------------------
+#
+# The operator's prioritisation standard: a card that carries a higher-priority card's
+# remaining DoD must never sit below it, because priority governs spawn ORDER - so a closure
+# filed low starves the chain it gates (five live violations measured 2026-09-28).
+#
+# The enforcement node is the COMPLETION, deliberately and nowhere else:
+#
+# * completion is the only moment the carrying relationship is OBSERVABLE. At birth a child of
+#   a high-priority card is indistinguishable from a follow-up filed against a card whose DoD
+#   is already delivered, so lifting every child at birth would inflate ordinary work - which
+#   the standard explicitly forbids. A child filed low BEFORE its parent closes is the failure
+#   mode measured live, and the parent's closure is when the kernel can see that the child
+#   carries the parent's remaining DoD;
+# * completion is the moment the closing card can DECLARE a deferral. That declaration is
+#   explicit and recorded (``deferred_children``), never inferred from a low priority.
+#
+# The lift rides the completion's OWN write txn (the caller holds it), so a promotion can
+# never be lost by a crash between the closing write and the lift, and anything that refuses
+# the lift rolls the completion back with it.
+
+PRIORITY_PROMOTED_EVENT = "priority_promoted"
+PRIORITY_DEFERRED_EVENT = "priority_deferred"
+
+
+def _closure_floor_target(conn: sqlite3.Connection, parent_priority: int) -> Optional[int]:
+    """The priority a completing card's DoD-carrying children may not sit below; None = stand down.
+
+    Capped at ``policy.ORDINARY_MAX``: the reserved tranche is DESIGNATED per card and never
+    inherited, so a designated parent lifts its children to the top of the ORDINARY domain.
+    The cap is not taste - a wired board's storage guard ABORTS a tranche write that carries no
+    designation row, and an inherited slot would take the completion down with it.
+
+    ``None`` when even the capped floor sits below this board's own floor, or when that floor
+    cannot be read: the board's floor is the stronger bound, and no priority nudge may fail the
+    completion it rides. The floor is only read on a DB that actually carries the storage
+    guard, so an unarmed board loads no policy file on the completion path.
+    """
+    from hermes_cli import kanban_priority_policy as policy
+
+    target = min(int(parent_priority), policy.ORDINARY_MAX)
+    floor: Optional[int] = None
+    if priority_tranche_guards(conn):
+        try:
+            slug = board_for_connection(conn)
+            if slug is None:
+                # An armed store this DB cannot be named as: its baked floor is unreadable from
+                # here, and guessing it is how a completion gets aborted.
+                return None
+            floor = _board_priority_floor(slug)
+        except Exception:
+            # An unreadable floor is the ARMING path's refusal (PolicyError there); on the
+            # completion path it stands the promotion down rather than risk aborting the write.
+            return None
+    if floor is not None and target < int(floor):
+        return None
+    return target
+
+
+def _gate_deferred_children(
+    conn: sqlite3.Connection, task_id: str, deferred_children: Optional[Mapping[str, Any]],
+) -> dict | CompletionRefusal:
+    """Normalise the closing card's deferral declaration, or refuse one that declares nothing real.
+
+    ``deferred_children`` is ``{child_id: why}``. A declaration is the ONLY way a child is held
+    out of the closure floor: it is explicit, it names a card that really is this card's child,
+    and it states a reason - an exemption nobody can read is not a declaration, and a low
+    priority is never read as one. Runs BEFORE the write txn (like the other completion gates),
+    so a refusal leaves the card exactly as it was, with an auditable event behind it.
+    """
+    if not deferred_children:
+        return {}
+    if not isinstance(deferred_children, Mapping):
+        return CompletionRefusal(
+            "deferral_not_a_child",
+            f"deferred_children must be an object of {{child_id: why}}, got "
+            f"{type(deferred_children).__name__}; a bare id list states no reason and is not a "
+            f"declaration",
+        )
+    declared: dict[str, str] = {}
+    for raw_id, raw_reason in deferred_children.items():
+        child_id = str(raw_id).strip()
+        if child_id:
+            declared[child_id] = _first_line(str(raw_reason) if raw_reason is not None else "", 500)
+    if not declared:
+        return {}
+    children = set(child_ids(conn, task_id))
+    strangers = sorted(cid for cid in declared if cid not in children)
+    reasonless = sorted(cid for cid, why in declared.items() if not why)
+    if strangers or reasonless:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_deferral",
+                {"not_a_child": strangers, "without_reason": reasonless},
+            )
+        if strangers:
+            return CompletionRefusal(
+                "deferral_not_a_child",
+                f"deferred_children names cards that are not children of {task_id}: "
+                f"{', '.join(strangers)}; a deferral can only hold out a child this card's "
+                f"completion would otherwise lift",
+            )
+        return CompletionRefusal(
+            "deferral_needs_reason",
+            f"deferred_children states no reason for {', '.join(reasonless)}; say WHY each child "
+            f"does not carry {task_id}'s remaining DoD, as {{child_id: why}}",
+        )
+    return declared
+
+
+def _promote_dod_children(
+    conn: sqlite3.Connection, task_id: str, *, deferred: Mapping[str, str],
+) -> list[dict]:
+    """Lift every open child of *task_id* up to the closing card's own priority.
+
+    The caller holds the completion's write txn: the promotion IS part of that write, not a
+    follow-up job. Lift-only, so a child already at or above the target is untouched and a child
+    is never moved above its parent; a card that carries nothing is not touched at all. Returns
+    the moves, which the ``completed`` payload carries so a reader can see why a child moved.
+    """
+    row = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return []
+    parent_priority = int(row["priority"] or 0)
+    target = _closure_floor_target(conn, parent_priority)
+    if target is None:
+        return []
+    rows = conn.execute(
+        "SELECT t.id AS child_id, t.priority AS priority FROM task_links l "
+        "  JOIN tasks t ON t.id = l.child_id "
+        " WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived') "
+        " ORDER BY t.id",
+        (task_id,),
+    ).fetchall()
+    moves: list[dict] = []
+    for child in rows:
+        child_id = child["child_id"]
+        if child_id in deferred:
+            continue
+        current = int(child["priority"] or 0)
+        if current >= target:
+            continue
+        payload: dict = {
+            "parent": task_id,
+            "parent_priority": parent_priority,
+            "from": current,
+            "to": target,
+        }
+        if target < parent_priority:
+            payload["capped_at"] = target
+        # Task-scoped on the CHILD: the promotion explains the child's own priority, and it is
+        # the child's row that moved.
+        conn.execute(
+            "UPDATE tasks SET priority = ? WHERE id = ? AND priority < ?",
+            (target, child_id, target),
+        )
+        _append_event(conn, child_id, PRIORITY_PROMOTED_EVENT, payload)
+        moves.append({"child": child_id, "from": current, "to": target})
+    return moves
+
+
+def _record_deferred_children(
+    conn: sqlite3.Connection, task_id: str, deferred: Mapping[str, str],
+) -> list[dict]:
+    """Record the closing card's deferral declaration on each child, inside the completion txn."""
+    records: list[dict] = []
+    for child_id, reason in sorted(deferred.items()):
+        _append_event(conn, child_id, PRIORITY_DEFERRED_EVENT, {"parent": task_id, "reason": reason})
+        records.append({"child": child_id, "reason": reason})
+    return records
 
 
 def complete_task(
@@ -2733,7 +5804,8 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
-) -> bool:
+    deferred_children: Optional[Mapping[str, Any]] = None,
+) -> bool | CompletionRefusal:
     """``running|ready|blocked|review -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
@@ -2746,42 +5818,90 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    ``deferred_children`` (``{child_id: why}``) is the closing card's EXPLICIT declaration that
+    a child does NOT carry its remaining DoD. Every other open child is lifted to the closing
+    card's own priority in this same transaction, and the promotion is recorded (see
+    :func:`_promote_dod_children`); a declaration naming a card that is not this card's child,
+    or stating no reason, is refused with the same vocabulary as every other refusal.
     Completions from non-review statuses need evidence: a stripped ``result``
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+    A refusal is a falsy :class:`CompletionRefusal` naming its ``cause`` (see
+    :data:`COMPLETION_REFUSAL_CAUSES`) in ``detail`` terms a human can act on — an unknown
+    id and an unsatisfiable contract are different problems and must not read alike. When
+    the receipt proves the contract is UNSATISFIABLE (CI-backed, and the repository requires
+    no checks at all) the card is parked ``blocked`` with kind ``capability`` as well as
+    refused: a bare refusal only respawns the worker against a verdict no retry can change.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
-        return False
+        return _parent_gate_refusal(conn, task_id)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
+    deferred = _gate_deferred_children(conn, task_id, deferred_children)
+    if isinstance(deferred, CompletionRefusal):
+        return deferred
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    _gate_deploy_proof(conn, task_id, metadata)
+    # INVARIANT A (design record platform-stl t_6747232b): the transition itself demands the
+    # evidence behind the claim. Runs AFTER the landed proof gate, which owns the landed claim
+    # and refuses for its own, clause-specific reasons; this one covers every other completion.
+    from hermes_cli import kanban_gate_invariants as _gates
+    _gates.gate_completion_evidence(conn, task_id, metadata, force=force)
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
-        return False
+        # prepare_acceptance refuses for two different reasons; name the real one.
+        status = _task_status(conn, task_id)
+        if status is None:
+            return CompletionRefusal("unknown_id", f"no task {task_id} on this board")
+        return CompletionRefusal(
+            "not_running",
+            f"{task_id} is {status}: completion needs running|ready|blocked|review, and a "
+            f"running card also needs the caller to own its run (expected_run_id) or --force",
+        )
+    if _unsatisfiable_acceptance(acceptance):
+        return _park_unsatisfiable_contract(conn, task_id, acceptance)
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
-            return False
+            return _parent_gate_refusal(conn, task_id)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
+            receipt = acceptance[1]
+            if not receipt.get("ok"):
+                return _acceptance_refusal(receipt)
+            # Green receipt, refused write: the CARD moved (status/run/contract) mid-flight.
+            return _record_acceptance_refusal(task_id)
         trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, worker_started_at, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
-        # Refuse to close a LIVE worker's run without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True); see
-        # _claim_is_live for what "live" means.
-        if expected_run_id is None and not force and trow and _claim_is_live(trow):
-            raise LiveClaimError(task_id)
+        # Refuse to close a worker's run without proof of ownership (expected_run_id) or an
+        # explicit human override (force=True); the claim's liveness decides whether a caller
+        # that names NO run may close at all, and the guard below keeps any admitted write off a
+        # run this caller did not read. See _close_run_fence.
+        allowed, refusal, guard_sql, guard_params = _close_run_fence(
+            trow, task_id, expected_run_id=expected_run_id, force=force,
+        )
+        if not allowed:
+            _verdict = _claim_liveness(trow)
+            _run = _opt_int(_row_get(trow, "current_run_id") if trow is not None else None)
+            raise LiveClaimError(
+                task_id, verdict=_verdict, run_id=_run,
+                # An ``unknown`` verdict must never be rendered with the proven-live text: that
+                # text offers ``force=True``, which is exactly the wrong instruction when the
+                # claim may protect a live worker.
+                detail=(live_claim_refusal(task_id, verdict=_verdict, run_id=_run)
+                        if _verdict == WORKER_UNKNOWN else None),
+            )
         sql = """
                 UPDATE tasks
                    SET status       = 'done',
@@ -2796,11 +5916,13 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
         params: tuple = (result, now, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
+        sql += guard_sql
+        params = (*params, *guard_params)
         if conn.execute(sql, params).rowcount != 1:
-            return False
+            return CompletionRefusal(
+                "not_running",
+                f"{task_id} left a completable status while it was being closed",
+            )
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -2813,15 +5935,44 @@ def complete_task(
             if prior_status == "review" and not synth_summary and not synth_metadata:
                 synth_summary = _REVIEW_APPROVED_NOTE
                 synth_metadata = {"source_status": "review", "approval": "manual"}
+            # No run was open when this completion landed. Either the card was never claimed, or an
+            # infrastructure reclaim closed the run and NULLed ``current_run_id`` — the un-owned
+            # un-owned branch admits. In the second case the run this lands on must SAY it is the
+            # recovery: the crashed row is left standing as history, and this one names it (#123811).
+            disowned = _newest_disowned_run(conn, task_id)
+            if disowned is not None:
+                synth_metadata = {
+                    **(synth_metadata if isinstance(synth_metadata, dict) else {}),
+                    "recovered_from_run_id": disowned,
+                    "infra_reclaimed": True,
+                }
             run_id = _synthesize_ended_run(
                 conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
             )
+        elif run_id is None:
+            # No handoff fields to record, but the card's last run may be an ABANDONED attempt: a
+            # reclaim closed it, not the worker, and left ``consecutive_failures`` incremented
+            # against a worker that never failed. Reconcile it with an empty completion so attempt
+            # history does not read "the card ran on a dead worker" beside delivered work, and so
+            # the falsified counter goes with it. Guarded: it does nothing unless the run is proven
+            # disowned (DISOWNED_RUN_REASONS) and no worker still holds the card.
+            run_id = _synthesize_empty_completion_run(conn, task_id)
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
+        # The closure floor, INSIDE this txn: a child carrying this card's remaining DoD is
+        # lifted to the card's own priority as part of the same write, and the closing card's
+        # deferral declarations are recorded on the children they hold out.
+        promotions = _promote_dod_children(conn, task_id, deferred=deferred)
+        deferrals = _record_deferred_children(conn, task_id, deferred)
+        completed_payload = _completed_event_payload(result, event_summary, verified_cards, metadata)
+        if promotions:
+            completed_payload["priority_promotions"] = promotions
+        if deferrals:
+            completed_payload["priority_deferrals"] = deferrals
         _append_event(
             conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
+            completed_payload,
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
@@ -2833,6 +5984,82 @@ def complete_task(
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
     return True
+
+
+def _parent_gate_refusal(conn: sqlite3.Connection, task_id: str) -> CompletionRefusal:
+    """Name the open parents — a caller cannot tell a live dependency from a mistyped id."""
+    blockers = unsatisfied_parents(conn, task_id)
+    detail = ", ".join(f"{pid} ({status})" for pid, status in blockers) or "an unfinished parent"
+    return CompletionRefusal(
+        "parent_gate_unsatisfied",
+        f"unsatisfied parent dependencies: {detail}; complete the parents first, or unlink a "
+        f"parent that is no longer a dependency",
+    )
+
+
+def _acceptance_refusal(receipt: dict) -> CompletionRefusal:
+    """Refuse a non-green PR acceptance receipt, naming the contract's release as well."""
+    detail = (f"PR acceptance {receipt.get('classification', 'unknown')}: "
+              f"{receipt.get('detail', '')} {receipt.get('recovery', '')}").strip()
+    return CompletionRefusal("acceptance_refusal", f"{detail} {SET_CONTRACT_HINT}")
+
+
+def _record_acceptance_refusal(task_id: str) -> CompletionRefusal:
+    """The receipt was collected against a card that then moved (status/run/contract)."""
+    return CompletionRefusal(
+        "record_acceptance_refusal",
+        f"{task_id} changed while its acceptance receipt was being collected; re-read the "
+        f"card and retry, or reclaim it if a rival took the run",
+    )
+
+
+def _unsatisfiable_acceptance(acceptance) -> bool:
+    """True when the receipt proves NO retry can pass.
+
+    ``collect_acceptance`` reports ``missing`` both for a check that has not appeared yet
+    (retryable) and for a repository that requires no checks at all. ``required == []`` is
+    the second case, which is permanent for this contract: nothing the worker does can make
+    a required check exist.
+    """
+    if acceptance is None:
+        return False
+    return acceptance[1].get("classification") == "missing" and acceptance[1].get("required") == []
+
+
+def _park_unsatisfiable_contract(
+    conn: sqlite3.Connection, task_id: str, acceptance,
+) -> CompletionRefusal:
+    """Record the receipt, park the card ``blocked``/``capability``, then refuse.
+
+    A plain refusal is not terminal: the dispatcher still sees a claimable card, respawns
+    the worker, and the same receipt comes back forever. Parking is what makes "this cannot
+    be satisfied" durable, and the reason carries the release (``set-contract``) so the
+    board itself says who can unstick it.
+    """
+    snapshot, receipt = acceptance
+    contract = snapshot[2]
+    from hermes_cli.kanban_pr_acceptance_store import _snapshot, record_acceptance
+
+    with write_txn(conn):
+        record_acceptance(conn, task_id, acceptance)
+        # ``record_acceptance`` returns the receipt's ``ok`` (False for every refusal), so
+        # "did the write land" is the snapshot comparison, never the return value.
+        landed = _snapshot(conn, task_id) == snapshot
+    if not landed:
+        return _record_acceptance_refusal(task_id)
+    reason = (
+        f"completion contract {contract} cannot be satisfied: "
+        f"{receipt.get('detail') or 'no repository-required checks are configured'} "
+        f"{SET_CONTRACT_HINT}."
+    )
+    parked = block_task(conn, task_id, reason=reason, kind="capability")
+    return CompletionRefusal(
+        "acceptance_refusal",
+        f"PR acceptance {receipt.get('classification', 'missing')}: "
+        f"{receipt.get('detail', '')} "
+        f"{'The card is parked blocked (capability) until the contract is released.' if parked else ''} "
+        f"{SET_CONTRACT_HINT}",
+    )
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
@@ -2863,6 +6090,55 @@ def _gate_created_cards(
 
 def _substantive_text(value: Optional[str]) -> bool:
     return bool(value is not None and str(value).strip())
+
+
+def _gate_deploy_proof(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> None:
+    """Refuse a ``landed`` card whose proof does not cover the deployed artifact.
+
+    The firing path (not a sweep): this runs before the completion write txn, so a
+    refusal leaves the card exactly as it was, records an auditable event, and hands the
+    worker the clause that failed. Cards authored ``local-only`` (or with a PR contract)
+    are untouched — the fence is the contract, never the lane, the board, or the assignee.
+    """
+    row = conn.execute(
+        "SELECT completion_contract FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    contract = row["completion_contract"] if "completion_contract" in row.keys() else None
+    # The import is GUARDED. ``hermes_cli/kanban_proof_gate.py`` is an untracked live override
+    # (pinned with its bytes in ``yoyoflow/untracked-overrides/MANIFEST.md``), so a tree that
+    # has lost it must refuse only a ``landed`` card — not every completion on the board.
+    # Confine the import behind the contract test: a non-landed contract returns WITHOUT the
+    # module, while a missing module on a ``landed`` card still fails closed (re-raises), so the
+    # landed fence never silently admits a completion it cannot evaluate.
+    try:
+        from hermes_cli import kanban_proof_gate
+    except Exception:
+        if (contract or "local-only").strip().lower() != "landed":
+            return
+        raise
+    if not kanban_proof_gate.is_landed_contract(contract):
+        return
+    proof = metadata.get("proof") if isinstance(metadata, dict) else None
+    verdict = kanban_proof_gate.evaluate(proof, conn=conn)
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "proof_gate_admitted" if verdict.ok else "completion_blocked_proof_gate",
+            {
+                "contract": contract,
+                "cause": verdict.cause,
+                "detail": verdict.detail,
+                "facts": verdict.facts,
+            },
+        )
+    if not verdict.ok:
+        raise ProofGateError(task_id, verdict)
 
 
 def _gate_empty_completion(
@@ -2955,18 +6231,35 @@ def _flag_phantom_prose_refs(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
     summary: Optional[str], result: Optional[str], verified_cards: list[str],
 ) -> None:
-    """Advisory post-commit scan of summary+result for unresolvable ``t_<hex>``
-    references; emits ``suspected_hallucinated_references`` in its own txn so
-    the completion is already durable. Never blocks."""
+    """Advisory post-commit scan of summary+result for ``t_<hex>`` references that
+    NO reachable board carries; emits ``suspected_hallucinated_references`` in its
+    own txn so the completion is already durable. Never blocks.
+
+    The scan is board-aware: an id a SIBLING board carries is a cross-board
+    reference, not a fabrication, so it is not flagged (measured 2026-09-29, card
+    t_89626ce6). The payload names the boards searched, so an operator reading the
+    event can tell a real cross-board card from an invented id without re-deriving
+    the resolver."""
     scan_text = " ".join(filter(None, [summary, result]))
     if not scan_text:
         return
-    phantom_refs = [p for p in _scan_prose_for_phantom_ids(conn, scan_text) if p not in set(verified_cards)]
+    verified = set(verified_cards)
+    ids = [i for i in dict.fromkeys(_TASK_ID_PROSE_RE.findall(scan_text)) if i not in verified]
+    if not ids:
+        return
+    phantom_refs, boards_searched, matched = _missing_task_ids_everywhere(conn, ids)
     if phantom_refs:
+        payload: dict[str, Any] = {
+            "phantom_refs": phantom_refs,
+            "source": "completion_summary",
+            "boards_searched": boards_searched,
+        }
+        if matched:
+            payload["matched_elsewhere"] = matched
         with write_txn(conn):
             _append_event(
                 conn, task_id, "suspected_hallucinated_references",
-                {"phantom_refs": phantom_refs, "source": "completion_summary"}, run_id=run_id,
+                payload, run_id=run_id,
             )
 
 
@@ -3141,22 +6434,113 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    goal_mode: Optional[bool] = None, goal_max_turns: Optional[int] = None,
+    max_runtime_seconds: Optional[int] = None, clear_max_runtime: bool = False,
+    clear_failure: bool = False, actor: Optional[str] = None,
 ) -> bool:
+    """Edit task fields, optionally backfilling a completed task's result.
+
+    ``goal_mode``/``goal_max_turns``/``max_runtime_seconds`` set how much ROOM the card gets and are
+    tri-state: ``None`` leaves the column alone, ``goal_max_turns=0`` clears it back to the default,
+    and ``clear_max_runtime=True`` writes NULL (used by ``--max-runtime none``). These are the fields
+    that decide whether a card dies at its iteration budget, so they need a sanctioned surface: the
+    only previous way to set them was a hand-written SQL UPDATE (#card).
+
+    ``clear_failure=True`` is the recovery door for a card wedged by a STALE failure wall: it nulls
+    ``last_failure_error`` and resets ``consecutive_failures``, then records a ``failure_cleared``
+    event naming ``actor`` (and the values it retired). A successful run retires both automatically
+    (``_end_run``); this verb exists for cards whose last run ended BEFORE that behaviour landed, or
+    whose streak was left behind by a reclaimed run.
+    """
     """Edit task fields, optionally backfilling a completed task's result."""
+    if priority is not None:
+        # Door 2b of the above-tranche guard (t_6ce41549): the CEILING, deliberately NOT
+        # policy-gated - the hand-lift is how the class was created.
+        _refuse_above_tranche_rerank(conn, task_id, priority, board=board)
+        # Door 2: the ordinary DOMAIN, also unconditional as of card t_ecbfb34b. A wiring
+        # gate here left every unwired board open; the domain is the kernel's.
+        _refuse_priority_outside_domain(conn, priority, board=board, task_id=task_id)
+    if body is not None:
+        # A rewrite keeps the ask the card is already in service of: a body edit must not
+        # silently resolve the card out of the register's roll-up
+        # (kanban_register.restamp_rewritten_body).
+        from hermes_cli.kanban_register import restamp_rewritten_body
+
+        body = restamp_rewritten_body(conn, task_id, body, board=board)
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
     ]
+    # Values worth echoing on the event: a goal loop or a cap turned on/off is a change a later reader
+    # has to be able to date, and "fields" alone would not say WHICH way the switch went.
+    room_values: dict = {}
+    if goal_mode is not None:
+        changed_fields.append("goal_mode")
+        room_values["goal_mode"] = bool(goal_mode)
+    if goal_max_turns is not None:
+        changed_fields.append("goal_max_turns")
+        room_values["goal_max_turns"] = goal_max_turns or None
+    if max_runtime_seconds is not None or clear_max_runtime:
+        changed_fields.append("max_runtime_seconds")
+        room_values["max_runtime_seconds"] = max_runtime_seconds
     with write_txn(conn):
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
             return False
+        gate_floor = None
+        if priority is not None:
+            # The GATE half of a re-rank, decided BEFORE the value is written: a card that holds
+            # other cards cannot be re-ranked below them (the child is never demoted, so the ask
+            # is raised to the floor and the event says so). Doored values were checked above,
+            # against the requested number - the floor is a kernel relation, not a band.
+            need = gate_need(conn, task_id)
+            if need is not None and int(priority) < int(need[0]):
+                policy = _policy_module()
+                target = min(int(need[0]), int(policy.MAX_PRIORITY))
+                if target >= int(policy.TRANCHE_FLOOR):
+                    designate_priority(
+                        conn, task_id,
+                        reason=_gate_designation_reason(need[1], need[0], "edit"),
+                        authority=GATE_AUTHORITY,
+                        board=board or board_for_connection(conn) or None, nested=True,
+                    )
+                priority = target
+                gate_floor = {"gate": need[1], "gate_priority": int(need[0]), "cause": "edit"}
+                if target != int(need[0]):
+                    gate_floor["capped_from"] = int(need[0])
         assignments = []
         params = []
         for field, value in (("title", title), ("body", body), ("priority", priority)):
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)
+        if goal_mode is not None:
+            assignments.append("goal_mode = ?")
+            params.append(1 if goal_mode else 0)
+        if goal_max_turns is not None:
+            # 0 (or negative, rejected at the CLI) means "no explicit budget": the goal loop falls
+            # back to its own default rather than running zero turns.
+            assignments.append("goal_max_turns = ?")
+            params.append(goal_max_turns if goal_max_turns > 0 else None)
+        if max_runtime_seconds is not None or clear_max_runtime:
+            assignments.append("max_runtime_seconds = ?")
+            params.append(max_runtime_seconds if max_runtime_seconds else None)
+        prior_failure = {"consecutive_failures": 0, "last_failure_error": None}
+        if clear_failure:
+            # Recovery door for a card wedged by a STALE failure wall: the respawn guard reads
+            # ``last_failure_error``, and before this verb the only ways to retire it were a
+            # successful run (which the wall blocks) or hand-written SQL. Capture what is being
+            # retired so the event is the audit record, then null it in this same UPDATE.
+            prow = conn.execute(
+                "SELECT consecutive_failures, last_failure_error FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            prior_failure = {
+                "consecutive_failures": int(prow["consecutive_failures"] or 0) if prow else 0,
+                "last_failure_error": prow["last_failure_error"] if prow else None,
+            }
+            assignments.append("consecutive_failures = 0")
+            assignments.append("last_failure_error = NULL")
         if result is not None:
             assignments.append("result = ?")
             params.append(result)
@@ -3167,12 +6551,27 @@ def edit_task(
             f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?",
             (*params, task_id),
         )
+        if clear_failure:
+            _append_event(conn, task_id, "failure_cleared", {
+                "actor": actor or "unknown",
+                "prior_consecutive_failures": prior_failure["consecutive_failures"],
+                "prior_last_failure_error": _first_line(prior_failure["last_failure_error"], 500) or None,
+            })
         if priority is not None:
-            _append_event(conn, task_id, "reprioritized", {"priority": priority})
+            payload: dict = {"priority": priority}
+            if gate_floor is not None:
+                payload["gate"] = gate_floor
+            _append_event(conn, task_id, "reprioritized", payload)
+            # A RAISED card may now outrank what it waits on: lift the ancestors it overtook.
+            # Same txn - the graph is never observably out of order.
+            lift_gate_chain(conn, task_id, cause="edit", board=board)
         if result is None:
             non_priority_fields = [field for field in changed_fields if field != "priority"]
             if non_priority_fields:
-                _append_event(conn, task_id, "edited", {"fields": non_priority_fields})
+                payload: dict = {"fields": non_priority_fields}
+                if room_values:
+                    payload["values"] = room_values
+                _append_event(conn, task_id, "edited", payload)
         else:
             handoff_summary = summary if summary is not None else result
             changed_fields.append("summary")
@@ -3209,13 +6608,154 @@ def edit_task(
                 },
                 run_id=run_id,
             )
-    notify_task_updated(conn, task_id, changed_fields, board=board)
+    notify_fields = changed_fields + (["failure_cleared"] if clear_failure else [])
+    notify_task_updated(conn, task_id, notify_fields, board=board)
     return True
+
+
+def retarget_task(
+    conn: sqlite3.Connection, task_id: str, *, project: Optional[str] = None,
+    workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
+    branch_name: Optional[str] = None, reason: Optional[str] = None,
+    actor: Optional[str] = None, force: bool = False, board: Optional[str] = None,
+) -> Optional[dict]:
+    """Re-point a card's project + workspace - the RECOVER door for a mis-born card.
+
+    ``create_task`` fixes a card's binding at birth, so before this verb the only
+    ways to correct a card born into the wrong repo were archive+recreate (which
+    severs whatever linkage the card carries - SDLC flow items, parent edges) or
+    hand-written SQL. This is the missing move: it re-resolves ``project_id`` /
+    ``workspace_kind`` / ``workspace_path`` / ``branch_name`` in ONE recorded step,
+    appends a ``retargeted`` event carrying the before/after, and works on any
+    non-terminal card - crucially a ``blocked``/``ready``/``todo`` one, the state a
+    card sits in while somebody notices it is bound to the wrong tree.
+
+    ``project`` - a project id or slug to re-anchor to (its ``primary_path`` and a
+    deterministic branch), or ``""``/``"none"`` to CLEAR the link so the card owns
+    no repo. Unlike ``create_task``, which drops an unresolvable project silently, a
+    NAMED-but-unknown project is REFUSED: a retarget that quietly kept the old
+    binding would defeat the point of the verb.
+
+    A card with a LIVE worker claim is refused unless ``force=True`` - its worker is
+    already sitting in the old tree, and re-pointing the binding under it would race.
+
+    Returns ``None`` for an unknown id, else ``{"task_id", "old", "new",
+    "changed"}``. Raises ``ValueError`` on a refusal (the CLI renders it).
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    status = (task.status or "").strip().lower()
+    if status in ("done", "archived"):
+        raise ValueError(
+            f"cannot retarget {task_id}: task is {status!r} (terminal) - a binding is "
+            f"only correctable while the card can still be worked")
+    if task.claim_lock and int(task.claim_expires or 0) > int(time.time()) and not force:
+        raise ValueError(
+            f"cannot retarget {task_id}: a worker holds a live claim (claim_lock="
+            f"{task.claim_lock}); reclaim the card first, or pass --force if the worker "
+            f"is gone")
+
+    requested = None if project is None else str(project).strip()
+    clear_project = requested is not None and requested.lower() in ("", "none")
+    project_obj = None
+    if requested and not clear_project:
+        from hermes_cli import projects_db as _pdb
+
+        try:
+            with _pdb.connect_closing() as _pconn:
+                project_obj = _pdb.get_project(_pconn, requested)
+        except Exception:
+            project_obj = None
+        if project_obj is None:
+            raise ValueError(
+                f"project {requested!r} not found (see `hermes project list`); nothing "
+                f"was written - name a project that exists, or 'none' to clear the link")
+
+    old = {
+        "project_id": task.project_id,
+        "workspace_kind": task.workspace_kind,
+        "workspace_path": task.workspace_path,
+        "branch_name": task.branch_name,
+    }
+
+    if clear_project and workspace_kind is None and workspace_path is None:
+        # Detaching the project with no explicit workspace: the old worktree belonged
+        # to the project being detached, so fall back to scratch.
+        workspace_kind = "scratch"
+
+    new_kind = workspace_kind if workspace_kind is not None else (task.workspace_kind or "scratch")
+    if project_obj is not None and not (workspace_kind is not None or workspace_path is not None) \
+            and new_kind == "scratch":
+        # Naming a project re-anchors the card: mirror create_task's project rule (a
+        # project turns a scratch card into a worktree under its repo). An explicitly
+        # named workspace wins, exactly as it does on create.
+        new_kind = "worktree"
+    if new_kind not in VALID_WORKSPACE_KINDS:
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, got {new_kind!r}")
+    new_path = workspace_path
+    new_branch = branch_name
+    if new_kind == "scratch":
+        new_path = None
+        new_branch = None
+    elif new_kind == "dir":
+        new_path = new_path or task.workspace_path
+        if not new_path:
+            raise ValueError("workspace_kind 'dir' needs an explicit workspace path")
+        new_branch = None
+    else:  # worktree
+        if not new_path:
+            if project_obj is not None and project_obj.primary_path:
+                new_path = os.path.join(str(project_obj.primary_path), ".worktrees", task_id)
+            elif project_obj is None and task.workspace_kind == "worktree" and task.workspace_path:
+                new_path = task.workspace_path
+            else:
+                raise ValueError(
+                    "workspace_kind 'worktree' needs --project (to anchor under its repo) "
+                    "or an explicit --workspace worktree:<path>")
+        if not new_branch and project_obj is not None:
+            new_branch = _project_branch_name(project_obj, task_id, task.title)
+        if not new_branch:
+            new_branch = task.branch_name
+
+    new_project_id = (None if clear_project
+                      else (project_obj.id if project_obj is not None else task.project_id))
+    new = {
+        "project_id": new_project_id,
+        "workspace_kind": new_kind,
+        "workspace_path": new_path,
+        "branch_name": new_branch,
+    }
+    changed = old != new
+
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET project_id = ?, workspace_kind = ?, workspace_path = ?, "
+            "branch_name = ? WHERE id = ?",
+            (new_project_id, new_kind, new_path, new_branch, task_id),
+        )
+        if changed:
+            _append_event(conn, task_id, "retargeted", {
+                "old": old,
+                "new": new,
+                "reason": (reason or "").strip() or None,
+                "actor": actor or "unknown",
+            })
+    if changed:
+        notify_task_updated(
+            conn, task_id,
+            ["project_id", "workspace_kind", "workspace_path", "branch_name"],
+            board=board,
+        )
+    return {"task_id": task_id, "old": old, "new": new, "changed": changed}
 
 
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    waits_on: Iterable[str] = (),
+    due_at: Optional[int] = None, window_policy: Optional[str] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3230,12 +6770,38 @@ def block_task(
     audit event is appended, while status, failure evidence and the terminal
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
-    """
+
+    ``due_at`` (epoch seconds, ``None`` for none) arms an auto-release on the
+    ``blocked`` landing only: the due-card waker unblocks the card on the first
+    dispatcher pass after that time, so a time-fenced hold releases without a
+    human touching it. It is meaningless on the ``todo`` (dependency) and
+    ``triage`` (loop-breaker) landings and is refused on the former."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    # INVARIANT C at the write door (design record platform-stl t_6747232b): a block that names
+    # the card it waits on must carry the EDGE, not just the prose. The board resumes a card on
+    # its PARENTS finishing, so a prose-only wait is invisible to that machinery - the card sits
+    # blocked after the work it named shipped, and only a human reading the reason takes it off
+    # the shelf (measured: t_9e9ea756). `waits_on` is the structured form: it creates the edge.
+    # A kind='dependency' block whose reason names a card, with no edge and no waits_on, is
+    # refused with the fix in the message. Nothing is written by a refusal.
+    from hermes_cli import kanban_gate_invariants as _gates
+    declared_parents = _gates.gate_dependency(conn, task_id, reason, kind, waits_on)
+    if window_policy is not None and window_policy not in VALID_DUE_WINDOW_POLICIES:
+        raise ValueError(
+            f"window_policy must be one of {sorted(VALID_DUE_WINDOW_POLICIES)}"
+        )
+    if window_policy is not None and due_at is None:
+        raise ValueError("window_policy needs a due time (pass due_at too, or drop it)")
+    if kind == "dependency" and (due_at is not None or window_policy is not None):
+        raise ValueError(
+            "a dependency block waits on parent completion, not a clock: "
+            "due_at is meaningless"
+        )
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, block_kind, block_recurrences, current_run_id, claim_lock, worker_pid, "
+            "worker_started_at FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
@@ -3249,35 +6815,71 @@ def block_task(
         if cur_row["status"] == "blocked":
             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
                 return False
+            # The payload's arm-on-block must survive THIS path too. A caller
+            # that classifies an already-parked card and asks for a time fence
+            # in the same call gets ``True`` back, so dropping the arm silently
+            # would leave a card that never auto-releases while reporting
+            # success (peer probe, review t_212aea2a: rc=True, due_at=None).
+            _due_sql = ""
+            _due_args: tuple = ()
+            _due_event: dict = {}
+            if due_at is not None:
+                _due_sql = ", due_at = ?, due_window_policy = ?"
+                _due_args = (int(due_at), window_policy or DEFAULT_DUE_WINDOW_POLICY)
+                _due_event = {
+                    "due_at": int(due_at),
+                    "window_policy": window_policy or DEFAULT_DUE_WINDOW_POLICY,
+                }
             classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                "UPDATE tasks SET block_kind = ?, block_recurrences = 1"
+                + _due_sql + " "
                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
                 "AND current_run_id IS NULL",
-                (kind, task_id),
+                (kind, *_due_args, task_id),
             ).rowcount
             if classified != 1:
                 return False
             _append_event(conn, task_id, "blocked", {
                 "kind": kind, "reason": reason, "classified_in_place": True,
+                **_due_event,
             })
             return True
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        # A handoff in flight is still the implementer's own card: the
+        # ``review_requested`` run stays attached (``_end_run(keep_attached=True)``),
+        # and the worker that filed it blocks the card to ask the reviewer a
+        # question. ``source_status`` records 'review' so unblocking resumes the
+        # review phase instead of a bare ``ready`` (which would re-spawn the
+        # implementer's lane onto a card already handed off).
+        if cur_row["status"] == "running":
+            source_status = _retry_status_for_run(conn, task_id)
+        elif cur_row["status"] == "review" and expected_run_id is not None:
+            source_status = "review"
+        else:
+            source_status = "ready"
         requested_kind = kind
         rekind_reason = None
         # ``dependency`` only waits on incomplete parents. A worker filing that
         # kind with none open would park in ``todo`` and ``recompute_ready``
         # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
+        # ``needs_input`` so it is sticky until a human unblocks. A ``waits_on``
+        # declaration counts as an open parent even before its edge exists - the
+        # edges are written just below, inside this same function.
+        if kind == "dependency" and not declared_parents and _parents_satisfied(conn, task_id):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            triage_round_trips=triage_round_trips(conn, task_id),
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
+        if new_status == "blocked" and due_at is not None:
+            set_sql += ",\n                       due_at = ?,\n                       due_window_policy = ?"
+            params = (*params, int(due_at), window_policy or DEFAULT_DUE_WINDOW_POLICY)
+            payload["due_at"] = int(due_at)
+            payload["window_policy"] = window_policy or DEFAULT_DUE_WINDOW_POLICY
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3286,12 +6888,32 @@ def block_task(
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
                 """
+        # The review-phase licence: a card in ``review`` whose attached run the
+        # caller names is blockable by that run. The fence below keeps the write
+        # pinned to the run the caller read, so this cannot reach a card under
+        # someone else's handoff or an active review claim.
+        sql += (
+            "   AND (status IN ('running', 'ready') OR status = 'review')\n"
+            if source_status == "review"
+            else "   AND status IN ('running', 'ready')\n"
+        )
         params = (*params, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
+        # The same fence as complete_task/request_review: a caller that names no run may only
+        # park a card whose claim does not protect a live worker, and every admitted write is
+        # made conditional on the run this caller read.
+        allowed, _refusal, guard_sql, guard_params = _close_run_fence(
+            cur_row, task_id, expected_run_id=expected_run_id, force=False,
+        )
+        if not allowed:
+            _log.warning(
+                "kanban: refusing to block %s — %s", task_id,
+                live_claim_refusal(task_id, verdict=_claim_liveness(cur_row),
+                                   run_id=_opt_int(_row_get(cur_row, "current_run_id"))),
+            )
+            return False
+        sql += guard_sql
+        params = (*params, *guard_params)
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
@@ -3299,17 +6921,28 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
+    # The ``waits_on`` edges land HERE, after the transition, never before it: ``link_tasks``
+    # demotes a ``ready`` child to ``todo`` when its new parent is not terminal, and the block's
+    # own guarded UPDATE above only matches ``running``/``ready`` - linking first would make the
+    # block match nothing and return False. Post-transition the child is already exactly where
+    # the link would have put it, so the link only records the edge (and its ``linked`` event).
+    for parent_id in declared_parents:
+        try:
+            link_tasks(conn, parent_id, task_id)
+        except (ValueError, sqlite3.Error) as exc:
+            # Never silent: the block landed, the edge it declared did not, and the card says
+            # so in its own history (the dependency family in `kanban gates report` also names
+            # it, because a blocked card that names a card with no edge is a violation).
+            with write_txn(conn):
+                _append_event(conn, task_id, "dependency_edge_refused",
+                              {"parent": parent_id, "error": str(exc)})
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
 
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    prev_kind: Optional[str], prev_recurrences: int, triage_round_trips: int = 0,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3323,6 +6956,9 @@ def _route_block(
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``triage_round_trips`` is read from the card's own escalation history (see
+    :func:`triage_round_trips`) and lands on the ``block_loop_detected`` payload, so
+    a count that spans a triage trip is not read as N consecutive honest blocks.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
@@ -3332,8 +6968,355 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
+        # ``recurrences`` alone reads as N consecutive honest blocks. Record how many
+        # triage round-trips the count already spans, so the reader who re-blocks this
+        # card after a trip cannot describe it as a state that never changed.
+        payload["triage_round_trips"] = triage_round_trips
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
+
+
+# --- The triage escalation guard -------------------------------------------------------
+#
+# ``_route_block`` parks a repeating card in ``triage`` for a HUMAN. Every promotion path
+# out of ``triage`` therefore has to refuse such a card: promoting it hands the same
+# unchanged card — and the same failing context — straight back to the board, where it
+# blocks again and manufactures a fresh graph of children on each pass. The promotion
+# paths are ``specify_triage_task`` and ``kanban_db_graph.decompose_triage_task``; both
+# call :func:`triage_escalation_refusal` inside their own write txn, so the refusal is
+# atomic with the read that decided it and no caller can forget the guard.
+
+TRIAGE_ESCALATION_EVENT_KIND = "block_loop_detected"
+BLOCK_ROUTING_EVENT_KINDS = ("blocked", "dependency_wait", TRIAGE_ESCALATION_EVENT_KIND, "gave_up")
+TRIAGE_ESCALATION_CAUSE = "block_loop_escalation"
+
+
+class TriageEscalationRefusal:
+    """Why a promotion out of ``triage`` refused: the block-loop breaker parked the card.
+
+    Falsy, so every existing ``if not specify_triage_task(...)`` caller keeps its meaning,
+    while the operator-facing surfaces can name the triggering event and the card. A bare
+    ``False`` cannot tell "already promoted / moved out" from "escalated to a human", and
+    that ambiguity is how the auto-decompose hook silently fanned out a card the board had
+    already handed to a person.
+    """
+
+    __slots__ = ("task_id", "cause", "detail", "event_id", "payload")
+
+    def __init__(self, task_id: str, event_id: int, payload: Optional[dict]):
+        payload = payload or {}
+        self.task_id = task_id
+        self.cause = TRIAGE_ESCALATION_CAUSE
+        self.event_id = event_id
+        self.payload = payload
+        self.detail = (
+            f"{task_id} is parked in triage by the block-loop breaker (event {event_id} "
+            f"'{TRIAGE_ESCALATION_EVENT_KIND}': kind={payload.get('kind')!r}, "
+            f"recurrences={payload.get('recurrences')}/{payload.get('limit')}, "
+            f"triage_round_trips={payload.get('triage_round_trips')}) — an escalation for a "
+            f"human to dispose of with a board edit: archive the card, or move it out of the "
+            f"triage column (to todo/ready). unblock / complete / reassign do not clear the "
+            f"park — the card stays in triage. Promoting the unchanged card back onto the "
+            f"board re-arms the block it was escalated for"
+        )
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"TriageEscalationRefusal(task_id={self.task_id!r}, event_id={self.event_id!r})"
+
+
+def triage_escalation_refusal(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[TriageEscalationRefusal]:
+    """The breaker's park for ``task_id`` when that is why it sits in ``triage``; else None.
+
+    The predicate is the NEWEST block-routing event, never the merely-newest-one-that-happens
+    -to-exist: a card that once escalated and later blocked again for another cause is
+    triaged by whichever routing decision came last. Sticky by construction — nothing in the
+    promotion paths clears the event, so a card stays refused until a human edits the column.
+    """
+    placeholders = ",".join("?" * len(BLOCK_ROUTING_EVENT_KINDS))
+    row = conn.execute(
+        f"SELECT id, kind, payload FROM task_events WHERE task_id = ? "
+        f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        (task_id, *BLOCK_ROUTING_EVENT_KINDS),
+    ).fetchone()
+    if row is None or row["kind"] != TRIAGE_ESCALATION_EVENT_KIND:
+        return None
+    return TriageEscalationRefusal(
+        task_id, int(row["id"]), _json_or(_lossy_text(row["payload"])),
+    )
+
+
+def triage_round_trips(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many times this card has already been through triage and come back to work.
+
+    Every prior ``block_loop_detected`` event is one COMPLETED round-trip: the card can only
+    block again after it left ``triage``, whether the exit was the decomposer/specifier or a
+    human editing the column directly. Counted *before* the current escalation is appended
+    (``block_task`` reads it, then ``_route_block`` writes the new event), so the payload
+    says how many times the board has already handed this card to a person.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
+        (task_id, TRIAGE_ESCALATION_EVENT_KIND),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+# ---------------------------------------------------------------------------
+# The decompose RECORD guard (card t_9cb7f0b9)
+#
+# The escalation guard above answers ONE question: "did the block-loop breaker park this
+# card in triage?". It does not answer "has this card's work already been decided?" — and
+# the auto-decomposer claimed a review-blocked card out of triage whose newest comments said
+# in as many words "the CODE HALF IS APPROVED at 3ce158d8" / "Do NOT decompose or
+# re-implement this card", and minted four children off the root BODY alone: work a
+# reviewer had already ruled on, invented a second time by an LLM that never read the
+# thread.
+#
+# So the decomposer READS THE RECORD — the card's comments and its run history — and
+# REFUSES, DETERMINISTICALLY (a fixed marker table over a bounded window; no inference, no
+# prose in the triage prompt), when ANY of these hold:
+#
+#   live_run       a live run owns the card (status 'running', or a held claim)
+#   in_review      the card sits in the review column, or its newest review-lifecycle event
+#                  is a REQUEST (handed to a reviewer, with no decision since)
+#   approved       the newest comments carry the estate's APPROVED verdict
+#   superseded     the newest comments carry a superseded / withdrawn / do-not-implement note
+#   live_artifact  the newest comments name a live branch (wt|fix|feat/<task-id>-*) or a PR
+#
+# The refusal is RECORDED as a ``decompose_refused`` event carrying every matched cause, the
+# matched line and its comment id, so a blocked loop stays VISIBLE instead of being papered
+# over with invented work. Sticky by construction — nothing in the promotion paths clears
+# it, so a human disposes of the card with a board edit (archive it, or move it out of the
+# triage column), exactly like the escalation park.
+# ---------------------------------------------------------------------------
+
+DECOMPOSE_REFUSAL_EVENT_KIND = "decompose_refused"
+# How far back into the thread the marker scan reads. The deciding note on a card the board
+# has just parked is at the tail; an unbounded scan would key on a superseded verdict the
+# card has since moved past.
+DECOMPOSE_RECORD_SCAN_DEPTH = 5
+
+DECOMPOSE_CAUSE_LIVE_RUN = "live_run"
+DECOMPOSE_CAUSE_IN_REVIEW = "in_review"
+DECOMPOSE_CAUSE_APPROVED = "approved"
+DECOMPOSE_CAUSE_SUPERSEDED = "superseded"
+DECOMPOSE_CAUSE_LIVE_ARTIFACT = "live_artifact"
+
+# A review handoff leaves the card with a reviewer; these kinds settle it. The newest
+# lifecycle event decides, so a review that was handed back (or closed) is not a park.
+REVIEW_REQUEST_EVENT_KINDS = ("review_requested", "review_reopened")
+REVIEW_SETTLED_EVENT_KINDS = ("changes_requested", "completed", "archived")
+REVIEW_LIFECYCLE_EVENT_KINDS = REVIEW_REQUEST_EVENT_KINDS + REVIEW_SETTLED_EVENT_KINDS
+
+# The estate's verdict vocabulary. APPROVED is case-sensitive on purpose: the review lanes
+# write the verdict in caps, and "needs an approval"/"the approval is pending" must not
+# refuse a card that is still open. Branch/PR markers are the estate's own naming
+# (``fix/t_<cardid>-<slug>``), so a card whose thread names one has a live artifact.
+_DECOMPOSE_RECORD_MARKERS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    (DECOMPOSE_CAUSE_APPROVED, re.compile(r"\bAPPROVED\b")),
+    (
+        DECOMPOSE_CAUSE_SUPERSEDED,
+        re.compile(
+            r"\bsuperseded\b|\bwithdrawn\b"
+            r"|\bDo NOT\s+(?:decompose|re-?implement|implement|start)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        DECOMPOSE_CAUSE_LIVE_ARTIFACT,
+        re.compile(
+            r"\b(?:wt|fix|feat|test|chore|release)/t_[A-Za-z0-9_.-]+"
+            r"|https?://github\.com/[^\s/]+/[^\s/]+/pull/\d+"
+        ),
+    ),
+)
+
+
+def _matched_line(body: str, match: "re.Match[str]") -> str:
+    """The whole line of ``body`` the marker matched, stripped and clipped for a payload."""
+    start = body.rfind("\n", 0, match.start()) + 1
+    end = body.find("\n", match.end())
+    line = body[start:end if end != -1 else len(body)].strip()
+    return line[:240]
+
+
+class DecomposeRefusal:
+    """Why the auto-decomposer refused: the card's RECORD says the work is already decided.
+
+    Falsy, like :class:`TriageEscalationRefusal`, so every existing ``if not
+    decompose_triage_task(...)`` caller keeps its meaning while an operator-facing surface
+    can name the causes and the rows that carried them. A bare ``False``/``None`` cannot
+    tell "nothing to decompose" from "already approved" — and that ambiguity is exactly how
+    a review-blocked card got fanned out into fresh children.
+    """
+
+    __slots__ = ("task_id", "causes", "matches", "detail")
+
+    def __init__(self, task_id: str, matches: list[dict]):
+        self.task_id = task_id
+        self.matches = matches
+        # One entry per cause, newest evidence first, so the payload stays readable.
+        causes: list[str] = []
+        for match in matches:
+            cause = str(match.get("cause"))
+            if cause not in causes:
+                causes.append(cause)
+        self.causes = causes
+        evidence = "; ".join(
+            f"{m['cause']} @ "
+            + (
+                f"comment {m['comment_id']} ({m.get('author')}): {m.get('line')!r}"
+                if m.get("comment_id") is not None
+                else f"event {m.get('event_id')} '{m.get('event_kind')}'"
+                if m.get("event_id") is not None
+                else f"tasks.{m.get('field')}={m.get('value')!r}"
+            )
+            for m in matches
+        )
+        self.detail = (
+            f"{task_id} is refused auto-decomposition: the card's RECORD says the work is "
+            f"already decided (causes: {', '.join(causes)}). A card carrying an approval, a "
+            f"superseded note or a live branch/PR — or one that sits in review, or that a "
+            f"live run owns — is not a triage card: decomposing it mints children off the "
+            f"unchanged root BODY, which is work invented a second time. Evidence: "
+            f"{evidence}. Disposals: archive the card, or move it out of the triage column "
+            f"(to todo/ready). unblock / complete / reassign do not clear this refusal"
+        )
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"DecomposeRefusal(task_id={self.task_id!r}, causes={self.causes!r})"
+
+
+def decompose_refusal(
+    conn: sqlite3.Connection, task_id: str, *,
+    scan_depth: int = DECOMPOSE_RECORD_SCAN_DEPTH,
+) -> Optional[DecomposeRefusal]:
+    """The RECORD refusal for ``task_id``, or None when the card is a plain triage card.
+
+    Read-only: it answers from ``tasks`` (live claim / review column), ``task_events`` (the
+    review lifecycle) and the newest ``scan_depth`` comments (the verdict vocabulary). The
+    caller records the refusal; see :func:`decompose_refusal_guard`.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock, current_run_id, worker_pid FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    matches: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(cause: str, **evidence: Any) -> None:
+        if cause in seen:
+            return
+        seen.add(cause)
+        matches.append({"cause": cause, **evidence})
+
+    status = row["status"]
+    if status == "running" or row["claim_lock"]:
+        _add(
+            DECOMPOSE_CAUSE_LIVE_RUN, field="status", value=status,
+            run_id=row["current_run_id"], worker_pid=row["worker_pid"],
+            claim_lock=row["claim_lock"],
+        )
+    if status == "review":
+        _add(DECOMPOSE_CAUSE_IN_REVIEW, field="status", value=status)
+    else:
+        placeholders = ",".join("?" * len(REVIEW_LIFECYCLE_EVENT_KINDS))
+        event = conn.execute(
+            f"SELECT id, kind FROM task_events WHERE task_id = ? "
+            f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+            (task_id, *REVIEW_LIFECYCLE_EVENT_KINDS),
+        ).fetchone()
+        if event is not None and event["kind"] in REVIEW_REQUEST_EVENT_KINDS:
+            _add(
+                DECOMPOSE_CAUSE_IN_REVIEW, event_id=int(event["id"]),
+                event_kind=str(event["kind"]),
+            )
+
+    comments = conn.execute(
+        "SELECT id, author, body FROM task_comments WHERE task_id = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        (task_id, int(scan_depth)),
+    ).fetchall()
+    for comment in comments:
+        body = _lossy_text(comment["body"]) or ""
+        if not isinstance(body, str):
+            continue
+        for cause, pattern in _DECOMPOSE_RECORD_MARKERS:
+            if cause in seen:
+                continue
+            match = pattern.search(body)
+            if match is None:
+                continue
+            _add(
+                cause, comment_id=int(comment["id"]),
+                author=_lossy_text(comment["author"]), line=_matched_line(body, match),
+            )
+
+    if not matches:
+        return None
+    return DecomposeRefusal(task_id, matches)
+
+
+def record_decompose_refusal(
+    conn: sqlite3.Connection, refusal: DecomposeRefusal, *, author: Optional[str] = None,
+) -> Optional[int]:
+    """Append the ``decompose_refused`` event inside the caller's txn; the new id, or None.
+
+    None means the newest recorded refusal already carries this cause set: the decomposer is
+    retried by the tick, the CLI sweep and the dashboard, and the record must not grow one
+    row per attempt over an unchanged card. No txn of its own — the callers (the promotion
+    paths) are already inside one, or open one around it.
+    """
+    previous = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        (refusal.task_id, DECOMPOSE_REFUSAL_EVENT_KIND),
+    ).fetchone()
+    if previous is not None:
+        payload = _json_or(_lossy_text(previous["payload"]), {}) or {}
+        if list(payload.get("causes") or []) == list(refusal.causes):
+            return None
+    _append_event(
+        conn, refusal.task_id, DECOMPOSE_REFUSAL_EVENT_KIND,
+        {
+            "causes": refusal.causes,
+            "matches": refusal.matches,
+            "detail": refusal.detail,
+            "author": author,
+        },
+    )
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    return int(row[0]) if row is not None else None
+
+
+def decompose_refusal_guard(
+    conn: sqlite3.Connection, task_id: str, *, author: Optional[str] = None,
+) -> Optional[TriageEscalationRefusal | DecomposeRefusal]:
+    """The refusal that keeps ``task_id`` in ``triage``, and record it; else None.
+
+    The ONE entrance both promotion paths use, so neither can forget a guard. The escalation
+    park comes first and is returned WITHOUT a new event — its own ``block_loop_detected``
+    payload already carries the reason and the operator's disposal instructions. Anything
+    else the record refuses is recorded here (idempotently).
+    """
+    escalation = triage_escalation_refusal(conn, task_id)
+    if escalation is not None:
+        return escalation
+    refusal = decompose_refusal(conn, task_id)
+    if refusal is None:
+        return None
+    record_decompose_refusal(conn, refusal, author=author)
+    return refusal
 
 
 def redact_review_value(value: Any) -> Any:
@@ -3399,20 +7382,43 @@ def request_review(
                 return _ret(False, "task not found")
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
-            # the same fence as complete_task (_claim_is_live).
-            if expected_run_id is None and not force and _claim_is_live(trow):
+            # the same fence as complete_task (_close_run_fence).
+            allowed, fence_verdict, guard_sql, guard_params = _close_run_fence(
+                trow, task_id, expected_run_id=expected_run_id, force=force,
+            )
+            if not allowed:
+                if fence_verdict == WORKER_UNKNOWN:
+                    return _ret(False, live_claim_refusal(
+                        task_id, verdict=fence_verdict,
+                        run_id=_opt_int(_row_get(trow, "current_run_id")),
+                    ))
                 return _ret(
                     False, "task is running under a live claim; pass expected_run_id "
                     "(worker ownership) or force=True (explicit operator "
                     "override) instead of clearing the live run's claim",
                 )
-            if reviewer is None:
+            if not _nonblank_str(reviewer):
                 reviewer = _prior_reviewer(conn, task_id)
                 if reviewer is False:
                     return _ret(
                         False, "re-review has no durable reviewer provenance (the "
                         "latest changes_requested event is missing or "
                         "malformed); pass reviewer= explicitly",
+                    )
+                if reviewer is None:
+                    # A FIRST review must name its reviewer. Leaving it unnamed does not
+                    # resolve to "whoever ought to review": the card still carries the
+                    # implementer as its assignee, so the handoff would record
+                    # ``reviewer: None`` and leave the review lane with nothing to spawn
+                    # but the lane it just came from (the self-review guard can only park
+                    # that row). Refuse HERE, where the implementer can still name one;
+                    # a re-review keeps the durable default above.
+                    return _ret(
+                        False, "a review request must name its reviewer: pass "
+                        "reviewer=<profile>, a lane distinct from the implementer. "
+                        "An unnamed handoff records reviewer: None and leaves the "
+                        "implementer holding the card, so the review lane has no "
+                        "reviewer it can spawn",
                     )
             reviewer = _canonical_assignee(reviewer)
             # The actor is the run that did the work. ``assignee`` is the actor
@@ -3433,10 +7439,23 @@ def request_review(
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
-            run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
+            # The guard the fence decided: the run this caller read, or ``current_run_id IS NULL``
+            # when it named none and the card had no active run. Never empty — an unguarded UPDATE
+            # here is what let a transition land on a successor's run (#123811).
+            #
+            # A card already in ``review`` accepts a re-request ONLY from the run that
+            # handed it off (the caller named it, and the fence pinned the write to it):
+            # that is how an implementer CORRECTS its own handoff — it named the wrong
+            # reviewer — instead of completing a card no reviewer ever looked at. Naming
+            # no run keeps the narrow set, so a blind re-stamp cannot rewrite a card the
+            # review lane may already be spawning.
+            source_sql = (
+                "   AND (status IN ('running', 'ready') OR status = 'review')\n"
+                if expected_run_id is not None
+                else "   AND status IN ('running', 'ready')\n"
+            )
             params: tuple[Any, ...] = (
-                *(() if reviewer is None else (reviewer,)), task_id,
-                *(() if expected_run_id is None else (int(expected_run_id),)),
+                *(() if reviewer is None else (reviewer,)), task_id, *guard_params,
             )
             cur = conn.execute(
                 """
@@ -3447,13 +7466,13 @@ def request_review(
                        worker_pid    = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + run_guard,
+                """ + source_sql + guard_sql,
                 params,
             )
             if cur.rowcount != 1:
                 return _ret(
-                    False, "task is not in running/ready (or expected_run_id did not match the current run)",
+                    False, live_row_refusal(conn, task_id, caller_run_id=expected_run_id,
+                                            verb="request review"),
                 )
             if isinstance(metadata, dict):
                 staged_copies = _stage_completion_artifacts(
@@ -3462,7 +7481,7 @@ def request_review(
             run_id = _end_or_synthesize_run(
                 conn, task_id, outcome="review_requested", status="review",
                 summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
-                profile=implementer,
+                profile=implementer, keep_attached=True,
             )
             payload: dict = {
                 "summary": _first_line(summary, 400) or None,
@@ -3478,6 +7497,24 @@ def request_review(
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
     return _ret(True)
+
+
+def review_implementer(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Implementer recorded by the latest ``review_requested`` event, else ``None``.
+
+    ``request_review`` stamps the task's assignee at handoff time as
+    ``implementer`` on that event, and only reassigns the row when a distinct
+    ``reviewer`` is named -- so for a card parked in ``review`` this is the
+    durable author provenance. The dispatcher uses it to refuse to spawn an
+    implementer as its own reviewer. ``None`` means the card never recorded one
+    (no ``review_requested`` event, or a payload without a usable value);
+    callers must read that as "unknown", never as "distinct". Shared by
+    :func:`request_changes` and :func:`reopen_review_task`, which both route on
+    this field.
+    """
+    review_event = _latest_event(conn, task_id, "review_requested")
+    handoff = _json_dict(_row_get(review_event, "payload"))
+    return _nonblank_str(handoff.get("implementer"))
 
 
 def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
@@ -3517,6 +7554,56 @@ def request_changes(
         if task_row is None:
             return False, "task not found"
         current_run_id = task_row["current_run_id"]
+        if task_row["status"] == "review":
+            # The AUTHOR's withdrawal. The handoff keeps the implementing run
+            # attached (``_end_run(keep_attached=True)``), and that run — and no
+            # other — may take the card back out of review before a reviewer
+            # claims it: the workspace is gone and nobody has started reading, so
+            # the honest move is to take the handoff back rather than to complete
+            # a card no reviewer looked at. Same landing status, same wake event
+            # for the implementer's lane, marked ``withdrawn_by: implementer`` so a
+            # reader can tell the author's withdrawal from a reviewer's verdict.
+            if (
+                current_run_id is None or expected_run_id is None
+                or int(current_run_id) != int(expected_run_id)
+            ):
+                return False, "task is not in an active review run"
+            handoff = _json_dict(
+                _row_get(_latest_event(conn, task_id, "review_requested"), "payload"))
+            implementer = review_implementer(conn, task_id) or _canonical_assignee(
+                _nonblank_str(task_row["assignee"]))
+            if implementer is None:
+                return False, "review handoff has no valid implementer provenance"
+            new_status = _landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = ?,
+                       assignee = COALESCE(?, assignee),
+                       current_run_id = NULL,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL, worker_started_at = NULL
+                 WHERE id = ? AND status = 'review' AND current_run_id = ?
+                """,
+                (new_status, implementer, task_id, int(current_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False, "task changed during review handoff"
+            _append_event(
+                conn,
+                task_id,
+                "changes_requested",
+                {
+                    "reason": reason,
+                    "implementer": implementer,
+                    "reviewer": _nonblank_str(handoff.get("reviewer")),
+                    "status": new_status,
+                    "withdrawn_by": "implementer",
+                },
+                run_id=int(current_run_id),
+            )
+            return True, implementer
         if task_row["status"] != "running" or current_run_id is None:
             return False, "task is not in an active review run"
         if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
@@ -3530,7 +7617,7 @@ def request_changes(
         requested_event = _latest_event(conn, task_id, "review_requested")
         if requested_event is None:
             return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
+        implementer = review_implementer(conn, task_id)
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
@@ -3649,9 +7736,16 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, extra_event: Optional[dict] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    ``extra_event`` merges into the ``unblocked`` event payload, so a caller that
+    unblocked the card for a reason of its own (the due-card waker, say) leaves
+    that reason on the board's event stream without a second event.
+    """
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3675,21 +7769,42 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # unbounded; only complete_task clears them. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
         # is a fresh start for the retry budget.
+        #
+        # A card resuming back to ``review`` keeps the run that owned it when it
+        # was blocked: the implementer's handoff run. Clearing it here reopened the
+        # wedge ``request_review`` closes — the worker that blocked its own review
+        # card to ask a question got it back with no owner, so it could no longer
+        # return, re-block or re-request it. The run stays CLOSED (it handed off);
+        # it is only re-attached as the card's owner, the state a handoff leaves.
+        #
+        # The due columns are cleared as well: the card is no longer time-gated,
+        # so leaving a stale ``due_at`` behind would re-wake (or falsely alarm
+        # about) a card that is already running.
+        restore_run_id = None
+        if new_status == "review":
+            row = conn.execute(
+                "SELECT run_id FROM task_events WHERE task_id = ? AND run_id IS NOT NULL "
+                "AND kind IN ('blocked', 'dependency_wait', 'block_loop_detected', 'gave_up') "
+                "ORDER BY id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            restore_run_id = int(row["run_id"]) if row is not None else None
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "UPDATE tasks SET status = ?, current_run_id = ?, "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "due_at = NULL, due_window_policy = NULL "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            (new_status, restore_run_id, task_id),
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        payload = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else None
         )
+        if extra_event:
+            payload = {**(payload or {}), **extra_event}
+        _append_event(conn, task_id, "unblocked", payload)
         return True
 
 
@@ -3705,9 +7820,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             note="invariant recovery on review reopen",
         )
         new_status = _landing_status_after_parents(conn, task_id)
-        review_event = _latest_event(conn, task_id, "review_requested")
-        handoff = _json_dict(_row_get(review_event, "payload"))
-        implementer = _nonblank_str(handoff.get("implementer"))
+        implementer = review_implementer(conn, task_id)
         params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
         cur = conn.execute(
             # consecutive_failures deliberately PRESERVED: review reopen is not
@@ -3827,10 +7940,15 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
-) -> bool:
+) -> bool | TriageEscalationRefusal:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+
+    A card the block-loop breaker parked refuses with a
+    :class:`TriageEscalationRefusal` (falsy) and stays in ``triage``: specification
+    cannot fix a card whose state has not changed since the block it was escalated
+    for, and promoting it re-arms the loop.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -3842,6 +7960,18 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        refusal = triage_escalation_refusal(conn, task_id)
+        if refusal is not None:
+            return refusal
+        if body is not None:
+            # Specifying a card rewrites its body; the ask the card was filed for travels
+            # with it (kanban_register.restamp_rewritten_body). A "specify" that merely
+            # restated the body without its stamp must not resolve the operator's ask.
+            from hermes_cli.kanban_register import restamp_rewritten_body
+
+            body = restamp_rewritten_body(
+                conn, task_id, body, previous=existing["body"],
+            )
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -3894,6 +8024,17 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     dispatcher can spawn a duplicate worker off the released claim. The
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
+
+    WITHDRAWAL IS THE REVOKE (t_c80646d1). Archiving IS how an operator ask is withdrawn, and an
+    archived card is not a standing request — so the card's LIVE priority designation is released
+    in the SAME transaction. It has to happen here because the designation door is fenced from
+    every card run (``_DELEGATED_CHILD_DENIED_ACTIONS``), so the archive is the only enforcement
+    node that can reach the ledger; putting it anywhere else leaves a withdrawn ask reported as
+    standing until somebody hand-runs ``hermes kanban defcon revoke``. One txn means a withdraw and
+    its revoke can never diverge, and the ledger keeps the DESIGNATION's own reason/authority as
+    the audit trail while the release rides a ``reprioritized`` event (``cause: archive``). The
+    GATE half needs no seam here: ``archived`` is terminal, so a release only RELAXES the relation
+    invariant (see THE GATE INVARIANT).
     """
     with write_txn(conn):
         row = conn.execute(
@@ -3917,6 +8058,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _release_designation_rows(conn, task_id, reason="withdrawn: card archived",
+                                  cause="archive")
     if was_running:
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
         with write_txn(conn):
@@ -3957,22 +8100,182 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+# --- Time-gated cards (due_at) ---
+#
+# ``due_at`` is what makes a parked card self-waking: the dispatcher tick calls
+# ``kanban_due.wake_due_cards`` and unblocks every card whose due time has
+# passed, so a time-gated card does not need an external cron to come back.
+class _UnsetType:
+    """Sentinel for ``schedule_task(due_at=...)``.
+
+    Omitting ``due_at`` (the default, ``UNSET``) leaves whatever due time the
+    card already has. Passing ``None`` explicitly CLEARS it -- re-parking a card
+    by hand means "no wake time". Collapsing the two would make every legacy
+    ``schedule_task`` call silently drop a card's due time.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _UnsetType()
+
+# What the waker does when a due time lands inside a reserved execution band.
+# ``defer`` holds the wake to the end of the band (a wake hands the card to the
+# spawn pass in the same tick, so it would start work inside the band);
+# ``ambient`` wakes anyway, for a wake that is a lightweight check.
+VALID_DUE_WINDOW_POLICIES = ("defer", "ambient")
+DEFAULT_DUE_WINDOW_POLICY = "defer"
+
+
+def list_due_tasks(
+    conn: sqlite3.Connection, *, now: int, limit: int = 200,
+    statuses: tuple[str, ...] = ("scheduled",),
+) -> list[Task]:
+    """Cards in ``statuses`` whose ``due_at`` has passed, oldest due first.
+
+    ``scheduled`` (parked on time) and a time-fenced ``blocked`` (a hold with an
+    auto-release) are the two self-waking states. The read side of the waker:
+    ``due_at IS NOT NULL`` keeps a card parked without a wake time (a wait on an
+    unknown moment) out of the result, so this never becomes a second, implicit
+    unblock path for human-parked cards.
+    """
+    placeholders = ", ".join("?" for _ in statuses)
+    rows = conn.execute(
+        f"SELECT * FROM tasks WHERE status IN ({placeholders}) AND due_at IS NOT NULL "
+        "AND due_at <= ? ORDER BY due_at ASC LIMIT ?",
+        (*statuses, int(now), int(limit)),
+    ).fetchall()
+    return [Task.from_row(r) for r in rows]
+
+
+def defer_due(conn: sqlite3.Connection, task_id: str, *, due_at: int) -> bool:
+    """Move a parked card's ``due_at`` forward in place, status unchanged.
+
+    The due-card waker uses this to hold a time-fenced ``blocked`` hold out of a
+    reserved execution band without leaking it into ``scheduled`` (a blocked card
+    must stay blocked while due, so the human block bucket still sees it).
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET due_at = ? WHERE id = ? AND status IN ('scheduled', 'blocked')",
+            (int(due_at), task_id),
+        )
+        return cur.rowcount == 1
+
+
+# --- Board-level key/value bookkeeping (``kanban_meta``) ---
+#
+# ``due_waker_last_tick`` is the waker's heartbeat: the overdue diagnostic reads
+# it to tell "the card's wake time passed and the tick that would wake it did
+# not happen" (gateway dispatcher down) apart from "the tick ran and the waker
+# refused" -- the two need different fixes.
+META_DUE_WAKER_LAST_TICK = "due_waker_last_tick"
+# Heartbeat write throttle: the dispatcher ticks every ~60 s and a heartbeat per
+# tick is a WAL write for nothing. 30 s keeps "has it ticked lately?" sharp while
+# halving the write rate.
+_META_TICK_THROTTLE_SECONDS = 30
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: Optional[str]) -> None:
+    """Upsert one board-level key. The CALLER owns the transaction."""
+    conn.execute(
+        "INSERT OR REPLACE INTO kanban_meta (key, value, updated_at) VALUES (?, ?, ?)",
+        (key, value, int(time.time())),
+    )
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM kanban_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row is not None else None
+
+
+def get_meta_int(conn: sqlite3.Connection, key: str, default=None):
+    """``get_meta`` as an int; a missing or unparsable value reads as ``default``."""
+    raw = get_meta(conn, key)
+    try:
+        return int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def record_due_waker_tick(conn: sqlite3.Connection, *, now: Optional[int] = None) -> None:
+    """Note that the due-card waker ran (throttled; see ``_META_TICK_THROTTLE_SECONDS``).
+
+    A missing heartbeat is how the board tells that nothing is ticking at all:
+    a parked card with a due time and no heartbeat is not a card about to wake.
+    """
+    ts = int(now if now is not None else time.time())
+    prev = get_meta_int(conn, META_DUE_WAKER_LAST_TICK)
+    if prev is not None and 0 <= ts - prev < _META_TICK_THROTTLE_SECONDS:
+        return
+    with write_txn(conn):
+        set_meta(conn, META_DUE_WAKER_LAST_TICK, str(ts))
+
+
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    due_at: Any = UNSET, window_policy: Optional[str] = None,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until ``unblock_task`` re-gates it.
+
+    ``due_at`` (epoch seconds) makes the card self-waking: the dispatcher tick
+    unblocks it on the first pass after that time via
+    ``kanban_due.wake_due_cards``, so nothing external has to run. Omit it to
+    leave an existing due time alone; pass ``None`` to clear it.
+
+    ``window_policy`` decides what the waker does when the due time falls inside
+    a reserved execution band -- ``"defer"`` (the default once ``due_at`` is set)
+    holds the wake until the band closes, ``"ambient"`` wakes anyway for a wake
+    that is a lightweight check and must tick around the clock.
+
+    Re-parking an already-``scheduled`` card is allowed, and is how a deferral
+    moves the same card forward; that path synthesizes no run (the card was
+    never claimed in the first place).
+    """
+    if window_policy is not None and window_policy not in VALID_DUE_WINDOW_POLICIES:
+        raise ValueError(
+            f"window_policy must be one of {sorted(VALID_DUE_WINDOW_POLICIES)}"
+        )
     with write_txn(conn):
-        params: list[Any] = [task_id]
-        sql = """
+        row = conn.execute(
+            "SELECT status, due_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        was_scheduled = row is not None and row["status"] == "scheduled"
+        # A band policy with nothing to apply it to is dead state no wake will
+        # ever read: refuse it instead of writing an inert column.
+        if (window_policy is not None and due_at is UNSET
+                and (row is None or row["due_at"] is None)):
+            raise ValueError(
+                "window_policy needs a due time: pass due_at as well "
+                "(CLI: --due ... --window-policy ...)"
+            )
+        sets = [
+            "status = 'scheduled'", "claim_lock = NULL", "claim_expires = NULL",
+            "worker_pid = NULL",
+        ]
+        set_params: list[Any] = []
+        if due_at is not UNSET:
+            sets.append("due_at = ?")
+            set_params.append(None if due_at is None else int(due_at))
+            if due_at is None:
+                sets.append("due_window_policy = NULL")
+            else:
+                sets.append("due_window_policy = ?")
+                set_params.append(window_policy or DEFAULT_DUE_WINDOW_POLICY)
+        elif window_policy is not None:
+            sets.append("due_window_policy = ?")
+            set_params.append(window_policy)
+        params: list[Any] = [*set_params, task_id]
+        sql = f"""
             UPDATE tasks
-               SET status       = 'scheduled',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL
+               SET {', '.join(sets)}
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'scheduled')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -3980,10 +8283,41 @@ def schedule_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome="scheduled", status="scheduled", summary=reason,
+            synthesize=bool(reason) and not was_scheduled,
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload: dict = {"reason": reason}
+        if due_at is not UNSET or window_policy is not None:
+            # Re-read rather than echo the arguments: the event has to say what
+            # the card is now waiting on, including an inherited due time.
+            final = conn.execute(
+                "SELECT due_at, due_window_policy FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            payload["due_at"] = final["due_at"] if final is not None else None
+            payload["window_policy"] = final["due_window_policy"] if final is not None else None
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
+
+
+def explicit_max_runtime_seconds(conn: sqlite3.Connection, task: Task) -> Optional[int]:
+    """The ``max_runtime_seconds`` the CARD AUTHOR set — never the dispatcher's default.
+
+    The dispatcher stamps ``kanban.default_max_runtime_seconds`` onto a card that carries none, at
+    CLAIM time, so its runtime sweep can always reap a running slot (ruling ``t_b2865b89`` §4). The
+    card's own column therefore no longer separates an author's budget from that scheduling default.
+    ``_claim_and_open_run`` copies the column onto the run row BEFORE the stamp, so the active run is
+    the canonical record: this returns ``None`` for a defaulted card — whose worker must keep the
+    generic terminal timeout — and the author's value otherwise. Falls back to the card's column when
+    there is no run row yet (a task that was never claimed still carries its own value).
+    """
+    run_id = task.current_run_id
+    if run_id is not None:
+        row = conn.execute(
+            "SELECT max_runtime_seconds FROM task_runs WHERE id = ?", (int(run_id),)
+        ).fetchone()
+        if row is not None:
+            return _row_get(row, "max_runtime_seconds")
+    return task.max_runtime_seconds
 
 
 # --- Worker context builder (what a spawned worker sees) ---
@@ -3999,7 +8333,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
-    _ctx_header(lines, task)
+    _ctx_header(
+        lines, task,
+        explicit_max_runtime_seconds=explicit_max_runtime_seconds(conn, task),
+    )
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
@@ -4045,7 +8382,9 @@ def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
     )
 
 
-def _ctx_header(lines: list[str], task: Task) -> None:
+def _ctx_header(
+    lines: list[str], task: Task, *, explicit_max_runtime_seconds: Optional[int] = None,
+) -> None:
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
@@ -4054,11 +8393,17 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
     if task.max_runtime_seconds is not None:
+        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
+    # The terminal timeout is derived from the card's EXPLICIT cap ONLY. A card that carries no cap
+    # of its own gets the dispatcher's ``default_max_runtime_seconds`` stamped onto it at claim so
+    # the runtime sweep can reap the slot; that default is not an author budget and must NEVER be
+    # reported as the worker's terminal timeout — the child env does not receive it either (ruling
+    # t_b2865b89 §4). Claiming a cap would tell the worker to run a command it will be killed in.
+    if explicit_max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
-            task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
+            explicit_max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
         )
         effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
-        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
         if effective_terminal_timeout:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
@@ -4502,12 +8847,17 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
+    WORKER_ALIVE,
+    WORKER_DEAD,
+    WORKER_UNKNOWN,
     _clear_failure_counter,
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
     _terminate_reclaimed_worker,
     _worker_alive,
+    _worker_liveness,
+    _worker_not_dead,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
