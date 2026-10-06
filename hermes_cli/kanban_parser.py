@@ -332,6 +332,21 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("reopen", [
+        _TASK_ID,
+        _arg("--reason", help="Reason/note recorded on the reopened event (quote multi-word reasons)."),
+        _arg("--to", choices=["ready", "todo", "blocked"], metavar="STATUS",
+             help="Landing status. Omit to re-gate on parent completion (ready, or todo "
+                  "while parents remain open). 'blocked' parks the card (the parked policy "
+                  "for a done->live repair that owes no work to a lane) — that needs "
+                  "--block-kind."),
+        _arg("--block-kind", dest="block_kind",
+             help="Typed block reason when --to blocked (default: external)."),
+        _arg("--dry-run", action="store_true",
+             help="Validate the reopen without mutating state"),
+        _json_flag(),
+    ], help="THE done->live door: restore a done/archived task to a live status "
+            "(repair/recovery; single id — a multi-id promote is the bulk class)"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

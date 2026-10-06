@@ -3729,6 +3729,111 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def reopen_task(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: str = "",
+    dest_status: Optional[str] = None, block_kind: Optional[str] = None,
+    dry_run: bool = False,
+) -> tuple[bool, Optional[str], dict[str, Any]]:
+    """``done``/``archived`` -> a LIVE status. THE sanctioned done->live door.
+
+    The third sibling of :func:`unblock_task` (``blocked``/``scheduled``) and
+    :func:`reopen_review_task` (``review``): together the three cover every
+    non-terminal resume, and each REFUSES the states the others own. This one
+    is guarded to the CLOSED states only, so it can never be used to launder a
+    live card's phase — the successor to the dashboard's private
+    ``_set_status_direct`` and to the forbidden raw ``UPDATE tasks SET status``.
+
+    *dest_status* selects the landing: ``None`` re-gates on parent completion
+    (``ready``/``todo``); ``'ready'`` / ``'todo'`` are explicit; ``'blocked'``
+    parks the card (the parked policy) with *block_kind* (default
+    ``'external'``) and ``block_recurrences = 0``. A ``blocked`` landing emits a
+    real ``blocked`` event so the hold is STICKY — otherwise
+    :func:`recompute_ready` would promote it straight back to ``ready`` in the
+    same pass, which is exactly the redundant re-dispatch the parked policy
+    exists to avoid.
+
+    A done parent going live retracts its closed descendants
+    (:func:`invalidate_descendants_for_parent_reopen`, the done->live
+    invariant) and the ready set is recomputed. ``dry_run=True`` validates
+    (closed state + computed landing) and writes nothing. Returns
+    ``(ok, err, info)``; *info* carries ``from_status`` / ``to_status``.
+    """
+    from_status = _task_status(conn, task_id)
+    if from_status not in ("done", "archived"):
+        return False, (
+            f"task {task_id} is '{from_status or 'missing'}'; reopen only applies to "
+            "'done' or 'archived' (blocked/scheduled -> unblock, review -> reopen-review)"
+        ), {}
+    if dest_status is None:
+        new_status = _landing_status_after_parents(conn, task_id)
+    elif dest_status in ("ready", "todo"):
+        new_status = dest_status
+    elif dest_status == "blocked":
+        new_status = "blocked"
+    else:
+        return False, (
+            f"dest_status {dest_status!r} is not one of 'ready', 'todo', 'blocked'"
+        ), {}
+    parked_kind: Optional[str] = None
+    if new_status == "blocked":
+        parked_kind = (block_kind or "external").strip()
+        if not parked_kind:
+            return False, "block_kind must be a non-empty string", {}
+    info = {"from_status": from_status, "to_status": new_status}
+    if dry_run:
+        return True, None, info
+    now = int(time.time())
+    with write_txn(conn):
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("done", "archived"), now=now,
+            note="invariant recovery on reopen",
+        )
+        set_sql = (
+            "status = ?, completed_at = NULL, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "worker_started_at = NULL, consecutive_failures = 0, "
+            "last_failure_error = NULL"
+        )
+        params: list[Any] = [new_status]
+        if parked_kind is not None:
+            set_sql += ", block_kind = ?, block_recurrences = 0"
+            params.append(parked_kind)
+        params.append(task_id)
+        cur = conn.execute(
+            f"UPDATE tasks SET {set_sql} "
+            "WHERE id = ? AND status IN ('done', 'archived')",
+            params,
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed during reopen", {}
+        _append_event(
+            conn, task_id, "reopened",
+            {"from_status": from_status, "to_status": new_status,
+             "actor": actor, "reason": reason},
+        )
+        # Legacy 'status' event: the dashboard live feed renders it and the
+        # disposition sweep's ``_resume_status_from_events`` reads it.
+        _append_event(
+            conn, task_id, "status",
+            {"status": new_status, "previous_status": from_status,
+             "reason": "reopened"},
+        )
+        if parked_kind is not None:
+            # A REAL ``blocked`` event so ``_has_sticky_block`` reads the newest
+            # blocked/unblocked event as a block and the recompute below cannot
+            # auto-promote the parked card.
+            _append_event(
+                conn, task_id, "blocked",
+                {"kind": parked_kind, "reason": reason, "source": "reopen"},
+            )
+    # OUTSIDE the txn: each of these opens its own write txn. A live parent
+    # retracts its closed descendants (done->live invariant); recompute_ready
+    # re-gates the demoted/re-gated cards.
+    invalidate_descendants_for_parent_reopen(conn, task_id, author=actor)
+    recompute_ready(conn)
+    return True, None, info
+
+
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection, task_id: str, *, author: str,
 ) -> dict[str, Any]:

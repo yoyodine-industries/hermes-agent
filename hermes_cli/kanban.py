@@ -207,7 +207,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "promote", "reopen", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1031,6 +1031,39 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_reopen(args: argparse.Namespace) -> int:
+    """``done``/``archived`` -> a LIVE status. THE sanctioned done->live door.
+
+    SINGLE id by design: a multi-id reopen->ready is the bulk-guard ``promote``
+    class, so the door stays one card per call (the SDLC flow's repair is one
+    card per item). Never a raw SQL status write — this is the only CLI surface
+    that reaches :func:`kanban_db.reopen_task`.
+    """
+    tid = args.task_id
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    dest_status = _stripped_or_none(getattr(args, "to", None))
+    block_kind = _stripped_or_none(getattr(args, "block_kind", None))
+    dry_run = bool(getattr(args, "dry_run", False))
+    actor = _profile_author()
+    with kbc.connect_closing() as conn:
+        ok, err, info = kb.reopen_task(
+            conn, tid, actor=actor, reason=reason or "",
+            dest_status=dest_status, block_kind=block_kind, dry_run=dry_run,
+        )
+        if getattr(args, "json", False):
+            _print_json({"task_id": tid, "reopened": bool(ok), "dry_run": dry_run,
+                         "to_status": (info or {}).get("to_status"), "error": err})
+            return 0 if ok else 1
+        if not ok:
+            return _err(f"cannot reopen {tid}: {err or 'not done/archived?'}")
+        tag = " (dry)" if dry_run else ""
+        label = "Would reopen" if dry_run else "Reopened"
+        suffix = f": {reason}" if reason else ""
+        to_status = (info or {}).get("to_status") or dest_status or "ready"
+        print(f"{label} {tid} -> {to_status}{tag}{suffix}")
+    return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1326,7 +1359,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "reopen": _cmd_reopen,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
