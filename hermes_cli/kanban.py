@@ -969,6 +969,53 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_retarget(args: argparse.Namespace) -> int:
+    """Re-point a card's project + workspace — the recovery door for a mis-born card.
+
+    Usable on a ``blocked``/``ready``/``todo`` card (the state a mis-born card is in
+    while somebody notices it is bound to the wrong repo); refused on a terminal card
+    and on a card another worker currently holds a live claim on (``--force``
+    overrides the claim guard). The change is recorded as a ``retargeted`` event.
+    """
+    try:
+        ws_kind, ws_path = _parse_workspace_flag(getattr(args, "workspace", None))
+        branch = _parse_branch_flag(getattr(args, "branch", None))
+    except argparse.ArgumentTypeError as exc:
+        return _err(f"kanban retarget: {exc}", 2)
+    if branch and ws_kind not in (None, "worktree"):
+        return _err("kanban retarget: --branch is only valid with a worktree workspace", 2)
+    with kbc.connect_closing() as conn:
+        try:
+            result = kb.retarget_task(
+                conn, args.task_id,
+                project=getattr(args, "project", None),
+                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch,
+                reason=getattr(args, "reason", None),
+                actor=getattr(args, "author", None) or _profile_author(),
+                force=bool(getattr(args, "force", False)),
+            )
+        except ValueError as exc:
+            return _err(f"kanban retarget: {exc}", 2)
+    if result is None:
+        return _err(f"cannot retarget {args.task_id}: unknown task id", 2)
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    old, new = result["old"], result["new"]
+    if not result["changed"]:
+        print(f"{args.task_id} already bound to {new['workspace_kind']}"
+              f"{' ' + new['workspace_path'] if new['workspace_path'] else ''} "
+              f"(project {new['project_id'] or '-'}) - no change")
+        return 0
+    print(f"Retargeted {args.task_id}: project {old['project_id'] or '-'} -> "
+          f"{new['project_id'] or '-'}, workspace {old['workspace_kind']}"
+          f"{' ' + old['workspace_path'] if old['workspace_path'] else ''} -> "
+          f"{new['workspace_kind']}"
+          f"{' ' + new['workspace_path'] if new['workspace_path'] else ''} "
+          f"(recorded as a retargeted event; a parked card stays parked - unblock it to resume)")
+    return 0
+
+
 def _commented(conn, reason: Optional[str], author, prefix: str, op):
     """Wrap a per-task ``op`` so a ``reason`` is first recorded as a ``PREFIX: reason`` comment."""
     def run(tid):
@@ -1325,7 +1372,8 @@ _HANDLERS = {
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
-    "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
+    "complete": _cmd_complete, "edit": _cmd_edit, "retarget": _cmd_retarget,
+    "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,

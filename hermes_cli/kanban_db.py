@@ -3213,6 +3213,144 @@ def edit_task(
     return True
 
 
+def retarget_task(
+    conn: sqlite3.Connection, task_id: str, *, project: Optional[str] = None,
+    workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
+    branch_name: Optional[str] = None, reason: Optional[str] = None,
+    actor: Optional[str] = None, force: bool = False, board: Optional[str] = None,
+) -> Optional[dict]:
+    """Re-point a card's project + workspace - the RECOVER door for a mis-born card.
+
+    ``create_task`` fixes a card's binding at birth, so before this verb the only
+    ways to correct a card born into the wrong repo were archive+recreate (which
+    severs whatever linkage the card carries - SDLC flow items, parent edges) or
+    hand-written SQL. This is the missing move: it re-resolves ``project_id`` /
+    ``workspace_kind`` / ``workspace_path`` / ``branch_name`` in ONE recorded step,
+    appends a ``retargeted`` event carrying the before/after, and works on any
+    non-terminal card - crucially a ``blocked``/``ready``/``todo`` one, the state a
+    card sits in while somebody notices it is bound to the wrong tree.
+
+    ``project`` - a project id or slug to re-anchor to (its ``primary_path`` and a
+    deterministic branch), or ``""``/``"none"`` to CLEAR the link so the card owns
+    no repo. Unlike ``create_task``, which drops an unresolvable project silently, a
+    NAMED-but-unknown project is REFUSED: a retarget that quietly kept the old
+    binding would defeat the point of the verb.
+
+    A card with a LIVE worker claim is refused unless ``force=True`` - its worker is
+    already sitting in the old tree, and re-pointing the binding under it would race.
+
+    Returns ``None`` for an unknown id, else ``{"task_id", "old", "new",
+    "changed"}``. Raises ``ValueError`` on a refusal (the CLI renders it).
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    status = (task.status or "").strip().lower()
+    if status in ("done", "archived"):
+        raise ValueError(
+            f"cannot retarget {task_id}: task is {status!r} (terminal) - a binding is "
+            f"only correctable while the card can still be worked")
+    if task.claim_lock and int(task.claim_expires or 0) > int(time.time()) and not force:
+        raise ValueError(
+            f"cannot retarget {task_id}: a worker holds a live claim (claim_lock="
+            f"{task.claim_lock}); reclaim the card first, or pass --force if the worker "
+            f"is gone")
+
+    requested = None if project is None else str(project).strip()
+    clear_project = requested is not None and requested.lower() in ("", "none")
+    project_obj = None
+    if requested and not clear_project:
+        from hermes_cli import projects_db as _pdb
+
+        try:
+            with _pdb.connect_closing() as _pconn:
+                project_obj = _pdb.get_project(_pconn, requested)
+        except Exception:
+            project_obj = None
+        if project_obj is None:
+            raise ValueError(
+                f"project {requested!r} not found (see `hermes project list`); nothing "
+                f"was written - name a project that exists, or 'none' to clear the link")
+
+    old = {
+        "project_id": task.project_id,
+        "workspace_kind": task.workspace_kind,
+        "workspace_path": task.workspace_path,
+        "branch_name": task.branch_name,
+    }
+
+    if clear_project and workspace_kind is None and workspace_path is None:
+        # Detaching the project with no explicit workspace: the old worktree belonged
+        # to the project being detached, so fall back to scratch.
+        workspace_kind = "scratch"
+
+    new_kind = workspace_kind if workspace_kind is not None else (task.workspace_kind or "scratch")
+    if project_obj is not None and not (workspace_kind is not None or workspace_path is not None) \
+            and new_kind == "scratch":
+        # Naming a project re-anchors the card: mirror create_task's project rule (a
+        # project turns a scratch card into a worktree under its repo). An explicitly
+        # named workspace wins, exactly as it does on create.
+        new_kind = "worktree"
+    if new_kind not in VALID_WORKSPACE_KINDS:
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, got {new_kind!r}")
+    new_path = workspace_path
+    new_branch = branch_name
+    if new_kind == "scratch":
+        new_path = None
+        new_branch = None
+    elif new_kind == "dir":
+        new_path = new_path or task.workspace_path
+        if not new_path:
+            raise ValueError("workspace_kind 'dir' needs an explicit workspace path")
+        new_branch = None
+    else:  # worktree
+        if not new_path:
+            if project_obj is not None and project_obj.primary_path:
+                new_path = os.path.join(str(project_obj.primary_path), ".worktrees", task_id)
+            elif project_obj is None and task.workspace_kind == "worktree" and task.workspace_path:
+                new_path = task.workspace_path
+            else:
+                raise ValueError(
+                    "workspace_kind 'worktree' needs --project (to anchor under its repo) "
+                    "or an explicit --workspace worktree:<path>")
+        if not new_branch and project_obj is not None:
+            new_branch = _project_branch_name(project_obj, task_id, task.title)
+        if not new_branch:
+            new_branch = task.branch_name
+
+    new_project_id = (None if clear_project
+                      else (project_obj.id if project_obj is not None else task.project_id))
+    new = {
+        "project_id": new_project_id,
+        "workspace_kind": new_kind,
+        "workspace_path": new_path,
+        "branch_name": new_branch,
+    }
+    changed = old != new
+
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET project_id = ?, workspace_kind = ?, workspace_path = ?, "
+            "branch_name = ? WHERE id = ?",
+            (new_project_id, new_kind, new_path, new_branch, task_id),
+        )
+        if changed:
+            _append_event(conn, task_id, "retargeted", {
+                "old": old,
+                "new": new,
+                "reason": (reason or "").strip() or None,
+                "actor": actor or "unknown",
+            })
+    if changed:
+        notify_task_updated(
+            conn, task_id,
+            ["project_id", "workspace_kind", "workspace_path", "branch_name"],
+            board=board,
+        )
+    return {"task_id": task_id, "old": old, "new": new, "changed": changed}
+
+
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,

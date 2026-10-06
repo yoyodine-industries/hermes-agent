@@ -312,6 +312,25 @@ _SPECS = [
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
+    _cmd("retarget", [
+        _TASK_ID,
+        _arg("--project",
+             help="Project id or slug to re-anchor the card to (its primary repo + a "
+                  "deterministic worktree branch); 'none' clears the link. Must exist - "
+                  "an unknown project is refused. See `hermes project list`."),
+        _arg("--workspace",
+             help="scratch | worktree | worktree:<path> | dir:<path> - re-resolve the "
+                  "workspace kind/path. Omit to keep the current kind (a project anchors "
+                  "a worktree under its repo)."),
+        _arg("--branch", help="Branch name for a worktree binding"),
+        _arg("--reason", required=True,
+             help="Why the card is being re-pointed (recorded on the retargeted event)"),
+        _arg("--author", help="Author recorded on the change (default: $HERMES_PROFILE or 'user')"),
+        _arg("--force", action="store_true",
+             help="Retarget even while a worker holds a live claim on the card"),
+        _json_flag(),
+    ], help="Re-point a card's project + workspace (the recovery door for a mis-born "
+            "card) — usable on a blocked/ready card; refused on done/archived"),
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
