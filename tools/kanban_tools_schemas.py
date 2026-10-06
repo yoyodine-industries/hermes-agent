@@ -139,6 +139,21 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "did not create any cards."
             ),
         },
+        "deferred_children": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": (
+                "Optional {child task id: reason} declaring children that do "
+                "NOT carry this card's remaining Definition of Done. "
+                "Completing a card lifts each of its open children to the "
+                "card's own priority, because priority governs spawn order "
+                "and a closure filed low starves the chain it gates; a "
+                "deferral is the explicit, recorded way to hold one out. It "
+                "needs a stated reason — never a low priority, which the "
+                "kernel is not allowed to read as intent. Name only cards "
+                "linked as children of the card you are completing."
+            ),
+        },
         "artifacts": {
             "type": "array",
             "items": {"type": "string"},
@@ -175,7 +190,11 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "auto-escalated to triage. A ``kind='dependency'`` block that NAMES "
+        "another card in ``reason`` must also declare ``waits_on`` (or already "
+        "be linked to that card) — a prose-only wait is refused, because the "
+        "board resumes a card from its linked parents, not from its reason text. "
+        "Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
     {
@@ -193,6 +212,19 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "resumes automatically when an incomplete parent finishes; "
                 "if no parent is open it is recorded as needs_input instead. "
                 "The others surface to a human. Omit only if none apply."
+            ),
+        },
+        "waits_on": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Card ids this block waits on. Each becomes a PARENT edge, so "
+                "the board resumes the card when they finish. Pass it whenever "
+                "the reason names a card: a ``kind='dependency'`` block that "
+                "names a card with no edge (neither here nor already linked) is "
+                "refused, because a prose-only wait is invisible to the board's "
+                "dependency machinery. A card already linked to an open parent "
+                "needs no ``waits_on`` — its existing edge is the wait."
             ),
         },
     },
@@ -219,8 +251,11 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "the whole diff; the reviewer has the board and the PR."
         )),
         "reviewer": _prop("string", (
-                "Optional reviewer profile. When provided, the task is "
-                "reassigned to that profile before review dispatch."
+                "The reviewer profile. REQUIRED on a first review: an unnamed "
+                "request is refused, because it leaves the implementer holding "
+                "the card and names nobody the review lane can spawn. On a "
+                "RE-review the reviewer recorded on the changes_requested run "
+                "is reused when this is omitted."
         )),
         "metadata": {
             "type": "object",
@@ -380,10 +415,12 @@ KANBAN_CREATE_SCHEMA = _schema(
     {
         "title": _prop("string", "Short task title (required)."),
         "assignee": _prop("string", (
-                "Profile name that should execute this task "
-                "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                "Required — tasks without an assignee are never "
-                "dispatched."
+                "Profile name that should execute this task, and it MUST be a live "
+                "profile id — a card whose assignee names no live profile is "
+                "REFUSED at creation (the dispatcher could never spawn it). A "
+                "genuine control-plane pull lane or probe fixture must be declared "
+                "once in `kanban.control_plane_assignees`. Required — tasks "
+                "without an assignee are never dispatched."
         )),
         "body": _prop("string", (
                 "Opening post: full spec, acceptance criteria, "
@@ -404,6 +441,23 @@ KANBAN_CREATE_SCHEMA = _schema(
         "tenant": _prop("string", (
                 "Optional namespace for multi-project isolation. "
                 "Defaults to HERMES_TENANT env if set."
+        )),
+        "serves": _prop("string", (
+                "The operator ask this card is filed IN SERVICE OF: a register card id "
+                "(the card becomes a new ask under that register) or "
+                "'<register>/<ask>'. Stamps 'Operator-ask: <register>/<ask>' into the "
+                "card's body so the work rolls up to the operator across ALL boards — "
+                "a parent edge cannot cross boards. Leave it off when the card has a "
+                "parent that already serves an ask, or when you are a worker whose own "
+                "card serves one: the ask is inherited at the create path either way."
+        )),
+        "allow_off_board_ask": _prop("boolean", (
+                "Escape hatch for the operator-ask home rule. A card that IS a NEW "
+                "operator ask (filed against a register, rather than inheriting an "
+                "existing ask id) is REFUSED unless it lands on the register's own board. "
+                "Set true ONLY to file such an ask on another board deliberately: the "
+                "filing proceeds and a task_events row records the caller. Read the "
+                "refusal first - it names the board to use."
         )),
         "priority": _prop("integer", (
                 "Dispatcher tiebreaker. Higher = picked sooner "
@@ -447,10 +501,13 @@ KANBAN_CREATE_SCHEMA = _schema(
             "type": "string",
             "enum": ["running", "blocked"],
             "description": (
-                "Initial card status. Use 'blocked' for tasks that "
-                "require immediate human ops (R3 gate) to skip the "
-                "brief running-to-blocked transition. Defaults to "
-                "'running', which preserves the usual dispatch path."
+                "Initial card status; defaults to 'running' (the usual dispatch "
+                "path). 'blocked' is RECOGNISED AND REFUSED: a card is never "
+                "created blocked (no card may be born with a status that names no "
+                "blocker). To express waiting on other work pass 'parents' (the card "
+                "is born 'todo' and promotes itself when they finish); to park a REAL "
+                "block found in the course of work create the card normally, then "
+                "call kanban_block with a kind and a reason."
             ),
         },
         "skills": {
@@ -478,8 +535,13 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "work. Defaults to false (classic single-shot worker)."
         )),
         "completion_contract": _prop("string", (
-            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
-            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
+            "Declare at creation: local-only (default), landed for a card that carries a DEPLOYED unit, "
+            "OWNER/REPO for PR publication, or an exact GitHub PR URL. "
+            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr. "
+            "A landed card cannot complete until its handoff carries metadata.proof = "
+            '{"artifacts": [{"path": <deployed file>, "sha256": <live hash>}], "landing": {"ref": <ledger landed_sha|card|pr>}, '
+            '"run": {"store": "yoyoflow"|"card", "id": <id>}} (or a service "probe": {"at": <iso>, "result": "ok"}); '
+            "the gate takes the timestamps from the ledger/run store itself and refuses a proof dated at or before the landing."
         )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
