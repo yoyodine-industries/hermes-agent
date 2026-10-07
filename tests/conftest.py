@@ -432,6 +432,46 @@ def _reset_foreground_exit_fence():
         base._exit_fenced = False
 
 
+# ── Kanban create-time assignee gate (card t_c8ff9bc1) ──────────────────────
+# ``create_task`` REFUSES an assignee that names no live Hermes profile unless the
+# name is DECLARED in ``kanban.control_plane_assignees``. Kanban tests across the
+# suite invent assignees ("alice", "worker", "builder", ...) that are not real
+# profile dirs, so the suite declares every name legal by default. The gate's own
+# tests re-patch ``control_plane_assignee_names`` to a real/specific set and the
+# dispatcher's belt tests clear it, so the enforcement is still exercised.
+
+
+class _DeclareAllAssignees(frozenset):
+    """A declaration set that contains every name (the suite's test seam)."""
+
+    def __contains__(self, item) -> bool:  # noqa: D105
+        return True
+
+
+_DECLARE_ALL_ASSIGNEES = _DeclareAllAssignees()
+
+
+@pytest.fixture(autouse=True)
+def _kanban_declare_synthetic_assignees():
+    # Its OWN MonkeyPatch (not the function-scoped ``monkeypatch`` fixture): a test
+    # that calls ``monkeypatch.undo()`` must not be able to disarm the suite seam
+    # mid-test (test_kanban_worker_pid_fingerprint does exactly that).
+    mp = pytest.MonkeyPatch()
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        yield
+        return
+    mp.setattr(
+        _kb, "control_plane_assignee_names",
+        lambda: _DECLARE_ALL_ASSIGNEES, raising=False,
+    )
+    try:
+        yield
+    finally:
+        mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def _neutralize_kanban_memory_guard(request, monkeypatch):
     """Pin the kanban dispatcher's memory guard to "no data" for every test.

@@ -55,3 +55,90 @@ def test_unknown_assignee_skip_event_is_written_once(tmp_path, monkeypatch):
             kbd.dispatch_once(conn, dry_run=False)
         kinds = [e.kind for e in kb.list_events(conn, tid)]
     assert kinds.count("skipped_nonspawnable") == 1
+
+
+# ── The belt: the bucket ACTS (card t_c8ff9bc1) ─────────────────────────────
+#
+# Ruling §4 on ops/t_5b9dbe02: the create-time gate is the primary enforcement,
+# but the dispatcher's skip branch must ALSO act on a bucket it still sees (rows
+# already on a board). It files ONE deduped escalation card per (board, assignee),
+# routed by the same deterministic seat resolver the stall escalation uses.
+# Names DECLARED in ``kanban.control_plane_assignees`` are exempt.
+
+
+_ESCALATION_KEY = "kanban-nonspawnable:default:no-such-profile"
+
+
+def _arm_escalation(monkeypatch):
+    """A live seat resolves; nothing is DECLARED, so the bucket is not exempt."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "ops-stl")
+    monkeypatch.setattr(kbd, "_kanban_config", lambda: {"default_assignee": "ops-stl"})
+    monkeypatch.setattr(kb, "control_plane_assignee_names", lambda: frozenset())
+
+
+def _escalation_rows(conn):
+    return conn.execute(
+        "SELECT id, assignee, created_by, status FROM tasks WHERE idempotency_key = ?",
+        (_ESCALATION_KEY,),
+    ).fetchall()
+
+
+def test_real_tick_files_exactly_one_escalation_card_idempotently(tmp_path, monkeypatch):
+    """A real tick on an undeclared, non-live assignee files ONE card, and three
+    ticks still leave exactly one (idempotency key ``kanban-nonspawnable:*``)."""
+    _isolated_home(tmp_path, monkeypatch)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="demo", assignee="no-such-profile")
+        _arm_escalation(monkeypatch)
+        res = None
+        for _ in range(3):
+            res = kbd.dispatch_once(conn, dry_run=False, spawn_fn=lambda *a, **k: 4242)
+        rows = _escalation_rows(conn)
+    assert res is not None and res.skipped_nonspawnable == [tid]
+    assert len(rows) == 1, f"expected exactly one escalation card, got {len(rows)}"
+    assert rows[0]["assignee"] == "ops-stl"
+    assert rows[0]["created_by"] == "kanban-dispatcher"
+
+
+def test_dry_run_tick_files_nothing(tmp_path, monkeypatch):
+    _isolated_home(tmp_path, monkeypatch)
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="demo", assignee="no-such-profile")
+        _arm_escalation(monkeypatch)
+        kbd.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 4242)
+        rows = _escalation_rows(conn)
+    assert rows == []
+
+
+def test_declared_control_plane_name_is_exempt(tmp_path, monkeypatch):
+    """A declared control-plane pull lane's skip is the expected steady state, so
+    it is NOT escalated."""
+    _isolated_home(tmp_path, monkeypatch)
+    from hermes_cli import profiles
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="demo", assignee="no-such-profile")
+        monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+        monkeypatch.setattr(kbd, "_kanban_config", lambda: {"default_assignee": "ops-stl"})
+        monkeypatch.setattr(
+            kb, "control_plane_assignee_names", lambda: frozenset({"no-such-profile"}),
+        )
+        res = kbd.dispatch_once(conn, dry_run=False, spawn_fn=lambda *a, **k: 4242)
+        rows = _escalation_rows(conn)
+    assert res.skipped_nonspawnable == [tid]
+    assert rows == []
+
+
+def test_no_seat_still_never_breaks_the_tick(tmp_path, monkeypatch):
+    """When no escalation seat resolves, the tick still completes (log-only)."""
+    _isolated_home(tmp_path, monkeypatch)
+    from hermes_cli import profiles
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="demo", assignee="no-such-profile")
+        monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+        monkeypatch.setattr(kbd, "_kanban_config", lambda: {})
+        monkeypatch.setattr(kb, "control_plane_assignee_names", lambda: frozenset())
+        res = kbd.dispatch_once(conn, dry_run=False, spawn_fn=lambda *a, **k: 4242)
+        rows = _escalation_rows(conn)
+    assert res.skipped_nonspawnable == [tid]
+    assert rows == []
