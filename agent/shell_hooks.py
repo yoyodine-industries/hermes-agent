@@ -76,18 +76,68 @@ def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _terminal_live_cwd(kwargs: Dict[str, Any]) -> str:
+    """The TERMINAL shell's live cwd for a terminal call, or "" when it cannot be resolved.
+
+    A hook's ``cwd`` is the directory a RELATIVE path in ``tool_input`` resolves against. For a
+    ``terminal`` call that is the PERSISTENT SHELL's cwd, which is NOT this process's cwd: the
+    shell keeps its own directory across calls (``cd <tree>`` earlier in the session), while this
+    process stays where it was started. Handing a relative-path guard the process cwd means a
+    ``cd`` earlier in the session is invisible to it, and a relative write from an inherited
+    live-tree cwd is measured against the wrong directory and slips — the incident this closes
+    (card t_096c9835): a worker's shell was left in ``/opt/hermes_prod/yaan-platform``, its
+    ``cd "$BH_AGENT_WORKSPACE"`` was a no-op because the variable was empty, and
+    ``echo "$P" > probehome.txt`` landed in the live tree while the guard, given the process
+    cwd, resolved the target outside it.
+
+    The records live in ``tools.terminal_tool`` (``_session_cwd``), written after every completed
+    command of a session and on cwd-override registration. The key is the one the terminal tool
+    itself uses — ``get_current_session_key() or task_id`` — tried in that order, then the
+    ``task_id`` alone: a contextvar bound in the tool's worker thread does not cross back to this
+    one, so the raw task/session id is the load-bearing key and both spellings are looked up.
+
+    Best-effort by design: any failure (module not importable in this process, no record yet on a
+    session's first terminal call) returns "" and the caller keeps the process cwd.
+    """
+    try:
+        from tools.terminal_tool import get_session_cwd
+        from tools.approval_context import get_current_session_key
+
+        candidates = []
+        key = get_current_session_key(default="")
+        if key:
+            candidates.append(key)
+        task_id = kwargs.get("task_id") or ""
+        if task_id and task_id not in candidates:
+            candidates.append(task_id)
+        for candidate in candidates:
+            live = get_session_cwd(candidate)
+            if live:
+                return str(live)
+    except Exception:
+        pass
+    return ""
+
+
 def _payload_fields(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """Common stdin/POST payload fields (shared with outbound webhooks); key order is wire order."""
-    try:
-        cwd = str(Path.cwd())
-    except OSError:
-        cwd = ""
+    # A terminal call's relative paths resolve in the SHELL, not in this process — so the payload
+    # must carry the shell's cwd when it is known (card t_096c9835). Everything else keeps the
+    # process cwd, which is what a path-naming tool call already resolves against.
+    resolved_cwd = ""
+    if kwargs.get("tool_name") == "terminal":
+        resolved_cwd = _terminal_live_cwd(kwargs)
+    if not resolved_cwd:
+        try:
+            resolved_cwd = str(Path.cwd())
+        except OSError:
+            resolved_cwd = ""
     from hermes_cli.profiles import get_active_profile_name
     return {
         "tool_name": kwargs.get("tool_name"),
         "tool_input": kwargs.get("args") if isinstance(kwargs.get("args"), dict) else None,
         "session_id": kwargs.get("session_id") or kwargs.get("parent_session_id") or "",
-        "cwd": cwd,
+        "cwd": resolved_cwd,
         # Resolved at fire time: a multiplexed gateway's hook script must know which profile fired it.
         "profile": get_active_profile_name(),
         "extra": {k: v for k, v in kwargs.items() if k not in _TOP_LEVEL_PAYLOAD_KEYS},

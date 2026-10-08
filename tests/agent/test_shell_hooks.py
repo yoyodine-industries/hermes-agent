@@ -75,6 +75,68 @@ class TestSerializePayload:
         assert payload["tool_input"] is None
 
 
+# ── payload cwd: the terminal shell's live cwd (t_096c9835) ────────────────
+
+
+class TestPayloadCwdIsTerminalShellCwd:
+    """A terminal call's relative paths resolve in the PERSISTENT SHELL, so the payload's
+    `cwd` must be the shell's recorded cwd — not this process's cwd. Handing the process cwd
+    let a relative write from an inherited live-tree cwd slip the shared-trees guard
+    (card t_096c9835)."""
+
+    def _patch(self, monkeypatch, *, session_key="", record=None):
+        import tools.approval_context as ac
+        import tools.terminal_tool as tt
+        monkeypatch.setattr(ac, "get_current_session_key", lambda default="": session_key)
+        monkeypatch.setattr(tt, "get_session_cwd", lambda key: (record or {}).get(key))
+
+    def test_terminal_cwd_is_the_session_record(self, monkeypatch):
+        self._patch(monkeypatch, record={"task-9": "/opt/hermes_prod/yaan-platform"})
+        fields = shell_hooks._payload_fields(
+            {"tool_name": "terminal", "args": {"command": "echo x > probehome.txt"},
+             "session_id": "s", "task_id": "task-9"})
+        assert fields["cwd"] == "/opt/hermes_prod/yaan-platform"
+
+    def test_session_key_is_tried_before_the_task_id(self, monkeypatch):
+        self._patch(monkeypatch, session_key="sess-1",
+                    record={"sess-1": "/from/session", "task-9": "/from/task"})
+        fields = shell_hooks._payload_fields(
+            {"tool_name": "terminal", "args": {"command": "ls"}, "task_id": "task-9"})
+        assert fields["cwd"] == "/from/session"
+
+    def test_task_id_is_used_when_no_session_key_is_bound(self, monkeypatch):
+        # The contextvar does not cross the tool-worker thread, so the raw task id is the
+        # load-bearing key; the record written by the terminal tool is reached through it.
+        self._patch(monkeypatch, session_key="", record={"task-9": "/from/task"})
+        fields = shell_hooks._payload_fields(
+            {"tool_name": "terminal", "args": {"command": "ls"}, "task_id": "task-9"})
+        assert fields["cwd"] == "/from/task"
+
+    def test_no_record_falls_back_to_the_process_cwd(self, monkeypatch):
+        # A session's FIRST terminal call has no record yet: never blank, never wrong.
+        self._patch(monkeypatch, record={})
+        fields = shell_hooks._payload_fields(
+            {"tool_name": "terminal", "args": {"command": "ls"}, "task_id": "task-9"})
+        assert fields["cwd"] == str(Path.cwd())
+
+    def test_non_terminal_calls_keep_the_process_cwd(self, monkeypatch):
+        self._patch(monkeypatch, record={"task-9": "/should/not/be/used"})
+        fields = shell_hooks._payload_fields(
+            {"tool_name": "write_file", "args": {"path": "/tmp/x"}, "task_id": "task-9"})
+        assert fields["cwd"] == str(Path.cwd())
+
+    def test_a_broken_lookup_never_drops_or_breaks_the_payload(self, monkeypatch):
+        import tools.terminal_tool as tt
+
+        def _boom(key):
+            raise RuntimeError("no live shell state in this process")
+
+        monkeypatch.setattr(tt, "get_session_cwd", _boom)
+        fields = shell_hooks._payload_fields(
+            {"tool_name": "terminal", "args": {"command": "ls"}, "task_id": "task-9"})
+        assert fields["cwd"] == str(Path.cwd())
+
+
 # ── Matcher behaviour ─────────────────────────────────────────────────────
 
 
