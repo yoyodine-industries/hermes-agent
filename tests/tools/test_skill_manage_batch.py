@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -267,6 +268,67 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertTrue(os.path.exists(skill_md))
         content = open(skill_md).read()
         self.assertIn("Step ONE.", content)
+
+    def test_failed_batch_restores_a_symlinked_skill_as_a_symlink(self):
+        """A profile skill entry is commonly a per-skill SYMLINK into a shared skills-repo
+        (every ``yaan-*`` entry under a profile's ``skills/``). ``_restore_snapshot`` used to
+        rename the entry aside and ``copytree`` the snapshot over its path: the entry became a
+        real directory and, because ``shutil.rmtree`` is a silent no-op on a symlink, a
+        ``<name>.rollback-broken`` link survived beside it. Both entries declare the same
+        frontmatter ``name:``, so name resolution refused the name and the skill stopped
+        resolving for the lane this run — the measured symptom. Rollback must instead restore
+        the link's TARGET content and leave the entry a symlink.
+
+        The write-path finder is injected: it resolves per-skill symlinks on the live line
+        (the symlink-aware index walk), but a base whose write walker skips symlinked dirs
+        would abort at ``operations[0]`` and prove nothing, so the rollback path is driven
+        deterministically regardless of the base's walker."""
+        skills_root = os.path.join(self.home, "skills")
+        shared = os.path.join(self.home, "skills-repo")
+        src = os.path.join(shared, "demo")
+        os.makedirs(src)
+        with open(os.path.join(src, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write(SK.format(n="demo"))
+        entry = os.path.join(skills_root, "demo")
+        os.symlink(src, entry, target_is_directory=True)
+
+        real_find = self.smt._find_skill
+
+        def find_through_alias(name):
+            candidate = os.path.join(skills_root, name)
+            return {"path": Path(candidate)} if os.path.islink(candidate) else real_find(name)
+
+        # op[0] (patch) succeeds — written THROUGH the link into the shared tree — then op[1]
+        # fails, so the batch rolls back with a real mutation on the link's target.
+        with patch.object(self.smt, "_find_skill", new=find_through_alias):
+            r = self._call("demo", [
+                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+            ])
+        self.assertFalse(r["success"], r)
+        self.assertEqual(r["failed_index"], 1)
+        self.assertEqual(r["completed_before_failure"], 1)  # the mutation really landed
+
+        # (a) no `<name>.rollback-broken` artifact anywhere under the profile home.
+        leaks = []
+        for root, dirs, files in os.walk(self.home):
+            leaks += [os.path.join(root, n) for n in dirs + files if "rollback-broken" in n]
+        self.assertEqual(leaks, [])
+        # the entry is STILL a symlink to its original target — never a materialised directory.
+        self.assertTrue(os.path.islink(entry), "the symlink was replaced by a real directory")
+        self.assertEqual(os.readlink(entry), src)
+        # the link's target content was restored through the link.
+        with open(os.path.join(src, "SKILL.md"), encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("Step 1.", body)
+        self.assertNotIn("Step ONE.", body)
+        # (b) the name still resolves — no ambiguous duplicate. `skill_view` runs the same
+        # collision refusal (`tools.skills_tool._locate_skill`) that killed the skill for the
+        # lane, so a lingering same-`name:` duplicate comes back as success=False here.
+        import tools.skills_tool as _st
+        with patch.object(_st, "SKILLS_DIR", Path(skills_root)):
+            resolved = json.loads(_st.skill_view("demo", preprocess=False))
+        self.assertTrue(resolved.get("success"), resolved)
 
     def test_single_op_path_unchanged(self):
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
