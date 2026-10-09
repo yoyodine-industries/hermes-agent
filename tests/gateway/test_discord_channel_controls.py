@@ -45,8 +45,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 class FakeDMChannel:
@@ -218,9 +218,9 @@ async def test_auto_thread_failure_skips_agent_and_notifies_user(adapter, monkey
 
 def test_config_bridges_ignored_channels(monkeypatch, tmp_path):
     """gateway/config.py bridges discord.ignored_channels to env var."""
-    import yaml
+    import hermes_yaml as yaml
     config_file = tmp_path / "config.yaml"
-    config_file.write_text(yaml.dump({
+    config_file.write_text(yaml.safe_dump({
         "discord": {
             "ignored_channels": ["111", "222"],
         },
