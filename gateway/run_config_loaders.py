@@ -19,10 +19,10 @@ from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
-    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, parse_cron_drain_timeout,
-    parse_restart_after_turn_timeout, parse_restart_drain_timeout,
-    launchd_service_label, parse_signal_interrupt_grace_timeout, read_launchd_exit_timeout_s,
-    resolve_launchd_capped_drain,
+    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, LAUNCHD_STOP_CLEANUP_RESERVE_S,
+    parse_cron_drain_timeout, parse_restart_after_turn_timeout, parse_restart_drain_timeout,
+    launchd_service_label, launchd_stop_budget_fits, parse_signal_interrupt_grace_timeout,
+    read_launchd_exit_timeout_s, resolve_launchd_capped_drain,
 )
 from gateway.session import SessionSource
 from gateway.session_state import SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET
@@ -79,7 +79,7 @@ class GatewayConfigLoadersMixin:
             logger.warning("Prefill messages file not found: %s", path)
             return []
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if not isinstance(data, list):
                 logger.warning("Prefill messages file must contain a JSON array: %s", path)
@@ -387,15 +387,21 @@ class GatewayConfigLoadersMixin:
         return value
 
     @staticmethod
-    def _load_launchd_exit_timeout(drain_timeout: float) -> Optional[float]:
+    def _load_launchd_exit_timeout(
+        drain_timeout: float, cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
+    ) -> Optional[float]:
         """Read the live launchd ``ExitTimeOut`` this job runs under, if any.
 
-        launchd is the one supervisor the gateway cannot size from config: the per-user (gui)
-        domain clamps ``ExitTimeOut`` (measured 60s on macOS 26), and any signal-driven stop that
-        drains past it is SIGKILLed mid-teardown — the unclean-exit half of the state.db
-        corruption class. Returns ``None`` (fail-open, drain unchanged) when not launchd-owned or
-        when ``launchctl print`` is unavailable. Logs a WARNING when the configured drain exceeds
-        the live budget so the misconfiguration is visible at boot, not at the next SIGKILL.
+        launchd is the one supervisor the gateway cannot size from config: ``ExitTimeOut`` lives
+        in the plist (a per-user ``gui`` job is clamped, measured 60s on macOS 26; a system-domain
+        LaunchDaemon measured 5s here), and any signal-driven stop that drains past it is
+        SIGKILLed mid-teardown — the unclean-exit half of the state.db corruption class. Returns
+        ``None`` (fail-open, drain unchanged) when not launchd-owned or when ``launchctl print``
+        is unavailable. Logs a WARNING when the live window cannot fit the configured stop wait
+        (the larger of ``restart_drain_timeout`` and ``cron_drain_timeout``, plus the teardown
+        reserve) so the misconfiguration is visible at boot, not at the next SIGKILL — the
+        pre-fix code compared only the CHAT drain, so its 0s default read as a false green over a
+        30s cron drain.
         """
         label = launchd_service_label()
         if label is None:
@@ -411,6 +417,15 @@ class GatewayConfigLoadersMixin:
                 "signal-driven stops will drain at most %.0fs so teardown finishes before launchd "
                 "SIGKILLs (launchd clamps ExitTimeOut in the per-user domain).",
                 drain_timeout, exit_timeout, label, effective,
+            )
+        elif not launchd_stop_budget_fits(drain_timeout, cron_drain_timeout, exit_timeout):
+            logger.warning(
+                "live launchd exit timeout for %s is %.0fs, which cannot fit the configured stop "
+                "drain (restart_drain_timeout=%.0fs, cron_drain_timeout=%.0fs) plus the %.0fs "
+                "teardown reserve; a signal-driven stop caps its drain to %.0fs and any in-flight "
+                "work is force-interrupted before launchd SIGKILLs (a capped-drain row is recorded).",
+                label, exit_timeout, drain_timeout, cron_drain_timeout,
+                LAUNCHD_STOP_CLEANUP_RESERVE_S, effective,
             )
         else:
             logger.info(

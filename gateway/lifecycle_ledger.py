@@ -49,7 +49,7 @@ def _proc_fields(path: str, wanted: Dict[str, str]) -> Dict[str, int]:
     """``{dst: int}`` for each ``src: dst`` key found in a ``Key: value`` /proc file."""
     found: Dict[str, int] = {}
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             for line in fh:
                 key = line.split(":", 1)[0]
                 if key in wanted:
@@ -76,7 +76,7 @@ def sample_memory() -> Dict[str, Any]:
 
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
@@ -293,6 +293,47 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
     return evidence
+
+
+def record_shutdown_drain_capped(
+    *,
+    configured_drain_s: float,
+    effective_drain_s: float,
+    cron_drain_s: Optional[float] = None,
+    launchd_exit_timeout_s: Optional[float] = None,
+    timed_out: bool = False,
+    active_agents: int = 0,
+    active_cron_jobs: int = 0,
+    active_api_runs: int = 0,
+    home: Optional[Path] = None,
+) -> None:
+    """Append a durable ``gateway.shutdown_drain_capped`` row when a signal-driven stop cannot
+    drain to its configured budget before the supervisor's kill window.
+
+    The write is deliberately lossy-compatible: it is the ONLY durable trace of *why* in-flight
+    work was force-interrupted (a log line is not enough; the next boot's
+    ``gateway.previous_unclean_exit`` rationale is inferred, not recorded, and a hard kill leaves
+    nothing else behind). Written at the moment the stop path knows the drain was clamped by the
+    live ``launchd_exit_timeout_s`` (or timed out), so the losing executions are surfaced rather
+    than silently reconciled as ``interrupted``. Never raises.
+    """
+    try:
+        record: Dict[str, Any] = {
+            "ts": _now_iso(),
+            "tag": "gateway.shutdown_drain_capped",
+            "pid": os.getpid(),
+            "configured_drain_s": configured_drain_s,
+            "effective_drain_s": effective_drain_s,
+            "cron_drain_s": cron_drain_s,
+            "launchd_exit_timeout_s": launchd_exit_timeout_s,
+            "timed_out": bool(timed_out),
+            "active_agents": int(active_agents),
+            "active_cron_jobs": int(active_cron_jobs),
+            "active_api_runs": int(active_api_runs),
+        }
+        _append_exit_diag(record, home)
+    except Exception:
+        logger.debug("Failed to record a capped shutdown drain", exc_info=True)
 
 
 def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdown", home: Optional[Path] = None) -> None:
