@@ -1883,6 +1883,36 @@ class GatewayShutdownMixin:
             self._active_cron_job_count(), _api_at_start, self._active_api_run_count(),
             _deferred_at_start, ctx.deferred_count(),
         )
+        # The stop path's drain budget was clamped by construction: when the live launchd exit
+        # timeout cannot fit the configured wait, `timeout` (chat) and/or `_cron_timeout` come back
+        # below what was configured, so in-flight work is force-interrupted before the supervisor's
+        # SIGKILL. Record that durably (a log line alone is not enough) so the losing executions
+        # are surfaced rather than silently reconciled as `interrupted` on the next boot.
+        _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
+        _configured_drain = getattr(self, "_restart_drain_timeout", 0.0)
+        _drain_capped = (
+            isinstance(_launchd_budget, (int, float)) and _launchd_budget > 0
+            and (timeout < _configured_drain or (bool(_cron_at_start) and _cron_timeout < _cron_drain_cfg))
+        )
+        if _drain_capped:
+            logger.warning(
+                "Shutdown drain clamped to fit the live launchd exit timeout (%.0fs): configured "
+                "restart_drain_timeout=%.0fs / cron_drain_timeout=%.0fs, effective %.0fs — in-flight "
+                "work is force-interrupted before the SIGKILL.",
+                _launchd_budget, _configured_drain, _cron_drain_cfg, timeout,
+            )
+        if _drain_capped or ctx.timed_out:
+            try:
+                from gateway.lifecycle_ledger import record_shutdown_drain_capped
+
+                record_shutdown_drain_capped(
+                    configured_drain_s=_configured_drain, effective_drain_s=timeout,
+                    cron_drain_s=_cron_drain_cfg, launchd_exit_timeout_s=_launchd_budget,
+                    timed_out=bool(ctx.timed_out), active_agents=self._running_agent_count(),
+                    active_cron_jobs=self._active_cron_job_count(), active_api_runs=self._active_api_run_count(),
+                )
+            except Exception:
+                logger.debug("Failed to record a capped shutdown drain", exc_info=True)
         if ctx.timed_out:
             return
         # Graceful drain: clear the pre-drain resume_pending markers so sessions that finished

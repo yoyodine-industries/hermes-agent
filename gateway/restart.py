@@ -119,6 +119,20 @@ def launchd_service_label(environ: Mapping[str, str] | None = None, *, platform:
     return launchd_job_label(environ)
 
 
+def _launchd_probe_domains(uid: int) -> tuple[str, ...]:
+    """``launchctl`` domains a Hermes gateway job can live in, in probe order.
+
+    Mirrors ``hermes_cli.gateway_launchd._probe_launchd_domain_for_label``: a LaunchAgent is
+    per-user (``gui/<uid>`` with an Aqua session, else ``user/<uid>``); a LaunchDaemon is
+    machine-wide ``system`` — including a daemon whose ``UserName`` is a NON-root user, which is
+    the shape measured on this host (``/Library/LaunchDaemons/ai.hermes.gateway.plist`` runs as
+    hermes_user). Probing only ``gui/<uid>`` (the pre-fix behaviour) returns nothing for that
+    daemon, so the drain cap failed OPEN and every signal-driven stop drained past the live 5s
+    ``ExitTimeOut`` into a launchd SIGKILL — the 288-record unclean-exit class.
+    """
+    return (f"gui/{uid}", f"user/{uid}", "system")
+
+
 def read_launchd_exit_timeout_s(
     label: str | None = None,
     *,
@@ -129,10 +143,15 @@ def read_launchd_exit_timeout_s(
 ) -> float | None:
     """Live ``ExitTimeOut`` (seconds) launchd enforces for this gateway's job.
 
-    Returns ``None`` — meaning "no launchd budget applies" — when the process
-    is not launchd-owned (non-darwin, or no ``ai.hermes`` job label — see :func:`launchd_job_label`), ``launchctl`` is missing
-    or fails, or the print output carries no ``exit timeout`` line. Callers
-    must treat ``None`` as fail-open: the configured drain stands unchanged.
+    The job is looked up in every domain launchd could have loaded it into
+    (:func:`_launchd_probe_domains`) and the first one that answers with an
+    ``exit timeout`` wins, so a system-domain LaunchDaemon running as a non-root
+    user is found as readily as a per-user LaunchAgent. Returns ``None`` — meaning
+    "no launchd budget applies" — when the process is not launchd-owned (non-darwin,
+    or no ``ai.hermes`` job label — see :func:`launchd_job_label`), ``launchctl`` is
+    missing or fails for every candidate domain, or no domain reports an
+    ``exit timeout`` line. Callers must treat ``None`` as fail-open: the configured
+    drain stands unchanged.
     """
     label = label or launchd_service_label(environ, platform=platform)
     if not label:
@@ -142,21 +161,25 @@ def read_launchd_exit_timeout_s(
         if getuid is None:
             return None
         uid = getuid()
-    domain = "system" if uid == 0 else f"gui/{uid}"
-    try:
-        proc = run(
-            ["launchctl", "print", f"{domain}/{label}"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return parse_launchd_exit_timeout(proc.stdout)
+    assert uid is not None  # narrowed by the getuid branch above; a local for the probe list
+    for domain in _launchd_probe_domains(uid):
+        try:
+            proc = run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        if proc.returncode != 0:
+            continue
+        exit_timeout = parse_launchd_exit_timeout(proc.stdout)
+        if exit_timeout is not None:
+            return exit_timeout
+    return None
 
 
 def resolve_launchd_capped_drain(
@@ -182,6 +205,34 @@ def resolve_launchd_capped_drain(
     if budget <= 0.0:
         return drain
     return min(drain, max(budget - _seconds(cleanup_reserve_s), 0.0))
+
+
+def launchd_stop_budget_fits(
+    drain_timeout: float,
+    cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
+    launchd_exit_timeout_s: float | None = None,
+    *,
+    cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
+) -> bool:
+    """True when the live launchd kill window fits the stop path's configured wait.
+
+    The NAMED boundary this module's drain cap exists to hold: a signal-driven stop may wait up
+    to ``max(restart_drain_timeout, cron_drain_timeout)`` seconds before it force-interrupts (the
+    cron floor only extends the chat drain), and must still leave ``cleanup_reserve_s`` for the
+    post-drain teardown, so the window fits only when
+    ``exit_timeout - cleanup_reserve_s >= max(drain, cron)``.
+
+    ``None``/non-positive ``launchd_exit_timeout_s`` means no launchd budget applies — always a fit
+    (fail-open), so the configured drain stands. Used at boot to warn (and to justify the capped
+    drain) when a supervisor's window cannot hold the configured stop wait.
+    """
+    budget = _seconds(launchd_exit_timeout_s)
+    if budget <= 0.0:
+        return True
+    wanted = max(_seconds(drain_timeout), _seconds(cron_drain_timeout))
+    if wanted <= 0.0:
+        return True  # nothing to wait for: the whole window is available for teardown
+    return budget - _seconds(cleanup_reserve_s) >= wanted
 
 
 def effective_stop_drain_timeout(runner: object) -> float:
