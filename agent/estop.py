@@ -68,6 +68,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import sys
 import tempfile
 import threading
@@ -112,6 +113,42 @@ SIG_PREFIX = "hmac-sha256:"
 LEDGER_NAME = ".estop-events.jsonl"
 LEDGER_MAX_EVENTS = 500
 LEDGER_MAX_BYTES = 512 * 1024
+
+# D1/D2 — a run-owned hold is a LEASE. ``expires_at`` is never optional for one, and the
+# renewal its owning run performs is the ONLY liveness assertion (a live section renews, a
+# dead one cannot), so *expiry equals owner-dead within one lease period*. The default comes
+# from the section's declared budget (``--budget``), never from a guess: a bound that is too
+# small fails SAFE (the section renews or re-arms), an ABSENT bound fails OPEN — 2026-10-10.
+DEFAULT_SECTION_BUDGET_S = 30 * 60
+# The environment a run-owned arm takes its owning run from, when the caller names none (D1).
+RUN_ID_ENV = ("YOYOFLOW_RUN_ID", "HERMES_UPDATE_RUN_ID")
+KANBAN_TASK_ENV = "HERMES_KANBAN_TASK"
+
+# D3 — the independent reaper resolves a hold's owning run against the run ledgers the runner
+# ALREADY writes, so no new state is introduced:
+#   * the shared yoyoflow run store (``runs.id/status/finished_at``);
+#   * the JSONL run ledgers under ``<home>/run_details`` — one object per run carrying
+#     ``run``/``id`` and ``status`` — which is where a hermes-update run records itself.
+# Absent a row for the owner the LEASE (D2) is the only bound: unresolvable is never terminal.
+RUN_STORE_DB = "/opt/hermes_prod/run_details/yoyoflow-state.db"
+RUN_LEDGER_DIRNAME = "run_details"
+RUN_LEDGER_GLOB = "*.jsonl"
+RUN_LEDGER_MAX_FILES = 20
+#: Statuses that mean "this run is OVER". A status in neither set is UNKNOWN and is never read
+#: as terminal — releasing a hold on a status we do not understand would fail OPEN.
+RUN_TERMINAL_STATUSES = frozenset({
+    "completed", "complete", "done", "success", "succeeded", "ok", "green",
+    "failed", "failure", "error", "errored", "dead", "cancelled", "canceled", "aborted",
+    "killed", "terminated", "timeout", "timed_out", "skipped", "orphaned", "expired",
+})
+RUN_ACTIVE_STATUSES = frozenset({
+    "running", "started", "starting", "pending", "queued", "launched", "active",
+    "in_progress", "in-progress", "waiting", "held", "draining",
+})
+
+# D5 — every release names WHY it happened, so the released scope stays legible after the
+# sentinel body (and with it the lane list) is gone.
+RELEASE_CAUSES = ("explicit", "handle", "owner", "all", "operator-resume", "deadman", "orphan")
 
 # Environment markers that say "this process is unattended" (D3 step 4). Presence of any of
 # them, like a non-TTY stdin, denies the ``operator`` name.
@@ -167,6 +204,9 @@ _expired_logged: dict[str, str] = {}
 # Sentinel path -> engagement key (mtime_ns:size) of the last REPORTED empty (unattributed)
 # sentinel, so the alarm is one loud line per engagement rather than one per check.
 _unattributed_logged: dict[str, str] = {}
+# Handle -> engagement of the last REPORTED run-owned hold with no owner binding (D3), so the
+# reaper's "I cannot resolve this owner" line is one per engagement, not one per tick.
+_unbound_logged: dict[str, str] = {}
 # Per-component snapshot of the hold that PAUSED it, kept while the pause is logged and read
 # back on the resume transition, so the tick can log "dispatch resumed …" with the hold that
 # ended and how it ended. "dispatch paused" had no counterpart before this (card t_f88ddb45).
@@ -232,7 +272,7 @@ def _parse_stamp(value: Any) -> Optional[datetime]:
         parsed = datetime.fromisoformat(value.strip())
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _normalize_allow(allow: Any) -> dict:
@@ -253,7 +293,7 @@ def _normalize_allow(allow: Any) -> dict:
 def _resolve_expiry(value: Any) -> Optional[datetime]:
     """Absolute expiry from an ISO-8601 string or an aware datetime; None otherwise."""
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     return _parse_stamp(value)
 
 
@@ -380,10 +420,35 @@ class ReleaseResult:
     actor: str = ""
     unverified_cleared: int = 0
     ledger: bool = True
+    #: D5 — WHY this release happened, from :data:`RELEASE_CAUSES` (None when nothing was
+    #: released). The released scope has to stay readable after the sentinel body is gone.
+    cause: Optional[str] = None
 
     @property
     def remaining_owners(self) -> list:
         return [hold["owner"] for hold in self.remaining]
+
+
+@dataclass(frozen=True)
+class RenewResult:
+    """Outcome of :func:`renew` — the liveness proof of a run-owned hold (D2).
+
+    ``stale`` is the loud path, exactly as in :func:`release`: a handle that names no live hold
+    must be TOLD, never silently renewed into the void (a run that believes it renewed a lease
+    it does not hold would let its section run unbounded). ``expires_at`` is the deadline the
+    hold now carries, ``ttl_s`` the lease it was set to, and ``ledger`` False when the
+    ``renew`` row could not be written.
+    """
+
+    handle: str
+    renewed: bool = False
+    stale: bool = False
+    message: str = ""
+    expires_at: Optional[str] = None
+    ttl_s: Optional[int] = None
+    owner_run: Optional[str] = None
+    actor: str = ""
+    ledger: bool = True
 
 
 @dataclass(frozen=True)
@@ -408,6 +473,11 @@ class ArmResult:
     verified: bool = True
     ttl_s: Optional[int] = None
     ledger: bool = True
+    #: D1 — the run this hold is bound to (None only for a hold that names no run at all,
+    #: which is now the operator's own arm and nothing else).
+    owner_run: Optional[str] = None
+    #: True when the deadline came from the section budget rather than the caller's ``--ttl``.
+    lease_default: bool = False
 
 
 class EstopWriteError(OSError):
@@ -425,6 +495,17 @@ class EstopOrderRequired(EstopWriteError):
     Distinct from ``EstopRefusal`` because the remedy differs: the venue is admitted, what is
     missing is the operator's authority. ``message`` is the three-part refusal from
     :func:`order_refusal`, and the caller MUST treat the pause as NOT armed."""
+
+
+class EstopUnboundRun(EstopWriteError):
+    """A run-owned arm that cannot name its owning run (D1) — sibling of
+    :class:`EstopOrderRequired`.
+
+    The venue is admitted and the moment may well be right to stop; what is missing is the
+    binding that lets the hold be resolved — and released — without the owning run's own code
+    ever running again. The wrong moment to STOP is never refused; the wrong moment to stop
+    *unboundedly and anonymously* is: an unattributed hold is exactly the one that outlived
+    its run on 2026-10-10 and had to be lifted by hand. Nothing is written to the sentinel."""
 
 
 def _normalize_owner(owner: Any) -> str:
@@ -469,6 +550,33 @@ def _unattended_markers() -> list:
     return [name for name in UNATTENDED_ENV_MARKERS if str(os.environ.get(name) or "").strip()]
 
 
+_BOOT_ID: Optional[str] = None
+
+
+def _read_boot_id() -> str:
+    """This boot's id (D6). A machine fact, read once per process and never guessed."""
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["sysctl", "-n", "kern.bootsessionuuid"],
+                capture_output=True, text=True, timeout=5,
+            )
+            value = str(out.stdout or "").strip()
+        else:
+            value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except Exception:
+        return "unknown"
+    return value if value and _ACTOR_RE.match(value) else "unknown"
+
+
+def _boot_id() -> str:
+    """Cached :func:`_read_boot_id` — a boot id cannot change while we run."""
+    global _BOOT_ID
+    if _BOOT_ID is None:
+        _BOOT_ID = _read_boot_id()
+    return _BOOT_ID
+
+
 def actor_handle() -> str:
     """The handle of the process arming or lifting a hold (D3), first match wins:
 
@@ -509,9 +617,70 @@ def actor_handle() -> str:
     if claimed == ACTOR_OPERATOR and not _unattended_markers() and _stdin_is_tty():
         return ACTOR_OPERATOR
     if _unattended_markers() or not _stdin_is_tty():
-        profile = str(os.environ.get("HERMES_PROFILE") or "").strip() or "unknown"
-        return f"bot:{profile}"
+        # D6 — an unattended caller with no resolvable profile is NAMED, never muddled into
+        # ``bot:unknown``: a hold has to be liftable by whoever can read its handle off the
+        # sentinel, and an unnameable one had to be cleared by hand (2026-10-10, twice).
+        profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
+        if profile:
+            return f"bot:{profile}"
+        return f"bot:unresolved:{os.getpid()}@{_boot_id()}"
     return ACTOR_OPERATOR
+
+
+def _actor_run(actor: str) -> Optional[str]:
+    """The run an actor handle ALREADY names, when it names one (D1).
+
+    ``card:<task>``, ``delegated:<parent>`` and ``bot:<lane>:<run>`` (the update's own handle
+    shape) are run-scoped: the handle is its own owner binding, so such a hold is resolvable
+    without any caller having to pass one. ``bot:<profile>`` names a LANE, not a run, and
+    ``bot:unresolved:<pid>@<boot>`` names a PROCESS — neither is a run. A run-shaped handle
+    with an EMPTY run segment (``bot:hermes-update:``, the shape a caller produces when its
+    run-id variable is unset) resolves NOTHING, which is exactly the arm D1 refuses.
+    """
+    text = str(actor or "").strip()
+    if text.startswith(("card:", "delegated:")):
+        return text
+    parts = text.split(":")
+    if _is_run_scoped(text) and len(parts) >= 3 and parts[2].strip():
+        return text
+    return None
+
+
+def _clean_run_id(value: Any) -> Optional[str]:
+    """A printable, bounded run id, or None when there is nothing usable to bind to."""
+    text = str(value).strip() if value is not None else ""
+    return text if text and _ACTOR_RE.match(text) else None
+
+
+def owner_run_for(actor: str, owner_run: Any = None) -> Optional[str]:
+    """The owning run a hold is bound to (D1): the caller's value, else the run id in the
+    environment, else the run the ACTOR handle itself names.
+
+    ``None`` means "this arm cannot name the run it belongs to", which is a refusal for a
+    run-scoped arm (see :func:`arm`) and is why nothing here ever guesses: a binding that does
+    not name the real owner would release the WRONG hold.
+    """
+    for candidate in (owner_run, *(os.environ.get(name) for name in RUN_ID_ENV),
+                      os.environ.get(KANBAN_TASK_ENV)):
+        resolved = _clean_run_id(candidate)
+        if resolved:
+            return resolved
+    return _actor_run(actor)
+
+
+def _is_run_scoped(actor: str) -> bool:
+    """True when the arm belongs to a RUN rather than to a lane or the operator itself (D1).
+
+    A run-scoped arm must carry its ``owner_run``: it is the arm that will be released by a
+    process that may never run again, so an unbound one is refused loudly rather than landing
+    as tonight's did. ``bot:hermes-update:`` (a run-shaped handle whose run segment is empty)
+    is run-scoped and resolves nothing — the refusal case D1 exists for.
+    """
+    text = str(actor or "").strip()
+    if text.startswith(("card:", "delegated:")):
+        return True
+    return (text.startswith("bot:") and not text.startswith("bot:unresolved:")
+            and len(text.split(":")) >= 3)
 
 
 def key_path(sentinel: Optional[Path] = None) -> Path:
@@ -564,12 +733,14 @@ def _load_key(sentinel: Path, *, create: bool = False) -> Optional[bytes]:
 
 
 def _canonical(handle: Any, owner: Any, actor: Any, mode: Any, reason: Any,
-               engaged_at: Any, expires_at: Any, allow: Any) -> str:
+               engaged_at: Any, expires_at: Any, allow: Any, owner_run: Any = None) -> str:
     """The exact text the D2 signature covers. Editing ANY signed field invalidates that
-    entry, and only that entry."""
+    entry, and only that entry. ``owner_run`` (D1) is signed because it is what the reaper
+    resolves ownership against: an unsigned binding could be rewritten to release a hold."""
     return "\n".join([
         "estop", str(SCHEMA_VERSION), str(handle or ""), str(owner or ""), str(actor or ""),
         str(mode or ""), str(reason or ""), str(engaged_at or ""), str(expires_at or ""),
+        str(owner_run or ""),
         json.dumps(_normalize_allow(allow), sort_keys=True, separators=(",", ":")),
     ])
 
@@ -586,6 +757,7 @@ def _canonical_fields(source: dict) -> dict:
         "engaged_at": source.get("engaged_at") or "",
         "expires_at": source.get("expires_at") or "",
         "allow": source.get("allow"),
+        "owner_run": source.get("owner_run") or "",
     }
 
 
@@ -684,7 +856,7 @@ def record_event(event: str, *, sentinel: Optional[Path] = None, **fields) -> bo
     hold or a release.
     """
     path = ledger_path(sentinel)
-    row = {"at": datetime.now(timezone.utc).isoformat(), "event": event}
+    row = {"at": datetime.now(UTC).isoformat(), "event": event}
     row.update({key: value for key, value in fields.items() if value is not None})
     line = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
     try:
@@ -800,6 +972,24 @@ def order_refusal(actor: str, resume_at: str) -> str:
     )
 
 
+def unbound_run_refusal(actor: str) -> str:
+    """The D1 refusal: a run-scoped arm that cannot name its run is not recorded at all.
+
+    Names the three ways to bind, because the remedy is a one-line fix in the caller and the
+    alternative is tonight's hold: armed, unbounded in fact, and unattributable to any run the
+    fleet could resolve.
+    """
+    return (
+        f"{actor} names a run but resolves no run id — refusing to arm an unbound hold.\n"
+        f"   A hold a run owns is released by the INDEPENDENT reaper, which resolves the run in\n"
+        f"   its ledger; a hold with no run to resolve is the one that stranded the fleet on\n"
+        f"   2026-10-10 (armed 04:31, never released, ~2h of fleet-wide pause). Two ways forward:\n"
+        f"   (1) arm from the owning run so the binding resolves itself: YOYOFLOW_RUN_ID, "
+        f"HERMES_UPDATE_RUN_ID, or the run segment of the venue handle (`bot:<lane>:<run>`);\n"
+        f"   (2) pass it explicitly: `arm(..., owner_run=\"<run-id>\", budget=\"30m\")`."
+    )
+
+
 def _hold_from_entry(entry: Any, *, path: Path) -> dict:
     """One normalised hold from a registry entry (or from a pre-registry whole body).
 
@@ -850,6 +1040,11 @@ def _hold_from_entry(entry: Any, *, path: Path) -> dict:
         "expired": _is_past(expires_at),
         "path": str(path),
         "venue": payload.get("venue") or None,
+        # D1: the run this hold belongs to — the field the INDEPENDENT reaper resolves. Carried
+        # even on a demoted entry: what the body claimed is exactly what an operator needs.
+        "owner_run": str(payload.get("owner_run") or "").strip() or None,
+        # D2: the last renewal, so a reader can see HOW stale the liveness proof is.
+        "renewed_at": payload.get("renewed_at") or None,
         # Carried verbatim so a release that rewrites the file around a KEPT co-holder
         # preserves that holder's provenance instead of re-signing it with our key.
         "sig": sig if isinstance(sig, str) else None,
@@ -924,7 +1119,7 @@ def _is_past(value: Any, now: Optional[datetime] = None) -> bool:
     stamp = _parse_stamp(value)
     if stamp is None:
         return False
-    return (now or datetime.now(timezone.utc)) >= stamp
+    return (now or datetime.now(UTC)) >= stamp
 
 
 def read_state(now: Optional[datetime] = None) -> EstopState:
@@ -1009,23 +1204,41 @@ def is_engaged() -> bool:
     """True while ANY live hold sits on a candidate sentinel; fail SAFE (True) on stat
     errors. Expired holds are retired here, so a holder that died without releasing cannot
     park the fleet forever. A SCOPED (all-lockdown) state is still engaged — the caller
-    that wants "may new work start at all" wants :func:`work_admitted` instead."""
+    that wants "may new work start at all" wants :func:`work_admitted` instead.
+
+    D3 — the INDEPENDENT REAPER rides here too: the cron scheduler tick and the kanban
+    dispatcher tick already call this, and neither is inside the run a hold guards, so a
+    run-owned hold whose owner is terminal in a run ledger is released here rather than by
+    the run that armed it (which is the whole point: tonight's release leg never ran).
+    """
     state = read_state()
     for hold in state.expired:
         _retire_hold(hold)
+    if state.holds and reap_orphans(state):
+        state = read_state()
     return state.engaged
 
 
 def _retire_hold(hold: dict) -> None:
     """Drop ONE expired hold, reporting it once per (handle, expiry) and keeping the file
     when other holders are still live — the 02:09:52 defect was an expiry that took a pause
-    it did not own with it."""
+    it did not own with it. D5 — the lift is ALSO written to the ledger: a hold that
+    self-lifted must not leave a ledger ending at ``arm`` (tonight's log shape, and the
+    reason no log-keyed stale-hold detector could ever have seen it). UNFENCED by
+    :func:`arm_admission`: an expiry is the engine's own act, never a caller's release."""
     key = f"{hold['handle']}@{hold.get('expires_at')}"
     with _log_lock:
         first_report = _expired_logged.get(hold["handle"]) != key
         _expired_logged[hold["handle"]] = key
     removed = _remove_holds([hold])
     if first_report:
+        record_event(
+            "expire", sentinel=Path(hold.get("path") or sentinel_path()),
+            path=hold.get("path"), handle=hold["handle"], owner=hold.get("owner"),
+            actor=hold.get("actor"), mode=hold.get("mode"), cause="deadman",
+            owner_run=hold.get("owner_run"), expires_at=hold.get("expires_at"),
+            removed=bool(removed),
+        )
         logger.warning(
             "ESTOP hold '%s' (%s) EXPIRED at its deadman TTL — that hold is released%s. "
             "%s",
@@ -1073,6 +1286,11 @@ def _write_registry(path: Path, holds_list: list) -> bool:
                     ("expires_at", hold.get("expires_at")),
                     ("allow", hold.get("allow") or None),
                     ("venue", hold.get("venue")),
+                    # D1/D2: the run this hold belongs to (the reaper's binding) and the last
+                    # renewal. Both must survive every rewrite or a co-holder's release would
+                    # strip the binding that keeps the hold resolvable.
+                    ("owner_run", hold.get("owner_run")),
+                    ("renewed_at", hold.get("renewed_at")),
                     # D2: the provenance signature, written VERBATIM when the hold brought one
                     # (a keeper we did not author keeps its own), else dropped.
                     ("sig", hold.get("sig")),
@@ -1134,13 +1352,223 @@ def _remove_holds(targets: list) -> bool:
             {
                 key: hold.get(key)
                 for key in ("handle", "owner", "actor", "claimed_owner", "mode", "reason",
-                            "engaged_at", "expires_at", "allow", "venue", "sig")
+                            "engaged_at", "expires_at", "allow", "venue", "sig",
+                            "owner_run", "renewed_at")
             }
             for hold in existing
             if hold["handle"] not in handles
         ]
         ok = _write_registry(path, kept) and ok
     return ok
+
+
+# ---------------------------------------------------------------------------------
+# D3 — the INDEPENDENT reaper: resolve a run-owned hold's owner in the run ledgers.
+# It lives HERE, in the engine's read path, and never inside the run a hold guards.
+# ---------------------------------------------------------------------------------
+
+
+def _run_ledger_files() -> list:
+    """The JSONL run ledgers beside this home — newest first, bounded (a tick surface cannot
+    walk an unbounded directory)."""
+    try:
+        root = _hermes_home() / RUN_LEDGER_DIRNAME
+        files = [path for path in root.glob(RUN_LEDGER_GLOB) if path.is_file()]
+    except (OSError, ValueError):
+        return []
+    try:
+        files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        pass
+    return files[:RUN_LEDGER_MAX_FILES]
+
+
+def _run_ledger_row(owner_ids: set) -> Optional[tuple]:
+    """``(status, finished, source)`` for the first ledger row naming one of ``owner_ids``."""
+    for path in _run_ledger_files():
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            named = {str(row.get(key) or "").strip()
+                     for key in ("run", "id", "run_id", "owner_run")}
+            if not (named & owner_ids):
+                continue
+            status = str(row.get("status") or "").strip().lower()
+            if status or row.get("finished_at"):
+                return status, bool(row.get("finished_at")), str(path)
+    return None
+
+
+def _run_store_row(owner_ids: set) -> Optional[tuple]:
+    """``(status, finished, source)`` from the shared yoyoflow run store, when it knows one of
+    the ids. An unreadable store is NOT a reason to lift a hold — it returns None."""
+    try:
+        db = Path(RUN_STORE_DB)
+        if not db.is_file():
+            return None
+    except OSError:
+        return None
+    try:
+        import sqlite3  # lazy: the engine's import stays light until a run-owned hold exists
+
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2) as conn:
+            placeholders = ",".join("?" for _ in owner_ids)
+            row = conn.execute(
+                f"SELECT status, finished_at FROM runs WHERE id IN ({placeholders}) "
+                "ORDER BY started_at DESC LIMIT 1",
+                tuple(sorted(owner_ids)),
+            ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return str(row[0] or "").strip().lower(), bool(row[1]), str(db)
+
+
+def _run_is_terminal(status: str, finished: bool) -> bool:
+    """Statuses we do not understand are NEVER terminal: releasing on one would fail OPEN."""
+    if status in RUN_ACTIVE_STATUSES:
+        return False
+    if status in RUN_TERMINAL_STATUSES:
+        return True
+    return bool(finished)
+
+
+def run_outcome(owner_ids) -> Optional[tuple]:
+    """``(status, terminal, source)`` for a run the fleet's ledgers know, else None.
+
+    None is the important half (D3): ABSENT a row for the owner, the lease (D2) is the only
+    bound. Nothing here guesses that a missing row means a dead run — that would release a
+    live section the moment a runner had not written its row yet.
+    """
+    ids = {str(value).strip() for value in owner_ids if str(value or "").strip()}
+    if not ids:
+        return None
+    found = _run_ledger_row(ids) or _run_store_row(ids)
+    if found is None:
+        return None
+    status, finished, source = found
+    return status, _run_is_terminal(status, finished), source
+
+
+def _hold_owner_ids(hold: dict) -> list:
+    """Every identifier a run ledger might know this hold's owner by: the bound ``owner_run``
+    and the ``actor`` that armed it (the update's own handle IS the run it belongs to)."""
+    return [value for value in (hold.get("owner_run"), hold.get("actor")) if value]
+
+
+def _is_run_owned(hold: dict) -> bool:
+    """A hold a RUN owns, rather than the operator's own panic button.
+
+    Bound (``owner_run`` present) it is resolvable; unbound it is an orphan of an unknown run
+    and only the lease bounds it (D3). A hold armed by hand and read back ``unverified`` is
+    nobody's run and is left to the operator.
+    """
+    if hold.get("owner_run"):
+        return True
+    actor = str(hold.get("actor") or "")
+    return bool(actor) and not actor.startswith(ACTOR_OPERATOR)
+
+
+def _lease_deadline(hold: dict) -> Optional[datetime]:
+    """When the DEFAULT lease of an unbound run-owned hold runs out: ``engaged_at`` plus the
+    section budget. None when the hold names no usable engage time — then it is only reported."""
+    engaged = _parse_stamp(hold.get("engaged_at"))
+    if engaged is None:
+        return None
+    return engaged + timedelta(seconds=DEFAULT_SECTION_BUDGET_S)
+
+
+def _release_orphan(hold: dict, *, cause: str, detail: str) -> bool:
+    """Release ONE hold the reaper resolved, and say so in the ledger (D5 — the whole point:
+    tonight's hold was released by hand BECAUSE nothing wrote the row nobody could act on)."""
+    if not _remove_holds([hold]):
+        logger.error(
+            "ESTOP: orphan hold '%s' (%s) could not be released — it is still in force (%s)",
+            hold.get("handle"), hold.get("owner"), detail,
+        )
+        return False
+    record_event(
+        "release", sentinel=Path(hold.get("path") or sentinel_path()),
+        path=hold.get("path"), handle=hold["handle"], owner=hold.get("owner"),
+        actor=hold.get("actor"), mode=hold.get("mode"), cause=cause,
+        owner_run=hold.get("owner_run"), reaper=True,
+        allow=hold.get("allow") or None,
+        allow_profiles=list((hold.get("allow") or {}).get("profiles") or []),
+    )
+    logger.warning(
+        "ESTOP hold '%s' (%s) was ORPHANED — %s. Released by the independent reaper "
+        "(cause %s).", hold.get("handle"), hold.get("owner"), detail, cause,
+    )
+    return True
+
+
+def _report_unbound_run(hold: dict, now: datetime) -> bool:
+    """A run-owned hold with NO ``owner_run`` is an orphan of an UNKNOWN run (D3): the default
+    lease measured from its own engage time is the only bound it can be given, and it is
+    REPORTED either way — once per engagement, so a tick does not become a log flood."""
+    deadline = _lease_deadline(hold)
+    if deadline is not None and now >= deadline:
+        return _release_orphan(
+            hold, cause="orphan",
+            detail=("it names no owner_run and its default lease from "
+                    f"{hold.get('engaged_at')} ran out"),
+        )
+    key = f"{hold.get('handle')}@{hold.get('engaged_at')}"
+    with _log_lock:
+        first_report = _unbound_logged.get(str(hold.get("handle"))) != key
+        _unbound_logged[str(hold.get("handle"))] = key
+    if first_report:
+        logger.warning(
+            "ESTOP hold '%s' (%s) names NO owner_run: it is an orphan of an unknown run, so "
+            "only its default lease bounds it (until %s). Arm with an owner binding so the "
+            "reaper can resolve it.",
+            hold.get("handle"), hold.get("owner"),
+            deadline.isoformat() if deadline else "no usable engaged_at — UNBOUNDED",
+        )
+    return False
+
+
+def reap_orphans(state: Optional[EstopState] = None,
+                 now: Optional[datetime] = None) -> list:
+    """Release every run-owned hold whose owning run is OVER, from outside that run (D3).
+
+    Called from :func:`is_engaged` — the tick surface the cron scheduler and the kanban
+    dispatcher already hit — and from any supervised sweep. It is deliberately NOT part of the
+    update DAG and cannot be stopped by the hold it releases (it never consults
+    :func:`arm_admission`): the release leg must not be inside the thing it protects.
+    """
+    state = read_state() if state is None else state
+    moment = now or datetime.now(UTC)
+    released = []
+    for hold in list(state.holds):
+        if not _is_run_owned(hold):
+            continue
+        outcome = run_outcome(_hold_owner_ids(hold))
+        if outcome is not None and outcome[1]:
+            status, _terminal, source = outcome
+            if _release_orphan(
+                hold, cause="orphan",
+                detail=(f"its run {hold.get('owner_run') or hold.get('actor')} is "
+                        f"{(status or 'finished')} in {source}"),
+            ):
+                released.append(hold)
+            continue
+        if not hold.get("owner_run"):
+            if _report_unbound_run(hold, moment):
+                released.append(hold)
+    return released
 
 
 def arm_admission(action: str = "arm") -> tuple:
@@ -1181,6 +1609,8 @@ def arm(
     replace_owner: bool = False,
     actor: Optional[str] = None,
     order: Optional[str] = None,
+    owner_run: Any = None,
+    budget: Any = None,
 ) -> ArmResult:
     """Add ONE hold to this home's sentinel and report what actually landed.
 
@@ -1207,6 +1637,16 @@ def arm(
     in ``allow["profiles"]``. Pre-existing holds — including a pre-registry sentinel body,
     which reads as unverified and TOTAL — are preserved.
 
+    D1 — a hold names the RUN it belongs to (``owner_run``: the caller's value, else
+    ``YOYOFLOW_RUN_ID``/``HERMES_UPDATE_RUN_ID``/the kanban card id, else the run the actor
+    handle itself names). A run-scoped arm (``bot:<lane>:<run>``, ``card:*``, ``delegated:*``)
+    that cannot resolve one is REFUSED with :class:`EstopUnboundRun` and a ``refused`` ledger
+    row — nothing is written to the sentinel.
+
+    D2 — the deadline is not optional. A caller's ``ttl`` wins; without one the ENGINE applies
+    a default lease from the section's declared ``budget`` (:data:`DEFAULT_SECTION_BUDGET_S`),
+    so no hold is ever unbounded. Renewal (:func:`renew`) is the liveness proof.
+
     FENCED: an unadmitted venue (a delegated child, a dispatched kanban worker) is refused
     here, at the hold itself — see :func:`arm_admission`. The refusal is a raised
     :class:`EstopRefusal`, so no caller can arm by accident on a fenced surface.
@@ -1217,13 +1657,29 @@ def arm(
     actor_id = str(actor).strip() if actor else actor_handle()
     target = sentinel_path()
     resolved_mode, _unknown = _normalize_mode(mode)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     claim = _normalize_owner(owner)
     if actor_id == ACTOR_OPERATOR:
         owner_id, claimed_owner, renamed = claim, None, False
     else:
         owner_id, claimed_owner, renamed = actor_id, claim, claim != actor_id
     seconds = parse_duration(ttl)
+    budget_s = parse_duration(budget)
+    # D1 — the ownership binding, BEFORE anything is written: an arm that cannot name its run
+    # is the one that outlives it (2026-10-10), so it is refused rather than recorded.
+    bound_run = owner_run_for(actor_id, owner_run)
+    if bound_run is None and _is_run_scoped(actor_id):
+        detail = unbound_run_refusal(actor_id)
+        recorded = record_event(
+            "refused", sentinel=target, path=str(target), action="arm", actor=actor_id,
+            mode=resolved_mode, reason="unbound-run", ttl_s=seconds,
+        )
+        raise EstopUnboundRun(
+            detail + ("" if recorded
+                      else "\n   (the ledger could not be written — this refusal is NOT recorded)")
+        )
+    # D2 — the lease. Never None for a run-owned hold; the section budget is the default, so a
+    # bound that is too small fails SAFE and an absent one (tonight's failure) cannot recur.
     # D8 — the order gate, BEFORE anything is written.
     proceed, gate_kind, resume_at = order_gate(actor_id, order)
     if not proceed:
@@ -1241,8 +1697,17 @@ def arm(
     else:
         recorded_order = str(order).strip() if order else None
     expiry = _resolve_expiry(expires_at)
-    if expiry is None and seconds:
-        expiry = now + timedelta(seconds=seconds)
+    # D2 — the lease. A caller's --ttl/--expires-at wins; WITHOUT one the engine applies the
+    # section's declared budget (default 30m) so that ``expires_at`` is never None. Expiry is
+    # what bounds a holder that dies silently: a bound too small fails SAFE (the section
+    # renews or re-arms), an absent bound failed OPEN on 2026-10-10.
+    lease_default = False
+    recorded_ttl = seconds
+    if expiry is None:
+        lease_seconds = seconds or budget_s or DEFAULT_SECTION_BUDGET_S
+        expiry = now + timedelta(seconds=lease_seconds)
+        recorded_ttl = lease_seconds
+        lease_default = seconds is None
     handle = _handle_for(owner_id, now)
     existing, _defect = _read_holds(target)
     kept = [hold for hold in existing if not (replace_owner and hold["owner"] == owner_id)]
@@ -1257,6 +1722,9 @@ def arm(
         "expires_at": expiry.isoformat() if expiry is not None else None,
         "allow": _normalize_allow(allow),
         "venue": venue,
+        # D1 — the binding the INDEPENDENT reaper resolves the hold against. Signed with the
+        # rest of the entry, so it cannot be rewritten to release somebody else's hold.
+        "owner_run": bound_run,
     }
     # D2 — sign the entry EXACTLY as it will be written, so a later read recomputes the same
     # canonical text. None means "no key beside this sentinel": unsigned, still a hold.
@@ -1280,7 +1748,7 @@ def arm(
                                     for key, value in entry.items()
                                     if key in ("handle", "owner", "actor", "claimed_owner",
                                                "mode", "venue", "engaged_at", "sig", "reason",
-                                               "expires_at", "allow")
+                                               "expires_at", "allow", "owner_run")
                                     and value not in (None, "", {}, [])
                                 }
                             ],
@@ -1310,7 +1778,8 @@ def arm(
     ledger_ok = record_event(
         "arm", sentinel=target, path=str(target), handle=handle, owner=owner_id, actor=actor_id,
         claimed_owner=claimed_owner, mode=resolved_mode, reason=reason or None,
-        order=recorded_order, ttl_s=seconds, verified=entry["sig"] is not None,
+        order=recorded_order, ttl_s=recorded_ttl, verified=entry["sig"] is not None,
+        owner_run=bound_run, lease_default=lease_default or None,
         allow=ledger_allow, allow_profiles=ledger_profiles,
     )
     if renamed:
@@ -1337,8 +1806,10 @@ def arm(
         renamed=renamed,
         after_resume=resume_at if gate_kind == "ordered" else None,
         verified=entry["sig"] is not None,
-        ttl_s=seconds,
+        ttl_s=recorded_ttl,
         ledger=ledger_ok,
+        owner_run=bound_run,
+        lease_default=lease_default,
     )
 
 
@@ -1352,12 +1823,14 @@ def acquire(
     replace_owner: bool = False,
     actor: Optional[str] = None,
     order: Optional[str] = None,
+    owner_run: Any = None,
+    budget: Any = None,
 ) -> str:
     """Add ONE hold to this home's sentinel and return its handle.
 
     Thin back-compat wrapper over :func:`arm`, which carries the policy (attribution,
-    provenance, the order gate) and the facts; this keeps the long-standing ``-> str``
-    contract for in-tree callers that only need the handle.
+    provenance, the order gate, the ownership binding, the lease) and the facts; this keeps
+    the long-standing ``-> str`` contract for in-tree callers that only need the handle.
     """
     return arm(
         owner=owner,
@@ -1369,7 +1842,83 @@ def acquire(
         replace_owner=replace_owner,
         actor=actor,
         order=order,
+        owner_run=owner_run,
+        budget=budget,
     ).handle
+
+
+def renew(
+    handle: str,
+    ttl: Any = None,
+    budget: Any = None,
+    actor: Optional[str] = None,
+) -> RenewResult:
+    """Push a live hold's lease forward — the liveness proof of a run-owned hold (D2).
+
+    A run-owned hold is a LEASE: renewal is the only assertion that its owner is still alive
+    and still needs the section guarded, so *expiry means owner-dead within one lease period*.
+    The new deadline is set from ``ttl``, else from ``budget``,
+    else :data:`DEFAULT_SECTION_BUDGET_S` — and it never moves BACKWARD (a renewal cannot
+    shorten a lease it holds).
+
+    Renewal is fenced like an arm or a lift (:func:`arm_admission`): a delegated child or a
+    dispatched kanban worker may not keep a stop alive any more than it may start one.
+
+    A handle naming no live hold is reported ``stale`` and NOT created: a run that renews a
+    lease it does not hold would go on believing its section was guarded.
+    """
+    wanted = str(handle or "").strip()
+    if not wanted:
+        return RenewResult(handle="", message="renew needs a handle to renew")
+    admitted, _venue, refusal = arm_admission("renew")
+    if not admitted:
+        raise EstopRefusal(f"Refusing to renew a hold: {refusal}.")
+    actor_id = str(actor).strip() if actor else actor_handle()
+    state = read_state()
+    target = next((hold for hold in state.holds if hold["handle"] == wanted), None)
+    if target is None:
+        expired = [hold for hold in state.expired if hold["handle"] == wanted]
+        if expired:
+            detail = (f"handle '{wanted}' already expired at {expired[0].get('expires_at')} — "
+                      f"re-arm the section instead of renewing it")
+        else:
+            held = ", ".join(f"{hold['handle']} ({hold['mode']})" for hold in state.holds) or "none"
+            detail = f"handle '{wanted}' names no live hold — live holds: {held}"
+        return RenewResult(handle=wanted, stale=True, message=detail, actor=actor_id,
+                           owner_run=None)
+    now = datetime.now(UTC)
+    seconds = parse_duration(ttl) or parse_duration(budget) or DEFAULT_SECTION_BUDGET_S
+    current = _resolve_expiry(target.get("expires_at"))
+    deadline = now + timedelta(seconds=seconds)
+    if current is not None and current > deadline:
+        deadline, seconds = current, int((current - now).total_seconds())
+    sentinel = Path(target.get("path") or sentinel_path())
+    entry = dict(target)
+    entry["expires_at"] = deadline.isoformat()
+    entry["renewed_at"] = now.isoformat()
+    # Re-sign ONLY what we authored: an entry whose provenance did not verify must stay
+    # unverified, or a renewal would launder a hold we never issued into a signed one.
+    if entry.get("verified"):
+        entry["sig"] = _sign_fields(_canonical_fields(entry), sentinel)
+    existing, _defect = _read_holds(sentinel)
+    updated = [entry if hold["handle"] == wanted else hold for hold in existing]
+    if not _write_registry(sentinel, updated):
+        return RenewResult(handle=wanted, message=(
+            f"the renewal of '{wanted}' could not be written — the hold still expires at "
+            f"{target.get('expires_at')}"
+        ), expires_at=target.get("expires_at"), actor=actor_id,
+            owner_run=target.get("owner_run"))
+    ledger_ok = record_event(
+        "renew", sentinel=sentinel, path=target.get("path"), handle=wanted,
+        owner=target.get("owner"), actor=actor_id, mode=target.get("mode"),
+        owner_run=target.get("owner_run"), ttl_s=seconds, expires_at=deadline.isoformat(),
+        verified=bool(entry.get("verified")),
+    )
+    return RenewResult(
+        handle=wanted, renewed=True, expires_at=deadline.isoformat(), ttl_s=seconds,
+        owner_run=target.get("owner_run"), actor=actor_id, ledger=ledger_ok,
+        message=f"renewed '{wanted}' until {deadline.isoformat()} (lease {seconds}s)",
+    )
 
 
 def release(
@@ -1397,7 +1946,8 @@ def release(
 
     Each released hold is recorded in the ledger (D6) AFTER its file write succeeds, because
     D8's re-arm gate reads those rows; ``ReleaseResult.ledger`` is False when a row could not
-    be written.
+    be written. D5 — every row names its ``cause`` (:data:`RELEASE_CAUSES`): a released scope
+    stays readable after the sentinel body, the lane list and the deadline are all gone.
 
     FENCED: an unadmitted venue (a delegated child, a dispatched kanban worker) cannot lift
     a hold here — see :func:`arm_admission`. The internal deadman expiry path does NOT come
@@ -1425,6 +1975,7 @@ def release(
             )
         targets = list(state.holds)
         label = "every hold"
+        cause = "all"
     elif handle is not None:
         wanted = str(handle).strip()
         live = [hold for hold in state.holds if hold["handle"] == wanted]
@@ -1439,6 +1990,7 @@ def release(
                                  actor=actor_id)
         targets = live
         label = wanted
+        cause = "handle"
     else:
         owner_id = actor_id if owner is None else _normalize_owner(owner)
         if owner_id == ACTOR_OPERATOR and actor_id != ACTOR_OPERATOR:
@@ -1466,6 +2018,12 @@ def release(
             unverified_cleared = len(extra)
             targets = targets + extra
         label = f"owner '{owner_id}'"
+        # D5 — WHY. A bare lift is the caller releasing its OWN hold (``explicit``); the
+        # operator resuming their own stop is the ``operator-resume`` the ledger names for it;
+        # anything else naming an owner is an ``owner`` release.
+        cause = ("explicit" if owner is None
+                 else "operator-resume" if actor_id == ACTOR_OPERATOR
+                 else "owner")
         if not targets:
             held = ", ".join(sorted(state.owners)) or "none"
             return ReleaseResult(
@@ -1491,6 +2049,7 @@ def release(
             "release", sentinel=Path(target.get("path") or sentinel_path()),
             path=target.get("path"), handle=target["handle"], owner=target.get("owner"),
             actor=actor_id, mode=target.get("mode"), verified=bool(target.get("verified")),
+            cause=cause, owner_run=target.get("owner_run"),
             allow=target_allow, allow_profiles=list((target_allow or {}).get("profiles") or []),
         ) and ledger_ok
     after = read_state()
@@ -1511,6 +2070,7 @@ def release(
         actor=actor_id,
         unverified_cleared=unverified_cleared,
         ledger=ledger_ok,
+        cause=cause,
     )
 
 
@@ -1524,6 +2084,8 @@ def engage(
     replace_owner: bool = True,
     actor: Optional[str] = None,
     order: Optional[str] = None,
+    owner_run: Any = None,
+    budget: Any = None,
 ) -> Path:
     """Arm a hold on the ESTOP sentinel and return the sentinel path.
 
@@ -1540,8 +2102,9 @@ def engage(
 
     ``allow`` is ``{"user_ids": [...], "profiles": [...]}`` (either key optional, values
     coerced to strings); ``ttl`` accepts ``45m``/``90m``/``2h``/seconds and sets the
-    deadman, or pass ``expires_at`` (ISO-8601 / aware datetime) directly. An unusable ttl
-    still engages — it never half-arms a pause — and is reported by the CLI.
+    deadman, or pass ``expires_at`` (ISO-8601 / aware datetime) directly, or let the engine
+    apply the section ``budget`` (D2). An unusable ttl still engages — it never half-arms a
+    pause — and is reported by the CLI.
     """
     acquire(
         owner=owner,
@@ -1553,6 +2116,8 @@ def engage(
         replace_owner=replace_owner,
         actor=actor,
         order=order,
+        owner_run=owner_run,
+        budget=budget,
     )
     return sentinel_path()
 
@@ -1676,7 +2241,7 @@ def _resume_note(prior: Optional[dict]) -> str:
     since = str(prior.get("logged_at") or "")
     try:
         rows = read_events()
-    except Exception:  # noqa: BLE001 - a resume log line is never worth a failed tick
+    except Exception:
         rows = []
     for row in reversed(rows):
         if str(row.get("event") or "") != "release":
@@ -1685,9 +2250,9 @@ def _resume_note(prior: Optional[dict]) -> str:
             break
         who = str(row.get("actor") or row.get("owner") or "unknown")
         handle = row.get("handle")
-        return "released by %s%s" % (who, " (handle %s)" % handle if handle else "")
+        return f"released by {who}{f' (handle {handle})' if handle else ''}"
     if prior.get("expires_at"):
-        return "auto-resumed at its declared expiry (%s)" % prior["expires_at"]
+        return f"auto-resumed at its declared expiry ({prior['expires_at']})"
     return "cleared with no release event on record (sentinel removed out-of-band)"
 
 
@@ -1728,7 +2293,7 @@ def check_paused(component: str, logger: logging.Logger) -> bool:
                 _last_holds[component] = {
                     "mode": "estop", "reason": held.get("reason"),
                     "expires_at": held.get("expires_at"),
-                    "logged_at": datetime.now(timezone.utc).isoformat(),
+                    "logged_at": datetime.now(UTC).isoformat(),
                 }
         if first:
             hold = _dominant_hold(state)
@@ -1750,7 +2315,7 @@ def check_paused(component: str, logger: logging.Logger) -> bool:
             _last_holds[component] = {
                 "mode": "lockdown", "reason": held.get("reason"),
                 "expires_at": held.get("expires_at"),
-                "logged_at": datetime.now(timezone.utc).isoformat(),
+                "logged_at": datetime.now(UTC).isoformat(),
             }
     if first:
         lanes = ", ".join(sorted(state.allow_profiles)) or "(none)"

@@ -20,11 +20,14 @@ CLAUSE COVERAGE — where each clause of the card's contract is locked down
     clause 1  arm is scoped ....................... cited (live-line-only files, see below)
     clause 2  the hold survives a gateway bounce .. tests here, engine + process boundary
     clause 3  release lifts exactly its own handle  cited (tests/cron/test_estop*.py)
-    clause 4  a failed release cannot strand ....... tests here (RED today)
-    clause 5  no advertised TTL that is not enforced tests here (RED today) + a green guard
-    clause 6  every transition is observable ....... tests here: the explicit-release half
-                                                     PASSES, the DEADMAN half is RED today
-    clause 7  a leaked hold is detected ............ tests here (RED today)
+    clause 4  a failed release cannot strand ....... tests here (GREEN: engine t_b70753e9 —
+                                                     the arm is bound and leased, and the reaper
+                                                     releases the orphan)
+    clause 5  no advertised TTL that is not enforced tests here (GREEN: the default lease) + a
+                                                     green guard
+    clause 6  every transition is observable ....... tests here: the explicit-release half PASSES,
+                                                     the DEADMAN half is GREEN (an `expire` row)
+    clause 7  a leaked hold is detected ............ tests here (GREEN: `release{cause:orphan}`)
     clause 8  is_engaged() fails HELD on a stat err  cited: tests/cron/test_estop.py::
                                                       test_is_engaged_fails_safe_on_stat_error
 
@@ -33,12 +36,13 @@ Clauses 1 and 3 are cited, never duplicated: their covering tests live in the LI
 `tests/gateway/test_estop_allowlist.py`, `tests/hermes_cli/test_kanban_dispatch_lockdown.py`)
 as untracked files, so a checkout that does not carry them cannot verify the citation.
 
-THE FOUR RED CLAUSES ARE NOT SOFTENED
-    Each opens with ``xfail(strict=True)`` naming its card. That is an ENFORCED expectation,
-    not a pass: run ``--runxfail`` and the clause fails on today's bytes exactly as measured.
-    ``strict=True`` means the moment an engine fix lands, the test XPASSes and the file turns
-    RED again until the marker is deleted — so the marker cannot rot into a permanent excuse.
-    Nothing is skipped, weakened or asserted-away.
+THE RED CLAUSES ARE NOT SOFTENED — THEY ARE FIXED
+    Clauses 4, 5 (arm path), 6 (deadman half) and 7 each opened with ``xfail(strict=True)``
+    naming its card while the engine still leaked the hold. The engine fix landed (t_b70753e9:
+    the mandatory lease, the ownership binding, the deadman's ledger row and the independent
+    reaper), each clause XPASSed — which ``strict=True`` turns RED — and the markers were
+    DELETED here in the same change. Nothing is skipped, weakened or asserted-away, and no
+    clause is left xfail: a red run means the leak is back.
 
 ISOLATION (the card's DoD)
     Deterministic, headless, mutating NO live fleet state.  Every scenario runs in a fresh
@@ -234,9 +238,18 @@ def _s_leaked_detected(estop, root: Path, arm: dict) -> dict:
     """clauses 4 + 7: a leaked hold is DETECTED, or lifted, by machinery INDEPENDENT of the owner.
 
     Scenario, exactly like 2026-10-10: an unattended run armed the guard with NO ttl, the
-    process then exited without reaching its release step, and the section is over. The guard
-    must not still be pausing the fleet, and if it is, something must SAY SO.
+    process then exited without reaching its release step, and the section is over. The only
+    external evidence is the run ledger's terminal row — so the row is written HERE, where a
+    hermes-update run records itself (``<home>/run_details/*.jsonl``), exactly as the leaked
+    run's own terminal row would have been. The guard must not still be pausing the fleet, and
+    if it is, something must SAY SO.
     """
+    ledger = Path(root) / "home" / ".hermes" / estop.RUN_LEDGER_DIRNAME / "update-runs.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(
+        json.dumps({"run": SIM_RUN, "section": "hermes-update wind_down", "status": "dead"}) + "\n",
+        encoding="utf-8",
+    )
     state = estop.read_state()
     still = estop.is_engaged()
     rows = estop.read_events()
@@ -362,9 +375,6 @@ def test_clause5_a_ttl_that_is_passed_is_enforced_at_read_time(root):
     assert result["ok"], result["detail"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "clause 5 on the ARM PATH: the wind-down arm advertises 'TTL 90m' in its reason and records "
-    "no ttl_s at all (t_bc67bdef F1 / 2026-10-10 arm). Fix: engine t_b70753e9, carriers t_7ec6ade9."))
 def test_clause5_no_ttl_may_be_advertised_without_being_recorded(root):
     result = _run_scenario(root, "advertised_ttl", reason=SIM_REASON)
     assert result["ok"], result["detail"]
@@ -379,9 +389,6 @@ def test_clause6_an_explicit_release_writes_a_ledger_row(root):
     assert result["ok"], result["detail"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "clause 6 on the DEADMAN path: `_retire_hold` -> `_remove_holds` records nothing, so a hold "
-    "that self-lifted still leaves ['arm','arm_renamed'] (t_56a91192). Engine card t_b70753e9."))
 def test_clause6_a_deadman_lift_writes_a_ledger_row(root):
     result = _run_scenario(root, "deadman_row", timeout=180)
     assert result["ok"], result["detail"]
@@ -390,17 +397,11 @@ def test_clause6_a_deadman_lift_writes_a_ledger_row(root):
 # --------------------------------------------------------------------------- #
 # clauses 4 + 7 — the leaked-hold class (the falsifier of t_e4da9955)
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(strict=True, reason=(
-    "clause 4 root cause: a run-owned arm lands UNBOUNDED and names no owner a reaper could "
-    "check — expires_at=None, ttl_s=None, no ownership field. Engine card t_b70753e9."))
 def test_clause4_a_run_owned_arm_is_bounded_or_liveness_bound(root):
     result = _run_scenario(root, "run_bound")
     assert result["ok"], result["detail"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "clauses 4+7: owner DEAD, section over, and the fleet is still paused with no defect named "
-    "and no orphan release row — 2026-10-10 reproduced (t_0b3d7d87). Engine card t_b70753e9."))
 def test_clause4_and_7_a_hold_whose_owner_died_does_not_strand_the_fleet(root):
     armed = _run_scenario(root, "arm", reason=SIM_REASON)
     assert armed["ok"], armed["detail"]
