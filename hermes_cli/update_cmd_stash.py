@@ -171,6 +171,11 @@ def _clear_pending_autostash() -> None:
     _pending_autostash = None
 
 
+def _pending_autostash_count() -> Optional[int]:
+    """How many paths this run stashed, while its autostash is unsettled; ``None`` otherwise."""
+    return _pending_autostash[1] if _pending_autostash else None
+
+
 def _unrestored_autostash_notice() -> Optional[str]:
     """What to tell the user while this run's autostash is unsettled (#122557), else ``None``.
 
@@ -235,14 +240,28 @@ def _warn_orphaned_update_autostashes(git_cmd: list[str], cwd: Path) -> int:
         return 0
 
 
-def _record_stash_disposition(outcome: str, stash_ref: str, detail: str = "", *, chosen: bool = False) -> None:
+def _record_stash_disposition(
+    outcome: str, stash_ref: str, detail: str = "", *, chosen: bool = False,
+    conflicted: str = "", file_count: Optional[int] = None, unrestored: bool = False,
+) -> None:
     """Note the autostash disposition in the update receipt so a parked stash is visible
     to automation reading receipts instead of stdout (#115363: an update that ended with
     local changes parked in the stash reported a bare success with no trace of them).
-    A park the user did not ask for (``chosen``) keeps the stash unsettled (#122557)."""
+    A park the user did not ask for (``chosen``) keeps the stash unsettled (#122557).
+
+    ``unrestored`` marks the parks where the user's override set is NOT back in the tree and
+    nobody asked for that (a conflicted restore, an unknown untracked baseline): the run earns
+    the ``local_overrides_unrestored`` hard failure (update_hard_failure), which is what holds
+    the fleet restart and files the remediation card.
+    """
     global _pending_autostash
     if outcome != "parked" or chosen:
         _pending_autostash = None
+    if unrestored and outcome == "parked" and not chosen:
+        from hermes_cli.update_hard_failure import record_unrestored_local_changes
+
+        record_unrestored_local_changes(
+            stash_ref, file_count=file_count, conflicted=conflicted, detail=detail)
     from hermes_cli.update_receipt import record_step
     record_step(
         "local_changes_stash",
@@ -478,7 +497,9 @@ def _apply_stash(git_cmd: list[str], cwd: Path, stash_ref: str, checkout_move=No
     print(f"  Stash ref: {stash_ref}")
     print("Working tree reset to clean state.")
     print(f"Restore your changes later with: git stash apply {stash_ref}")
-    _record_stash_disposition("parked", stash_ref, "restore hit conflicts")
+    _record_stash_disposition("parked", stash_ref, "restore hit conflicts",
+                              conflicted=conflicted_files,
+                              file_count=_pending_autostash_count(), unrestored=True)
     return None  # code update succeeded; cmd_update continues (deps, skills, gateway)
 
 
@@ -525,7 +546,8 @@ def _restore_stashed_changes(
     if preexisting_untracked is None:
         print("  The stash was not restored because its cleanup baseline is unknown.")
         print(f"  Restore manually with: git stash apply {stash_ref}")
-        _record_stash_disposition("parked", stash_ref, "untracked baseline unknown")
+        _record_stash_disposition("parked", stash_ref, "untracked baseline unknown",
+                                  file_count=_pending_autostash_count(), unrestored=True)
         return False
     clean_import_failures = _critical_module_import_failures(cwd, report_runtime_errors=True)
     replaced = _apply_stash(git_cmd, cwd, stash_ref, checkout_move)
