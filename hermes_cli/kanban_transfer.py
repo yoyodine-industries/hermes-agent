@@ -289,12 +289,27 @@ def import_board(
     slug: Optional[str] = None,
     *,
     activate: bool = False,
+    approval: str = "",
 ) -> dict[str, Any]:
     """Import an archive as a NEW board (``slug`` overrides the archive's;
-    either way it auto-suffixes if taken). Returns a summary dict."""
+    either way it auto-suffixes if taken). Returns a summary dict.
+
+    This is a store-layer BULK load (a whole board store), so the operator's 2026-09-27 rule (card
+    t_bf9605f8) applies at THIS entry point too, not only at the CLI seam: the call is refused
+    unless ``approval`` names the approval bundle for exactly this archive (``hermes kanban
+    bulk-approvals ask --verb boards-import --scope "archive=<path>"``). ``board`` is empty by
+    design — a `boards import` action is board-agnostic (it CREATES a board), so the digest binds
+    the archive, the exact input, and the CLI derives the same digest.
+    """
     archive = Path(archive_path).expanduser()
     if not archive.exists():
         raise FileNotFoundError(f"archive not found: {archive}")
+
+    from hermes_cli import kanban_bulk_guard as kbg
+
+    kbg.assert_board_action_approved(
+        board="", sub_action="import", params={"archive": str(archive)}, approval=approval,
+    )
 
     roots = archive_root_dirs(archive)
     if len(roots) != 1:

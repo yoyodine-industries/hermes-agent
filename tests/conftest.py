@@ -1443,3 +1443,107 @@ def real_bash() -> str:
             if candidate.exists():
                 return str(candidate)
     return found or "bash"
+
+
+# ── Kanban create-time assignee gate (card t_c8ff9bc1) ──────────────────────
+# ``create_task`` REFUSES an assignee that names no live Hermes profile unless the
+# name is DECLARED in ``kanban.control_plane_assignees``. Kanban tests across the
+# suite invent assignees ("alice", "worker", "builder", ...) that are not real
+# profile dirs, so the suite declares every name legal by default. The gate's own
+# tests re-patch ``control_plane_assignee_names`` to a real/specific set and the
+# dispatcher's belt tests clear it, so the enforcement is still exercised.
+
+
+class _DeclareAllAssignees(frozenset):
+    """A declaration set that contains every name (the suite's test seam)."""
+
+    def __contains__(self, item) -> bool:  # noqa: D105
+        return True
+
+
+_DECLARE_ALL_ASSIGNEES = _DeclareAllAssignees()
+
+# The module objects every test file's own import bound at COLLECTION time. A test that
+# purges ``hermes_cli.*`` from ``sys.modules`` and re-imports it (test_kanban_lane_fair_spawn's
+# ``env`` fixture does) leaves those bindings pointing at now-orphaned objects while
+# ``sys.modules`` serves fresh ones — so a later file's monkeypatch lands on an object the code
+# under test does not call, and a door that raises ``policy.PriorityOutOfDomain`` off a stale
+# binding is no longer the class the caller resolves (measured: the estate board's dispatcher
+# spy missed every tick, one ceiling test spawned nothing, and three priority-policy door
+# tests saw two different exception classes). The seam restores the collected mapping once the
+# purging test is over, so every file keeps one set of modules.
+#
+# Captured LAZILY, on the first test of the session: at conftest-import time the test modules
+# have not been collected yet, so a module imported only by them (``kanban_priority_policy``)
+# would be missing from the map and could not be restored.
+_ORIGINAL_HERMES_MODULES: "dict[str, object] | None" = None
+
+
+def _capture_original_modules() -> None:
+    global _ORIGINAL_HERMES_MODULES
+    if _ORIGINAL_HERMES_MODULES is not None:
+        return
+    _ORIGINAL_HERMES_MODULES = {
+        _name: _mod for _name, _mod in sys.modules.items()
+        if _name.startswith("hermes_cli") or _name.startswith("hermes_state")
+        or _name == "hermes_constants"
+    }
+
+
+@pytest.fixture(autouse=True)
+def _kanban_declare_synthetic_assignees():
+    # Its OWN MonkeyPatch (not the function-scoped ``monkeypatch`` fixture): a test
+    # that calls ``monkeypatch.undo()`` must not be able to disarm the suite seam
+    # mid-test (test_kanban_worker_pid_fingerprint does exactly that).
+    mp = pytest.MonkeyPatch()
+    _capture_original_modules()
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        yield
+        return
+    # Patch EVERY reachable copy of the reader, not just the one ``sys.modules``
+    # currently holds: a test that purges ``hermes_cli.*`` from ``sys.modules`` and
+    # re-imports it (test_kanban_lane_fair_spawn's ``env`` fixture) leaves the test
+    # modules' own collected reference pointing at the PRE-purge object, so a patch
+    # applied only to the fresh one would leave that older object refusing the
+    # suite's synthetic assignees in every later file.
+    targets: list = []
+
+    def _collect(mod) -> None:
+        from types import ModuleType
+
+        if isinstance(mod, ModuleType) and mod not in targets:
+            if getattr(mod, "__name__", "").startswith("hermes_cli"):
+                targets.append(mod)
+
+    for _name, _mod in list(sys.modules.items()):
+        if _name.startswith("tests."):
+            for _value in list(vars(_mod).values()):
+                _collect(_value)
+        else:
+            _collect(_mod)
+    _collect(_kb)
+    for _mod in targets:
+        mp.setattr(_mod, "control_plane_assignee_names",
+                   lambda: _DECLARE_ALL_ASSIGNEES, raising=False)
+    try:
+        yield
+    finally:
+        mp.undo()
+        for _name, _mod in (_ORIGINAL_HERMES_MODULES or {}).items():
+            if sys.modules.get(_name) is not _mod:
+                sys.modules[_name] = _mod
+
+# ── Task-completion evidence gate: the suite declares `measure` ─────────────
+# The completion gate (``hermes_cli/kanban_gate_invariants.py``) refuses a completion that
+# declares no evidence class. Its kernel default is ``refuse`` — correct for a real board,
+# where a lane knows what backs its own claim. The suite is not a real board: these tests
+# close cards with no run and no artifact behind them by the hundred, and every one of them
+# would have to declare a class that means nothing. So the suite makes the same declaration a
+# migrating board makes in its own registry (``kanban/evidence_gate``): ``measure``.
+#
+# The refusal is NOT untested by this — the gate's own tests arm ``refuse`` explicitly
+# (tests/hermes_cli/test_kanban_gate_invariants.py), and so does every test of the refusal
+# vocabulary. ``setdefault``, never an assignment: a test that sets the variable itself wins.
+os.environ.setdefault("HERMES_KANBAN_EVIDENCE_GATE", "measure")

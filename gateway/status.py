@@ -506,6 +506,136 @@ def get_process_start_time(pid: int) -> Optional[int]:
     return _get_process_start_time(pid)
 
 
+def _psutil_init_boot_time() -> Optional[float]:
+    """psutil's OWN boot reference, captured when psutil was imported in this process.
+
+    ``psutil._psosx.adjust_proc_create_time`` shifts every macOS ``create_time()`` by
+    ``|INIT_BOOT_TIME - boot_time()|`` once the system clock has been updated: a process that imported
+    psutil before the update therefore reports creation times shifted against one that imported after
+    it, for the SAME live process. That shift is what makes a start-time fingerprint recorded by one
+    reader fail to match the read of another (#123811). Undoing it needs the exact constant psutil used,
+    so read it from psutil rather than re-deriving it.
+    """
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return None
+    for mod_name in ("_psosx", "_psbsd"):
+        init = getattr(getattr(psutil, mod_name, None), "INIT_BOOT_TIME", None)
+        if init:
+            return float(init)
+    return None
+
+
+def get_process_uptime_start_time(pid: int) -> Optional[int]:
+    """Start time of ``pid`` expressed as centiseconds since BOOT: the reference-invariant twin of
+    :func:`get_process_start_time`.
+
+    The absolute form is not safe to compare over time on platforms without ``/proc``. On macOS
+    ``psutil.Process.create_time()`` is an epoch timestamp that two different readers can disagree
+    about by seconds after a ``kern.boottime`` adjustment (psutil compensates with the boot reference
+    it read at its own import), so a recorded absolute start stops matching the live one for the SAME
+    process — which a liveness check then reads as "the PID was recycled". Subtracting the same boot
+    reference the reading was built from leaves the boot-relative start. Linux ``/proc`` field 22 is
+    already boot-relative and is returned unchanged. ``None`` when the start time (or, off Linux, the
+    boot reference) cannot be read: callers must treat that as "cannot certify identity", never as a
+    difference.
+
+    NOTE the reference itself is NOT invariant on macOS: ``kern.boottime`` moves with the system clock,
+    so two readings of the same live process only agree while that reference holds. Use
+    :func:`get_process_uptime_fingerprint` when the reference has to be RECORDED alongside the start,
+    which is what lets a later reader tell "the PID was recycled" from "the reference moved".
+    """
+    fingerprint = get_process_uptime_fingerprint(pid)
+    if fingerprint is None:
+        return None
+    return fingerprint[1]
+
+
+def get_process_uptime_fingerprint(pid: int) -> Optional[tuple[int, int]]:
+    """``(boot reference, uptime-relative start)`` in centiseconds, read against ONE reference.
+
+    The start half is what :func:`get_process_uptime_start_time` returns; the reference half is the
+    value it is expressed against — off Linux the ``kern.boottime`` psutil read from, ``0`` on Linux
+    (``/proc`` field 22 is already boot-relative and cannot move).
+
+    Both halves are returned so a caller can PERSIST the reference with the identity it records: two
+    start readings only compare while both were built against the same reference. macOS moves
+    ``kern.boottime`` with the system clock (it is recomputed so uptime stays continuous), which
+    shifts every start recorded before the move by exactly the move — measured on this host as an
+    8.00 s move that put two live workers 800 cs out of their own fingerprints (#124570). Read once
+    here so the pair is internally consistent. ``None`` when either half cannot be read.
+    """
+    start = _get_process_start_time(pid)
+    if start is None:
+        return None
+    if sys.platform == "linux":
+        return 0, int(start)
+    try:
+        import psutil  # type: ignore
+        live_boot = float(psutil.boot_time())
+    except Exception:
+        return None
+    init_boot = _psutil_init_boot_time()
+    shift_cs = 0 if not init_boot else int(round(abs(init_boot - live_boot) * 100))
+    reference_cs = int(round(live_boot * 100))
+    return reference_cs, int(start) - reference_cs - shift_cs
+
+
+def _darwin_boot_session_uuid() -> str:
+    """``kern.bootsessionuuid`` — a fresh UUID per boot, unaffected by clock/boottime adjustments."""
+    try:
+        proc = subprocess.run(
+            ["sysctl", "-n", "kern.bootsessionuuid"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def host_boot_witness() -> str:
+    """Identity of the CURRENT boot, for pairing with an uptime-relative start.
+
+    A boot-relative start alone does not survive a reboot: the tick value recurs, so a row written
+    before the reboot can match an unrelated process on the same PID. The witness is what makes the
+    pair collision-free, and it must itself be immune to the clock/boottime adjustments that move every
+    absolute timestamp — a witness that moves would turn "the clock was corrected" into "the worker
+    died". Preference order is by that property:
+
+    * Linux: ``boot_id`` (plus the PID-1 start) — regenerated per boot, never adjusted.
+    * macOS: ``kern.bootsessionuuid`` — a fresh UUID per boot session.
+    * Anything else: the boot epoch itself, which a clock step DOES move; callers comparing two
+      ``boottime:`` witnesses must allow :data:`START_TIME_DRIFT_TOLERANCE` (see
+      ``kanban_db_dispatch._witnesses_agree``).
+
+    Empty string means "no witness available", which a caller must read as "cannot certify identity".
+    """
+    try:
+        from gateway.drain_control import current_instantiation_epoch
+        epoch = current_instantiation_epoch()
+    except Exception:
+        epoch = ""
+    if epoch:
+        return str(epoch)
+    if sys.platform == "darwin":
+        session_uuid = _darwin_boot_session_uuid()
+        if session_uuid:
+            return f"bootsession:{session_uuid}"
+    try:
+        import psutil  # type: ignore
+        boot = int(round(float(psutil.boot_time()) * 100))
+    except Exception:
+        return ""
+    return f"boottime:{boot}" if boot > 0 else ""
+
+
 def _read_process_cmdline(pid: int) -> Optional[str]:
     """Process command line as one string: /proc, then psutil, then ``ps``.
 
@@ -553,8 +683,10 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
         return None
     basenames = [t.rsplit("/", 1)[-1] for t in tokens]
     # ``python -c <src> … -m hermes_cli.main gateway run``: the trailing argv belongs to the program
-    # the inline source will spawn later, not to this process (#107002). Case-preserving tokens:
-    # the operand-taking ``-X``/``-W``/``-Q`` must not be conflated with ``-q``/``-b``.
+    # the inline source will spawn later, not to this process (#107002) -- unless the source is a
+    # Hermes bootstrap running the entry point in THIS process (store launcher, published launcher
+    # script, venv_sync re-entry): then its argv IS this process's own (#124318). Case-preserving
+    # tokens: the operand-taking ``-X``/``-W``/``-Q`` must not be conflated with ``-q``/``-b``.
     if command_line_runs_inline_source(cased_tokens):
         # …unless the source is a Hermes bootstrap running the entry point in THIS process (store
         # launcher, launcher script, venv_sync re-entry): then its argv is this process's (#124318).
@@ -1105,6 +1237,55 @@ def _coerce_session_store(session_store: Any) -> dict[str, str]:
     return {"status": state if state in {"ok", "unavailable", "retrying"} else "unknown"}
 
 
+def _downgrade_foreign_life_platforms(
+    platforms: dict[str, Any], current_record: dict[str, Any],
+    loaded_record: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """B1: keep a platform verdict only if it can prove it belongs to THIS process life.
+
+    ``gateway_state.json`` outlives its writer, so the first write of a new life merges into the
+    PREVIOUS life's record. ``clear_profile_platforms`` only ever dropped ``<profile>:``-keyed
+    entries, so the default profile's OWN (flat) adapters — ``api_server`` among them — survived a
+    restart carrying the DEAD life's verdict beside the NEW life's ``pid``/``start_time``/
+    ``updated_at``: a false green no reader could detect from the file alone.
+
+    At a life boundary — the record being merged into names a different ``(pid, start_time)`` —
+    every inherited entry that cannot name THIS life is re-stamped ``starting`` (never a healthy
+    state; see ``web_routers.status._HEALTHY_PLATFORM_STATES``) with the old verdict parked under
+    ``stale_*``. The entry's writer identity moves to the current life so readers serve the honest
+    ``starting`` state instead of dropping the platform entirely. Entries with NO writer stamps
+    fail closed. Colon-keyed and flat keys are treated identically. When there is no boundary (the
+    record is this life's, or carries no identity at all) every entry is left untouched, which
+    keeps ``clear_profile_platforms`` and the stopped-gateway behaviour byte-for-byte.
+    """
+    if not isinstance(platforms, dict):
+        return {}
+    loaded = loaded_record if isinstance(loaded_record, dict) else {}
+    current_pid = current_record.get("pid")
+    current_start = current_record.get("start_time")
+    has_loaded_identity = loaded.get("pid") is not None or loaded.get("start_time") is not None
+    if not has_loaded_identity or (
+        loaded.get("pid") == current_pid and loaded.get("start_time") == current_start
+    ):
+        return platforms
+    for value in platforms.values():
+        if not isinstance(value, dict):
+            continue
+        if (value.get("writer_pid") == current_pid
+                and value.get("writer_start_time") == current_start):
+            continue
+        old_state = value.get("state")
+        old_pid = value.get("writer_pid")
+        old_start = value.get("writer_start_time")
+        value.update(
+            state="starting", error_code=None, error_message=None, needs_attention=False,
+            stale_state=old_state, stale_writer_pid=old_pid,
+            stale_writer_start_time=old_start,
+            writer_pid=current_pid, writer_start_time=current_start,
+        )
+    return platforms
+
+
 def _prepare_runtime_status_update(
     *, gateway_state: Any = _UNSET, exit_reason: Any = _UNSET, restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET, active_work: Any = _UNSET, platform: Any = _UNSET, platform_state: Any = _UNSET,
@@ -1139,6 +1320,12 @@ def _prepare_runtime_status_update(
                 if not isinstance(k, str) or ":" not in k
                 or (drop_prefix is not None and not k.startswith(drop_prefix))
             }
+        # A platform verdict may not survive a gateway life boundary. Deliberately here, at the one
+        # chokepoint every writer passes (boot write, per-platform publishes, the quiet writer), so
+        # no future call site can reintroduce the false green; ``clear_profile_platforms`` above
+        # only ever reached ``<profile>:``-keyed entries (see the helper's docstring).
+        payload["platforms"] = _downgrade_foreign_life_platforms(
+            payload["platforms"], current_record, previous_payload)
         payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
         payload["updated_at"] = _utc_now_iso()
         payload.update(_get_code_identity_fields())
@@ -1246,6 +1433,49 @@ def runtime_status_heartbeat_age_s(record: Optional[dict[str, Any]]) -> Optional
 def runtime_status_pid_is_live(record: Optional[dict[str, Any]]) -> bool:
     """True when the snapshot's PID is alive and passes the start-time PID-reuse guard."""
     return _live_pid_from_record(record) is not None
+
+
+def runtime_platforms_owned_by(platforms: Any, live_pid: Any, live_start: Any) -> dict[str, Any]:
+    """Platform entries of ``platforms`` written by the process ``(live_pid, live_start)``.
+
+    The single home of the gateway's writer-identity predicate. Gateway startup preserves plain
+    platform entries across restarts, so a runtime-status platform map can carry a DEAD life's
+    verdict; ownership is exact ``(writer_pid, writer_start_time)`` equality — the same PID-reuse
+    fingerprint the liveness checks use — never a clock heuristic. Fails closed: an entry with no
+    writer stamps, or a caller that cannot name the live process, is not owned.
+    """
+    if not isinstance(platforms, dict) or live_pid is None or live_start is None:
+        return {}
+    return {
+        key: value for key, value in platforms.items()
+        if isinstance(value, dict)
+        and value.get("writer_pid") == live_pid
+        and value.get("writer_start_time") == live_start}
+
+
+def own_profile_platforms_owned_by(runtime: Any, live_pid: Any) -> dict[str, Any]:
+    """A runtime record's OWN platform map, filtered to entries the live process wrote.
+
+    Own-profile readers project the RAW map, so a live-pid record could carry a previous, dead
+    life's flat-platform verdict (``api_server: connected`` for a server the current process never
+    bound) and certify it healthy. Ownership is the record's OWN declared ``(pid, start_time)`` —
+    the exact pair ``write_runtime_status`` stamps into every platform entry — trusted only while
+    the resolved live pid agrees, so a lagging record can never drop a live process's entries.
+    Identity that cannot be certified (unknown live pid, missing/None declared identity,
+    cross-container record) returns the map unchanged: the callers' dead/startup_failed arms
+    already cover the not-running cases, and a false drop is the worse failure mode.
+    """
+    platforms = runtime.get("platforms") if isinstance(runtime, dict) else None
+    if not isinstance(platforms, dict):
+        return {}
+    if not platforms:
+        return platforms
+    declared_pid = runtime.get("pid")
+    declared_start = runtime.get("start_time")
+    if (live_pid is None or declared_pid is None or declared_start is None
+            or declared_pid != live_pid):
+        return platforms
+    return runtime_platforms_owned_by(platforms, declared_pid, declared_start)
 
 
 def parse_active_agents(raw: Any) -> int:
