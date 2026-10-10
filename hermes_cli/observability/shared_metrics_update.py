@@ -102,7 +102,13 @@ def _named_stop(receipt: dict[str, Any], stages: list[dict[str, Any]]) -> str | 
     ``stop_class`` a pre-apply exit recorded (read only while nothing was applied)."""
     from .shared_metrics_contract import UPDATE_STOP_CLASSES
 
-    if receipt.get("outcome") == "partial" and receipt.get("user_action"):
+    # A committed run owing the user's parked changes (``partial``), or the hard failure where the
+    # stashed override set was not restored at all (``failed``, update_hard_failure): both name the
+    # same class, and for the latter the receipt is deliberately not ``partial`` so no downstream
+    # verifier reconciles it back to green.
+    if receipt.get("user_action") and (
+            receipt.get("outcome") == "partial"
+            or _unrestored_local_changes(receipt) is not None):
         # Committed; only the user's stashed changes are owed (record_user_action, exit 1). Since C3
         # this is the only ``partial`` a receipt gets; older releases' verification wrote it too.
         return "local_changes_parked"
@@ -110,6 +116,13 @@ def _named_stop(receipt: dict[str, Any], stages: list[dict[str, Any]]) -> str | 
     if stop_class in UPDATE_STOP_CLASSES and not any(s["name"] == "apply" for s in stages):
         return stop_class
     return None
+
+
+def _unrestored_local_changes(receipt: dict[str, Any]) -> dict[str, Any] | None:
+    """``update_hard_failure.unrestored_local_changes`` without importing it at module scope."""
+    from hermes_cli.update_hard_failure import unrestored_local_changes
+
+    return unrestored_local_changes(receipt)
 
 
 def update_failure_class(receipt: dict[str, Any], stages: list[dict[str, Any]], outcome: str) -> str:
