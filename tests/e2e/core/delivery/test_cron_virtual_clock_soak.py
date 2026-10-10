@@ -579,7 +579,8 @@ def _run_scenario(sc: Scenario, soak_env) -> dict[str, int]:
     tmp_path, hermes_home, monkeypatch = soak_env
     monkeypatch.setenv("TZ", sc.process_tz)
     time.tzset()
-    lines = ["platforms:", "  telegram:", "    enabled: true", "    token: fake-soak-token"]
+    lines = ["model:", "  default: soak-model",  # card t_2dd613e1: an agent job needs a resolvable model at ARM time
+             "platforms:", "  telegram:", "    enabled: true", "    token: fake-soak-token"]
     if sc.hermes_tz:
         lines.insert(0, f"timezone: {sc.hermes_tz}")
     (hermes_home / "config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -635,6 +636,7 @@ def test_two_replicas_contend_for_every_fire(soak_env):
     monkeypatch.setenv("TZ", "UTC")
     time.tzset()
     (hermes_home / "config.yaml").write_text(
+        "model:\n  default: soak-model\n"  # card t_2dd613e1: agent jobs resolve a model at ARM time
         "platforms:\n  telegram:\n    enabled: true\n    token: fake-soak-token\n", encoding="utf-8")
     control = H.Control(tmp_path / "control").ensure()
     from cron import jobs

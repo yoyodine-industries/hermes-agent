@@ -3,6 +3,17 @@ from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 
 import pytest
+
+
+# --- Arm-time model default (card t_2dd613e1) -----------------------------------
+# ``cron.jobs`` now RESOLVES an agent-mode job's model at ARM time (job.model -> this profile's
+# config.yaml model.default -> the INSTALL ROOT's config.yaml model.default -> HERMES_MODEL) and
+# REFUSES a job that resolves none, so an agent-mode create needs a resolvable model. These tests
+# run in the hermetic sandbox home (no config.yaml, no HERMES_MODEL), so they pin the same default
+# the ``tests/cron`` suite pins for its run_job tests (tests/cron/conftest.py, #23979).
+@pytest.fixture(autouse=True)
+def _default_cron_test_model(monkeypatch):
+    monkeypatch.setenv("HERMES_MODEL", "test-cron-default-model")
 from croniter import croniter
 
 from cron.blueprint_catalog import CATALOG, fill_blueprint, get_blueprint

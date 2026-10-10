@@ -1619,9 +1619,10 @@ class _CronJobConfig:
 
 def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
     """Load config.yaml and resolve the run's model: per-job pin > cron.model (fleet default) >
-    the main agent model (config ``model:``, then HERMES_MODEL). Re-read every tick (no cache) so
-    ``hermes cron edit --model`` and ``hermes model`` both apply next tick."""
-    model = job.get("model") or cron_env_setting("HERMES_MODEL") or ""
+    this profile's ``model.default`` > the INSTALL ROOT's ``model.default`` > HERMES_MODEL.
+    Re-read every tick (no cache) so ``hermes cron edit --model`` and ``hermes model`` both apply
+    next tick. The model half is ``cron.jobs.resolve_agent_model`` — the SAME resolver the
+    arm-time guard uses, so a job the arm door accepted cannot die here (card t_2dd613e1)."""
     _cron_default_provider = ""
     _cfg: dict = {}
     _model_cfg: Any = {}
@@ -1633,21 +1634,17 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             # Coerce null to {} so a falsy default never clobbers a resolved env value.
             _model_cfg = _cfg.get("model") or {}
             _cron_cfg_for_model = _cfg.get("cron") or {}
-            _cron_default_model = ""
             if isinstance(_cron_cfg_for_model, dict):
-                _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
                 _cron_default_provider = str(_cron_cfg_for_model.get("model_provider") or "").strip()
-            if not job.get("model"):
-                if _cron_default_model:
-                    model = _cron_default_model
-                else:
-                    # The main agent model: ``model: <name>`` shorthand or ``model.default``.
-                    _main = _model_cfg if isinstance(_model_cfg, str) else (
-                        _model_cfg.get("default") or _model_cfg.get("model") or _model_cfg.get("name")
-                        if isinstance(_model_cfg, dict) else "")
-                    model = str(_main or "").strip() or model
     except Exception as e:
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+
+    # One resolver, shared with the arm-time guard (card t_2dd613e1). A profile config OVERRIDES
+    # the install root's default; it does not ERASE it, so a profile that declares no ``model``
+    # key inherits the root's ``model.default`` — a pre-existing dead carrier HEALS at the next
+    # tick instead of dying at fire time with its one-shot repetition already consumed.
+    from cron.jobs import resolve_agent_model
+    model = resolve_agent_model(job.get("model"), home=_get_hermes_home())
 
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400.
     # See #23979.

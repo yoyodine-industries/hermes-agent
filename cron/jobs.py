@@ -1684,6 +1684,109 @@ def _normalize_job_optional_text(
     return (value.strip().rstrip("/") if strip_trailing_slash else value.strip()) or None
 
 
+# --- Agent-mode model resolution (card t_2dd613e1) ------------------------------
+# An agent-mode cron job must RESOLVE a model at ARM time rather than die at FIRE time
+# (#23979's fail-fast guard raised inside the tick, after the one-shot's single
+# repetition had already been consumed, so the carrier could never fire again). The
+# precedence is: per-job pin -> this profile's ``cron.model`` fleet default -> this
+# profile's ``config.yaml model.default`` -> the INSTALL ROOT's ``config.yaml
+# model.default`` -> ``HERMES_MODEL``. A profile config OVERRIDES the root default; it
+# does not ERASE it, so a profile that declares no ``model`` key inherits the install's.
+_AGENT_MODEL_UNRESOLVED = (
+    "Cron job '{name}' is an agent-mode job but no model resolves for it: job.model is "
+    "unset, this profile's config.yaml declares no model.default, the install-root "
+    "config.yaml declares none either, and HERMES_MODEL is empty. Refused at ARM time "
+    "because it would die at FIRE time. Set a per-job model "
+    "(`hermes cron edit {job_id} --model <name>`) or a default (`hermes model <name>`)."
+)
+
+
+def _effective_config_for_home(home: Path) -> dict[str, Any]:
+    """Effective ``config.yaml`` for *home* (no ``DEFAULT_CONFIG`` merge); ``{}`` when absent or broken."""
+    cfg_path = Path(home) / "config.yaml"
+    try:
+        if not cfg_path.exists():
+            return {}
+        from hermes_cli.config_effective import load_user_config_effective
+        return load_user_config_effective(cfg_path) or {}
+    except Exception:
+        return {}
+
+
+def _model_default_from_config(cfg: dict[str, Any]) -> str:
+    """The model one config layer declares: ``cron.model`` fleet default, else ``model.default``
+    (or the ``model: <name>`` / ``model.model`` / ``model.name`` shorthand). ``""`` when unset."""
+    cron_cfg = cfg.get("cron")
+    if isinstance(cron_cfg, dict):
+        fleet = _normalize_job_optional_text(cron_cfg.get("model"))
+        if fleet:
+            return fleet
+    model_cfg = cfg.get("model")
+    if isinstance(model_cfg, str):
+        return _normalize_job_optional_text(model_cfg) or ""
+    if isinstance(model_cfg, dict):
+        for key in ("default", "model", "name"):
+            value = _normalize_job_optional_text(model_cfg.get(key))
+            if value:
+                return value
+    return ""
+
+
+def _install_root_for_home(home: Path) -> Optional[Path]:
+    """The install root owning *home*, or ``None`` when *home* IS the root (no fallback to make).
+
+    ``<root>/profiles/<name>`` -> ``<root>``; a Docker/custom root resolves the same way through
+    ``get_default_hermes_root()`` (which maps ``<root>/profiles/<name>`` back to ``<root>``).
+    """
+    home = Path(home)
+    if home.parent.name == "profiles":
+        return home.parent.parent
+    try:
+        from hermes_constants import get_default_hermes_root
+        root = Path(get_default_hermes_root())
+        return None if root.resolve(strict=False) == home.resolve(strict=False) else root
+    except Exception:
+        return None
+
+
+def resolve_agent_model(job_model: Any = None, *, home: Optional[Path] = None) -> str:
+    """The model an agent-mode cron job will actually run on, or ``""`` when nothing resolves.
+
+    ONE resolver shared by the arm-time guard (:func:`_require_agent_model`) and the fire-time
+    loader (``cron.scheduler._load_cron_job_config``), so the two can never disagree and a job the
+    arm door accepts cannot die at fire. ``home`` is the profile home to resolve against at call
+    time (the scheduler passes its own ``_get_hermes_home()`` so its test override is honoured).
+    """
+    explicit = _normalize_job_optional_text(job_model)
+    if explicit:
+        return explicit
+    home = Path(home) if home is not None else get_hermes_home()
+    model = _model_default_from_config(_effective_config_for_home(home))
+    if not model:
+        root = _install_root_for_home(home)
+        if root is not None:
+            model = _model_default_from_config(_effective_config_for_home(root))
+    if not model:
+        model = _normalize_job_optional_text(cron_env_setting("HERMES_MODEL")) or ""
+    return model
+
+
+def _require_agent_model(
+    *, model: Any, no_agent: bool, name: Optional[str], job_id: str
+) -> None:
+    """Refuse by name an agent-mode job that resolves no model (arm-time guard, card t_2dd613e1).
+
+    Called at every ARM door — create_job, the arming branches of update_job, and rearm_oneshot.
+    A ``no_agent`` script job needs no model; bookkeeping updates and the fire path are never
+    routed here, so a row that predates the guard still fires and is still pausable.
+    """
+    if no_agent:
+        return
+    if resolve_agent_model(model):
+        return
+    raise ValueError(_AGENT_MODEL_UNRESOLVED.format(name=name or job_id, job_id=job_id))
+
+
 def _normalize_base_url(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value, strip_trailing_slash=True)
 
@@ -1888,6 +1991,13 @@ def create_job(
     name = name or label_source[:50].strip()
     if pinned and not f["model"]:
         f["provider"], f["model"] = _main_model_pin()
+    # Arm-time model guard (card t_2dd613e1): an agent-mode job that resolves no model is refused
+    # BY NAME here, at the door, instead of dying inside the first tick with its one-shot
+    # repetition already consumed. A PAUSED create is a staging write (a shipped distribution's
+    # jobs, the operator-approval queue), not an arm — the enable door re-checks it on resume.
+    if not paused:
+        _require_agent_model(
+            model=f["model"], no_agent=f["no_agent"], name=name, job_id=job_id)
     next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, name, schedule, "")
 
     job = {
@@ -2108,6 +2218,31 @@ def _fill_missing_next_run(updated: dict[str, Any]) -> None:
     updated["next_run_at"] = next_run
 
 
+# Update keys that (re)ARM an agent-mode job, so the arm-time model guard must run on the MERGED
+# record. Deliberately narrow: an explicit model/provider/pin change, a mode flip, or the enable
+# door (pause/resume/run-now). Bookkeeping writes — last_status/next_run_at/last_delivery_*/
+# monitor_state — are NOT here, because a row that predates the guard must still fire and must
+# still be pausable (pausing a dead row is the first half of the repair).
+_ARM_TRIGGER_FIELDS = frozenset({"model", "provider", "pinned", "no_agent"})
+
+
+def _update_arms_agent_model(updated: dict[str, Any], updates: dict[str, Any]) -> bool:
+    """True when this update puts an agent-mode job on the schedule (card t_2dd613e1).
+
+    A PAUSE (``enabled`` False / ``state`` paused) is never an arming write, so a dead job stays
+    pausable; a RESUME/run-now (``enabled`` True and not paused) is.
+    """
+    if updated.get("no_agent"):
+        return False
+    if _ARM_TRIGGER_FIELDS.intersection(updates):
+        return True
+    return (
+        "enabled" in updates
+        and bool(updated.get("enabled"))
+        and updated.get("state") != "paused"
+    )
+
+
 def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # ``id`` is a path component under OUTPUT_DIR — changing it would leak path-escape values.
@@ -2130,6 +2265,14 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
                 _normalize_job_optional_text(updated.get("script")))
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
+        # Arm-time model guard on the ENABLE door (card t_2dd613e1): a write that (re)arms an
+        # agent-mode job is refused if no model resolves for the merged record. Bookkeeping
+        # updates and pauses never reach it, so a pre-existing dead row still fires and is still
+        # pausable; the refusal persists nothing (it raises before save_jobs below).
+        if _update_arms_agent_model(updated, updates):
+            _require_agent_model(
+                model=updated.get("model"), no_agent=bool(updated.get("no_agent")),
+                name=updated.get("name"), job_id=job_id)
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
             # next_run_at now follows the new schedule; a stale quota_hold_until would only shield
@@ -2275,6 +2418,11 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[dict[str, Any]]:
             schedule=parsed_schedule, schedule_display=parsed_schedule.get("display", str(run_at)),
             repeat=repeat, run_claim=None, fire_claim=None)
         _activate_job_record(job)
+        # Re-arming a one-shot is the same arm door as create/enable (card t_2dd613e1): the
+        # released executor was re-armed here.
+        _require_agent_model(
+            model=job.get("model"), no_agent=bool(job.get("no_agent")),
+            name=job.get("name"), job_id=job_ref["id"])
         job["next_run_at"] = next_run_at
         save_jobs(jobs)
         return _normalize_job_record(job)
