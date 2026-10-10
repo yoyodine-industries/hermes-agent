@@ -1,9 +1,13 @@
 """Task graph initialization and atomic decomposition persistence."""
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:  # typing only: importing kanban_db here would close an import cycle
+    from hermes_cli.kanban_db import DecomposeRefusal, TriageEscalationRefusal
 
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
@@ -87,10 +91,75 @@ def _validate_children_graph(children: list) -> None:
         raise ValueError("cyclic dependency detected in decomposed children list")
 
 
+def _text(value: Any) -> str:
+    """Read a column real board stores hold as either TEXT or BLOB.
+
+    Measured 2026-09-21: the ops store carries comment bodies as BLOB, so a regex
+    run straight over them raises TypeError ("cannot use a string pattern on a
+    bytes-like object"). A guard that crashes the decomposer is worse than none.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return value or ""
+
+
+# The fan-out is the one destructive door out of `triage`: the root's body is
+# rewritten into children, so a design spec consumed that way is gone -- what the
+# designer wrote is replaced by the model's paraphrase of it. Two deliberately
+# narrow mechanical clauses, because `triage` exists to shred genuinely
+# under-specified work and the guard must not disable that:
+#   * a comment authored by an identity OTHER than the assignee -- a designer or
+#     another lane has already engaged with the card; or
+#   * an explicit frozen marker in the title, body or a comment -- the
+#     deliberate, reassignment-proof form, since the assignee can change and
+#     silently erase the comment clause's signal.
+# Measured over the seven live board stores (read-only, 2026-09-21): of the 61
+# cards that have ever been in `triage`, 44 match the comment clause and 7 match
+# the marker (114 of the 1573 never-triage cards contain the word at all, so it
+# is prose-adjacent rather than a hair trigger); only 2 of the 61 have the
+# disposition sweep's own `kanban-disposition` as their sole foreign commenter,
+# so the comment clause is not a proxy for "a machine touched this card".
+_SPEC_MARKER_RE = re.compile(r"\bfrozen\b", re.IGNORECASE)
+
+
+def spec_carrying_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Short reason ``task_id`` carries a design spec, or None when it is ordinary.
+
+    Read-only and cheap, so a caller can decide BEFORE spending an auxiliary LLM
+    call on a decomposition it would have to throw away.
+    """
+    row = conn.execute(
+        "SELECT title, body, assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    assignee = row["assignee"]
+    title, body = _text(row["title"]), _text(row["body"])
+    foreign, comments = set(), []
+    for comment in conn.execute(
+        "SELECT author, body FROM task_comments WHERE task_id = ?", (task_id,),
+    ):
+        author = _text(comment["author"])
+        comments.append(_text(comment["body"]))
+        if author and author != assignee:
+            foreign.add(author)
+    if foreign:
+        return ("spec-carrying: %s (not the assignee) commented on it"
+                % ", ".join(sorted(foreign)))
+    if _SPEC_MARKER_RE.search(title):
+        return "spec-carrying: explicit frozen marker in the title"
+    if _SPEC_MARKER_RE.search(body):
+        return "spec-carrying: explicit frozen marker in the body"
+    if any(_SPEC_MARKER_RE.search(c) for c in comments):
+        return "spec-carrying: explicit frozen marker in a comment"
+    return None
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
     author: Optional[str] = None, auto_promote: bool = True,
-) -> Optional[list[str]]:
+    allow_off_board_ask: bool = False,
+) -> Optional[list[str] | TriageEscalationRefusal | DecomposeRefusal]:
     """Fan a triage task out into children and move the root to ``todo``; the root
     waits on every child and wakes (``ready``) when all are done.
 
@@ -98,7 +167,13 @@ def decompose_triage_task(
     ``parents`` (indices into this list), optional workspace overrides.
     Returns child ids in input order, or None when the root is missing / not
     in triage, or has already decomposed. Atomic: malformed entries abort fan-out.
+
+    A root the block-loop breaker parked returns a ``TriageEscalationRefusal`` (falsy)
+    instead: it is an escalation for a human, and fanning it out would hand the same
+    unchanged card back to the board — where it blocks again and manufactures another
+    graph of children that inherit the failing context.
     """
+    from hermes_cli import kanban_db as kb_triage
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
         write_txn, recompute_ready,
@@ -120,6 +195,24 @@ def decompose_triage_task(
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
+        # Refuse a spec-carrying card BEFORE anything is spawned, and leave the diagnosis on the
+        # card: the scheduled drain re-sees every triage card it can decompose, so the evidence
+        # is written once per card rather than once per attempt.
+        spec_refusal = spec_carrying_reason(conn, task_id)
+        if spec_refusal:
+            if not conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decompose_refused' LIMIT 1",
+                (task_id,),
+            ).fetchone():
+                _append_event(conn, task_id, "decompose_refused", {"reason": spec_refusal})
+            return None
+        # Guard before the fan-out: both refusals are decided inside this txn, so neither a
+        # concurrent escalation nor a record that now says the work is already decided
+        # (approved / superseded / in review / live branch / live run) can slip a graph
+        # past it. The record refusal is also WRITTEN here, so it survives the attempt.
+        refusal = kb_triage.decompose_refusal_guard(conn, task_id, author=author)
+        if refusal is not None:
+            return refusal
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.
         if conn.execute(
@@ -128,19 +221,22 @@ def decompose_triage_task(
         ).fetchone():
             return None
         child_ids = [
-            _insert_decomposed_child(conn, task_id, root_row, child, author, now)
+            _insert_decomposed_child(
+                conn, task_id, root_row, child, author, now,
+                allow_off_board_ask=allow_off_board_ask,
+            )
             for child in children
         ]
         # Sibling edges within the decomposed graph.
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
                 parent_id, child_id = child_ids[p_idx], child_ids[idx]
-                _link(conn, parent_id, child_id)
+                _link(conn, parent_id, child_id, cause="decompose")
                 _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
         # Root waits for the whole graph: link it under EVERY child (simpler
         # than computing leaves; cycle-free since the root is only ever a child).
         for cid in child_ids:
-            _link(conn, cid, task_id)
+            _link(conn, cid, task_id, cause="decompose")
         # Flip the root triage -> todo, assignee -> orchestrator.
         sets = ["status = 'todo'"]
         params: list[Any] = []
@@ -168,7 +264,7 @@ def decompose_triage_task(
 
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
-    author: Optional[str], now: int,
+    author: Optional[str], now: int, *, allow_off_board_ask: bool = False,
 ) -> str:
     """Insert one decomposed child as ``todo`` (linked under the root later so
     the dispatcher only ever sees a coherent graph); returns its id.
@@ -181,7 +277,11 @@ def _insert_decomposed_child(
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
     """
     from hermes_cli.kanban_db import (
-        _new_task_id, _canonical_assignee, _append_event,
+        _new_task_id, _canonical_assignee, _append_event, _apply_board_priority_policy,
+        board_for_connection, _resolve_operator_ask, operator_ask_event,
+    )
+    from hermes_cli.kanban_register import (
+        OFF_BOARD_ASK_EVENT, apply_stamp, guard_new_ask_home, normalise_body,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
@@ -195,20 +295,70 @@ def _insert_decomposed_child(
     else:
         child_ws_path = None
     new_id = _new_task_id()
-    body = child.get("body")
+    # THE ONE NORMALISATION (card t_35272553): the child body is decoded ONCE, here, and the
+    # single value feeds every consumer below - the priority policy, the ask resolver and the
+    # INSERT. Previously each consumer normalised (or failed to) independently: a non-str
+    # (BLOB) body reached the policy and the resolver as ``None`` (so the policy saw "" and a
+    # body-carried ask stamp was invisible), while the INSERT re-normalised the same bytes; the
+    # three could disagree about one input. One decode, three identical readers.
+    body = normalise_body(child.get("body"))
+    child_assignee = _canonical_assignee(child.get("assignee"))
+    # THE SECOND WRITER (card t_0396c536; restored by t_ecbfb34b). A decomposed child is born
+    # here rather than through ``create_task``, so the board's bound has to be reached from
+    # THIS insert too: wired into one writer only, a fan-out put every child outside its
+    # band while the root's own card looked correctly banded. The board is resolved from
+    # THIS connection - a caller holding a ``--board`` override is not on the current board,
+    # and reading the ambient one would bound the children by somebody else's table.
+    priority, policy_provenance = _apply_board_priority_policy(
+        0, assignee=child_assignee, board=board_for_connection(conn),
+        title=child["title"].strip(), body=body,
+    )
+    # The ask stamp rides this insert for the SAME reason as the policy above: a
+    # decomposition is a card born outside ``create_task``, and the children of an ask are
+    # exactly the "deep chains" the register tree lost. The root's own body is the
+    # reference - a fan-out of a card in service of an ask serves that ask.
+    _board = board_for_connection(conn)
+    ask_ref = _resolve_operator_ask(
+        conn, board=_board, parents=[root_id], body=body,
+        serves=None,
+    )
+    # THE ASK-HOME DOOR (card t_abefe660): the SAME guard the create seam applies, at the
+    # second writer. A decomposed child that IS a new ask (the root is the register, or a
+    # card whose ask half is empty) must land on the register's own board; a child that
+    # inherits an existing ask id is not gated. Refused before the INSERT.
+    ask_off_board = guard_new_ask_home(
+        ask_ref, board=_board, title=child["title"].strip(),
+        allow_off_board=allow_off_board_ask, caller=author,
+    )
+    ask_pair = ask_ref.for_card(new_id) if ask_ref is not None else None
+    # No ask pair: the body is already the ONE normalised value from the top of this function
+    # (card t_35272553), so it is stored verbatim - no second normalisation to disagree with
+    # the value the policy and resolver saw.
+    child_body = apply_stamp(body, *ask_pair) if ask_pair else body
     conn.execute(
         "INSERT INTO tasks "
-        "(id, title, body, assignee, status, workspace_kind, "
+        "(id, title, body, assignee, status, priority, workspace_kind, "
         " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
-            new_id, child["title"].strip(), body if isinstance(body, str) else None,
-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
+            new_id, child["title"].strip(), child_body,
+            child_assignee, priority, child_ws_kind, child_ws_path,
             root_row["tenant"], now, (author or "decomposer"),
         ),
     )
     _append_event(
-        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
+        conn, new_id, "created",
+        {
+            "by": author or "decomposer",
+            "from_decompose_of": root_id,
+            **(operator_ask_event(ask_ref, ask_pair)),
+            **((
+                {"priority_policy": policy_provenance}
+            ) if policy_provenance else {}),
+        },
     )
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
+    # The hatch's own record, so an off-board NEW ask let through on purpose is visible.
+    if ask_off_board is not None:
+        _append_event(conn, new_id, OFF_BOARD_ASK_EVENT, ask_off_board)
     return new_id

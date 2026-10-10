@@ -325,6 +325,15 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
 
 
 def _kb_first_line(value: Any, limit: int) -> str:
+    """First line of *value*, prefixed with a newline; ``""`` when there is nothing to show.
+
+    ``value`` is usually an absent payload key (``payload.get(...)``), so ``None`` must render
+    NOTHING: ``str(None)`` is ``"None"``, which would print the literal word on the notice in place
+    of the cause. Guarded here rather than at one call site because every present and future caller
+    passes a possibly-absent payload key.
+    """
+    if value is None:
+        return ""
     lines = str(value).strip().splitlines()
     return f"\n{lines[0][:limit]}" if lines else ""
 
@@ -336,9 +345,47 @@ def _kb_completed(task, payload: dict, title: str) -> str:
 
 
 def _kb_timed_out(task, payload: dict, title: str) -> str:
-    with contextlib.suppress(TypeError, ValueError):
-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
-    return " timed out (max_runtime=0s); will retry"
+    """Name the ACTUAL cause of a ``timed_out`` run.
+
+    Every run that ends without completing shares ``outcome=timed_out``, so the cause has to come
+    from the payload: ``budget_used``/``budget_max`` for an iteration-budget death,
+    ``limit_seconds`` for a real ``max_runtime_seconds`` reap. Reporting the wall clock for a budget
+    death sends triage after a timeout config that has nothing to do with the failure, and a card
+    that never set a limit must say so rather than print ``0s``.
+    """
+    used, total = payload.get("budget_used"), payload.get("budget_max")
+    if used is not None and total is not None:
+        cause = f"hit its iteration budget ({int(used)}/{int(total)} turns)"
+    elif payload.get("limit_seconds"):
+        cause = _kb_runtime_cap_cause(payload.get("limit_seconds"))
+    else:
+        cause = "ended without completing (no runtime cap set)"
+    unfinished = _kb_first_line(payload.get("unfinished"), 200)
+    return f" {cause}{unfinished}; {_kb_retry_clause(payload)}"
+
+
+def _kb_runtime_cap_cause(limit_seconds: object) -> str:
+    """The wall-clock cause, tolerating a missing or non-integral ``limit_seconds``."""
+    try:
+        seconds = int(str(limit_seconds).strip())
+    except (TypeError, ValueError):
+        return "ran past its runtime cap"
+    return f"ran past its {seconds}s runtime cap"
+
+
+def _kb_retry_clause(payload: dict) -> str:
+    """``will retry`` only where the run really was re-queued.
+
+    The failure path stamps the status it left the card in; a hand-written ``will retry`` over a card
+    parked in review is the same false-green class as naming the wrong timeout.
+    """
+    status = str(payload.get("retry_status") or "").strip()
+    if status and status not in {"ready", "todo"}:
+        return f"re-queued as {status}"
+    failures, limit = payload.get("failures"), payload.get("failure_limit")
+    if isinstance(failures, int) and isinstance(limit, int) and limit > 0:
+        return f"will retry (consecutive failure {failures}/{limit})"
+    return "will retry"
 
 
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
@@ -349,6 +396,10 @@ _KANBAN_EVENT_FORMATTERS = {
                 + (f"\n{str(p.get('error'))[:200]}" if p.get("error") else "")),
     "crashed": ("✖", lambda t, p, title: " worker crashed (pid gone); dispatcher will retry"),
     "timed_out": ("⏱", _kb_timed_out),
+    "goal_armed": ("🎯", lambda t, p, title: (
+        f" given a goal loop after hitting its iteration budget"
+        f" ({p.get('turns') or '?'} turns) — its next run continues instead of dying at the same wall"
+    )),
     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
 }
 

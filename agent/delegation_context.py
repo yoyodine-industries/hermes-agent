@@ -8,6 +8,7 @@ closed for them without mutating the process-global environment.
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping, overload
@@ -160,6 +161,157 @@ def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
     except ValueError:
         return False
     return True
+
+
+# --- provenance arm (ruling t_fcf7a321, Decision 1) --------------------------------------------
+#
+# The ContextVar arm above and the marker arm inside ``kanban_path_is_fenced`` are COOPERATIVE:
+# a worker's shell can strip ``HERMES_DELEGATED_CHILD_CONTEXT`` (the marker), and the process is
+# then indistinguishable from a top-level CLI. Provenance is not cooperatively clearable — a
+# descendant cannot change who its ancestors are — so the kanban seams consult this arm IN
+# ADDITION to the two above. Nothing here narrows ``kanban_path_is_fenced`` for its non-kanban
+# callers (cron / estop / code_exec / transports).
+
+#: How long one live-claim read is reused inside a process. The CLI is short-lived (one read per
+#: invocation); a long-lived process (the gateway) can only ever ADD this refusal for a caller
+#: descended from a worker of ITS OWN board, which it never is, so a stale entry is inert there.
+LIVE_CLAIM_PROBE_TTL_SECONDS = 15.0
+_live_claim_cache: "dict[str, tuple[float, tuple[tuple[int, object], ...]]]" = {}
+#: Ancestry is stable for the life of a process; computed once, capped so a pathological tree
+#: cannot spin.
+_MAX_ANCESTOR_HOPS = 64
+_ancestor_cache: "tuple[int, ...] | None" = None
+
+#: Named for every refusal this arm raises, so a worker learns the ONE sanctioned release rather
+#: than reaching for an ``env -u`` strip (Decision 1(b)).
+PROVENANCE_REFUSAL_MESSAGE = (
+    "kanban: refusing — this process descends from a LIVE dispatched worker that holds a claim "
+    "on this board, so it may not move the estate; a worker's shell cannot clear its own fence by "
+    "unsetting HERMES_DELEGATED_CHILD_CONTEXT. Run the action from a top-level session, or use the "
+    "one sanctioned non-top-level release: a board whose own board.json declares \"dispatch\": "
+    "false is torn down single-actor with `hermes kanban boards rm --estate <slug>`."
+)
+
+
+def process_ancestors(pid: "int | None" = None) -> "tuple[int, ...]":
+    """PID ancestry of this process (or *pid*), nearest first, EXCLUDING the pid itself.
+
+    ``psutil`` is already a dependency of ``hermes_cli.tree_identity``; when it is
+    unavailable the chain is empty, which fences nothing (a fence that cannot see must not
+    refuse).
+    """
+    global _ancestor_cache
+    own = pid is None
+    if own and _ancestor_cache is not None:
+        return _ancestor_cache
+    try:
+        import psutil
+    except Exception:
+        return ()
+    chain: "list[int]" = []
+    try:
+        current = int(os.getpid() if own else pid)
+        for _ in range(_MAX_ANCESTOR_HOPS):
+            parent = int(psutil.Process(current).ppid())
+            if parent <= 1 or parent in chain or parent == current:
+                break
+            chain.append(parent)
+            current = parent
+    except Exception:
+        pass
+    result = tuple(chain)
+    if own:
+        _ancestor_cache = result
+    return result
+
+
+def _resolve_claim_store(path: "os.PathLike[str] | str | None") -> "str | None":
+    """The board DB whose live claims this arm consults.
+
+    *path* is what the mutator named — a board DB, or a metadata root. A board DB is used as
+    given; anything else falls back to the ACTIVE board, which is the board a worker's shell is
+    pinned to (``scrub_kanban_env`` keeps ``HERMES_KANBAN_DB``).
+    """
+    from pathlib import Path
+
+    if path is not None:
+        candidate = Path(path).expanduser()
+        if candidate.suffix == ".db":
+            try:
+                return str(candidate.resolve())
+            except OSError:
+                return None
+    try:
+        from hermes_cli import kanban_db as kb
+
+        return str(kb.kanban_db_path().expanduser().resolve())
+    except Exception:
+        return None
+
+
+def live_claim_workers(path: "os.PathLike[str] | str | None" = None) -> "tuple[tuple[int, object], ...]":
+    """``(worker_pid, worker_started_at)`` for every LIVE claim on *path*'s board.
+
+    LIVE is the dispatcher's own reading: ``status = 'running'`` with an unexpired
+    ``claim_expires`` and a recorded ``worker_pid``. Read-only and bounded; any failure answers
+    ``()`` — this arm may only ADD a refusal it can prove.
+    """
+    import sqlite3
+
+    store = _resolve_claim_store(path)
+    if not store:
+        return ()
+    now = time.monotonic()
+    cached = _live_claim_cache.get(store)
+    if cached is not None and (now - cached[0]) <= LIVE_CLAIM_PROBE_TTL_SECONDS:
+        return cached[1]
+    rows: "tuple[tuple[int, object], ...]" = ()
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % store, uri=True, timeout=1.0)
+        try:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT worker_pid, worker_started_at FROM tasks "
+                "WHERE status = 'running' AND worker_pid IS NOT NULL "
+                "  AND claim_expires IS NOT NULL AND claim_expires > ?",
+                (int(time.time()),),
+            )
+            rows = tuple(
+                (int(r["worker_pid"]), r["worker_started_at"])
+                for r in cur.fetchall() if r["worker_pid"]
+            )
+        finally:
+            conn.close()
+    except Exception:
+        rows = ()
+    _live_claim_cache[store] = (now, rows)
+    return rows
+
+
+def ancestor_owns_live_kanban_claim(path: "os.PathLike[str] | str | None" = None) -> bool:
+    """The PROVENANCE arm of the fence (ruling t_fcf7a321, Decision 1).
+
+    True when an ANCESTOR process of this one is the ``worker_pid`` of a LIVE claim on *path*'s
+    board AND the recorded ``worker_started_at`` fingerprint still names that pid (the same
+    PID-reuse guard the dispatcher trusts). Same-pid is never a match: a worker mutating
+    IN-PROCESS is the ContextVar arm's job, not this one's — this arm exists for the SHELL a
+    worker spawns. Reads are unaffected; callers gate only estate- mutating verbs.
+    """
+    ancestors = process_ancestors()
+    if not ancestors:
+        return False
+    claims = live_claim_workers(path)
+    if not claims:
+        return False
+    ancestor_set = set(ancestors)
+    try:
+        from hermes_cli.kanban_db_dispatch import _worker_not_dead
+    except Exception:
+        return False
+    for pid, started_at in claims:
+        if pid in ancestor_set and _worker_not_dead(pid, started_at):
+            return True
+    return False
 
 
 @overload

@@ -74,12 +74,19 @@ def _activate_root_inline(
     summary: str,
     metadata: dict[str, Any],
 ) -> bool:
-    """Inline blocked→done CAS flip + event insert for the swarm root.
+    """Inline ready→done CAS flip + event insert for the swarm root.
 
     Runs INSIDE create_swarm's write_txn, so it must not call
     ``kb.complete_task`` (own transaction + post-commit side effects that
     would run while the outer txn can still roll back). The caller runs
     ``recompute_ready`` after the outer commit.
+
+    The root is born in the ordinary state (``ready``) and latched to ``done`` here,
+    in the same transaction - never born ``blocked``: a card is never created blocked
+    (operator ruling 2026-09-27, card t_5c89c04e), and the old ``blocked`` latch also
+    left a ``reason='initial_status'`` event behind it, which is the created-blocked
+    detector's signature. Post-commit the row is ``done`` either way, so nothing a
+    reader sees moves.
     """
     cur = conn.execute(
         """
@@ -90,7 +97,7 @@ def _activate_root_inline(
                claim_expires= NULL,
                worker_pid   = NULL
          WHERE id = ?
-           AND status = 'blocked'
+           AND status = 'ready'
         """,
         (int(time.time()), root_id),
     )
@@ -132,7 +139,7 @@ def create_swarm(
             priority=priority, idempotency_key=idempotency_key,
         )
         root = kb.get_task(conn, created.root_id)
-        if root is not None and root.status == "blocked":
+        if root is not None and root.status == "ready":
             if not _activate_root_inline(
                 conn,
                 created.root_id,
@@ -169,8 +176,9 @@ def _create_swarm_uncommitted(
     workspace_kind: Optional[str], workspace_path: Optional[str], priority: int, idempotency_key: Optional[str],
 ) -> SwarmCreated:
     """Create the swarm graph inside the caller's transaction: planning root
-    (``blocked`` until the caller activates it), parallel workers, a verifier
-    waiting on every worker, and a synthesizer waiting on the verifier."""
+    (born ``ready``, activated to ``done`` by the caller, in the same transaction),
+    parallel workers, a verifier waiting on every worker, and a synthesizer waiting
+    on the verifier."""
     goal = _require_text(goal, "goal")
     verifier_assignee = _require_text(verifier_assignee, "verifier_assignee")
     synthesizer_assignee = _require_text(synthesizer_assignee, "synthesizer_assignee")
@@ -181,7 +189,7 @@ def _create_swarm_uncommitted(
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
 
-    common = dict(
+    common: dict[str, Any] = dict(
         created_by=created_by, tenant=tenant,
         workspace_kind=workspace_kind, workspace_path=workspace_path,
     )
@@ -194,7 +202,6 @@ def _create_swarm_uncommitted(
         assignee=created_by,
         priority=priority,
         idempotency_key=idempotency_key,
-        initial_status="blocked",
         **common,
     )
 

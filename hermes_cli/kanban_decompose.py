@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_db_graph import decompose_triage_task
+from hermes_cli.kanban_db_graph import decompose_triage_task, spec_carrying_reason
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
@@ -233,7 +233,11 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
         )
     if not ok:
-        return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
+        # A refused promotion carries the refusal (triage escalation names the event
+        # and the card); a bare False is the read-then-write race.
+        return DecomposeOutcome(
+            task.id, False, getattr(ok, "detail", None) or "task moved out of triage before promotion",
+        )
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
 
 
@@ -294,10 +298,50 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
+        # The DB layer refuses a spec-carrying card; without this branch the operator would be
+        # told the card "moved out of triage" and go looking for a race instead of reading the
+        # refusal.
+        with kbc.connect_closing() as conn:
+            refusal = spec_carrying_reason(conn, task_id)
+        if refusal:
+            return DecomposeOutcome(task_id, False, refusal)
         return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
+    if not isinstance(child_ids, list):
+        # Falsy: the DB layer refused the fan-out and named the reason and the card, so the
+        # operator sees why nothing was created — the block-loop breaker's park, or a record
+        # that says the work is already decided (approved / superseded / in review /
+        # live branch / live run).
+        return DecomposeOutcome(
+            task_id, False, getattr(child_ids, "detail", None) or "decompose refused",
+        )
+    if not child_ids:
+        return DecomposeOutcome(task_id, False, "decompose refused: no children created")
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
     )
+
+
+def _promotion_refusal(
+    task_id: str, author: str,
+) -> Optional[kb.TriageEscalationRefusal | kb.DecomposeRefusal]:
+    """The refusal that keeps ``task_id`` in ``triage``, or None.
+
+    Checked BEFORE the aux call: a card the record has already decided — or one the
+    block-loop breaker parked — stays put whatever the decomposer would have said, so the
+    LLM round-trip is pure waste. The refusal is RECORDED here (see
+    ``kanban_db.decompose_refusal_guard``), so the operator reads the reason off the card
+    instead of inferring it from a decompose that quietly did nothing.
+    """
+    with kbc.connect_closing() as conn:
+        escalation = kb.triage_escalation_refusal(conn, task_id)
+        if escalation is not None:
+            return escalation
+        refusal = kb.decompose_refusal(conn, task_id)
+        if refusal is None:
+            return None
+        with kb.write_txn(conn):
+            kb.record_decompose_refusal(conn, refusal, author=author)
+        return refusal
 
 
 def decompose_task(
@@ -312,6 +356,19 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    # Decide the spec guard BEFORE the routing read and the aux call: a card we are going to
+    # refuse must not cost an LLM round-trip, and the refusal has to name itself instead of
+    # surfacing as "moved out of triage".
+    with kbc.connect_closing() as conn:
+        refusal = spec_carrying_reason(conn, task_id)
+    if refusal:
+        return DecomposeOutcome(task_id, False, refusal)
+
+    audit_author = author or _profile_author()
+    refusal = _promotion_refusal(task_id, audit_author)
+    if refusal is not None:
+        return DecomposeOutcome(task_id, False, refusal.detail)
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
@@ -330,7 +387,6 @@ def decompose_task(
     if parsed is None:
         return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
 
-    audit_author = author or _profile_author()
     if not parsed.get("fanout"):
         return _apply_single(task, parsed, routing, audit_author)
     return _apply_fanout(task_id, parsed, routing, audit_author)

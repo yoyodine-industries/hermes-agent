@@ -375,6 +375,18 @@ def _payload(ev: Any, key: str) -> Any:
     return ev.payload.get(key) if ev.payload and ev.payload.get(key) else None
 
 
+def _payload_int(ev: Any, key: str) -> Optional[int]:
+    """``int`` payload read, or ``None`` when absent or unparseable.
+
+    A malformed count must not take down delivery of the ping it belongs to: the notice falls back to
+    generic wording instead of raising through the notifier loop.
+    """
+    try:
+        return int(_payload(ev, key))
+    except (TypeError, ValueError):
+        return None
+
+
 def _clip(ev: Any, key: str, msg_key: str, limit: int) -> str:
     """Catalog message ``msg_key`` (``{value}`` placeholder) rendered with the truncated payload
     value, or ``""`` when absent."""
@@ -461,10 +473,35 @@ def _fmt_gave_up(ev, n) -> tuple:
 
 
 def _fmt_timed_out(ev, n) -> tuple:
-    limit = int(_payload(ev, "limit_seconds") or 0)
-    minutes = max(1, round(limit / 60)) if limit else 0
-    span = t("gateway.kanban.ping.limit_minutes", minutes=minutes) if minutes else t("gateway.kanban.ping.limit_generic")
+    """Name the REAL cause: an iteration-budget death is not a wall-clock timeout.
+
+    Both failures arrive as ``outcome=timed_out``, so the payload is the only thing that separates
+    them — ``budget_used``/``budget_max`` for a run that consumed its iteration budget,
+    ``limit_seconds`` for a run reaped by ``max_runtime_seconds``. Reporting the wall clock for a
+    budget death points triage at a timeout config that had nothing to do with the failure; a run
+    with no cap set says so instead of reporting ``0m``.
+    """
+    used, total = _payload_int(ev, "budget_used"), _payload_int(ev, "budget_max")
+    if used is not None and total is not None:
+        span = t("gateway.kanban.ping.limit_iterations", used=used, total=total)
+        return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
+    limit = _payload_int(ev, "limit_seconds") or 0
+    if not limit:
+        # A run with no cap set was NOT reaped on time, so it gets its own message rather than a
+        # span that would name a limit the card never had.
+        return t("gateway.kanban.ping.limit_unset", head=n.head), None, None
+    span = t("gateway.kanban.ping.limit_minutes", minutes=max(1, round(limit / 60)))
     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
+
+
+def _fmt_goal_armed(ev, n) -> tuple:
+    """The dispatcher gave this card a bounded goal loop (its run died of iteration exhaustion)."""
+    turns = _payload_int(ev, "turns")
+    return (
+        t("gateway.kanban.ping.goal_armed", head=n.head, turns=turns if turns is not None else "?"),
+        None,
+        None,
+    )
 
 
 # archived / unblocked are claimed (so the cursor advances past them) but
@@ -479,6 +516,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
     "gave_up": _fmt_gave_up,
     "crashed": lambda ev, n: (t("gateway.kanban.ping.crashed", head=n.head), None, None),
     "timed_out": _fmt_timed_out,
+    "goal_armed": _fmt_goal_armed,
     "status": lambda ev, n: (t("gateway.kanban.ping.status", head=n.head, status=_payload(ev, "status") or ""), None, None),
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,

@@ -19,6 +19,10 @@ _TASK_DICT_FIELDS = (
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
+    # The card's ROOM: readable over `--json` because it is what decides whether a card can survive
+    # its own iteration budget, and a field only the SQL surface can read is a field nobody audits.
+    "goal_mode", "goal_max_turns",
+    "due_at", "due_window_policy",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",

@@ -252,6 +252,22 @@ class GatewayKanbanWatchersMixin:
         else:
             logger.warning("kanban dispatcher: advisory lock unavailable at %s; proceeding "
                            "on config control alone.", _lock_path)
+
+        # Record the tree THIS process dispatches from, so an estate-mutating CLI running a
+        # DIFFERENT checkout refuses to move the board instead of silently running another
+        # tree's (possibly older) guards (hermes_cli.tree_identity; card t_70e91ef2).
+        # Skipped only when the lock is contended: another gateway IS the dispatcher and its
+        # record must not be overwritten by a process that will not dispatch.
+        if _lock_state != "contended":
+            try:
+                from hermes_cli import tree_identity as _tree_identity
+
+                if _tree_identity.record_dispatching_tree():
+                    logger.info("kanban dispatcher: recorded dispatching tree %s at %s",
+                                _tree_identity.current_tree(), _tree_identity.record_path())
+            except Exception:
+                logger.debug("kanban dispatcher: could not record the dispatching tree",
+                             exc_info=True)
         return _load_config, _kb, kanban_cfg
 
     async def _kanban_dispatcher_watcher(self) -> None:
@@ -273,11 +289,17 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
         await asyncio.sleep(5)
 
-        # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
-        # is non-empty but spawns are 0 for N consecutive ticks — usually a
-        # broken PATH, missing venv, or credential loss.
-        bad_ticks = 0
-        last_warn_at = 0
+        # Health telemetry (shared with `_cmd_daemon` via DispatcherHealth): a
+        # warning here has to mean the dispatcher is BROKEN, not merely busy.
+        # Capacity deferrals (kanban.max_spawn / max_in_progress / per-profile
+        # cap), guards (respawn, board-held, memory pressure) and work that just
+        # arrived are the steady state on a loaded host and stay silent; a card
+        # claimed but never launched warns at once, naming board, profile, task
+        # and reason. Imported under a distinct name because `_kbd` is bound
+        # (as a local) further down in the loop below.
+        from hermes_cli import kanban_db_dispatch as _kbd_health
+
+        health = _kbd_health.DispatcherHealth(window=_HEALTH_WINDOW)
         results: Optional[list] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
 
@@ -297,7 +319,7 @@ class GatewayKanbanWatchersMixin:
                 # Emergency stop (`hermes pause`): no auto-decompose or
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
-                    bad_ticks = 0
+                    health.pause()
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
@@ -306,20 +328,12 @@ class GatewayKanbanWatchersMixin:
                     if _ad_enabled:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(dispatcher.tick_once)
-                    any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
-                now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
-                    logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned.%s Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks, f" Last tick held back: {held}." if held else "",
-                    )
-                    last_warn_at = now
+                    _log_spawn_results(results)
+                    pending = await _to_thread_process_service(dispatcher.oldest_pending)
+                    report = health.observe_tick(results, pending=pending, now=time.time())
+                    if report is not None:
+                        log = logger.warning if report.level == "warning" else logger.info
+                        log("%s", report.message)
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()
