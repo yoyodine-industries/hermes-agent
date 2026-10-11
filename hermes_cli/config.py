@@ -1214,7 +1214,107 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
 
     _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)
+    _validate_denied_models(config, issues)
     return issues
+
+
+def _validate_denied_models(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
+    """Refuse a DENIED model anywhere a config can name one (card t_a1ae7cc6, ruling B2.2).
+
+    A config is where the model is most likely to come back: a default, an auxiliary slot, an MoA
+    reference or aggregator, a cron pin, or a ``providers.*.models`` entry. Each is named with the
+    PATH that holds it, so the refusal is actionable rather than a bare "denied" - and every check
+    goes through the ONE predicate in :mod:`hermes_cli.model_denylist`, so this file holds no
+    second list.
+
+    ``model.denied_models`` is the ADD-ONLY config layer. An entry that is not a model-id string
+    cannot add anything, so it is reported rather than silently ignored.
+    """
+    from hermes_cli.model_denylist import denial
+
+    hint = ("Choose another model. The ban is the code floor plus model.denied_models, and a "
+            "denied model cannot be confirmed past in a config.")
+
+    def check(value: Any, where: str) -> None:
+        if not isinstance(value, str) or not value.strip():
+            return
+        found = denial(value, config=config)
+        if found is not None:
+            _issue(issues, "error",
+                   f"{where} names the DENIED model {value!r} ({found.machine_reason})", hint)
+
+    model = config.get("model")
+    if isinstance(model, dict):
+        check(model.get("default"), "model.default")
+        configured = model.get("denied_models")
+        if configured is not None:
+            for i, entry in enumerate(configured if isinstance(configured, list) else [configured]):
+                if not isinstance(entry, str) or not entry.strip():
+                    _issue(issues, "warning",
+                           f"model.denied_models[{i}] is not a model id: {entry!r}",
+                           "model.denied_models is a list of model-id strings")
+
+    auxiliary = config.get("auxiliary")
+    if isinstance(auxiliary, dict):
+        for name, slot in auxiliary.items():
+            if isinstance(slot, dict):
+                check(slot.get("model"), f"auxiliary.{name}.model")
+
+    cron = config.get("cron")
+    if isinstance(cron, dict):
+        check(cron.get("model"), "cron.model")
+
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for provider_name, provider_cfg in providers.items():
+            declared = provider_cfg.get("models") if isinstance(provider_cfg, dict) else None
+            if isinstance(declared, dict):
+                for model_name in declared:
+                    check(model_name, f"providers.{provider_name}.models.{model_name}")
+
+    moa = config.get("moa")
+    if isinstance(moa, dict):
+        check(moa.get("model"), "moa.model")
+        presets = moa.get("presets")
+        if isinstance(presets, dict):
+            for preset_name, preset in presets.items():
+                if not isinstance(preset, dict):
+                    continue
+                for i, ref in enumerate(preset.get("reference_models") or []):
+                    if isinstance(ref, dict):
+                        check(ref.get("model"), f"moa.presets.{preset_name}.reference_models[{i}].model")
+                aggregator = preset.get("aggregator")
+                if isinstance(aggregator, dict):
+                    check(aggregator.get("model"), f"moa.presets.{preset_name}.aggregator.model")
+
+
+def _refuse_denied_model_set(key: str, value: Any) -> None:
+    """Refuse a ``hermes config set`` that would NAME a denied model (card t_a1ae7cc6, ruling B2.2).
+
+    The load-time validator above never runs on this path - ``set_config_value`` writes what it is
+    told - so the ban needs its own gate here, and it must test the KEY as well as the value:
+    ``model.default`` and ``auxiliary.*.model`` carry the id as the VALUE, while
+    ``providers.<provider>.models.<model-id>`` names it IN THE KEY.
+
+    Adding to ``model.denied_models`` is deliberately NOT refused: that key IS the ADD-ONLY config
+    layer, so adding an id there is the ban working, not a breach of it.
+    """
+    from hermes_cli.model_denylist import denial
+
+    path = [segment.strip().lower() for segment in key.split(".")]
+    candidate: Any = None
+    if path[-1] == "model" or key.strip().lower() == "model.default":
+        candidate = value
+    elif path[0] == "providers" and "models" in path and len(path) >= 4:
+        candidate = path[-1]
+    if not isinstance(candidate, str) or not candidate.strip():
+        return
+    found = denial(candidate)
+    if found is not None:
+        _exit_invalid(
+            f"✗ {key} would name the DENIED model {candidate!r} ({found.machine_reason}). "
+            "Choose another model: the ban is the code floor plus model.denied_models, and a "
+            "denied model cannot be confirmed past.")
 
 
 def print_config_warnings(config: Optional[dict[str, Any]] = None) -> None:
@@ -3645,6 +3745,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     config_path = get_config_path()
     user_config = require_readable_config_before_write(config_path)
     value = _coerce_config_set_value(key, value)
+    _refuse_denied_model_set(key, value)
     # A scalar ``model`` shorthand must become a dict before writing sub-keys, or _set_nested
     # replaces it with an empty dict and the model id is lost.
     _model_val = user_config.get("model")
