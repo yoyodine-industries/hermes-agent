@@ -90,6 +90,22 @@ def _hold(handle: str) -> dict:
     raise AssertionError(f"hold {handle!r} is not live: {[h['handle'] for h in estop.read_state().holds]}")
 
 
+def _arm(**kwargs) -> estop.ArmResult:
+    """Arm the RUN-OWNED LEASE this suite measures — as a SCOPED hold.
+
+    CONVERGED LINE (card t_871b1d96): the retirement half (t_e04b4c81) retires ``mode: estop``,
+    so a hold is LEGAL iff it names a scope and a bare ``arm()`` is refused with
+    :class:`estop.EstopTotalHaltRetired` before anything is written. The clauses below (D1
+    binding, D2 lease + budget, D3 reaper, D5 rows) are properties of a run-owned hold, not of
+    the retired total-halt mode, so every arm here goes through this helper and names a scope.
+    The lane allowlist is deliberately one the suite's own lane is NOT on, so "the gate still
+    holds this lane" stays a real measurement (``work_admitted``), never a vacuous one.
+    """
+    kwargs.setdefault("mode", estop.MODE_LOCKDOWN)
+    kwargs.setdefault("allow", {"profiles": ["default"]})
+    return estop.arm(**kwargs)
+
+
 # ── D1: no unbound, anonymous hold ──────────────────────────────────────────
 
 
@@ -99,7 +115,7 @@ def test_a_run_scoped_arm_that_cannot_name_its_run_is_refused(hermes_home, monke
     monkeypatch.setenv("HERMES_ESTOP_ACTOR", "bot:hermes-update:")
 
     with pytest.raises(estop.EstopUnboundRun) as excinfo:
-        estop.arm(reason="wind-down hold, TTL 90m", ttl="90m")
+        _arm(reason="wind-down hold, TTL 90m", ttl="90m")
 
     assert "unbound" in str(excinfo.value).lower()
     assert not estop.sentinel_path().exists(), "the refused arm still wrote a sentinel"
@@ -110,7 +126,7 @@ def test_a_run_scoped_arm_that_cannot_name_its_run_is_refused(hermes_home, monke
 
 def test_the_owning_run_is_written_on_the_hold_and_on_the_arm_row(hermes_home):
     """D1: a run-scoped arm carries the binding the reaper resolves — on the body AND the row."""
-    res = estop.arm(reason="wind-down hold, TTL 90m", ttl="90m")
+    res = _arm(reason="wind-down hold, TTL 90m", ttl="90m")
 
     assert res.owner_run == RUN
     assert _hold(res.handle)["owner_run"] == RUN
@@ -123,7 +139,7 @@ def test_the_owner_run_comes_from_the_environment_when_the_caller_names_none(her
     monkeypatch.setenv("HERMES_ESTOP_ACTOR", "bot:platform-coder")
     monkeypatch.setenv("YOYOFLOW_RUN_ID", "20261010-1200-9")
 
-    res = estop.arm(reason="critical section", ttl="10m")
+    res = _arm(reason="critical section", ttl="10m")
 
     assert res.owner_run == "20261010-1200-9"
     assert _hold(res.handle)["owner_run"] == "20261010-1200-9"
@@ -135,7 +151,7 @@ def test_the_owner_run_comes_from_the_environment_when_the_caller_names_none(her
 def test_the_section_budget_is_the_default_lease(hermes_home):
     """With no --ttl the engine applies the declared budget, never None: tonight's arm shape
     (``expires_at=None ttl_s=None``) is unreachable."""
-    res = estop.arm(reason="wind-down hold, TTL 90m")
+    res = _arm(reason="wind-down hold, TTL 90m")
 
     assert res.ttl_s == estop.DEFAULT_SECTION_BUDGET_S
     assert res.lease_default is True
@@ -146,15 +162,15 @@ def test_the_section_budget_is_the_default_lease(hermes_home):
 
 
 def test_a_declared_budget_sizes_the_lease(hermes_home):
-    res = estop.arm(reason="wind-down hold", budget="2m", mode=estop.MODE_LOCKDOWN,
-                    allow={"profiles": ["default"]})
+    res = _arm(reason="wind-down hold", budget="2m", mode=estop.MODE_LOCKDOWN,
+               allow={"profiles": ["default"]})
 
     assert res.ttl_s == 120
     assert res.lease_default is True
 
 
 def test_an_explicit_ttl_still_wins(hermes_home):
-    res = estop.arm(reason="window", ttl="90m")
+    res = _arm(reason="window", ttl="90m")
 
     assert res.ttl_s == 5400
     assert res.lease_default is False
@@ -163,7 +179,7 @@ def test_an_explicit_ttl_still_wins(hermes_home):
 def test_renew_pushes_the_deadline_forward_and_records_it(hermes_home):
     """Renewal is the liveness proof: it must move the deadline, stamp the hold and leave a
     row, or a live section has no way to say it is still alive."""
-    res = estop.arm(reason="wind-down hold", ttl="60s")
+    res = _arm(reason="wind-down hold", ttl="60s")
     before = _hold(res.handle)["expires_at"]
 
     renewed = estop.renew(res.handle, ttl="10m")
@@ -180,7 +196,7 @@ def test_renew_pushes_the_deadline_forward_and_records_it(hermes_home):
 
 
 def test_renew_never_shortens_a_lease_it_holds(hermes_home):
-    res = estop.arm(reason="wind-down hold", ttl="30m")
+    res = _arm(reason="wind-down hold", ttl="30m")
     before = _hold(res.handle)["expires_at"]
 
     estop.renew(res.handle, ttl="1m")
@@ -202,7 +218,7 @@ def test_renew_of_a_stale_handle_is_reported_and_creates_nothing(hermes_home):
 def test_a_hold_whose_run_is_terminal_is_released_by_the_reaper(hermes_home):
     """2026-10-10, reproduced: the run armed the guard and never released it. The run ledger's
     terminal row is the evidence, and the release leg is NOT in that run."""
-    res = estop.arm(reason="wind-down hold, TTL 90m")
+    res = _arm(reason="wind-down hold, TTL 90m")
     assert estop.is_engaged() is True
 
     _run_ledger(hermes_home, {"run": RUN, "section": "hermes-update wind_down", "status": "dead"})
@@ -216,7 +232,7 @@ def test_a_hold_whose_run_is_terminal_is_released_by_the_reaper(hermes_home):
 
 def test_a_hold_whose_run_is_still_running_is_left_alone(hermes_home):
     """The reaper resolves; it never guesses. A live section keeps its hold."""
-    res = estop.arm(reason="wind-down hold")
+    res = _arm(reason="wind-down hold")
 
     _run_ledger(hermes_home, {"run": RUN, "status": "running"})
 
@@ -228,7 +244,7 @@ def test_a_hold_whose_run_is_still_running_is_left_alone(hermes_home):
 def test_a_run_the_ledgers_do_not_know_is_bounded_by_its_lease_alone(hermes_home):
     """Absent a row for the owner, the LEASE is the only bound (D3) — the lease, not a guess
     that a missing row means a dead run."""
-    res = estop.arm(reason="wind-down hold", ttl="30m")
+    res = _arm(reason="wind-down hold", ttl="30m")
 
     _run_ledger(hermes_home, {"run": OTHER_RUN, "status": "dead"})
 
@@ -238,8 +254,8 @@ def test_a_run_the_ledgers_do_not_know_is_bounded_by_its_lease_alone(hermes_home
 
 def test_the_reaper_releases_through_a_co_holders_hold(hermes_home):
     """The reaper releases ONE hold and leaves a co-holder's entry byte-identical."""
-    orphan = estop.arm(reason="update window", ttl="30m")
-    keeper = estop.arm(reason="ops window", ttl="30m", actor="bot:ops-head:OPS-9",
+    orphan = _arm(reason="update window", ttl="30m")
+    keeper = _arm(reason="ops window", ttl="30m", actor="bot:ops-head:OPS-9",
                        mode=estop.MODE_LOCKDOWN, allow={"profiles": ["default"]})
 
     _run_ledger(hermes_home, {"run": RUN, "status": "completed"})
@@ -254,7 +270,7 @@ def test_the_reaper_releases_through_a_co_holders_hold(hermes_home):
 
 def test_the_deadman_lift_writes_an_expire_row(hermes_home):
     """The measured gap: a hold that self-lifted left a ledger ending at ``arm``."""
-    res = estop.arm(reason="observable clause", ttl="1s")
+    res = _arm(reason="observable clause", ttl="1s")
     time.sleep(1.5)
 
     assert estop.is_engaged() is False
@@ -265,27 +281,30 @@ def test_the_deadman_lift_writes_an_expire_row(hermes_home):
 
 
 def test_every_release_names_its_cause(hermes_home):
-    """``cause ∈ {explicit, handle, owner, all, operator-resume}`` — the scope stays readable
-    after the sentinel body (and with it the lane list) is gone."""
-    by_handle = estop.arm(reason="wind-down hold", ttl="30m")
+    """``cause ∈ {explicit, handle, owner, operator-resume}`` — the scope stays readable after
+    the sentinel body (and with it the lane list) is gone.
+
+    CONVERGED (t_871b1d96): the ``all`` cause is NOT reachable from this suite's arms any more.
+    The retirement half retires ``release(all_holds=True)`` as a recovery path — it lifts only a
+    PRE-RULING ``mode: estop`` hold, which the converged line can no longer arm — so the ``all``
+    cause is measured where it is still reachable, on a hand-written legacy entry, by
+    ``tests/cron/test_estop_retirement.py``.
+    """
+    by_handle = _arm(reason="wind-down hold", ttl="30m")
     estop.release(handle=by_handle.handle, actor=RUN)
     assert _event_row(by_handle.handle, "release")["cause"] == "handle"
 
-    by_owner = estop.arm(reason="wind-down hold", ttl="30m")
+    by_owner = _arm(reason="wind-down hold", ttl="30m")
     estop.release(owner=RUN, actor=RUN)
     assert _event_row(by_owner.handle, "release")["cause"] == "owner"
 
-    bare = estop.arm(reason="wind-down hold", ttl="30m")
+    bare = _arm(reason="wind-down hold", ttl="30m")
     estop.release(actor=RUN)
     assert _event_row(bare.handle, "release")["cause"] == "explicit"
 
-    resumed = estop.arm(reason="operator stop", ttl="30m", actor="operator", owner="operator")
+    resumed = _arm(reason="operator stop", ttl="30m", actor="operator", owner="operator")
     estop.release(owner="operator", actor="operator")
     assert _event_row(resumed.handle, "release")["cause"] == "operator-resume"
-
-    every = estop.arm(reason="wind-down hold", ttl="30m", order="t_b70753e9 re-arm")
-    estop.release(all_holds=True, actor="operator")
-    assert _event_row(every.handle, "release")["cause"] == "all"
 
 
 # ── D3/D5 through the PRODUCTION GATE, not the CLI ──────────────────────────
@@ -303,16 +322,24 @@ def _gate_logger():
 
 
 def test_the_cron_gate_reaps_an_orphaned_hold_on_its_own_tick(hermes_home):
-    """Control, then defect: while the run is live the gate pauses the tick; once the run's
-    ledger row is terminal, the NEXT gate tick releases the hold by itself — no CLI, no human."""
-    res = estop.arm(reason="wind-down hold")
-    assert estop.check_paused("gate-test", _gate_logger()) is True, (
-        "the control is vacuous: a live run-owned hold must pause the cron tick")
+    """Control, then defect: while the run is live the gate holds the lane; once the run's
+    ledger row is terminal, the NEXT gate tick releases the hold by itself — no CLI, no human.
+
+    CONVERGED (t_871b1d96): the only hold this line arms is SCOPED, and ``check_paused`` (the
+    cron tick's own call) answers for a TOTAL halt — so the control is the per-lane gate the
+    tick threads down (``work_admitted``), measured through the same tick.
+    """
+    res = _arm(reason="wind-down hold")
+    assert estop.check_paused("gate-test", _gate_logger()) is False, (
+        "a scoped hold is admitted to run the tick; it holds lanes, not the fleet")
+    assert estop.work_admitted("platform-coder") is False, (
+        "the control is vacuous: a live run-owned hold must hold its lane")
 
     _run_ledger(hermes_home, {"run": RUN, "status": "dead"})
 
-    assert estop.check_paused("gate-test", _gate_logger()) is False, (
-        "the cron gate still held the fleet after its owner's run ended (the defect)")
+    assert estop.check_paused("gate-test", _gate_logger()) is False
+    assert estop.work_admitted("platform-coder") is True, (
+        "the cron gate still held the lane after its owner's run ended (the defect)")
     release = [r for r in _rows(res.handle) if r["event"] == "release"]
     assert release and release[0]["cause"] == "orphan" and release[0]["reaper"] is True, (
         "the gate released the hold without writing the orphan row (D5)")
@@ -324,7 +351,7 @@ def test_the_kanban_dispatch_tick_reaps_and_readmits_in_one_read(hermes_home):
     that read must reap too, and the state handed to the lanes must be the POST-reap state."""
     from hermes_cli import kanban_db_dispatch
 
-    res = estop.arm(reason="wind-down hold")
+    res = _arm(reason="wind-down hold")
     state = kanban_db_dispatch._estop_state_for_tick()
     assert kanban_db_dispatch._lane_admitted(state, "platform-coder", None) is False, (
         "the control is vacuous: a live hold must refuse the lane")
@@ -342,8 +369,15 @@ def test_the_kanban_dispatch_tick_reaps_and_readmits_in_one_read(hermes_home):
 
 def test_the_gate_writes_the_deadman_row_it_retires(hermes_home):
     """D5 shares D3's reachability gap: the lift row is written by whichever surface retires
-    the hold, so a deadman expiry on a live tick must not leave a ledger ending at `arm`."""
-    res = estop.arm(reason="observable clause", ttl="1s")
+    the hold, so a deadman expiry on a live tick must not leave a ledger ending at `arm`.
+
+    The control reads the sentinel WITHOUT reaping (``_hold`` -> ``read_state``): calling any
+    reaping surface before the tick would write the very row this test exists to attribute to
+    the GATE.
+    """
+    res = _arm(reason="observable clause", ttl="1s")
+    assert _hold(res.handle)["handle"] == res.handle, (
+        "the control is vacuous: the hold must be armed before its lease expires")
     time.sleep(1.5)
 
     assert estop.check_paused("gate-test", _gate_logger()) is False

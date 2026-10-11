@@ -31,12 +31,19 @@ Two fields extend the primitive, both so an unattended hold cannot strand the fl
     operator happens to be chatting through at 00:00. Absent allowlist = nobody exempt.
 
 ``mode``
-    What the pause STOPS. ``estop`` (the default, and the meaning of every pre-mode
-    sentinel) is a TOTAL halt: cron, kanban dispatch and new gateway turns all stop.
-    ``lockdown`` is a SCOPED halt: the dispatch surfaces keep running and admit only the
-    lanes named in ``allow.profiles``, so the lanes an operator needs in order to end an
-    incident keep working while everything else is frozen. Admission is keyed on the LANE
-    (profile), never on a board — see :func:`work_admitted`.
+    What the pause STOPS. ``lockdown`` is the ONE supported hold shape: a SCOPED halt, where
+    the dispatch surfaces keep running and admit only the lanes named in ``allow.profiles``,
+    so the lanes an operator needs in order to end an incident keep working while everything
+    else is frozen. Admission is keyed on the LANE (profile), never on a board — see
+    :func:`work_admitted`.
+
+    ``estop`` — a TOTAL halt, no exemptions anywhere — is **LEGACY, READ-ONLY**. The operator
+    ruling of 2026-10-10 (cards t_9d108a04 / t_e04b4c81) retired the fleet-wide ESTOP as the
+    fleet's stop mechanism: a hold is LEGAL iff it names a scope — lanes and/or a bounded
+    lease — and stopping the whole fleet is a COMPOSITION of the scoped controls
+    (:func:`scoped_controls_help`), never one lever. A ``mode: estop`` entry still READS as a
+    total halt (pre-ruling bytes wrote them, and one may sit on disk right now), but no verb
+    may ARM one: :func:`arm` refuses with :class:`EstopTotalHaltRetired`.
 
 The sentinel is a REF-COUNTED HOLD REGISTRY, not a boolean, because two unrelated
 mechanisms write it: the operator's ``hermes pause`` and an unattended holder (a
@@ -165,6 +172,16 @@ MODE_ESTOP = "estop"
 MODE_LOCKDOWN = "lockdown"
 MODES = (MODE_ESTOP, MODE_LOCKDOWN)
 DEFAULT_MODE = MODE_ESTOP
+
+# The three SCOPED controls (operator ruling 2026-10-10) — the answer to every refused unscoped
+# stop, printed by every verb that used to arm a total halt. Stopping the whole fleet is a
+# COMPOSITION of these, reversible one scope at a time; there is no fleet-wide lever.
+SCOPED_CONTROLS: tuple = (
+    "one board : hermes kanban boards set-dispatch <slug> off   (reverse: … set-dispatch <slug> on)",
+    "one job   : hermes cron pause <job_id>                     (reverse: hermes cron resume <job_id>)",
+    "one run   : hermes pause --lockdown --allow-profile <lane> --ttl <dur> --reason \"…\"\n"
+    "            (reverse: hermes resume --handle <handle> — or let the lease expire)",
+)
 
 # Owner key of the operator's own pause. The LIBRARY default for ``engage()``/``acquire()``
 # (back-compat); the CLI resolves its owner from the actor instead (D4/D7).
@@ -507,6 +524,71 @@ class EstopUnboundRun(EstopWriteError):
     *unboundedly and anonymously* is: an unattributed hold is exactly the one that outlived
     its run on 2026-10-10 and had to be lifted by hand. Nothing is written to the sentinel."""
 
+class EstopTotalHaltRetired(EstopWriteError):
+    """A ``mode: estop`` arm — a fleet-wide halt with NO scope — is not a supported operation.
+
+    Operator ruling 2026-10-10: the fleet-wide ESTOP is retired as the fleet's stop mechanism,
+    because one leaked unscoped hold strands every lane at once (37 ready + 3 review cards
+    froze, and no bot could lift it). Refused LOUDLY at the hold itself, so no surface — this
+    CLI, the gateway's ``/pause``, or a direct ``acquire()``/``engage()`` — can re-create one
+    by accident. A legacy ``mode: estop`` entry already on disk still READS as a total halt and
+    is lifted BY HANDLE from any admitted venue: it is an alarm, never a control.
+    """
+
+
+def scoped_controls_help(indent: str = "   ") -> str:
+    """The three SCOPED controls, one per line — what a refused unscoped stop must name."""
+    return "\n".join(f"{indent}{line}" for line in SCOPED_CONTROLS)
+
+
+def total_halt_refusal() -> str:
+    """The refusal text for an arm that would write a fleet-wide halt (a stop with no scope)."""
+    return (
+        "a fleet-wide emergency stop is not a supported operation — it names no scope, so one\n"
+        "   leaked hold would strand every lane at once. Stop what you meant to stop, by scope:\n"
+        + scoped_controls_help()
+    )
+
+
+def resume_all_refusal() -> str:
+    """The refusal text for ``hermes resume --all``, RETIRED as a recovery path."""
+    return (
+        "`hermes resume --all` is RETIRED as a recovery path: it is the fleet-wide override, and\n"
+        "   no hold needs it any more — every hold is nameable and liftable by handle:\n"
+        "     hermes resume --handle <handle>    # the handle is in `hermes pause --history`\n"
+        "   It still lifts a PRE-RULING `mode: estop` hold (legacy state, one-time, logged) from\n"
+        "   any admitted venue — but the stop itself is expressed by scope:\n"
+        + scoped_controls_help()
+    )
+
+
+def is_legacy_total(hold: dict) -> bool:
+    """True for a PRE-RULING total halt: ``mode: estop``, under a name no admitted venue owns.
+
+    Two shapes, both legacy state rather than a control: an entry with no ``actor`` at all
+    (pre-D1 bytes) and one whose ``actor`` IS the operator (the pre-ruling "legal unbounded
+    class", withdrawn by the 2026-10-10 ruling). These are the alarm the boundary statement
+    names: lift them (by handle, or via ``resume --all``'s one-time legacy path), and infer
+    nothing from them about who meant to stop the fleet.
+    """
+    if str(hold.get("mode") or "") != MODE_ESTOP:
+        return False
+    actor = str(hold.get("actor") or "").strip()
+    return not actor or actor == ACTOR_OPERATOR
+
+
+def bot_armed(hold: dict) -> bool:
+    """True when the record says a BOT armed this hold (any actor but the operator).
+
+    ``bot:*`` is the common shape; ``card:*``, ``delegated:*`` and a custom
+    ``HERMES_ESTOP_ACTOR`` handle are the same class — work the fleet itself started. Such an
+    arm never wears its claim (D4 renames it), but a PRE-D4 record can still carry
+    ``owner=operator`` from a bot arm, and that record is exactly what R2 (ruling 2026-10-10)
+    must let an admitted ops venue lift, so a leaked hold never needs a human.
+    """
+    actor = str(hold.get("actor") or "").strip()
+    return bool(actor) and actor != ACTOR_OPERATOR
+
 
 def _normalize_owner(owner: Any) -> str:
     text = str(owner).strip() if owner is not None else ""
@@ -582,8 +664,13 @@ def actor_handle() -> str:
 
     1. the worker of a dispatched kanban card -> ``card:<task_id>``;
     2. a delegated child -> ``delegated:<parent>``;
-    3. ``HERMES_ESTOP_ACTOR`` when it is charset-valid and is not ``operator``;
-    4. an unattended caller (a marker present, or stdin is not a TTY) -> ``bot:<profile>``;
+    3. ``HERMES_ESTOP_ACTOR`` when it is charset-valid and is not the operator's own name
+       (a claim of ``operator``/``Operator`` is ONE claim, and only an interactive session
+       may hold it);
+    4. an unattended caller (a marker present, or stdin is not a TTY) -> ``bot:<profile>``, or
+       ``bot:unresolved:<pid>@<boot-id>`` when no profile resolves (R1, ruling 2026-10-10: a
+       handle no admitted venue can name is a DEFECT, not an attribution — ``bot:unknown``
+       stranded the fleet on the operator's `resume --all`);
     5. otherwise -> ``operator``.
 
     ``HERMES_ESTOP_ACTOR=operator`` is honoured ONLY when the worker/delegated tests and the
@@ -612,18 +699,22 @@ def actor_handle() -> str:
     claimed = str(os.environ.get("HERMES_ESTOP_ACTOR") or "").strip()
     if claimed and not _ACTOR_RE.match(claimed):
         claimed = ""
-    if claimed and claimed != ACTOR_OPERATOR:
+    # R1 (ruling 2026-10-10): the operator's name is ONE name. A claim of "Operator"/"operator "
+    # is that same claim, not a lookalike handle a bot may be recorded under.
+    if claimed and claimed.strip().lower() != ACTOR_OPERATOR:
         return claimed
-    if claimed == ACTOR_OPERATOR and not _unattended_markers() and _stdin_is_tty():
+    if claimed and not _unattended_markers() and _stdin_is_tty():
         return ACTOR_OPERATOR
     if _unattended_markers() or not _stdin_is_tty():
-        # D6 — an unattended caller with no resolvable profile is NAMED, never muddled into
-        # ``bot:unknown``: a hold has to be liftable by whoever can read its handle off the
-        # sentinel, and an unnameable one had to be cleared by hand (2026-10-10, twice).
         profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
         if profile:
             return f"bot:{profile}"
-        return f"bot:unresolved:{os.getpid()}@{_boot_id()}"
+        # R1: `bot:unknown` names NOBODY — the ops seat could not say which unattended process
+        # armed a hold, and the only exit was the operator's `resume --all` (the 2026-10-10
+        # incident). Record a handle any admitted venue can name instead: this process, this
+        # boot. Both values are printable and bounded, so `resume --handle <h>` can name it.
+        boot = _boot_id()
+        return f"bot:unresolved:{os.getpid()}@{boot}" if boot else f"bot:unresolved:{os.getpid()}"
     return ACTOR_OPERATOR
 
 
@@ -1249,6 +1340,11 @@ def _retire_hold(hold: dict) -> None:
         first_report = _expired_logged.get(hold["handle"]) != key
         _expired_logged[hold["handle"]] = key
     removed = _remove_holds([hold])
+    # D5/R3 (converged line, card t_871b1d96): the deadman lift carries the ENGINE half's shape —
+    # ONE `expire` row naming its `cause: deadman` (ruling t_b70753e9 round 2, shape 1; the D5
+    # vocabulary lists `expire` beside `release{cause}`). The retirement half's
+    # `release{cause: deadman, via: "lease"}` row for the same transition YIELDS here: two rows
+    # for one lift is exactly the double shape this convergence exists to remove.
     if first_report:
         record_event(
             "expire", sentinel=Path(hold.get("path") or sentinel_path()),
@@ -1652,9 +1748,11 @@ def arm(
     requires ``order``. Without it the arm is REFUSED with :class:`EstopOrderRequired` and a
     ``refused`` ledger row; nothing is written to the sentinel.
 
-    ``mode`` defaults to ``estop`` (a total halt); ``lockdown`` scopes the stop to the lanes
-    in ``allow["profiles"]``. Pre-existing holds — including a pre-registry sentinel body,
-    which reads as unverified and TOTAL — are preserved.
+    ``mode`` must name a scope: ``lockdown`` (the lanes in ``allow["profiles"]``) is the only
+    mode this function ARMS. A ``mode: estop`` arm — a total halt, the shape that leaked on
+    2026-10-10 and stranded every lane — is REFUSED with :class:`EstopTotalHaltRetired` and
+    nothing is written. Pre-existing holds — including a pre-registry sentinel body, which
+    reads as unverified and TOTAL — are preserved, and stay readable as legacy state.
 
     D1 — a hold names the RUN it belongs to (``owner_run``: the caller's value, else
     ``YOYOFLOW_RUN_ID``/``HERMES_UPDATE_RUN_ID``/the kanban card id, else the run the actor
@@ -1676,6 +1774,20 @@ def arm(
     actor_id = str(actor).strip() if actor else actor_handle()
     target = sentinel_path()
     resolved_mode, _unknown = _normalize_mode(mode)
+    if resolved_mode == MODE_ESTOP:
+        # The retirement (ruling 2026-10-10) is enforced HERE — at the hold — so every arm
+        # surface (this module's callers, the CLI, the gateway's `/pause`) refuses the same
+        # way, and cannot re-create the fleet-wide outage by accident. Nothing is written.
+        recorded = record_event(
+            "refused", sentinel=target, path=str(target), action="arm", actor=actor_id,
+            mode=resolved_mode, reason="unsupported-fleet-wide-halt",
+        )
+        raise EstopTotalHaltRetired(
+            total_halt_refusal() + (
+                "" if recorded else
+                "\n   (the ledger could not be written — this refusal is NOT recorded)"
+            )
+        )
     now = datetime.now(UTC)
     claim = _normalize_owner(owner)
     if actor_id == ACTOR_OPERATOR:
@@ -1956,7 +2068,10 @@ def release(
     * ``owner=operator`` from any other actor is REFUSED (``forbidden``): a bot may not
       silently resume the fleet the operator stopped. It serves the window without lifting it
       (a lockdown hold is scoped), or escalates — the hold's TTL is the backstop;
-    * ``all_holds`` is the operator's own emergency exit and is refused to every other actor;
+    * ``all_holds`` is RETIRED as a recovery path (ruling 2026-10-10). It lifts only PRE-RULING
+      ``mode: estop`` holds — legacy state, the alarm the boundary statement names — and any
+      ADMITTED venue may run it (the ops seat), never the operator only. With none on disk it
+      refuses and names the by-handle release plus the scoped controls;
     * ``handle=`` is unchanged, and now also names an ``unverified#...`` hold.
 
     A handle that names no LIVE hold (unknown, already released, or expired) is reported as
@@ -1980,20 +2095,21 @@ def release(
     state = read_state()
     unverified_cleared = 0
     if all_holds:
-        if actor_id != ACTOR_OPERATOR:
+        # RETIRED as a recovery path (ruling 2026-10-10): `--all` was the fleet-wide override
+        # only the operator could press, so ONE leaked hold stranded the fleet until a human
+        # appeared. The one thing it still does is lift PRE-RULING `mode: estop` holds — legacy
+        # state under a name no admitted venue owns — and it does that from ANY admitted venue
+        # (the ops seat), never operator-only. Every other hold is lifted BY HANDLE.
+        targets = [hold for hold in state.holds if is_legacy_total(hold)]
+        if not targets:
             return ReleaseResult(
                 False,
                 forbidden=True,
-                message=(
-                    f"refusing to lift EVERY hold: {actor_id} is not the operator.\n"
-                    f"   `--all` is the operator's own exit. Lift your own hold by handle, or "
-                    f"ask the operator to run it."
-                ),
+                message=resume_all_refusal(),
                 remaining=state.holds,
                 actor=actor_id,
             )
-        targets = list(state.holds)
-        label = "every hold"
+        label = f"the {len(targets)} pre-ruling estop hold{'s' if len(targets) != 1 else ''}"
         cause = "all"
     elif handle is not None:
         wanted = str(handle).strip()
@@ -2012,20 +2128,26 @@ def release(
         cause = "handle"
     else:
         owner_id = actor_id if owner is None else _normalize_owner(owner)
+        named = [hold for hold in state.holds if hold["owner"] == owner_id]
+        # R2 (ruling 2026-10-10): `owner=operator` on a BOT-armed record is the bot's CLAIM —
+        # D4 keeps that claim in ``claimed_owner`` and records the hold under the actor — and
+        # refusing to lift it is the denial-of-service this ruling retires. D7 stands for a hold
+        # the OPERATOR really armed.
         if owner_id == ACTOR_OPERATOR and actor_id != ACTOR_OPERATOR:
-            return ReleaseResult(
-                False,
-                forbidden=True,
-                message=(
-                    f"refusing to lift the operator's hold: {actor_id} is not the operator.\n"
-                    f"   A bot may not resume the fleet the operator stopped. Serve the window "
-                    f"without lifting it (a lockdown hold is scoped to its allowlist), or "
-                    f"escalate to the operator — the hold's TTL is the backstop."
-                ),
-                remaining=state.holds,
-                actor=actor_id,
-            )
-        targets = [hold for hold in state.holds if hold["owner"] == owner_id]
+            if [hold for hold in named if not bot_armed(hold)]:
+                return ReleaseResult(
+                    False,
+                    forbidden=True,
+                    message=(
+                        f"refusing to lift the operator's hold: {actor_id} is not the operator.\n"
+                        f"   A bot may not resume the fleet the operator stopped. Serve the window "
+                        f"without lifting it (a lockdown hold is scoped to its allowlist), or "
+                        f"escalate to the operator — the hold's TTL is the backstop."
+                    ),
+                    remaining=state.holds,
+                    actor=actor_id,
+                )
+        targets = named
         if actor_id == ACTOR_OPERATOR and owner_id == ACTOR_OPERATOR:
             # D7 — the operator's own resume clears the UNVERIFIED holds too: nothing else can
             # name them, and an unattributable hold is not any holder's scope to keep.
@@ -2051,6 +2173,11 @@ def release(
                 remaining=state.holds,
                 actor=actor_id,
             )
+        # (converged, t_871b1d96) The retirement half recomputed ``cause = "owner"`` here for
+        # EVERY release in this branch. That is a second shape for the same transition and it
+        # swallowed the D5 vocabulary the engine half's rows carry — a bare lift lost its
+        # ``explicit`` cause. The engine half's computation above (explicit / operator-resume /
+        # owner) SURVIVES; the retirement half contributes the ``via`` venue on the row.
     if not _remove_holds(targets):
         return ReleaseResult(
             False,
@@ -2064,11 +2191,19 @@ def release(
         # hold it lifted, so the released scope stays recoverable after the sentinel body — and
         # with it ``allow.profiles`` — is gone.
         target_allow = target.get("allow") or None
+        target_owner = str(target.get("owner") or "")
+        # R3 (ruling 2026-10-10): every release names its CAUSE and its VENUE, so "who lifted
+        # it, and why" survives the sentinel body. The vocabulary is D5's: explicit · handle ·
+        # owner · all · operator-resume · deadman · orphan.
+        hold_cause = cause
+        if target_owner == ACTOR_UNVERIFIED and not all_holds:
+            hold_cause = "operator-resume"
         ledger_ok = record_event(
             "release", sentinel=Path(target.get("path") or sentinel_path()),
             path=target.get("path"), handle=target["handle"], owner=target.get("owner"),
             actor=actor_id, mode=target.get("mode"), verified=bool(target.get("verified")),
-            cause=cause, owner_run=target.get("owner_run"),
+            cause=hold_cause, owner_run=target.get("owner_run"),
+            via="holder" if target_owner == actor_id else "ops-venue",
             allow=target_allow, allow_profiles=list((target_allow or {}).get("profiles") or []),
         ) and ledger_ok
     after = read_state()
@@ -2109,10 +2244,12 @@ def engage(
     """Arm a hold on the ESTOP sentinel and return the sentinel path.
 
     The panic-button entry point: ``owner`` defaults to ``operator`` (the library default, kept
-    for back-compat) and mode ``estop`` (a total halt) unless ``mode="lockdown"`` is given. It
-    is idempotent — re-engaging REPLACES that OWNER's entry — and it leaves every OTHER
-    holder's entry byte-identical, which is what stops a maintenance hold and the operator's
-    pause from releasing each other.
+    for back-compat) and the mode MUST name a scope — ``mode="lockdown"`` is the only one that
+    arms, because the fleet-wide total halt is not a supported operation any more (ruling
+    2026-10-10; ``engage()`` on the old default raises :class:`EstopTotalHaltRetired`). It is
+    idempotent — re-engaging REPLACES that OWNER's entry — and it leaves every OTHER holder's
+    entry byte-identical, which is what stops a maintenance hold and the operator's pause from
+    releasing each other.
 
     WHO the hold is recorded under is decided by :func:`actor_handle` / ``actor`` (D3/D4): a
     caller that is not the operator does not get to wear the operator's name, and a
@@ -2176,6 +2313,18 @@ def _dominant_hold(state: EstopState) -> dict:
     return _dominant(list(state.holds))
 
 
+def dominant_hold(state: Optional[EstopState] = None) -> dict:
+    """The hold a single-hold view should show — ``{}`` when nothing is held.
+
+    A ``mode: estop`` hold wins (it governs the fleet), else the most recently engaged one.
+    Public because the SCOPE lives here: a status line or a notice that must name
+    ``hold <handle> lanes=[…] until <ts>`` instead of "the fleet is paused" needs the handle and
+    the lane list, and :func:`get_state`'s legacy shape carries neither.
+    """
+    current = state if state is not None else read_state()
+    return _dominant_hold(current) if current.holds else {}
+
+
 def get_state() -> Optional[dict]:
     """Legacy single-hold view of the pause, or None when the fleet is clear.
 
@@ -2228,22 +2377,33 @@ def is_allowed(
 
 
 def paused_reply() -> Optional[str]:
-    """Short user-facing notice for new gateway turns, or None if not paused."""
+    """Short user-facing notice for new gateway turns, or None if not paused.
+
+    Names the SCOPE of the hold that is in force — its handle, its lanes and its deadline —
+    never a fleet-wide "Hermes is paused" (ruling 2026-10-10 §5): whoever reads this must be
+    able to see WHAT stopped and how to lift it. A total entry can only be PRE-RULING state by
+    now (the arm verb refuses them), and is named as the legacy alarm it is.
+    """
     state = read_state()
     if not state.engaged:
         return None
     hold = _dominant_hold(state)
-    tag = f" ({hold['reason']})" if hold.get("reason") else ""
-    until = f" Auto-resumes {hold['expires_at']}." if hold.get("expires_at") else ""
+    tag = f" (reason: {hold['reason']})" if hold.get("reason") else ""
+    handle = hold.get("handle") or "?"
+    deadline = f"until {hold['expires_at']}" if hold.get("expires_at") else "until released"
+    lift = f"hermes resume --handle {handle}"
     if state.total:
+        scoped = state.counts[MODE_LOCKDOWN]
+        also = f" (+{scoped} scoped hold{'s' if scoped != 1 else ''} beside it)" if scoped else ""
         return (
-            f"⏸️ Hermes is paused{tag}. New work is on hold; run `hermes resume` to pick "
-            f"things back up.{until}"
+            f"⏸️ hold {handle} — LEGACY fleet-wide halt{also}{tag}: arming one is not a supported "
+            f"operation any more, and every lane's new work is paused. Lift it by handle: `{lift}`."
         )
-    lanes = ", ".join(sorted(state.allow_profiles)) or "(no lane — every lane is held)"
+    lanes = ", ".join(sorted(state.allow_profiles)) or "(no lane named — every lane is held)"
     return (
-        f"⏸️ Hermes is in lockdown{tag}: {lanes} keep working; every other lane's cards and "
-        f"cron jobs are held until the lockdown lifts.{until}"
+        f"⏸️ hold {handle} lanes=[{lanes}] {deadline}{tag}: those lanes keep working; every other "
+        f"lane's cards and cron jobs are paused per item, never silently skipped. "
+        f"Lift it with `{lift}`."
     )
 
 
@@ -2263,13 +2423,23 @@ def _resume_note(prior: Optional[dict]) -> str:
     except Exception:
         rows = []
     for row in reversed(rows):
-        if str(row.get("event") or "") != "release":
+        event = str(row.get("event") or "")
+        if event not in ("release", "expire"):
             continue
         if str(row.get("at") or "") <= since:
             break
         who = str(row.get("actor") or row.get("owner") or "unknown")
         handle = row.get("handle")
-        return f"released by {who}{f' (handle {handle})' if handle else ''}"
+        suffix = f" (handle {handle})" if handle else ""
+        if event == "expire":
+            # D5 (converged line, t_871b1d96): the deadman lift is an `expire` row — name it
+            # HERE, so the gateway's "fleet RESUMED" line keeps its attribution instead of
+            # falling through to the declared-expiry wording below, which cannot tell a lift
+            # by the engine from a hold nobody ever released.
+            cause = str(row.get("cause") or "deadman")
+            when = row.get("expires_at") or prior.get("expires_at")
+            return f"auto-resumed by the {cause}{f' at {when}' if when else ''}{suffix}"
+        return f"released by {who}{suffix}"
     if prior.get("expires_at"):
         return f"auto-resumed at its declared expiry ({prior['expires_at']})"
     return "cleared with no release event on record (sentinel removed out-of-band)"

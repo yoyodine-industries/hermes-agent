@@ -81,6 +81,11 @@ SELF = Path(__file__).resolve()
 # The owning run's actor handle and the exact reason string the 2026-10-10 wind-down arm used.
 SIM_RUN = "bot:hermes-update:SIM-0000"
 SIM_REASON = "wind-down hold, TTL 90m"
+# The remaining LEGAL hold shape: scoped (lanes + a bounded lease). A `mode: estop` arm — the
+# fleet-wide halt — is not a supported operation any more (operator ruling 2026-10-10, card
+# t_e04b4c81), so every scenario here arms a lockdown and the clauses read THAT shape. The
+# run-ownership/lease guarantees for it are  clauses 4/5 and the engine card t_b70753e9's.
+_SCOPED = {"mode": "lockdown", "allow": {"profiles": ["platform-coder"]}}
 
 _SCENARIO_ENV = "HERMES_ESTOP_TEST_SCENARIO"
 _ROOT_ENV = "HERMES_ESTOP_TEST_ROOT"
@@ -167,13 +172,13 @@ def _s_isolation(estop, root: Path, arm: dict) -> dict:
 
 
 def _s_arm(estop, root: Path, arm: dict) -> dict:
-    res = estop.arm(actor=SIM_RUN, **arm)
+    res = estop.arm(actor=SIM_RUN, **_SCOPED, **arm)
     return {"ok": True, "detail": f"armed handle={res.handle} ttl_s={res.ttl_s!r}"}
 
 
 def _s_deadman(estop, root: Path, arm: dict) -> dict:
     """clause 5, green half: a TTL that IS passed is enforced at read time."""
-    res = estop.arm(owner="operator", reason="ttl clause", ttl="2s", actor=SIM_RUN)
+    res = estop.arm(owner="operator", reason="ttl clause", ttl="2s", actor=SIM_RUN, **_SCOPED)
     armed = estop.is_engaged()
     time.sleep(3)
     after = estop.is_engaged()
@@ -196,7 +201,7 @@ def _s_bounce_read(estop, root: Path, arm: dict) -> dict:
 
 def _s_run_bound(estop, root: Path, arm: dict) -> dict:
     """clause 4 root cause: a run-owned arm carries an ENFORCED bound or a liveness binding."""
-    res = estop.arm(owner="operator", reason=SIM_REASON, actor=SIM_RUN)
+    res = estop.arm(owner="operator", reason=SIM_REASON, actor=SIM_RUN, **_SCOPED)
     state = estop.read_state()
     hold = next((h for h in state.holds if h["handle"] == res.handle), None)
     if hold is None:
@@ -210,7 +215,7 @@ def _s_run_bound(estop, root: Path, arm: dict) -> dict:
 
 def _s_explicit_release(estop, root: Path, arm: dict) -> dict:
     """clause 6, green half: an explicit release DOES land a row (t_56a91192's other half)."""
-    res = estop.arm(owner="operator", reason="observable clause", actor=SIM_RUN)
+    res = estop.arm(owner="operator", reason="observable clause", actor=SIM_RUN, **_SCOPED)
     lifted = estop.release(handle=res.handle, actor=SIM_RUN)
     rows = [r for r in estop.read_events() if r.get("handle") == res.handle]
     lifts = [r for r in rows if str(r.get("event", "")).startswith(("release", "retire", "expire"))]
@@ -224,7 +229,7 @@ def _s_deadman_row(estop, root: Path, arm: dict) -> dict:
     The explicit-release half passes today; this one is why the log of the 2026-10-10 leak
     ends at ``arm``+``arm_renamed`` with no lift row at all.
     """
-    res = estop.arm(owner="operator", reason="observable clause", ttl="2s", actor=SIM_RUN)
+    res = estop.arm(owner="operator", reason="observable clause", ttl="2s", actor=SIM_RUN, **_SCOPED)
     time.sleep(3)
     estop.is_engaged()                       # the tick path that retires an expired hold
     rows = [r for r in estop.read_events() if r.get("handle") == res.handle]
@@ -267,7 +272,7 @@ def _s_advertised_ttl(estop, root: Path, arm: dict) -> dict:
     ledger's arm row has no ``ttl_s`` key at all and the hold carries no deadline.
     """
     reason = str(arm.get("reason") or SIM_REASON)
-    res = estop.arm(owner="operator", reason=reason, actor=SIM_RUN)
+    res = estop.arm(owner="operator", reason=reason, actor=SIM_RUN, **_SCOPED)
     row = next((r for r in estop.read_events()
                 if r.get("event") == "arm" and r.get("handle") == res.handle), None)
     hold = next((h for h in estop.read_state().holds if h["handle"] == res.handle), None)
@@ -390,6 +395,12 @@ def test_clause6_an_explicit_release_writes_a_ledger_row(root):
 
 
 def test_clause6_a_deadman_lift_writes_a_ledger_row(root):
+    """A hold that self-lifted must leave a row too.
+
+    This was the measured gap behind the 2026-10-10 leak (a log ending at ``arm``): the
+    retirement card's R3 (t_e04b4c81) writes it, so the marker that named this clause as RED
+    is gone — per this file's own doctrine, an XPASS means delete the marker.
+    """
     result = _run_scenario(root, "deadman_row", timeout=180)
     assert result["ok"], result["detail"]
 
