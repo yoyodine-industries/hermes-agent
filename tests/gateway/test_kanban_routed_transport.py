@@ -33,6 +33,13 @@ def setup_runner(tmp_path, monkeypatch):
         profile = home / "profiles" / name
         profile.mkdir(parents=True)
         (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+    # ``worker`` is the handle every completion() below files under. It resolves to no
+    # profile on disk, and the assignee invariant (kanban_gate_invariants.gate_assignee,
+    # armed at the kernel's create door) refuses a handle that resolves nowhere and is not
+    # a DECLARED lane. Declaring it here is the honest path for a probe handle that pulls
+    # its own work; it changes nothing these tests assert.
+    (home / "kanban").mkdir(parents=True, exist_ok=True)
+    (home / "kanban" / "terminal_lanes").write_text("worker\n", encoding="utf-8")
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.adapters = {Platform.DISCORD: RecordingAdapter()}
     runner._profile_adapters = {"yuki": {}}

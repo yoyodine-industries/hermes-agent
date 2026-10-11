@@ -990,21 +990,27 @@ class GatewayBusySessionMixin:
         return t("gateway.busy.slash_rejected", command=name)
 
     async def _handle_pause_command(self, event: MessageEvent):
-        """`/pause [reason]` engages the global emergency stop; `/pause off` lifts it (the estop gate
-        lets slash commands through while paused so messaging-only operators are never locked out)."""
+        """`/pause` has NO unscoped form any more: it refuses and names the scoped controls.
+
+        `/pause off` still releases the CALLER's own hold. The chat surface cannot express a
+        board/job/lane scope, so the arm direction is refused (operator ruling 2026-10-10):
+        a fleet-wide stop armed from a chat line is exactly the outage that ruling retires.
+        A hold already in force is REPORTED with its scope, and the estop gate keeps letting
+        slash commands through, so a messaging-only operator is never locked out.
+        """
         from agent import estop
         args = (event.get_command_args() or "").strip()
         if args.lower() in {"off", "resume", "stop", "disengage"}:
             if estop.disengage():
                 return t("gateway.pause.resumed")
+            if estop.paused_reply() is not None:
+                # A hold IS in force and it is not this venue's own to lift: name it, and the
+                # by-handle release — the ops seat lifts any hold that way, no `--all`, no
+                # operator (R2).
+                return t("gateway.pause.not_own_hold", notice=estop.paused_reply())
             return t("gateway.pause.not_paused")
-        state = estop.get_state()
-        if state is not None and not args:
-            suffix = t("gateway.pause.reason_suffix", reason=state.get("reason")) if state.get("reason") else ""
-            return t("gateway.pause.already_paused", suffix=suffix)
-        estop.engage(reason=args or None)
-        suffix = t("gateway.pause.reason_suffix", reason=args) if args else ""
-        return t("gateway.pause.paused", suffix=suffix)
+        # The unscoped (and only) arm form is refused, with the scoped controls spelled out.
+        return t("gateway.pause.unscoped_refused", controls=estop.scoped_controls_help("    "))
 
     async def _busy_start_command(self, event: MessageEvent, quick_key: str, source):
         # Telegram's /start is a platform ping (bot launch/deep-link), not a user command.

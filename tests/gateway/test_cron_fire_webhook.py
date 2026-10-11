@@ -376,9 +376,14 @@ async def test_fire_passes_live_adapters_to_provider(adapter, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_estop_refuses_fire_before_admission_and_lifts_on_resume(adapter, monkeypatch, tmp_path):
-    """`hermes pause` must stop the NAS-driven door too: 503 + Retry-After (NAS redelivers
-    after `hermes resume`) and no ``claim_fire`` — a claim followed by a 503 would leave a
-    claimed job that the retry and the misfire backstop both race for."""
+    """A total hold must stop the NAS-driven door too: 503 + Retry-After (NAS redelivers after
+    the hold is lifted) and no ``claim_fire`` — a claim followed by a 503 would leave a
+    claimed job that the retry and the misfire backstop both race for.
+
+    A `mode: estop` hold can only be PRE-RULING state now — arming one is not a supported
+    operation (operator ruling 2026-10-10, card t_e04b4c81) — so the state is written directly
+    and lifted BY HANDLE, exactly as an admitted venue would.
+    """
     from agent import estop
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -392,7 +397,8 @@ async def test_estop_refuses_fire_before_admission_and_lifts_on_resume(adapter, 
 
     app = _create_app(adapter)
     async with TestClient(TestServer(app)) as cli:
-        estop.engage(reason="runaway fan-out")
+        estop.sentinel_path().write_text('{"reason": "runaway fan-out"}\n', encoding="utf-8")
+        handle = estop.holds()[0]["handle"]
         response = await cli.post(
             "/api/cron/fire",
             headers={"Authorization": "Bearer good"},
@@ -404,7 +410,7 @@ async def test_estop_refuses_fire_before_admission_and_lifts_on_resume(adapter, 
         assert provider.claimed == [] and provider.fired == []
         assert adapter.active_agent_work_count() == 0
 
-        estop.disengage()
+        estop.release(handle=handle)
         response = await cli.post(
             "/api/cron/fire",
             headers={"Authorization": "Bearer good"},

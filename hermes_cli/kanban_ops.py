@@ -112,8 +112,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
+            "skipped_board_disabled": res.skipped_board_disabled,
             "memory_pressure": res.memory_pressure,
         }, ascii=True)
+        return 0
+    if res.skipped_board_disabled:
+        # The loudest possible zero: this tick did not run because the board it
+        # resolved to is an estate/scratch board (card t_17c9c847). Silence here
+        # is what made a redirect to a "scratch" board look like isolation.
+        print("Refused:      board is NOT dispatch-enabled (estate/scratch board) — "
+              "no card on it can be spawned; `hermes kanban boards set-dispatch "
+              "<slug> on` admits it again.")
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
     if res.reaped_terminal_workers:

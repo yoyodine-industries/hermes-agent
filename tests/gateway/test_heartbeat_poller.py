@@ -139,7 +139,8 @@ async def test_emergency_stop_holds_due_tick_without_messaging_until_resume(poll
     adapter.set_message_handler(real_gateway)
     clock.now += 900
     original = HeartbeatManager("heartbeat-session").state.to_json()
-    estop.engage(reason="maintenance")
+    estop.sentinel_path().write_text('{"reason": "maintenance"}\n', encoding="utf-8")
+    _handle = estop.holds()[0]["handle"]
     for _ in range(3):
         await runner._heartbeat_poll_once(watch)
         await asyncio.gather(*adapter._background_tasks)
@@ -150,7 +151,7 @@ async def test_emergency_stop_holds_due_tick_without_messaging_until_resume(poll
         event._heartbeat_execution_started = True  # fake agent execution boundary
         received.append(event)
 
-    estop.disengage()
+    estop.release(handle=_handle)
     adapter.set_message_handler(agent_turn)
     await runner._heartbeat_poll_once(watch)
     await asyncio.gather(*adapter._background_tasks)
@@ -173,7 +174,8 @@ async def test_emergency_stop_gate_drops_heartbeat_silently_but_tells_real_users
 
     monkeypatch.setattr(adapter, "send", send)
     adapter.set_message_handler(runner._handle_message)
-    estop.engage(reason="maintenance")
+    estop.sentinel_path().write_text('{"reason": "maintenance"}\n', encoding="utf-8")
+    _handle = estop.holds()[0]["handle"]
     heartbeat = runner._synthetic_prompt_event(source, "check status")
     heartbeat._heartbeat_session_id = "heartbeat-session"
     await adapter.handle_message(heartbeat)
@@ -183,3 +185,4 @@ async def test_emergency_stop_gate_drops_heartbeat_silently_but_tells_real_users
     await adapter.handle_message(MessageEvent(text="are you there?", source=source))
     await asyncio.gather(*adapter._background_tasks)
     assert len(sent) == 1 and estop.paused_reply() in sent[0]
+    estop.release(handle=_handle)
