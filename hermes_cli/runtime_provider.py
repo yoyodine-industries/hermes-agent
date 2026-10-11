@@ -1009,6 +1009,17 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
          api_mode to ``codex_app_server``; the rung's credential/endpoint is then not used
     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
     OpenCode Zen/Go where different models route through different API surfaces)."""
+    # A DENIED model is refused FIRST, before any credential, alias or endpoint work: the ban must
+    # not cause a provider call, and there is no fallback to quietly land on (card t_a1ae7cc6, A4).
+    # This is the one resolution path shared by the CLI, oneshot, the agent, cron and the gateway,
+    # so the refusal is identical wherever a model is resolved rather than repeated per surface.
+    if target_model:
+        from hermes_cli.model_denylist import ModelDeniedError, denial
+
+        denied = denial(target_model)
+        if denied is not None:
+            raise ModelDeniedError(denied, where="resolve_runtime_provider")
+
     requested_provider = resolve_requested_provider(requested)
     _raise_if_provider_disabled(requested_provider)
     # Same alias expansion the auxiliary client applies, so ``provider: openai`` means one thing on
