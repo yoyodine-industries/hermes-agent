@@ -100,6 +100,16 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
     # subparser only; treat the alias as `rm --delete`.
     # See #23139.
     force_delete = getattr(args, "delete", False) or getattr(args, "boards_action", "") == "delete"
+    # Capture the estate declaration BEFORE the directory moves, so the handler can report which
+    # record the single-actor teardown left behind (ruling t_fcf7a321, Decision 2).
+    estate_declared = False
+    if not force_delete:
+        try:
+            from hermes_cli import kanban_bulk_guard as kbg
+
+            estate_declared = kbg._estate_state(str(args.slug or ""))[0]
+        except Exception:
+            estate_declared = False
     try:
         res = kb.remove_board(args.slug, archive=not force_delete)
     except ValueError as exc:
@@ -108,6 +118,11 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
         print(f"Board {res['slug']!r} archived → {res['new_path']}\n"
               "Recover by moving the directory back to <root>/kanban/boards/<slug>/ "
               "and deleting the archived tombstone board.json left in its place.")
+        if estate_declared:
+            from hermes_cli import kanban_bulk_guard as kbg
+
+            print(f"Estate teardown recorded (actor + reason + verified preimage): "
+                  f"{kbg.ledger_path()} · {kbg.audit_path()}")
     else:
         print(f"Board {res['slug']!r} deleted.")
     return 0

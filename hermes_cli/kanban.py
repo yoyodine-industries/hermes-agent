@@ -22,6 +22,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
+from hermes_cli import kanban_bulk_guard as kbg
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
@@ -151,7 +152,24 @@ def kanban_command(args: argparse.Namespace) -> int:
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
-        return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
+        return _err(_DELEGATED_CHILD_CLI_REFUSAL)
+
+    # One seam for the operator's 2026-09-27 bulk-action rule (card t_bf9605f8): a destructive BULK
+    # board action is REFUSED unless an authorized ask (the profile in
+    # `kanban_bulk_guard.AUTHORIZED_ASK_PROFILE`; REQUIRED_APPROVALS is 0, so no second party is
+    # needed) and a VERIFIED
+    # snapshot of the target store all exist — and the approval binds this EXACT action (board +
+    # verb + canonical scope), so it cannot be transplanted to a different parameter set. Gated by
+    # classification, so a bulk verb is covered by construction (`kanban_bulk_guard.BULK_SURFACES`);
+    # a non-bulk single-card write returns None here and is untouched. The ONE waiver is a declared
+    # estate board (board.json `"dispatch": false`), torn down single-actor via
+    # `hermes kanban boards rm --estate <slug>` with the ask/APR clause skipped and the destination
+    # claim, verified snapshot and ledger/audit row kept (ruling t_fcf7a321, Decision 2).
+    try:
+        kbg.gate_cli(args)
+    except kbg.BulkActionRefused as exc:
+        return _err(str(exc), 1)
+
 
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
     # the `--board` routing override (else `--board beta boards show` reports beta).
@@ -225,16 +243,68 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
 })
 
 
+#: Printed for BOTH cooperative arms and the provenance arm (ruling t_fcf7a321, Decision 1(b)):
+#: a refused worker must learn the ACTUAL requirement and the ONE sanctioned release, never be
+#: told to reach for an ``env -u`` strip.
+_DELEGATED_CHILD_CLI_REFUSAL: str = (
+    "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI "
+    "(and a shell that merely unsets HERMES_DELEGATED_CHILD_CONTEXT is still refused when it "
+    "descends from a LIVE dispatched worker holding a claim on this board). Run the action from a "
+    "top-level session; the one sanctioned non-top-level release is the estate path — a board "
+    "whose own board.json declares \"dispatch\": false is torn down single-actor with "
+    "`hermes kanban boards rm --estate <slug>`."
+)
+def _fence_target_store(args: argparse.Namespace) -> Path:
+    """The board store the invocation actually TARGETS.
+
+    ``--board`` names the board a command addresses; the ambient chain
+    (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` -> ``<kanban>/current``) resolves only
+    the board that is ACTIVE in this process. Judging the fast-fail against the ambient board
+    refuses a mutation targeting a board this lineage holds no claim on, and lets the verdict
+    flip when ``<kanban>/current`` moves (card t_63a0c2d9).
+
+    The ``boards …`` actions are the exception: they ignore ``--board`` by construction (board
+    metadata and the current-board pointer live at the root), so the caller keeps the ambient
+    resolution for them.
+    """
+    named = getattr(args, "board", None)
+    if named:
+        try:
+            return kb.kanban_db_path(board=named)
+        except Exception:
+            # An unregistered/malformed ``--board`` is the CLI's own validation to refuse a
+            # moment later (:func:`kanban_command` validates it before dispatch); the fast-fail
+            # must never raise from here. Fall through to the ambient board, which is exactly
+            # what the pre-fix helper judged.
+            pass
+    return kb.kanban_db_path()
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
+    """Fence a mutating CLI verb from a non-top-level session.
+
+    Two cooperative arms (the ContextVar and the ``HERMES_DELEGATED_CHILD_CONTEXT`` marker,
+    both inside :func:`kanban_path_is_fenced`) plus the PROVENANCE arm (ruling t_fcf7a321,
+    Decision 1): a process descended from a LIVE dispatched worker is refused even after the
+    marker has been stripped. Reads never reach this helper — the caller checks the action
+    vocabulary first.
+
+    Both arms are judged against the board the invocation TARGETS (:func:`_fence_target_store`),
+    never the host-global ambient board: a mutation aimed at another board is not this lineage's
+    to fence, and the verdict must not move when ``<kanban>/current`` does.
+    """
     action = getattr(args, "kanban_action", None)
     if action == "boards":
         if (getattr(args, "boards_action", None) or "list") not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
             return False
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
-    from agent.delegation_context import kanban_path_is_fenced
+    from agent.delegation_context import ancestor_owns_live_kanban_claim, kanban_path_is_fenced
 
-    return kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(kb.kanban_db_path())
+    # ``boards …`` ignores ``--board``, so its target is the ambient board (as before).
+    target = kb.kanban_db_path() if action == "boards" else _fence_target_store(args)
+    if kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(target):
+        return True
+    # Durable arm: the marker is clearable, ancestry is not. Same fence, proven from the TARGET board.
+    return ancestor_owns_live_kanban_claim(target)
 
 
 def _joined_words(words) -> Optional[str]:
@@ -481,7 +551,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
         assignee = _profile_author()
     with kbc.connect_closing() as conn:
         # Cheap mini-dispatch so list reflects dependencies cleared since the last tick.
-        kb.recompute_ready(conn)
+        # A FENCED caller (delegated child, or a shell descended from a LIVE dispatched worker —
+        # ruling t_fcf7a321) lists READ-ONLY: ``recompute_ready`` is housekeeping the board's
+        # OWNER performs every tick, and letting it refuse would fence a read verb, which the
+        # fence must never do. ``connect`` already hands such a caller a read-only connection.
+        try:
+            kb.recompute_ready(conn)
+        except PermissionError:
+            pass
         tasks = kb.list_tasks(
             conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
             include_archived=args.archived, order_by=getattr(args, "sort", None),
@@ -1494,6 +1571,17 @@ def _cmd_defcon(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+
+def _cmd_bulk_approvals(args: argparse.Namespace) -> int:
+    """``hermes kanban bulk-approvals <ask|approve|list|show>`` (decked in kanban_bulk_guard)."""
+    handler = kbg.APPROVAL_HANDLERS.get(getattr(args, "bulk_approvals_action", None))
+    if not handler:
+        return _err("kanban bulk-approvals: unknown subcommand", 2)
+    try:
+        return int(handler(args) or 0)
+    except kbg.BulkActionRefused as exc:
+        return _err(str(exc), 1)
+
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
@@ -1514,7 +1602,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc, "defcon": _cmd_defcon,
+    "gc": _cmd_gc, "bulk-approvals": _cmd_bulk_approvals, "defcon": _cmd_defcon,
 }
 
 

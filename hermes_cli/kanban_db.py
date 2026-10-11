@@ -250,11 +250,23 @@ def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None
     user and board-metadata mutator fails closed before touching durable state.
     *path* is the board DB / metadata root being mutated; ``None`` means the
     lineage's own board (``kanban_home()``).
-    """
-    from agent.delegation_context import kanban_path_is_fenced
 
-    if kanban_path_is_fenced(kanban_home() if path is None else path):
+    Three arms, all additive (ruling t_fcf7a321, Decision 1): the ContextVar and the
+    ``HERMES_DELEGATED_CHILD_CONTEXT`` marker (both inside :func:`kanban_path_is_fenced`), plus
+    the PROVENANCE arm — a process descended from a LIVE dispatched worker is refused even when
+    the cooperatively-clearable marker has been stripped. Reads never call this.
+    """
+    from agent.delegation_context import (
+        PROVENANCE_REFUSAL_MESSAGE,
+        ancestor_owns_live_kanban_claim,
+        kanban_path_is_fenced,
+    )
+
+    target = kanban_home() if path is None else path
+    if kanban_path_is_fenced(target):
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
+    if ancestor_owns_live_kanban_claim(target):
+        raise PermissionError(PROVENANCE_REFUSAL_MESSAGE)
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -630,11 +642,24 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Board has a ``board.json`` on disk; ``default`` always exists."""
+    """Whether a board lives at ``board``'s directory: its ``board.json`` or its store.
+
+    ``default`` always exists. An ``archived`` tombstone is the RECORD of a board that was
+    torn down, never a board: ``remove_board(archive=True)`` renamed the directory away and
+    left the marker behind only to guard a stale reader (#43243), so the slug answers False
+    here once the teardown is done. Discovery is deliberately NARROWER and keeps using
+    :func:`_dir_holds_board` (``board.json`` only), which is what keeps a ``kanban.db``-only
+    stub out of the board list.
+    """
     slug = _slug_or_default(board)
     if slug == DEFAULT_BOARD:
         return True
-    return _dir_holds_board(board_dir(slug))
+    d = board_dir(slug)
+    if (d / "kanban.db").exists():
+        return True
+    if not _dir_holds_board(d):
+        return False
+    return not read_board_metadata(slug).get("archived")
 
 
 def board_is_registered(board: Optional[str] = None) -> bool:
@@ -643,11 +668,14 @@ def board_is_registered(board: Optional[str] = None) -> bool:
     ``default`` is always registered. Every other slug is registered iff its directory
     carries ``board.json`` — ``create_board`` always writes that file, while the filing
     path's creating connect() mints only ``kanban.db``. So this is the probe a FILING
-    uses to refuse a slug nobody registered. On this tree :func:`board_exists` already
-    requires ``board.json`` (#43243), so the two agree; the name is kept because the
-    filing path and its tests ask for the registration question by name.
+    uses to refuse a slug nobody registered. :func:`board_exists` is the LOOSER probe
+    (it also answers True for a slug's own store, and False once a teardown has left only
+    the ``archived`` tombstone); the registration question is this one, asked by name.
     """
-    return board_exists(board)
+    slug = _slug_or_default(board)
+    if slug == DEFAULT_BOARD:
+        return True
+    return _dir_holds_board(board_dir(slug))
 
 
 class BoardResolutionError(ValueError):
@@ -906,7 +934,7 @@ def board_has_live_claims(board: Optional[str] = None) -> bool:
     if not db.exists():
         return False
     try:
-        conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=1.0)
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
         try:
             row = conn.execute(
                 "SELECT 1 FROM tasks WHERE status = 'running' AND worker_pid IS NOT NULL "
@@ -2414,7 +2442,7 @@ def designate_priority(conn: sqlite3.Connection, task_id: str, *, reason: str,
         raise ValueError("a designation needs a reason (it is the audit answer)")
     current = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if current is None:
-        raise ValueError("no such task %s on this board" % task_id)
+        raise ValueError(f"no such task {task_id} on this board")
     slug = board or board_for_connection(conn) or get_current_board()
     stamp = _designation_stamp(now)
     with write_txn(conn, allow_nested=nested):

@@ -271,17 +271,48 @@ def cli_home(tmp_path, monkeypatch):
 
 
 
-def test_cli_repair_json_shape(cli_home, capsys):
+def test_cli_repair_json_shape(cli_home, capsys, tmp_path, monkeypatch):
     db_path = kb.kanban_db_path()
     _build_board_db(db_path)
     _corrupt_index(db_path, "idx_tasks_status")
 
-    rc = _run_kanban_cli(["repair", "--json"])
+    # `repair` quarantines a store and REINDEXes it, so it is a destructive BULK action: since the
+    # operator's 2026-09-27 rule (card t_bf9605f8) the CLI seam REFUSES it unless the call carries
+    # the approval bundle for exactly this action. Admit it the way production does, then assert
+    # the JSON shape this test is about.
+    from hermes_cli import kanban_bulk_guard as kbg
+    from tests.hermes_cli.bulk_guard_admission import admit
+
+    digest = admit(monkeypatch, tmp_path, board=kb.get_current_board(), verb="repair",
+                   scope=kbg.classify("repair", {}))
+
+    rc = _run_kanban_cli(["repair", "--json", "--approval", digest])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert payload["status"] == "repaired"
     assert payload["reindexed"] == ["idx_tasks_status"]
     assert payload["backup_path"]
     assert Path(payload["backup_path"]).exists()
+
+
+def test_cli_repair_without_an_approval_bundle_is_refused(cli_home, capsys, tmp_path, monkeypatch):
+    """The rule, at the CLI: an unapproved `repair` names its cause and its remedy, and sweeps nothing."""
+    db_path = kb.kanban_db_path()
+    _build_board_db(db_path)
+    _corrupt_index(db_path, "idx_tasks_status")
+    monkeypatch.setenv("BULK_GUARD_LEDGER_DIR", str(tmp_path / "bulk_actions"))
+
+    rc = _run_kanban_cli(["repair", "--json"])
+    captured = capsys.readouterr()
+    assert rc != 0
+    assert "bulk-guard refusal" in captured.err
+    assert "bulk_unapproved" in captured.err
+    assert "bulk-approvals ask" in captured.err
+    # Nothing ran: no JSON on stdout, and the index is still as corrupt as it was built.
+    assert captured.out.strip() == ""
+    conn = sqlite3.connect(db_path)
+    problems = [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()]
+    conn.close()
+    assert any("idx_tasks_status" in problem for problem in problems)
 
 
