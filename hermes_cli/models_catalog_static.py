@@ -19,7 +19,6 @@ class CuratedFallbackModels(list[str]):
 _OPENROUTER_DESCRIPTIONS = {
     "anthropic/claude-opus-5-fast": "2x price, higher output speed",
     "anthropic/claude-opus-4.8-fast": "2x price, higher output speed",
-    "deepseek/deepseek-v4-pro-0813": "dated snapshot of v4-pro",
     "deepseek/deepseek-v4-flash-0731": "dated snapshot of v4-flash",
     "moonshotai/kimi-k3": "recommended",
     "z-ai/glm-5.2": "default",
@@ -153,7 +152,7 @@ _TENCENT_MODELS = ["hy4-preview", "hy3", "hy3-preview"]
 _ALIBABA_MODELS = [
     "qwen3.8-max", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash", "kimi-k2.5",
     "qwen3.5-plus", "qwen3-coder-plus", "qwen3-coder-next", "glm-5.2", "glm-5", "glm-4.7",
-    "deepseek-v4-pro", "deepseek-v4-flash-0731", "MiniMax-M2.5",
+    "deepseek-v4-flash-0731", "MiniMax-M2.5",
 ]
 _ALIBABA_CODING_PLAN_MODELS = [
     "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus", "qwen3-max-2026-01-23", "qwen3-coder-plus",
@@ -161,7 +160,7 @@ _ALIBABA_CODING_PLAN_MODELS = [
 ]
 # Verified against a live Token Plan subscription (key tier ``sk-sp-...``).
 _ALIBABA_TOKEN_PLAN_MODELS = [
-    "qwen3.8-max-0902", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash", "deepseek-v4-pro",
+    "qwen3.8-max-0902", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash",
     "deepseek-v4-flash", "deepseek-v3.2", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "glm-5.2", "glm-5.1", "glm-5",
 ]
 _XAI_MODELS = _xai_curated_models()
@@ -246,7 +245,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4", "claude-haiku-4-5", "gemini-3.8-flash",
         "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro", "gemini-3-flash",
         "grok-4.6", "grok-4.5", "grok-build-0.1", "muse-spark-1.2", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
-        "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5", "kimi-k2.7-code", "deepseek-v4-pro",
+        "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5", "kimi-k2.7-code",
         "deepseek-v4-flash", "qwen3.6-plus", "qwen3.5-plus", "big-pickle", "mimo-v2.5-free",
         "nemotron-3-ultra-free", "nemotron-3.5-lightning-free",
         "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor-free",
@@ -257,7 +256,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "opencode-go": [
         "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "gpt-5.6-luna", "grok-4.5", "glm-5.3",
         "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5", "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro",
-        "mimo-v2-omni", "minimax-m3", "minimax-m2.7", "minimax-m2.5", "deepseek-v4-pro",
+        "mimo-v2-omni", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
         "deepseek-v4-flash", "qwen3.8-max", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus",
         "qwen3.5-plus", "hy3", "hy3-preview", "muse-spark-1.2-contributor", "muse-spark-1.3-contributor",
     ],

@@ -1435,7 +1435,6 @@ DEFAULT_CONFIG = {
             "default": {
                 "reference_models": [
                     {"provider": "openai-codex", "model": "gpt-5.5"},
-                    {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"},
                 ],
                 "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
 
