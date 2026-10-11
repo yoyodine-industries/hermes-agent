@@ -1754,6 +1754,21 @@ def create_task(
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                # THE TOP-LEVEL-ONLY GATE, create door (ruling t_efa908e8, card
+                # t_0d8f71ae). A card whose whole DoD needs a genuine top-level
+                # context declares it with a line-leading `GATE-TOP-LEVEL-ONLY`;
+                # the dispatcher must never spawn a worker for it (a dispatched
+                # worker is structurally fenced from the work). FILING stays legal
+                # -- proposing work is legal, and refusing it would delete the
+                # record -- so the card is PARKED `scheduled` (due_at stays NULL,
+                # a fresh insert), a status `recompute_ready` never promotes (it
+                # promotes only `todo`/`blocked`), hence stably non-dispatchable.
+                # The RUN door re-checks the card's LIVE text (an amendment can add
+                # the marker after filing). See hermes_cli/kanban_top_level_gate.py.
+                from hermes_cli.kanban_top_level_gate import declares as _top_level_declares
+                top_level_parked = task_status == "ready" and _top_level_declares(title, body)
+                if top_level_parked:
+                    task_status = "scheduled"
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1827,6 +1842,20 @@ def create_task(
                         task_id,
                         "blocked",
                         {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
+                    )
+                if top_level_parked:
+                    # Named on the card so the author sees why their card is not
+                    # dispatchable; the RUN door writes the one comment naming the
+                    # sanctioned top-level routes. This event is the durable record
+                    # of the create-door park.
+                    _append_event(
+                        conn, task_id, "top_level_gate_parked",
+                        {
+                            "reason": "declared",
+                            "marker": "GATE-TOP-LEVEL-ONLY",
+                            "status": "scheduled",
+                            "actor": created_by or "user",
+                        },
                     )
                 if task_status == "todo":
                     # Parked behind an open parent: record why, exactly as

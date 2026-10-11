@@ -828,6 +828,13 @@ class DispatchResult:
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
     on multi-lane setups, NOT operator-actionable; tracked apart so health
     telemetry can tell "stuck" from "correctly idle"."""
+    skipped_top_level_only: list[str] = field(default_factory=list)
+    """Ready/review task ids HELD at the run door because the card declares
+    ``GATE-TOP-LEVEL-ONLY`` (hermes_cli/kanban_top_level_gate.py; ruling
+    t_efa908e8): its whole DoD needs a genuine top-level context and a dispatched
+    worker is structurally fenced from it. The card is PARKED ``scheduled``
+    (due_at NULL) -- never a silent skip -- and the tick's suppression line names
+    the hold, because a silent hold is how a starved board reads as an idle one."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -911,6 +918,12 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             # tick touched nothing (card t_17c9c847). Without this the refusal is
             # invisible to the "dispatcher stuck" line.
             counts["board_not_dispatch_enabled"] = counts.get("board_not_dispatch_enabled", 0) + 1
+        if res.skipped_top_level_only:
+            # The top-level-only gate's RUN door held these (hermes_cli/
+            # kanban_top_level_gate.py; ruling t_efa908e8): the card is PARKED,
+            # never silently skipped, so the tick's own line must name the hold --
+            # a silent hold is how a starved board reads as an idle one.
+            counts["skipped_top_level_only"] = counts.get("skipped_top_level_only", 0) + len(res.skipped_top_level_only)
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
@@ -3718,6 +3731,18 @@ def _dispatch_lane_task(
         result.respawn_guarded.append((task_id, consent_reason))
         return False
 
+    # TOP-LEVEL-ONLY gate (RUN door, ruling t_efa908e8 / card t_0d8f71ae): a card
+    # that declares it needs a genuine top-level context is NEVER spawned -- a
+    # dispatched worker is structurally fenced from the work (delegate-child
+    # fence + board confinement). The card is PARKED ``scheduled`` (due_at NULL)
+    # with ONE deduped event + ONE comment naming the routes, and the hold is
+    # counted on the tick's suppression line (a silent hold is a defect).
+    # Re-checked LIVE, so an amendment that adds the marker after filing is
+    # caught. Respects ``dry_run``: reports the hold, writes nothing.
+    if _hold_top_level_only(conn, task_id, dry_run=dry_run, board=board):
+        result.skipped_top_level_only.append(task_id)
+        return False
+
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -3824,6 +3849,72 @@ def check_consent_guard(
         return reason
     _park_for_consent(conn, task_id, verdict)
     return reason
+
+
+def _hold_top_level_only(
+    conn: sqlite3.Connection, task_id: str, *, dry_run: bool = False,
+    board: Optional[str] = None,
+) -> bool:
+    """The RUN door of the top-level-only gate (hermes_cli/kanban_top_level_gate.py).
+
+    Returns True when the card declares ``GATE-TOP-LEVEL-ONLY`` and must not be
+    spawned, else False. Deterministic: one regex pass over the card's own
+    LIVE title/body (re-read, exactly as :func:`check_consent_guard` re-reads, so
+    an amendment that adds the marker after filing is honoured -- the create door
+    catches the marker at birth, this door catches it later).
+
+    The hold is never silent. The card is PARKED ``scheduled`` with ``due_at``
+    NULL (waiting on a human, not on time; ``recompute_ready`` promotes only
+    ``todo``/``blocked``, so it stays non-dispatchable), with ONE deduped
+    ``top_level_only_held`` event and ONE comment naming the sanctioned top-level
+    routes. The dedupe keeps one row per hold episode -- the guard runs every
+    tick, and a row per tick would bury ``hermes kanban tail`` with the very
+    noise that makes a starved board read as an idle one. A write fault must
+    never take the tick down: the next tick retries, and the card is not spawned
+    either way. ``dry_run`` reports the hold and writes nothing.
+    """
+    from hermes_cli import kanban_top_level_gate as _tlg
+
+    row = conn.execute(
+        "SELECT title, body, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in ("ready", "review"):
+        return False
+    if not _tlg.declares(row["title"], row["body"]):
+        return False
+    if dry_run:
+        return True
+    payload = {
+        "reason": "declared",
+        "marker": _tlg.SENTINEL,
+        "board": board,
+        "routes": list(_tlg.ROUTES),
+    }
+    try:
+        with _kb.write_txn(conn):
+            last = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'top_level_only_held' "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if last is None or last["payload"] != _kb._json_or_null(payload):
+                _kb._append_event(conn, task_id, "top_level_only_held", payload)
+                _kb.add_comment(conn, task_id, "dispatcher", _tlg.park_comment(task_id))
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: top-level-only hold could not be recorded for %s",
+            task_id, exc_info=True,
+        )
+    try:
+        _kb.schedule_task(
+            conn, task_id, due_at=None,
+            reason=f"top-level-only: {_tlg.ROUTES[0]}",
+        )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: top-level-only park failed for %s", task_id, exc_info=True,
+        )
+    return True
 
 
 def _park_for_consent(conn: sqlite3.Connection, task_id: str, verdict) -> None:
