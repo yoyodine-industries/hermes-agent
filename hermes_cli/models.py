@@ -1724,9 +1724,26 @@ def _drop_delisted_opencode_models(normalized: str, rows: Optional[list[str]]) -
 
 
 def _chat_catalog_rows(models):
-    """Drop generation ids from a chat-catalog list, keeping its list subclass."""
+    """Drop generation ids AND fleet-denied models, keeping the list subclass.
+
+    Both drops live here because this is where the catalog functions finalize what a picker sees:
+    filtering at this one shaping point covers every path that returns through it - live fetch, a
+    warm ``provider_models_cache.json``, a static fallback - instead of a filter per return path,
+    which is how one path gets forgotten (card t_a1ae7cc6; the model denylist is
+    ``hermes_cli.model_denylist``, and a denied model must not reach a picker at all).
+    """
     from hermes_cli.chat_catalog import without_generation_models
-    return without_generation_models(models)
+    from hermes_cli.model_denylist import is_denied
+
+    kept = without_generation_models(models)
+    # In-place removal keeps the list subclass AND the return type its callers are typed against,
+    # so this filter adds no new shape to the catalog pipeline.
+    for row in [r for r in kept if is_denied(r[0] if isinstance(r, tuple) and r else r)]:
+        try:
+            kept.remove(row)
+        except ValueError:  # pragma: no cover - a duplicate that was already dropped
+            pass
+    return kept
 
 
 def _configured_relay_base_url(provider: str) -> str:
