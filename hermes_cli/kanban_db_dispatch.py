@@ -5152,12 +5152,19 @@ def _estop_state_for_tick() -> Optional[Any]:
 
     Read once and threaded down through every lane decision so one tick can never see two
     different modes (a re-arm landing mid-tick must not half-gate the board).
+
+    D3/D5 — the read is ``estop.tick()``: the dispatcher tick is a GATE, so it retires expired
+    holds and releases orphaned ones as part of the same read, instead of only observing them
+    (the measured defect: a hold whose owning run was long dead kept gating this tick for its
+    whole lease, and its release was reachable only from the pause CLI). An engine predating
+    ``tick`` falls back to a plain read, never to no gate at all.
     """
     estop = _estop_module()
     if estop is None:
         return None
     try:
-        return estop.read_state()
+        step = getattr(estop, "tick", None) or estop.read_state
+        return step()
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("kanban dispatch: could not read the ESTOP sentinel (%s)", exc)
         return None
