@@ -444,6 +444,19 @@ DANGEROUS_PATTERNS = [
     # --ha, --har): --hard is the only reset mode starting with "h", and `--help` is special-cased
     # by git before mode resolution.
     (r'\bgit\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
+    # The LEASE-CHECKED force push is a NARROWER verb than a bare force push: git refuses it
+    # unless the remote tip still matches the one this push was prepared against, so it cannot
+    # silently discard a peer's work. It carries its OWN key (card t_ca4879f5) so a worker
+    # profile can pre-approve the leased form in `command_allowlist` WITHOUT also approving bare
+    # `--force` / `-f`, which the two patterns below still refuse for every profile.
+    #
+    # The negative lookahead IS the scope guard, and it is deliberately FAIL-CLOSED: a leased
+    # push whose command line names `main` or `master` does not match here, falls through to
+    # `--forc[a-z]*` below, and is refused as a bare force push - that is the authorization's
+    # "never to main". A branch whose own name merely CONTAINS `main` (say `card-x-main-fix`)
+    # is refused along with it; rename the branch rather than weaken the guard.
+    (r'\bgit\s+push\b(?!.*\b(?:main|master)\b).*--force-with-lease(?:=[^\s;&|]*)?\b',
+     "git push --force-with-lease (lease-checked force push)"),
     (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
