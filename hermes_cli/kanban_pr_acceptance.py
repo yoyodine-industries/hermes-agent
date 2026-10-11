@@ -23,10 +23,26 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
         return "local-only"
+    # ``landed`` is the deploy-proof contract (hermes_cli/kanban_proof_gate.py): the card
+    # carries a deployed unit and may only close on a run/probe dated AFTER its landing.
+    if isinstance(value, str) and value.strip().lower() == "landed":
+        return "landed"
     if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
-        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+        raise ValueError(
+            "completion_contract must be local-only, landed, OWNER/REPO, or an exact GitHub PR URL")
     return value
 
+
+def needs_repository_checks(value: str | None) -> bool:
+    """True when the contract is signed off by repository-required CI rather than the local run.
+
+    A repository that requires no checks can never satisfy one: ``collect_acceptance``
+    reports ``missing`` with an empty ``required`` list and no retry can change that, which
+    is why authoring one warns and completion parks the card (see ``complete_task``).
+    ``landed`` is NOT a repository check: its fence is the deploy-proof gate, so routing it
+    into the GitHub path would park every proof-contract card as unsatisfiable.
+    """
+    return validate_contract(value) not in ("local-only", "landed")
 
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
          profile_home: str | None = None):
@@ -107,7 +123,9 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
 def collect_acceptance(contract: str, published_pr: str | None,
                        assignee: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
-               "pr_url": published_pr, "checks": [],
+               # The published PR is RECORDED here, never by rebinding the task's contract:
+               # a declared OWNER/REPO stays the declaration for the card's life.
+               "pr_url": published_pr, "published_pr": published_pr, "checks": [],
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:

@@ -98,8 +98,12 @@ def _gc_retention_days() -> int:
 
 
 def _kanban_dispatch_allowed() -> bool:
-    """False while the global emergency stop (`hermes pause`) is engaged.
+    """False only while a TOTAL emergency stop (`hermes pause`) is engaged.
 
+    A lane-scoped ``lockdown`` is NOT a halt at this seam: the tick RUNS and the dispatcher
+    refuses per LANE (``agent.estop.work_admitted``), so an allowlisted lane keeps spawning
+    while every other lane's cards are deferred and RECORDED on the card. Halting the whole
+    tick here would turn a lane-scoped stop into the fleet-wide stop it exists to avoid.
     Checked every tick before spawning, so a pause applies on the next tick;
     in-flight workers are never touched. Fails open if estop is unimportable.
     """

@@ -69,6 +69,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = kbd._positive_int(
             _kanban_cfg.get("max_in_progress_per_profile"), None
         )
+        # Fair ready-lane ordering (ruling t_b2865b89); same parse the gateway uses.
+        lane_fair_spawn, designated_pool_reserve = kbd.lane_fair_ready_config(_kanban_cfg)
         # Memory-derived default when unset — same fallback the gateway applies.
         max_in_progress = kbd.resolve_max_in_progress(
             kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
@@ -81,6 +83,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        lane_fair_spawn, designated_pool_reserve = kbd.lane_fair_ready_config({})
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
@@ -90,6 +93,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            lane_fair_spawn=lane_fair_spawn,
+            designated_pool_reserve=designated_pool_reserve,
         )
     if getattr(args, "json", False):
         _print_json({
@@ -101,9 +106,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_self_review": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.skipped_self_review
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
+            ],
+            "skipped_lockdown": [
+                {"task_id": tid, "assignee": who}
+                for (tid, who) in res.skipped_lockdown
             ],
             "auto_assigned_default": res.auto_assigned_default,
             "respawn_guarded": [
@@ -112,8 +125,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
+            "skipped_board_disabled": res.skipped_board_disabled,
             "memory_pressure": res.memory_pressure,
         }, ascii=True)
+        return 0
+    if res.skipped_board_disabled:
+        # The loudest possible zero: this tick did not run because the board it
+        # resolved to is an estate/scratch board (card t_17c9c847). Silence here
+        # is what made a redirect to a "scratch" board look like isolation.
+        print("Refused:      board is NOT dispatch-enabled (estate/scratch board) — "
+              "no card on it can be spawned; `hermes kanban boards set-dispatch "
+              "<slug> on` admits it again.")
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
     if res.reaped_terminal_workers:
@@ -139,6 +161,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    if res.skipped_lockdown:
+        # Named, not counted: a lane-starved card is the operator's whole visibility into
+        # which profile the stop is holding back.
+        held = ", ".join(f"{tid} ({who})" for tid, who in res.skipped_lockdown)
+        print(f"Skipped (lane held by the emergency stop): {held}")
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
     if res.skipped_nonspawnable:
@@ -148,6 +175,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     for tid, reason in res.respawn_guarded:
         print(f"Guarded ({reason}): {tid}")
+    for tid, reason in res.skipped_self_review:
+        if reason == "implementer_unknown":
+            print(
+                f"Parked in review (no implementer provenance to prove a "
+                f"distinct reviewer): {tid}"
+            )
+        else:
+            print(
+                f"Parked in review (assignee is the implementer - name a "
+                f"distinct reviewer): {tid}"
+            )
     if res.rate_limited:
         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
     if res.skipped_locked:
@@ -198,42 +236,37 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
 
-    # Health telemetry: warn when every tick finds ready work but spawns
-    # nothing (broken profile, PATH drift, missing venv, credential loss) —
-    # the per-task breaker auto-blocks quietly, so the operator needs a signal.
+    # Health telemetry (shared with the gateway watcher via DispatcherHealth):
+    # warn when the dispatcher is BROKEN, not merely busy. Capacity deferrals
+    # (kanban.max_spawn / max_in_progress / per-profile cap), guards (respawn,
+    # board-held, memory pressure) and work that just arrived are the steady
+    # state on a loaded host and stay silent; a card claimed but never launched
+    # warns at once, naming board, profile, task and reason.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health = kbd.DispatcherHealth(window=HEALTH_WINDOW)
 
-    def _ready_queue_nonempty() -> bool:
-        """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
-        Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
+    def _oldest_pending():
+        """Longest-waiting spawnable card on this board, None when nothing is."""
         try:
             with kbc.connect_closing() as conn:
-                return kbd.has_spawnable_ready(conn)
+                task_id, age = kbd.oldest_spawnable_pending(conn)
         except Exception:
-            return False
+            return None
+        if not task_id:
+            return None
+        return kbd.PendingWork(
+            board=getattr(args, "board", None), task_id=task_id, age_seconds=age
+        )
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
-            health_state["bad_ticks"] += 1
-        else:
-            health_state["bad_ticks"] = 0
-        # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
-        if health_state["bad_ticks"] >= HEALTH_WINDOW:
-            now = int(time.time())
-            if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
-                print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
-                    file=sys.stderr, flush=True,
-                )
-                health_state["last_warn_at"] = now
+        report = health.observe_tick(res, pending=_oldest_pending(), now=time.time())
+        if report is not None:
+            print(
+                f"[{_fmt_ts(int(time.time()))}] {report.message}",
+                file=sys.stderr if report.level == "warning" else sys.stdout,
+                flush=True,
+            )
+
         if not verbose:
             return
         did_work = (
