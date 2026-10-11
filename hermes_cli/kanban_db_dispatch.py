@@ -865,6 +865,13 @@ class DispatchResult:
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
+    skipped_board_disabled: bool = False
+    """True when the tick refused to run AT ALL: the board it resolved to is not
+    dispatch-enabled (an estate/rehearsal board, ``board.json`` ``"dispatch":
+    false``). Nothing was claimed, promoted, reclaimed or spawned — the refusal
+    happens BEFORE the lock, the reclaim phase and every claim, so the spawn path
+    is never reached and no card on that board can become lane work (card
+    t_17c9c847)."""
     memory_pressure: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
@@ -899,6 +906,11 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.skipped_board_disabled:
+            # Board-level refusal: the board is an estate/scratch board and the
+            # tick touched nothing (card t_17c9c847). Without this the refusal is
+            # invisible to the "dispatcher stuck" line.
+            counts["board_not_dispatch_enabled"] = counts.get("board_not_dispatch_enabled", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
@@ -3557,6 +3569,20 @@ def dispatch_once(
     this function, so none of them is a hole. The check is once per tick and bounded
     (``hermes_cli.tree_fingerprint``: a stat walk on the steady state), never per card.
     """
+    # Resolve the board this tick is actually against. The pin/name may be absent
+    # (the CLI passes no board=), so read it off the open store — the same mapping
+    # ``board_for_connection`` gives, never the ambient current board.
+    resolved_board = board
+    if not resolved_board:
+        try:
+            resolved_board = _kb.board_for_connection(conn)
+        except Exception:
+            resolved_board = None
+    if resolved_board and not _kb.board_dispatch_enabled(resolved_board):
+        result = DispatchResult(skipped_board_disabled=True)
+        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        return result
+
     try:
         _raise_if_tree_skewed()
     except DispatcherTickYielded as yielded:
