@@ -1014,11 +1014,14 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     # This is the one resolution path shared by the CLI, oneshot, the agent, cron and the gateway,
     # so the refusal is identical wherever a model is resolved rather than repeated per surface.
     if target_model:
-        from hermes_cli.model_denylist import ModelDeniedError, denial
+        from hermes_cli.model_denylist import denial
+        from hermes_cli.model_denial_alert import refuse_denied_model
 
         denied = denial(target_model)
         if denied is not None:
-            raise ModelDeniedError(denied, where="resolve_runtime_provider")
+            # FILE one idempotency-keyed card, then RAISE: the refusal must be loud AND acting
+            # (card t_a1ae7cc6, ruling B3). No fallback model is chosen on the way out.
+            refuse_denied_model(denied, where="resolve_runtime_provider", cause="pin")
 
     requested_provider = resolve_requested_provider(requested)
     _raise_if_provider_disabled(requested_provider)

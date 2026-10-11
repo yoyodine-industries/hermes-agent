@@ -1033,14 +1033,31 @@ def _host_prefix() -> str:
 
 # --- Task creation / mutation ---
 
-def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+def _validate_model_override(model: Optional[str], provider: Optional[str],
+                             assignee: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
     """Strip both; a provider without a model is rejected (a bare ``--provider``
     would re-resolve the profile's model against another backend — exactly
-    the mismatch the override exists to kill)."""
+    the mismatch the override exists to kill).
+
+    A DENIED model is refused here too: this is the one place both ``create_task`` (the
+    dispatcher's spawn path) and ``set_model_override`` (CLI/dashboard) pass through, so a card
+    or a surface may not pin the banned id (card t_a1ae7cc6, ruling B2 chokepoint 3 / case A5).
+    The refusal files its one acting card and raises — see ``hermes_cli.model_denial_alert``.
+    ``assignee`` is the lane the pin is FOR, so the filed card routes to that lane's Design
+    Authority rather than to whichever profile happens to be running the command.
+    """
     model = (model or "").strip() or None
     provider = (provider or "").strip() or None
     if provider and not model:
         raise ValueError("provider_override requires a model_override")
+    if model:
+        from hermes_cli.model_denylist import denial
+        from hermes_cli.model_denial_alert import refuse_denied_model
+
+        denied = denial(model, provider=provider)
+        if denied is not None:
+            refuse_denied_model(denied, where="kanban model_override", cause="pin",
+                                lane=(assignee or "").strip() or None)
     return model, provider
 
 
@@ -1213,7 +1230,7 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
-    model_override, provider_override = _validate_model_override(model_override, provider_override)
+    model_override, provider_override = _validate_model_override(model_override, provider_override, assignee=assignee)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -1515,7 +1532,13 @@ def set_model_override(
     """Set (empty ``model`` clears BOTH) the per-task model/provider override.
     Allowed while ``running``: it applies on the NEXT dispatch, which is the
     rate-limit-recovery flow (set, then reclaim/retry)."""
-    model, provider = _validate_model_override(model, provider)
+    _assignee = None
+    try:
+        _row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        _assignee = _row[0] if _row else None
+    except sqlite3.Error:
+        _assignee = None
+    model, provider = _validate_model_override(model, provider, assignee=_assignee)
     return _set_task_override(
         conn, task_id,
         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
