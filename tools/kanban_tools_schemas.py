@@ -198,6 +198,39 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "due_at": _prop("string", (
+            "Optional clock fence on the hold: WHEN the card should come back. "
+            "ISO-8601 local (2026-09-16T01:40), an offset from now (+90m, +2h, "
+            "+1d), or epoch seconds. The deployed maintenance-sweep releaser "
+            "unblocks the card once it passes. OMIT for an ordinary block -- a "
+            "hold waiting on a person, not on a clock -- which is never "
+            "auto-released. Refused with kind='dependency'."
+        )),
+        "window_policy": {
+            "type": "string",
+            "enum": ["defer", "ambient"],
+            "description": (
+                "What a release should do when the due time lands inside a "
+                "reserved execution band: 'defer' (the default) holds it until "
+                "the band closes; 'ambient' releases anyway, for a lightweight "
+                "check that has to move around the clock. Needs due_at."
+            ),
+        },
+        "clear_due": _prop("boolean", (
+            "Drop the task's due time (the hold stays, with no clock). "
+            "Mutually exclusive with due_at."
+        )),
+        "waits_on": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Card ids this block WAITS ON: each becomes a parent edge of the "
+                "blocked card, so the board resumes it when that work finishes. "
+                "Required whenever a kind='dependency' reason NAMES a card — a "
+                "prose-only wait is invisible to the board's own dependency "
+                "machinery and would sit blocked after that work shipped."
+            ),
+        },
     },
     ["reason"],
 )
@@ -207,15 +240,39 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
     (
         "Park your current task in the 'scheduled' state while it waits for "
         "time or an external event. This ends the current run and makes the "
-        "task non-dispatchable until an orchestrator unblocks it; it does not "
-        "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
+        "task non-dispatchable until a releaser wakes it; it creates no timer "
+        "of its own. With no due_at this is the HUMAN HOLD -- a card waiting on "
+        "a person, which is never auto-released. Pass due_at to arm a clock "
+        "fence instead, and the deployed maintenance-sweep releaser unblocks "
+        "the card once it passes."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "reason": _prop("string", (
             "Optional reason or machine-readable wake-up marker recorded on "
             "the completed run and scheduled event."
+        )),
+        "due_at": _prop("string", (
+            "Optional clock fence: WHEN the card should come back. ISO-8601 "
+            "local (2026-09-16T01:40), an offset from now (+90m, +2h, +1d), or "
+            "epoch seconds. The deployed maintenance-sweep releaser unblocks "
+            "the card once it passes. OMIT for the human hold -- a card parked "
+            "on a person, not on a clock -- which is never auto-released."
+        )),
+        "window_policy": {
+            "type": "string",
+            "enum": ["defer", "ambient"],
+            "description": (
+                "What a release should do when the due time lands inside a "
+                "reserved execution band: 'defer' (the default) holds it until "
+                "the band closes; 'ambient' releases anyway, for a wake that is "
+                "a lightweight check and has to move around the clock. Needs "
+                "due_at."
+            ),
+        },
+        "clear_due": _prop("boolean", (
+            "Drop the task's due time (it stays parked until released by "
+            "hand). Mutually exclusive with due_at."
         )),
     },
     [],

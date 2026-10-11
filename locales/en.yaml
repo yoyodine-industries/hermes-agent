@@ -747,11 +747,13 @@ gateway:
     save_failed: "Busy input mode could not be saved to config. Mode unchanged."
     set: "Busy input mode set to **`{mode}`** (saved).\n_{behavior}_"
   pause:
-    resumed: "▶️ Resumed — new work is accepted again."
-    not_paused: "Hermes wasn't paused."
+    resumed: "▶️ Resumed — your hold is lifted; new work is accepted again."
+    not_paused: "No hold is in force."
+    not_own_hold: "{notice}\nYour venue has no hold of its own to release here — lift the one you mean BY HANDLE (that works from any admitted venue, no `--all`, no operator): `hermes resume --handle <handle>`, handles in `hermes pause --history`."
     reason_suffix: " (reason: {reason})"
-    already_paused: "⏸️ Hermes is already paused{suffix}. Use `/pause off` to resume."
-    paused: "⏸️ Paused{suffix}. New cron/kanban/gateway work is on hold; in-flight work finishes normally. Use `/pause off` to resume."
+    unscoped_refused: "⛔ `/pause` no longer arms anything: a fleet-wide stop names no scope, so one leaked hold would strand every lane at once (retired 2026-10-10). Stop what you meant to stop, by scope:\n{controls}\nThe one hold a verb arms is lane-scoped, from the CLI: `hermes pause --lockdown --allow-profile <lane> --ttl <dur>`."
+    already_paused: "⏸️ A hold is already in force{suffix}. Lift it by handle (`hermes resume --handle <handle>`), or `/pause off` for your own."
+    paused: "⏸️ Hold armed (scoped). Lift it by handle (`hermes resume --handle <handle>`), or `/pause off` for your own."
 
   queue:
     usage: "Usage: /queue <prompt>"
@@ -1605,7 +1607,7 @@ slash:
   stop:
     description: "Kill all running background processes"
   pause:
-    description: "Pause new work globally (emergency stop); '/pause off' resumes"
+    description: "Stop new work in a scoped hold (one board / one job / one lane hold); the fleet-wide emergency stop is retired — '/pause off' releases your hold"
   deny:
     description: "Deny a pending dangerous command (optionally with a reason)"
   btw:

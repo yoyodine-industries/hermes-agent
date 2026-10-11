@@ -208,6 +208,11 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+    # set-contract is a DECLARATION rewrite (which contract the card must satisfy to close), so a
+    # delegated child — inside the parent's own process or a spawned descendant — must not perform
+    # it. It was already an ESTATE write (tree_identity.ESTATE_MUTATING_ACTIONS); this closes the
+    # delegated fence over it too. (Card t_36adf9a5)
+    "set-contract",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
@@ -360,9 +365,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
-    with kbc.connect_closing() as conn:
+    # A card fired from another card lands on the SAME board as the card that fired
+    # it (operator standing order): the source card's board outranks the ambient
+    # board, which is only a fallback for a filing with no source card (a loop, a
+    # cron row, a sweep). Read the source card's board from the board stores - the
+    # ambient pin/pointer is a property of this process and can be stale or wrong.
+    fired_board = kb.board_for_fired_card(
+        getattr(args, "board", None),
+        source_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                        if is_dispatcher_owned_worker_context() else None))
+    with kbc.connect_closing(board=fired_board) as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
+            # The card's OWN board, not the ambient one: the priority policy, the
+            # board floor and every board-scoped read below must see the board the
+            # card actually lands on (a policy run against the ambient board computed
+            # a value the destination board's floor then refused).
+            board=fired_board,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
@@ -375,6 +394,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            serves=getattr(args, "serves", None),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
@@ -383,12 +403,51 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _print_json(_task_to_dict(task))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        # One-line authoring advisory (card t_36adf9a5): a card born on a repo/PR/landed contract
+        # is the one that can strand, and the door out of that declaration is `set-contract`.
+        # Named HERE, at the moment the declaration is authored, so the operator never has to
+        # discover the release from a refusal. Unassigned / triage / todo cards are covered too --
+        # the advisory is about the DECLARATION, not the dispatch.
+        if (task.completion_contract or "local-only") != "local-only":
+            print(f"  completion contract {task.completion_contract}: release it with "
+                  f"`hermes kanban set-contract {task_id} local-only --reason '<why>'`")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
         if task.status == "ready" and task.assignee:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_set_contract(args: argparse.Namespace) -> int:
+    """``hermes kanban set-contract <id> <contract> --reason <why>`` — the release door.
+
+    Registered here and in ``kanban_parser``; the kernel half is :func:`kb.set_contract`. The
+    blank-reason refusal is returned as rc 2 (a usage error) rather than being left to the
+    dispatcher's generic ``ValueError`` catch (rc 1), so a shell can tell "you omitted the why"
+    from "the card said no".
+    """
+    reason = (getattr(args, "reason", None) or "").strip()
+    if not reason:
+        return _err("kanban set-contract: --reason is required and must not be blank "
+                    "(the release records WHY the contract is being re-scoped)", 2)
+    actor = getattr(args, "author", None) or _profile_author()
+    with kbc.connect_closing() as conn:
+        try:
+            ok = kb.set_contract(conn, args.task_id, args.contract, reason=reason, actor=actor)
+        except ValueError as exc:
+            return _err(f"kanban set-contract: {exc}", 2)
+        except RuntimeError as exc:
+            return _err(f"kanban set-contract: {exc}")
+        if not ok:
+            return _err(f"kanban set-contract: no such task {args.task_id!r}")
+        task = kb.get_task(conn, args.task_id)
+    if getattr(args, "json", False):
+        _print_json(_task_to_dict(task))
+    else:
+        print(f"contract_changed: {args.task_id} {task.completion_contract} "
+              f"(reason: {reason}; actor: {actor})")
     return 0
 
 
@@ -505,6 +564,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
+    if task.due_at:
+        policy = task.due_window_policy or kb.DEFAULT_DUE_WINDOW_POLICY
+        field("due", f"{_fmt_ts(task.due_at)} ({policy})")
+    elif task.status in ("scheduled", "blocked"):
+        # A parked card with no clock fence is a wait only a human can end. Say so
+        # on the card, so "scheduled forever" is visible rather than inferred.
+        field("due", "none — no due time; released by hand only")
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
@@ -529,7 +595,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(
+        task, events, runs, graph=graph,
+    )
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -979,12 +1047,61 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
     return run
 
 
+def _due_fence_args(args: argparse.Namespace):
+    """``(due_at, window_policy, error)`` for the ``schedule``/``block`` verbs.
+
+    ``--due`` is ADDITIVE and has NO default: omitting it returns ``kb.UNSET``,
+    which leaves whatever fence the card already carries. The human hold -- a
+    card waiting on a person, not on a clock -- must never be converted into a
+    timed hold by omission, and a verb that did so would be the bug, not the fix.
+    ``--clear-due`` is the explicit opposite: it passes ``None`` (drop the fence)
+    and is refused alongside ``--due``, because the two say different things.
+    """
+    due_raw = getattr(args, "due", None)
+    clear_due = bool(getattr(args, "clear_due", False))
+    window_policy = getattr(args, "window_policy", None)
+    if due_raw and clear_due:
+        return kb.UNSET, None, "--due and --clear-due are mutually exclusive"
+    if clear_due:
+        return None, None, ""
+    if not due_raw:
+        return kb.UNSET, window_policy, ""
+    from hermes_cli import kanban_due as kdue
+    try:
+        return kdue.parse_due(due_raw), window_policy, ""
+    except ValueError as exc:
+        return kb.UNSET, None, f"--due {due_raw!r}: {exc}"
+
+
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    due_at, window_policy, due_err = _due_fence_args(args)
+    if due_err:
+        return _err(due_err)
+    fence_note = ""
+    if due_at is not kb.UNSET:
+        fence_note = (
+            f" — clock-fenced, auto-release {_fmt_ts(int(due_at))} "
+            f"({window_policy or kb.DEFAULT_DUE_WINDOW_POLICY})"
+            if due_at is not None
+            else " — due time cleared (stays blocked until released by hand)"
+        )
+    failures: dict[str, str] = {}
+
+    def op(tid: str) -> bool:
+        try:
+            return kb.block_task(
+                conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+                due_at=due_at, window_policy=window_policy,
+            )
+        except ValueError as exc:  # --due with --kind dependency, policy with no fence
+            failures[tid] = f"{tid}: {exc}"
+            return False
+
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -999,11 +1116,10 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 verdict = ("needs a human decision" if (landed.block_kind if landed else kind) == "needs_input"
                            else "orchestration attention needed")
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
-            return f"Blocked {tid}{suffix}"
+            return f"Blocked {tid}{suffix}{fence_note}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        op = _commented(conn, reason, author, "BLOCKED", op)
+        return _bulk_apply(ids, op, ok_msg, lambda tid: failures.get(tid) or f"cannot block {tid}")
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -1011,10 +1127,33 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    due_at, window_policy, due_err = _due_fence_args(args)
+    if due_err:
+        return _err(due_err)
+    due_note = ""
+    if due_at is not kb.UNSET:
+        due_note = (
+            f" — due {_fmt_ts(int(due_at))} "
+            f"({window_policy or kb.DEFAULT_DUE_WINDOW_POLICY})"
+            if due_at is not None
+            else " — due time cleared (released by hand only)"
+        )
+    failures: dict[str, str] = {}
+
+    def op(tid: str) -> bool:
+        try:
+            return kb.schedule_task(
+                conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
+                due_at=due_at, window_policy=window_policy,
+            )
+        except ValueError as exc:  # e.g. --window-policy with no due time
+            failures[tid] = f"{tid}: {exc}"
+            return False
+
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+        op = _commented(conn, reason, author, "SCHEDULED", op)
+        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}{due_note}",
+                           lambda tid: failures.get(tid) or f"cannot schedule {tid}")
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
@@ -1317,6 +1456,44 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+def _defcon_authority(args: argparse.Namespace) -> str:
+    """Who is designating: ``--authority`` when given, else the acting profile."""
+    return (getattr(args, "authority", None) or "").strip() or _profile_author()
+
+
+def _cmd_defcon_designate(args: argparse.Namespace) -> int:
+    """Put one card in the reserved tranche: ledger row first, then the priority."""
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    if not reason:
+        return _err("kanban defcon designate: --reason is required (it is the audit answer)", 2)
+    with kbc.connect_closing() as conn:
+        try:
+            row = kb.designate_priority(
+                conn, args.task_id, reason=reason, authority=_defcon_authority(args),
+            )
+        except (ValueError, PermissionError) as exc:
+            return _err(f"kanban defcon designate: {exc}")
+    if _json_out(args, row):
+        return 0
+    print(f"Designated {row['task_id']}: priority {row['priority']} on board {row['board']!r}.\n"
+          f"  Authority: {row['authority']}\n"
+          f"  Reason:    {row['reason']}\n"
+          f"  Revoke restores priority {row['restore_priority']}.")
+    return 0
+
+
+_DEFCON_HANDLERS = {"designate": _cmd_defcon_designate}
+
+
+def _cmd_defcon(args: argparse.Namespace) -> int:
+    """``hermes kanban defcon designate`` - the one door into the reserved tranche."""
+    action = getattr(args, "defcon_action", None) or ""
+    handler = _DEFCON_HANDLERS.get(action)
+    if handler is None:
+        return _err(f"kanban defcon: unknown action {action!r}; use designate", 2)
+    return handler(args)
+
+
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
@@ -1327,6 +1504,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
+    "set-contract": _cmd_set_contract,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
@@ -1336,7 +1514,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc,
+    "gc": _cmd_gc, "defcon": _cmd_defcon,
 }
 
 

@@ -101,14 +101,17 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
     route = {"platform": "telegram", "chat_id": "42", "chat_type": "dm", "user_id": "42", "profile": "sec"}
     state = SimpleNamespace(awaiting_response=False, next_due_at=0, route=route)
 
-    # `hermes pause`: loop wakeups are internal events that bypass the inbound estop gate, so the
-    # watcher itself must hold the tick — unclaimed (fire_tick never runs), so it stays due for resume.
-    estop.engage(reason="maintenance")
+    # A total hold (`hermes pause`'s retired shape, written directly — arming one is not a
+    # supported operation since t_e04b4c81): loop wakeups are internal events that bypass the
+    # inbound estop gate, so the watcher itself must hold the tick — unclaimed (fire_tick never
+    # runs), so it stays due for resume.
+    estop.sentinel_path().write_text('{"reason": "maintenance"}\n', encoding="utf-8")
+    _handle = estop.holds()[0]["handle"]
     try:
         await r._loop_wakeup_fire_one("sid", state, 1e12, set())
         assert (fired, r._profile_adapters["sec"][Platform.TELEGRAM].handled) == ([], [])
     finally:
-        estop.disengage()
+        estop.release(handle=_handle)
 
     await r._loop_wakeup_fire_one("sid", state, 1e12, set())
     await r._loop_wakeup_fire_one("sid2", SimpleNamespace(**{**vars(state), "route": {**route, "profile": "nobot"}}), 1e12, set())

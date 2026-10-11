@@ -77,7 +77,7 @@ class ActivityTrackingMixin:
                 from tools.kanban_tools import (
                     heartbeat_current_worker_from_env, inject_new_comments_from_env
                 )
-                heartbeat_current_worker_from_env()
+                heartbeat_current_worker_from_env(self)
                 # Fold new operator notes into the running turn (OUT-OF-BAND steer).
                 inject_new_comments_from_env(self)
         if force_persist or is_terminal_compression_provenance(resolved_provenance):

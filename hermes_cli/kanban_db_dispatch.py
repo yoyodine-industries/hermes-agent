@@ -8,6 +8,10 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import importlib.util
+import json
+import logging
 import os
 import re
 import signal
@@ -15,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -25,10 +30,15 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli import kanban_crash_sweep_guard as _crash_guard
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+
+# Module logger. The witness/contract code (restored from the 2026-10-10 autostash)
+# announces the liveness contract through it; the rest of this module logs through ``_kb._log``.
+logger = logging.getLogger(__name__)
 
 
 # After this many consecutive non-success attempts on a task/profile the
@@ -88,6 +98,699 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Spawn-seam substrate import guard (card t_a2f35c4d, ruling t_dbf5c876)
+# ---------------------------------------------------------------------------
+#
+# Measured incident (2026-10-10): every review-run worker spawn on the fleet died with
+# ``cannot import name 'ADVISORY_SKILLS_ENV' from 'agent.skill_commands'`` -- an import no
+# source file contained -- and the whole review LANE went silently dead. The stale
+# ``cpython-311`` bytecode beside the tree was a smell, not the wound: CPython selects
+# ``__pycache__/<mod>.<sys.implementation.cache_tag>.pyc``, so a 3.14 runtime cannot load a
+# 3.11 pyc at all (measured: 733 inert foreign-tag files against 1594 live ones, 0 sourceless,
+# 0 hash-based). The wound is a live tree whose OWN modules disagree -- an importer present,
+# its provider absent -- so the durable half is to NAME that artifact at the spawn seam and to
+# classify it as SUBSTRATE: the card spends nothing of its retry budget, and one signature-
+# deduped lane actor is filed instead of the lane dying quietly.
+#
+# Boundary (deliberate, ruling D1): nothing here refuses a spawn on foreign-tag bytecode. A
+# foreign-tag population is inert, and a refusal would be a false-positive spawn killer -- the
+# exact failure mode this guard exists to remove. The sweep helper REPORTS the two layouts that
+# can change behaviour (a sourceless ``module.pyc``, a non-zero header flags field) and measures
+# the foreign-tag population as inert.
+
+#: Greppable prefix of the one-line naming payload (D4). It leads, because
+#: ``_record_task_failure`` truncates the stored error at 500 chars.
+TREE_IMPORT_INCONSISTENCY = "tree-import-inconsistency:"
+
+#: Classifier verdicts (D5). ``card`` is the default and never widens on its own.
+SPAWN_FAILURE_CARD = "card"
+SPAWN_FAILURE_SUBSTRATE_IMPORT = "substrate_import"
+SPAWN_FAILURE_HOST_CAPACITY = "host_capacity"
+
+#: ``substrate_import:<provider-relpath>:<symbol>`` -- the lane-level dedupe key (D6).
+SUBSTRATE_SIGNATURE_PREFIX = "substrate_import:"
+
+#: The LANE actor: one card per (signature, board, window), addressed to the domain's design
+#: authority. The idempotency key is what makes N failures across N cards resolve to ONE card.
+SUBSTRATE_ACTOR_IDEMPOTENCY_PREFIX = "substrate:"
+SUBSTRATE_ACTOR_ASSIGNEE = "platform-stl"
+SUBSTRATE_ACTOR_EVENT = "substrate_actor_filed"
+SUBSTRATE_ACTOR_TITLE = "[guard] substrate import failure in the dispatching tree"
+
+#: ``from x import y`` -- the shape whose ``y`` is the symbol the naming line quotes.
+_CANNOT_IMPORT_NAME_RE = re.compile(r"cannot import name ['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]")
+
+#: A ``def`` / ``class`` / assignment binding of a name: the ``defines-it`` HINT (D4 says a hint,
+#: never authority -- the verdict that matters is the interpreter's, and that is the exception).
+_SYMBOL_BINDING_RE_TEMPLATE = (
+    r"(?m)^[ \t]*(?:async[ \t]+def|def|class)[ \t]+{name}\b"
+    r"|^[ \t]*{name}[ \t]*(?::[^=\n]*)?=(?!=)"
+    r"|^[ \t]*{name}[ \t]*(?:,|\)|\]|\}})"
+)
+
+
+def _dispatching_tree_root() -> Path:
+    """The tree THIS dispatcher runs from -- the closure root the guard reasons about.
+
+    Derived from this module's own file, which is the same directory the tree-skew fence
+    resolves for itself; ``kanban_db_dispatch`` deliberately does not import that fence (a
+    sibling suite pins the absence of that dependency), so the root is spelled out here rather
+    than delegated. Every guard helper takes ``tree`` explicitly and the dispatch seam reads the
+    default from THIS one function -- which is the seam a test patches instead of breaking the
+    real checkout.
+    """
+    return Path(__file__).resolve().parents[1]
+
+
+def _pyc_tag(filename: str) -> Optional[str]:
+    """The interpreter tag of a bytecode filename: ``mod.cpython-311.pyc`` -> ``cpython-311``.
+
+    ``mod.pyc`` (untagged) -> None. The tag is the LAST dot-separated component before ``.pyc``,
+    because a tag itself carries a hyphen -- splitting on ``-`` would mangle it.
+    """
+    name = str(filename)
+    if not name.endswith(".pyc"):
+        return None
+    stem = name[: -len(".pyc")]
+    if "." not in stem:
+        return None
+    return stem.rsplit(".", 1)[1] or None
+
+
+def _pyc_header_flags(raw: bytes) -> int:
+    """The 4-byte header flags field of a ``.pyc`` (0 when too short to carry one).
+
+    Header layout: 4-byte magic, 4-byte flags, then either (mtime, size) or an 8-byte hash.
+    """
+    if len(raw) < 8:
+        return 0
+    return int.from_bytes(raw[4:8], "little")
+
+
+def sweep_tree_bytecode_pycs(tree: Path) -> dict[str, Any]:
+    """REPORT the bytecode layouts under ``tree`` that can change behaviour -- and those that cannot.
+
+    ``sourceless``: an ``*.pyc`` OUTSIDE ``__pycache__`` with no ``*.py`` beside it -- the import
+    system will happily load it, so it can shadow source that a checkout thinks it has.
+    ``flags_nonzero`` / ``hash_based``: a header whose flags field is non-zero (a
+    hash-invalidated pyc, whose staleness is judged by content rather than mtime).
+    ``current_tag`` / ``foreign_tag`` / ``untagged``: the tag population. A FOREIGN tag is inert
+    -- this interpreter can never select it -- which is why this function only ever reports and
+    no spawn is gated on the result (ruling D1).
+    """
+    tree = Path(tree)
+    cache_tag = sys.implementation.cache_tag
+    report: dict[str, Any] = {
+        "tree": str(tree),
+        "cache_tag": cache_tag,
+        "sourceless": [],
+        "current_tag": 0,
+        "foreign_tag": 0,
+        "untagged": 0,
+        "flags_nonzero": 0,
+        "hash_based": 0,
+        "pyc_total": 0,
+    }
+    try:
+        paths = sorted(tree.rglob("*.pyc"))
+    except OSError:
+        return report
+    for path in paths:
+        report["pyc_total"] += 1
+        tag = _pyc_tag(path.name)
+        if tag == cache_tag:
+            report["current_tag"] += 1
+        elif tag is None:
+            report["untagged"] += 1
+        else:
+            report["foreign_tag"] += 1
+        if "__pycache__" not in path.parts and not path.with_suffix(".py").exists():
+            try:
+                rel = path.relative_to(tree).as_posix()
+            except ValueError:
+                rel = str(path)
+            report["sourceless"].append(rel)
+        try:
+            flags = _pyc_header_flags(path.read_bytes())
+        except OSError:
+            continue
+        if flags:
+            report["flags_nonzero"] += 1
+            if flags & 0b11:
+                report["hash_based"] += 1
+    return report
+
+
+def _is_under(path: Any, tree: Path) -> bool:
+    """Does ``path`` resolve inside ``tree``? The guard's whole "this tree's own" test."""
+    try:
+        Path(path).resolve().relative_to(Path(tree).resolve())
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _relative_to_tree(path: Any, tree: Path) -> str:
+    """``path`` spelled relative to ``tree`` (posix), or its absolute spelling when it escapes."""
+    try:
+        return Path(path).resolve().relative_to(Path(tree).resolve()).as_posix()
+    except (OSError, TypeError, ValueError):
+        return str(path)
+
+
+def _importer_frame(exc: BaseException, tree: Path) -> Optional[tuple[str, int]]:
+    """Deepest traceback frame whose file lives under ``tree``: ``(relpath, lineno)`` or None.
+
+    "Deepest" is the frame that RAISED -- the importer whose ``from ... import`` disagreed. The
+    interpreter's own ``importlib`` frames are skipped by the under-tree test, and a failure whose
+    only frames are outside the tree is by definition not the tree's (the card's, the test's, or
+    a third-party module's).
+    """
+    try:
+        frames = traceback.extract_tb(getattr(exc, "__traceback__", None))
+    except Exception:
+        return None
+    for frame in reversed(frames):
+        if _is_under(frame.filename, tree):
+            return _relative_to_tree(frame.filename, tree), int(frame.lineno or 0)
+    return None
+
+
+def _imported_symbol(exc: BaseException) -> Optional[str]:
+    """The name the importer asked for: ``cannot import name 'X' from 'Y'`` -> ``X``.
+
+    Only that shape carries a symbol, and a symbol is what the signature and the naming line are
+    built from -- a bare ``No module named 'x'`` has none, so it cannot be deduped and stays the
+    card's (deliberately never widened).
+    """
+    match = _CANNOT_IMPORT_NAME_RE.search(str(exc))
+    return match.group(1) if match else None
+
+
+def _provider_source(exc: BaseException) -> Optional[Path]:
+    """The provider module's SOURCE FILE, resolved from its spec -- the spec is never imported.
+
+    ``importlib.util.find_spec`` answers where the name would load from without executing it, so
+    reporting a broken provider cannot itself run the broken module. A spec that is absent
+    (a missing third-party dependency) or whose origin is not a ``.py`` file (a builtin, a frozen
+    module, an extension, a namespace package) is not a source this guard speaks about -> None.
+    """
+    name = getattr(exc, "name", None)
+    origin: Any = None
+    if name:
+        try:
+            spec = importlib.util.find_spec(name)
+        except Exception:
+            spec = None
+        origin = getattr(spec, "origin", None) if spec is not None else None
+    if not origin:
+        raw_path = getattr(exc, "path", None)
+        origin = raw_path if isinstance(raw_path, (str, os.PathLike)) else None
+    if not origin:
+        return None
+    path = Path(origin)
+    return path if path.suffix == ".py" else None
+
+
+def _source_defines_symbol(text: str, symbol: str) -> bool:
+    """Does this provider source BIND ``symbol``? A hint for the naming line, never authority."""
+    return re.search(
+        _SYMBOL_BINDING_RE_TEMPLATE.format(name=re.escape(symbol)), text,
+    ) is not None
+
+
+def _head_verdict(tree: Path, relpath: str, on_disk_sha256: str) -> Optional[bool]:
+    """Is the on-disk file different from ``HEAD:<relpath>``? ``None`` when git cannot answer.
+
+    The exit status is checked FIRST: a failed ``git show`` piped into a hash yields the
+    EMPTY-INPUT digest (``e3b0c442...``), which would report a difference that does not exist
+    (ruling D4). A tree git cannot answer for reports unknown, never a verdict.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(tree), "show", f"HEAD:{relpath}"],
+            capture_output=True,
+        )
+    except (OSError, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return hashlib.sha256(proc.stdout).hexdigest() != on_disk_sha256
+
+
+def _foreign_tag_pyc_count(provider: Path) -> int:
+    """Bytecode files beside the provider carrying a tag THIS interpreter cannot select."""
+    cache = provider.parent / "__pycache__"
+    try:
+        entries = list(cache.glob("*.pyc"))
+    except OSError:
+        return 0
+    cache_tag = sys.implementation.cache_tag
+    return sum(1 for entry in entries if _pyc_tag(entry.name) not in (None, cache_tag))
+
+
+def _tree_import_evidence(exc: BaseException, tree: Path) -> Optional[dict[str, Any]]:
+    """What the naming line quotes about a tree-internal import disagreement, or None.
+
+    None means "not this tree's own disagreement", and it is the ONLY place that decision is
+    made: BOTH halves must hold -- an ``ImportError`` carrying a symbol, whose deepest under-tree
+    frame raised it, whose provider resolves to a source file under the same tree. A missing
+    third-party dependency (no resolvable spec, or one outside the tree) therefore stays on the
+    card. This runs on the FAILURE path only; the happy path walks no import closure (D4).
+    """
+    if not isinstance(exc, ImportError):
+        return None
+    importer = _importer_frame(exc, tree)
+    if importer is None:
+        return None
+    provider = _provider_source(exc)
+    if provider is None or not _is_under(provider, tree):
+        return None
+    symbol = _imported_symbol(exc)
+    if not symbol:
+        return None
+    try:
+        raw = provider.read_bytes()
+        stat = provider.stat()
+    except OSError:
+        return None
+    sha256 = hashlib.sha256(raw).hexdigest()
+    provider_rel = _relative_to_tree(provider, tree)
+    defines_it = _source_defines_symbol(raw.decode("utf-8", "replace"), symbol)
+    return {
+        "importer_rel": importer[0],
+        "importer_line": importer[1],
+        "symbol": symbol,
+        "provider_rel": provider_rel,
+        "provider_sha256": sha256,
+        "provider_mtime": int(stat.st_mtime),
+        "provider_size": int(stat.st_size),
+        "defines_it": defines_it,
+        "differs_from_head": _head_verdict(tree, provider_rel, sha256),
+        "foreign_tag_pyc": _foreign_tag_pyc_count(provider),
+    }
+
+
+def describe_tree_import_failure(
+    exc: BaseException, *, tree: Optional[Path] = None, task_id: Optional[str] = None,
+) -> Optional[str]:
+    """ONE line naming the artifact, front-loaded for the 500-char truncation (D4), else None.
+
+    Shape::
+
+        tree-import-inconsistency: importer <relpath>:<lineno> imports <symbol>; provider
+        <relpath> sha256=<64> mtime=<epoch> size=<n> defines-it=no differs-from-HEAD=yes;
+        tree-self-consistent=no; foreign-tag-pyc-in-provider-dir=0; nothing of card <id> ran
+
+    ``tree-self-consistent`` is the tree's own verdict: this closure has exactly one witness --
+    the provider's current source -- so it reads the same fact as ``defines-it``, and it is
+    carried separately because it is what the reader greps for ("are this tree's modules
+    agreeing?"). ``differs-from-HEAD`` says whether the broken provider is the committed bytes,
+    which is what separates "someone edited this tree" from "the tree shipped broken".
+    """
+    tree = Path(tree) if tree is not None else _dispatching_tree_root()
+    evidence = _tree_import_evidence(exc, tree)
+    if evidence is None:
+        return None
+    head = evidence["differs_from_head"]
+    head_text = "unknown" if head is None else ("yes" if head else "no")
+    self_consistent = "yes" if evidence["defines_it"] else "no"
+    return (
+        f"{TREE_IMPORT_INCONSISTENCY} importer {evidence['importer_rel']}:{evidence['importer_line']}"
+        f" imports {evidence['symbol']}; provider {evidence['provider_rel']}"
+        f" sha256={evidence['provider_sha256']} mtime={evidence['provider_mtime']}"
+        f" size={evidence['provider_size']} defines-it={'yes' if evidence['defines_it'] else 'no'}"
+        f" differs-from-HEAD={head_text}; tree-self-consistent={self_consistent};"
+        f" foreign-tag-pyc-in-provider-dir={evidence['foreign_tag_pyc']};"
+        f" nothing of card {task_id or 'unknown'} ran"
+    )
+
+
+def substrate_import_signature(
+    exc: BaseException, *, tree: Optional[Path] = None,
+) -> Optional[str]:
+    """``substrate_import:<provider-relpath>:<symbol>`` -- the lane-level dedupe key (D6), or None."""
+    tree = Path(tree) if tree is not None else _dispatching_tree_root()
+    evidence = _tree_import_evidence(exc, tree)
+    if evidence is None:
+        return None
+    return f"{SUBSTRATE_SIGNATURE_PREFIX}{evidence['provider_rel']}:{evidence['symbol']}"
+
+
+def classify_spawn_failure(exc: BaseException, *, tree: Optional[Path] = None) -> str:
+    """The ONE decider for who owns a failed spawn: ``card`` | ``substrate_import`` | ``host_capacity``.
+
+    * ``host_capacity`` -- the host refused to place the worker (``RestartSafeScopeUnavailable``):
+      neither the card's failure nor the tree's, retried spaced and never charged.
+    * ``substrate_import`` -- THIS tree's own modules disagree: the importer is source under the
+      tree and its provider is source under the tree that does not supply the name. Nothing of
+      the card ran, so the failure must not spend the card's retry budget, and it must be counted
+      for the LANE actor instead of parking the card.
+    * ``card`` -- everything else, deliberately including a missing third-party dependency and a
+      failure whose frames are all outside the tree. The classifier never widens its own reach:
+      an import failure it cannot attribute to THIS tree stays the card's.
+
+    Callers must not scatter ``isinstance`` checks beside this: one verdict per failure.
+    """
+    try:
+        from tools.process_registry import RestartSafeScopeUnavailable
+    except Exception:  # pragma: no cover - a host without the module has no such refusal
+        RestartSafeScopeUnavailable = ()  # type: ignore[assignment]
+    if RestartSafeScopeUnavailable and isinstance(exc, RestartSafeScopeUnavailable):
+        return SPAWN_FAILURE_HOST_CAPACITY
+    tree = Path(tree) if tree is not None else _dispatching_tree_root()
+    if _tree_import_evidence(exc, tree) is not None:
+        return SPAWN_FAILURE_SUBSTRATE_IMPORT
+    return SPAWN_FAILURE_CARD
+
+
+def _spawn_failure_report(
+    exc: BaseException, task_id: str, *, tree: Optional[Path] = None,
+) -> tuple[str, str, Optional[dict[str, Any]]]:
+    """``(error_text, kind, metadata_extra)`` for one failed spawn -- the seam's single classify call.
+
+    ``error_text`` is the naming line when this is the tree's own import disagreement (it LEADS,
+    because the stored error is cut at 500 chars), else the exception's own text. ``metadata_extra``
+    rides the run and the event so the lane actor can dedupe on the signature without re-deriving
+    it from prose later.
+    """
+    tree = Path(tree) if tree is not None else _dispatching_tree_root()
+    kind = classify_spawn_failure(exc, tree=tree)
+    if kind != SPAWN_FAILURE_SUBSTRATE_IMPORT:
+        return str(exc), kind, None
+    metadata_extra: dict[str, Any] = {"substrate_import": True}
+    signature = substrate_import_signature(exc, tree=tree)
+    if signature:
+        metadata_extra["substrate_signature"] = signature
+    named = describe_tree_import_failure(exc, tree=tree, task_id=task_id)
+    return (named or str(exc)), kind, metadata_extra
+
+
+def _substrate_failure_threshold() -> int:
+    """``kanban.failure_threshold`` (legacy alias ``spawn_failure_threshold``) else the default.
+
+    NO new config key (D5): the lane actor's bar is the same one the per-card breaker uses, so an
+    operator who already tuned ``failure_threshold`` tunes this too. A non-positive or
+    unparseable value falls back to ``DEFAULT_FAILURE_LIMIT``.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        kanban_cfg = (load_config_readonly() or {}).get("kanban") or {}
+    except Exception:
+        return DEFAULT_FAILURE_LIMIT
+    if not isinstance(kanban_cfg, dict):
+        return DEFAULT_FAILURE_LIMIT
+    raw = kanban_cfg.get("failure_threshold", kanban_cfg.get("spawn_failure_threshold"))
+    if raw is None:
+        return DEFAULT_FAILURE_LIMIT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_FAILURE_LIMIT
+    return value if value >= 1 else DEFAULT_FAILURE_LIMIT
+
+
+def _substrate_window(now: int) -> tuple[int, int]:
+    """``(window_start, window_seconds)`` for the lane actor's idempotency key.
+
+    The window is the SAME cooldown the retired card is spaced by
+    (``_resolve_rate_limit_cooldown_seconds``), bucketed so every failure inside one window
+    resolves to one key -- that bucketing is what makes the actor idempotent per tick. A disabled
+    cooldown (0, the tests' switch) still needs a bucket, so it falls back to the default.
+    """
+    seconds = _kb._resolve_rate_limit_cooldown_seconds()
+    if seconds <= 0:
+        seconds = DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    now = int(now)
+    return (now // seconds) * seconds, seconds
+
+
+def _substrate_affected_cards(
+    conn: sqlite3.Connection, signature: str, *, window_start: int,
+) -> list[str]:
+    """DISTINCT cards whose recorded substrate failure carries ``signature`` in this window.
+
+    Read from the board's own events: the ``spawn_failed`` row the seam writes carries
+    ``substrate_signature`` (``_record_task_failure(..., metadata_extra=...)``), so the count is
+    per BOARD with no new table and no new config key. Distinct CARDS, not failures: the actor
+    exists because a LANE is dying, and one hot card retrying is the per-card ``gave_up``'s story.
+    """
+    affected: list[str] = []
+    for row in conn.execute(
+        "SELECT task_id, payload FROM task_events "
+        "WHERE kind = 'spawn_failed' AND created_at >= ? ORDER BY created_at",
+        (int(window_start),),
+    ).fetchall():
+        payload = _kb._json_dict(row["payload"])
+        if payload.get("substrate_signature") != signature:
+            continue
+        task_id = row["task_id"]
+        if task_id not in affected:
+            affected.append(task_id)
+    return affected
+
+
+def _substrate_provider_path(tree: Path, signature: str) -> Optional[Path]:
+    """The provider file a signature names: ``substrate_import:<relpath>:<symbol>`` -> path."""
+    body = signature[len(SUBSTRATE_SIGNATURE_PREFIX):]
+    if ":" not in body:
+        return None
+    relpath = body.rsplit(":", 1)[0]
+    if not relpath:
+        return None
+    return Path(tree) / relpath
+
+
+def _recorded_naming_line(conn: sqlite3.Connection, affected: list[str]) -> Optional[str]:
+    """The naming line as RECORDED on one affected card -- quoted verbatim in the actor's body."""
+    for task_id in affected:
+        row = conn.execute(
+            "SELECT last_failure_error FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        text = _kb._lossy_text(row["last_failure_error"]) if row is not None else None
+        if text and TREE_IMPORT_INCONSISTENCY in text:
+            return text
+    return None
+
+
+def _substrate_actor_body(
+    conn: sqlite3.Connection, signature: str, affected: list[str], tree: Path,
+) -> str:
+    """The actor card's body: the naming line, the affected cards, and the tree evidence (D6).
+
+    Deterministic -- no model, no prose a human has to interpret. What a reader needs is: which
+    module disagreeing with which symbol, which cards died on it, and the tree's own state.
+    """
+    window_start, window_seconds = _substrate_window(int(time.time()))
+    lines = [
+        "## Observed",
+        "",
+        f"`{TREE_IMPORT_INCONSISTENCY}` the dispatching tree's own modules disagree, so worker",
+        "spawns are dying at the seam. Filed by the dispatcher's spawn-seam substrate guard --",
+        "deterministic, no model was consulted.",
+        "",
+        f"- signature: `{signature}`",
+        f"- affected cards ({len(affected)}): " + ", ".join(f"`{tid}`" for tid in affected),
+        f"- window: {window_start} (+{window_seconds}s)",
+        "",
+        "## Recorded failure line",
+        "",
+        "```",
+        _recorded_naming_line(conn, affected) or f"{TREE_IMPORT_INCONSISTENCY} {signature}",
+        "```",
+        "",
+        "## Tree evidence",
+        "",
+        f"- tree: `{tree}`",
+    ]
+    provider = _substrate_provider_path(tree, signature)
+    if provider is not None and provider.is_file():
+        try:
+            raw = provider.read_bytes()
+            stat = provider.stat()
+        except OSError:
+            raw, stat = b"", None
+        if stat is not None:
+            lines.append(
+                f"- provider: `{_relative_to_tree(provider, tree)}`"
+                f" sha256={hashlib.sha256(raw).hexdigest()}"
+                f" mtime={int(stat.st_mtime)} size={int(stat.st_size)}"
+            )
+    else:
+        lines.append(f"- provider: `{_substrate_provider_path(tree, signature)}` (not readable)")
+    lines += ["", "```", *_git_status_lines(tree), "```"]
+    return "\n".join(lines)
+
+
+def _git_status_lines(tree: Path) -> list[str]:
+    """``git status --porcelain`` for the tree, or the reason it could not be read."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(tree), "status", "--porcelain"],
+            capture_output=True, text=True,
+        )
+    except (OSError, ValueError) as exc:
+        return [f"(git unavailable: {exc})"]
+    if proc.returncode != 0:
+        return [f"(git status failed rc={proc.returncode}: {proc.stderr.strip()})"]
+    return proc.stdout.splitlines() or ["(clean)"]
+
+
+def _board_key(conn: sqlite3.Connection, board: Optional[str]) -> str:
+    """The board slug the actor's idempotency key is scoped to.
+
+    The CONNECTION is the board: ``PRAGMA database_list`` names the DB file it writes, and the
+    directory holding it IS the slug (``<kanban_home>/boards/<slug>/kanban.db``). An explicit
+    ``board`` argument wins when the caller carries one, and the current-board helper is the last
+    fallback. Only upstream helpers are used: an override-local one would make the key's spelling
+    depend on whatever else the tree happens to carry.
+    """
+    if board:
+        try:
+            explicit = _kb._normalize_board_slug(board)
+        except Exception:
+            explicit = None
+        if explicit:
+            return explicit
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            if str(row[1]) == "main" and row[2]:
+                db_file = Path(str(row[2]))
+                if db_file.parent == Path(_kb.kanban_home()):
+                    return "default"      # the default board's DB sits at <kanban_home>/kanban.db
+                slug = db_file.parent.name
+                if slug:
+                    return slug
+    except Exception:
+        pass
+    try:
+        return _kb._slug_or_default(board)
+    except Exception:
+        return "default"
+
+
+def _file_substrate_actor(
+    conn: sqlite3.Connection,
+    signature: str,
+    *,
+    affected: list[str],
+    tree: Path,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """File EXACTLY ONE acting card for a lane-level signature, idempotently (D6).
+
+    The idempotency key (``substrate:<signature>:<board>:<window-start>``) is the whole mechanism:
+    N cards failing the same way in one window resolve to one card, and a tree that stays broken
+    into the NEXT window can file its own. Best-effort by design -- a board that refuses the write
+    must not take the dispatcher tick down with it, and the per-card naming line is already
+    recorded either way -- but never silent: the refusal is logged with the key it could not file.
+    """
+    key = (
+        f"{SUBSTRATE_ACTOR_IDEMPOTENCY_PREFIX}{signature}"
+        f":{_board_key(conn, board)}:{_substrate_window(int(time.time()))[0]}"
+    )
+    try:
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            return existing["id"]
+        actor_id = _kb.create_task(
+            conn,
+            title=SUBSTRATE_ACTOR_TITLE,
+            body=_substrate_actor_body(conn, signature, affected, tree),
+            assignee=SUBSTRATE_ACTOR_ASSIGNEE,
+            created_by="kanban-dispatcher",
+            idempotency_key=key,
+        )
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, actor_id, SUBSTRATE_ACTOR_EVENT,
+                {"signature": signature, "affected": list(affected),
+                 "board": _board_key(conn, board)},
+            )
+        return actor_id
+    except Exception as exc:
+        _kb._log.warning(
+            "kanban dispatcher: could not file the substrate actor for %s (key=%s): %s",
+            signature, key, exc,
+        )
+        return None
+
+
+def _maybe_file_substrate_actor(
+    conn: sqlite3.Connection,
+    signature: Optional[str],
+    *,
+    tree: Path,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """File the lane actor once ``kanban.failure_threshold`` cards share one signature (D6).
+
+    A per-card ``blocked`` + ``gave_up`` names a card, never the lane -- which is how the review
+    lane went silently dead. This is the lane-level half: count DISTINCT cards carrying the
+    signature inside the cooldown window, across the board, and at the threshold file one acting
+    card for the design authority. The existing per-card ``gave_up`` is left exactly as it was.
+    """
+    if not signature:
+        return None
+    window_start, _ = _substrate_window(int(time.time()))
+    affected = _substrate_affected_cards(conn, signature, window_start=window_start)
+    if len(affected) < _substrate_failure_threshold():
+        return None
+    return _file_substrate_actor(
+        conn, signature, affected=affected, tree=tree, board=board,
+    )
+
+
+def _record_spawn_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    exc: BaseException,
+    *,
+    failure_limit: int,
+    board: Optional[str] = None,
+    prefix: str = "",
+) -> bool:
+    """Record one failed spawn through the guard: classify, name, charge-or-not, then escalate.
+
+    Returns True when the card was auto-blocked. One helper for BOTH spawn-seam ``except`` sites
+    (workspace resolution and the spawn call), so the verdict is reached exactly once, by
+    :func:`classify_spawn_failure`, and no caller re-implements the infrastructure rule beside it
+    (D5: one named classifier, no scattered ``isinstance`` checks).
+    """
+    tree = _dispatching_tree_root()
+    error_text, kind, metadata_extra = _spawn_failure_report(exc, task_id, tree=tree)
+    infrastructure = kind in (SPAWN_FAILURE_SUBSTRATE_IMPORT, SPAWN_FAILURE_HOST_CAPACITY)
+    if kind == SPAWN_FAILURE_HOST_CAPACITY:
+        _kb._log.warning(
+            "kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s",
+            task_id, exc,
+        )
+    elif kind == SPAWN_FAILURE_SUBSTRATE_IMPORT:
+        _kb._log.warning(
+            "kanban dispatcher: spawn of %s refused, the dispatching tree's own modules "
+            "disagree: %s", task_id, error_text,
+        )
+    # The naming line leads for a substrate failure; an ordinary failure keeps its caller's
+    # context label ("workspace: ...").
+    text = error_text if kind == SPAWN_FAILURE_SUBSTRATE_IMPORT else f"{prefix}{error_text}"
+    blocked = _record_task_failure(
+        conn, task_id, text,
+        outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+        infrastructure=infrastructure, metadata_extra=metadata_extra,
+    )
+    if kind == SPAWN_FAILURE_SUBSTRATE_IMPORT:
+        _maybe_file_substrate_actor(
+            conn, (metadata_extra or {}).get("substrate_signature"), tree=tree, board=board,
+        )
+    return blocked
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass.
@@ -131,6 +834,20 @@ class DispatchResult:
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
+    crash_sweep_refused: dict = field(default_factory=dict)
+    """The R4 refusal this tick, as a plain dict (``signature``/``count``/``threshold``/
+    ``ended_at``/``task_ids``), or ``{}``. Non-empty means the reclaim wrote NOTHING: a sweep that
+    would close ``>= kanban_crash_sweep_guard.mass_crash_threshold()`` runs in one tick is
+    host-systemic, not N card failures (ruling ``t_63a20c59`` R4)."""
+    crash_sweep_held: list[str] = field(default_factory=list)
+    """Task ids the reclaim HELD because their recorded identity fingerprint is not comparable with
+    the shape this dispatcher would write (R2 ``UNKNOWN -> HOLD`` at row granularity, R6). They were
+    neither reclaimed nor counted; their claims are untouched."""
+    identity_generation_alerts: list[str] = field(default_factory=list)
+    """R6 divergence reasons for this tick (``identity-shape-changed:…``, ``psutil-lost``,
+    ``witness-bytes-lost:…``); empty when the deployed identity generation is unchanged. Non-empty
+    means the shape the dispatcher WRITES is no longer the one recorded, so a liveness comparison is
+    meaningless until the witness bytes are re-landed."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -148,10 +865,24 @@ class DispatchResult:
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
+    skipped_board_disabled: bool = False
+    """True when the tick refused to run AT ALL: the board it resolved to is not
+    dispatch-enabled (an estate/rehearsal board, ``board.json`` ``"dispatch":
+    false``). Nothing was claimed, promoted, reclaimed or spawned — the refusal
+    happens BEFORE the lock, the reclaim phase and every claim, so the spawn path
+    is never reached and no card on that board can become lane work (card
+    t_17c9c847)."""
     memory_pressure: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    tick_yielded: str = ""
+    """Non-empty when this tick REFUSED to serve because the tree this process
+    imported no longer matches the checkout on disk (the content-based skew
+    gate, ruling ``t_8fed34c8``). The reason string starts with
+    ``tree-skew-yield:``. A refused tick reclaims nothing, promotes nothing and
+    spawns nothing; it is deliberately NOT ``skipped_locked`` and NOT idle --
+    a yielding ticker must never read green at the status surface."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -175,6 +906,11 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.skipped_board_disabled:
+            # Board-level refusal: the board is an estate/scratch board and the
+            # tick touched nothing (card t_17c9c847). Without this the refusal is
+            # invisible to the "dispatcher stuck" line.
+            counts["board_not_dispatch_enabled"] = counts.get("board_not_dispatch_enabled", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
@@ -308,24 +1044,54 @@ def reap_worker_zombies() -> list[int]:
     return reaped
 
 
-def _pid_alive(pid: Optional[int]) -> bool:
-    """Return True if ``pid`` is still running on this host.
+# ---------------------------------------------------------------------------
+# Liveness: one witness, three answers
+# ---------------------------------------------------------------------------
+# A liveness read has to be able to answer "I cannot tell" (#123811). Reading a FAILED probe as death
+# is what let a single dispatch tick declare six live workers dead — each recovery then spawned a
+# duplicate beside the worker it had just abandoned. Every verdict here is one of the three below, and
+# only ``WORKER_DEAD`` may release a claim or authorize a signal. ``WORKER_UNKNOWN`` holds the claim.
+WORKER_ALIVE = "alive"
+WORKER_UNKNOWN = "unknown"
+WORKER_DEAD = "dead"
 
-    Uses ``gateway.status._pid_exists`` (OpenProcess on Windows, ``os.kill(pid, 0)``
-    on POSIX). **DO NOT** call ``os.kill(pid, 0)`` directly on Windows — there
-    ``sig=0`` is ``CTRL_C_EVENT`` broadcast to the console group, potentially
-    killing unrelated processes.
+# A recorded fingerprint's start is expressed relative to a boot reference; two starts compare only
+# while that reference holds. macOS moves ``kern.boottime`` with the system clock, shifting every start
+# taken before the move by exactly the move — measured here as 800 cs (#124570). This tolerance covers
+# only the centisecond rounding of two readers sharing one reference; a move of real size is far
+# larger, and a move is not a difference (see ``boot_reference_held``).
+BOOT_REFERENCE_TOLERANCE_CS = 2
 
-    Zombies (exited, not yet reaped) still pass the existence check, so a
-    worker would look "alive" forever between exit and reap. Linux: peek at
-    ``/proc/<pid>/status`` and treat ``State: Z`` as dead; macOS: ask ``ps``
-    for the BSD ``stat`` field and treat ``Z`` as dead.
+
+def _exists_probe(pid: int) -> bool:
+    """Is the PID number occupied (zombies included)?
+
+    Goes through the ``kanban_db`` facade when it has been replaced — plugins and tests patch
+    ``kanban_db._pid_alive`` to drive liveness, and the pre-existing code honoured that by calling
+    ``_kb._pid_alive``. Doing that unconditionally would recurse here, because by default the facade IS
+    this module's ``_pid_alive``; so only an OVERRIDE is consulted, and otherwise the probe is made
+    directly.
+    """
+    facade = getattr(_kb, "_pid_alive", None)
+    if facade is not None and facade is not _pid_alive:
+        return bool(facade(int(pid)))
+    from gateway.status import _pid_exists
+    return bool(_pid_exists(int(pid)))
+
+
+def _pid_liveness(pid: Optional[int]) -> str:
+    """``alive`` / ``dead`` / ``unknown`` for a bare PID (no identity component).
+
+    ``dead`` is reserved for proof: the OS says the number is unoccupied (``ESRCH``/``OpenProcess``
+    failure) or the process is a zombie. A secondary probe that FAILED is not proof — macOS ``ps``
+    exits non-zero for PIDs it cannot see, under load as well as after exit — so it answers
+    ``unknown`` and leaves the caller's own evidence (a matching fingerprint) in charge. The probe
+    timing out or raising keeps the ``kill(0)`` answer, which is the pre-existing behaviour.
     """
     if not pid or pid <= 0:
-        return False
-    from gateway.status import _pid_exists
-    if not _pid_exists(int(pid)):
-        return False
+        return WORKER_DEAD
+    if not _exists_probe(int(pid)):
+        return WORKER_DEAD
     if sys.platform == "linux":
         try:
             with open(f"/proc/{int(pid)}/status", "r", encoding="utf-8") as f:
@@ -333,7 +1099,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
                     if line.startswith("State:"):
                         # "State:\tZ (zombie)" → dead
                         if "Z" in line.split(":", 1)[1]:
-                            return False
+                            return WORKER_DEAD
                         break
         except (FileNotFoundError, PermissionError, OSError):
             # proc entry gone → already reaped; treat as dead.
@@ -349,13 +1115,25 @@ def _pid_alive(pid: Optional[int]) -> bool:
                 check=False,
             )
             if proc.returncode != 0:
-                return False
+                # A failed probe proves nothing: the number IS occupied (``_pid_exists`` said so
+                # above), and "could not read the state" is not "the process is gone".
+                return WORKER_UNKNOWN
             if "Z" in (proc.stdout or "").strip():
-                return False
+                return WORKER_DEAD
         except (OSError, subprocess.SubprocessError, TimeoutError):
             # If the secondary probe fails, keep the kill(0) answer.
             pass
-    return True
+    return WORKER_ALIVE
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    """True only when ``pid`` is PROVEN to be a running process (verdict ``alive``).
+
+    Callers asking "is this number still occupied?" must not use the negation: ``unknown`` reads as
+    False here, so ``not _pid_alive(...)`` would turn an unreadable probe into proof of death.
+    Compare the verdict instead — ``_pid_liveness(pid) == WORKER_DEAD``.
+    """
+    return _pid_liveness(pid) == WORKER_ALIVE
 
 
 # ``worker_started_at`` value for a spawn whose fingerprint could not be captured. Distinct from the
@@ -365,53 +1143,267 @@ UNVERIFIED_WORKER_FINGERPRINT = "unverified"
 
 
 def _process_fingerprint(pid: int) -> Optional[str]:
-    """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
-    time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
-    survives a reboot could match an unrelated process with the same PID and the same tick value;
-    ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
-    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable."""
-    from gateway.drain_control import current_instantiation_epoch
-    from gateway.status import get_process_start_time
-    start = get_process_start_time(int(pid))
-    if start is None:
+    """Restart-stable identity of a live process: ``"<boot witness>|<boot reference>|<start>"``.
+
+    The witness names the boot itself (``gateway.status.host_boot_witness``); the start is centiseconds
+    since boot and the reference is the value that start is expressed against
+    (``gateway.status.get_process_uptime_fingerprint``). A reboot breaks the pair, and — unlike the
+    absolute form — so does nothing else while the reference holds. The reference is recorded because
+    it does NOT always hold: macOS moves ``kern.boottime`` with the system clock, which shifts every
+    start taken before the move by exactly the move, and a comparator that cannot see the move reads
+    that shift as a recycled PID (#124570). A platform whose start is already boot-relative records
+    ``0``. ``None`` when a half is unreadable — including "the platform has no boot witness", whose only
+    honest reading is inability to certify identity, never a difference.
+    """
+    from gateway.status import get_process_uptime_fingerprint, host_boot_witness
+    witness = host_boot_witness()
+    if not witness:
         return None
-    return f"{current_instantiation_epoch()}|{start}"
+    fingerprint = get_process_uptime_fingerprint(int(pid))
+    if fingerprint is None:
+        return None
+    reference, start = fingerprint
+    return f"{witness}|{reference}|{start}"
+
+
+# ---------------------------------------------------------------------------
+# Liveness contract (R1, card t_d98471e5) — a DEPLOYED-BYTES contract, not a heuristic
+# ---------------------------------------------------------------------------
+# On 2026-09-29 the live dispatch path silently regressed to pre-#123811/#124570 liveness bytes
+# (every spawn from 01:02:10 to 12:36:53 recorded the 2-field ``witness=""|absolute_start`` form)
+# and the old comparator answered DEAD for live workers: claims were released and cards re-queued
+# beside their live workers (runs 5642/5643, 08:41:06). A guard written INSIDE the fixed code
+# cannot stop a deployment that is RUNNING OLDER BYTES, so the primary fix is a contract the
+# running module DECLARES, which the reclaim path checks before it acts and a reload probe reads.
+#
+# Version ``LIVENESS_CONTRACT_ID`` whenever the fingerprint format or the verdict semantics
+# change, and keep it beside the code it names so the two cannot drift silently.
+LIVENESS_CONTRACT_ID = "witness-v1"
+
+# The minimum contract the reclaim path requires before it may release ANY claim. A tree whose
+# declared id is missing, unparseable or below this HOLDS: its bytes are older than the semantics
+# they would be acting on. `_reclaim_dead_workers` refuses every release it would otherwise make
+# and records `reclaim_refused {reason: "stale_liveness_contract"}`.
+REQUIRED_LIVENESS_CONTRACT_ID = "witness-v1"
+
+_liveness_contract_announced = False
+
+
+def _liveness_contract_rank(contract_id: Any) -> Optional[int]:
+    """``N`` for a ``"witness-vN"`` contract id, else ``None``.
+
+    ``None`` means "unreadable", never ``0``: a module that declares nothing at all must FAIL
+    the required check, not tie with a real contract of rank 0.
+    """
+    if not isinstance(contract_id, str):
+        return None
+    prefix = "witness-v"
+    if not contract_id.startswith(prefix):
+        return None
+    try:
+        return int(contract_id[len(prefix):])
+    except (TypeError, ValueError):
+        return None
+
+
+def _liveness_contract_ok() -> bool:
+    """True when the RUNNING module's declared contract is at or above the required one.
+
+    Read from the module global at call time (never a frozen local), so a partially-updated
+    tree or a downgraded constant is caught by the very path that would act on it.
+    """
+    declared = _liveness_contract_rank(globals().get("LIVENESS_CONTRACT_ID"))
+    required = _liveness_contract_rank(REQUIRED_LIVENESS_CONTRACT_ID)
+    if declared is None or required is None:
+        return False
+    return declared >= required
+
+
+def announce_liveness_contract() -> Optional[str]:
+    """Say ONCE per process which liveness contract this dispatcher is running.
+
+    Called from the dispatch tick; the status prints only on the first call in the process, so
+    a running dispatcher names its contract exactly once per boot. A reload/update leg greps
+    the gateway log for ``liveness contract 'witness-v1'`` and reports the reload FAILED when
+    the line is absent — a live tree that does not report the contract is the 2026-09-29 class.
+    """
+    global _liveness_contract_announced
+    if _liveness_contract_announced:
+        return None
+    _liveness_contract_announced = True
+    declared = globals().get("LIVENESS_CONTRACT_ID")
+    ok = _liveness_contract_ok()
+    line = (
+        f"kanban dispatch: liveness contract {declared!r} "
+        f"(required {REQUIRED_LIVENESS_CONTRACT_ID!r}, {'ok' if ok else 'stale'})"
+    )
+    if ok:
+        logger.info(line)
+    else:
+        logger.error(line + " — reclaims are REFUSED until the tree carries a current contract")
+    return line
+
+
+def _fingerprint_parts(fingerprint: Any) -> Optional[tuple[str, int, Optional[int]]]:
+    """``(witness, uptime-relative start, boot reference)`` for a fingerprint, else ``None``.
+
+    ``None`` covers every shape that cannot be compared at all — a bare start tick (rows written before
+    the witness existed) and a ``"|<start>"`` pair whose witness component is EMPTY (macOS rows written
+    while ``current_instantiation_epoch`` had no answer there).
+
+    A ``None`` REFERENCE (the two-field shape rows carry from before #124570) is different: it compares
+    by exact match but never certifies a mismatch, because the reference it was built against is not in
+    it — a mismatch there carries the same information as a moved reference, so a caller must read
+    "unknown", never "recycled".
+    """
+    if not isinstance(fingerprint, str) or "|" not in fingerprint:
+        return None
+    witness, _, rest = fingerprint.partition("|")
+    if not witness:
+        return None
+    fields = rest.split("|")
+    try:
+        if len(fields) == 1:
+            return witness, int(fields[0]), None
+        if len(fields) == 2:
+            return witness, int(fields[1]), int(fields[0])
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _witnesses_agree(recorded: str, current: str) -> Optional[bool]:
+    """True/False when two boot witnesses are comparable, ``None`` when they are not.
+
+    Opaque witnesses (a boot id, a boot session UUID) must be EQUAL: they only ever change on a reboot.
+    The boot-epoch fallback is the one form a clock step can move, so it is compared within
+    ``START_TIME_DRIFT_TOLERANCE`` — the same tolerance the start component gets — instead of exactly.
+    """
+    from gateway.status import START_TIME_DRIFT_TOLERANCE
+    if recorded == current:
+        return True
+    prefix = "boottime:"
+    recorded_is_time = recorded.startswith(prefix)
+    current_is_time = current.startswith(prefix)
+    if recorded_is_time and current_is_time:
+        try:
+            gap = abs(int(recorded[len(prefix):]) - int(current[len(prefix):]))
+        except (TypeError, ValueError):
+            return None
+        return gap <= START_TIME_DRIFT_TOLERANCE
+    if recorded_is_time != current_is_time:
+        # Mixed forms: one probe failed to yield its session id, so the witness changed SHAPE, not the
+        # boot. "Cannot tell", never "different boot".
+        return None
+    return False
+
+
+def _worker_liveness(pid: Optional[int], started_at) -> str:
+    """The liveness verdict for a recorded worker: ``alive`` / ``dead`` / ``unknown``.
+
+    ``dead`` needs proof of death (the PID is gone or a zombie) or proof of non-identity (the recorded
+    fingerprint and the live reading disagree while the boot reference they are both expressed against
+    still holds). Everything else is ``unknown``, and ``unknown`` never releases a claim: a reclaim that
+    cannot prove the worker is gone must hold the claim and retry, because releasing it spawns a
+    duplicate beside the process it abandoned. Fingerprints in an older shape — no witness, or no
+    recorded reference to compare against — are ``unknown`` on a mismatch for the same reason:
+    indistinguishable from a reference adjustment. Legacy NULL rows (no fingerprint at all) and
+    deliberately UNVERIFIED spawns keep the existence answer they always had.
+
+    A mismatch is only evidence while the reference holds. Measured 2026-09-27: macOS moved
+    ``kern.boottime`` by 8.00 s, which put two live workers exactly 800 cs out of their own recorded
+    start times (tolerance is 200 cs), and the sweep reclaimed both while they were running —
+    ``dead`` there was a false verdict on a single reading, which is the defect this refuses
+    (#124570).
+    """
+    if not pid or int(pid) <= 0:
+        return WORKER_DEAD
+    pid_state = _pid_liveness(int(pid))
+    if pid_state == WORKER_DEAD:
+        return WORKER_DEAD
+    if started_at is None or started_at == UNVERIFIED_WORKER_FINGERPRINT:
+        # Unchanged semantics today: these rows never had a comparable identity, so the
+        # answer is the bare existence probe's, unprovable reading included.
+        return WORKER_ALIVE if pid_state == WORKER_ALIVE else WORKER_DEAD
+    parts = _fingerprint_parts(started_at)
+    if parts is None:
+        return WORKER_UNKNOWN
+    witness, recorded_start, recorded_reference = parts
+    from gateway.status import (
+        get_process_uptime_fingerprint,
+        host_boot_witness,
+        start_time_fingerprints_match,
+    )
+    current_witness = host_boot_witness()
+    if not current_witness:
+        return WORKER_UNKNOWN
+    same_boot = _witnesses_agree(witness, current_witness)
+    if same_boot is None:
+        return WORKER_UNKNOWN
+    if not same_boot:
+        # A different boot: the PID and the boot-relative tick can both recur.
+        return WORKER_DEAD
+    current = get_process_uptime_fingerprint(int(pid))
+    if current is None:
+        return WORKER_UNKNOWN
+    current_reference, current_start = current
+    if recorded_start <= 0 or current_start <= 0:
+        return WORKER_UNKNOWN
+    if start_time_fingerprints_match(recorded_start, current_start):
+        return WORKER_ALIVE
+    if not boot_reference_held(recorded_reference, current_reference):
+        # The reference both readings are expressed against MOVED between the recording and this read,
+        # so the start below is not the same measurement: two live workers were declared dead this way
+        # (see the docstring). A comparison across a moved reference proves neither identity nor its
+        # absence — hold, and let the TTL/backstop paths bound the wait.
+        return WORKER_UNKNOWN
+    return WORKER_DEAD
+
+
+def boot_reference_held(
+    recorded_reference: Optional[int], current_reference: Optional[int]
+) -> bool:
+    """True when both start readings were built against the same boot reference and may be compared.
+
+    ``None`` (a fingerprint written before the reference was recorded) is never comparable: a mismatch
+    there carries the same information as a moved reference, so the caller must read "hold", never
+    "recycled". A small tolerance absorbs the centisecond rounding of the two readers sharing one
+    ``kern.boottime``.
+    """
+    if recorded_reference is None or current_reference is None:
+        return False
+    return abs(int(recorded_reference) - int(current_reference)) <= BOOT_REFERENCE_TOLERANCE_CS
 
 
 def _worker_alive(pid: Optional[int], started_at) -> bool:
-    """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
-    recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
-    the number, so bare existence is never enough to extend a claim or to signal. A legacy row without
-    a fingerprint keeps the existence answer: killing it is the pre-fingerprint behaviour and the row is
-    rewritten with a fingerprint on its next spawn. An UNVERIFIED spawn also keeps the existence answer
-    (a claim is never released beside a possibly-live worker) but ``_terminate_reclaimed_worker``
-    refuses to signal it."""
-    if not _kb._pid_alive(pid):
-        return False
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
-        return True
-    return not _pid_recycled(pid, started_at)
+    """True when ``pid`` is live AND is still the worker we spawned (verdict ``alive``).
+
+    ``started_at`` is the fingerprint recorded by ``_set_worker_pid``; after a reboot (or any PID
+    recycle) an unrelated process can own the number, so bare existence is never enough to extend a
+    claim or to signal. For CLAIM PROTECTION use :func:`_worker_not_dead` — this one answers False for
+    ``unknown``, which must never be read as "release it".
+    """
+    return _worker_liveness(pid, started_at) == WORKER_ALIVE
+
+
+def _worker_not_dead(pid: Optional[int], started_at) -> bool:
+    """Claim protection: keep the claim unless the worker is PROVEN dead (``alive`` or ``unknown``).
+
+    This is the predicate every reclaim guard uses. Holding a claim beside a worker that may still be
+    running costs a delayed retry; releasing it spawns a second worker on the same card, which is the
+    duplication loop the reclaim exists to prevent.
+    """
+    return _worker_liveness(pid, started_at) != WORKER_DEAD
 
 
 def _pid_recycled(pid: Optional[int], started_at) -> bool:
-    """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
-    longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
-    recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
-    if started_at is None or not pid:
-        return False
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
-        return True
-    if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
-    from gateway.status import _start_times_agree, get_process_start_time
-    current = get_process_start_time(int(pid))
-    if current is None:
-        return True
-    try:
-        return not _start_times_agree(current, started_at)
-    except (TypeError, ValueError):
-        return True
+    """True when a live ``pid`` is PROVEN not to be the process fingerprinted at spawn.
+
+    Signalling it would hit a stranger, and the reclaim may proceed: the worker we cared about is
+    gone. An unprovable identity is NOT recycled (``unknown`` answers False here) — callers must
+    consult the verdict, not this boolean, before releasing a claim.
+    """
+    return _worker_liveness(pid, started_at) == WORKER_DEAD
 
 
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
@@ -422,9 +1414,13 @@ def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
 
 
 def _poll_worker_exit(pid: int, started_at: Optional[int] = None) -> bool:
-    """Poll ~5 s (10 x 0.5 s) for ``pid`` to die; True once it is gone."""
+    """Poll ~5 s (10 x 0.5 s) for ``pid`` to die; True once it is PROVEN gone.
+
+    An ``unknown`` read keeps polling instead of answering "exited": the caller uses True to conclude
+    the worker is gone, and an unreadable probe is not that conclusion.
+    """
     for _ in range(10):
-        if not _worker_alive(pid, started_at):
+        if _worker_liveness(pid, started_at) == WORKER_DEAD:
             return True
         time.sleep(0.5)
     return False
@@ -472,9 +1468,20 @@ def _terminate_reclaimed_worker(
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
         info["signal_refused"] = True
-        info["terminated"] = not _kb._pid_alive(pid)
+        info["terminated"] = _pid_liveness(pid) == WORKER_DEAD
         return info
-    if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
+    verdict = _worker_liveness(pid, started_at)
+    if verdict == WORKER_UNKNOWN:
+        # The recorded identity cannot be compared with the live process (see ``_worker_liveness``).
+        # Signalling the bare number could hit whatever now owns it, and reporting ``terminated`` would
+        # release the claim beside a worker that may still be running. Hold both; retry next tick.
+        info["signal_refused"] = True
+        info["liveness_unknown"] = True
+        info["terminated"] = False
+        return info
+
+    if verdict == WORKER_DEAD and _pid_liveness(pid) == WORKER_ALIVE:
+        # Occupied by a stranger (the PID was recycled): never signal it. Our worker is gone.
         info["terminated"] = True
         info["pid_recycled"] = True
         return info
@@ -493,11 +1500,11 @@ def _terminate_reclaimed_worker(
     if _poll_worker_exit(pid, started_at):
         info["terminated"] = True
         return info
-    if _worker_alive(pid, started_at):
+    if _worker_liveness(pid, started_at) == WORKER_ALIVE:
         if not _sigkill(kill, pid):
             return info
         info["sigkill"] = True
-    info["terminated"] = not _worker_alive(pid, started_at)
+    info["terminated"] = _worker_liveness(pid, started_at) == WORKER_DEAD
     return info
 
 
@@ -537,7 +1544,12 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         return
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
-    alive = _worker_alive(pid, fingerprint)
+    verdict = _worker_liveness(pid, fingerprint)
+    if verdict == WORKER_UNKNOWN:
+        # Cannot certify identity. Clearing this row's pid would destroy the only handle on a worker
+        # that may still be running, so leave the evidence for the next tick instead.
+        return
+    alive = verdict == WORKER_ALIVE
     termination = None
     if alive:
         termination = _terminate_reclaimed_worker(
@@ -652,6 +1664,15 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     task's source phase so the next tick re-spawns the same kind of worker —
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+
+    The population is gated on a POSITIVE cap. The column's ``0`` is the author's
+    documented "no cap" opt-out (``hermes_cli/kanban.py::_parse_duration`` normalises
+    the CLI's ``0`` to unset for exactly this reason, and the stamp in
+    ``_stamp_default_max_runtime_seconds`` treats a stored ``0`` as the card's own
+    value), so it is NOT a budget: with ``limit == 0`` the ``elapsed < limit`` guard
+    below is false for ANY elapsed and a ``0``-cap card is reaped on the very next
+    tick with ``limit_seconds 0``. Gating the SELECT on ``> 0`` repairs rows already
+    stored as ``0`` rather than only future writes.
     """
     timed_out: list[str] = []
     now = int(time.time())
@@ -664,6 +1685,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "  AND t.max_runtime_seconds > 0 "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -681,7 +1703,14 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         pid = int(row["worker_pid"])
         tid = row["id"]
         started_at = _kb._row_get(row, "worker_started_at")
-        if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
+        verdict = _worker_liveness(pid, started_at)
+        if verdict == WORKER_UNKNOWN:
+            # Cannot certify identity: the number may belong to a stranger (no signal) and the worker
+            # may still be running (no release beside it). Hold the claim; the next tick re-reads.
+            _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but its process "
+                             "identity cannot be read; held, not signalled", tid, pid)
+            continue
+        if started_at == UNVERIFIED_WORKER_FINGERPRINT and verdict != WORKER_DEAD:
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
             # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
@@ -692,12 +1721,13 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # mismatch) is never signalled: the worker is already gone.
         killed = False
         kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
+        stranger = verdict == WORKER_DEAD and _pid_liveness(pid) == WORKER_ALIVE
+        if kill is not None and not stranger:
             with contextlib.suppress(ProcessLookupError, OSError):
                 kill(pid, signal.SIGTERM)
             # Short polling wait — no time.sleep on the write txn.
             _poll_worker_exit(pid, started_at)
-            if _worker_alive(pid, started_at):
+            if _worker_liveness(pid, started_at) == WORKER_ALIVE:
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
@@ -862,12 +1892,31 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
-            # Never requeue beside a live process. Retry next tick.
+        verdict = _worker_liveness(pid, _kb._row_get(row, "worker_started_at")) if pid else WORKER_DEAD
+        if verdict != WORKER_DEAD:
+            # Never requeue beside a live process — nor beside one whose identity cannot be read:
+            # the reclaim would spawn a duplicate next to a worker that may still be running
+            # (#123811). Retry next tick.
             _kb._log.debug(
                 "kanban reconcile: task %s has broken claim bookkeeping but "
-                "pid %s is alive on this host — deferring", tid, pid,
+                "pid %s is %s on this host — deferring", tid, pid, verdict,
             )
+            # Record the deferral. ``detect_crashed_workers`` refuses to pronounce a reclaimed run
+            # a crash without a reason from DISOWNED_RUN_REASONS, and this event is what makes the
+            # later recovery honest: without it the next sweep would read a live worker's card as
+            # a dead one whose attempt must be written off.
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, tid, "reclaim_deferred",
+                    {
+                        "reason": "orphaned_running_worker_alive",
+                        "liveness": verdict,
+                        "claim_lock": row["claim_lock"],
+                        "claim_expires": _kb._opt_int(row["claim_expires"]),
+                        "worker_pid": int(pid) if pid else None,
+                        "now": now,
+                    },
+                )
             continue
         with _kb.write_txn(conn):
             cur = conn.execute(
@@ -900,6 +1949,11 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 now,
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
+            # The reclaim has no worker evidence: nobody observed a crash, the card simply
+            # lost its claim bookkeeping. Reconcile the run it closed with an empty completion so
+            # that row is not the attempt history's last word, and so the failure counter the
+            # recovery booked does not stand against a worker that never failed.
+            _kb._synthesize_empty_completion_run(conn, tid, disowned_run_id=run_id)
             reconciled.append(tid)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
@@ -1141,14 +2195,109 @@ class _CrashSweep:
     # Worker-exit observer payloads, fired only after every reclaim/accounting
     # txn has committed.
     exited_hook_payloads: list[dict] = field(default_factory=list)
+    # The guard's whole decision for this sweep (the R4 count verdict and the R6 held rows), or
+    # ``None`` when the sweep was never assessed.
+    assessment: Optional[_crash_guard.SweepAssessment] = None
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat veto (R2, card t_d98471e5)
+# ---------------------------------------------------------------------------
+# A `running` row whose own `last_heartbeat_at` is inside this window is NOT reclaimed, whatever
+# the pid verdict says: the worker is talking to us, so the verdict is wrong about the worker we
+# care about. Default 0 = OFF so tests and other callers are unaffected; prod arms it at 2x the
+# automatic-heartbeat cadence (the agent bridge beats at most once every
+# `tools.kanban_tools._AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS` = 60 s, so 2x that is the smallest
+# window that cannot miss a live worker between beats) via
+# `HERMES_KANBAN_HEARTBEAT_VETO_SECONDS=120` in the gateway environment.
+#
+# Safety is MONOTONE: the veto can only convert a reclaim into a hold, and it can never delay a
+# TRUE reclaim by more than the window. It closes the false-dead class for ANY wrong pid answer
+# inside fixed code (invisible pid, recycled pid, unreadable probe).
+#
+# It would NOT have prevented the 2026-09-29 runs (5642/5643): those bytes predated this guard
+# and never read a heartbeat at all. The contract (R1) is what covers THAT class.
+HEARTBEAT_VETO_SECONDS = 0
+
+
+def resolve_heartbeat_veto_seconds() -> int:
+    """The veto window: ``HEARTBEAT_VETO_SECONDS``, armable in prod without a code change via
+    ``HERMES_KANBAN_HEARTBEAT_VETO_SECONDS``. Unreadable/invalid values fall back to the
+    constant; a negative value is clamped to 0 (off), never a negative window."""
+    raw = os.environ.get("HERMES_KANBAN_HEARTBEAT_VETO_SECONDS")
+    if raw:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(0, int(HEARTBEAT_VETO_SECONDS))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _hold_claim_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    now: int,
+    *,
+    event_kind: str,
+    reason: str,
+    extra: Optional[dict] = None,
+) -> None:
+    """Extend a running claim's expiry and record WHY it was not released.
+
+    ASSUMES an open write txn (caller holds one). No release, no failure accounting, no
+    re-spawn: the row stays ``running`` and is re-read next tick. Mirrors
+    ``_defer_reclaim_for_live_worker``'s vocabulary (``reclaim_deferred``) and adds
+    ``reclaim_refused`` for the stale-contract case; neither counts a failure.
+    """
+    grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
+    cur = conn.execute(
+        "UPDATE tasks SET claim_expires = ? "
+        "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+        (grace, task_id, claim_lock),
+    )
+    if cur.rowcount != 1:
+        return
+    run_id = _kb._current_run_id(conn, task_id)
+    if run_id is not None:
+        conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
+    payload = {
+        "reason": reason,
+        "claim_lock": claim_lock,
+        "claim_expires_now": grace,
+        "liveness_contract": globals().get("LIVENESS_CONTRACT_ID"),
+    }
+    if extra:
+        payload.update(extra)
+    _kb._append_event(conn, task_id, event_kind, payload, run_id=run_id)
 
 
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
-    """Release every host-local ``running`` task whose worker PID is dead."""
+    """Release every host-local ``running`` task whose worker PID is dead AND may be released.
+
+    Two guards stand between a dead-pid VERDICT and a release (card t_d98471e5):
+
+    * R1 liveness contract — if this module's declared ``LIVENESS_CONTRACT_ID`` is missing or
+      below ``REQUIRED_LIVENESS_CONTRACT_ID``, NOTHING is released; each otherwise-reclaimable
+      row is held with ``reclaim_refused {reason: "stale_liveness_contract"}``. A tree running
+      bytes older than the witness-aware comparator is exactly the 2026-09-29 incident.
+    * R2 heartbeat veto — a row whose ``last_heartbeat_at`` is inside the veto window
+      (``resolve_heartbeat_veto_seconds()``; prod arms it, default 0 = off) MUST NOT be
+      reclaimed on a pid verdict, and is held with
+      ``reclaim_deferred {reason: "heartbeat_fresh"}``.
+    """
     sweep = _CrashSweep()
+    announce_liveness_contract()
+    now = int(time.time())
+    contract_ok = _liveness_contract_ok()
+    veto_seconds = resolve_heartbeat_veto_seconds()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
+            "       last_heartbeat_at "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1162,13 +2311,68 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
-            if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+            if _worker_not_dead(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+                # Alive, or unprovable. Only PROOF of death releases a claim or spawns beside it:
+                # an unreadable start-time/probe read is not proof, and treating it as one put six
+                # duplicate workers on six live cards in a single tick (#123811). Held rows are
+                # re-read next tick, and the TTL/backstop paths bound the wait.
                 continue
 
             pid = int(row["worker_pid"])
+            # R1: the running module must declare a current contract before ANY release.
+            if not contract_ok:
+                _hold_claim_in_txn(
+                    conn, row["id"], row["claim_lock"], now,
+                    event_kind="reclaim_refused",
+                    reason="stale_liveness_contract",
+                    extra={
+                        "worker_pid": pid,
+                        "declared_contract": globals().get("LIVENESS_CONTRACT_ID"),
+                        "required_contract": REQUIRED_LIVENESS_CONTRACT_ID,
+                    },
+                )
+                continue
+            # R2: the worker's own recent heartbeat vetoes the dead-pid verdict.
+            last_hb = _kb._row_get(row, "last_heartbeat_at")
+            hb_age = (now - int(last_hb)) if last_hb is not None else None
+            if veto_seconds > 0 and hb_age is not None and hb_age < veto_seconds:
+                _hold_claim_in_txn(
+                    conn, row["id"], row["claim_lock"], now,
+                    event_kind="reclaim_deferred",
+                    reason="heartbeat_fresh",
+                    extra={
+                        "worker_pid": pid,
+                        "heartbeat_age_seconds": hb_age,
+                        "veto_seconds": veto_seconds,
+                    },
+                )
+                continue
+
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            # The attempt is RECORDED, not discarded: an exit code alone says
+            # nothing about how much of the run was spent, so the reaped attempt
+            # also books its wall-clock duration and the runtime budget it was
+            # working against. Same field names ``enforce_max_runtime`` uses, so
+            # a run's cost reads the same whether it timed out or died.
+            open_run = conn.execute(
+                "SELECT started_at FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            run_started_at = _kb._row_get(open_run, "started_at") if open_run is not None else None
+            if run_started_at:
+                dead.event_payload["elapsed_seconds"] = max(0, now - int(run_started_at))
+            budget = _kb._row_get(row, "max_runtime_seconds")
+            if budget is not None:
+                dead.event_payload["limit_seconds"] = int(budget)
+            dead.event_payload.setdefault("exit_kind", dead.kind)
+            dead.event_payload["liveness_contract"] = globals().get("LIVENESS_CONTRACT_ID")
+            error_text = (
+                f"{dead.error_text} "
+                f"[liveness_contract={globals().get('LIVENESS_CONTRACT_ID')}]"
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -1181,7 +2385,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             run_id = _kb._end_run(
                 conn, row["id"],
                 outcome=dead.run_outcome, status=dead.run_outcome,
-                error=dead.error_text,
+                error=error_text,
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
@@ -1203,7 +2407,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 # board UI and retry worker need the corrective message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                    (dead.error_text[:500], row["id"]),
+                    (error_text[:500], row["id"]),
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
@@ -1304,6 +2508,25 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     ``_last_rate_limited`` attribute (the return stays crashed-only).
     """
     sweep = _reclaim_dead_workers(conn, board=board)
+    if sweep.assessment is not None and sweep.assessment.alerting:
+        # LOUD, never silent: the refusal (R4) and the held rows (R6) both go to the log, to the
+        # board as per-card evidence, and to the design authority as one idempotent acting card.
+        _crash_guard.alert_sweep_guard(
+            conn, sweep.assessment, board=board, tree=_crash_guard.dispatching_tree(),
+        )
+    detect_crashed_workers._last_crash_sweep_abort = (  # type: ignore[attr-defined]
+        sweep.assessment.verdict if sweep.assessment is not None and sweep.assessment.refusal_needed
+        else None
+    )
+    detect_crashed_workers._last_crash_sweep_held = (  # type: ignore[attr-defined]
+        list(sweep.assessment.held) if sweep.assessment is not None else []
+    )
+    if sweep.assessment is not None and sweep.assessment.refusal_needed:
+        # The sweep refused itself: NOTHING was closed, so the returned list is empty and the
+        # crash accounting below must not run.
+        detect_crashed_workers._last_auto_blocked = []  # type: ignore[attr-defined]
+        detect_crashed_workers._last_rate_limited = []  # type: ignore[attr-defined]
+        return []
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
@@ -1354,6 +2577,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    metadata_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1372,6 +2596,13 @@ def _record_task_failure(
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
     the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
+
+    ``metadata_extra``: structured facts that belong on the run AND the event
+    alongside the failure — the spawn-seam substrate guard puts
+    ``substrate_import`` / ``substrate_signature`` here so the lane actor can
+    dedupe on the signature later without re-deriving it from prose. Applied on
+    both branches (charged and not), because the guard reads the events of the
+    not-charged one.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1418,6 +2649,8 @@ def _record_task_failure(
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
                     detail["infrastructure"] = True
+                if metadata_extra:
+                    detail.update(metadata_extra)
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
@@ -1445,15 +2678,18 @@ def _record_task_failure(
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
+            run_meta = {
+                "failures": failures,
+                "trigger_outcome": outcome,
+                "effective_limit": effective_limit,
+                "limit_source": limit_source,
+                "retry_status": retry_status,
+            }
+            if metadata_extra:
+                run_meta.update(metadata_extra)
             run_id = _kb._end_run(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
-                metadata={
-                    "failures": failures,
-                    "trigger_outcome": outcome,
-                    "effective_limit": effective_limit,
-                    "limit_source": limit_source,
-                    "retry_status": retry_status,
-                },
+                metadata=run_meta,
             )
         if force_trip:
             # The caller applied its own bounded policy, so the counter cannot
@@ -1461,6 +2697,8 @@ def _record_task_failure(
             payload["sticky"] = True
         if event_payload_extra:
             payload.update(event_payload_extra)
+        if metadata_extra:
+            payload.update(metadata_extra)
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         return True
 
@@ -1528,6 +2766,10 @@ def check_respawn_guard(
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready/review row before any claim attempt. Priority order:
+    ``"substrate_cooldown"`` (latest run is a ``spawn_failed`` on THIS tree's
+    own import disagreement — nothing of the card ran; never counted, and it
+    never falls through to ``blocker_auth`` because the naming line quotes
+    module paths the quota/auth pattern would match),
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
@@ -1565,7 +2807,21 @@ def check_respawn_guard(
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "spawn_failed":
-        if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
+        latest_meta = _kb._json_dict(latest_run["metadata"])
+        if latest_meta.get("substrate_import"):
+            # The dispatching tree's own modules disagree (spawn-seam guard, t_a2f35c4d): nothing
+            # of the card ran, so the card is spaced by its OWN reason and RETURNS here either
+            # way. Returning matters: the naming line quotes module paths, so it can contain a
+            # word the quota/auth pattern matches (``agent/auth.py``) and ``blocker_auth`` would
+            # park the card forever on a failure that was never the card's. Retry (spaced) until
+            # the tree is repaired; the lane actor is what escalates.
+            if rl_cooldown <= 0:
+                return None
+            ended_at = latest_run["ended_at"]
+            if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+                return "substrate_cooldown"
+            return None
+        if rl_cooldown > 0 and latest_meta.get("infrastructure"):
             ended_at = latest_run["ended_at"]
             if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
                 return "infrastructure_cooldown"
@@ -1950,6 +3206,339 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Consumer-side CONTENT skew gate on the tick (platform-stl ruling t_8fed34c8, R2 + R3)
+# ---------------------------------------------------------------------------
+#
+# The contract: a checkout rewrite must never leave a long-lived consumer serving a mixed
+# revision. ``sys.path``/``sys.modules`` are per-process, so the writer cannot reach a consumer
+# that is already running -- the enforceable half lives in the CONSUMER, and the first (and worst)
+# consumer is this dispatcher tick.
+#
+# Measured live 2026-10-10: gateway pid 56908 (booted 13:06:29) froze a patched ``hermes_cli/*``
+# beside an unpatched ``agent/*``; the disk was repaired, the PROCESS kept serving, and every
+# spawn died ``cannot import name 'ADVISORY_SKILLS_ENV' from 'agent.skill_commands'`` for ~2h56m
+# after the repair. ``gateway.code_skew.detect_code_skew()`` returned ``None`` for that whole
+# window: it fingerprints only ``.git/HEAD`` -> ref -> sha and never the working tree, and the
+# incident moved the WORKING TREE with HEAD unchanged (an interrupted merge leaves HEAD at the
+# pre-merge commit; the recovery restores paths "to HEAD"). So the decision here is CONTENT
+# (``hermes_cli.tree_fingerprint``); the ref check rides along as a cheap fast path and can only
+# ADD detection, never be the whole decision.
+#
+# What a refusal does, deterministically and with no model consulted: spawn nothing this tick,
+# write a NON-GREEN status record a human reads, and file EXACTLY ONE acting card to the seat that
+# owns the bounce (``default``, the ops seat -- see the ruling's D4: the reload door is NOT this
+# worker's). The standalone daemon loop and the CLI ``dispatch`` entry reach the same gate because
+# it sits in :func:`dispatch_once`, the one entry all three share.
+
+#: Greppable prefix of every refusal. A yielding ticker must be distinguishable from a healthy one
+#: at the status surface (the ``cron.scheduler.CronTickYielded`` precedent); this string is what a
+#: reader greps for.
+TICK_YIELD_PREFIX = "tree-skew-yield:"
+
+#: The non-green status record: ``<kanban_home>/kanban/dispatcher_tick_yield.json``, machine-global
+#: like the board itself. Tick-scoped on purpose, and a different record from the boot identity
+#: (this one records WHY a tick served nothing; the boot record records what the process loaded).
+TICK_YIELD_STATUS_FILENAME = "dispatcher_tick_yield.json"
+TICK_YIELD_STATUS_VERSION = 1
+
+#: Exactly ONE acting card, addressed to the seat that owns the bounce.
+TICK_YIELD_ACTOR_ASSIGNEE = "default"
+TICK_YIELD_ACTOR_EVENT = "tree_skew_actor_filed"
+TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX = "tree-skew:"
+TICK_YIELD_ACTOR_TITLE = "[guard] dispatcher is serving a mixed revision; refusing to spawn"
+
+#: The window the actor's idempotency key is bucketed by -- one hour, the same window the
+#: crash-sweep guard's actor uses. N ticks inside one window resolve to ONE key.
+TICK_YIELD_WINDOW_SECONDS = 3600
+
+
+class DispatcherTickYielded(RuntimeError):
+    """The tick refused to serve: the tree this process imported no longer matches the disk.
+
+    Mirrors ``cron.scheduler.CronTickYielded`` -- a yielding ticker must be distinguishable from a
+    healthy one at the status surface, never a silent or a false green. The exception carries the
+    forensics the status record and the acting card quote verbatim.
+
+    ``str(exc)`` always starts with :data:`TICK_YIELD_PREFIX`.
+    """
+
+    def __init__(self, boot_fingerprint: str, disk_fingerprint: str, *, boot_pid: int) -> None:
+        self.boot_fingerprint = str(boot_fingerprint)
+        self.disk_fingerprint = str(disk_fingerprint)
+        self.boot_pid = int(boot_pid)
+        self.boot_label = _short_tree_fingerprint(self.boot_fingerprint)
+        self.disk_label = _short_tree_fingerprint(self.disk_fingerprint)
+        super().__init__(
+            f"{TICK_YIELD_PREFIX} this dispatcher imported tree content {self.boot_label} "
+            f"(pid {self.boot_pid}) but the checkout on disk is now {self.disk_label}; refusing "
+            f"to spawn from a mixed revision until the gateway is reloaded onto the new code."
+        )
+
+
+def _short_tree_fingerprint(fingerprint: Optional[str]) -> str:
+    """Compact label for a tree fingerprint (degrades to the raw value, never raises)."""
+    try:
+        from hermes_cli.tree_fingerprint import short
+
+        return short(fingerprint)
+    except Exception:  # pragma: no cover - a tree without the module keeps the raw value
+        return fingerprint or "unresolved"
+
+
+def _consumer_tree_skew() -> Optional[tuple[str, str, int]]:
+    """``(boot_fingerprint, disk_fingerprint, boot_pid)`` when THIS process is skewed, else None.
+
+    CONTENT first, and load-bearing: the working tree is what moved in the incident this closes.
+    The git-ref check is consulted only when the content half reports nothing, so a pure HEAD move
+    whose files are byte-identical is still caught -- the ref path can ADD detection but never
+    replace it.
+
+    Every uncertain read returns ``None`` (no boot record, unreadable tree, unchanged tree): the
+    gate fails OPEN, exactly like the ref-only guard it backstops. A guard that refused on an
+    unreadable read would stop the fleet on a transient IO error.
+    """
+    try:
+        from hermes_cli import tree_fingerprint
+
+        content = tree_fingerprint.detect_skew()
+        record = tree_fingerprint.boot_record() or {}
+    except Exception:
+        content, record = None, {}
+    boot_pid = int(record.get("pid") or os.getpid())
+    if content is not None:
+        return str(content[0]), str(content[1]), boot_pid
+
+    try:
+        from gateway import code_skew
+
+        ref_skew = code_skew.detect_code_skew()
+    except Exception:
+        ref_skew = None
+    if ref_skew is None:
+        return None
+    boot_fingerprint = record.get("fingerprint") or f"git-ref:{ref_skew[0]}"
+    return str(boot_fingerprint), f"git-ref:{ref_skew[1]}", boot_pid
+
+
+def _raise_if_tree_skewed() -> None:
+    """Refuse the tick -- raise :class:`DispatcherTickYielded` -- when this process is provably
+    serving a mixed revision. The named entry point of the gate."""
+    skew = _consumer_tree_skew()
+    if skew is None:
+        return
+    raise DispatcherTickYielded(skew[0], skew[1], boot_pid=skew[2])
+
+
+def tick_yield_status_path(path: Any = None) -> Path:
+    """The non-green status record's path, or the explicit one a caller or a test supplies."""
+    if path is not None:
+        return Path(path)
+    return _kb.kanban_home() / "kanban" / TICK_YIELD_STATUS_FILENAME
+
+
+def _record_tick_yield(yielded: DispatcherTickYielded, *, board: Optional[str] = None) -> str:
+    """Write the NON-GREEN status record. Returns the path (or an ``unwritable`` note).
+
+    Best-effort by design -- an unwritable kanban home must not take the tick down -- but never
+    silent: the refusal has already been logged loudly by the caller, and the return value is
+    carried into the log line and the acting card so a reader can find the record even when it
+    could not be written.
+    """
+    path = tick_yield_status_path()
+    payload = {
+        "version": TICK_YIELD_STATUS_VERSION,
+        "yielded": True,
+        "reason": str(yielded),
+        "boot_fingerprint": yielded.boot_fingerprint,
+        "disk_fingerprint": yielded.disk_fingerprint,
+        "boot_label": yielded.boot_label,
+        "disk_label": yielded.disk_label,
+        "pid": yielded.boot_pid,
+        "board": board,
+        "recorded_at": int(time.time()),
+    }
+    try:
+        from utils import atomic_json_write
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(path, payload, mode=0o600)
+        return str(path)
+    except Exception as exc:
+        _kb._log.warning(
+            "kanban dispatcher: could not write the tree-skew status record to %s: %s", path, exc,
+        )
+        return f"(status record unwritable: {exc})"
+
+
+def _clear_tick_yield_status() -> None:
+    """Retire a stale non-green marker once a tick serves normally again.
+
+    Cleared ONLY when this process wrote the record (it is the one that is now healthy), or when
+    the recording process is PROVEN dead (its refusal is history, not a live condition). A fresh
+    dispatcher process must never clear a live gateway's marker -- that would read green over a
+    frozen gateway, which is the exact false green this record exists to prevent.
+    """
+    path = tick_yield_status_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return
+    try:
+        record = json.loads(raw)
+    except (ValueError, TypeError):
+        record = None
+    if isinstance(record, dict):
+        recorded_pid = record.get("pid")
+        try:
+            recorded_pid = int(recorded_pid)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            recorded_pid = None
+        if recorded_pid is not None and recorded_pid != os.getpid():
+            if _pid_liveness(recorded_pid) != WORKER_DEAD:
+                return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _tree_skew_subject_root() -> Path:
+    """The tree the gate reasoned about: the boot record's tree when it names one, else ours.
+
+    In production the two are the same install; naming the RECORDED tree keeps the card honest when
+    a caller points the fingerprint at another root (a scratch-tree demonstration), so a reader
+    never has to reconcile the evidence with the wrong checkout.
+    """
+    try:
+        from hermes_cli import tree_fingerprint
+
+        named = (tree_fingerprint.boot_record() or {}).get("tree")
+        if named:
+            return Path(str(named))
+    except Exception:
+        pass
+    return _dispatching_tree_root()
+
+
+def _tick_yield_actor_body(
+    yielded: DispatcherTickYielded,
+    *,
+    board: Optional[str],
+    status_path: str,
+    tree: Optional[Path] = None,
+) -> str:
+    """The acting card's body: deterministic evidence, no model, no prose to interpret."""
+    tree = Path(tree) if tree is not None else _tree_skew_subject_root()
+    return "\n".join([
+        "## Observed",
+        "",
+        f"`{TICK_YIELD_PREFIX}` the kanban dispatcher is refusing to spawn: the tree it IMPORTED",
+        "no longer matches the checkout on disk, so every worker it spawns would run a mixed",
+        "revision. Filed by the dispatcher's tick skew gate -- deterministic, no model consulted.",
+        "",
+        "## The measurement",
+        "",
+        f"- boot content fingerprint: `{yielded.boot_fingerprint}` (label `{yielded.boot_label}`)",
+        f"- disk content fingerprint: `{yielded.disk_fingerprint}` (label `{yielded.disk_label}`)",
+        f"- frozen process pid: {yielded.boot_pid}",
+        f"- tree: `{tree}`",
+        f"- board: `{board or 'unknown'}`",
+        f"- non-green status record: `{status_path}`",
+        "",
+        "## Why this is not the ref-only signal",
+        "",
+        "`gateway.code_skew.detect_code_skew()` fingerprints only `.git/HEAD` -> ref -> sha and",
+        "never reads the working tree, so it reports NO skew while a working-tree rewrite is in",
+        "progress under an unchanged HEAD -- measured live 2026-10-10 at 120 dirty paths with",
+        "`detect_code_skew() == None`. The signal above is content, so that window is covered.",
+        "",
+        "## What closes it",
+        "",
+        "Reload the gateway onto the current checkout (ops-seat hand bounce) -- the live tree only",
+        "loads at a restart. The gate clears itself on the first tick that serves normally.",
+        "",
+        "```",
+        *_git_status_lines(tree),
+        "```",
+    ])
+
+
+def _file_tick_yield_actor(
+    conn: sqlite3.Connection,
+    yielded: DispatcherTickYielded,
+    *,
+    board: Optional[str] = None,
+    status_path: str = "",
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """File EXACTLY ONE acting card for this frozen process, idempotently.
+
+    The idempotency key is ``tree-skew:<boot-fingerprint>:<boot-pid>:<window-start>``. The boot
+    half is stable for the life of the frozen process, so N ticks on one skewed tree can only
+    ever resolve to ONE card -- while a process that boots AFTER a fix is a different pid and may
+    file its own if it, too, is skewed. Best-effort: a board that refuses the write is logged with
+    the key it could not file and never takes the tick down.
+    """
+    moment = int(time.time() if now is None else now)
+    window_start = moment // TICK_YIELD_WINDOW_SECONDS * TICK_YIELD_WINDOW_SECONDS
+    board_key = _board_key(conn, board)
+    key = (
+        f"{TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{yielded.boot_fingerprint}"
+        f":{yielded.boot_pid}:{window_start}"
+    )
+    try:
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            return existing["id"]
+        actor_id = _kb.create_task(
+            conn,
+            title=TICK_YIELD_ACTOR_TITLE,
+            body=_tick_yield_actor_body(yielded, board=board_key, status_path=status_path),
+            assignee=TICK_YIELD_ACTOR_ASSIGNEE,
+            created_by="kanban-dispatcher",
+            idempotency_key=key,
+        )
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, actor_id, TICK_YIELD_ACTOR_EVENT,
+                {
+                    "boot_fingerprint": yielded.boot_fingerprint,
+                    "disk_fingerprint": yielded.disk_fingerprint,
+                    "boot_pid": yielded.boot_pid,
+                    "window_start": window_start,
+                    "status_record": status_path,
+                    "board": board_key,
+                },
+            )
+        return actor_id
+    except Exception as exc:
+        _kb._log.warning(
+            "kanban dispatcher: could not file the tree-skew actor (key=%s): %s", key, exc,
+        )
+        return None
+
+
+def _tick_refused_for_tree_skew(
+    conn: sqlite3.Connection,
+    yielded: DispatcherTickYielded,
+    *,
+    board: Optional[str] = None,
+    dry_run: bool = False,
+) -> DispatchResult:
+    """The whole non-green path for a refused tick: loud line, status record, ONE actor, result."""
+    status_path = "(dry run: nothing written)"
+    if not dry_run:
+        status_path = _record_tick_yield(yielded, board=board)
+        _file_tick_yield_actor(conn, yielded, board=board, status_path=status_path)
+    logger.error("kanban dispatcher: %s (status record: %s)", yielded, status_path)
+    return DispatchResult(tick_yielded=str(yielded))
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1972,7 +3561,35 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    CONSUMED FIRST (ruling ``t_8fed34c8``): a process whose imported tree no longer matches the
+    checkout on disk refuses the whole tick -- no reclaim, no promotion, no spawn -- and returns a
+    NON-GREEN ``DispatchResult``. This sits here rather than in the board loop because every entry
+    point (the gateway's embedded dispatcher, ``run_daemon`` and the CLI ``dispatch`` verb) shares
+    this function, so none of them is a hole. The check is once per tick and bounded
+    (``hermes_cli.tree_fingerprint``: a stat walk on the steady state), never per card.
     """
+    # Resolve the board this tick is actually against. The pin/name may be absent
+    # (the CLI passes no board=), so read it off the open store — the same mapping
+    # ``board_for_connection`` gives, never the ambient current board.
+    resolved_board = board
+    if not resolved_board:
+        try:
+            resolved_board = _kb.board_for_connection(conn)
+        except Exception:
+            resolved_board = None
+    if resolved_board and not _kb.board_dispatch_enabled(resolved_board):
+        result = DispatchResult(skipped_board_disabled=True)
+        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        return result
+
+    try:
+        _raise_if_tree_skewed()
+    except DispatcherTickYielded as yielded:
+        result = _tick_refused_for_tree_skew(conn, yielded, board=board, dry_run=dry_run)
+        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        return result
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -2003,6 +3620,10 @@ def dispatch_once(
             result = _locked_tick()
             # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
             _kbc._maybe_checkpoint_wal(conn, db_path)
+    # This tick served normally, so a non-green marker left by THIS process (or by a process that
+    # is now provably dead) is retired. A fresh process never clears a live gateway's marker.
+    if not dry_run:
+        _clear_tick_yield_status()
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -2085,6 +3706,18 @@ def _dispatch_lane_task(
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
+    # Consent gate (RUN door; restored by t_1fce1feb, ruling t_e31d9241): a card
+    # that ASSERTS consent it cannot show, or that DECLARES itself consent-gated
+    # (in a line-leading label -- see ``kanban_consent_gate.DECLARED_LABEL``) with
+    # nothing behind it, is refused the spawn and PARKED ``needs_input``. Reported
+    # on the guard channel so ``hermes kanban tail`` shows why this card stopped;
+    # the parking itself is the durable record (event + one deduped comment +
+    # block). Re-evaluated LIVE, so an amendment after filing is honoured.
+    consent_reason = check_consent_guard(conn, task_id, dry_run=dry_run)
+    if consent_reason is not None:
+        result.respawn_guarded.append((task_id, consent_reason))
+        return False
+
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -2106,9 +3739,8 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
-        if _record_task_failure(
-            conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+        if _record_spawn_failure(
+            conn, claimed.id, exc, failure_limit=failure_limit, board=board, prefix="workspace: ",
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -2133,20 +3765,105 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
-        from tools.process_registry import RestartSafeScopeUnavailable
-
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
-        if infrastructure:
-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
-        if _record_task_failure(
-            conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
+        # ONE classifier decides the owner of this failure (D5): the host refusing to place
+        # the worker, THIS tree's own modules disagreeing, or the card. Only the last one
+        # spends the card's retry budget.
+        if _record_spawn_failure(
+            conn, claimed.id, exc, failure_limit=failure_limit, board=board,
         ):
             result.auto_blocked.append(claimed.id)
         return False
+
+
+def check_consent_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    dry_run: bool = False,
+    approvals_db: Optional[str] = None,
+) -> Optional[str]:
+    """The RUN door of the consent gate: refuse a run that claims consent it cannot show.
+
+    Deterministic, like :func:`check_respawn_guard` -- one regex pass over the
+    card's own text plus a read-only lookup in the approvals store
+    (``hermes_cli/kanban_consent_gate.py``; ruling: card ``t_e31d9241``).
+
+    Returns a reason string when the card must not run, else ``None``. A refused
+    card is PARKED ``blocked``/``needs_input`` with one durable comment naming
+    the cause and the moves -- never merely skipped: a skipped-but-ready card
+    loops silently every tick, and a spawned consent-gated card is the defect
+    this gate exists to stop. ``dry_run`` reports the refusal without writing.
+
+    RESTORED by card t_1fce1feb: the door had been dropped from this tracked file
+    while the module it calls survived, so the gate enforced NOTHING -- the
+    assertion arm included. The import below is LAZY and GUARDED, the fork's idiom
+    for a pin-adjacent gate module (cf. ``kanban_db._gate_deploy_proof``): a tree
+    that has lost the module cannot judge ANY card's text, so refusing the board
+    is not an option and the loss is reported here -- the update rig's own pin
+    (``UNTRACKED_OVERRIDES``) is the guard for it.
+    """
+    try:
+        from hermes_cli import kanban_consent_gate as _cg
+    except Exception as _import_exc:  # pragma: no cover - pinned module present
+        _kb._log.warning(
+            "kanban dispatch: consent gate module unavailable, the run door cannot "
+            "judge %s (%s)", task_id, _import_exc,
+        )
+        return None
+
+    row = conn.execute(
+        "SELECT title, body, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in ("ready", "review"):
+        return None
+    verdict = _cg.evaluate(row["title"], row["body"], approvals_db=approvals_db)
+    if not verdict.refused:
+        return None
+    reason = f"consent-refused:{verdict.cause}"
+    if dry_run:
+        return reason
+    _park_for_consent(conn, task_id, verdict)
+    return reason
+
+
+def _park_for_consent(conn: sqlite3.Connection, task_id: str, verdict) -> None:
+    """Record the refusal on the card, then hold it (``needs_input`` is sticky).
+
+    The event dedupe keeps ONE comment per distinct cause: the guard runs every
+    tick, and a comment per tick would bury the board. A store outage, or a
+    failed write, must never take the dispatcher down with it -- the next tick
+    retries, and the card is not spawned either way.
+    """
+    from hermes_cli import kanban_consent_gate as _cg
+
+    payload = {
+        "cause": verdict.cause,
+        "trigger": verdict.trigger,
+        "refs": [r.ref for r in verdict.refs],
+    }
+    try:
+        with _kb.write_txn(conn):
+            last = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'consent_refused' "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if last is None or last["payload"] != _kb._json_or_null(payload):
+                _kb._append_event(conn, task_id, "consent_refused", payload)
+                _kb.add_comment(
+                    conn, task_id, "dispatcher",
+                    "CONSENT REFUSED before the run (not spawned).\n\n"
+                    + _cg.refusal_message(task_id, verdict),
+                )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: consent refusal could not be recorded for %s", task_id, exc_info=True,
+        )
+    try:
+        _kb.block_task(conn, task_id, reason=f"consent: {verdict.cause}", kind="needs_input")
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: consent refusal could not park %s", task_id, exc_info=True,
+        )
 
 
 def _apply_default_assignee(
@@ -2180,6 +3897,38 @@ def _apply_default_assignee(
     return True
 
 
+def _check_identity_generation(conn: sqlite3.Connection, board: Optional[str] = None) -> list[str]:
+    """R6: stamp the deployed identity generation and alert on a one-tick divergence.
+
+    The shape this dispatcher WRITES is stamped on disk on the first tick and compared on every
+    later tick, so a tree write that drops the witness bytes or an interpreter change that moves the
+    shape is detected in ONE tick and alerted -- instead of being discovered by a false crash sweep
+    hours later (the recurring class: t_1e6a58c3, 2026-09-26, 2026-09-29, t_ae80d242, 2026-10-10).
+
+    Best-effort by design: a guard that cannot read its own record, or a board that refuses the
+    acting card, must never take the dispatcher tick down. Returns the divergence reasons (empty
+    when the generation is unchanged), so ``DispatchResult`` carries the alert as well as the log.
+    """
+    try:
+        tick = _crash_guard.check_deployed_generation(
+            sample=_process_fingerprint(os.getpid()),
+            tree=_crash_guard.dispatching_tree(),
+            witness_symbols=_crash_guard.witness_symbols_present(sys.modules[__name__]),
+        )
+    except Exception:
+        _kb._log.debug("kanban dispatch: identity-generation check failed", exc_info=True)
+        return []
+    if not tick.alerting:
+        return []
+    try:
+        _crash_guard.alert_generation_divergence(
+            conn, tick, board=board, tree=_crash_guard.dispatching_tree(),
+        )
+    except Exception:
+        _kb._log.debug("kanban dispatch: identity-generation alert failed", exc_info=True)
+    return list(tick.reasons)
+
+
 def _run_reclaim_phase(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -2196,7 +3945,20 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
+    # R6 BEFORE the sweep: the deployed identity generation is stamped and compared first, so a
+    # regression is on record in ONE tick instead of being discovered by a false crash sweep later.
+    result.identity_generation_alerts = _check_identity_generation(conn, board=board)
     result.crashed = detect_crashed_workers(conn, board=board)
+    _refused = getattr(detect_crashed_workers, "_last_crash_sweep_abort", None)
+    if _refused is not None:
+        result.crash_sweep_refused = {
+            "signature": _refused.signature,
+            "count": _refused.count,
+            "threshold": _refused.threshold,
+            "ended_at": _refused.ended_at,
+            "task_ids": list(_refused.task_ids),
+        }
+    result.crash_sweep_held = list(getattr(detect_crashed_workers, "_last_crash_sweep_held", []) or [])
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
@@ -2991,8 +4753,21 @@ def run_daemon(
     are test hooks. Each tick resolves ``kanban.max_in_progress`` exactly like
     the gateway dispatcher and ``hermes kanban dispatch`` — the standalone
     daemon must not be the one uncapped entry point.
+
+    This loop is ALSO a long-lived consumer (ruling ``t_8fed34c8``): it records its own content
+    fingerprint at startup, so a checkout rewritten under it is detected by the gate in
+    :func:`dispatch_once` -- exactly as it is for the gateway's embedded dispatcher. A one-shot
+    ``hermes kanban dispatch`` needs no record: it imports fresh from disk and cannot be stale.
     """
     import threading
+
+    try:
+        from hermes_cli import tree_fingerprint
+
+        tree_fingerprint.record_boot()
+    except Exception:
+        # A daemon that cannot fingerprint its tree keeps ticking (fail open); the gate no-ops.
+        logger.debug("kanban daemon: could not record the boot tree fingerprint", exc_info=True)
 
     if stop_event is None:
         stop_event = threading.Event()
