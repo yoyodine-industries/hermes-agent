@@ -5,12 +5,19 @@ new gateway turns halt on their next check (in-flight work is never killed). ``r
 releases the CALLER'S OWN hold — never another holder's — and reports any that remain.
 Ported from gastownhall/gastown estop.go (MIT).
 
-Two scopes, one sentinel:
+Two scopes used to share this sentinel; ONE remains:
 
-* a BARE ``hermes pause`` is ``mode=estop`` — the total panic button: no exemptions anywhere.
-* ``hermes pause --lockdown --allow-profile P`` is ``mode=lockdown`` — the stop holds every
-  lane except the ones named. The lanes are the key: **board placement is not a factor**, so
-  an admitted lane spawns on any board and a held lane spawns on none. There is no ``--board``.
+* ``hermes pause --lockdown --allow-profile P [--ttl D]`` is the only hold this verb arms. The
+  stop holds every lane EXCEPT the ones named, for the leased window. The lanes are the key:
+  **board placement is not a factor**, so an admitted lane spawns on any board and a held lane
+  spawns on none. There is no ``--board``.
+
+* a BARE ``hermes pause`` is NO LONGER a supported operation (operator ruling 2026-10-10). It
+  used to arm ``mode=estop`` — the total panic button, no exemptions anywhere — and one leaked
+  arm stranded every lane at once (37 ready + 3 review cards froze). It now REFUSES (rc=2) and
+  prints the three scoped controls: one board (``hermes kanban boards set-dispatch <slug> off``),
+  one job (``hermes cron pause <job_id>``), one run (``hermes pause --lockdown --allow-profile P
+  --ttl <dur>``). Stopping the whole fleet is a COMPOSITION of those, one scope at a time.
 
 ``--allow-user`` (the operator's authenticated id) keeps messaging working THROUGH either
 scope. Every hold carries its owner and a handle; ``--ttl`` arms a deadman that lifts only
@@ -130,7 +137,7 @@ def _print_history(limit: int, json_out: bool) -> int:
             "total halt" if row.get("mode") == "estop" else "none")
         parts = [
             str(row.get("at") or "?"),
-            f"{row.get('event') or '?':!s:<16}",
+            f"{(row.get('event') or '?')!s:<16}",
             f"handle={row.get('handle') or '-'}",
             f"mode={row.get('mode') or '-'}",
             f"lanes=[{scope}]",
@@ -139,6 +146,12 @@ def _print_history(limit: int, json_out: bool) -> int:
             parts.append(f"actor={row['actor']}")
         if row.get("reason"):
             parts.append(f"reason={row['reason']}")
+        # R3: the CAUSE and the VENUE of every release — "who lifted it, and why" — must stay
+        # readable after the sentinel body (and with it the released lane list) is gone.
+        if row.get("cause"):
+            parts.append(f"cause={row['cause']}")
+        if row.get("via"):
+            parts.append(f"via={row['via']}")
         print("  " + "  ".join(parts))
     return 0
 
@@ -194,8 +207,9 @@ def _profile_is_real(name: str) -> bool:
 def cmd_pause(args: argparse.Namespace) -> int:
     """Engage the global emergency stop (total, or lane-scoped with ``--lockdown``)."""
     from agent.estop import (
-        MODE_ESTOP, MODE_LOCKDOWN, EstopOrderRequired, EstopRefusal, ORDER_ENV, actor_handle, arm,
-        get_state, is_engaged, ledger_path, parse_duration, record_event,
+        MODE_LOCKDOWN, EstopOrderRequired, EstopRefusal, EstopTotalHaltRetired, ORDER_ENV,
+        actor_handle, arm, get_state, is_engaged, ledger_path, parse_duration, record_event,
+        scoped_controls_help,
     )
 
     if getattr(args, "history", False):
@@ -204,6 +218,24 @@ def cmd_pause(args: argparse.Namespace) -> int:
         return _print_history(int(getattr(args, "history_limit", 20) or 0),
                               bool(getattr(args, "json", False)))
 
+    lanes = list(getattr(args, "allow_profile", None) or [])
+    lockdown = bool(getattr(args, "lockdown", False))
+    reason = getattr(args, "reason", None)
+
+    if not lockdown:
+        # RETIRED OPERATION (operator ruling 2026-10-10): a hold is LEGAL iff it names a scope.
+        # A bare `hermes pause` armed a fleet-wide halt, and ONE leaked arm stranded every lane
+        # at once (37 ready + 3 review cards froze; no bot could lift it). Refused for EVERY
+        # venue, before any hold exists — nothing is written.
+        print("⛔ Refusing to arm a fleet-wide emergency stop: it names no scope, so one leaked")
+        print("   hold would strand every lane at once. Stop what you meant to stop, by scope:")
+        print(scoped_controls_help("     "))
+        if lanes or getattr(args, "allow_user", None):
+            print("   --allow-profile/--allow-user do not scope a stop on their own — they name who")
+            print("   keeps working THROUGH one. A hold that names a scope is:")
+            print("     hermes pause --lockdown --allow-profile <lane> --ttl <dur> --reason \"…\"")
+        return 2
+
     refusal = _arm_refusal()
     if refusal:
         print(f"⛔ Refusing to arm the emergency stop: {refusal}.")
@@ -211,14 +243,10 @@ def cmd_pause(args: argparse.Namespace) -> int:
         print("   worker whose card a hold is starving cannot be the thing that lifts it.")
         return 3
 
-    reason = getattr(args, "reason", None)
-    lanes = list(getattr(args, "allow_profile", None) or [])
-    lockdown = bool(getattr(args, "lockdown", False))
-
-    if lockdown and not lanes:
+    if not lanes:
         print("⛔ --lockdown names no lane — refusing to arm a lockdown that admits nobody.")
         print(f"   Pass --allow-profile for at least one lane (recommended: {', '.join(RECOMMENDED_LANES)}).")
-        print("   A bare `hermes pause` is the total halt; use that instead of an empty lockdown.")
+        print("   An empty lockdown holds the very lanes it was meant to let through.")
         return 2
 
     unknown = [name for name in lanes if not _profile_is_real(name)]
@@ -240,7 +268,7 @@ def cmd_pause(args: argparse.Namespace) -> int:
         "user_ids": list(getattr(args, "allow_user", None) or []),
         "profiles": lanes,
     }
-    mode = MODE_LOCKDOWN if lockdown else MODE_ESTOP
+    mode = MODE_LOCKDOWN
     json_out = bool(getattr(args, "json", False))
     actor = actor_handle()
     order = (getattr(args, "order", None) or os.environ.get(ORDER_ENV) or "").strip() or None
@@ -257,6 +285,12 @@ def cmd_pause(args: argparse.Namespace) -> int:
         # and carries no order. Nothing was written — the sentinel is untouched.
         print(f"⛔ {exc}")
         return 5
+    except EstopTotalHaltRetired as exc:
+        # The HOLD refuses a fleet-wide halt (agent/estop.py): the pre-check above and this
+        # catch are the same rule, and this one is what a caller that skipped the pre-check
+        # hits. Nothing was written.
+        print(f"⛔ {exc}")
+        return 2
     except EstopRefusal as exc:
         # The HOLD itself refused this venue (agent/estop.py::arm_admission), i.e. exactly the
         # refusal the pre-check above prints. Same leading shape, rc=3, nothing armed —
@@ -333,27 +367,21 @@ def cmd_pause(args: argparse.Namespace) -> int:
         return 0
 
     state = get_state() or {}
-    verb = "Still paused" if already else "Hermes paused"
+    verb = "Still held" if already else "Hold armed"
     detail = f" — reason: {state.get('reason')}" if state.get("reason") else ""
     print(f"⏸️  {verb}{detail} ({mode})")
     print(f"    sentinel: {path}")
     print(f"    handle:   {outcome.handle}   (release this one: "
           f"`hermes resume --handle {outcome.handle}`)")
-    if mode == MODE_LOCKDOWN:
+    deadline = f" until {state['expires_at']}" if state.get("expires_at") else " until released"
+    print(f"    scope: hold {outcome.handle} lanes=[{', '.join(lanes)}]{deadline}")
+    print("    those lanes keep working; every other lane's cards and cron jobs are HELD per")
+    print("    item and recorded, never silently skipped. A board is NOT a key: an admitted lane")
+    print("    spawns on any board, a held lane on none.")
+    if unknown:
         print(
-            f"    scope: lanes admitted — {', '.join(lanes)}; every other lane's cards and jobs "
-            "are HELD and recorded, never silently skipped")
-        print("    board is NOT a key: an admitted lane spawns on any board, a held lane on none")
-    else:
-        print("    scope: TOTAL halt — no exemptions, every lane and every board")
-        if lanes:
-            print(
-                f"    lanes named for TURN service only ({', '.join(lanes)}) — this total halt "
-                "still stops their dispatch")
-        if unknown:
-            print(
-                f"    note: no live profile named {', '.join(unknown)} — the turn gate simply "
-                "never matches it; lane identity only decides dispatch under --lockdown")
+            f"    note: no live profile named {', '.join(unknown)} — the lane gate fails CLOSED, "
+            "so that name admits nobody")
     allowed = state.get("allow") or {}
     if allowed.get("user_ids"):
         print(f"    allowlist (turns): {', '.join(allowed['user_ids'])} — served through the pause")
@@ -364,9 +392,15 @@ def cmd_pause(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
-    """Release the caller's own hold (``--handle``/``--owner`` name one; ``--all`` is the
-    operator's exit)."""
-    from agent.estop import EstopRefusal, actor_handle, is_engaged, release, sentinel_path
+    """Release a hold — the caller's own, or the one ``--handle``/``--owner`` names.
+
+    ``--all`` is RETIRED as a recovery path (operator ruling 2026-10-10): it lifts only a
+    PRE-RULING ``mode: estop`` hold, from any admitted venue, and is logged as such.
+    """
+    from agent.estop import (
+        EstopRefusal, actor_handle, holds, is_engaged, is_legacy_total, release,
+        resume_all_refusal, sentinel_path,
+    )
 
     refusal = _arm_refusal("lift")
     if refusal:
@@ -383,6 +417,25 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if len(asked) > 1:
         print(f"⛔ Pass ONE of --handle/--owner/--all, not {len(asked)} of them ({', '.join(asked)}).")
         return 2
+
+    if lift_all:
+        # `--all` is the fleet-wide override, and it is no longer an exit: every hold is
+        # nameable and liftable BY HANDLE, from any admitted venue (the ops seat included).
+        # The single exception is PRE-RULING state — a `mode: estop` hold left by older bytes,
+        # under a name nobody owns — which is lifted here, once, loudly, and logged.
+        legacy = [hold for hold in holds() if is_legacy_total(hold)]
+        if not legacy:
+            print(f"⛔ {resume_all_refusal()}")
+            live = holds()
+            if live:
+                print("   Live holds (lift the one you mean, by handle):")
+                for hold in live:
+                    print(f"     {hold['handle']}  owner={hold.get('owner')}  "
+                          f"mode={hold.get('mode')}")
+            return 2
+        print("⚠  `hermes resume --all` is RETIRED — running its one-time legacy path for")
+        print(f"   pre-ruling `mode: estop` hold(s): {', '.join(hold['handle'] for hold in legacy)}")
+        print("   Logged as release{cause: all}. Every OTHER holder's scope is left untouched.")
 
     actor = actor_handle()
     if not is_engaged():
@@ -449,23 +502,24 @@ def cmd_resume(args: argparse.Namespace) -> int:
 def build_pause_parser(subparsers) -> None:
     """Attach the ``pause`` and ``resume`` subcommands to ``subparsers``."""
     pause_parser = subparsers.add_parser(
-        "pause", help="Emergency stop: pause cron/kanban dispatch and new gateway turns",
-        description="Engage the global emergency stop. Halts NEW work only — cron "
-            "dispatch, kanban dispatch, and new gateway turns — until "
-            "`hermes resume`. In-flight work is never killed. A bare pause is a "
-            "TOTAL halt; --lockdown scopes it to every lane NOT named by "
-            "--allow-profile. There is no --board: the stop is lane-scoped, never "
-            "board-scoped.")
+        "pause", help="Arm a SCOPED hold: pause cron/kanban dispatch and new gateway turns",
+        description="Arm a SCOPED hold over new work only — cron dispatch, kanban dispatch, "
+            "and new gateway turns — until `hermes resume`. In-flight work is never "
+            "killed. The one hold this verb arms is `--lockdown --allow-profile <lane> "
+            "[--ttl <dur>]`: it holds every lane EXCEPT the ones named, for the leased "
+            "window. There is no --board (the lock is on the lane) and NO fleet-wide stop: "
+            "a bare `hermes pause` refuses and names the three scoped controls (one "
+            "board / one job / one run). See the operator ruling of 2026-10-10.")
     pause_parser.add_argument(
         "--reason", default=None, help="Optional reason stored in the sentinel and shown to users")
     pause_parser.add_argument(
         "--lockdown", action="store_true",
-        help="Lane-scoped stop: hold every lane EXCEPT the ones in --allow-profile "
-             "(requires at least one lane)")
+        help="REQUIRED for a scoped hold: hold every lane EXCEPT the ones in --allow-profile "
+             "(at least one lane). Without it the verb refuses — the fleet-wide stop is retired")
     pause_parser.add_argument(
         "--allow-profile", action="append", default=None, metavar="PROFILE",
         help="Lane admitted through --lockdown (repeatable; validated against the live "
-             "profile roster). Also the turn gate for that profile in a total pause")
+             "profile roster) — the lanes that keep working while every other lane is held")
     pause_parser.add_argument(
         "--allow-user", action="append", default=None, metavar="ID",
         help="Authenticated user id served through the pause (repeatable) — normally the operator's")
@@ -493,23 +547,31 @@ def build_pause_parser(subparsers) -> None:
     pause_parser.set_defaults(func=cmd_pause)
 
     resume_parser = subparsers.add_parser(
-        "resume", help="Lift the emergency stop set by `hermes pause`",
-        description="Release the calling holder's OWN hold (the handle its actor was recorded "
-            "under, or the one named by --handle). NEVER another holder's: if a co-holder's "
-            "hold remains, it is reported and the fleet is not resumed. --all is the "
-            "operator's emergency exit and is refused to every other actor.")
+        "resume", help="Lift a hold set by `hermes pause` (your own, or the one named)",
+        description="Release a hold: the calling holder's OWN, or the one named by "
+            "--handle/--owner. Any hold may be lifted BY HANDLE from an admitted venue — "
+            "that is how the ops seat un-strands the fleet without the operator. NEVER "
+            "silently another holder's: a co-holder's hold that remains is reported and the "
+            "fleet is not resumed. `--all` is RETIRED as a recovery path: it refuses with an "
+            "explanation naming the by-handle release and the scoped controls, and lifts only "
+            "a PRE-RULING `mode: estop` hold left by older bytes (one-time, logged, and "
+            "executable by any admitted venue).")
     resume_parser.add_argument(
         "--handle", default=None, metavar="H",
-        help="Release exactly this hold (the value stored in the sentinel). A stale handle "
-             "is refused, never silently ignored.")
+        help="Release exactly this hold (the value in `hermes pause --history`). Works from "
+             "any admitted venue, whatever name the hold wears. A stale handle is refused, "
+             "never silently ignored.")
     resume_parser.add_argument(
         "--owner", default=None, metavar="OWNER",
-        help="Release the holds owned by OWNER. Releasing 'operator' from another actor is "
-             "refused (rc=6) — a bot may not resume the fleet the operator stopped.")
+        help="Release the holds owned by OWNER. Releasing a hold THE OPERATOR armed is "
+             "refused (rc=6); a bot-armed hold that merely CLAIMS `operator` is not that "
+             "hold — an admitted venue lifts it (R2).")
     resume_parser.add_argument(
         "--all", action="store_true",
-        help="Release EVERY live hold (operator only, rc=6 otherwise): the exit for a fleet "
-             "stranded by holds nobody can name")
+        help="RETIRED as a recovery path. Lifts ONLY a pre-ruling `mode: estop` hold (legacy "
+             "state under a name nobody owns), from any admitted venue, logged as "
+             "release{cause: all}; with none on disk it refuses and names the by-handle "
+             "release plus the scoped controls")
     resume_parser.add_argument(
         "--json", action="store_true",
         help="Print one machine-readable object on stdout "
