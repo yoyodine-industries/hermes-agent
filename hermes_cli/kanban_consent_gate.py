@@ -27,6 +27,21 @@ THE INTERFACE, and which side moves.
   skipped. Filing is not refused: deleting the proposal loses the record of work
   the fleet intends to do.
 
+  The ``consent-gated`` marker is a LABEL, not a substring (ruling, cards
+  ``t_2460e4ba`` / ``t_1fce1feb``): it counts only where the phrase occupies a
+  LINE-LEADING LABEL / PREDICATE position -- a title, or a body line that BEGINS
+  with it after leading whitespace and list/emphasis markers, and that is either
+  followed by ``:`` or ``;`` introducing its clause, or ENDS the line
+  (``DECLARED_LABEL`` below). The label must TERMINATE: a line that begins with
+  the phrase and then CONTINUES as prose is MENTIONING gating, not declaring
+  itself gated. Both measured shapes are mentions and are not held -- the
+  mid-line form ("...the consent-gated SURFACE class...", ``t_2460e4ba``) and the
+  WRAPPED-sentence form, where a prose sentence happens to begin a line with the
+  phrase ("consent-gated live path from a kanban worker context must carry an
+  APPROVED approval row that", a line of ``t_919ee6ad``'s own body).
+  Precedent: ``kanban_top_level_gate.SENTINEL_RE``, line-anchored for exactly
+  this reason -- a mid-line quote does not fire.
+
 THE REQUIREMENT in both cases: the card carries ``APR-NNNN`` and that reference
 resolves, in the approvals store, to a row whose terminal status is ``approved``.
 A ``superseded`` row follows ``superseded_by`` to its covering decision; a
@@ -66,6 +81,7 @@ from typing import Optional, Sequence
 
 __all__ = [
     "APPROVALS_DB_ENV",
+    "DECLARED_LABEL",
     "DEFAULT_APPROVALS_DB",
     "LICENSING_STATUSES",
     "ConsentRefused",
@@ -98,11 +114,29 @@ CLAIM = tuple(re.compile(p, re.I) for p in (
     r"(?:^|[\n\r*\-|#])\s*APPROVED\s*[:=]",
 ))
 
-#: Self-declared consent gating. Exact by construction: only a card that says
-#: consent is required is held, so the hostile reading of a broad rule -- hold
-#: every card that mentions a live surface -- never happens.
+#: Self-declared consent gating, keyed on GRAMMATICAL ROLE (ruling, cards
+#: ``t_2460e4ba`` / ``t_1fce1feb``; amended round 1 ``t_1fce1feb``). The
+#: ``consent-gated`` marker counts ONLY in a line-leading LABEL / PREDICATE
+#: position -- never as a mid-line MENTION, which is how a card that merely NAMES
+#: the mechanism was misread as a self-declaration and parked ``needs_input``.
+#: Line-anchored for exactly the reason ``kanban_top_level_gate.SENTINEL_RE`` is:
+#: a mid-line quote does not fire.
+#: Leading whitespace, list/emphasis markers (``-``/``*``/``|``/``#``/``>``) and a
+#: single leading non-word character are consumed first; the label must then
+#: TERMINATE -- either introduce its clause with ``:``/``;``, or end the line.
+#: A line that merely BEGINS with the phrase and continues as prose is a mention:
+#: the wrapped-sentence shape measured on ``t_919ee6ad``'s body
+#: ("consent-gated live path from a kanban worker context must carry an APPROVED
+#: approval row that") is a MENTION and must not fire, while a bare
+#: ``consent-gated`` line still holds via the end-of-line arm.
+DECLARED_LABEL = re.compile(r"^[ \t>*\-|#]*\W?consent[- ]gated\b\s*(?:[:;]|$)", re.I | re.M)
+
+#: Self-declared consent gating in CLAUSE form. Exact by construction: only a
+#: card that says consent is required is held, so the hostile reading of a broad
+#: rule -- hold every card that mentions a live surface -- never happens. The
+#: phrase rule is ``DECLARED_LABEL`` above; these two keep their anchoring
+#: unchanged (ruling acceptance case 4).
 DECLARED = tuple(re.compile(p, re.I) for p in (
-    r"consent[- ]gated",
     r"\b(?:needs|need|requires|required|awaiting|pending)\s+(?:the\s+)?(?:operator|rob\b|owner)"
     r"(?:\s*'s)?\s*(?:approval|authority|consent|sign[- ]?off|say[- ]?so)",
     r"system\s+change\s*[,:(]\s*needs\s+rob",
@@ -241,7 +275,7 @@ def evaluate(
     trigger = ""
     if any(p.search(text) for p in CLAIM):
         trigger = "claim"
-    elif any(p.search(text) for p in DECLARED):
+    elif DECLARED_LABEL.search(text) or any(p.search(text) for p in DECLARED):
         trigger = "declared"
     if not trigger:
         return Verdict()

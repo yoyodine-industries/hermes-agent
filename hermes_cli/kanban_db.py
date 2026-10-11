@@ -1630,6 +1630,24 @@ def create_task(
         OFF_BOARD_ASK_EVENT, apply_stamp, guard_new_ask_home, normalise_body,
     )
     from hermes_cli import kanban_gate_invariants as _gates
+    # The CONSENT GATE's admission door (ruling, card t_e31d9241; restored by
+    # t_1fce1feb). Imported LAZILY and GUARDED, the fork's idiom for a
+    # pin-adjacent gate module (cf. ``_gate_deploy_proof``'s guarded import of
+    # ``kanban_proof_gate``, and this function's own guarded import of
+    # ``kanban_contract_resolve``): ``hermes_cli/kanban_consent_gate.py`` is a
+    # live-only override whose bytes the update rig pins, and a tree that has lost
+    # it must NOT become unable to file ANY card. A module that cannot be imported
+    # cannot judge a card either way, so the loss is reported LOUDLY here and
+    # caught by the rig's own pin (``UNTRACKED_OVERRIDES``), which is the guard
+    # for it -- not by refusing every filing on the board.
+    try:
+        from hermes_cli import kanban_consent_gate as _consent_gate
+    except Exception as _consent_import_exc:  # pragma: no cover - pinned module present
+        _consent_gate = None  # type: ignore[assignment]
+        _log.warning(
+            "kanban create: consent gate module unavailable, a consent CLAIM is not "
+            "checked at the filing door (%s)", _consent_import_exc,
+        )
 
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
@@ -1643,6 +1661,16 @@ def create_task(
     _gates.gate_created_by(created_by, board=board, where="kanban_create")
     if not title or not title.strip():
         raise ValueError("title is required")
+    # Admission door of the consent gate (ruling, card t_e31d9241): a card that
+    # ASSERTS operator consent with no reference behind it is refused HERE, before
+    # any row is written -- the claim is a false statement in the record and every
+    # downstream reader (dispatcher, lanes, disposition sweep) acts on it. A card
+    # that merely DECLARES itself consent-gated is filable: proposing work is
+    # legal, and the RUN door holds it (``kanban_db_dispatch.check_consent_guard``).
+    if _consent_gate is not None:
+        _consent = _consent_gate.evaluate(title, body)
+        if _consent.trigger == "claim" and _consent.refused:
+            raise _consent_gate.ConsentRefused(_consent_gate.refusal_message(None, _consent))
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     if assignee:
