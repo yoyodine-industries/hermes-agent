@@ -11,8 +11,10 @@ hold can never outlive its owning run":
   * **D2** ``renew()`` pushes the deadline forward and writes a ``renew`` row — renewal is the
     only liveness assertion, so expiry means owner-dead within one lease period;
   * **D3** the reaper RELEASES a hold whose ``owner_run`` is terminal in a run ledger, from
-    OUTSIDE the owning run (``is_engaged()``, the tick surface the cron scheduler and the
-    kanban dispatcher already call);
+    OUTSIDE the owning run, and it rides the surfaces that GATE work — ``check_paused()``
+    (the cron scheduler tick, the gateway's kanban watchers, the cron webhook) and the kanban
+    dispatcher's own tick read. Measuring it through the pause CLI is what let the defect
+    through the first time: the CLI is not on any production tick surface.
   * **D5** the deadman lift writes its row (the measured gap: ``['arm','arm_renamed']`` with no
     lift, which is why no log-keyed detector could see 2026-10-10), and every release names its
     ``cause``.
@@ -25,6 +27,7 @@ lockdown suite uses).  Nothing here touches live fleet state.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -283,3 +286,68 @@ def test_every_release_names_its_cause(hermes_home):
     every = estop.arm(reason="wind-down hold", ttl="30m", order="t_b70753e9 re-arm")
     estop.release(all_holds=True, actor="operator")
     assert _event_row(every.handle, "release")["cause"] == "all"
+
+
+# ── D3/D5 through the PRODUCTION GATE, not the CLI ──────────────────────────
+#
+# The review defect this section exists for: `reap_orphans` was reachable only from
+# `is_engaged()`, and `is_engaged()` only from the pause CLI — while every surface that GATES
+# work called `check_paused()` / the dispatcher's tick read and did not reap. The hold was
+# therefore released only if somebody happened to run the CLI, and the fleet stayed held for
+# the whole lease. Each clause below is measured through the seam that actually holds work
+# back, with the gate's own tick as the only actor.
+
+
+def _gate_logger():
+    return logging.getLogger("estop.gate.test")
+
+
+def test_the_cron_gate_reaps_an_orphaned_hold_on_its_own_tick(hermes_home):
+    """Control, then defect: while the run is live the gate pauses the tick; once the run's
+    ledger row is terminal, the NEXT gate tick releases the hold by itself — no CLI, no human."""
+    res = estop.arm(reason="wind-down hold")
+    assert estop.check_paused("gate-test", _gate_logger()) is True, (
+        "the control is vacuous: a live run-owned hold must pause the cron tick")
+
+    _run_ledger(hermes_home, {"run": RUN, "status": "dead"})
+
+    assert estop.check_paused("gate-test", _gate_logger()) is False, (
+        "the cron gate still held the fleet after its owner's run ended (the defect)")
+    release = [r for r in _rows(res.handle) if r["event"] == "release"]
+    assert release and release[0]["cause"] == "orphan" and release[0]["reaper"] is True, (
+        "the gate released the hold without writing the orphan row (D5)")
+    assert not estop.sentinel_path().exists()
+
+
+def test_the_kanban_dispatch_tick_reaps_and_readmits_in_one_read(hermes_home):
+    """The dispatcher's tick seam reads the state ONCE and threads it down every lane decision;
+    that read must reap too, and the state handed to the lanes must be the POST-reap state."""
+    from hermes_cli import kanban_db_dispatch
+
+    res = estop.arm(reason="wind-down hold")
+    state = kanban_db_dispatch._estop_state_for_tick()
+    assert kanban_db_dispatch._lane_admitted(state, "platform-coder", None) is False, (
+        "the control is vacuous: a live hold must refuse the lane")
+
+    _run_ledger(hermes_home, {"run": RUN, "status": "dead"})
+
+    state = kanban_db_dispatch._estop_state_for_tick()
+    assert kanban_db_dispatch._lane_admitted(state, "platform-coder", None) is True, (
+        "the dispatch tick still refused the lane after its owner's run ended (the defect)")
+
+    release = [r for r in _rows(res.handle) if r["event"] == "release"]
+    assert release and release[0]["cause"] == "orphan"
+    assert not estop.sentinel_path().exists()
+
+
+def test_the_gate_writes_the_deadman_row_it_retires(hermes_home):
+    """D5 shares D3's reachability gap: the lift row is written by whichever surface retires
+    the hold, so a deadman expiry on a live tick must not leave a ledger ending at `arm`."""
+    res = estop.arm(reason="observable clause", ttl="1s")
+    time.sleep(1.5)
+
+    assert estop.check_paused("gate-test", _gate_logger()) is False
+
+    lifts = [r for r in _rows(res.handle) if r["event"] == "expire"]
+    assert lifts, "the gate retired the hold without recording it (the measured D5 gap)"
+    assert lifts[0]["cause"] == "deadman"

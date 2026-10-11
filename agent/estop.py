@@ -1200,23 +1200,41 @@ def _is_lane_allowed(profile: Optional[str], state: EstopState) -> bool:
     return lane in allowed
 
 
+def tick(now: Optional[datetime] = None) -> EstopState:
+    """The GATE's own housekeeping: retire what expired, reap what is orphaned, return state.
+
+    D3/D5 — the release leg must ride the surface that GATES the fleet's work, never a verb
+    somebody has to remember to run. **The measured defect this exists for:** ``reap_orphans``
+    was reachable only from :func:`is_engaged`, and ``is_engaged`` was reachable only from the
+    pause CLI — while every surface that actually holds work back read the state WITHOUT
+    reaping (:func:`check_paused` for the cron tick, the gateway's kanban watchers and the
+    cron webhook; the kanban dispatcher's own tick seam). A leaked hold therefore parked the
+    fleet for its whole lease and left a ledger ending at ``arm`` unless a human happened to
+    run ``hermes pause``. Every one of those seams calls THIS now.
+
+    One read, then one write path: the returned state is the state AFTER the reaping, so a
+    tick can never gate on a hold it has just released.
+    """
+    state = read_state()
+    for hold in list(state.expired):
+        _retire_hold(hold)
+    if state.holds and reap_orphans(state, now):
+        state = read_state()
+    return state
+
+
 def is_engaged() -> bool:
     """True while ANY live hold sits on a candidate sentinel; fail SAFE (True) on stat
     errors. Expired holds are retired here, so a holder that died without releasing cannot
     park the fleet forever. A SCOPED (all-lockdown) state is still engaged — the caller
     that wants "may new work start at all" wants :func:`work_admitted` instead.
 
-    D3 — the INDEPENDENT REAPER rides here too: the cron scheduler tick and the kanban
-    dispatcher tick already call this, and neither is inside the run a hold guards, so a
-    run-owned hold whose owner is terminal in a run ledger is released here rather than by
-    the run that armed it (which is the whole point: tonight's release leg never ran).
+    D3 — the INDEPENDENT REAPER rides :func:`tick`, so a run-owned hold whose owner is
+    terminal in a run ledger is released from OUTSIDE the run that armed it. This entry point
+    serves the status/CLI readers; the seams that actually gate work reach the same reaper
+    through :func:`check_paused` and the dispatcher's tick read (see :func:`tick`).
     """
-    state = read_state()
-    for hold in state.expired:
-        _retire_hold(hold)
-    if state.holds and reap_orphans(state):
-        state = read_state()
-    return state.engaged
+    return tick().engaged
 
 
 def _retire_hold(hold: dict) -> None:
@@ -1544,8 +1562,9 @@ def reap_orphans(state: Optional[EstopState] = None,
                  now: Optional[datetime] = None) -> list:
     """Release every run-owned hold whose owning run is OVER, from outside that run (D3).
 
-    Called from :func:`is_engaged` — the tick surface the cron scheduler and the kanban
-    dispatcher already hit — and from any supervised sweep. It is deliberately NOT part of the
+    Called from :func:`tick` — and :func:`tick` is what the surfaces that GATE work run:
+    :func:`check_paused` (the cron scheduler tick, the gateway's kanban watchers, the cron
+    webhook) and the kanban dispatcher's own tick seam. It is deliberately NOT part of the
     update DAG and cannot be stopped by the hold it releases (it never consults
     :func:`arm_admission`): the release leg must not be inside the thing it protects.
     """
@@ -2263,8 +2282,13 @@ def check_paused(component: str, logger: logging.Logger) -> bool:
     ``lockdown`` (only lockdown holds live) this returns False on purpose: the tick RUNS,
     admits the allowlisted lanes, and the per-card / per-job lane gate holds everything
     else — which is what keeps a scoped stop from looking like an idle board.
+
+    D3/D5 — this is a GATE, so it runs the gate's housekeeping (:func:`tick`) rather than a
+    bare read: an expired hold is retired and an orphaned one is released HERE, on this tick,
+    by the fleet's own machinery. A hold that leaked out of a dead run must not have to wait
+    for a human to notice (2026-10-10: it waited ~2h).
     """
-    state = read_state()
+    state = tick()
     if not state.engaged:
         with _log_lock:
             was_paused = component in _logged_components or component in _lockdown_logged

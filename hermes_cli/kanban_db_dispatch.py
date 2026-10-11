@@ -3462,7 +3462,7 @@ def _stall_escalation_assignee(held_assignees: Iterable[str]) -> Optional[str]:
     return None
 
 
-def _stall_hold(result: "DispatchResult") -> Optional[dict[str, list[str]]]:
+def _stall_hold(result: DispatchResult) -> Optional[dict[str, list[str]]]:
     """Held task ids by reason when THIS tick had startable work and spawned
     nothing, else ``None``.
 
@@ -3572,7 +3572,7 @@ def _file_nonspawnable_escalation(
     bucket = board or _kb.DEFAULT_BOARD
     try:
         declared = _kb.control_plane_assignee_names()
-    except Exception:  # noqa: BLE001 — an unreadable declaration claims nothing
+    except Exception:  # an unreadable declaration claims nothing
         declared = frozenset()
     if assignee in declared:
         return None
@@ -3620,7 +3620,7 @@ def _file_nonspawnable_escalation(
             idempotency_key=key,
             workspace_kind="scratch",
         )
-    except Exception as exc:  # noqa: BLE001 — never break the tick over reporting
+    except Exception as exc:  # never break the tick over reporting
         _kb._log.error(
             "kanban dispatch: could not file the nonspawnable escalation for board "
             "%r assignee %r (%s): %s", bucket, assignee, type(exc).__name__, exc,
@@ -3658,7 +3658,7 @@ def reset_stall_tracker(board: Optional[str] = None) -> None:
 
 def observe_dispatch_tick(
     conn: sqlite3.Connection,
-    result: "DispatchResult",
+    result: DispatchResult,
     *,
     board: Optional[str] = None,
     dry_run: bool = False,
@@ -3713,7 +3713,7 @@ def observe_dispatch_tick(
             conn, board=board, held=held, ticks=tracker.consecutive,
             assignee=assignee, health=health, now=now,
         )
-    except Exception as exc:  # noqa: BLE001 — never break the tick over reporting
+    except Exception as exc:  # never break the tick over reporting
         _kb._log.error(
             "kanban dispatch: could not file the stall escalation for board %r (%s): %s",
             board or _kb.DEFAULT_BOARD, health.describe(), exc,
@@ -4652,14 +4652,14 @@ def _run_reclaim_phase(
     result.priority_demote_refused = []
     try:
         demoted = _kb.demote_above_tranche(conn, board=board)
-    except Exception as exc:  # noqa: BLE001 - a repair must never stop the board dispatching
+    except Exception as exc:  # a repair must never stop the board dispatching
         # THE PASS CANNOT TAKE THE TICK DOWN (measured 2026-10-01: an abort in this pass — door 3
         # refusing the pass's own write — killed every `defcon` tick for 6.5 h, and the tick died
         # BEFORE the spawn loop, so 452 ready cards spawned nothing). Whatever the guard and the
         # doors disagree about, the repair of an already-broken invariant is not what stops the
         # board's dispatching: it is recorded on the tick's own result and logged at ERROR.
         demoted = []
-        result.priority_demote_error = "%s: %s" % (type(exc).__name__, exc)
+        result.priority_demote_error = f"{type(exc).__name__}: {exc}"
         _kb._log.error(
             "kanban: the above-tranche repair pass FAILED on board %s; the tick continues and "
             "dispatches from a board still carrying an over-claim: %s",
@@ -4670,7 +4670,7 @@ def _run_reclaim_phase(
         for row in demoted if row.get("now") is not None
     ]
     result.priority_demote_refused = [
-        "%s (%s -> %s): %s" % (row["task_id"], row["was"], row["now"], row.get("error"))
+        "{} ({} -> {}): {}".format(row["task_id"], row["was"], row["now"], row.get("error"))
         for row in demoted if row.get("error")
     ]
 
@@ -5135,7 +5135,7 @@ def _estop_module():
     """
     global _ESTOP_IMPORT_WARNED
     try:
-        from agent import estop  # noqa: PLC0415 - optional-runtime import, guarded by design
+        from agent import estop  # optional-runtime import, guarded by design
         return estop
     except Exception as exc:  # pragma: no cover - import guard
         if not _ESTOP_IMPORT_WARNED:
@@ -6238,7 +6238,7 @@ def run_daemon(
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
-from hermes_cli import kanban_db as _kb  # noqa: E402
-from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
-from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
-from hermes_cli import kanban_due as _kdue  # noqa: E402
+from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_db_connect as _kbc
+from hermes_cli import kanban_db_workspace as _kbw
+from hermes_cli import kanban_due as _kdue
