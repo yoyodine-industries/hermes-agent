@@ -131,9 +131,37 @@ def _context_cache_guard(
         provider=(provider or "").strip(), message=message)
 
 
+def _denied_model_guard(
+    model_name: str, provider: Optional[str], base_url: Optional[str], api_key: Optional[str],
+    model_info: Optional[ModelInfo], ctx: Optional[SelectionContext] = None) -> Optional[SelectionWarning]:
+    """A DENIED model is refused here so every surface refuses from ONE place (card t_a1ae7cc6).
+
+    The registry aggregates warnings, so this returns one for a surface that only renders warnings
+    - but an absolute ban is NOT a confirm prompt, and no surface may treat this as one. The
+    enforcement is `hermes_cli.model_denylist`: `is_denied()` answers the hard question and
+    `assert_allowed()` RAISES :class:`ModelDeniedError`. The message below says so in the surface's
+    own text, because a caller that renders "confirm?" for a banned model has already spent.
+    """
+    from hermes_cli.model_denylist import denial
+
+    found = denial(model_name, provider=provider)
+    if found is None:
+        return None
+    return SelectionWarning(
+        kind="denied_model", title="Model Denied Fleet-Wide", model=model_name,
+        provider=(provider or "").strip(),
+        message="\n".join([
+            "!!! MODEL DENIED FLEET-WIDE !!!",
+            "",
+            f"{model_name} is banned ({found.source}: {found.machine_reason}).",
+            "This is a HARD REFUSAL, not a confirmation - selecting it is refused, and no fallback",
+            "model is substituted, because a silent fallback still spends.",
+            "Remedy: choose another model. The ban is the code floor plus model.denied_models."]))
+
+
 # Registry, evaluated in order. Add new guard classes here — never at the
 # individual surfaces.
-_GUARDS = (_cost_guard, _data_policy_guard, _context_cache_guard)
+_GUARDS = (_cost_guard, _data_policy_guard, _context_cache_guard, _denied_model_guard)
 
 
 def selection_warnings(
