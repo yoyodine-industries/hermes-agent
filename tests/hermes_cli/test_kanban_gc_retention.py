@@ -94,20 +94,26 @@ def test_cmd_gc_retention_bounds(board, days, expect_rc, expect_kept):
     ("days", "expected"),
     [
         pytest.param("-1", "must be >= 0", id="negative-blocked"),
-        pytest.param("0", "GC complete", id="zero-disables"),
+        pytest.param("0", "bulk-guard refusal: bulk_unapproved", id="zero-gated"),
     ],
 )
 def test_slash_kanban_gc_retention_bounds(board, days, expected):
     """``/kanban gc`` from a chat session uses the same argparse type as the
     shell command: ``-1`` is rejected by the parser type before ``_cmd_gc``
-    runs (usage error); ``0`` parses, reaches ``_cmd_gc``, and disables the
-    sweep."""
+    runs (usage error); ``0`` parses (no usage error) and then meets the bulk
+    gate, which refuses it — ``gc`` is a destructive BULK verb, so since the
+    operator's 2026-09-27 rule (card t_bf9605f8) it can only run against an
+    authorized ask (``bulk-approvals ask``), never from a
+    bare slash command. The parser bound this test is about is unchanged."""
     from hermes_cli import kanban
     with kbc.connect_closing() as conn:
         tid = _done_task_with_old_event(conn)
     log = _old_log_file()
     out = kanban.run_slash(f"gc --event-retention-days {days} --log-retention-days {days}")
     assert expected in out
+    if expected.startswith("bulk-guard refusal"):
+        # The refusal names the exact remedy rather than sweeping first.
+        assert "bulk-approvals ask" in out
     with kbc.connect_closing() as conn:
         assert _event_rows(conn, tid) > 0
     assert log.exists()
