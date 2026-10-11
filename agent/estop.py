@@ -131,6 +131,20 @@ DEFAULT_SECTION_BUDGET_S = 30 * 60
 RUN_ID_ENV = ("YOYOFLOW_RUN_ID", "HERMES_UPDATE_RUN_ID")
 KANBAN_TASK_ENV = "HERMES_KANBAN_TASK"
 
+#: RELEASE CARRIERS (the carrier half of the 2026-10-10 ruling, cards t_950de3e5 / t_7ec6ade9).
+#:
+#: A hold that refuses the very work that RELEASES it is a self-hold: the two carriers the fleet's
+#: route to prod rides (``deploy-train`` and ``hermes-update``) live in the ``default`` profile's
+#: cron store, so a lane-scoped ``--lockdown`` whose allowlist omits ``default`` refused its own
+#: release leg every tick (measured: ``Cron job c21eb1835846 held by the lane-scoped lockdown``).
+#: The exemption lives HERE, in the engine, and NOT only in the sentinel: a hold must never be able
+#: to name its own releaser as held, whatever the operator remembered to pass at arm time. It is a
+#: substring match against the job's id or name, exactly as the watchdog's ``DEFCON_NEVER_PAUSE``.
+#:
+#: It applies ONLY under ``lockdown``. A total (``mode == estop``) halt keeps its "no exemptions"
+#: meaning: the operator's own panic button still stops the carriers (the pre-ruling alarm path).
+RELEASE_CARRIER_JOBS = ("deploy-train", "hermes-update")
+
 # D3 — the independent reaper resolves a hold's owning run against the run ledgers the runner
 # ALREADY writes, so no new state is introduced:
 #   * the shared yoyoflow run store (``runs.id/status/finished_at``);
@@ -293,11 +307,16 @@ def _parse_stamp(value: Any) -> Optional[datetime]:
 
 
 def _normalize_allow(allow: Any) -> dict:
-    """``{"user_ids": [...], "profiles": [...]}`` with string values and no empties."""
+    """``{"user_ids": [...], "profiles": [...], "jobs": [...]}`` with strings and no empties.
+
+    ``profiles`` admits a LANE, ``jobs`` admits a single cron ROW (by id or name) under a
+    ``lockdown`` — the two-job exemption t_950de3e5 decided, so a window can keep its release
+    carriers dispatchable without opening a whole lane (``default``).
+    """
     if not isinstance(allow, dict):
         return {}
     normalized: dict = {}
-    for key in ("user_ids", "profiles"):
+    for key in ("user_ids", "profiles", "jobs"):
         value = allow.get(key)
         if isinstance(value, (str, int, float)):
             value = [value]
@@ -374,6 +393,19 @@ class EstopState:
         )
 
     @property
+    def allow_jobs(self) -> frozenset:
+        """Cron ROWS admitted for WORK by id or name (the job-level exemption, t_950de3e5).
+
+        The union over live holds, used only under lockdown, alongside — never instead of — the
+        engine's reserved :data:`RELEASE_CARRIER_JOBS`.
+        """
+        return frozenset(
+            job
+            for hold in self.holds
+            for job in hold["allow"].get("jobs", [])
+        )
+
+    @property
     def allow_user_ids(self) -> frozenset:
         """Authenticated ids still SERVED through the pause (never admits work)."""
         return frozenset(
@@ -395,6 +427,7 @@ class EstopState:
             "allow": {
                 "profiles": sorted(self.allow_profiles),
                 "user_ids": sorted(self.allow_user_ids),
+                "jobs": sorted(self.allow_jobs),
             },
             "defect": self.defect,
             "sentinel": str(sentinel_path()),
@@ -1261,12 +1294,19 @@ def holds() -> list:
     return [dict(hold) for hold in read_state().holds]
 
 
-def work_admitted(profile: Optional[str], board: Optional[str] = None, state: Optional[EstopState] = None) -> bool:
-    """May this LANE start NEW work right now?
+def work_admitted(profile: Optional[str], board: Optional[str] = None,
+                  job: Any = None, state: Optional[EstopState] = None) -> bool:
+    """May this LANE (or this JOB) start NEW work right now?
 
     ``board`` is accepted so the dispatch seam and the cron seam call ONE function, and is
     IGNORED: the lock is on the lane, never on where a card sits. Filing work on a
     "critical" board grants nothing; an allowlisted lane is admitted on every board.
+
+    ``job`` (a cron row's ``{"id", "name"}`` mapping, or its id/name string) is the carrier
+    half of the 2026-10-10 ruling: under a ``lockdown`` a RELEASE CARRIER is admitted even when
+    its lane is not, so a hold can never name its own releaser as held (t_950de3e5). A job the
+    sentinel explicitly admits (``allow.jobs``) is admitted the same way. A total halt
+    (``mode == estop``) admits NOTHING — the operator's panic button still stops the carriers.
     """
     if state is None:
         state = read_state()
@@ -1274,7 +1314,58 @@ def work_admitted(profile: Optional[str], board: Optional[str] = None, state: Op
         return True
     if state.total:
         return False
+    if job is not None:
+        if is_release_carrier(job):
+            return True
+        if _is_job_allowed(job, state):
+            return True
     return _is_lane_allowed(profile, state)
+
+
+def release_carrier_tokens(identity: Any) -> list:
+    """The normalised ``(id, name)`` strings a job identity carries — one job, read as one."""
+    if isinstance(identity, dict):
+        parts = [identity.get("id"), identity.get("name")]
+    else:
+        parts = [identity]
+    return [str(part).strip().lower() for part in parts if str(part or "").strip()]
+
+
+def is_release_carrier(identity: Any) -> bool:
+    """Is this job one of the work-that-releases (``RELEASE_CARRIER_JOBS``)?
+
+    A substring match against the job's id or name — the same shape the watchdog's
+    ``DEFCON_NEVER_PAUSE`` check uses — so a carrier is recognised whatever the row is
+    labelled. This is the STRUCTURAL exemption: it does not depend on the sentinel naming
+    the job, which is exactly why a hold cannot strand its own release leg.
+    """
+    for text in release_carrier_tokens(identity):
+        if any(token in text for token in RELEASE_CARRIER_JOBS):
+            return True
+    return False
+
+
+def _is_job_allowed(identity: Any, state: EstopState) -> bool:
+    """Lockdown admission for ONE cron row: its id or name is on the sentinel's ``allow.jobs``.
+
+    Normalisation mirrors :func:`_is_lane_allowed` (trimmed, case-folded); an entry matches the
+    job's id or name EXACTLY, or appears inside the job's name (so the arm may name the same
+    tokens the watchdog does rather than a raw row id). An unknown entry grants nothing.
+    """
+    tokens = release_carrier_tokens(identity)
+    if not tokens:
+        return False
+    allowed = {str(entry).strip().lower() for entry in state.allow_jobs}
+    if not allowed:
+        return False
+    ids = {tokens[0]} if tokens else set()
+    names = {tokens[1]} if len(tokens) > 1 else set()
+    for entry in allowed:
+        if entry in ids or entry in names:
+            return True
+        if any(entry in name for name in names):
+            return True
+    return False
 
 
 def _is_lane_allowed(profile: Optional[str], state: EstopState) -> bool:

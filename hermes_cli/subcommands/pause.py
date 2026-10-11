@@ -318,6 +318,7 @@ def cmd_pause(args: argparse.Namespace) -> int:
     allow = {
         "user_ids": list(getattr(args, "allow_user", None) or []),
         "profiles": lanes,
+        "jobs": list(getattr(args, "allow_job", None) or []),
     }
     mode = MODE_LOCKDOWN
     json_out = bool(getattr(args, "json", False))
@@ -574,6 +575,12 @@ def build_pause_parser(subparsers) -> None:
         "--allow-profile", action="append", default=None, metavar="PROFILE",
         help="Lane admitted through --lockdown (repeatable; validated against the live "
              "profile roster) — the lanes that keep working while every other lane is held")
+    pause_parser.add_argument(
+        "--allow-job", action="append", default=None, metavar="JOB",
+        help="Cron job (id or name) admitted through --lockdown (repeatable) — the JOB-level "
+             "exemption, so a window never holds its own release leg. The engine ALSO reserves "
+             "the release carriers (deploy-train, hermes-update) structurally, so this is "
+             "belt-and-braces rather than the only guard.")
     pause_parser.add_argument(
         "--allow-user", action="append", default=None, metavar="ID",
         help="Authenticated user id served through the pause (repeatable) — normally the operator's")
