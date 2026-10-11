@@ -82,9 +82,12 @@ def test_pr_completion_requires_current_required_evidence(github):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
             ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
-            assert ok is (conclusion == "success")
+            # ``complete_task`` returns ``bool | CompletionRefusal`` -- a TYPED, falsy refusal for a
+            # non-green receipt -- so compare TRUTHINESS, never identity: ``is False`` read a typed
+            # acceptance refusal as a test failure (measured 2026-10-10, t_36adf9a5).
+            assert bool(ok) is (conclusion == "success")
             task = kb.get_task(conn, tid)
-            assert (task.status == "done") is ok
+            assert (task.status == "done") is bool(ok)
             receipts = [json.loads(r[0]) for r in conn.execute(
                 "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))]
             assert receipts and receipts[-1]["head_sha"] == "a" * 40

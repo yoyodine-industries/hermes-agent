@@ -107,6 +107,12 @@ _BOARD_SPECS = [
         _arg("--color", help="Optional hex color (e.g. '#8b5cf6') for the dashboard"),
         _arg("--switch", action="store_true", help="Switch to the new board after creating it"),
         _arg("--default-workdir", help="Default workspace path for tasks created on this board"),
+        _arg("--no-dispatch", action="store_true", dest="no_dispatch",
+             help="Mark an ESTATE/scratch board: write \"dispatch\": false into the "
+                  "board's metadata so the dispatcher NEVER serves it. Use this for a "
+                  "rehearsal board a SEV1/failure card may be redirected to — a redirect "
+                  "to a normal board is not isolation, because the dispatcher serves every "
+                  "non-archived board."),
     ], aliases=["new"], help="Create a new board"),
     _cmd("rm", [
         _SLUG,
@@ -122,6 +128,14 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-dispatch", [
+        _SLUG,
+        _arg("state", choices=("on", "off"),
+             help="'off' marks an estate/scratch board the dispatcher must never "
+                  "serve; 'on' admits it again"),
+        _json_flag(),
+    ], help="Admit or exclude a board from the dispatcher's set "
+            "(off = estate/scratch board, never served)"),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
@@ -219,6 +233,23 @@ _SPECS = [
                   "to skip the brief running-to-blocked transition."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
+    # Card t_36adf9a5: the RELEASE door. Named as THE release by the proof-gate refusal
+    # (``kanban_proof_gate.py``), the agent-tool refusal (``tools/kanban_tools.py``) and the
+    # estate fence (``tree_identity.ESTATE_MUTATING_ACTIONS``) -- and, until this record existed,
+    # registered nowhere: `hermes kanban set-contract` answered "not a `hermes kanban` command".
+    # TOP-LEVEL ONLY: the verb is in ``kanban._DELEGATED_CHILD_DENIED_ACTIONS`` and in
+    # ``tree_identity.ESTATE_MUTATING_ACTIONS``, so a dispatched worker / delegated child is
+    # refused before the handler runs.
+    _cmd("set-contract", [
+        _TASK_ID,
+        _arg("contract",
+             help="New declaration: local-only, OWNER/REPO, an exact GitHub PR URL, or landed"),
+        _reason("WHY the contract is being re-scoped (required; recorded on the audit event)"),
+        _arg("--author",
+             help="Actor recorded on the contract_changed event "
+                  "(default: the current profile)"),
+        _json_flag(),
+    ], help="Re-scope a card's completion_contract (the release door; top-level only)"),
     _cmd("swarm", [
         _arg("goal", help="Swarm goal / final outcome"),
         _arg("--worker", action="append", default=[], metavar="PROFILE:TITLE[:SKILL,SKILL]",
@@ -322,11 +353,38 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--due", metavar="WHEN",
+             help="Clock-fence the hold: a due time (ISO-8601 local 2026-09-16T01:40, "
+                  "an offset from now +90m/+2h/+1d, or epoch seconds). The deployed "
+                  "maintenance-sweep releaser unblocks the card once it passes. Omit "
+                  "for an ordinary block, which waits on a human and is never "
+                  "auto-released. Refused with --kind dependency (a parent wait is "
+                  "not a clock wait). Reason words must come BEFORE the flags."),
+        _arg("--window-policy", choices=["defer", "ambient"], metavar="POLICY",
+             help="What a release should do when the due time lands inside a reserved "
+                  "execution band: 'defer' (default) holds it until the band closes; "
+                  "'ambient' releases anyway, for a hold that is a lightweight check "
+                  "and has to move around the clock. Needs --due."),
+        _arg("--clear-due", action="store_true",
+             help="Drop the task's due time (the hold stays, with no clock)."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
+        _arg("--due", metavar="WHEN",
+             help="Clock-fence the park: a due time (ISO-8601 local 2026-09-16T01:40, "
+                  "an offset from now +90m/+2h/+1d, or epoch seconds). The deployed "
+                  "maintenance-sweep releaser unblocks the card once it passes. Omit "
+                  "for the human hold -- a card that waits on a person, never on a "
+                  "clock. Reason words must come BEFORE the flags."),
+        _arg("--window-policy", choices=["defer", "ambient"], metavar="POLICY",
+             help="What a release should do when the due time lands inside a reserved "
+                  "execution band: 'defer' (default) holds it until the band closes; "
+                  "'ambient' releases anyway, for a wake that is a lightweight check "
+                  "and has to move around the clock. Needs --due."),
+        _arg("--clear-due", action="store_true",
+             help="Drop the task's due time (it stays parked until released by hand)."),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
@@ -434,6 +492,14 @@ _SPECS = [
               "routed to specialist profiles by description. Falls back "
               "to specify-style single-task promotion when the task "
               "doesn't benefit from fan-out. Uses auxiliary.kanban_decomposer."),
+    _cmd("defcon", children=("defcon_action", [
+        _cmd("designate", [
+            _TASK_ID,
+            _reason("Why this card holds a reserved-tranche priority (the audit answer)"),
+            _arg("--authority", help="Who is designating (default: the acting profile)"),
+            _json_flag(),
+        ], help="Designate a card: the ledger row first, then priority 990000"),
+    ]), help="The designation door - the ONLY way into the reserved priority tranche"),
     _cmd("gc", [
         _arg("--event-retention-days", type=_nonnegative_int, default=30,
              help="Delete task_events older than N days for terminal tasks (default: 30; 0 disables)"),

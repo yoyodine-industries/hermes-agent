@@ -27,7 +27,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
@@ -113,6 +113,113 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+# --- The due contract (``due_at``) -----------------------------------------
+#
+# ``due_at`` (absolute epoch seconds) is the clock fence a parked card can carry:
+# ``schedule_task(due_at=...)`` fences a ``scheduled`` card, ``block_task(due_at=...)``
+# fences a ``blocked`` one. The sanctioned verbs that express it are
+# ``hermes kanban schedule --due`` / ``hermes kanban block --due``.
+#
+# TWO rules this contract exists to protect, both load-bearing:
+#
+# * **Omitting a due time IS the human hold.** A card with ``due_at IS NULL``
+#   waits for a person, not a clock -- ``kanban_top_level_gate`` parks
+#   ``GATE-TOP-LEVEL-ONLY`` cards exactly that way, and the dispatcher never
+#   promotes ``scheduled``. No verb may silently turn a human hold into a timed
+#   hold: the fence is only ever written when a caller asks for it.
+# * **ONE releaser.** The release leg is the deployed ``maintenance-sweep``
+#   workflow's ``scheduled_wake`` node. Nothing in this process ticks, so this
+#   module ships no waker and no automatic unblock path.
+
+
+class _UnsetType:
+    """Sentinel for ``schedule_task(due_at=...)`` / ``block_task(due_at=...)``.
+
+    Omitting ``due_at`` (the default, ``UNSET``) leaves whatever fence the card
+    already carries. Passing ``None`` explicitly CLEARS it -- parking a card by
+    hand means "no clock". Collapsing the two would make every legacy
+    ``schedule_task`` call silently disarm a self-waking card.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _UnsetType()
+
+# What a release does when the fence falls inside a reserved execution band.
+# ``defer`` holds the release to the end of the band; ``ambient`` releases anyway,
+# for a wake that is a lightweight check and has to move around the clock.
+VALID_DUE_WINDOW_POLICIES = ("defer", "ambient")
+DEFAULT_DUE_WINDOW_POLICY = "defer"
+
+# The refusal for a fence the board cannot carry, worded ONCE. The driver error it
+# replaces -- ``OperationalError: no such column: due_at`` -- names neither the
+# cause nor the remedy, and it fires on a fence-FREE park too, because the probe
+# row named the fence column as well as the write.
+_FENCE_COLUMN_ABSENT = (
+    "this board cannot hold a clock fence: no due_at column on tasks; it is "
+    "un-migrated — open it through kanban_db_connect.connect() (which migrates it) "
+    "or park without --due"
+)
+
+
+def _tasks_columns(conn: sqlite3.Connection) -> set[str]:
+    """The ``tasks`` columns the board ACTUALLY carries (PRAGMA, never assumed).
+
+    The same probe the deployed release leg uses
+    (``kanban_unblocker_nodes._env.task_columns``), for the same reason: the fence
+    columns (``due_at`` / ``due_window_policy``) belong to the dispatcher's
+    time-fenced-block half, and a store built without that half has no such column,
+    so ANY statement that names them unconditionally dies with ``no such column``.
+    A board reached through ``kanban_db_connect.connect`` always carries them (its
+    ``init_db`` migrates them in via ``_LATER_TASK_COLUMNS``); a raw handle on an
+    un-migrated board does not.
+    """
+    return {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+
+
+def _fence_guard(conn: sqlite3.Connection, due_at: Any) -> set[str]:
+    """Refuse a clock fence the board cannot hold; return its ``tasks`` columns.
+
+    Raises :class:`ValueError` naming the cause and the remedy when the caller
+    ASKED for a fence (``due_at is not UNSET``) and the store has no ``due_at``
+    column -- raised HERE so the caller reads a refusal, not the driver's bare
+    ``OperationalError``. A park with NO fence asks for no clock, needs no fence
+    column, and is never refused here.
+    """
+    columns = _tasks_columns(conn)
+    if due_at is not UNSET and "due_at" not in columns:
+        raise ValueError(_FENCE_COLUMN_ABSENT)
+    return columns
+
+
+def _present_columns(columns: set[str], names: Iterable[str]) -> str:
+    """``names`` filtered to those the board HAS, comma-joined for a SELECT list.
+
+    The read-side half of the rule :func:`_fence_guard` enforces on the write side:
+    a SELECT that names an absent column raises exactly as an UPDATE would, so a
+    fence-free park must not name the fence column at all.
+    """
+    return ", ".join(name for name in names if name in columns)
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    """One board-level ``kanban_meta`` value, or ``None`` when unset."""
+    row = conn.execute("SELECT value FROM kanban_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row is not None else None
+
+
+def get_meta_int(conn: sqlite3.Connection, key: str, default=None):
+    """``get_meta`` as an int; a missing or unparsable value reads as ``default``."""
+    raw = get_meta(conn, key)
+    try:
+        return int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -264,6 +371,11 @@ def _fire_dispatch_tick_hook(
         outcome = "ok"
         if result.skipped_locked:
             outcome = "skipped_locked"
+        elif getattr(result, "tick_yielded", ""):
+            # A refused tick is its own outcome -- never "idle" (which reads as a healthy quiet
+            # loop). Ruling t_8fed34c8: a yielding ticker must be distinguishable from a healthy
+            # one at every status surface, this observer included.
+            outcome = "yielded_tree_skew"
         elif not any(getattr(result, f) for f in _TICK_ACTIVITY_FIELDS):
             outcome = "idle"
         invoke_hook(
@@ -525,6 +637,81 @@ def board_exists(board: Optional[str] = None) -> bool:
     return _dir_holds_board(board_dir(slug))
 
 
+def board_is_registered(board: Optional[str] = None) -> bool:
+    """``board`` exists because someone REGISTERED it, not because a filing minted it.
+
+    ``default`` is always registered. Every other slug is registered iff its directory
+    carries ``board.json`` — ``create_board`` always writes that file, while the filing
+    path's creating connect() mints only ``kanban.db``. So this is the probe a FILING
+    uses to refuse a slug nobody registered. On this tree :func:`board_exists` already
+    requires ``board.json`` (#43243), so the two agree; the name is kept because the
+    filing path and its tests ask for the registration question by name.
+    """
+    return board_exists(board)
+
+
+class BoardResolutionError(ValueError):
+    """A board could not be resolved to exactly ONE store, so nothing was resolved.
+
+    Raised instead of guessing. Canonical board resolution never falls back to the
+    current board, never falls back to ``default``, and never hands back a would-be
+    path under ``boards/<slug>/`` for a board nobody registered: a caller that asked
+    for a board by name gets that board's store or a refusal naming the board.
+
+    Subclasses ``ValueError`` so the CLI surfaces it as a usage error. Callers that
+    mean "does this board exist" ask :func:`board_exists` instead — that is the
+    probe; this is the refusal.
+    """
+
+
+def unregistered_board_refusal(slug: str) -> str:
+    """THE refusal text for a caller-named board nobody registered.
+
+    ONE definition, read by every door into a store — the tool board resolver
+    (``tools.kanban_tools._board``) and the CLI ``--board`` guard — so the messages
+    cannot drift apart. A duplicated string here is a drift bug: the doors would then
+    disagree about which slug is refused and why.
+    """
+    return (
+        f"refusing to file on board {slug!r}: no board by that name is "
+        f"registered under {boards_root()} (no board.json). A filing never "
+        f"mints a board, so a name-shaped slug — a lane handle or a profile "
+        f"display name — cannot silently become an estate. Register it with "
+        f"`hermes kanban boards create {slug}`, or omit `board` to file on "
+        f"the source card's board (else {DEFAULT_BOARD!r})."
+    )
+
+
+def _require_registered_board(board: str) -> str:
+    """Normalise an explicit board name and refuse it unless it is REGISTERED.
+
+    The ONE chokepoint an explicit caller-supplied slug passes through before a
+    creating ``connect()`` can turn it into a store. ``board=None``/empty never
+    reaches here — that means "the active board" and keeps the ambient chain.
+    """
+    normed = _require_slug(str(board))
+    if not board_is_registered(normed):
+        raise BoardResolutionError(unregistered_board_refusal(normed))
+    return normed
+
+
+def assert_board_registered(board: Optional[str]) -> Optional[str]:
+    """Refuse a caller-named board that is not REGISTERED; return its normalised slug.
+
+    ``None``/empty means "the active board" and is returned unchanged (``None``),
+    so the ambient chain (env pin -> current -> default) still applies to a
+    source-less call. An explicit name must resolve to a registered board or raise
+    :class:`BoardResolutionError` — the *same* refusal the filing path raises — so no
+    handler reachable from a caller-supplied slug can MINT a store: the creating seam
+    (:func:`kanban_db_connect.connect`) would otherwise satisfy any slug-shaped string
+    by writing ``boards/<slug>/``, which is how a lane display handle silently became
+    an estate. Callers that meant a probe ask :func:`board_is_registered` instead.
+    """
+    if not board:
+        return None
+    return _require_registered_board(str(board))
+
+
 
 
 def _explicit_board_slug(board: Optional[str]) -> Optional[str]:
@@ -616,6 +803,123 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     return _board_path(None, board, ("kanban", "logs"), "logs")
 
 
+def board_for_store_path(path: Any) -> Optional[str]:
+    """The slug of the board whose canonical store IS ``path``, else ``None``.
+
+    The single layout->board rule (``<root>/kanban.db`` = ``default``, else
+    ``<root>/kanban/boards/<slug>/<leaf>``), shared by :func:`board_for_connection`
+    and by anything that must ask "is this file a board store, and whose?".
+    """
+    if not path:
+        return None
+    try:
+        resolved = Path(path).resolve()
+        if resolved == (kanban_home() / "kanban.db").resolve():
+            return DEFAULT_BOARD
+        rel = resolved.relative_to(boards_root().resolve())
+    except (OSError, ValueError):
+        return None
+    return rel.parts[0] if len(rel.parts) > 1 else None
+
+
+def board_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """The slug of the board ``conn`` is open against, or ``None`` when it cannot be told.
+
+    A filing must be bounded by the board its OWN connection belongs to: a caller holding
+    a ``--board`` override is not on ``get_current_board()``, and ``HERMES_KANBAN_DB`` can
+    pin a database no board claims (workers are spawned with exactly that). So the slug is
+    read off the open file's path, never off the ambient current board.
+    """
+    path = ""
+    for _seq, name, file in conn.execute("PRAGMA database_list"):
+        if name == "main" and file:
+            path = file
+    return board_for_store_path(path)
+
+
+def source_board_for_task(task_id: Optional[str]) -> Optional[str]:
+    """The board holding ``task_id``, probed across every registered board.
+
+    A card fired from another card lands on the SAME board as the card that fired
+    it, so the source card's board is read from the board STORES (a fact) rather
+    than from any pin or name in the callers' environment. ``None`` when the id
+    names no card on any board; the caller then keeps the ambient board.
+    """
+    if not task_id:
+        return None
+    try:
+        # Lazy: kanban_register imports this module at module level, so the probe
+        # is imported here rather than at the top (no import cycle).
+        from hermes_cli.kanban_register import find_card_board
+        return find_card_board(task_id)
+    except Exception:
+        return None
+
+
+def board_for_fired_card(explicit: Optional[str] = None, *,
+                         source_task_id: Optional[str] = None) -> Optional[str]:
+    """The board a newly FIRED card lands on: explicit > SOURCE CARD > ambient.
+
+    THE RULE (operator standing order, 2026-09-29): a card fired from another card
+    lands on the SAME board as the card that fired it. The SOURCE card's board
+    therefore outranks the ambient board - ``HERMES_KANBAN_BOARD`` / the
+    ``<root>/kanban/current`` pointer - which is a property of the CALLING PROCESS,
+    not of the work, and is only a fallback for a filing with NO source card: a
+    loop, a cron row, a sweep. It can be stale or simply wrong (measured
+    2026-09-29: three cards fired from a defcon card landed on a lane-named board
+    nobody grooms, invisibly to every board that gets read). The source card's
+    board is the work's own estate, so it wins unconditionally.
+
+    An EXPLICIT board must resolve to a REGISTERED board or the filing is REFUSED
+    (:class:`BoardResolutionError`) — a filing never MINTs a board. A name-shaped
+    slug is exactly the case this refusal exists for: registration is deliberate
+    (``create_board`` writes ``board.json``), minting is not, so a caller that means
+    a board registers it first or omits ``board`` to inherit the source/default
+    board.
+
+    Returns ``None`` when neither an explicit board nor a source board applies,
+    which is what keeps the ambient chain (``env pin -> current -> default``)
+    byte-for-byte as it was for every source-less caller.
+    """
+    if explicit:
+        # The ONE refusal (shared with the tool board resolver via
+        # :func:`unregistered_board_refusal`) — a duplicated message would let the
+        # two doors into a store drift.
+        return _require_registered_board(str(explicit))
+    return source_board_for_task(source_task_id)
+
+
+def board_has_live_claims(board: Optional[str] = None) -> bool:
+    """True when the board's store carries at least one LIVE claim.
+
+    LIVE is the dispatcher's own reading: ``status = 'running'`` with an unexpired
+    ``claim_expires`` and a recorded ``worker_pid``. Used by the estate teardown to
+    refuse while a worker is still running on the board (ruling t_fcf7a321,
+    Decision 2). Any read failure is ``False`` (the caller's other refusals still
+    apply); this never opens a write path.
+    """
+    slug = _slug_or_default(board)
+    try:
+        db = kanban_db_path(board=slug)
+    except Exception:
+        return False
+    if not db.exists():
+        return False
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=1.0)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE status = 'running' AND worker_pid IS NOT NULL "
+                "  AND claim_expires IS NOT NULL AND claim_expires > ? LIMIT 1",
+                (int(time.time()),),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
 # --- Data classes ---
 
 @dataclass
@@ -665,6 +969,15 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Absolute epoch seconds at which a ``scheduled``/``blocked`` card becomes DUE.
+    # The RELEASE leg is the deployed ``maintenance-sweep`` workflow's
+    # ``scheduled_wake`` node (``scripts/kanban_unblocker_nodes/scheduled_wake.py``) --
+    # nothing in this tree ticks. NULL = parked with no clock fence, i.e. the human
+    # hold, which is a first-class state and never auto-released.
+    due_at: Optional[int] = None
+    # VALID_DUE_WINDOW_POLICIES; NULL reads as "defer". Recorded with the fence so a
+    # release can say which policy the fence was armed under.
+    due_window_policy: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -694,11 +1007,12 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "due_at",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "due_window_policy",
 )
 
 
@@ -899,7 +1213,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Absolute epoch seconds at which a ``scheduled``/``blocked`` card becomes DUE.
+    -- Set by ``schedule_task(due_at=...)`` / ``hermes kanban schedule --due`` and by
+    -- ``block_task(due_at=...)`` / ``hermes kanban block --due``. The RELEASE leg is
+    -- the deployed ``maintenance-sweep`` workflow's ``scheduled_wake`` node; nothing
+    -- in this process ticks. NULL = parked with no clock fence (the human hold --
+    -- waiting on a person, not on time), which is never auto-released.
+    due_at               INTEGER,
+    -- One of VALID_DUE_WINDOW_POLICIES; NULL reads as 'defer'. Recorded with the
+    -- fence so the release leg can say which policy the fence was armed under.
+    due_window_policy    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -996,6 +1320,26 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- The designation ledger: the cards ALLOWED to hold a reserved-tranche priority, one row per
+-- designated card (no new database - the board's own store). ``hermes kanban defcon`` is the
+-- only writer, and the opt-in tranche storage guard refuses a tranche value on a card with no
+-- live row here. ``priority`` is the card's ORDINARY priority: what a revoke restores.
+CREATE TABLE IF NOT EXISTS priority_designations (
+    task_id       TEXT PRIMARY KEY,
+    board         TEXT NOT NULL,
+    priority      INTEGER NOT NULL,
+    authority     TEXT,
+    reason        TEXT NOT NULL,
+    designated_at TEXT NOT NULL,
+    revoked_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS kanban_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -1005,6 +1349,11 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+-- NOTE: `idx_tasks_due` is deliberately NOT here. `executescript` parses every
+-- statement against the LIVE schema, so a CREATE INDEX over `due_at` aborts init
+-- on a legacy board that predates the column, before the ALTER TABLE pass can add
+-- it. It is created with the other additive-column indexes at the end of
+-- `_migrate_add_optional_columns` (hermes_cli/kanban_db_connect.py).
 """
 
 
@@ -1179,6 +1528,62 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _resolve_operator_ask(conn: sqlite3.Connection, *, board: Optional[str] = None,
+                          parents: Any = (), body: Optional[str] = "",
+                          serves: Any = None) -> Any:
+    """The :class:`~hermes_cli.kanban_register.AskRef` a filing is stamped with, or ``None``.
+
+    Reads only what the caller and THIS board can answer: an explicit ``serves``, the
+    worker-session env, the body's own stamp, then the parents — never another board's
+    rows, except through the cross-board probe that resolves a reference naming a card
+    elsewhere (the case this whole feature exists for, and only for a ref the caller
+    named outright). Nothing here may fail a FILING: a reference that names no card is
+    warned about and carried into the ``created`` event as ``operator_ask_unresolved``,
+    so it is visible to the roll-up and to whoever reads the card, rather than fatal.
+
+    Restored from the pre-update carrier (card ``t_ac98fc08``) after the 2026-09-29 04:48
+    ``hermes-update`` R5 round-trip left this seam a documented stand-in returning ``None``.
+    """
+    from hermes_cli import kanban_register as reg
+
+    if serves is not None and reg.parse_ref(serves) is None:
+        # A malformed reference is a CALLER error, refused here before any write: a
+        # guessed id would poison the roll-up, and the caller is the only one who can
+        # fix it. (Syntactically valid but unknown ids stay a warning - see below.)
+        raise ValueError(
+            f"serves must be a card id or <register>/<ask>, got {serves!r}; a card id "
+            f"is 't_' + hex (e.g. t_fc615201). Nothing was created."
+        )
+    env = os.environ.get(reg.ENV_VAR)
+    try:
+        ref = reg.resolve_for_create(
+            conn, board=board, parents=parents, body=body, explicit=serves, env=env,
+            find_card=reg.find_card_board if (serves or env) else None,
+        )
+    except Exception as exc:  # a filing outranks a stamp: never fail the create
+        _log.warning("operator-ask resolution failed for a filing: %s", exc)
+        return None
+    if ref is not None and ref.unresolved:
+        _log.warning(
+            "no operator-ask stamp on this filing: %r does not resolve to an operator ask "
+            "(a register card id, or a card in service of one) - the card is filed "
+            "un-stamped and reported by `hermes kanban rollup`",
+            ref.unresolved,
+        )
+    return ref
+
+
+def operator_ask_event(ask_ref: Any, ask_pair: Optional[tuple[str, str]]) -> dict:
+    """The ``created`` event fields recording the ask, or ``{}`` on a card with none."""
+    if ask_ref is None:
+        return {}
+    if ask_pair:
+        return {"operator_ask": f"{ask_pair[0]}/{ask_pair[1]}", "operator_ask_source": ask_ref.source}
+    if ask_ref.unresolved:
+        return {"operator_ask_unresolved": ask_ref.unresolved}
+    return {}
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1193,6 +1598,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    serves: Optional[str] = None,
+    allow_off_board_ask: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1208,18 +1615,43 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    ``serves``: the operator ask this card is filed in service of, as
+    ``<register>`` or ``<register>/<ask>`` — see
+    ``hermes_cli/kanban_register.py``. The card is stamped in its body at this
+    seam (the one moment every filing surface reaches); omitting it still
+    inherits an ask from the body, the worker's session env or the parents, in
+    that order. ``allow_off_board_ask``: the deliberate escape hatch for a NEW
+    ask filed off its register's board (the ASK-HOME rule) — admitted and
+    recorded on the card rather than refused.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_register import (
+        OFF_BOARD_ASK_EVENT, apply_stamp, guard_new_ask_home, normalise_body,
+    )
+    from hermes_cli import kanban_gate_invariants as _gates
 
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    # INVARIANT D at its earliest door (operator ruling 2026-10-05, card t_5bbf4e80): the
+    # card's ATTRIBUTION (`created_by`) must name a LIVE fleet identity. A card filed under a
+    # DELETED profile is MISATTRIBUTED -- its provenance points at nothing and no lane can be
+    # asked to own it. A DENYLIST -- a non-profile producer origin (pr-evergreen, deploy-train,
+    # sdlc, ...) is not a profile and passes.
+    _gates.gate_created_by(created_by, board=board, where="kanban_create")
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    if assignee:
+        # INVARIANT B at its earliest door (design record platform-stl t_6747232b): an assignee
+        # that resolves to no profile on disk and to no declared pull lane can never be spawned
+        # and never reports a failure - the card strands silently. Measured before this seam:
+        # 361 rows on handles that resolve nowhere, 15 cards stranded on two retired lanes.
+        # The refusal names both honest paths (assign a real profile, or declare the lane).
+        _gates.gate_assignee(assignee, board=board, where="kanban_create")
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1258,6 +1690,25 @@ def create_task(
         if row:
             return row["id"]
 
+    # THE OPERATOR-ASK SEAM (card t_8ca4b5a0, operator ask 2026-09-27) AND ITS ASK-HOME DOOR
+    # (card t_abefe660, operator ask 2026-10-04). Both apply HERE, at the one moment every
+    # filing surface reaches, so a reference stamped at birth cannot be routed around by a
+    # caller that forgot. Resolution reads only what the caller and THIS board can answer (an
+    # explicit ``serves``, the worker-session env, the body's own stamp, then the parents) and
+    # never fails a FILING: a reference that names no card is warned about and carried into the
+    # ``created`` event as ``operator_ask_unresolved``. A card that IS a new ask must be filed
+    # on its register's own board or its register's roll-up never sees it - refused LOUDLY
+    # before any write; the hatch ``allow_off_board_ask`` admits a deliberate cross-board filing
+    # and returns a record the created txn writes as a task_events row.
+    _ask_board = board or board_for_connection(conn)
+    ask_ref = _resolve_operator_ask(
+        conn, board=_ask_board, parents=parents, body=body, serves=serves,
+    )
+    ask_off_board = guard_new_ask_home(
+        ask_ref, board=_ask_board, title=title,
+        allow_off_board=allow_off_board_ask, caller=created_by,
+    )
+
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -1283,6 +1734,16 @@ def create_task(
                     if not branch_name:
                         branch_name = _project_branch_name(project_obj, task_id, title)
 
+                # The stamp rides the INSERT: the card carries its ask from birth, in the
+                # same transaction that creates the row, so no reader ever sees an
+                # in-service card without it and no second writer has to add it later.
+                # With NO ask pair the body is STILL normalised: a bytes body passed
+                # through verbatim landed as a BLOB, and the decompose seam dropped a
+                # non-str body entirely - so both no-ask fallbacks share
+                # ``normalise_body`` (the public name for the register module's lossy
+                # ``_text``) instead of each deciding for itself.
+                ask_pair = ask_ref.for_card(task_id) if ask_ref is not None else None
+                card_body = apply_stamp(body, *ask_pair) if ask_pair else normalise_body(body)
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -1296,7 +1757,7 @@ def create_task(
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        task_id, title.strip(), body, assignee, task_status, priority,
+                        task_id, title.strip(), card_body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
@@ -1325,8 +1786,13 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        **(operator_ask_event(ask_ref, ask_pair)),
                     },
                 )
+                # The hatch's own record, so an off-board NEW ask that was let through on
+                # purpose is visible on the card rather than silent (a row naming the caller).
+                if ask_off_board is not None:
+                    _append_event(conn, task_id, OFF_BOARD_ASK_EVENT, ask_off_board)
                 if task_status == "blocked":
                     _append_event(
                         conn,
@@ -1868,6 +2334,113 @@ def _insert_comment(
     )
 
 
+# --- The designation door: the reserved tranche's ONE legitimate entrance ---------------
+#
+# A card in ``990000..999999`` is DESIGNATED, never requested: the board's armed storage guard
+# refuses such a value unless a LIVE ``priority_designations`` row backs it, and that row is
+# this door's first write (the card is parked at ``DESIGNATED_PRIORITY`` = 990000 afterwards,
+# which a later ``edit --priority`` may raise inside the tranche).
+#
+# These functions are ported VERBATIM (bodies unchanged) from the recovered admission stack on
+# ``card/t_44485b2b`` / PR yoyodine-industries/hermes-agent#78, which is the canonical copy.
+# They ride the LIVE TREE because the 2026-10-10 ``hermes update`` half-applied its autostash
+# restore and dropped them: the guard stayed armed while its door disappeared, so no ask and no
+# SEV1 could be ranked (card t_38e29432). When the stack itself is restored, DELETE this block -
+# it is the one small delta, and the only name that differs is ``_designation_policy`` where the
+# stack has ``_policy_module`` (same job: the board's ``kanban_priority_policy`` module).
+
+def _designation_policy():
+    """The board-scoped priority domain module (``kanban_priority_policy``), imported lazily.
+
+    THE door's own reader of the domain numbers: ``TRANCHE_FLOOR`` is what the ledger
+    row is written against and ``DESIGNATED_PRIORITY`` is where the card is parked.
+    """
+    from hermes_cli import kanban_priority_policy as policy
+
+    return policy
+
+
+def priority_designation(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """The card's designation row - live or revoked - or ``None``."""
+    row = conn.execute(
+        "SELECT task_id, board, priority, authority, reason, designated_at, revoked_at "
+        "FROM priority_designations WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def is_priority_designated(conn: sqlite3.Connection, task_id: str, *,
+                           board: Optional[str] = None) -> bool:
+    """Is *task_id* in the reserved tranche BY DESIGNATION? (the guard's predicate)
+
+    The exemption the storage guard and the fleet's sweep both read: a row here, not revoked,
+    is what makes a tranche priority legitimate for one card - and nothing else does.
+    """
+    sql = "SELECT 1 FROM priority_designations WHERE task_id = ? AND revoked_at IS NULL"
+    params: list = [task_id]
+    if board:
+        sql += " AND board = ?"
+        params.append(board)
+    return conn.execute(sql, params).fetchone() is not None
+
+
+def _designation_stamp(now: object = None) -> str:
+    """An ISO-8601 UTC stamp: the ledger's two stamp columns are TEXT, so the audit reads them."""
+    return str(now) if now else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def designate_priority(conn: sqlite3.Connection, task_id: str, *, reason: str,
+                       authority: Optional[str] = None, board: Optional[str] = None,
+                       now: object = None, nested: bool = False) -> dict:
+    """The designation door: ledger row FIRST, then the card into the reserved tranche.
+
+    In that order because the storage guard refuses a tranche value with no live designation -
+    the trigger is what makes "only this door" true rather than advisory. The ledger keeps the
+    card's ordinary priority, so revoke returns the card exactly to the rest it left instead of
+    to a value re-derived afterwards.
+
+    ``nested`` is the gate lift's opt-in: the relation invariant is held INSIDE the txn that
+    created the edge (``_link``) or wrote the re-rank (``edit_task``), so the door has to run
+    under an open outer transaction. It is explicit - never inferred from
+    ``conn.in_transaction`` - because every other caller must keep failing loudly on an
+    accidental nest. This is the one door whose whole effect is rows in the caller's own txn:
+    no post-commit side effect can fire while an outer txn can still roll back.
+    """
+    policy = _designation_policy()
+    _assert_not_delegated_child_mutation(kanban_db_path(board=board))
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("a designation needs a reason (it is the audit answer)")
+    current = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if current is None:
+        raise ValueError("no such task %s on this board" % task_id)
+    slug = board or board_for_connection(conn) or get_current_board()
+    stamp = _designation_stamp(now)
+    with write_txn(conn, allow_nested=nested):
+        conn.execute(
+            "INSERT INTO priority_designations "
+            "(task_id, board, priority, authority, reason, designated_at, revoked_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL) "
+            "ON CONFLICT(task_id) DO UPDATE SET board = excluded.board, "
+            "priority = excluded.priority, authority = excluded.authority, "
+            "reason = excluded.reason, designated_at = excluded.designated_at, revoked_at = NULL",
+            (task_id, slug, int(current["priority"]), authority, reason, stamp),
+        )
+        conn.execute(
+            "UPDATE tasks SET priority = ? WHERE id = ?", (policy.DESIGNATED_PRIORITY, task_id),
+        )
+        _append_event(conn, task_id, "reprioritized", {
+            "priority": policy.DESIGNATED_PRIORITY, "designation": "designated",
+            "authority": authority, "reason": reason,
+        })
+    return {
+        "task_id": task_id, "board": slug, "priority": policy.DESIGNATED_PRIORITY,
+        "restore_priority": int(current["priority"]), "authority": authority, "reason": reason,
+        "designated_at": stamp, "revoked_at": None,
+    }
+
+
 def _append_event(
     conn: sqlite3.Connection, task_id: str, kind: str, payload: Optional[dict] = None, *,
     run_id: Optional[int] = None,
@@ -1879,12 +2452,59 @@ def _append_event(
     )
 
 
+
+# Terminal run outcomes that are NOT failures: the attempt ended deliberately —
+# a success, a handoff, or a park the card's own workflow chose. A failure
+# streak and its corrective text describe a FAILED ATTEMPT, never the card, so
+# one of these must retire both when it closes a run. Otherwise a stale
+# rate-limit / auth wall left by an earlier attempt keeps
+# ``kanban_db_dispatch.check_respawn_guard`` from ever spawning the recovered
+# card — the chicken-and-egg where the spawn that would clear the wall is the
+# spawn the wall blocks.
+#
+# A POSITIVE allow-list on purpose: a newly added FAILURE outcome can never
+# clear the streak by accident (fail closed). ``reclaimed`` is deliberately
+# absent — a reclaimed/orphaned run is not a success, and ``complete_task``
+# reconciles that case itself.
+_NON_FAILURE_RUN_OUTCOMES = frozenset({
+    "completed",
+    "review_requested",
+    "changes_requested",
+    "blocked",
+    "dependency_wait",
+    "scheduled",
+})
+
+
+def _clear_failure_streak(conn: sqlite3.Connection, task_id: str) -> None:
+    """Retire ``consecutive_failures`` / ``last_failure_error`` for a non-failure outcome.
+
+    A bare UPDATE that must run inside the caller's transaction — unlike
+    ``kanban_db_dispatch._clear_failure_counter``, which opens its own and so
+    cannot be called from here. The failed attempt's diagnosis survives on its
+    ``task_runs.error`` and its ``gave_up`` / ``timed_out`` / ... event; only
+    the task-row copy the respawn guard reads is retired.
+    """
+    conn.execute(
+        "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL WHERE id = ?",
+        (task_id,),
+    )
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
+    keep_attached: bool = False,
 ) -> Optional[int]:
     """Close the active run (``status`` defaults to ``outcome``) and clear
     ``current_run_id``; None when no run was active (never-claimed task).
+
+    ``keep_attached=True`` closes the run but leaves it as the card's owner.
+    A review handoff is the case: the run ENDS (it handed off), yet the worker
+    that filed it must keep the licence to return, re-block or re-request the
+    card. Clearing ``current_run_id`` there hands the implementer a card it can
+    no longer act on — the wedge the named-reviewer refusal exists to prevent,
+    reached through the back door.
 
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
@@ -1909,7 +2529,10 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if not keep_attached:
+        conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if outcome in _NON_FAILURE_RUN_OUTCOMES:
+        _clear_failure_streak(conn, task_id)
     return run_id
 
 
@@ -1948,16 +2571,24 @@ _UNSET: Any = object()
 def _end_or_synthesize_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, status: str,
     summary: Optional[str] = None, metadata: Optional[dict] = None, synthesize: bool,
-    profile: Any = _UNSET,
+    profile: Any = _UNSET, keep_attached: bool = False,
 ) -> Optional[int]:
     """:func:`_end_run`; when no run was active and ``synthesize`` holds, record a
     zero-duration run instead so the handoff fields survive in attempt history.
     ``profile`` overrides the profile read off the task row for the synthesized
     run — transitions that reassign the task (e.g. review handoff) pass the
-    acting profile captured before the rewrite."""
-    run_id = _end_run(conn, task_id, outcome=outcome, status=status, summary=summary, metadata=metadata)
+    acting profile captured before the rewrite. ``keep_attached`` is
+    :func:`_end_run`'s: the closed run stays the card's owner (review handoff)."""
+    run_id = _end_run(conn, task_id, outcome=outcome, status=status, summary=summary,
+                      metadata=metadata, keep_attached=keep_attached)
     if run_id is None and synthesize:
         run_id = _synthesize_ended_run(conn, task_id, outcome=outcome, summary=summary, metadata=metadata, profile=profile)
+        # ``_end_run`` was a no-op (never-claimed task), so its failure-streak
+        # clear never ran; do it on the synthesized path too. A reclaimed run
+        # can leave the streak set on a card that is NOT claimed when a human
+        # requests review / blocks it, and the guard would then wedge the card.
+        if outcome in _NON_FAILURE_RUN_OUTCOMES:
+            _clear_failure_streak(conn, task_id)
     return run_id
 
 
@@ -2385,7 +3016,10 @@ def release_stale_claims(
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
-        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
+        # ``not_dead``, not ``alive``: an unprovable worker must HOLD its claim too. Releasing it
+        # beside a process that may still be running is how a duplicate is spawned next to it
+        # (#123811); the worker's own fence still lets it close the card.
+        if (host_local and row["worker_pid"] and _worker_not_dead(row["worker_pid"], started_at)
                 and not heartbeat_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
@@ -2627,32 +3261,468 @@ class ArtifactPreservationError(RuntimeError):
 
 
 class LiveClaimError(ValueError):
-    """``complete_task`` refused: the task is ``running`` under a live claim and
-    the caller neither owns its run (``expected_run_id``) nor passed ``force``.
-    Completing anyway would close the worker's run row underneath a process
-    that is still executing. A ``ValueError`` so tool error handlers treat it
-    as recoverable."""
+    """``complete_task`` refused: the task is ``running`` under a claim that may still
+    protect a live run, and the caller neither owns its run (``expected_run_id``)
+    nor passed ``force``. Completing anyway would close the worker's run row
+    underneath a process that is still executing. A ``ValueError`` so tool error
+    handlers treat it as recoverable. ``verdict`` carries the tri-state liveness
+    answer (``alive`` / ``unknown``) so a caller can render the right escape
+    (see :func:`live_claim_refusal`)."""
 
-    def __init__(self, task_id: str):
-        super().__init__(
-            f"{task_id} is running under a live worker claim; pass expected_run_id "
-            "(worker ownership) or force=True (explicit operator override) instead "
-            "of closing the live run"
+    def __init__(self, task_id: str, *, verdict: str = "alive",
+                 run_id: Optional[int] = None, detail: Optional[str] = None):
+        # ``verdict`` defaults to the proven-live answer (``WORKER_ALIVE``), which is resolved at
+        # call time in :func:`live_claim_refusal`; the literal keeps this default off the
+        # dispatch import that lands at the bottom of the module.
+        self.task_id = task_id
+        self.verdict = verdict
+        self.run_id = run_id
+        super().__init__(detail or live_claim_refusal(task_id, verdict=verdict, run_id=run_id))
+
+
+def live_claim_refusal(task_id: str, *, verdict: str, run_id: Optional[int] = None) -> str:
+    """The ONE refusal text for a transition refused because the claim may protect a run.
+
+    ``verdict`` is the tri-state liveness answer. ``alive`` is proof that a worker
+    process owns the run, so both escapes are offered (own the run, or force).
+    ``unknown`` is the cannot-certify case and must NOT offer ``force``: forcing
+    there closes the very run the fence exists to protect, which is how a live
+    worker's run was closed underneath it (#123811). The run-naming escape is
+    offered in both cases — it is the one that is always safe.
+    """
+    if verdict == WORKER_UNKNOWN:
+        owns = (f"Pass expected_run_id={int(run_id)} (your run id)" if run_id
+                else "Pass expected_run_id (your run id)")
+        return (
+            f"{task_id} is running and the worker's process identity cannot be read on this host, "
+            f"so the claim may be live. Nothing was written. {owns} "
+            f"to close the run you hold; do NOT force this card — a live "
+            f"worker's run would be closed underneath it."
         )
-
-
-def _claim_is_live(trow) -> bool:
-    """True when a ``running`` task's claim still protects a run: the worker process
-    it spawned exists (PID + start-time fingerprint). A claim whose worker is gone,
-    or a library/CLI claim that never spawned one, has no run to protect. TTL expiry
-    is deliberately not consulted: ``reclaim_stale_tasks`` extends, not reclaims, the
-    claim of a live worker, so the process is the liveness authority here too."""
-    return bool(
-        trow["status"] == "running"
-        and trow["claim_lock"] is not None
-        and trow["worker_pid"]
-        and _worker_alive(trow["worker_pid"], trow["worker_started_at"])
+    return (
+        f"{task_id} is running under a live worker claim; pass expected_run_id "
+        "(worker ownership) or force=True (explicit operator override) instead "
+        "of closing the live run"
     )
+
+
+def live_row_refusal(conn: sqlite3.Connection, task_id: str, *, caller_run_id: Optional[int] = None,
+                     verb: str = "complete") -> str:
+    """Why a transition was refused, read from the LIVE row — never from ``last_failure_error``.
+
+    ``tasks.last_failure_error`` is durable and describes a run that is OVER. Presenting it as the
+    current reason is how a two-day-old crash string answered a live call and sent the operator
+    chasing a stale run (#123811). The live row answers instead: what the card IS now, which run
+    owns it, and whether the caller's own run is superseded by a newer attempt or was closed by the
+    infrastructure — in which case the way back is named. Crash text is quoted only as history, and
+    labelled as such.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return (f"could not {verb} {task_id}: no such card "
+                "(unknown id, stale run, or already terminal)")
+    parts = [f"could not {verb} {task_id}: the live row is status={getattr(task, 'status', '?')}"]
+    owner = _opt_int(getattr(task, "current_run_id", None))
+    if owner is not None:
+        parts.append(f"run {owner} owns it")
+        if caller_run_id is not None and int(caller_run_id) != owner:
+            parts.append(
+                f"your run {int(caller_run_id)} is SUPERSEDED by it — a newer attempt owns the "
+                f"card, so closing it from here would land on that attempt"
+            )
+    else:
+        parts.append("no run owns it")
+        disowned = _newest_disowned_run(conn, task_id)
+        if disowned is not None:
+            parts.append(
+                f"run {disowned} was closed by the INFRASTRUCTURE, not by its worker (a reclaim), "
+                f"so this attempt is recoverable: pass expected_run_id={disowned} and the "
+                f"transition is recorded as a recovery"
+            )
+    history = (getattr(task, "last_failure_error", None) or "").strip()
+    if history:
+        parts.append(f"for history only — NOT the current reason: {history!r}")
+    return "; ".join(parts)
+
+
+COMPLETION_REFUSAL_CAUSES = (
+    "unknown_id",                  # no such task on this board
+    "not_running",                 # status or run changed under the caller
+    "parent_gate_unsatisfied",     # a parent is not terminal yet
+    "acceptance_refusal",          # the PR acceptance receipt is not green
+    "record_acceptance_refusal",   # the card moved while its receipt was collected
+    "hallucinated_created_cards",  # created_cards names cards this worker did not create
+    "deferral_not_a_child",        # deferred_children names a card that is not this card's child
+    "deferral_needs_reason",       # a deferral must say WHY the child is not carrying this DoD
+)
+
+
+class CompletionRefusal:
+    """Why :func:`complete_task` refused, as data instead of a bare ``False``.
+
+    Falsy, so every existing ``if not complete_task(...)`` caller keeps its meaning, while
+    the operator-facing surfaces can name the *cause* — a bool cannot tell a mistyped id
+    from a completion contract no retry can satisfy, and that ambiguity is how a card sits
+    un-completable with no signal. :class:`HallucinatedCardsError` stays an exception
+    (existing callers catch it) and carries the same cause name as a class attribute.
+    """
+
+    __slots__ = ("cause", "detail")
+
+    def __init__(self, cause: str, detail: str):
+        if cause not in COMPLETION_REFUSAL_CAUSES:
+            raise ValueError(f"unknown completion refusal cause: {cause!r}")
+        self.cause = cause
+        self.detail = detail
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"CompletionRefusal(cause={self.cause!r}, detail={self.detail!r})"
+
+
+# The operator's RELEASE door, spelled the way every live surface spells it
+# (``hermes_cli/kanban_proof_gate.py``, ``tools/kanban_tools.py``): a mis-authored
+# ``completion_contract`` is re-scoped by an OWNER act, never by a worker and never by a direct
+# DB write (ruling t_90767078, D3/D4). A refusal that names it must never name a dead end.
+CONTRACT_RELEASE_VERB = "hermes kanban set-contract"
+
+
+def _contract_is_unsatisfiable(receipt: Mapping[str, Any]) -> bool:
+    """True when NO retry can pass: a repository contract whose repository requires no checks.
+
+    ``collect_acceptance`` reports ``missing`` with an empty ``required`` list for that case --
+    there is no check to wait for and none that can ever appear -- so the refusal is terminal
+    (the card is PARKED) instead of respawning the worker against the same verdict forever.
+    The discriminator is the receipt's own data, never a guess: ``required`` is absent entirely
+    on a receipt that never reached the repository (a declaration/PR mismatch), and non-empty
+    when a required check simply has not reported yet.
+    """
+    return receipt.get("classification") == "missing" and receipt.get("required") == []
+
+
+def _unsatisfiable_contract_release(task_id: str, contract: str) -> str:
+    """The remedy a refusal about an unsatisfiable contract must NAME, in one sentence."""
+    return (
+        f"The contract {contract!r} requires repository checks, but the repository declares "
+        f"none, so no retry can satisfy it. Release the declaration with "
+        f"`{CONTRACT_RELEASE_VERB} {task_id} local-only --reason '<why no repository checks>'` "
+        f"if the unit genuinely needs no repository checks, or set the exact PR URL it lands on."
+    )
+
+
+class ProofGateError(ValueError):
+    """``complete_task`` refused: the card is authored ``landed`` and its handoff's proof
+    does not cover the deployed artifact — a run dated before the landing, no run at all,
+    or an artifact that is not the bytes the handoff declared. ``.clause`` names the clause
+    (see ``hermes_cli/kanban_proof_gate.py``), the audit event
+    ``completion_blocked_proof_gate`` carries the resolved facts, and the task itself is
+    NOT mutated. A ``ValueError`` so tool error handlers treat it as recoverable."""
+
+    cause = "proof_gate"
+
+    def __init__(self, task_id: str, verdict):
+        from hermes_cli.kanban_proof_gate import render
+
+        self.task_id = task_id
+        self.clause = getattr(verdict, "cause", None) or "proof_gate"
+        self.cause = self.clause
+        self.detail = getattr(verdict, "detail", "")
+        self.facts = getattr(verdict, "facts", {})
+        super().__init__(render(task_id, verdict))
+
+
+def _gate_deferred_children(
+    task_id: str, declared: Optional[Mapping[str, Any]],
+) -> Any:
+    """Validate a closing card's EXPLICIT deferral declarations: ``{child_id: why}``.
+
+    A declaration that states no reason is an unexplained exemption, so it is refused with
+    the same vocabulary as every other completion refusal (``deferral_needs_reason``). The
+    shape is checked HERE as well as in the tool layer, so a direct kernel caller cannot
+    land a bodyless exemption.
+
+    Returns the cleaned ``{child_id: why}`` mapping, or a falsy :class:`CompletionRefusal`.
+
+    NOTE (this tree): the kernel carries no closure-floor child promotion yet, so a
+    declaration has nothing to hold a child OUT of — it is RECORDED (``priority_deferrals``
+    on the ``completed`` event) so the declaration is never silently dropped, and it is
+    honoured by construction. Child-ness is therefore not adjudicated here: the promotion
+    that a deferral exempts a child from does not exist on this kernel yet.
+    """
+    if not declared:
+        return {}
+    if not isinstance(declared, Mapping):
+        raise ValueError(
+            "deferred_children must be a mapping of {child id: why the child does not carry "
+            "this card's remaining DoD}, got " + type(declared).__name__
+        )
+    cleaned: dict[str, str] = {}
+    for child, why in declared.items():
+        if not isinstance(why, str) or not why.strip():
+            return CompletionRefusal(
+                "deferral_needs_reason",
+                f"deferred_children[{str(child)!r}] states no reason: a deferral must say WHY "
+                f"the child does not carry this card's remaining DoD",
+            )
+        cleaned[str(child)] = why.strip()
+    return cleaned
+
+
+# Reasons a run row's ``metadata['reason']`` can carry that mean the run was abandoned by an
+# INFRASTRUCTURE event rather than finished by its worker: a reclaim (orphan reconciliation,
+# stale-claim TTL, crash sweep) or the runtime limit. Written by the reclaim paths in
+# ``kanban_db_dispatch``. A fence that deletes or rewrites history must find one of these before it
+# may proceed — an attempt the worker itself recorded is never "falsified evidence".
+DISOWNED_RUN_REASONS = frozenset({
+    "orphaned_running",
+    "stale_lock",
+    "crashed_worker",
+    "timed_out",
+    "ttl_expired_worker_alive",
+    "heartbeat_stale_worker_alive",
+})
+
+
+def _run_was_disowned(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> bool:
+    """True when the recorded run itself says an infrastructure event abandoned it.
+
+    Reads ``task_runs.metadata['reason']`` — written by every reclaim path — and accepts only
+    :data:`DISOWNED_RUN_REASONS`. A run closed by the worker (or by anything else) is NOT
+    disowned, and every recovery that would rewrite or drop its record must then do nothing.
+    """
+    if not run_id:
+        return False
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(run_id), task_id),
+    ).fetchone()
+    if row is None:
+        return False
+    raw = _row_get(row, "metadata")
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    reason = parsed.get("reason")
+    if not reason or reason not in DISOWNED_RUN_REASONS:
+        return False
+    # Terminal-only, and never the spawner's record: a ``spawn_failed`` run is the HOST's evidence
+    # that it refused to start an attempt, and the respawn cooldown reads it. Overwriting that row
+    # would erase a cooldown and let a failing card spin, so the premise excludes it by name.
+    state = conn.execute(
+        "SELECT outcome, status FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(run_id), task_id),
+    ).fetchone()
+    if state is None:
+        return False
+    if _row_get(state, "status") == "running" or _row_get(state, "outcome") == "spawn_failed":
+        return False
+    return True
+
+
+def _newest_disowned_run(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Id of the card's NEWEST run when it is proven abandoned by infrastructure, else ``None``.
+
+    "The card's last run" is the row that stands as its last word on the attempt. It is NOT
+    ``tasks.current_run_id``: an infrastructure reclaim NULLs that column and leaves the abandoned
+    row standing, which is exactly why one authority decides whether that row is disowned.
+    """
+    newest = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    run_id = _opt_int(_row_get(newest, "id")) if newest is not None else None
+    return run_id if _run_was_disowned(conn, task_id, run_id) else None
+
+
+def _reconcile_owned_run(
+    conn: sqlite3.Connection, task_id: str, *, disowned_run_id: Optional[int], summary: str = "",
+) -> Optional[int]:
+    """Record the empty ``completed`` run a recovery owes the attempt history.
+
+    ``summary=""`` is deliberate and is the whole point: the recovery attributes NOTHING to the
+    worker — no prose, no metadata about work, and ``started_at == ended_at`` (via
+    :func:`_synthesize_ended_run`) so elapsed stats are not inflated either. The caller holds the
+    transaction; the failure counter is cleared by :func:`_synthesize_empty_completion_run` outside it.
+    """
+    return _synthesize_ended_run(
+        conn, task_id, outcome="completed", summary=summary,
+        metadata={
+            "recovery": "reclaim",
+            "recovered_from_run_id": _opt_int(disowned_run_id),
+            "infra_reclaimed": True,
+        },
+    )
+
+
+def _synthesize_empty_completion_run(
+    conn: sqlite3.Connection, task_id: str, *, disowned_run_id: Optional[int] = None,
+) -> Optional[int]:
+    """The empty completion run that stops an abandoned attempt standing as the card's last word.
+
+    A reclaim closes the abandoned run as a FAILURE (``reclaimed`` / ``crashed`` / ``timed_out``).
+    When the card then completes with no handoff fields of its own, that failed row is the attempt
+    history's last word — "the card ran on a worker that crashed" beside a delivered artifact — and
+    the reclaim also left ``consecutive_failures`` incremented against a worker that never failed.
+    This records the recovery honestly (see :func:`_reconcile_owned_run`); the CALLER clears that
+    falsified counter after its transaction commits (``complete_task`` already does on success —
+    ``_clear_failure_counter`` opens its own transaction and must never run under an open one).
+
+    GUARDED, in both directions. It refuses unless the run it is reconciling is PROVEN disowned
+    (:func:`_run_was_disowned`, :data:`DISOWNED_RUN_REASONS`): history that a worker recorded is not
+    ours to rewrite. It also refuses beside a live claim — a card whose worker is still running is
+    mid-attempt, not recovered. Returns the synthesized run id, or ``None`` when it did nothing.
+    """
+    if disowned_run_id is None:
+        # "The card's last run": the row that would stand as its last word on the attempt. It is
+        # NOT ``tasks.current_run_id`` — a terminal run leaves that NULL, which is exactly why the
+        # abandoned row survives a completion unless something reconciles it.
+        disowned_run_id = _newest_disowned_run(conn, task_id)
+        if disowned_run_id is None:
+            return None
+    if not _run_was_disowned(conn, task_id, disowned_run_id):
+        return None
+    trow = conn.execute(
+        "SELECT status, claim_lock, worker_pid, worker_started_at, current_run_id FROM tasks "
+        "WHERE id = ?", (task_id,),
+    ).fetchone()
+    if trow is not None and _claim_is_live(trow):
+        return None
+    run_id = _reconcile_owned_run(conn, task_id, disowned_run_id=disowned_run_id, summary="")
+    _append_event(
+        conn, task_id, "recovery_reconciled",
+        {"disowned_run_id": _opt_int(disowned_run_id), "synthesized_run_id": _opt_int(run_id)},
+        run_id=run_id,
+    )
+    return run_id
+
+
+# --- the closure floor: a completing card's DoD-carrying children --------------------------
+#
+# The operator's prioritisation standard: a card that carries a higher-priority card's
+# remaining DoD must never sit below it, because priority governs spawn ORDER - so a closure
+# filed low starves the chain it gates (five live violations measured 2026-09-28).
+#
+# The enforcement node is the COMPLETION, deliberately and nowhere else:
+#
+# * completion is the only moment the carrying relationship is OBSERVABLE. At birth a child of
+#   a high-priority card is indistinguishable from a follow-up filed against a card whose DoD
+#   is already delivered, so lifting every child at birth would inflate ordinary work - which
+#   the standard explicitly forbids. A child filed low BEFORE its parent closes is the failure
+#   mode measured live, and the parent's closure is when the kernel can see that the child
+#   carries the parent's remaining DoD;
+# * completion is the moment the closing card can DECLARE a deferral. That declaration is
+#   explicit and recorded (``deferred_children``), never inferred from a low priority.
+#
+# The lift rides the completion's OWN write txn (the caller holds it), so a promotion can
+# never be lost by a crash between the closing write and the lift, and anything that refuses
+# the lift rolls the completion back with it.
+
+def _claim_liveness(trow) -> str:
+    """Tri-state liveness of a ``running`` task's claim: ``alive`` / ``dead`` / ``unknown``.
+
+    ``dead`` means nothing protects the run: the task is not running, holds no claim
+    lock, recorded no worker process, or its worker process is proven gone/recycled.
+    ``unknown`` means the claim may still protect a live worker whose identity cannot
+    be certified (see ``kanban_db_dispatch._worker_liveness``). TTL expiry is
+    deliberately not consulted: ``reclaim_stale_tasks`` extends, not reclaims, the claim
+    of a live worker, so the process is the liveness authority here too.
+    """
+    if (trow is None or trow["status"] != "running" or trow["claim_lock"] is None
+            or not _row_get(trow, "worker_pid")):
+        return WORKER_DEAD
+    return _worker_liveness(_row_get(trow, "worker_pid"), _row_get(trow, "worker_started_at"))
+def _claim_is_live(trow) -> bool:
+    """True when a ``running`` task's claim is PROVEN to protect a live worker process.
+
+    This is the predicate that REFUSES a transition. An unprovable (``unknown``) claim is
+    deliberately not enough to refuse — see :func:`_close_run_fence` — but it IS enough to
+    keep the claim from being released (:func:`_worker_not_dead`, used by
+    ``release_stale_claims`` / ``_reclaim_dead_workers``).
+    """
+    return _claim_liveness(trow) == WORKER_ALIVE
+
+
+def _run_guard_sql(run_id: Optional[int]) -> tuple[str, tuple]:
+    """The run-ownership CAS every run-closing UPDATE carries.
+
+    ``run_id`` is the run the caller read inside this transaction — the one it named, or the
+    card's active run when it named none. A card with NO active run is matched by
+    ``current_run_id IS NULL``. The guard is what stops a transition landing on a run the caller
+    never read; without it a stale actor's write silently closes its successor's run, which is how
+    a run was requeued while its worker held it (#123811).
+
+    A caller that NAMES a run is admitted on the SUPERSEDED/UN-OWNED split: while
+    ``current_run_id`` is NULL **and its run is the card's newest**, the write lands. That is the
+    half an infrastructure reclaim creates — it NULLs ``current_run_id`` and closes the run
+    underneath a worker that is still executing, and exact equality alone fenced that worker, the
+    only legitimate owner, out of its own card permanently. A SUPERSEDED caller (a newer run
+    exists, so ``MAX(id)`` is not its run) is still refused by the same clause.
+    """
+    if run_id is None:
+        return " AND current_run_id IS NULL", ()
+    return (
+        " AND (current_run_id = ? OR (current_run_id IS NULL AND ? = ("
+        "SELECT MAX(id) FROM task_runs WHERE task_id = tasks.id)))",
+        (int(run_id), int(run_id)),
+    )
+
+
+def _close_run_fence(
+    trow, task_id: str, *, expected_run_id: Optional[int], force: bool,
+) -> tuple[bool, str, str, tuple]:
+    """The ONE fence for closing a run: ``(allowed, verdict, guard_sql, guard_params)``.
+
+    ``verdict`` is the tri-state answer that decided it (``""`` when the caller named the
+    run, so the liveness question was never asked). Callers render their own refusal text;
+    an ``unknown`` verdict must render one that offers ``expected_run_id`` and NOT ``force``
+    (:func:`live_claim_refusal`).
+
+    Both directions live here so no path can check one and silently skip the other:
+
+    * the caller NAMED a run — admitted, and the UPDATE is made conditional on it, so a
+      mismatch is refused by the write instead of landing on a successor's run;
+    * the caller named NONE — the claim's liveness decides. A claim PROVEN to protect a
+      live worker is refused (something else owns the run). Anything else is admitted WITH
+      the guard: refusing on an unprovable claim would turn away the worker that owns the
+      card, and the guard already keeps the write off any run the caller did not read.
+    """
+    if trow is None:
+        # Let the UPDATE decide (it cannot match a missing task); never invent a refusal.
+        return True, "", *_run_guard_sql(expected_run_id)
+    current_run_id = _row_get(trow, "current_run_id")
+    if force:
+        return True, "", *_run_guard_sql(
+            int(expected_run_id) if expected_run_id is not None else current_run_id)
+    if expected_run_id is not None:
+        return True, "", *_run_guard_sql(int(expected_run_id))
+    verdict = _claim_liveness(trow)
+    if verdict == WORKER_ALIVE:
+        return False, verdict, "", ()
+    return True, "", *_run_guard_sql(current_run_id)
+
+
+def _park_unsatisfiable_contract(
+    conn: sqlite3.Connection, task_id: str, contract: str, *,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Park a card whose repository contract NO retry can satisfy: ``blocked`` / ``capability``.
+
+    ``capability``, not ``transient``: the fence cannot clear on its own, so the failure breaker
+    must not respawn the worker against the same verdict. The reason names the contract AND the
+    release door, because the card's own record is what a human reads next.
+    """
+    return bool(block_task(
+        conn, task_id, kind="capability",
+        reason=f"completion contract {contract!r} is unsatisfiable. "
+               + _unsatisfiable_contract_release(task_id, contract),
+        expected_run_id=expected_run_id,
+    ))
 
 
 def complete_task(
@@ -2660,7 +3730,8 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
-) -> bool:
+    deferred_children: Optional[Mapping[str, Any]] = None,
+) -> bool | CompletionRefusal:
     """``running|ready|blocked|review -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
@@ -2679,36 +3750,110 @@ def complete_task(
     auditable event. Approving a card out of ``review`` stays exempt.
     """
     now = int(time.time())
+    # WHY a completion was refused, as DATA, never a bare ``False``: a bool cannot tell a
+    # mistyped id from a contract no retry can satisfy, and that ambiguity is how a card sits
+    # un-completable with no signal (spec:
+    # tests/hermes_cli/test_kanban_completion_contract_release.py; ruling t_90767078). Every
+    # refusal below returns a falsy :class:`CompletionRefusal`, so every existing
+    # ``if not complete_task(...)`` caller keeps its meaning.
+    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+        return CompletionRefusal("unknown_id", f"no task {task_id} on this board")
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
-        return False
+        return CompletionRefusal(
+            "parent_gate_unsatisfied",
+            f"{task_id} cannot complete: parent(s) "
+            + ", ".join(f"{pid} ({status})" for pid, status in unsatisfied_parents(conn, task_id))
+            + " are not terminal (done or archived)",
+        )
+    # A closing card's EXPLICIT deferral declarations. Validated here (not only in the tool
+    # layer) so a direct kernel caller cannot land a bodyless exemption; recorded on the
+    # ``completed`` event below. See _gate_deferred_children for this tree's promotion gap.
+    deferrals = _gate_deferred_children(task_id, deferred_children)
+    if isinstance(deferrals, CompletionRefusal):
+        return deferrals
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # The LANDED fence travels with the completion door (ruling t_90767078, D1/D2): a card
+    # authored ``landed`` is judged by the deploy-proof gate BEFORE any acceptance clause,
+    # and the PR-acceptance clause is inapplicable to it. Exempting ``landed`` from PR
+    # acceptance WITHOUT this call is a silent free pass — strictly worse than today's
+    # unclosable card — so the two halves ship as one unit.
+    _gate_deploy_proof(conn, task_id, metadata)
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
-        return False
+        return CompletionRefusal(
+            "not_running",
+            f"{task_id} left a completable status while it was being closed",
+        )
+    if acceptance is not None and not acceptance[1].get("ok"):
+        # The acceptance receipt is not green. The DECLARATION is the fence, so nothing is
+        # traded away to make it pass: the refusal is reported, naming its own remedy, and an
+        # UNSATISFIABLE contract parks the card so no retry respawns against the same verdict.
+        # The receipt is persisted first -- in its own txn, because ``block_task`` takes one
+        # too -- so a refusal always stays auditable on the event log. Nothing else is written:
+        # the card is never completed and its declaration never moves (ruling t_90767078, D4).
+        with write_txn(conn):
+            record_acceptance(conn, task_id, acceptance)
+        receipt = acceptance[1]
+        contract = conn.execute(
+            "SELECT completion_contract FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        detail = (
+            f"PR acceptance {receipt.get('classification')}: {receipt.get('detail', '')} "
+            f"{receipt.get('recovery', '')}"
+        ).strip()
+        if _contract_is_unsatisfiable(receipt):
+            _park_unsatisfiable_contract(
+                conn, task_id, contract, expected_run_id=expected_run_id,
+            )
+            detail = f"{detail} {_unsatisfiable_contract_release(task_id, contract)}"
+        return CompletionRefusal("acceptance_refusal", detail)
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
-            return False
+            return CompletionRefusal(
+                "parent_gate_unsatisfied",
+                f"{task_id} cannot complete: parent(s) "
+                + ", ".join(f"{pid} ({status})"
+                            for pid, status in unsatisfied_parents(conn, task_id))
+                + " are not terminal (done or archived)",
+            )
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
+            return CompletionRefusal(
+                "not_running",
+                f"{task_id} left a completable status while it was being closed",
+            )
         trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, worker_started_at, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
-        # Refuse to close a LIVE worker's run without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True); see
-        # _claim_is_live for what "live" means.
-        if expected_run_id is None and not force and trow and _claim_is_live(trow):
-            raise LiveClaimError(task_id)
+        # Refuse to close a worker's run without proof of ownership (expected_run_id) or an
+        # explicit human override (force=True); the claim's liveness decides whether a caller
+        # that names NO run may close at all, and the guard below keeps any admitted write off a
+        # run this caller did not read. See _close_run_fence.
+        allowed, _refusal, guard_sql, guard_params = _close_run_fence(
+            trow, task_id, expected_run_id=expected_run_id, force=force,
+        )
+        if not allowed:
+            _verdict = _claim_liveness(trow)
+            _run = _opt_int(_row_get(trow, "current_run_id") if trow is not None else None)
+            raise LiveClaimError(
+                task_id, verdict=_verdict, run_id=_run,
+                # An ``unknown`` verdict must never be rendered with the proven-live text: that
+                # text offers ``force=True``, which is exactly the wrong instruction when the
+                # claim may protect a live worker.
+                detail=(live_claim_refusal(task_id, verdict=_verdict, run_id=_run)
+                        if _verdict == WORKER_UNKNOWN else None),
+            )
         sql = """
                 UPDATE tasks
                    SET status       = 'done',
@@ -2723,11 +3868,13 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
         params: tuple = (result, now, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
+        sql += guard_sql
+        params = (*params, *guard_params)
         if conn.execute(sql, params).rowcount != 1:
-            return False
+            return CompletionRefusal(
+                "not_running",
+                f"{task_id} left a completable status while it was being closed",
+            )
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -2740,15 +3887,29 @@ def complete_task(
             if prior_status == "review" and not synth_summary and not synth_metadata:
                 synth_summary = _REVIEW_APPROVED_NOTE
                 synth_metadata = {"source_status": "review", "approval": "manual"}
+            # No run was open when this completion landed. Either the card was never claimed, or an
+            # infrastructure reclaim closed the run and NULLed ``current_run_id`` — the un-owned
+            # branch admits. In the second case the run this lands on must SAY it is the recovery:
+            # the crashed row is left standing as history, and this one names it (#123811).
+            disowned = _newest_disowned_run(conn, task_id)
+            if disowned is not None:
+                synth_metadata = {
+                    **(synth_metadata if isinstance(synth_metadata, dict) else {}),
+                    "recovered_from_run_id": disowned,
+                    "infra_reclaimed": True,
+                }
             run_id = _synthesize_ended_run(
                 conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
             )
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
+        completed_payload = _completed_event_payload(result, event_summary, verified_cards, metadata)
+        if deferrals:
+            completed_payload["priority_deferrals"] = deferrals
         _append_event(
             conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
+            completed_payload,
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
@@ -2790,6 +3951,63 @@ def _gate_created_cards(
 
 def _substantive_text(value: Optional[str]) -> bool:
     return bool(value is not None and str(value).strip())
+
+
+def _gate_deploy_proof(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> None:
+    """Refuse a ``landed`` card whose proof does not cover the deployed artifact.
+
+    The firing path (not a sweep): this runs before the completion write txn, so a
+    refusal leaves the card exactly as it was, records an auditable event, and hands the
+    worker the clause that failed. Cards authored ``local-only`` (or with a PR contract)
+    are untouched — the fence is the contract, never the lane, the board, or the assignee.
+
+    RESTORED by card t_28dcede4 (ruling t_90767078, D1/D2). The clause engine
+    (``hermes_cli/kanban_proof_gate.py``) and this fence were both live in this tree at
+    16:02 EDT 2026-10-10 (``migrations/t_6a54c8da`` wrote ``proof_gate_admitted``), and
+    the 19:08:56 compose of ``kanban_db.py`` from ``origin/main`` dropped the fence while
+    ``ProofGateError`` stayed defined and caught — leaving a ``landed`` card closable by
+    no door at all (raised nowhere, so nothing adjudicated a landed claim).
+    """
+    row = conn.execute(
+        "SELECT completion_contract FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    contract = row["completion_contract"] if "completion_contract" in row.keys() else None
+    # The import is GUARDED. ``hermes_cli/kanban_proof_gate.py`` is a live-only override
+    # whose bytes the update rig's pin table records (``scripts/hermes_update_nodes.py``,
+    # ``UNTRACKED_OVERRIDES``), so a tree that has lost it must refuse only a ``landed``
+    # card — not every completion on the board. Confine the import behind the contract
+    # test: a non-landed contract returns WITHOUT the module, while a missing module on a
+    # ``landed`` card still fails closed (re-raises), so the landed fence never silently
+    # admits a completion it cannot evaluate.
+    try:
+        from hermes_cli import kanban_proof_gate
+    except Exception:
+        if (contract or "local-only").strip().lower() != "landed":
+            return
+        raise
+    if not kanban_proof_gate.is_landed_contract(contract):
+        return
+    proof = metadata.get("proof") if isinstance(metadata, dict) else None
+    verdict = kanban_proof_gate.evaluate(proof, conn=conn)
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "proof_gate_admitted" if verdict.ok else "completion_blocked_proof_gate",
+            {
+                "contract": contract,
+                "cause": verdict.cause,
+                "detail": verdict.detail,
+                "facts": verdict.facts,
+            },
+        )
+    if not verdict.ok:
+        raise ProofGateError(task_id, verdict)
 
 
 def _gate_empty_completion(
@@ -3143,6 +4361,8 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    waits_on: Iterable[str] = (),
+    due_at: Any = UNSET, window_policy: Optional[str] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3157,15 +4377,74 @@ def block_task(
     audit event is appended, while status, failure evidence and the terminal
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
+
+    ``waits_on`` DECLARES the dependency edge: every card named is validated
+    (exists on this board, no cycle) through the live
+    :mod:`hermes_cli.kanban_gate_invariants` gate and, after the transition,
+    written as a parent edge. A ``kind='dependency'`` block whose reason names a
+    card must carry that edge — prose alone names a wait the board's own
+    machinery cannot read.
+
+    ``due_at`` (epoch seconds) arms a CLOCK FENCE on the block: the deployed
+    ``maintenance-sweep`` ``scheduled_wake`` node releases the card once that time
+    has passed, so a time-fenced hold comes back on its own. Omit it (the default,
+    ``UNSET``) for an ordinary block -- a hold with no clock, never auto-released;
+    a hold waiting on a person stays a hold. Pass ``None`` to clear a fence.
+    ``window_policy`` records the band policy the fence was armed under ("defer"
+    by default) and, like a policy everywhere else in this contract, needs a fence
+    to apply to.
+
+    A ``dependency`` wait cannot carry a fence: it waits on an open parent, not on
+    a clock, so ``kind='dependency'`` with a due time is refused.
+
+    On a board that cannot hold a fence at all -- its ``tasks`` table predates the
+    fence columns and was never migrated -- a fence is refused by name (see
+    :func:`_fence_guard`) rather than dying on ``no such column: due_at``, and a
+    fence-free block works there exactly as it does everywhere else.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    # INVARIANT C at the write door (design record platform-stl t_6747232b): a block that names
+    # the card it waits on must carry the EDGE, not just the prose. The board resumes a card on
+    # its PARENTS finishing, so a prose-only wait is invisible to that machinery - the card sits
+    # blocked after the work it named shipped, and only a human reading the reason takes it off
+    # the shelf (measured: t_9e9ea756). ``waits_on`` is the structured form: it creates the edge.
+    # A kind='dependency' block whose reason names a card, with no edge and no waits_on, is
+    # refused with the fix in the message. Nothing is written by a refusal.
+    from hermes_cli import kanban_gate_invariants as _gates
+    declared_parents = _gates.gate_dependency(conn, task_id, reason, kind, waits_on)
+    if window_policy is not None and window_policy not in VALID_DUE_WINDOW_POLICIES:
+        raise ValueError(
+            f"window_policy must be one of {sorted(VALID_DUE_WINDOW_POLICIES)}"
+        )
+    if kind == "dependency" and due_at is not UNSET and due_at is not None:
+        raise ValueError(
+            "a dependency wait cannot carry a due time: 'dependency' waits on an open "
+            "parent, not on a clock, so --due is refused with --kind dependency"
+        )
+    # Probe the board BEFORE the write: the fence column is named by the probe row
+    # only when the store carries it, and a fence the store cannot carry is refused
+    # here by name instead of by driver error.
+    columns = _fence_guard(conn, due_at)
     with write_txn(conn):
+        probe_cols = _present_columns(columns, (
+            "status", "block_kind", "block_recurrences", "due_at", "claim_lock",
+            "worker_pid", "worker_started_at", "current_run_id",
+        ))
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            f"SELECT {probe_cols} FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        if (window_policy is not None and due_at is UNSET
+                and _row_get(cur_row, "due_at") is None):
+            # Same refusal as schedule_task: an arm policy with no fence to apply
+            # it to is dead state that no releaser will ever read.
+            raise ValueError(
+                "window_policy needs a due time: pass due_at as well "
+                "(CLI: --due ... --window-policy ...)"
+            )
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
@@ -3194,8 +4473,10 @@ def block_task(
         # ``dependency`` only waits on incomplete parents. A worker filing that
         # kind with none open would park in ``todo`` and ``recompute_ready``
         # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
+        # ``needs_input`` so it is sticky until a human unblocks. A ``waits_on``
+        # declaration counts as an open parent even before its edge exists - the
+        # edges are written just below, inside this same function.
+        if kind == "dependency" and not declared_parents and _parents_satisfied(conn, task_id):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
@@ -3205,6 +4486,17 @@ def block_task(
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
+        if due_at is not UNSET:
+            # The fence rides the SAME update and the SAME event as the block, so a
+            # releaser reading either sees the hold and its clock together.
+            due_value = None if due_at is None else int(due_at)
+            policy_value = (
+                None if due_at is None else (window_policy or DEFAULT_DUE_WINDOW_POLICY)
+            )
+            set_sql = f"{set_sql},\n                       due_at = ?, due_window_policy = ?"
+            params = (*params, due_value, policy_value)
+            payload["due_at"] = due_value
+            payload["window_policy"] = policy_value
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3216,9 +4508,21 @@ def block_task(
                    AND status IN ('running', 'ready')
                 """
         params = (*params, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
+        # The same fence as complete_task/request_review: a caller that names no run may only
+        # park a card whose claim does not protect a live worker, and every admitted write is
+        # made conditional on the run this caller read. See _close_run_fence.
+        allowed, _fence_verdict, guard_sql, guard_params = _close_run_fence(
+            cur_row, task_id, expected_run_id=expected_run_id, force=False,
+        )
+        if not allowed:
+            _log.warning(
+                "kanban: refusing to block %s — %s", task_id,
+                live_claim_refusal(task_id, verdict=_fence_verdict,
+                                   run_id=_opt_int(_row_get(cur_row, "current_run_id"))),
+            )
+            return False
+        sql += guard_sql
+        params = (*params, *guard_params)
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
@@ -3226,10 +4530,21 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
+    # The ``waits_on`` edges land HERE, after the transition, never before it: ``link_tasks``
+    # demotes a ``ready`` child to ``todo`` when its new parent is not terminal, and the block's
+    # own guarded UPDATE above only matches ``running``/``ready`` - linking first would make the
+    # block match nothing and return False. Post-transition the child is already exactly where
+    # the link would have put it, so the link only records the edge (and its ``linked`` event).
+    for parent_id in declared_parents:
+        try:
+            link_tasks(conn, parent_id, task_id)
+        except (ValueError, sqlite3.Error) as exc:
+            # Never silent: the block landed, the edge it declared did not, and the card says
+            # so in its own history (the dependency family in `kanban gates report` also names
+            # it, because a blocked card that names a card with no edge is a violation).
+            with write_txn(conn):
+                _append_event(conn, task_id, "dependency_edge_refused",
+                              {"parent": parent_id, "error": str(exc)})
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
@@ -3326,8 +4641,16 @@ def request_review(
                 return _ret(False, "task not found")
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
-            # the same fence as complete_task (_claim_is_live).
-            if expected_run_id is None and not force and _claim_is_live(trow):
+            # the same fence as complete_task (_close_run_fence).
+            allowed, fence_verdict, guard_sql, guard_params = _close_run_fence(
+                trow, task_id, expected_run_id=expected_run_id, force=force,
+            )
+            if not allowed:
+                if fence_verdict == WORKER_UNKNOWN:
+                    return _ret(False, live_claim_refusal(
+                        task_id, verdict=fence_verdict,
+                        run_id=_opt_int(_row_get(trow, "current_run_id")),
+                    ))
                 return _ret(
                     False, "task is running under a live claim; pass expected_run_id "
                     "(worker ownership) or force=True (explicit operator "
@@ -3360,10 +4683,8 @@ def request_review(
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
-            run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (
-                *(() if reviewer is None else (reviewer,)), task_id,
-                *(() if expected_run_id is None else (int(expected_run_id),)),
+                *(() if reviewer is None else (reviewer,)), task_id, *guard_params,
             )
             cur = conn.execute(
                 """
@@ -3375,7 +4696,7 @@ def request_review(
                 """ + assignee_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + run_guard,
+                """ + guard_sql,
                 params,
             )
             if cur.rowcount != 1:
@@ -3576,9 +4897,16 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, extra_event: Optional[dict] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    ``extra_event`` merges into the ``unblocked`` event payload, so a caller that
+    released the card for a reason of its own (a due-fence releaser, say) leaves
+    that reason on the board's event stream without a second event.
+    """
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3601,23 +4929,96 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # resetting them is the amnesia that let cron-unblock <-> re-block loop
         # unbounded; only complete_task clears them. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # is a fresh start for the retry budget. The due columns are cleared
+        # because the card is no longer clock-fenced: leaving a stale ``due_at``
+        # behind would re-release (or falsely alarm about) a card already running.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "due_at = NULL, due_window_policy = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        payload = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else None
         )
+        if extra_event:
+            payload = {**(payload or {}), **extra_event}
+        _append_event(conn, task_id, "unblocked", payload)
         return True
+
+
+#: Statuses after which a card's declaration is FROZEN: ``set_contract`` refuses a terminal card
+#: (the release is a re-scope of live work, never a rewrite of history). Same four the workspace
+#: reaper uses (``kanban_db_workspace._TERMINAL_STATUSES_SQL``).
+_CONTRACT_TERMINAL_STATUSES = frozenset({"done", "archived", "failed", "cancelled"})
+
+
+def set_contract(
+    conn: sqlite3.Connection, task_id: str, contract: str, *,
+    reason: Optional[str] = None, actor: Optional[str] = None,
+) -> bool:
+    """Re-scope a card's ``completion_contract`` — the operator's RELEASE door.
+
+    ``hermes kanban set-contract <id> <contract> --reason <why>`` is the release named by three
+    live surfaces that had no verb behind them: the proof gate's refusal
+    (``kanban_proof_gate.py``), the agent-tool refusal (``tools/kanban_tools.py``) and the
+    estate-mutating fence, where the verb is already listed. A mis-authored declaration — a
+    repository that requires no status checks, a superseded PR head, a ``landed`` assigned by
+    routing with no unit to land — otherwise strands the card forever with no door out, and a
+    refusal that names a non-existent remedy is worse than no remedy at all.
+
+    ``contract`` is validated through
+    :func:`hermes_cli.kanban_pr_acceptance.validate_contract` PLUS the deploy-proof class
+    ``landed`` (``kanban_proof_gate.LANDED_CONTRACT`` — the value that clause owns; a ``landed``
+    declaration is authorable and releasable by this same door, and the sibling that teaches
+    ``validate_contract`` about it only makes this branch redundant). ``reason`` is REQUIRED and
+    must be non-blank: the release is recorded WITH why it happened.
+
+    Returns ``True`` on success and ``False`` for an unknown id. Raises :class:`ValueError` for a
+    blank reason or an invalid contract, and :class:`RuntimeError` for a terminal card. On
+    success the new value is written and a ``contract_changed`` audit event records the OLD value,
+    the NEW value, the reason and the actor. NOTHING is written on a refusal: every validation
+    precedes the transaction, and the terminal check raises inside it before any UPDATE.
+    """
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(
+            "set_contract requires a non-blank reason: the release records WHY the contract is "
+            "being re-scoped (hermes kanban set-contract <id> <contract> --reason '<why>')")
+    reason = reason.strip()
+    if not isinstance(contract, str):
+        raise ValueError("completion_contract must be a string")
+    from hermes_cli.kanban_proof_gate import is_landed_contract
+    if is_landed_contract(contract):
+        # The deploy-proof class. Accepting it here is what makes ``landed`` AUTHORABLE and
+        # RELEASABLE by one door; it is deliberately not routed through the PR validator, which
+        # refuses it (the sibling card teaches it the value).
+        new_contract = "landed"
+    else:
+        new_contract = validate_contract(contract)
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, completion_contract FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] in _CONTRACT_TERMINAL_STATUSES:
+            raise RuntimeError(
+                f"task {task_id} is terminal ({row['status']}); a terminal card's "
+                f"completion_contract is frozen and cannot be re-scoped")
+        conn.execute(
+            "UPDATE tasks SET completion_contract = ? WHERE id = ?", (new_contract, task_id))
+        _append_event(conn, task_id, "contract_changed", {
+            "old": row["completion_contract"], "new": new_contract,
+            "reason": reason, "actor": actor,
+        })
+    return True
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -3887,19 +5288,76 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    due_at: Any = UNSET, window_policy: Optional[str] = None,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until a releaser re-gates it.
+
+    ``due_at`` (epoch seconds) arms the card's clock fence: the deployed
+    ``maintenance-sweep`` ``scheduled_wake`` node releases it once that time has
+    passed. Omit ``due_at`` (the default, ``UNSET``) and the card keeps whatever
+    fence it has -- typically none, which is the human hold. Pass ``None``
+    explicitly to CLEAR the fence; the verb must never convert a human hold into
+    a timed hold on its own.
+
+    ``window_policy`` records what the release should do when the fence falls
+    inside a reserved execution band -- ``"defer"`` (the default once ``due_at``
+    is set) holds it to the band's close, ``"ambient"`` releases anyway. A policy
+    with no fence to apply it to is dead state, so it is refused.
+
+    Re-parking an already-``scheduled`` card is allowed, and is how a deferral
+    moves the same card forward; that path synthesizes no run (the card was never
+    claimed in the first place).
+
+    On a board that cannot hold a fence at all -- its ``tasks`` table predates the
+    fence columns and was never migrated -- a fence is refused by name (see
+    :func:`_fence_guard`) rather than dying on ``no such column: due_at``, and a
+    fence-free park works there exactly as it does everywhere else.
+    """
+    if window_policy is not None and window_policy not in VALID_DUE_WINDOW_POLICIES:
+        raise ValueError(
+            f"window_policy must be one of {sorted(VALID_DUE_WINDOW_POLICIES)}"
+        )
+    # Probe the board BEFORE the write: the probe row names the fence column only
+    # when the store carries it, and a fence the store cannot carry is refused here
+    # by name instead of by driver error.
+    columns = _fence_guard(conn, due_at)
     with write_txn(conn):
-        params: list[Any] = [task_id]
-        sql = """
+        row = conn.execute(
+            f"SELECT {_present_columns(columns, ('status', 'due_at'))} FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        was_scheduled = row is not None and row["status"] == "scheduled"
+        # A band policy with nothing to apply it to is dead state no release will
+        # ever read: refuse it instead of writing an inert column.
+        if (window_policy is not None and due_at is UNSET
+                and (row is None or _row_get(row, "due_at") is None)):
+            raise ValueError(
+                "window_policy needs a due time: pass due_at as well "
+                "(CLI: --due ... --window-policy ...)"
+            )
+        sets = [
+            "status = 'scheduled'", "claim_lock = NULL", "claim_expires = NULL",
+            "worker_pid = NULL",
+        ]
+        set_params: list[Any] = []
+        if due_at is not UNSET:
+            sets.append("due_at = ?")
+            set_params.append(None if due_at is None else int(due_at))
+            if due_at is None:
+                sets.append("due_window_policy = NULL")
+            else:
+                sets.append("due_window_policy = ?")
+                set_params.append(window_policy or DEFAULT_DUE_WINDOW_POLICY)
+        elif window_policy is not None:
+            sets.append("due_window_policy = ?")
+            set_params.append(window_policy)
+        params: list[Any] = [*set_params, task_id]
+        sql = f"""
             UPDATE tasks
-               SET status       = 'scheduled',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL
+               SET {', '.join(sets)}
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'scheduled')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -3907,9 +5365,21 @@ def schedule_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome="scheduled", status="scheduled", summary=reason,
+            synthesize=bool(reason) and not was_scheduled,
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload: dict = {"reason": reason}
+        if "due_at" in columns and (due_at is not UNSET or window_policy is not None):
+            # Re-read rather than echo the arguments: the event has to say what
+            # the card is now waiting on, including an inherited fence.
+            final = conn.execute(
+                f"SELECT {_present_columns(columns, ('due_at', 'due_window_policy'))} "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            payload["due_at"] = _row_get(final, "due_at")
+            payload["window_policy"] = _row_get(final, "due_window_policy")
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
 
 
@@ -4416,6 +5886,9 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_boards import (
     _default_board_display_name,
+    board_dispatch_enabled,
+    board_is_archived_stub,
+    list_dispatch_boards,
     _dir_holds_board,
     board_metadata_path,
     create_board,
@@ -4439,12 +5912,17 @@ from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
+    WORKER_ALIVE,
+    WORKER_DEAD,
+    WORKER_UNKNOWN,
     _clear_failure_counter,
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
     _terminate_reclaimed_worker,
     _worker_alive,
+    _worker_liveness,
+    _worker_not_dead,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
