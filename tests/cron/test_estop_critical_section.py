@@ -17,9 +17,9 @@ THE PROPERTY
     regardless of how the owning run failed.
 
 CLAUSE COVERAGE — where each clause of the card's contract is locked down
-    clause 1  arm is scoped ....................... cited (live-line-only files, see below)
+    clause 1  arm is scoped ....................... cited (the four files named below)
     clause 2  the hold survives a gateway bounce .. tests here, engine + process boundary
-    clause 3  release lifts exactly its own handle  cited (tests/cron/test_estop*.py)
+    clause 3  release lifts exactly its own handle  cited (tests/cron/test_estop_lockdown.py)
     clause 4  a failed release cannot strand ....... tests here (RED today)
     clause 5  no advertised TTL that is not enforced tests here (RED today) + a green guard
     clause 6  every transition is observable ....... tests here: the explicit-release half
@@ -28,10 +28,13 @@ CLAUSE COVERAGE — where each clause of the card's contract is locked down
     clause 8  is_engaged() fails HELD on a stat err  cited: tests/cron/test_estop.py::
                                                       test_is_engaged_fails_safe_on_stat_error
 
-Clauses 1 and 3 are cited, never duplicated: their covering tests live in the LIVE line
-(`tests/cron/test_estop_lockdown.py`, `tests/cron/test_estop_arm_fence.py`,
-`tests/gateway/test_estop_allowlist.py`, `tests/hermes_cli/test_kanban_dispatch_lockdown.py`)
-as untracked files, so a checkout that does not carry them cannot verify the citation.
+Clauses 1 and 3 are cited, never duplicated, and every citation is machine-checked in
+`CITATIONS` below. Their covering tests live in `tests/cron/test_estop_lockdown.py`,
+`tests/cron/test_estop_arm_fence.py`, `tests/gateway/test_estop_allowlist.py` and
+`tests/hermes_cli/test_kanban_dispatch_lockdown.py` — all TRACKED on the committed home since
+the override-generation bootstrap `37b2a9e7d5` (card `t_babd2b2e` replaced the print-only
+`LIVE_LINE_ONLY_CITATIONS` tuple with that check). Resolvability is not greenness: the measured
+red state of those tests, and the card converting them, sit beside `CITATIONS`.
 
 THE FOUR RED CLAUSES ARE NOT SOFTENED
     Each opens with ``xfail(strict=True)`` naming its card. That is an ENFORCED expectation,
@@ -99,16 +102,21 @@ _STRIPPED_ENV = (
 )
 
 # Clauses 1, 3 and 8 are covered by tests that already exist — cited, not duplicated. A
-# citation that no longer resolves is a silent coverage gap, so the pair is checked below.
+# citation that no longer resolves is a silent coverage gap, so ALL of them are checked below
+# (card t_babd2b2e: clauses 1 and 3 used to sit in a print-only tuple because their covering
+# tests had no tracked home; they are tracked now, so the check verifies them too).
+#
+# MEASURED STATE OF THE CITED TESTS (2026-10-11, card t_babd2b2e) — a citation RESOLVING is not
+# the same as the cited test being GREEN. On the committed home three of the four below are
+# RED: the pre-retirement `mode: estop` arming (EstopTotalHaltRetired x20 across the four
+# files) and the retired notice shape; the dispatcher-seam ones additionally need the union
+# generation t_41d413b4 (blocked) + deploy t_c8c846a7, and are 13/14 green on the converged
+# estop line 62e09de9f5. The conversion is carded as t_dc664c58. The check below verifies
+# RESOLVABILITY — what a clean checkout can prove — never that the cited bytes pass.
 CITATIONS = (
     # (clause, path relative to the repo root, test function)
     ("clause 8  is_engaged() fails HELD on a stat error",
      "tests/cron/test_estop.py", "test_is_engaged_fails_safe_on_stat_error"),
-)
-
-# Reported, not asserted: these cover clauses 1 and 3 but live ONLY in the live line as
-# untracked files, so a checkout that does not carry them cannot verify the citation.
-LIVE_LINE_ONLY_CITATIONS = (
     ("clause 1  arm is scoped",
      "tests/cron/test_estop_lockdown.py", "test_cli_pause_lockdown_arms_the_named_lanes"),
     ("clause 1  arm is scoped",
@@ -420,10 +428,12 @@ def test_clause4_and_7_a_hold_whose_owner_died_does_not_strand_the_fleet(root):
 # the cited clauses — a citation that no longer resolves is a silent gap
 # --------------------------------------------------------------------------- #
 def test_covering_tests_for_the_cited_clauses_exist():
-    """clauses 1, 3 and 8 are covered elsewhere; verify the citations this tree can carry."""
-    print("live-line-only citations (untracked in this checkout, unverifiable here):")
-    for clause, path, name in LIVE_LINE_ONLY_CITATIONS:
-        print(f"  {clause} -> {path}::{name}")
+    """clauses 1, 3 and 8 are covered elsewhere; every citation must resolve in THIS tree.
+
+    A TRACKED-home check, not a greenness check: it proves a clean checkout carries the cited
+    bytes (card t_babd2b2e). The cited tests' own pass/fail state is named beside `CITATIONS`
+    and carded as t_dc664c58.
+    """
     missing = []
     for clause, path, name in CITATIONS:
         source = REPO_ROOT / path
