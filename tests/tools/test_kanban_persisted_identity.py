@@ -24,12 +24,18 @@ def board_env(tmp_path, monkeypatch):
         (root / "profiles" / name).mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(root))
     for var in ("HERMES_PROFILE", "HERMES_PROFILE_NAME", "HERMES_SESSION_ID", "HERMES_KANBAN_DB",
-                "HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT"):
+                "HERMES_KANBAN_HOME", "HERMES_KANBAN_WORKSPACES_ROOT"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
 
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
+    # A filing must NAME its board (operator mandate, 2026-10-10, card t_b56e48c1):
+    # `default` is never a filing destination, so this suite registers and names one
+    # (every connect below then resolves to it).
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "identity-board")
+    kb.create_board("identity-board")
     kb.init_db()
     conn = kbc.connect()
     try:

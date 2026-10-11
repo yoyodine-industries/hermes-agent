@@ -56,6 +56,11 @@ def worker_env(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
+    # A filing must NAME its board (operator mandate, 2026-10-10, card t_b56e48c1):
+    # `default` is never a filing destination, so this worker's own card — and every
+    # card it fires — lives on a registered, non-default board.
+    kb.create_board("worker-board")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "worker-board")
     kb.init_db()
     conn = kbc.connect()
     try:
@@ -1278,6 +1283,11 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
         "kanban:\n  auto_subscribe_on_create: false\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # A filing must NAME its board (operator mandate, 2026-10-10, card t_b56e48c1):
+    # the board the worker_env fixture named must exist in THIS (fresh) home too,
+    # because an unregistered name is not a board and `default` is never a destination.
+    from hermes_cli import kanban_db as _kb
+    _kb.create_board("worker-board")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
 

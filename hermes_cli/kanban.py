@@ -440,10 +440,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
     # board, which is only a fallback for a filing with no source card (a loop, a
     # cron row, a sweep). Read the source card's board from the board stores - the
     # ambient pin/pointer is a property of this process and can be stale or wrong.
-    fired_board = kb.board_for_fired_card(
-        getattr(args, "board", None),
-        source_task_id=(os.environ.get("HERMES_KANBAN_TASK")
-                        if is_dispatcher_owned_worker_context() else None))
+    source_tid = (os.environ.get("HERMES_KANBAN_TASK")
+                  if is_dispatcher_owned_worker_context() else None)
+    # OPERATOR MANDATE (2026-10-10, card t_b56e48c1): every card must NAME its board.
+    # `default` is the terminal fallback of the resolution chain, so a filing that
+    # named no board could land there with nobody having chosen the estate. Refuse
+    # BEFORE the connect/create, so no row and no store is written.
+    board_refusal = kb.filing_board_refusal(getattr(args, "board", None),
+                                            source_task_id=source_tid)
+    if board_refusal:
+        return _err(f"kanban: {board_refusal}", 2)
+    fired_board = kb.board_for_fired_card(getattr(args, "board", None),
+                                          source_task_id=source_tid)
     with kbc.connect_closing(board=fired_board) as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,

@@ -9,6 +9,11 @@ def test_creator_origin_survives_without_dependency_parent(tmp_path, monkeypatch
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    # A filing must NAME its board (operator mandate, 2026-10-10, card t_b56e48c1):
+    # `default` is never a filing destination, so this suite registers and names one —
+    # every connect below and the CLI child then resolve to it.
+    kb.create_board("origin-board")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "origin-board")
     kb.init_db()
     with kbc.connect_closing() as conn:
         owner = kb.create_task(conn, title="owner", session_id="durable", triage=True)

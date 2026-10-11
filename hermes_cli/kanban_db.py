@@ -917,6 +917,89 @@ def board_for_fired_card(explicit: Optional[str] = None, *,
     return source_board_for_task(source_task_id)
 
 
+def missing_filing_board_refusal() -> str:
+    """THE refusal text for a FILING that names no real board.
+
+    ONE definition, read by BOTH doors into a filing — the CLI (``hermes kanban
+    create``) and the tool (``kanban_create``) — so the two messages cannot drift
+    apart. A duplicated string here would be a drift bug: the doors would then
+    disagree about which board is missing and why.
+    """
+    return (
+        "refusing to file a card that names no board: an explicit board is "
+        f"required, and {DEFAULT_BOARD!r} is never a filing destination. Name one: "
+        "`hermes kanban --board <slug> create ...` (or the tool's `board=<slug>`), "
+        "set `HERMES_KANBAN_BOARD`, file from a card so the source card's own board "
+        "carries, or run in a worker pinned by `HERMES_KANBAN_DB`. The ambient "
+        f"{current_board_path()} pointer does not count — "
+        "`hermes kanban boards list` shows the registered slugs."
+    )
+
+
+def filing_board_refusal(
+    explicit: Optional[str] = None, *, source_task_id: Optional[str] = None,
+) -> Optional[str]:
+    """The refusal text for a filing that names no real board, else ``None``.
+
+    Operator mandate, 2026-10-10 (card t_b56e48c1): *"nothing should ever be carded
+    on ``default`` because every card should require an explicit board."* ``default``
+    is the terminal fallback of the board-resolution chain, so a create that named no
+    board could land there silently, with nobody having chosen the estate.
+
+    This tests the DESTINATION the filing will actually take (ruling platform-stl
+    R2, 2026-10-10), resolved by the same chain the creating ``connect()`` uses:
+
+    * a ``board=`` argument / the in-process ``--board`` scope (a typed NAME) —
+      refused when it names ``default``;
+    * the firing card's own board (operator standing order, 2026-09-29) — a real
+      board is a destination, but a card ON ``default`` is NOT a licence to file
+      onto it, so that falls through to the refusal;
+    * ``HERMES_KANBAN_DB`` — the store pin the dispatcher injects into a worker. It
+      names a board by PATH, and the path decides: a pin onto that board's own store
+      carries, a pin onto the DEFAULT store (``<root>/kanban.db``) does not. Since
+      the pin outranks typed intent exactly where the resolver fences it
+      (:func:`_explicit_board_intent_pinned`), that override is applied here too so
+      the verdict matches the destination;
+    * ``HERMES_KANBAN_BOARD`` — a board NAME in the environment, refused when it
+      names ``default`` or no registered board.
+
+    The ambient ``<root>/kanban/current`` pointer is deliberately NOT a source
+    (ruling platform-stl R1, 2026-10-10): it is a property of the CALLING PROCESS,
+    not of the work, and honouring it is precisely the silent fallback the mandate
+    removes. It stays the ambient default for *reads*.
+
+    Returns the refusal TEXT and writes nothing; ``None`` means the filing may
+    proceed on the board the resolver picks.
+    """
+    slug = _explicit_board_slug(explicit)
+    if slug is None:
+        source = source_board_for_task(source_task_id)
+        if source is not None and source != DEFAULT_BOARD:
+            slug = source
+    pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if slug is None and pin:
+        # The pin names the board by path; only a real, non-default store carries.
+        dest = board_for_store_path(pin)
+        if dest is not None and dest != DEFAULT_BOARD:
+            slug = dest
+    elif slug is not None and pin and _explicit_board_intent_pinned():
+        # A fenced caller keeps resolving through the pin, so THAT is the
+        # destination to judge, not the typed name it also passed.
+        slug = board_for_store_path(pin)
+    if slug is None:
+        env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+        if env_board:
+            try:
+                normed = _normalize_board_slug(env_board)
+            except ValueError:
+                normed = None
+            if normed is not None and normed != DEFAULT_BOARD and board_is_registered(normed):
+                slug = normed
+    if slug is None or slug == DEFAULT_BOARD:
+        return missing_filing_board_refusal()
+    return None
+
+
 def board_has_live_claims(board: Optional[str] = None) -> bool:
     """True when the board's store carries at least one LIVE claim.
 

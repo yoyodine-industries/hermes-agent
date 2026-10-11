@@ -34,6 +34,10 @@ ROOT = Path(__file__).parents[2]
 #: the module under test.
 RETIRED_ALLOW_SKEW_ENV = "HERMES_ALLOW_TREE_SKEW"
 
+#: A filing must NAME its board (operator mandate, 2026-10-10, card t_b56e48c1): `default`
+#: is never a filing destination, so every e2e child addresses this registered board.
+TREE_BOARD = "tree-probe"
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import tree_identity as ti
@@ -266,9 +270,10 @@ def _run_hermes(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
     env["HERMES_KANBAN_HOME"] = str(home)
-    for name in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT",
+    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT",
                  "HERMES_DELEGATED_CHILD_CONTEXT"):
         env.pop(name, None)
+    env["HERMES_KANBAN_BOARD"] = TREE_BOARD
     # E) The retired waiver is set on EVERY e2e child (card t_73155b4a): a tree that is not the
     # dispatching one must refuse anyway, and the allow arm must still be allowed by the RECORD,
     # never by the env var.
@@ -279,14 +284,25 @@ def _run_hermes(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
                           timeout=90)
 
 
+def _temp_home_with_board(tmp_path, monkeypatch) -> Path:
+    """A temp home carrying TREE_BOARD: a filing must NAME its board (operator mandate,
+    2026-10-10, card t_b56e48c1) and a filing never mints one."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    kb.create_board(TREE_BOARD)
+    return home
+
+
 def _refusal_lines(stderr: str) -> list[str]:
     return [ln for ln in stderr.splitlines() if ln.startswith(ti.REFUSAL_PREFIX)]
 
 
-def test_cli_refuses_a_mutation_from_a_tree_that_is_not_the_dispatching_one(tmp_path):
+def test_cli_refuses_a_mutation_from_a_tree_that_is_not_the_dispatching_one(tmp_path, monkeypatch):
     """End-to-end arm A: the refusal is a non-zero exit with the greppable prefix."""
-    home = tmp_path / "hermes"
-    home.mkdir()
+    home = _temp_home_with_board(tmp_path, monkeypatch)
     created = _run_hermes(home, "kanban", "create", "tree-skew e2e probe", "--json")
     assert created.returncode == 0, created.stderr
     tid = json.loads(created.stdout)["id"]
@@ -309,10 +325,9 @@ def test_cli_refuses_a_mutation_from_a_tree_that_is_not_the_dispatching_one(tmp_
     assert listed.returncode == 0, listed.stderr
 
 
-def test_cli_allows_a_mutation_when_the_record_names_this_tree(tmp_path):
+def test_cli_allows_a_mutation_when_the_record_names_this_tree(tmp_path, monkeypatch):
     """End-to-end arm B: same verb, same board — allowed once the record names the caller."""
-    home = tmp_path / "hermes"
-    home.mkdir()
+    home = _temp_home_with_board(tmp_path, monkeypatch)
     created = _run_hermes(home, "kanban", "create", "tree-skew e2e allow", "--json")
     assert created.returncode == 0, created.stderr
     tid = json.loads(created.stdout)["id"]
@@ -326,15 +341,14 @@ def test_cli_allows_a_mutation_when_the_record_names_this_tree(tmp_path):
     assert after["task"]["status"] == "done"
 
 
-def test_cli_refuses_set_model_from_a_tree_that_is_not_the_dispatching_one(tmp_path):
+def test_cli_refuses_set_model_from_a_tree_that_is_not_the_dispatching_one(tmp_path, monkeypatch):
     """End-to-end F2 (acceptance 1, card t_73155b4a): a skewed ``set-model`` refuses.
 
     ``set-model`` retargets the model a card dispatches on, so a tree that is not the
     dispatcher's must not reach it — with the unchanged ``tree-skew refusal:`` text — while the
     same verb on the same board succeeds from the dispatching tree.
     """
-    home = tmp_path / "hermes"
-    home.mkdir()
+    home = _temp_home_with_board(tmp_path, monkeypatch)
     created = _run_hermes(home, "kanban", "create", "tree-skew set-model probe", "--json")
     assert created.returncode == 0, created.stderr
     tid = json.loads(created.stdout)["id"]

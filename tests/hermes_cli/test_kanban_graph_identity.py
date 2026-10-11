@@ -38,8 +38,13 @@ def test_completed_decomposition_survives_retriage(tmp_path, monkeypatch):
 def test_parent_tenant_is_inherited_at_creation_boundary(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv("HERMES_TENANT", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    # A filing must NAME its board (operator mandate, 2026-10-10, card t_b56e48c1):
+    # `default` is never a filing destination, so this suite registers and names one.
+    kb.create_board("tenant-board")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "tenant-board")
     from tools.kanban_tools import _handle_create
     with kbc.connect_closing() as conn:
         unscoped = kb.create_task(conn, title="unscoped")
