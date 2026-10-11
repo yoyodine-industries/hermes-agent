@@ -99,6 +99,23 @@ def _all_ids(home):
     return found
 
 
+def _pin_at_default_store(monkeypatch, home):
+    """``HERMES_KANBAN_DB`` pinned at the DEFAULT store — the fallback in disguise."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+
+
+def _board_ids(home, board):
+    """Rows on ``board``'s own store, read WITHOUT the resolver (a pin misdirects it)."""
+    db = home / "kanban" / "boards" / board / "kanban.db"
+    if not db.exists():
+        return set()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return {row[0] for row in conn.execute("select id from tasks")}
+    finally:
+        conn.close()
+
+
 # --- the refusal itself --------------------------------------------------------------------
 
 def test_boardless_create_is_refused_and_writes_no_row(kanban_home, capsys):
@@ -189,6 +206,101 @@ def test_an_explicit_default_board_is_refused(kanban_home):
     rc = kb_cli._cmd_create(_create_args(board=kb.DEFAULT_BOARD))
     assert rc != 0
     assert _default_ids(kanban_home) == before
+
+
+# --- round 2: the PIN decides — an env board NAME must not judge a pinned filing ------------
+#
+# Round-2 review (platform-stl, 2026-10-11): with ``HERMES_KANBAN_DB`` pinned at the DEFAULT
+# store AND ``HERMES_KANBAN_BOARD`` naming a REGISTERED non-default board, the guard fell
+# through to the env name and ALLOWED — while the creating ``connect()`` opens the PIN, so the
+# row landed on ``default`` anyway (measured rc=0, +1 row). The destination is the pin (the
+# resolver never consults the env name while a pin decides), so each case below asserts NO row
+# on ``default`` and no row anywhere off the pin.
+
+def test_a_pin_at_default_with_an_env_board_name_is_refused(kanban_home, monkeypatch):
+    """The pin IS the destination; a registered env name must not save the filing."""
+    _pin_at_default_store(monkeypatch, kanban_home)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", BOARD_B)
+    before = _default_ids(kanban_home)
+    assert kb_cli._cmd_create(_create_args()) != 0, \
+        "the pin decides the destination; the env name must not override it"
+    assert _default_ids(kanban_home) == before
+    assert _board_ids(kanban_home, BOARD_A) == set()
+    assert _board_ids(kanban_home, BOARD_B) == set()
+
+
+def test_a_pin_at_default_with_an_env_board_name_is_refused_when_fenced(kanban_home, monkeypatch):
+    """Same inside a dispatcher-owned worker (``HERMES_KANBAN_TASK`` set → intent is pinned)."""
+    _pin_at_default_store(monkeypatch, kanban_home)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", BOARD_B)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_not_a_card")
+    before = _default_ids(kanban_home)
+    assert kb_cli._cmd_create(_create_args()) != 0
+    assert _default_ids(kanban_home) == before
+    assert _board_ids(kanban_home, BOARD_A) == set()
+    assert _board_ids(kanban_home, BOARD_B) == set()
+
+
+def test_a_pin_at_default_with_an_env_board_name_and_a_source_card_is_refused(
+        kanban_home, monkeypatch):
+    """A source card's board does not save a filing the pin lands on ``default`` either."""
+    with kbc.connect(board=BOARD_A) as conn:
+        source_id = kb.create_task(conn, title="the card that fires",
+                                   assignee="platform-coder")
+    assert _board_ids(kanban_home, BOARD_A) == {source_id}, "fixture: source on BOARD_A"
+    _pin_at_default_store(monkeypatch, kanban_home)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", BOARD_B)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", source_id)
+    before = _default_ids(kanban_home)
+    assert kb_cli._cmd_create(_create_args()) != 0
+    assert _default_ids(kanban_home) == before
+    assert _board_ids(kanban_home, BOARD_A) == {source_id}, "the child must not land here"
+    assert _board_ids(kanban_home, BOARD_B) == set()
+
+
+def test_a_pin_at_default_with_an_unregistered_env_board_name_is_refused(kanban_home, monkeypatch):
+    """An env name that is no board is not a destination — the resolver falls through it."""
+    _pin_at_default_store(monkeypatch, kanban_home)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "not-a-registered-board")
+    before = _default_ids(kanban_home)
+    assert kb_cli._cmd_create(_create_args()) != 0
+    assert _default_ids(kanban_home) == before
+    assert _board_ids(kanban_home, BOARD_A) == set()
+    assert _board_ids(kanban_home, BOARD_B) == set()
+
+
+def test_an_unfenced_explicit_board_still_outranks_a_pin_at_default(kanban_home, monkeypatch):
+    """Counterpart: an UNFENCED typed name keeps deciding (it is intent, not a fallback)."""
+    _pin_at_default_store(monkeypatch, kanban_home)
+    assert kb_cli._cmd_create(_create_args(board=BOARD_A)) == 0
+    assert _board_ids(kanban_home, BOARD_A) != set()
+    assert _default_ids(kanban_home) == set()
+
+
+def test_a_fenced_explicit_board_follows_the_pin_onto_default_and_refuses(kanban_home, monkeypatch):
+    """A fenced worker's typed name resolves THROUGH the pin, so the pin is the destination."""
+    _pin_at_default_store(monkeypatch, kanban_home)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_not_a_card")
+    assert kb_cli._cmd_create(_create_args(board=BOARD_A)) != 0
+    assert _default_ids(kanban_home) == set()
+    assert _board_ids(kanban_home, BOARD_A) == set()
+
+
+def test_the_tool_refuses_a_pin_at_default_with_an_env_board_name(kanban_home, monkeypatch):
+    """The second door reads the same verdict: the pin decides, the env name does not save it."""
+    import json
+
+    from tools import kanban_tools as kt
+
+    _pin_at_default_store(monkeypatch, kanban_home)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", BOARD_B)
+    before = _default_ids(kanban_home)
+    payload = json.loads(kt._handle_create({"title": "filed by the tool",
+                                            "assignee": "platform-coder",
+                                            "triage": True}))
+    assert payload.get("ok") is not True, payload
+    assert _default_ids(kanban_home) == before
+    assert _board_ids(kanban_home, BOARD_B) == set()
 
 
 # --- every genuine explicit source still files ---------------------------------------------

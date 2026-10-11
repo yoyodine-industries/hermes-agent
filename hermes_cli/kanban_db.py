@@ -958,8 +958,11 @@ def filing_board_refusal(
       names a board by PATH, and the path decides: a pin onto that board's own store
       carries, a pin onto the DEFAULT store (``<root>/kanban.db``) does not. Since
       the pin outranks typed intent exactly where the resolver fences it
-      (:func:`_explicit_board_intent_pinned`), that override is applied here too so
-      the verdict matches the destination;
+      (:func:`_explicit_board_intent_pinned`), that override is applied here too and
+      the pin's board is the verdict outright — it never falls through to the
+      ``HERMES_KANBAN_BOARD`` name, which the resolver does not consult while the pin
+      decides (a name that judged a filing which will never go there would let a row
+      land on the pinned DEFAULT store);
     * ``HERMES_KANBAN_BOARD`` — a board NAME in the environment, refused when it
       names ``default`` or no registered board.
 
@@ -971,22 +974,36 @@ def filing_board_refusal(
     Returns the refusal TEXT and writes nothing; ``None`` means the filing may
     proceed on the board the resolver picks.
     """
+    # Mirror :func:`_board_path` EXACTLY. The board a filing takes is
+    # ``board_for_fired_card(...)`` (explicit > source card > ambient), and the
+    # store it opens from there is ``_board_path``'s own decision; a verdict that
+    # disagrees with that destination is the defect this guard closes (round-1 and
+    # round-2 reviews both blocked on it), so every branch below reproduces the
+    # resolver's, never a provenance test over the same inputs.
     slug = _explicit_board_slug(explicit)
     if slug is None:
-        source = source_board_for_task(source_task_id)
-        if source is not None and source != DEFAULT_BOARD:
-            slug = source
+        # The source card's board (standing order 2026-09-29) is INHERITED as the
+        # fired board, so it counts as directed intent here too — INCLUDING when
+        # it is ``default``: a card on ``default`` firing a child resolves onto
+        # ``default`` (``board_for_fired_card`` returns it), so that is the
+        # destination to judge, not "no board was named".
+        slug = source_board_for_task(source_task_id)
     pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if slug is None and pin:
-        # The pin names the board by path; only a real, non-default store carries.
-        dest = board_for_store_path(pin)
-        if dest is not None and dest != DEFAULT_BOARD:
-            slug = dest
-    elif slug is not None and pin and _explicit_board_intent_pinned():
-        # A fenced caller keeps resolving through the pin, so THAT is the
-        # destination to judge, not the typed name it also passed.
+    if pin and (slug is None or _explicit_board_intent_pinned()):
+        # The pin IS the store the creating ``connect()`` opens (the identical
+        # condition ``_board_path`` fences on), so the board it names BY PATH is
+        # the verdict: a real board carries, while ``default`` or an unclaimed
+        # store (``None``) refuses. It must NOT fall through to
+        # ``HERMES_KANBAN_BOARD`` — the resolver never consults that env name
+        # while the pin decides, so the name would judge a filing that will never
+        # go there.
         slug = board_for_store_path(pin)
-    if slug is None:
+    elif slug is None:
+        # No pin deciding and nothing typed/inherited: the ambient
+        # ``HERMES_KANBAN_BOARD`` name is the last source the resolver reaches
+        # before the ``current`` pointer (refused as a source, ruling R1). An
+        # unregistered name is not a board — the resolver falls through it to
+        # ``default``, so it refuses here too.
         env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
         if env_board:
             try:
