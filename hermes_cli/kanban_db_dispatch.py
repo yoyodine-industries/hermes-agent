@@ -2278,7 +2278,16 @@ def _hold_claim_in_txn(
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead AND may be released.
 
-    Two guards stand between a dead-pid VERDICT and a release (card t_d98471e5):
+    The write is DECIDED before it is made (:mod:`hermes_cli.kanban_crash_sweep_guard`): every
+    candidate is classified first, with NO writes (pass 1); rows whose recorded fingerprint was
+    built by a different identity generation than this dispatcher's are HELD (R6/R2); and a sweep
+    that would close ``>= kanban_crash_sweep_guard.mass_crash_threshold()`` unexplained-death runs
+    in one tick is refused IN FULL (R4) -- no run ended, no claim released, nothing counted. The
+    caller (:func:`detect_crashed_workers`) fires the loud path. A wrong refusal is a loud card; a
+    silent board mutation is not.
+
+    Two guards also stand between a dead-pid VERDICT and a release (card t_d98471e5). Both are
+    EVALUATED in pass 1 and APPLIED in pass 2, so a refused tick writes nothing at all:
 
     * R1 liveness contract — if this module's declared ``LIVENESS_CONTRACT_ID`` is missing or
       below ``REQUIRED_LIVENESS_CONTRACT_ID``, NOTHING is released; each otherwise-reclaimable
@@ -2288,12 +2297,19 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
       (``resolve_heartbeat_veto_seconds()``; prod arms it, default 0 = off) MUST NOT be
       reclaimed on a pid verdict, and is held with
       ``reclaim_deferred {reason: "heartbeat_fresh"}``.
+
+    Only PROOF of death releases a claim or spawns beside it (``_worker_not_dead``): a row whose
+    verdict is ``alive`` or ``unknown`` is skipped entirely, because an unreadable start-time/probe
+    read is not proof, and treating it as one put six duplicate workers on six live cards in a
+    single tick (#123811). Held rows are re-read next tick, and the TTL/backstop paths bound the
+    wait.
     """
     sweep = _CrashSweep()
     announce_liveness_contract()
     now = int(time.time())
     contract_ok = _liveness_contract_ok()
     veto_seconds = resolve_heartbeat_veto_seconds()
+    write_shape = _crash_guard.identity_shape(_process_fingerprint(os.getpid()))
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
@@ -2302,6 +2318,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
+        # PASS 1 -- classify every candidate. NO writes: the guard's verdict is a decision about
+        # the WHOLE sweep, so it cannot be reached one row at a time.
+        pending: list[tuple[Any, int, _DeadWorker, str]] = []
+        # R1/R2 holds, deferred so a refused tick writes nothing (see the docstring).
+        withheld: list[tuple[str, str, str, Optional[str], dict]] = []
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -2312,44 +2333,73 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             if _worker_not_dead(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
-                # Alive, or unprovable. Only PROOF of death releases a claim or spawns beside it:
-                # an unreadable start-time/probe read is not proof, and treating it as one put six
-                # duplicate workers on six live cards in a single tick (#123811). Held rows are
-                # re-read next tick, and the TTL/backstop paths bound the wait.
+                # Alive, or unprovable. Only PROOF of death releases a claim or spawns beside it.
                 continue
 
             pid = int(row["worker_pid"])
             # R1: the running module must declare a current contract before ANY release.
             if not contract_ok:
-                _hold_claim_in_txn(
-                    conn, row["id"], row["claim_lock"], now,
-                    event_kind="reclaim_refused",
-                    reason="stale_liveness_contract",
-                    extra={
+                withheld.append((
+                    "reclaim_refused", "stale_liveness_contract", row["id"], row["claim_lock"],
+                    {
                         "worker_pid": pid,
                         "declared_contract": globals().get("LIVENESS_CONTRACT_ID"),
                         "required_contract": REQUIRED_LIVENESS_CONTRACT_ID,
                     },
-                )
+                ))
                 continue
             # R2: the worker's own recent heartbeat vetoes the dead-pid verdict.
             last_hb = _kb._row_get(row, "last_heartbeat_at")
             hb_age = (now - int(last_hb)) if last_hb is not None else None
             if veto_seconds > 0 and hb_age is not None and hb_age < veto_seconds:
-                _hold_claim_in_txn(
-                    conn, row["id"], row["claim_lock"], now,
-                    event_kind="reclaim_deferred",
-                    reason="heartbeat_fresh",
-                    extra={
+                withheld.append((
+                    "reclaim_deferred", "heartbeat_fresh", row["id"], row["claim_lock"],
+                    {
                         "worker_pid": pid,
                         "heartbeat_age_seconds": hb_age,
                         "veto_seconds": veto_seconds,
                     },
-                )
+                ))
                 continue
 
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
+            pending.append((row, pid, dead, retry_status))
+
+        # THE GUARD (R4 + R6). Reached before a single write: an incomparable fingerprint is HELD,
+        # and a sweep that would close too many runs at one instant is refused in full.
+        assessment = _crash_guard.assess_sweep(
+            [
+                _crash_guard.SweepClosure(
+                    task_id=row["id"],
+                    pid=pid,
+                    kind=dead.kind,
+                    shape=_crash_guard.identity_shape(_kb._row_get(row, "worker_started_at")),
+                    protocol_violation=dead.protocol_violation,
+                    terminal_provider=dead.terminal_provider,
+                    rate_limited=dead.rate_limited,
+                    claim_lock=row["claim_lock"],
+                )
+                for row, pid, dead, _ in pending
+            ],
+            write_shape=write_shape,
+        )
+        sweep.assessment = assessment
+        if assessment.refusal_needed:
+            # REFUSE the whole write. Nothing above wrote; nothing below runs -- not the R1/R2
+            # holds, not one booking.
+            return sweep
+        for event_kind, reason, task_id, claim_lock, extra in withheld:
+            _hold_claim_in_txn(
+                conn, task_id, claim_lock, now,
+                event_kind=event_kind, reason=reason, extra=extra,
+            )
+        held = frozenset(assessment.held)
+        # PASS 2 -- book the survivors. A held row gets NO write: its claim stays, and the loud
+        # path has already reported the shape divergence.
+        for row, pid, dead, retry_status in pending:
+            if row["id"] in held:
+                continue
             dead.event_payload["retry_status"] = retry_status
             # The attempt is RECORDED, not discarded: an exit code alone says
             # nothing about how much of the run was spent, so the reaped attempt
