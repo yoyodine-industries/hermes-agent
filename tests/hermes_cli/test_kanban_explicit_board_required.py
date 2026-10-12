@@ -18,7 +18,9 @@ NOTHING lands on `default`.
 What these cases pin down:
 
 * a boardless `hermes kanban create` exits NON-ZERO, names the missing board, and
-  writes NO row and NO store;
+  writes NO row and NO store — including on the ARGV path, where the refusal runs
+  before `kanban_command`'s pre-dispatch `init_db()` (which would otherwise mint the
+  ambient `default` store for a filing it is about to refuse);
 * the ``<root>/kanban/current`` pointer is NOT sufficient — the resolver still honours
   it (asserted, so the case cannot pass on a broken fixture) and the FILING is refused
   anyway (ruling platform-stl R1);
@@ -33,7 +35,12 @@ What these cases pin down:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -43,6 +50,9 @@ from hermes_cli import kanban_db_connect as kbc
 
 BOARD_A = "boarda"
 BOARD_B = "boardb"
+
+#: The repo root — the argv door below drives `python -m hermes_cli.main` from here.
+REPO_ROOT = Path(__file__).parents[2]
 
 
 @pytest.fixture
@@ -129,8 +139,14 @@ def test_boardless_create_is_refused_and_writes_no_row(kanban_home, capsys):
     assert _all_ids(kanban_home) == before
 
 
-def test_no_store_is_minted_for_a_refused_filing(kanban_home):
-    """The refusal fires BEFORE the connect, so it cannot mint a store either."""
+def test_the_direct_create_seam_mints_no_store_for_a_refused_filing(kanban_home):
+    """The DIRECT ``_cmd_create`` seam refuses BEFORE its ``connect()``, so it mints nothing.
+
+    This drives the seam itself (``channel``: an in-process call), which is what the tool
+    door and any direct importer share. It does NOT prove the ARGV path writes no store —
+    ``hermes kanban create`` runs ``kb.init_db()`` before it dispatches here, so that door
+    needs its own case (``test_the_argv_create_refusal_mints_no_default_store``).
+    """
     rc = kb_cli._cmd_create(_create_args())
     assert rc != 0
     assert not (kanban_home / "kanban.db").exists(), \
@@ -385,3 +401,101 @@ def test_the_tool_still_files_with_an_explicit_board(kanban_home):
                                             "triage": True, "board": BOARD_B}))
     assert payload.get("ok") is True, payload
     assert _ids_on(BOARD_B) != set()
+
+
+# --- the argv door: `hermes kanban create` must refuse BEFORE it mints a store ---------------
+#
+# `hermes_cli.kanban.kanban_command` runs `kb.init_db()` BEFORE it dispatches to `_cmd_create`,
+# and `init_db()` resolves the AMBIENT board — `default`, absent a pin or a name — and MINTS its
+# store. The guard inside `_cmd_create` alone therefore fires too late on this door: measured
+# 2026-10-11 (card t_23953f6a) — rc=2 with the ONE refusal text, yet `<root>/kanban.db` existed
+# afterwards, empty (0 rows). The in-process cases above cannot see this, because they call the
+# seam directly; only a real argv invocation reaches `kanban_command`'s pre-dispatch `init_db()`.
+# (Pre-existing, not introduced by the guard: identical at the round-2 tip 84f0e52d6d and the
+# round-3 tip 7b5080c4aa.)
+
+def _run_hermes(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Drive the REAL CLI argv door in a subprocess against an isolated ``home``."""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_KANBAN_HOME"] = str(home)
+    for name in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_TASK",
+                 "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        env.pop(name, None)
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    return subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", *args],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False, timeout=180,
+    )
+
+
+def _store_census(home: Path) -> dict[str, list[str]]:
+    """``{relative store path: sorted row ids}`` for every store under ``home``.
+
+    Read WITHOUT the resolver and with ``mode=ro``, so the census itself can neither mint a
+    store nor be misdirected by a pin.
+    """
+    census: dict[str, list[str]] = {}
+    for db in sorted(home.rglob("kanban.db")):
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            census[str(db.relative_to(home))] = sorted(
+                row[0] for row in conn.execute("select id from tasks"))
+        finally:
+            conn.close()
+    return census
+
+
+def test_the_argv_create_refusal_mints_no_default_store(tmp_path):
+    """A refused boardless `hermes kanban create` must write NOTHING — store included.
+
+    Requires a REGISTERED board elsewhere, so the refusal is about the MISSING board rather
+    than an empty estate, and asserts that board's own store is untouched too (the refusal
+    must not side-write into it). rc, the ONE shared refusal text, and a full per-store row
+    census are all asserted: this door must fail closed *and* say why.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+
+    registered = _run_hermes(home, "kanban", "boards", "create", BOARD_B)
+    assert registered.returncode == 0, registered.stderr
+    assert (home / "kanban" / "boards" / BOARD_B / "kanban.db").exists(), \
+        "fixture: the registered board must carry its store"
+    assert not (home / "kanban.db").exists(), "fixture: no default store before the filing"
+
+    before = _store_census(home)
+    refused = _run_hermes(home, "kanban", "create", "reviewer mint probe",
+                          "--assignee", "platform-coder")
+
+    assert refused.returncode == 2, (refused.returncode, refused.stdout, refused.stderr)
+    assert "names no board" in refused.stderr, refused.stderr
+    # Verbatim identity with the ONE shared refusal text. That text embeds the ambient
+    # `current` pointer path — the SUBPROCESS's home, not this process's — so normalise that
+    # single segment: the comparison is about the WORDING (one definition, both doors), not
+    # about where each process resolves its pointer from.
+    expected = kb.missing_filing_board_refusal().replace(
+        str(kb.current_board_path()), str(home / "kanban" / "current"))
+    assert refused.stderr.strip() == f"kanban: {expected}", refused.stderr
+    assert not (home / "kanban.db").exists(), (
+        "a refused argv filing must not mint the default store: the refusal has to run "
+        "BEFORE kanban_command's pre-dispatch init_db()")
+    assert _store_census(home) == before, "a refused filing writes no row anywhere"
+
+
+def test_the_argv_create_with_a_named_board_still_files(tmp_path):
+    """Counterpart on the SAME door: a genuine `--board <slug> create` still files.
+
+    Guards against a "fix" that refuses everything the argv door sends — the pre-init guard
+    must judge the DESTINATION, not the door.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    assert _run_hermes(home, "kanban", "boards", "create", BOARD_B).returncode == 0
+
+    filed = _run_hermes(home, "kanban", "--board", BOARD_B, "create", "a named filing",
+                        "--assignee", "platform-coder", "--json")
+    assert filed.returncode == 0, (filed.returncode, filed.stdout, filed.stderr)
+    task_id = json.loads(filed.stdout)["id"]
+    store = os.path.join("kanban", "boards", BOARD_B, "kanban.db")
+    assert task_id in _store_census(home)[store]
+    assert not (home / "kanban.db").exists(), "a named filing mints no default store"

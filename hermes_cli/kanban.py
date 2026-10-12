@@ -199,6 +199,19 @@ def kanban_command(args: argparse.Namespace) -> int:
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
             return _cmd_repair(args)
+        # `create` refuses a filing that names no board (operator mandate 2026-10-10, card
+        # t_b56e48c1). That guard reads only the ENVIRONMENT and the source card's own store
+        # (read-only), so it needs no DB and must run BEFORE `init_db()` below: `init_db()`
+        # resolves the AMBIENT board — `default`, absent a pin/name — and MINTS its store, so
+        # a boardless `create` that is about to be refused still left `<root>/kanban.db`
+        # behind (empty). Measured 2026-10-11, card t_23953f6a: rc=2 with the refusal text,
+        # yet the store existed afterwards. A refused filing must write NOTHING, store
+        # included. `_cmd_create` keeps its own refusal — it is the seam both doors share.
+        if action == "create":
+            filing_refusal = kb.filing_board_refusal(
+                getattr(args, "board", None), source_task_id=_filing_source_task_id())
+            if filing_refusal:
+                return _err(f"kanban: {filing_refusal}", 2)
         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:
@@ -221,6 +234,20 @@ def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
     from hermes_cli.profiles import current_profile_name
     return current_profile_name("user") or "user"
+
+
+def _filing_source_task_id() -> Optional[str]:
+    """``HERMES_KANBAN_TASK`` when THIS process is a dispatcher-owned worker, else ``None``.
+
+    The card that FIRED a filing, whose own board the fired card inherits (operator standing
+    order 2026-09-29). ONE definition, read by BOTH the pre-``init_db`` filing guard in
+    :func:`kanban_command` and :func:`_cmd_create`'s own refusal, so the two doors into the
+    seam cannot disagree about which card fired the filing.
+    """
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    if not is_dispatcher_owned_worker_context():
+        return None
+    return os.environ.get("HERMES_KANBAN_TASK")
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
@@ -408,8 +435,6 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
-    from agent.delegation_context import is_dispatcher_owned_worker_context
-
     body = args.body
     body_file = getattr(args, "body_file", None)
     if body is not None and body_file is not None:
@@ -440,8 +465,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     # board, which is only a fallback for a filing with no source card (a loop, a
     # cron row, a sweep). Read the source card's board from the board stores - the
     # ambient pin/pointer is a property of this process and can be stale or wrong.
-    source_tid = (os.environ.get("HERMES_KANBAN_TASK")
-                  if is_dispatcher_owned_worker_context() else None)
+    source_tid = _filing_source_task_id()
     # OPERATOR MANDATE (2026-10-10, card t_b56e48c1): every card must NAME its board.
     # `default` is the terminal fallback of the resolution chain, so a filing that
     # named no board could land there with nobody having chosen the estate. Refuse
@@ -473,8 +497,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
             serves=getattr(args, "serves", None),
-            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
-                             if is_dispatcher_owned_worker_context() else None),
+            creator_task_id=source_tid,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
