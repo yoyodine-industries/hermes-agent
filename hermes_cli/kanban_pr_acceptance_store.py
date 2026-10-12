@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from hermes_cli.kanban_db_connect import write_txn
-from hermes_cli.kanban_pr_acceptance import _PR, collect_acceptance
+from hermes_cli.kanban_pr_acceptance import collect_acceptance
 
 
 def _snapshot(conn, task_id):
@@ -15,20 +15,20 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     if snapshot is None:
         return False
     run_id, status, contract = snapshot
-    if not contract or contract == "local-only":
+    # ``landed`` is the deploy-proof contract: its fence is ``_gate_deploy_proof`` in
+    # complete_task, NOT repository-required CI, so it must not enter the GitHub path.
+    # The PR clause could never pass on it (16 receipts, every one classification
+    # ``missing``) -- see ruling t_90767078, D1/D2.
+    if not contract or contract in ("local-only", "landed"):
         return None
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
         return False
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
-    match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
-    # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
-    if match and contract == match[1]:
-        with write_txn(conn):
-            if _snapshot(conn, task_id) != snapshot:
-                return False
-            conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
-        snapshot = (run_id, status, published_pr)
-        contract = published_pr
+    # The declaration is IMMUTABLE: the published PR is recorded on the receipt and the audit
+    # event, never written back to the card. Rebinding froze a card to the first PR it ever
+    # published, so a superseded PR left it unsatisfiable forever with no verb to release it.
+    # A contract change is an OWNER act (``hermes kanban set-contract``), never a side effect
+    # of a completion -- ruling t_90767078, D2/D4.
     # The assignee profile's gh login owns the repo: acceptance must not run as
     # the ambient login of whichever process completes the card (#122689).
     assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]

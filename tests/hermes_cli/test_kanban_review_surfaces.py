@@ -23,6 +23,12 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     # kanban_request_review now rejects reviewers that are not installed profiles (#106163).
     (home / "profiles" / "reviewer").mkdir(parents=True)
     (home / "profiles" / "reviewer" / "config.yaml").write_text("{}\n")  # identity marker
+    # ``builder`` is the handle filed under below. Creating the ``reviewer`` profile above
+    # arms the assignee invariant (kanban_gate_invariants.gate_assignee, at the kernel's
+    # create door), which refuses a handle that resolves nowhere and is not a DECLARED lane.
+    # Declare it: the honest path for a probe handle that pulls its own work.
+    (home / "kanban").mkdir(parents=True, exist_ok=True)
+    (home / "kanban" / "terminal_lanes").write_text("builder\n", encoding="utf-8")
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kbc.connect() as conn:
