@@ -21,6 +21,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.kanban_scope import scope_refusal_reason
 
 from utils import env_int
 
@@ -199,6 +200,14 @@ def specify_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
+
+    # Deterministic scope gate (hermes_cli.kanban_scope): an OVERSIZE declared
+    # scope is refused HERE, before the aux LLM is spent and before the card can
+    # be promoted and dispatched whole. No SCOPE line is not refused — see
+    # scope_refusal_reason.
+    refusal = scope_refusal_reason(task.body or "")
+    if refusal:
+        return SpecifyOutcome(task_id, False, refusal)
 
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,
