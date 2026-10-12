@@ -108,7 +108,7 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
             from hermes_cli import kanban_bulk_guard as kbg
 
             estate_declared = kbg._estate_state(str(args.slug or ""))[0]
-        except Exception:
+        except Exception:  # health: allow BLE001 -- fail-open (t_fcf7a321): an unreadable estate declaration reports no estate record; the teardown is unchanged
             estate_declared = False
     try:
         res = kb.remove_board(args.slug, archive=not force_delete)

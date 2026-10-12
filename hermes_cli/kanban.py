@@ -170,7 +170,6 @@ def kanban_command(args: argparse.Namespace) -> int:
     except kbg.BulkActionRefused as exc:
         return _err(str(exc), 1)
 
-
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
     # the `--board` routing override (else `--board beta boards show` reports beta).
     if action == "boards":
@@ -254,6 +253,8 @@ _DELEGATED_CHILD_CLI_REFUSAL: str = (
     "whose own board.json declares \"dispatch\": false is torn down single-actor with "
     "`hermes kanban boards rm --estate <slug>`."
 )
+
+
 def _fence_target_store(args: argparse.Namespace) -> Path:
     """The board store the invocation actually TARGETS.
 
@@ -271,13 +272,15 @@ def _fence_target_store(args: argparse.Namespace) -> Path:
     if named:
         try:
             return kb.kanban_db_path(board=named)
-        except Exception:
+        except Exception:  # health: allow BLE001, S110 -- fail-open (t_fcf7a321): an unresolvable --board falls through to the ambient store, as the pre-fix helper judged
             # An unregistered/malformed ``--board`` is the CLI's own validation to refuse a
             # moment later (:func:`kanban_command` validates it before dispatch); the fast-fail
             # must never raise from here. Fall through to the ambient board, which is exactly
             # what the pre-fix helper judged.
             pass
     return kb.kanban_db_path()
+
+
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     """Fence a mutating CLI verb from a non-top-level session.
 
@@ -1569,7 +1572,6 @@ def _cmd_defcon(args: argparse.Namespace) -> int:
     if handler is None:
         return _err(f"kanban defcon: unknown action {action!r}; use designate", 2)
     return handler(args)
-
 
 
 def _cmd_bulk_approvals(args: argparse.Namespace) -> int:

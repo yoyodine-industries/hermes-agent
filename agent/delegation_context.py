@@ -206,7 +206,7 @@ def process_ancestors(pid: int | None = None) -> tuple[int, ...]:
         return _ancestor_cache
     try:
         import psutil
-    except Exception:
+    except Exception:  # health: allow BLE001 -- fail-open (t_fcf7a321): a fence that cannot see must not refuse, so no psutil means no ancestry
         return ()
     chain: list[int] = []
     try:
@@ -217,7 +217,7 @@ def process_ancestors(pid: int | None = None) -> tuple[int, ...]:
                 break
             chain.append(parent)
             current = parent
-    except Exception:
+    except Exception:  # health: allow BLE001, S110 -- fail-open (t_fcf7a321): a broken walk keeps the chain read so far; the fence may only add a refusal it can prove
         pass
     result = tuple(chain)
     if own:
@@ -245,7 +245,7 @@ def _resolve_claim_store(path: os.PathLike[str] | str | None) -> str | None:
         from hermes_cli import kanban_db as kb
 
         return str(kb.kanban_db_path().expanduser().resolve())
-    except Exception:
+    except Exception:  # health: allow BLE001 -- fail-open (t_fcf7a321): an unresolvable board store leaves the arm blind, so it answers None, not a refusal
         return None
 
 
@@ -282,7 +282,7 @@ def live_claim_workers(path: os.PathLike[str] | str | None = None) -> tuple[tupl
             )
         finally:
             conn.close()
-    except Exception:
+    except Exception:  # health: allow BLE001 -- fail-open (t_fcf7a321): an unreadable board DB answers "no live claims" and can only fail to ADD a refusal
         rows = ()
     _live_claim_cache[store] = (now, rows)
     return rows
@@ -306,7 +306,7 @@ def ancestor_owns_live_kanban_claim(path: os.PathLike[str] | str | None = None) 
     ancestor_set = set(ancestors)
     try:
         from hermes_cli.kanban_db_dispatch import _worker_not_dead
-    except Exception:
+    except Exception:  # health: allow BLE001 -- fail-open (t_fcf7a321): without the dispatcher's own liveness check the claim is unprovable, so this arm stays silent
         return False
     for pid, started_at in claims:
         if pid in ancestor_set and _worker_not_dead(pid, started_at):
