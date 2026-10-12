@@ -211,7 +211,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # nothing (broken profile, PATH drift, missing venv, credential loss) —
     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health_state = {"bad_ticks": 0, "last_warn_at": 0, "last_stuck_probe_at": 0}
 
     def _ready_queue_nonempty() -> bool:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
@@ -221,6 +221,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 return kbd.has_spawnable_ready(conn)
         except Exception:
             return False
+
+    def _zero_run_ready():
+        """Stuck-ready probe on this board: ready cards nothing has attempted."""
+        try:
+            with kbc.connect_closing() as conn:
+                stats = kbd.zero_run_ready(conn)
+        except Exception:
+            return None
+        return stats if int(stats.get("count") or 0) else None
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
@@ -243,6 +252,19 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                     file=sys.stderr, flush=True,
                 )
                 health_state["last_warn_at"] = now
+        # Stuck-ready probe, on its own (throttled) cadence: ready cards nothing has
+        # EVER attempted. The dead-assignee case it exists for is bucketed
+        # ``skipped_nonspawnable``, which the rule above deliberately ignores — so
+        # the old signal is silent on exactly the fault that matters most.
+        now_stuck = int(time.time())
+        if now_stuck - health_state["last_stuck_probe_at"] >= 300:
+            health_state["last_stuck_probe_at"] = now_stuck
+            stuck = _zero_run_ready()
+            if stuck:
+                print(
+                    f"[{_fmt_ts(now_stuck)}] WARN {kbd.stuck_ready_message(stuck)}",
+                    file=sys.stderr, flush=True,
+                )
         if not verbose:
             return
         did_work = (

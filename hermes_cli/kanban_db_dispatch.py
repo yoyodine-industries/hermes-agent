@@ -919,6 +919,39 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     return ", ".join(parts)
 
 
+def stuck_ready_message(stats: dict) -> str:
+    """Operator-facing line for ready cards nothing has ever attempted.
+
+    Distinct from the suppression summary (``describe_suppression``: what the
+    last tick held back) and from the ``skipped_nonspawnable`` bucket, which
+    health telemetry suppresses precisely because ``hermes kanban assign`` — not
+    the dispatcher — is the fix.
+    """
+    count = int(stats.get("count") or 0)
+    task_id = stats.get("oldest_task_id") or "?"
+    assignee = stats.get("oldest_assignee") or "(unassigned)"
+    minutes = int((stats.get("oldest_age_seconds") or 0) // 60)
+    board = stats.get("board")
+    where = f"kanban dispatcher[{board}]" if board else "kanban dispatcher"
+    if stats.get("oldest_spawnable") is False:
+        why = (
+            f"the oldest card's assignee {assignee!r} is not a live profile, so every "
+            f"tick buckets it skipped_nonspawnable and no worker will EVER launch for "
+            f"it — reassign it to a real profile or recreate it unassigned."
+        )
+    else:
+        why = (
+            f"the oldest card's assignee {assignee!r} is spawnable and unclaimed, so "
+            f"nothing running it means the lane is starved (caps, guards, memory "
+            f"pressure) or that worker never polls; check "
+            f"`hermes kanban list --status ready` and the gateway log."
+        )
+    return (
+        f"{where}: {count} ready card(s) have never been attempted by any worker; "
+        f"oldest is {task_id} ({assignee}) waiting ~{minutes} min. {why}"
+    )
+
+
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
 # ``dispatch_once`` and read by ``detect_crashed_workers`` to classify a dead-pid
 # task. Entry: ``pid -> (raw_wait_status, reaped_at_epoch)``; raw status kept so
@@ -3975,12 +4008,37 @@ def _tick_spawn_budget(
     return True, spawn_budget
 
 
+def zero_run_ready(
+    conn: sqlite3.Connection, *, now: Optional[float] = None,
+    min_age_seconds: Optional[float] = None,
+) -> dict:
+    """Stuck-ready probe — see :func:`hermes_cli.kanban_db.zero_run_ready`.
+
+    Defined ONCE in ``kanban_db`` so every dispatcher health surface (the
+    gateway watcher, the standalone daemon, the board-stats / ops-API export)
+    reads the same query; this module only forwards, and is the board-aware
+    entry point plugin consumers reach through ``kanban_db``.
+    """
+    if min_age_seconds is None:
+        return _kb.zero_run_ready(conn, now=now)
+    return _kb.zero_run_ready(conn, now=now, min_age_seconds=min_age_seconds)
+
+
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed rows of one lane in dispatch order.
+
+    Ordering is the shared age-aware effective priority
+    (``kanban_db.effective_priority_order_sql``): a card that has waited long
+    enough outranks fresher higher-priority work, so a low-priority lane can
+    never be starved indefinitely by a steady trickle of P0/P1 cards. Both lane
+    orders (ready and review) call the one helper so they cannot drift.
+    """
+    order_body, order_params = _kb.effective_priority_order_sql()
     return conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        f"ORDER BY {order_body}",
+        order_params,
     ).fetchall()
 
 

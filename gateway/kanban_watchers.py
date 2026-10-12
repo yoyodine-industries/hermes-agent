@@ -279,6 +279,7 @@ class GatewayKanbanWatchersMixin:
         # broken PATH, missing venv, or credential loss.
         bad_ticks = 0
         last_warn_at = 0
+        last_stuck_probe_at = 0  # stuck-ready probe cadence (see below), independent of bad_ticks
         results: Optional[list] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
 
@@ -308,6 +309,18 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
+                    # Stuck-ready probe (card t_d6ae62e7, PART B): ready cards nothing has
+                    # EVER attempted. It runs on its own cadence because the dead-assignee
+                    # case it exists for is bucketed ``skipped_nonspawnable``, which the
+                    # bad-tick rule below deliberately ignores — that rule is silent on
+                    # exactly the fault that matters most. Throttled: a read-only probe of
+                    # every board every 5s is a cost with no matching benefit.
+                    _now_tick = int(time.time())
+                    if _now_tick - last_stuck_probe_at >= 300:
+                        last_stuck_probe_at = _now_tick
+                        stuck = await _to_thread_process_service(dispatcher.zero_run_ready)
+                        if stuck:
+                            logger.warning("%s", _kbd.stuck_ready_message(stuck))
                     if _log_tick_yields(results):
                         # Working as designed: the content-skew gate refused to spawn from a mixed
                         # revision. Counting it as a "stuck dispatcher" would mislabel a healthy
