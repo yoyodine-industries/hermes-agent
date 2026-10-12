@@ -21,8 +21,9 @@ import threading
 import time
 from cron.env_settings import cron_env_setting
 from cron.jobs import _ensure_cron_dir
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -64,8 +65,53 @@ def _timeout_from_env_or_config(
     return None
 
 
-def _get_script_timeout() -> int:
-    """Resolve cron pre-run script timeout from module/env/config with a safe default."""
+def _job_script_timeout(job: Optional[Mapping[str, Any]]) -> Optional[int]:
+    """The job's OWN ``script_timeout_seconds`` as a positive int, or None to keep resolving.
+
+    Most-specific rung of the timeout chain: one long script job (e.g. a cross-markets report that
+    legitimately runs for hours) raises its own budget without raising every other script job in the
+    profile. An unusable stored value (0, negative, unparsable, wrong type) is deliberately NOT an
+    error here: resolution WARNs and falls through to the profile-wide rungs. Wedging a job on a
+    value that write-time validation (``cron.jobs._normalize_job_script_timeout``) already refuses
+    would turn a hand-edited jobs.json into a job that can never run at all.
+    """
+    if not isinstance(job, Mapping):
+        return None
+    raw = job.get("script_timeout_seconds")
+    if raw is None:
+        return None
+    job_id = job.get("id")
+    try:
+        timeout = _positive_int(raw)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning(
+            "Job '%s': invalid script_timeout_seconds=%r; using env/config/default",
+            job_id, raw)
+        return None
+    if timeout is None:
+        logger.warning(
+            "Job '%s': script_timeout_seconds=%r is not positive; using env/config/default",
+            job_id, raw)
+    return timeout
+
+
+def _get_script_timeout(job: Optional[Mapping[str, Any]] = None) -> int:
+    """Resolve cron pre-run script timeout from the job, then module/env/config, with a safe default.
+
+    Precedence, most specific first:
+
+    (a) the job's own ``script_timeout_seconds`` (validated at write time; ignored with a warning
+        when a stored record holds junk),
+    (b) the module-level test-injection seam ``_SCRIPT_TIMEOUT`` when it differs from the default,
+    (c) ``HERMES_CRON_SCRIPT_TIMEOUT``,
+    (d) ``cron.script_timeout_seconds`` in config.yaml,
+    (e) the built-in default (3600s).
+
+    ``job=None`` (monitor probes, ad-hoc callers) reproduces the pre-per-job chain exactly.
+    """
+    job_timeout = _job_script_timeout(job)
+    if job_timeout is not None:
+        return job_timeout
     if _sched._SCRIPT_TIMEOUT != _sched._DEFAULT_SCRIPT_TIMEOUT:
         try:
             timeout = _positive_int(_sched._SCRIPT_TIMEOUT)
@@ -433,6 +479,7 @@ def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
     identity: Optional[Mapping[str, str]] = None,
+    job: Optional[Mapping[str, Any]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -445,12 +492,14 @@ def _run_job_script(
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
     ``.py`` scripts (#8714). identity: the fire's occurrence identity
     (``cron.execution_identity.cron_execution_env``), overlaid LAST so the sanitizer inside
-    ``build_subprocess_env`` cannot strip the Hermes-owned names it carries.
+    ``build_subprocess_env`` cannot strip the Hermes-owned names it carries. job: Optional job
+    record whose own ``script_timeout_seconds`` bounds THIS run; omitted/None falls back to the
+    profile-wide chain.
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
-    script_timeout = _get_script_timeout()
+    script_timeout = _get_script_timeout(job)
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
@@ -574,8 +623,10 @@ def _run_job_script_with_claim_heartbeat(
     identity = cron_execution_env(job)
 
     def run() -> tuple[bool, str]:
+        # Every call site forwards ``job`` so the job's own script_timeout_seconds is honoured on
+        # this path too — the heartbeat wrapper is the ONLY entry point the scheduler uses.
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"), identity=identity)
+                               interpreter=job.get("interpreter"), identity=identity, job=job)
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")
