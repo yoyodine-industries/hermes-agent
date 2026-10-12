@@ -106,6 +106,14 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Statuses no worker will ever be launched in again: the card is closed, so the
+# ``(assignee, skills)`` pair cannot fail at dispatch any more. Read by the sites
+# that judge that pair to tell attribution on a finished card from handing a name
+# to a worker that cannot load it. Distinct from ``goals._KANBAN_TERMINAL_STATUSES``,
+# which names the worker-driven GOAL-LOOP terminators (``blocked``/``review`` are
+# terminators there and very much still dispatchable here).
+TERMINAL_STATUSES = {"done", "archived"}
+
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
@@ -1582,6 +1590,77 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _unloadable_task_skills(skills: Iterable[str], assignee: Optional[str]) -> list[dict[str, str]]:
+    """``skills`` entries a worker launched as *assignee* could not load.
+
+    A worker resolves ``--skills`` against ITS OWN profile's skill directories and exits
+    on ``Unknown skill(s)`` before the agent starts, so a card carrying one of these
+    names spends an attempt and auto-blocks with the reason only the worker log shows.
+    Ask the worker's own question instead (``agent.skill_commands``).
+
+    Empty when the question cannot be answered truthfully: an unassigned card cannot
+    dispatch at all (``assign_task`` attaches the profile), and an unresolvable profile
+    home is that profile's own error — neither has a registry to judge names against.
+    """
+    if not skills or not assignee:
+        return []
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from agent.skill_commands import preload_skill_problems
+
+    try:
+        profile_home = resolve_profile_env(normalize_profile_name(assignee))
+    except Exception:  # health: allow BLE001 -- fail-open: an unresolvable profile home is that profile's own error, so no registry exists to judge these names against and the gate stays silent
+        return []
+    override = set_hermes_home_override(profile_home)
+    try:
+        return preload_skill_problems(list(skills))
+    finally:
+        reset_hermes_home_override(override)
+
+
+def _unloadable_skills_message(problems: list[dict[str, str]], assignee: Optional[str]) -> str:
+    """Refusal text for skill names the assignee profile's worker would exit on."""
+    quoted = ", ".join(repr(problem["identifier"]) for problem in problems)
+    noun = "skill" if len(problems) == 1 else "skills"
+    lines = [
+        f"{noun} {quoted} cannot be loaded by a worker for assignee {assignee!r}, "
+        "so the task would fail on 'Unknown skill(s)' before the agent starts."
+    ]
+    for problem in problems:
+        closest = problem.get("closest") or ""
+        lines.append(
+            f"  {problem['identifier']}: {problem.get('error') or 'not registered for that profile'}"
+            + (f" Closest name(s): {closest}." if closest else "")
+        )
+    lines.append(f"List that profile's skills with `hermes -p {assignee} skills list`.")
+    return "\n".join(lines)
+
+
+def _task_skill_names(skills: Any) -> list[str]:
+    """Skill names off a task row's JSON ``skills`` column (or a raw list of names)."""
+    parsed = skills if isinstance(skills, (list, tuple)) else _json_or(skills)
+    return [str(name) for name in parsed if name] if isinstance(parsed, list) else []
+
+
+def _refuse_unloadable_skills(skills: Any, assignee: Optional[str]) -> None:
+    """Raise :class:`ValueError` for stored skill names *assignee*'s worker cannot load.
+
+    ``create_task`` asks this where the card is created; every site that ATTACHES an
+    assignee afterwards asks it again (``assign_task``, ``request_review``, the
+    dispatcher's ``kanban.default_assignee`` fallback), because the pair can only be
+    judged once the profile is known. A card created with no assignee therefore
+    reaches a worker with its names unjudged and spends its attempts on
+    ``Unknown skill(s)`` — the failure the create-time check exists to prevent.
+    """
+    names = _task_skill_names(skills)
+    if not names:
+        return
+    problems = _unloadable_task_skills(names, assignee)
+    if problems:
+        raise ValueError(_unloadable_skills_message(problems, assignee))
+
+
 def _resolve_operator_ask(conn: sqlite3.Connection, *, board: Optional[str] = None,
                           parents: Any = (), body: Optional[str] = "",
                           serves: Any = None) -> Any:
@@ -1732,6 +1811,12 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    if skills_list:
+        # Refuse a name no worker for this assignee can load, rather than letting the
+        # card spend an attempt and auto-block on a failure only the worker log shows.
+        unloadable = _unloadable_task_skills(skills_list, assignee)
+        if unloadable:
+            raise ValueError(_unloadable_skills_message(unloadable, assignee))
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -2057,11 +2142,15 @@ def list_tasks(
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+    """Assign/reassign; raises RuntimeError while the task is running under a claim,
+    and ValueError when a worker for *profile* could not load the task's skills —
+    except on a card in a terminal status (``done``/``archived``), which no worker
+    will run again and can therefore be assigned for attribution.
+    """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -2070,6 +2159,15 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        # A card created with no assignee carried its skills past the create-time
+        # check (nothing to judge them against); judge them against the profile
+        # being attached here, before it can reach a worker — and before the
+        # failure streak and the assignee are written. A card in a terminal status
+        # is not a dispatch: no worker will load those names again, so the pair
+        # cannot fail on ``Unknown skill(s)``. Judging it there would only make a
+        # finished (or archived) card un-attributable.
+        if row["status"] not in TERMINAL_STATUSES:
+            _refuse_unloadable_skills(row["skills"], profile)
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
@@ -4748,7 +4846,7 @@ def request_review(
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-                "worker_started_at FROM tasks WHERE id = ?", (task_id,),
+                "worker_started_at, skills FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
@@ -4778,6 +4876,15 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
             reviewer = _canonical_assignee(reviewer)
+            if reviewer is not None:
+                # The reviewer takes the card over, so the skill pair is judged here
+                # exactly as assign_task judges it: refusing keeps the card in the
+                # implementer's hands instead of handing the reviewer a session that
+                # aborts on "Unknown skill(s)".
+                try:
+                    _refuse_unloadable_skills(trow["skills"], reviewer)
+                except ValueError as exc:
+                    return _ret(False, str(exc))
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
             # whoever the operator assigned -- possibly the reviewer itself,
