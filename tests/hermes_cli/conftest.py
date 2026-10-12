@@ -178,3 +178,48 @@ def probe_root(tmp_path):
     """
     (tmp_path / "hermes_bootstrap.py").write_text("", encoding="utf-8")
     return tmp_path
+
+
+class FakeDenialBoard:
+    """A stand-in for the kanban board that records ``create_task`` calls.
+
+    The model DENYLIST files a real acting card when a banned model is refused (card
+    t_a1ae7cc6, ruling B3). Any test that drives a refusal on a developer host would
+    otherwise write a real card to the live board, so the denial suites install this
+    fake instead. ``create_task`` honours the idempotency contract the real one honours:
+    the same key the second time files nothing (returns ``""``).
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.seen_keys = set()
+
+    def create_task(self, conn, *, title, assignee=None, body=None, idempotency_key=None, **kw):
+        if idempotency_key in self.seen_keys:
+            return ""
+        self.seen_keys.add(idempotency_key)
+        self.calls.append({"title": title, "assignee": assignee, "body": body, "key": idempotency_key,
+                           "board": kw.get("board")})
+        return "t_synthetic"
+
+
+@pytest.fixture
+def fake_denial_board(monkeypatch):
+    """Install a fake kanban board so a denial refusal files a RECORDED call, not a real card."""
+    import sys
+
+    fake = FakeDenialBoard()
+
+    class _KB:
+        create_task = staticmethod(fake.create_task)
+
+    class _Conn:
+        def close(self):
+            pass
+
+    class _KBC:
+        connect = staticmethod(lambda *a, **k: _Conn())
+
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_db", _KB)
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_db_connect", _KBC)
+    return fake
