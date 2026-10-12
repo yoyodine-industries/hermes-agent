@@ -1298,8 +1298,10 @@ class TestGitGlobalFlagPrefix:
     ran with NO approval on every surface (interactive, cron, ``-q``) while the contiguous
     spelling was gated. ONE shared prefix fragment (``_QUOTED_GLOBAL_FLAGS``) is inserted
     between ``\\bgit\\s+`` and the verb in all 12 git rows; the ``systemctl`` row (same defect
-    class, module grammar ``_GLOBAL_FLAGS``) is widened the same way. Row ORDER, descriptions
-    and the lease/main/bulk guard chain are unchanged - order is the mechanism.
+    class, module grammar ``_GLOBAL_FLAGS``) is widened the same way, and so is its
+    ``_CMDPOS``-anchored HARDLINE sibling (``systemctl poweroff|reboot|halt|kexec``), which is a
+    floor rather than a prompt and is measured with ``detect_hardline_command``. Row ORDER,
+    descriptions and the lease/main/bulk guard chain are unchanged - order is the mechanism.
     """
 
     LEASE = "git push --force-with-lease (lease-checked force push)"
@@ -1402,9 +1404,40 @@ class TestGitGlobalFlagPrefix:
         "systemctl is-active hermes-gateway",
     ]
 
+    # The SAME verb family one tier up: `_CMDPOS`-anchored, but in HARDLINE_PATTERNS, so the
+    # instrument is `detect_hardline_command` (a floor, never bypassable) and its verdict is a
+    # 2-tuple. A global flag used to walk straight past this row (t_c4feb0f4).
+    HARD = "systemctl poweroff/reboot"
+
+    SYSTEMCTL_POWER_DETECTED = [
+        "systemctl --host user@prod reboot",
+        "systemctl -H user@prod reboot",
+        "systemctl --host user@prod poweroff",
+        "systemctl --root /mnt halt",
+        "systemctl --machine box kexec",
+        "systemctl --user reboot",
+        "systemctl --user --host box reboot",
+        "sudo systemctl --host user@prod reboot",
+        "systemctl reboot",
+        "systemctl poweroff",
+    ]
+
+    SYSTEMCTL_POWER_CLEAN = [
+        "systemctl is-active hermes-gateway",
+        "systemctl --host user@prod status nginx",
+        "systemctl --user status hermes-gateway",
+        "systemctl list-units --type=service",
+    ]
+
     def test_git_global_flag_spellings_are_gated_with_their_key(self):
         for command, key in self.DETECTED:
             assert detect_dangerous_command(command) == (True, key, key), command
+
+    def test_systemctl_poweroff_rows_survive_a_global_flag(self):
+        for command in self.SYSTEMCTL_POWER_DETECTED:
+            assert detect_hardline_command(command) == (True, self.HARD), command
+        for command in self.SYSTEMCTL_POWER_CLEAN:
+            assert detect_hardline_command(command) == (False, None), command
 
     def test_git_global_flag_spellings_that_stay_clean(self):
         for command in self.CLEAN_ROWS:
@@ -1425,10 +1458,24 @@ class TestGitGlobalFlagPrefix:
         assert all(p.startswith(prefix) for p in rows), [p for p in rows if not p.startswith(prefix)]
 
     def test_systemctl_row_carries_the_module_grammar(self):
-        prefix = r"\bsystemctl\s+" + approval_detection._GLOBAL_FLAGS
-        rows = [p for p, _d in approval_detection.DANGEROUS_PATTERNS if p.startswith(r"\bsystemctl")]
+        """EVERY systemctl row carries the module grammar - and there are TWO anchors, not one.
+
+        The population used to be ``p.startswith(r"\\bsystemctl")`` over DANGEROUS_PATTERNS only,
+        which left the ``_CMDPOS``-anchored HARDLINE row outside its scope: the invariant was
+        silent about the exact row a global flag still defeated (t_c4feb0f4). Coverage is now
+        asserted PER ANCHOR, so a renamed or dropped spelling cannot quietly empty it.
+        """
+        anchors = (r"\bsystemctl\s+", approval_detection._CMDPOS + r"systemctl\s+")
+        rows = [
+            p
+            for p, _d in (*approval_detection.DANGEROUS_PATTERNS, *approval_detection.HARDLINE_PATTERNS)
+            if p.startswith(anchors)
+        ]
         assert rows
-        assert all(p.startswith(prefix) for p in rows), rows
+        prefixes = tuple(a + approval_detection._GLOBAL_FLAGS for a in anchors)
+        assert all(p.startswith(prefixes) for p in rows), [p for p in rows if not p.startswith(prefixes)]
+        for anchor in anchors:
+            assert any(p.startswith(anchor + approval_detection._GLOBAL_FLAGS) for p in rows), anchor
 
     def test_fragment_keeps_the_apostrophe_alternative(self):
         """`\\'` inside a single-quoted raw literal IS a literal apostrophe to the regex engine
