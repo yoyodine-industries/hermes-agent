@@ -249,11 +249,13 @@ def test_stuck_ready_message_names_the_card_and_the_real_failure_mode():
     """The line an operator (or the gateway log) actually sees.
 
     Port note: the September revision drove this line from
-    ``DispatcherHealth.observe_tick(stuck=...)``. That class is absent from the
-    live line (it was lost at the same 2026-09-23 checkout switch as the age
-    bonus — see card t_d6ae62e7), and the live health surfaces are the gateway
-    watcher and ``_cmd_daemon``. The message contract is what the probe owns, so
-    it is pinned directly here; the surfaces call it verbatim.
+    ``DispatcherHealth.observe_tick(stuck=...)``. That class was absent from the
+    live line when this suite was ported (lost at the same 2026-09-23 checkout
+    switch as the age bonus — see card t_d6ae62e7); card t_0cc0c4cb carried the
+    class and its telemetry back onto the live line, leaving its wiring into the
+    health surfaces to a platform-stl ruling. The message contract is what the
+    probe owns, so it is pinned directly here; the live health surfaces (the
+    gateway watcher and ``_cmd_daemon``) call it verbatim.
     """
     from hermes_cli import kanban_db_dispatch as kbd
 
