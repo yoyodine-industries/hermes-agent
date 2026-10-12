@@ -198,6 +198,30 @@ def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
     return tid
 
 
+def _hand_off_to_review(
+    conn: sqlite3.Connection,
+    title: str,
+    author: str = "builder",
+    reviewer: str = "reviewer",
+) -> str:
+    """Move a task into ``review`` the way the product does: an author
+    implements it and hands it to a distinct reviewer.
+
+    ``_park_in_review`` writes the status directly, leaving the card owned by
+    its own author with no implementer provenance. The dispatcher refuses to
+    spawn that shape (an author must not review its own change), so tests that
+    need review work which can actually spawn must hand off for real.
+    """
+    tid = kb.create_task(conn, title=title, assignee=author)
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    assert kb.request_review(
+        conn, tid, summary="ready", reviewer=reviewer,
+        expected_run_id=claimed.current_run_id,
+    )
+    return tid
+
+
 def test_review_lane_gets_reserved_slot_under_ready_backlog(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
@@ -211,7 +235,7 @@ def test_review_lane_gets_reserved_slot_under_ready_backlog(
     with kbc.connect() as conn:
         for title in ("ready-1", "ready-2", "ready-3"):
             kb.create_task(conn, title=title, assignee="alice")
-        review_id = _park_in_review(conn, "review-me", "reviewer")
+        review_id = _hand_off_to_review(conn, "review-me")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -226,11 +250,16 @@ def _guard_review_row(conn: sqlite3.Connection, review_id: str) -> dict:
     """Latest run ``rate_limited`` → ``check_respawn_guard`` returns a cooldown."""
     now = int(time.time())
     with kb.write_txn(conn):
+        latest = conn.execute(
+            "SELECT COALESCE(MAX(ended_at), 0) FROM task_runs WHERE task_id = ?",
+            (review_id,),
+        ).fetchone()[0]
+        ended = max(now, int(latest) + 1)
         conn.execute(
             "INSERT INTO task_runs (task_id, profile, status, outcome, "
             "started_at, ended_at) VALUES (?, 'reviewer', 'rate_limited', "
             "'rate_limited', ?, ?)",
-            (review_id, now, now),
+            (review_id, ended, ended),
         )
     assert kbd.check_respawn_guard(conn, review_id, lane="review") == "rate_limit_cooldown"
     return {"max_in_progress": 1}
@@ -260,7 +289,7 @@ def test_unspawnable_review_does_not_reserve_the_only_ready_slot(
     spawns: list = []
     with kbc.connect() as conn:
         ready_id = kb.create_task(conn, title="ready-now", assignee="alice")
-        review_id = _park_in_review(conn, "review-unspawnable", "reviewer")
+        review_id = _hand_off_to_review(conn, "review-unspawnable")
         caps = make_unspawnable(conn, review_id)
         res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns), **caps)
 
@@ -281,7 +310,7 @@ def test_unguarded_review_reserves_the_only_ready_slot(
     spawns: list = []
     with kbc.connect() as conn:
         kb.create_task(conn, title="ready-now", assignee="alice")
-        review_id = _park_in_review(conn, "review-now", "reviewer")
+        review_id = _hand_off_to_review(conn, "review-now")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1,
         )
@@ -330,7 +359,7 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     with kbc.connect() as conn:
         for title in ("ready-1", "ready-2"):
             kb.create_task(conn, title=title, assignee="alice")
-        _park_in_review(conn, "human-review", "some-human")
+        _hand_off_to_review(conn, "human-review", reviewer="some-human")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -353,7 +382,7 @@ def test_review_budget_still_bounded_by_shared_cap(
     with kbc.connect() as conn:
         kb.create_task(conn, title="ready-1", assignee="alice")
         for i in range(3):
-            _park_in_review(conn, f"review-{i}", "reviewer")
+            _hand_off_to_review(conn, f"review-{i}")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
