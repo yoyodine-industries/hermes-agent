@@ -6,7 +6,10 @@ another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_K
 file path) > ``<root>/kanban/current`` > ``default`` — but only for unfenced callers; the dispatcher
 injects these into workers, and dispatched workers (``HERMES_KANBAN_TASK``), delegated children and
 board-enumerating machine flows (gateway notifier/watcher/dispatcher, ``pin_first_board_resolution``)
-always resolve through the pin, so workers physically cannot see other boards.
+always resolve through the pin, so workers physically cannot see other boards. The model-facing tools
+(``tools/kanban_tools``) additionally REFUSE an explicit ``board=`` that resolves to a different board
+than the pinned DB (:func:`assert_board_matches_pin`) instead of silently serving the pin — a read from
+the wrong board is indistinguishable from success.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -779,6 +782,55 @@ def _explicit_board_intent_pinned() -> bool:
     return explicit_board_intent_is_pinned()
 
 
+def _slug_board_path(slug: str, default_parts: tuple[str, ...], leaf: str) -> Path:
+    """``default`` -> legacy ``<root>/<default_parts>``, else ``board_dir(slug)/leaf``."""
+    if slug == DEFAULT_BOARD:
+        return kanban_home().joinpath(*default_parts)
+    return board_dir(slug) / leaf
+
+
+def _pinned_board_slug(pinned: Path, default_parts: tuple[str, ...], leaf: str) -> Optional[str]:
+    """Best-effort slug a pinned path names (``None`` when it is not canonical)."""
+    try:
+        resolved = pinned.resolve()
+    except OSError:
+        return None
+    home = kanban_home()
+    if resolved == home.joinpath(*default_parts).resolve():
+        return DEFAULT_BOARD
+    try:
+        rel = resolved.relative_to(boards_root().resolve())
+    except ValueError:
+        return None
+    parts = rel.parts
+    return parts[0] if len(parts) == 2 and parts[1] == leaf else None
+
+
+def assert_board_matches_pin(board: Optional[str]) -> None:
+    """Refuse an explicit ``board=`` slug that resolves to a different board than the
+    pinned DB (``HERMES_KANBAN_DB``), instead of silently serving it from the pin — a
+    read from the wrong board is indistinguishable from success. No-op when the board
+    is omitted or the process is not DB-pinned. Called by the model-facing tools.
+    """
+    if not board:
+        return
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if not override:
+        return
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        return
+    pinned = Path(override).expanduser()
+    natural = _slug_board_path(slug, ("kanban.db",), "kanban.db")
+    if natural.resolve() != pinned.resolve():
+        pinned_name = _pinned_board_slug(pinned, ("kanban.db",), "kanban.db")
+        pinned_label = f"board {pinned_name!r}" if pinned_name else str(pinned)
+        raise ValueError(
+            f"refusing to target board {slug!r}: this process is pinned to "
+            f"{pinned_label} (HERMES_KANBAN_DB)"
+        )
+
+
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
@@ -790,16 +842,19 @@ def _board_path(
     watcher / dispatcher ticks) and dispatched or delegated workers keep
     resolving through the pin. Without explicit intent the ``env_var`` override
     pins the file, else legacy ``<root>/<default_parts>`` for the ``default``
-    board, else ``board_dir(slug)/leaf``."""
+    board, else ``board_dir(slug)/leaf``. Where the pin IS authoritative this
+    resolver still returns the pinned file; the model-facing tools refuse a
+    contradicting explicit ``board=`` up front via
+    :func:`assert_board_matches_pin`, so the pin never silently retargets a
+    tool call.
+    """
     pin = os.environ.get(env_var, "").strip() if env_var else ""
     slug = _explicit_board_slug(board)
     if pin and (slug is None or _explicit_board_intent_pinned()):
         return Path(pin).expanduser()
     if slug is None:
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home().joinpath(*default_parts)
-    return board_dir(slug) / leaf
+    return _slug_board_path(slug, default_parts, leaf)
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
