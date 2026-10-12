@@ -419,7 +419,13 @@ def _row_at(row: dict) -> Optional[float]:
 def _is_admitted(row: dict) -> bool:
     if row.get("admission") not in (None, "admitted"):
         return False
-    return row.get("exit") in (None, 0)
+    if row.get("exit") in (None, 0):
+        return True
+    # exit 3 is land.sh's "landed" leg (the merge is real; the flow's ``merged``
+    # transition is recorded by the next sdlc sync tick). The one sub-case that is a
+    # real provenance gap -- the merge sha's review row was NOT recorded -- rides the
+    # same row as ``row_recorded: false``, so the exit must not be read alone.
+    return row.get("exit") == 3 and row.get("row_recorded") is True
 
 
 def _is_ancestor_dest(dest: Any, artifact_path: str) -> bool:
