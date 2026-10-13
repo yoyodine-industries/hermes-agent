@@ -3685,7 +3685,10 @@ TICK_YIELD_PREFIX = "tree-skew-yield:"
 #: like the board itself. Tick-scoped on purpose, and a different record from the boot identity
 #: (this one records WHY a tick served nothing; the boot record records what the process loaded).
 TICK_YIELD_STATUS_FILENAME = "dispatcher_tick_yield.json"
-TICK_YIELD_STATUS_VERSION = 1
+#: Version 2 carries the refusal streak (`sig`/`streak`/`first_tick`/`last_tick`); version 1 held
+#: only the tick's own forensics. The reader is tolerant, so a v1 relic on disk reads as "no prior
+#: streak" and the next streak simply starts at 1.
+TICK_YIELD_STATUS_VERSION = 2
 
 #: Exactly ONE acting card, addressed to the seat that owns the bounce.
 TICK_YIELD_ACTOR_ASSIGNEE = "default"
@@ -3693,9 +3696,16 @@ TICK_YIELD_ACTOR_EVENT = "tree_skew_actor_filed"
 TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX = "tree-skew:"
 TICK_YIELD_ACTOR_TITLE = "[guard] dispatcher is serving a mixed revision; refusing to spawn"
 
-#: The window the actor's idempotency key is bucketed by -- one hour, the same window the
-#: crash-sweep guard's actor uses. N ticks inside one window resolve to ONE key.
-TICK_YIELD_WINDOW_SECONDS = 3600
+#: Consecutive refused ticks for ONE skew signature before the guard ACTS. One refusal is normal
+#: churn (a tree moves under a daemon mid-write); three in a row is a stall. Ruling t_eaadb60e
+#: (2026-10-11): ~3 minutes at the dispatcher's one-refusal-per-minute cadence.
+TICK_YIELD_ACTOR_THRESHOLD = 3
+
+#: The ops board the acting card is filed on. The dispatcher may be ticking ANY board, but the ops
+#: seat's carrier board is ONE, and filing on the ticked board would mint one card per board for a
+#: single fleet-wide stall (different boards are different DBs, so the idempotency key cannot span
+#: them). Overridable so an acceptance surface can exercise the path without touching the fleet.
+TICK_YIELD_ACTOR_BOARD = os.environ.get("HERMES_KANBAN_TICK_YIELD_BOARD", "migrations")
 
 
 class DispatcherTickYielded(RuntimeError):
@@ -3782,8 +3792,38 @@ def tick_yield_status_path(path: Any = None) -> Path:
     return _kb.kanban_home() / "kanban" / TICK_YIELD_STATUS_FILENAME
 
 
+def _yield_signature(yielded: DispatcherTickYielded) -> str:
+    """The STALL's identity: the tree content this process IMPORTED, plus its pid.
+
+    The disk half is deliberately NOT in the signature. Bytes landing under a frozen process
+    change the disk side without ending the stall, so a disk-sensitive signature would reset the
+    streak on every landing and file a second card mid-stall. The disk fingerprint is EVIDENCE
+    (status record + card body), never identity.
+
+    ``boot_pid`` stays IN: a process that boots AFTER a reload and is AGAIN skewed is a genuinely
+    new stall and may file its own card.
+    """
+    return f"{yielded.boot_fingerprint}:{yielded.boot_pid}"
+
+
+def _read_tick_yield_status(path) -> dict:
+    """The status record as a dict, or ``{}``. Tolerant by design: an unreadable record is "no
+    prior streak", never a refusal -- a guard that stopped the fleet on a transient IO error would
+    be worse than the condition it watches."""
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
 def _record_tick_yield(yielded: DispatcherTickYielded, *, board: Optional[str] = None) -> str:
-    """Write the NON-GREEN status record. Returns the path (or an ``unwritable`` note).
+    """Write the NON-GREEN status record, carrying the REFUSAL STREAK.
+
+    How many consecutive refused ticks this same frozen process has produced for the same
+    signature, and the window's first and last tick. Corroboration only -- the streak is the
+    dispatcher's OWN refusal count, never the reload state row's counter (whose ``consecutive: 10``
+    sat beside ``act: none, card: <closed>``).
 
     Best-effort by design -- an unwritable kanban home must not take the tick down -- but never
     silent: the refusal has already been logged loudly by the caller, and the return value is
@@ -3791,6 +3831,20 @@ def _record_tick_yield(yielded: DispatcherTickYielded, *, board: Optional[str] =
     could not be written.
     """
     path = tick_yield_status_path()
+    prior = _read_tick_yield_status(path)
+    now = int(time.time())
+    sig = _yield_signature(yielded)
+    same = (
+        bool(prior.get("yielded"))
+        and prior.get("sig") == sig
+        and int(prior.get("pid") or -1) == int(yielded.boot_pid)
+    )
+    if same:
+        streak = int(prior.get("streak") or 0) + 1
+        first_tick = int(prior.get("first_tick") or now)
+    else:
+        streak = 1
+        first_tick = now
     payload = {
         "version": TICK_YIELD_STATUS_VERSION,
         "yielded": True,
@@ -3801,7 +3855,13 @@ def _record_tick_yield(yielded: DispatcherTickYielded, *, board: Optional[str] =
         "disk_label": yielded.disk_label,
         "pid": yielded.boot_pid,
         "board": board,
-        "recorded_at": int(time.time()),
+        # --- the streak half (version 2) ---
+        "sig": sig,
+        "streak": streak,
+        "first_tick": first_tick,
+        "last_tick": now,
+        "threshold": TICK_YIELD_ACTOR_THRESHOLD,
+        "recorded_at": now,
     }
     try:
         from utils import atomic_json_write
@@ -3848,6 +3908,39 @@ def _clear_tick_yield_status() -> None:
         pass
 
 
+def _last_spawned_line(board: Optional[str], *, limit_bytes: int = 2_000_000) -> str:
+    """The last successful dispatcher tick summary for `board`, or a NAMED reason there is none.
+
+    The ruling's own evidence form: `kanban dispatcher [<board>]: spawned=1 reclaimed=0 ...`
+    in `<HERMES_HOME>/logs/gateway.log`. Read from the TAIL of the file only (`limit_bytes`) so the
+    read is O(tick), never O(log). An unreadable/absent log answers with the reason, never a silent
+    empty string -- a card that omits this line would read as "nothing was ever spawned", which is
+    a different claim from "I could not read the log".
+    """
+    import re
+
+    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    path = Path(home) / "logs" / "gateway.log"
+    board_name = re.escape(str(board or ""))
+    pattern = re.compile(rf"kanban dispatcher \[{board_name}\]: spawned=")
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > limit_bytes:
+                fh.seek(size - limit_bytes)
+                fh.readline()  # drop the partial first line
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError as exc:
+        return f"(gateway log unreadable: {exc})"
+    last = ""
+    for line in tail.splitlines():
+        if pattern.search(line) and "spawned=" in line:
+            last = line.strip()
+    if not last:
+        return "(no successful spawn line for this board in the log tail)"
+    return last
+
+
 def _tree_skew_subject_root() -> Path:
     """The tree the gate reasoned about: the boot record's tree when it names one, else ours.
 
@@ -3871,25 +3964,47 @@ def _tick_yield_actor_body(
     *,
     board: Optional[str],
     status_path: str,
+    streak: int = 0,
+    first_tick: int = 0,
+    last_tick: int = 0,
     tree: Optional[Path] = None,
+    filed_on: Optional[str] = None,
 ) -> str:
     """The acting card's body: deterministic evidence, no model, no prose to interpret."""
     tree = Path(tree) if tree is not None else _tree_skew_subject_root()
-    return "\n".join([
+    import datetime
+
+    def _iso(epoch):
+        try:
+            return datetime.datetime.fromtimestamp(int(epoch)).isoformat(timespec="seconds")
+        except (TypeError, ValueError, OSError):
+            return "?"
+
+    lines = [
         "## Observed",
         "",
         f"`{TICK_YIELD_PREFIX}` the kanban dispatcher is refusing to spawn: the tree it IMPORTED",
         "no longer matches the checkout on disk, so every worker it spawns would run a mixed",
         "revision. Filed by the dispatcher's tick skew gate -- deterministic, no model consulted.",
         "",
+        "## The refusal streak",
+        "",
+        f"- consecutive refused ticks: **{streak}** (act threshold {TICK_YIELD_ACTOR_THRESHOLD})",
+        f"- first tick: `{_iso(first_tick)}` (epoch {int(first_tick)})",
+        f"- last tick: `{_iso(last_tick)}` (epoch {int(last_tick)})",
+        f"- frozen process pid: {yielded.boot_pid}",
+        "",
         "## The measurement",
         "",
-        f"- boot content fingerprint: `{yielded.boot_fingerprint}` (label `{yielded.boot_label}`)",
-        f"- disk content fingerprint: `{yielded.disk_fingerprint}` (label `{yielded.disk_label}`)",
-        f"- frozen process pid: {yielded.boot_pid}",
+        f"- imported tree content (what the running process loaded): `{yielded.boot_fingerprint}`"
+        f" (label `{yielded.boot_label}`)",
+        f"- on-disk checkout (what the tree holds now): `{yielded.disk_fingerprint}`"
+        f" (label `{yielded.disk_label}`)",
         f"- tree: `{tree}`",
-        f"- board: `{board or 'unknown'}`",
+        f"- board refused: `{board or 'unknown'}`",
+        f"- card filed on: `{filed_on or board or 'unknown'}`",
         f"- non-green status record: `{status_path}`",
+        f"- last successful spawn: `{_last_spawned_line(board)}`",
         "",
         "## Why this is not the ref-only signal",
         "",
@@ -3898,15 +4013,73 @@ def _tick_yield_actor_body(
         "progress under an unchanged HEAD -- measured live 2026-10-10 at 120 dirty paths with",
         "`detect_code_skew() == None`. The signal above is content, so that window is covered.",
         "",
-        "## What closes it",
+        "## DEADLINE -- 30 minutes",
         "",
-        "Reload the gateway onto the current checkout (ops-seat hand bounce) -- the live tree only",
-        "loads at a restart. The gate clears itself on the first tick that serves normally.",
+        "This card IS the deadline's carrier: a `tree-skew-yield` refusal is MONOTONIC (it clears",
+        "only on a reload) and it stops dispatch for every lane on this host. Take the reload within",
+        "30 minutes of the last tick above, or comment why not.",
+        "",
+        "## What closes it (the remedy)",
+        "",
+        "Reload the gateway onto the current checkout: the sanctioned door is the ops seat's",
+        "`bounce_gateway` verb (`default` / `platform-stl`), with `force=true` and a note when the",
+        "lull gate cannot clear -- the card-worker hold is ADVISORY and must never gate a service",
+        "restore. The hand form is the canonical planned-stop marker for the pid plus ONE SIGTERM",
+        "(launchd KeepAlive respawns it); a hand reload must write its `bounces.jsonl` row through",
+        "the deploy seam or it is unattributable. The gate clears itself on the first tick that",
+        "serves normally.",
         "",
         "```",
         *_git_status_lines(tree),
         "```",
-    ])
+    ]
+    return "\n".join(lines)
+
+
+def _tick_yield_actor_priority(*, title: str, body: str, board: str) -> tuple[int, str]:
+    """(priority, note) asked of the LADDER, never typed.
+
+    Resolved through the board's OWN priority policy (`board.json:priority_policy`), loaded the
+    same way the create door loads it, with GATE_ASK (0): the card is born where the ladder places
+    it. An unavailable ladder is RECORDED, never invented away -- the card is still filed, at the
+    kernel default, and the note rides into the card body.
+    """
+    try:
+        from hermes_cli import kanban_priority_policy as _pol
+
+        meta = _kb._board_meta_for(board) or {}
+        verdict = _pol.priority_for_create(
+            0, assignee=TICK_YIELD_ACTOR_ASSIGNEE, board=board, title=title, body=body,
+            spec=meta.get("priority_policy"),
+        )
+        if verdict is None:
+            return 0, (f"(no priority policy on board {board}: filed at the kernel default; "
+                       f"the board sweep will band it)")
+        return int(verdict.applied), ""
+    except Exception as exc:
+        return 0, f"(the ladder could not be read: {exc.__class__.__name__}: {exc})"
+
+
+def _ops_board_connection(fallback_conn: sqlite3.Connection):
+    """(conn, board, close_it) for the board the acting card rides.
+
+    The ops board when it can be opened, else the board that was ticking -- and the caller SAYS
+    which, in the card, so a fallback is visible rather than silent. The fallback's slug is read
+    back off the connection (never assumed) so the card cannot name a board it is not on.
+    """
+    try:
+        conn = _kbc.connect(board=TICK_YIELD_ACTOR_BOARD)
+        return conn, TICK_YIELD_ACTOR_BOARD, True
+    except Exception as exc:
+        _kb._log.warning(
+            "kanban dispatcher: cannot open the ops board %s for the tree-skew actor (%s); "
+            "filing on the board that ticked", TICK_YIELD_ACTOR_BOARD, exc,
+        )
+        try:
+            fallback_board = _kb.board_for_connection(fallback_conn)
+        except Exception:
+            fallback_board = None
+        return fallback_conn, fallback_board, False
 
 
 def _file_tick_yield_actor(
@@ -3915,57 +4088,85 @@ def _file_tick_yield_actor(
     *,
     board: Optional[str] = None,
     status_path: str = "",
+    streak: int = 0,
+    first_tick: int = 0,
+    last_tick: int = 0,
     now: Optional[int] = None,
 ) -> Optional[str]:
-    """File EXACTLY ONE acting card for this frozen process, idempotently.
+    """File the ACTING card for this stall, idempotently and status-aware.
 
-    The idempotency key is ``tree-skew:<boot-fingerprint>:<boot-pid>:<window-start>``. The boot
-    half is stable for the life of the frozen process, so N ticks on one skewed tree can only
-    ever resolve to ONE card -- while a process that boots AFTER a fix is a different pid and may
-    file its own if it, too, is skewed. Best-effort: a board that refuses the write is logged with
-    the key it could not file and never takes the tick down.
+    Key shape: ``tree-skew:<signature>:<occurrence>``  (signature = DEC-1).
+
+    * a LIVE carrier (status not in ('done','archived')) with this signature's prefix absorbs the
+      repeat -- a long stall files ONE card, never one per tick;
+    * a CLOSED last carrier is the RE-OPEN LEG: a new card is filed under a fresh ordinal, because
+      a fixed key would be handed straight back by the kernel's own idempotency door (the exact
+      defect that cost 1h38m: three closed guard cards absorbed every refusal of the recurrence).
+
+    Best-effort: a board that refuses the write is logged with the key it could not file and never
+    takes the tick down.
     """
-    moment = int(time.time() if now is None else now)
-    window_start = moment // TICK_YIELD_WINDOW_SECONDS * TICK_YIELD_WINDOW_SECONDS
-    board_key = _board_key(conn, board)
-    key = (
-        f"{TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{yielded.boot_fingerprint}"
-        f":{yielded.boot_pid}:{window_start}"
-    )
+    sig = _yield_signature(yielded)
+    prefix = f"{TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{sig}"
+    filed_on_conn, filed_on, close_it = _ops_board_connection(conn)
     try:
-        existing = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (key,),
+        existing = filed_on_conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE ? || ':%' "
+            "AND status NOT IN ('done', 'archived') ORDER BY created_at DESC LIMIT 1",
+            (prefix,),
         ).fetchone()
         if existing is not None:
             return existing["id"]
+        used = filed_on_conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ? || ':%'", (prefix,),
+        ).fetchone()[0]
+        key = f"{prefix}:{int(used) + 1}"
+        priority, ladder_note = _tick_yield_actor_priority(
+            title=TICK_YIELD_ACTOR_TITLE, body="", board=filed_on or board or "",
+        )
+        body = _tick_yield_actor_body(
+            yielded, board=board, status_path=status_path, streak=streak,
+            first_tick=first_tick, last_tick=last_tick, filed_on=filed_on,
+        )
+        if ladder_note:
+            body += f"\n\n_priority note: {ladder_note}_"
         actor_id = _kb.create_task(
-            conn,
+            filed_on_conn,
             title=TICK_YIELD_ACTOR_TITLE,
-            body=_tick_yield_actor_body(yielded, board=board_key, status_path=status_path),
+            body=body,
             assignee=TICK_YIELD_ACTOR_ASSIGNEE,
             created_by="kanban-dispatcher",
+            priority=priority,
             idempotency_key=key,
         )
-        with _kb.write_txn(conn):
+        with _kb.write_txn(filed_on_conn):
             _kb._append_event(
-                conn, actor_id, TICK_YIELD_ACTOR_EVENT,
+                filed_on_conn, actor_id, TICK_YIELD_ACTOR_EVENT,
                 {
                     "boot_fingerprint": yielded.boot_fingerprint,
                     "disk_fingerprint": yielded.disk_fingerprint,
                     "boot_pid": yielded.boot_pid,
-                    "window_start": window_start,
+                    "sig": sig,
+                    "streak": int(streak),
+                    "first_tick": int(first_tick),
+                    "last_tick": int(last_tick or (time.time() if now is None else now)),
                     "status_record": status_path,
-                    "board": board_key,
+                    "board": board,
+                    "filed_on": filed_on,
                 },
             )
         return actor_id
     except Exception as exc:
         _kb._log.warning(
-            "kanban dispatcher: could not file the tree-skew actor (key=%s): %s", key, exc,
+            "kanban dispatcher: could not file the tree-skew actor (prefix=%s): %s", prefix, exc,
         )
         return None
+    finally:
+        if close_it:
+            try:
+                filed_on_conn.close()
+            except Exception:
+                pass
 
 
 def _tick_refused_for_tree_skew(
@@ -3975,11 +4176,19 @@ def _tick_refused_for_tree_skew(
     board: Optional[str] = None,
     dry_run: bool = False,
 ) -> DispatchResult:
-    """The whole non-green path for a refused tick: loud line, status record, ONE actor, result."""
+    """The whole non-green path for a refused tick: loud line, status record, and -- at the
+    THRESHOLD, not before -- ONE acting card on the ops board. Returns the non-green result."""
     status_path = "(dry run: nothing written)"
     if not dry_run:
         status_path = _record_tick_yield(yielded, board=board)
-        _file_tick_yield_actor(conn, yielded, board=board, status_path=status_path)
+        state = _read_tick_yield_status(tick_yield_status_path())
+        streak = int(state.get("streak") or 0)
+        if streak >= TICK_YIELD_ACTOR_THRESHOLD:
+            _file_tick_yield_actor(
+                conn, yielded, board=board, status_path=status_path, streak=streak,
+                first_tick=int(state.get("first_tick") or 0),
+                last_tick=int(state.get("last_tick") or 0),
+            )
     logger.error("kanban dispatcher: %s (status record: %s)", yielded, status_path)
     return DispatchResult(tick_yielded=str(yielded))
 
