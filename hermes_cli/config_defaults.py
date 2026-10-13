@@ -2284,14 +2284,21 @@ DEFAULT_CONFIG = {
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,
-        # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
-        # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
-        # deleted AND freelist/page_count > 25%.
-        # SQLite does not reclaim disk space on DELETE — freed pages are just reused on subsequent INSERTs —
-        # so without VACUUM the file stays bloated even after pruning. See #54189.
+        # Reclaim space after a prune that deleted rows (SQLite never reclaims disk on DELETE).
+        # A store NOT already in auto_vacuum=INCREMENTAL is converted ONCE (the only full
+        # rewrite this path ever issues); every later pass drains bounded
+        # `PRAGMA incremental_vacuum(N)` chunks, holding the write lock for tens of ms each
+        # instead of for a whole multi-GB rewrite. See #54189 and card t_f8db44f6.
         "vacuum_after_prune": True,
-        # Minimum days between VACUUM rewrites; pruning keeps its normal cadence.
-        "min_vacuum_interval_days": 30,
+        # Minimum days between reclaim passes; pruning keeps its normal cadence. 1 = every day
+        # auto-maintenance runs. The pass is bounded (budgets below), so cadence is the lever.
+        "min_vacuum_interval_days": 1,
+        # Pages bound handed to each `PRAGMA incremental_vacuum(N)` chunk.
+        "vacuum_chunk_pages": 512,
+        # Per-pass ceiling on pages returned to the file system (~16 MiB at 4 KiB pages).
+        "vacuum_max_pages_per_pass": 4096,
+        # Per-pass wall-clock ceiling in seconds; the pass stops here even mid-freelist.
+        "vacuum_max_seconds_per_pass": 5.0,
         # Minimum hours between auto-maintenance runs (tracked in state.db state_meta, shared across
         # processes).
         "min_interval_hours": 24,

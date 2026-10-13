@@ -58,8 +58,11 @@ def _run_state_db_auto_maintenance(session_db) -> None:
         session_db.maybe_auto_prune_and_vacuum(
             retention_days=int(cfg.get("retention_days", 90)),
             min_interval_hours=int(cfg.get("min_interval_hours", 24)),
-            min_vacuum_interval_days=int(cfg.get("min_vacuum_interval_days", 30)),
+            min_vacuum_interval_days=int(cfg.get("min_vacuum_interval_days", 1)),
             vacuum=bool(cfg.get("vacuum_after_prune", True)),
+            vacuum_chunk_pages=int(cfg.get("vacuum_chunk_pages", 512)),
+            vacuum_max_pages_per_pass=int(cfg.get("vacuum_max_pages_per_pass", 4096)),
+            vacuum_max_seconds_per_pass=float(cfg.get("vacuum_max_seconds_per_pass", 5.0)),
             sessions_dir=_hermes_home_maint / "sessions",
         )
     except Exception as exc:

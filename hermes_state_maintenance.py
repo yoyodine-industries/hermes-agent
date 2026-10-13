@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_state_common import (
-    AUTO_VACUUM_MIN_FREELIST_RATIO, _id_chunks, _non_continuation_child_sql, _placeholders, _sql_session_last_active,
+    AUTO_VACUUM_MIN_FREELIST_RATIO, RECLAIM_CHUNK_PAGES, RECLAIM_MAX_PAGES_PER_PASS,
+    RECLAIM_MAX_SECONDS_PER_PASS, RECLAIM_MIN_FREELIST_PAGES, RECLAIM_MIGRATE_MIN_FREELIST_RATIO,
+    _id_chunks, _non_continuation_child_sql, _placeholders, _sql_session_last_active,
     escape_like as _escape_like
 )
 from hermes_startup_watchdog import report_startup_progress
@@ -389,14 +391,165 @@ class SessionMaintenanceMixin:
         except Exception as exc:
             logger.debug(fail_msg, exc)
 
-    def vacuum(self) -> int:
+    # ── bounded incremental reclaim (card t_f8db44f6) ─────────────────────────
+
+    def _auto_vacuum_mode(self) -> Optional[int]:
+        """``PRAGMA auto_vacuum`` (0 = NONE, 1 = FULL, 2 = INCREMENTAL); None = unreadable.
+
+        A ``PRAGMA auto_vacuum = INCREMENTAL`` takes effect only at the NEXT VACUUM, so this
+        reports the header — i.e. whether the store has actually been MIGRATED — not intent."""
+        values = self._page_pragmas(("auto_vacuum",), "Could not read auto_vacuum mode: %s")
+        return None if values is None else values[0]
+
+    def _freelist_pages(self) -> tuple[int, int]:
+        """``(page_size, freelist_count)`` over the connection; ``(0, 0)`` when unreadable."""
+        values = self._page_pragmas(("page_size", "freelist_count"), "Could not read freelist pages: %s")
+        return (0, 0) if values is None else (values[0], values[1])
+
+    def incremental_vacuum(
+        self, *, chunk_pages: int = RECLAIM_CHUNK_PAGES, max_pages: int = RECLAIM_MAX_PAGES_PER_PASS,
+        max_seconds: float = RECLAIM_MAX_SECONDS_PER_PASS,
+        min_freelist_pages: int = RECLAIM_MIN_FREELIST_PAGES,
+    ) -> dict[str, Any]:
+        """Bounded ``PRAGMA incremental_vacuum`` drain.  NEVER issues a VACUUM.
+
+        The store must already be ``auto_vacuum = INCREMENTAL`` (see :meth:`reclaim` for the
+        one-time migration); on a NONE store the pragma is a no-op and running it anyway would
+        report a drain that never happened.
+
+        Each chunk is its own implicit transaction under ``self._lock``, so the write lock is
+        released between chunks and a live writer interleaves instead of waiting behind a
+        whole-file rewrite.  One statement returns at most one page to the file system
+        (measured on SQLite 3.54.0 — the N argument is a bound, not a batch), so the drain
+        loops.  It stops at ``max_pages`` freed, ``max_seconds`` elapsed, an empty freelist or
+        a stalled pass — whichever comes first.  ``max_lock_hold_ms`` is the longest single
+        write-lock hold observed, which is the number this exists to bound.
+        """
+        out: dict[str, Any] = {
+            "ran": False, "pages": 0, "bytes": 0, "chunks": 0, "max_lock_hold_ms": 0.0,
+            "page_size": 0, "freelist_before": 0, "freelist_after": 0, "stopped": "noop",
+        }
+        mode = self._auto_vacuum_mode()
+        if mode is None:
+            out["stopped"] = "unreadable"
+            return out
+        if mode != 2:
+            out["stopped"] = "not-incremental"
+            return out
+        page_size, freelist = self._freelist_pages()
+        out["page_size"] = page_size
+        out["freelist_before"] = out["freelist_after"] = freelist
+        # The pass is selected: report it as run even when the floor below makes it a no-op.
+        out["ran"] = True
+        if freelist < max(1, int(min_freelist_pages)):
+            out["stopped"] = "below-floor"
+            return out
+        freed = 0
+        deadline = time.monotonic() + max(0.0, float(max_seconds))
+        stopped = "pages"
+        while freed < max_pages:
+            if time.monotonic() >= deadline:
+                stopped = "seconds"
+                break
+            want = min(int(chunk_pages), int(max_pages) - freed)
+            with self._lock:
+                if self._conn is None:
+                    self._reopen_after_close_locked(context="write")
+                self._raise_if_db_replaced()
+                before_pages = int(self._conn.execute("PRAGMA page_count").fetchone()[0])
+                started = time.monotonic()
+                self._conn.execute(f"PRAGMA incremental_vacuum({int(want)})")
+                hold_ms = (time.monotonic() - started) * 1000.0
+                after_pages = int(self._conn.execute("PRAGMA page_count").fetchone()[0])
+            out["chunks"] += 1
+            out["max_lock_hold_ms"] = max(out["max_lock_hold_ms"], hold_ms)
+            gained = before_pages - after_pages
+            if gained <= 0:
+                stopped = "drained"
+                break
+            freed += gained
+        _, out["freelist_after"] = self._freelist_pages()
+        out["pages"] = freed
+        out["bytes"] = freed * page_size
+        out["stopped"] = stopped
+        return out
+
+    def reclaim(
+        self, *, min_vacuum_freelist_ratio: float = RECLAIM_MIGRATE_MIN_FREELIST_RATIO,
+        chunk_pages: int = RECLAIM_CHUNK_PAGES, max_pages: int = RECLAIM_MAX_PAGES_PER_PASS,
+        max_seconds: float = RECLAIM_MAX_SECONDS_PER_PASS,
+    ) -> dict[str, Any]:
+        """Bounded space reclaim for the automatic maintenance path.
+
+        ``PRAGMA auto_vacuum`` decides the branch:
+
+        * NOT INCREMENTAL — set the header flag and run ONE ``VACUUM`` to convert the file.
+          That rewrite is exclusive, so it keeps the freelist-ratio admission the full-VACUUM
+          path always had (``None`` ratio = unreadable pragmas, fall back to the time
+          throttle).  It is issued ONCE per store and never again: the next pass reads
+          INCREMENTAL and takes the drain branch.
+        * INCREMENTAL — drain bounded chunks via :meth:`incremental_vacuum`.  No VACUUM is ever
+          issued again, so the store is never rewritten whole.
+
+        The automatic path checkpoints PASSIVE only, never TRUNCATE (#110054).  The caller owns
+        the holder gate and the time throttle; this method owns the mechanics.
+        """
+        out: dict[str, Any] = {
+            "ran": False, "migrated": False, "reclaimed_bytes": 0, "reclaimed_pages": 0,
+            "max_lock_hold_ms": 0.0, "mode": None, "mode_after": None,
+            "freelist_ratio": None, "stopped": None,
+        }
+        self._raise_if_db_corrupt()
+        mode = self._auto_vacuum_mode()
+        out["mode"] = mode
+        if mode is None:
+            out["stopped"] = "unreadable"
+            return out
+        if mode != 2:
+            ratio = self._freelist_ratio()
+            out["freelist_ratio"] = ratio
+            if ratio is not None and ratio <= min_vacuum_freelist_ratio:
+                out["stopped"] = "freelist-ratio"
+                return out
+            before = self.logical_size_bytes() or 0
+            with self._lock:
+                if self._conn is None:
+                    self._reopen_after_close_locked(context="write")
+                self._raise_if_db_replaced()
+                # The pragma only lands at the next VACUUM, so a failed rewrite below leaves
+                # the store in NONE and the migration is simply retried on the next pass.
+                self._conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            started = time.monotonic()
+            self.vacuum(truncate_checkpoint=False)
+            out["max_lock_hold_ms"] = (time.monotonic() - started) * 1000.0
+            out["migrated"] = True
+            out["ran"] = True
+            out["stopped"] = "migrated"
+            out["reclaimed_bytes"] = max(0, before - (self.logical_size_bytes() or before))
+            out["mode_after"] = self._auto_vacuum_mode()
+            return out
+        drain = self.incremental_vacuum(
+            chunk_pages=chunk_pages, max_pages=max_pages, max_seconds=max_seconds)
+        out.update({
+            "ran": drain["ran"], "reclaimed_pages": drain["pages"], "reclaimed_bytes": drain["bytes"],
+            "max_lock_hold_ms": drain["max_lock_hold_ms"], "stopped": drain["stopped"],
+        })
+        self._try_checkpoint("PASSIVE", "WAL checkpoint (PASSIVE) after incremental reclaim failed: %s")
+        out["mode_after"] = self._auto_vacuum_mode()
+        return out
+
+    def vacuum(self, *, truncate_checkpoint: bool = True) -> int:
         """VACUUM to reclaim space after large deletes (SQLite never shrinks on its own).
         Takes an exclusive lock — callers must ensure no other writers are active.  FTS5
         segments are merged first (:meth:`optimize_fts`) so their pages are reclaimed too;
         returns the number of FTS indexes optimized (0 on merge failure / no FTS). A quarantined
         handle (corrupt image, replaced file, lost WAL generation) raises before any rewrite: a
         VACUUM reads every page and commits the result back, turning contained damage into an
-        amplified one (#105670). Same guard ``_execute_write`` applies to every write."""
+        amplified one (#105670). Same guard ``_execute_write`` applies to every write.
+
+        *truncate_checkpoint* defaults to True for the manual command. The AUTOMATIC path
+        passes False: a TRUNCATE reset retires the WAL generation a sibling writer still holds,
+        which is the state every agent then refuses turns in (#110054). See :meth:`reclaim`."""
         self._raise_if_db_corrupt()
         optimized = 0
         try:
@@ -411,28 +564,41 @@ class SessionMaintenanceMixin:
             # process; a TRUNCATE reset here would race a live gateway writer.
             self._try_checkpoint("PASSIVE", "WAL checkpoint (PASSIVE) before VACUUM failed: %s")
             self._conn.execute("VACUUM")
-            # VACUUM rewrites every page THROUGH the WAL; without this TRUNCATE a 3 GB DB leaves a 3 GB -wal.
-            self._try_checkpoint("TRUNCATE", "WAL checkpoint (TRUNCATE) after VACUUM failed: %s")
-            # TRUNCATE may replace the WAL inode; adopt the new sidecars so the
-            # write-path generation guard does not halt this connection.
-            self._record_db_file_identity()
+            if truncate_checkpoint:
+                # VACUUM rewrites every page THROUGH the WAL; without this TRUNCATE a 3 GB DB leaves a 3 GB -wal.
+                self._try_checkpoint("TRUNCATE", "WAL checkpoint (TRUNCATE) after VACUUM failed: %s")
+                # TRUNCATE may replace the WAL inode; adopt the new sidecars so the
+                # write-path generation guard does not halt this connection. Not re-recorded on
+                # the automatic path: a PASSIVE checkpoint of ours did not replace the inode, so
+                # a fresh identity here could only mask a FOREIGN replacement.
+                self._record_db_file_identity()
         return optimized
 
     def maybe_auto_prune_and_vacuum(
         self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True,
-        sessions_dir: Optional[Path] = None, min_vacuum_interval_days: int = 30,
+        sessions_dir: Optional[Path] = None, min_vacuum_interval_days: int = 1,
         min_vacuum_freelist_ratio: float = AUTO_VACUUM_MIN_FREELIST_RATIO,
+        vacuum_chunk_pages: int = RECLAIM_CHUNK_PAGES,
+        vacuum_max_pages_per_pass: int = RECLAIM_MAX_PAGES_PER_PASS,
+        vacuum_max_seconds_per_pass: float = RECLAIM_MAX_SECONDS_PER_PASS,
     ) -> dict[str, Any]:
         """Idempotent startup auto-maintenance (never raises): prune inactive sessions, reap stale open
-        state-owned rows, optional VACUUM.  Runs at most once per ``min_interval_hours``; VACUUM has its own
-        ``min_vacuum_interval_days`` throttle and also requires ``freelist_count / page_count`` >
-        ``min_vacuum_freelist_ratio`` so a small prune on a dense multi-GB database never triggers a full
-        rewrite.  Stale-open reconciliation: cron/kanban/subagent/one-shot CLI rows never set ``ended_at``
+        state-owned rows, optional space reclaim.  Runs at most once per ``min_interval_hours``; the
+        reclaim has its own ``min_vacuum_interval_days`` throttle (default 1 — the stored bytes must
+        actually come back, and a bounded pass is cheap enough to run every day).  Stale-open
+        reconciliation: cron/kanban/subagent/one-shot CLI rows never set ``ended_at``
         when their process dies and prune only deletes ended rows, so after pruning, open rows from
         :attr:`_AUTO_PRUNE_STALE_OPEN_SOURCES` older than ``retention_days`` are closed
         (``startup_orphan_reap``); they stay resumable and age from their close.  Returns ``{"skipped",
-        "pruned", "closed", "vacuumed"}`` plus ``"freelist_ratio"`` when a VACUUM was considered and
-        ``"error"`` on failure.
+        "pruned", "closed", "vacuumed"}`` plus ``"reclaimed_bytes"`` / ``"max_lock_hold_ms"`` /
+        ``"reclaim_mode"`` / ``"freelist_ratio"`` when a reclaim was attempted, and ``"error"`` on
+        failure.
+
+        The reclaim itself is :meth:`reclaim`: a store already in ``auto_vacuum = INCREMENTAL``
+        drains bounded chunks (tens of ms of write lock each); a store still in NONE gets ONE
+        migration ``VACUUM`` — admitted by the same holder scan and ``freelist_count /
+        page_count`` > ``min_vacuum_freelist_ratio`` gate a full rewrite always needed, so a small
+        prune on a dense multi-GB database never pays for one — and is never rewritten whole again.
 
         Records the last run timestamp in state_meta so subsequent calls within ``min_interval_hours``
         no-op. Designed to be called once at startup from long-lived entrypoints (CLI, gateway, cron
@@ -477,43 +643,63 @@ class SessionMaintenanceMixin:
                 respect_gateway_heartbeats=False,  # state-owned lifecycles, not gateway heartbeats
             )
             result["closed"] = len(closed)
-            # VACUUM only if rows were freed, the time throttle passed AND the
-            # freelist ratio passed — it holds an exclusive lock for a full rewrite.
+            # Reclaim only if rows were freed AND the time throttle passed.  The store's own
+            # auto_vacuum mode decides the admission:
+            #  * INCREMENTAL — bounded chunks, each holding the write lock for tens of ms and a
+            #    pass that stops on a budget, so a live writer interleaves instead of waiting
+            #    behind a rewrite. No holder gate, no freelist gate;
+            #  * NONE — ONE exclusive rewrite converts the file. That is the admission
+            #    `hermes sessions optimize` runs, so it keeps its holder gate and its freelist
+            #    gate. It is the LAST whole-file rewrite this path issues for the store.
             since_vacuum = _seconds_since(now, self.get_meta("last_vacuum"))
             vacuum_due = since_vacuum is None or since_vacuum >= min_vacuum_interval_days * 86400
             if vacuum and pruned > 0 and vacuum_due:
-                result["freelist_ratio"] = ratio = self._freelist_ratio()
-                # Same admission `hermes sessions optimize` runs: VACUUM plus the TRUNCATE checkpoint
-                # retire the WAL generation a sibling writer (gateway, Desktop, dashboard, cron) still
-                # holds, and that is exactly the state every agent then refuses turns in (#110054).
-                # The foreign scan skips our own pid, so it is paired with the in-process arm: under
-                # one multiplexed process another live SessionDB generation for this same path is
-                # just as much a holder as another process would be.
-                # Automatic maintenance only ever SKIPS — a turn is never refused over housekeeping.
-                from hermes_state_holders import (
-                    foreign_state_db_holders, in_process_state_db_holders)
-                holders = (foreign_state_db_holders(self.db_path)
-                           + in_process_state_db_holders(self.db_path, exclude=self))
+                needs_migration = self._auto_vacuum_mode() != 2
+                holders: list = []
+                ratio: Optional[float] = None
+                if needs_migration:
+                    result["freelist_ratio"] = ratio = self._freelist_ratio()
+                    # Same admission `hermes sessions optimize` runs: VACUUM plus the TRUNCATE checkpoint
+                    # retire the WAL generation a sibling writer (gateway, Desktop, dashboard, cron) still
+                    # holds, and that is exactly the state every agent then refuses turns in (#110054).
+                    # The foreign scan skips our own pid, so it is paired with the in-process arm: under
+                    # one multiplexed process another live SessionDB generation for this same path is
+                    # just as much a holder as another process would be.
+                    # Automatic maintenance only ever SKIPS — a turn is never refused over housekeeping.
+                    from hermes_state_holders import (
+                        foreign_state_db_holders, in_process_state_db_holders)
+                    holders = (foreign_state_db_holders(self.db_path)
+                               + in_process_state_db_holders(self.db_path, exclude=self))
                 if holders:
                     result["vacuum_skipped_holders"] = len(holders)
                     logger.debug(
                         "state.db auto-maintenance: skipping VACUUM, %d other process(es) hold the "
                         "store or a WAL sidecar (%s)",
                         len(holders), ", ".join(f"{pid}:{target}" for pid, target in holders[:3]))
-                elif ratio is None or ratio > min_vacuum_freelist_ratio:
-                    try:
-                        # VACUUM rewrites every page with ~zero CPU: renew the lease here so
-                        # a multi-minute rewrite on a large state.db never outlives the clamp.
-                        report_startup_progress(900.0, phase="state_db_auto_vacuum")
-                        self.vacuum()
-                        result["vacuumed"] = True
-                        self.set_meta("last_vacuum", str(now))
-                    except Exception as exc:
-                        logger.warning("state.db VACUUM failed: %s", exc)
                 else:
-                    logger.debug("state.db auto-maintenance: skipping VACUUM, only "
-                                 "%.1f%% of pages reclaimable (threshold %.0f%%)",
-                                 ratio * 100.0, min_vacuum_freelist_ratio * 100.0)
+                    try:
+                        # Reclaim is I/O-bound with ~zero CPU: renew the lease here so a slow
+                        # migration rewrite on a large state.db never outlives the clamp.
+                        report_startup_progress(900.0, phase="state_db_auto_vacuum")
+                        rec = self.reclaim(
+                            min_vacuum_freelist_ratio=min_vacuum_freelist_ratio,
+                            chunk_pages=vacuum_chunk_pages, max_pages=vacuum_max_pages_per_pass,
+                            max_seconds=vacuum_max_seconds_per_pass)
+                        result["freelist_ratio"] = rec["freelist_ratio"]
+                        result["reclaim_stopped"] = rec["stopped"]
+                        if rec["ran"]:
+                            result["vacuumed"] = True
+                            result["reclaim_mode"] = "migrate" if rec["migrated"] else "incremental"
+                            result["reclaimed_bytes"] = rec["reclaimed_bytes"]
+                            result["reclaimed_pages"] = rec["reclaimed_pages"]
+                            result["max_lock_hold_ms"] = round(rec["max_lock_hold_ms"], 3)
+                            self.set_meta("last_vacuum", str(now))
+                        elif rec["stopped"] == "freelist-ratio" and ratio is not None:
+                            logger.debug("state.db auto-maintenance: skipping VACUUM, only "
+                                         "%.1f%% of pages reclaimable (threshold %.0f%%)",
+                                         ratio * 100.0, min_vacuum_freelist_ratio * 100.0)
+                    except Exception as exc:
+                        logger.warning("state.db reclaim failed: %s", exc)
             # Record even when pruned == 0 so the throttle holds.
             self.set_meta("last_auto_prune", str(now))
             if closed or pruned > 0:
