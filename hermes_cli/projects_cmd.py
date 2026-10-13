@@ -208,21 +208,67 @@ def _flag_command(op: str, verb: str):
     return _with_project(lambda args, conn, proj: (getattr(pdb, op)(conn, proj.id), f"{verb} {proj.slug}")[1])
 
 
+def _board_meta_writer(board: str):
+    """``(slug, write_board_metadata)`` for a board that exists, else ``(None, None)``.
+
+    Never raises: ``bind-board`` is a convenience for the human filing a workstream, so a
+    board slug that matches nothing must not fail the project write (it stays fail-soft,
+    exactly like the ``default_workdir`` write this seam already made).
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+
+        slug = kb._normalize_board_slug(board)
+        if slug and (slug == kb.DEFAULT_BOARD or kb.board_exists(slug)):
+            return slug, kb.write_board_metadata
+    except Exception:
+        pass
+    return None, None
+
+
+def _clear_board_project(board: str, proj) -> None:
+    """Fail-soft: drop ``board``'s default project when it points at ``proj``."""
+    slug, write = _board_meta_writer(board)
+    if write is None:
+        return
+    try:
+        from hermes_cli import kanban_db as kb
+
+        current = (kb.read_board_metadata(slug).get("project_id") or "").strip()
+        if current and current in {proj.slug, proj.id}:
+            write(slug, project_id="")
+    except Exception:
+        pass
+
+
 @_with_project
 def _cmd_bind_board(args, conn, proj) -> str:
-    pdb.update_project(conn, proj.id, board_slug=args.board)
-    if not args.board.strip():
-        return f"Unbound board from {proj.slug}"
-    if proj.primary_path:  # best-effort: point the bound board's default_workdir at the primary repo
-        try:
-            from hermes_cli import kanban_db as kb
+    """``hermes project bind-board <project> [board]`` — the board half of the link.
 
-            slug = kb._normalize_board_slug(args.board)
-            if slug and (slug == kb.DEFAULT_BOARD or kb.board_exists(slug)):
-                kb.write_board_metadata(slug, default_workdir=proj.primary_path)
+    Binding writes the board's DEFAULT PROJECT (``board.json:project_id``) beside the
+    ``default_workdir`` it already wrote. ``create_task`` reads that key to scope every new
+    task on the board to the project (deterministic worktree + branch), so "the project
+    groups the cards" no longer rests on every creator remembering ``--project``. The value
+    stored is the project's **slug**, never its ``p_…`` id: a slug is stable across the
+    per-profile registries (``$HERMES_HOME/projects.db``), an id is not. Unbinding (no board
+    argument) clears the key again. Both writes stay fail-soft, like the ``default_workdir``
+    write they sit beside.
+    """
+    previous_board = (proj.board_slug or "").strip()
+    board = (args.board or "").strip()
+    pdb.update_project(conn, proj.id, board_slug=args.board)
+    if not board:
+        _clear_board_project(previous_board, proj)
+        return f"Unbound board from {proj.slug}"
+    slug, write = _board_meta_writer(board)
+    if write is not None:
+        try:
+            write(slug, default_workdir=proj.primary_path, project_id=proj.slug)
         except Exception:
             pass
-    return f"Bound {proj.slug} -> board {args.board}"
+    if previous_board and previous_board != board:
+        _clear_board_project(previous_board, proj)
+    return f"Bound {proj.slug} -> board {board}"
 
 
 _HANDLERS = {

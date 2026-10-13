@@ -161,6 +161,17 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-project", [
+        _SLUG,
+        _arg("project", nargs="?", default=None,
+             help="Project SLUG (or id) to make this board's default project: new tasks "
+                  "on the board inherit it (deterministic worktree + branch under the "
+                  "project's primary repo) with no --project flag. A SLUG is the portable "
+                  "handle — the registry is per-profile, so an id is not. Omit with "
+                  "--clear to unscope the board."),
+        _arg("--clear", action="store_true",
+             help="Clear the board's default project (new tasks are unscoped again)."),
+    ], help="Set (or clear) the board's default project"),
     _cmd("set-dispatch", [
         _SLUG,
         _arg("state", choices=("on", "off"),
