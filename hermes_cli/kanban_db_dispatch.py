@@ -828,6 +828,14 @@ class DispatchResult:
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
     on multi-lane setups, NOT operator-actionable; tracked apart so health
     telemetry can tell "stuck" from "correctly idle"."""
+    skipped_self_review: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` review rows parked because the assignee is the
+    card's OWN implementer — ``"assignee_is_implementer"`` (spawning it would
+    hand the review skill to the bot that wrote the change) or
+    ``"implementer_unknown"`` (no implementer provenance, so a distinct reviewer
+    cannot be proven). Fail-closed: the row stays in ``review`` until a distinct
+    reviewer is named. Needs a human, so it is bucketed apart from the
+    "busy, retry later" per-profile deferrals."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -884,6 +892,308 @@ class DispatchResult:
     spawns nothing; it is deliberately NOT ``skipped_locked`` and NOT idle --
     a yielding ticker must never read green at the status surface."""
 
+    spawn_budget_blocked: Optional[str] = None
+    """Which cap had already consumed this tick's spawn budget, so no card was
+    even attempted: ``"max_spawn"`` (``kanban.max_spawn``, or the board's own
+    ``kanban.max_spawn_by_board`` ceiling) or ``"max_in_progress"`` (host-wide).
+    ``_tick_spawn_budget`` declines the whole
+    tick without touching any skip bucket, so before this field health telemetry
+    could not tell "queue deep, capacity full" (healthy) from "cannot spawn"
+    (broken). A deferral, never a failure."""
+
+    deferred_board_capped: list[str] = field(default_factory=list)
+    """Task ids the BOARD'S OWN ceiling held back this tick: the board was
+    already at ``kanban.max_spawn_by_board`` (or ``kanban.max_spawn``), so a free
+    host slot could not start them. No per-card refusal exists for these — the
+    tick simply looks idle from the outside — so they are named here and counted
+    by ``describe_suppression`` (``board_cap_deferred=N``). Never a failure:
+    nothing is killed to get under a ceiling, and the board still reclaims and
+    promotes."""
+
+    deferred_host_capped: list[str] = field(default_factory=list)
+    """Task ids this board's SHARE of the free host slots could not cover, when
+    more boards had startable work than the host budget had free slots. That is
+    a rotation, not a fault, and it is recorded the same way so a board that
+    keeps losing the race is still visible (``host_cap_deferred=N``) instead of
+    reading as an idle queue."""
+
+    spawn_failed: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, assignee, reason)`` for cards that were claimed and whose
+    worker could NOT be launched this tick (workspace resolution or the spawn
+    call raised); a ``spawn_failed`` task event is written alongside each. This
+    is the operator-actionable "cannot spawn" signal — deferrals
+    (``respawn_guarded``, ``skipped_per_profile_capped``, ``skipped_locked``,
+    ``memory_pressure``, ``spawn_budget_blocked``) are not failures."""
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher health telemetry (shared by the gateway watcher and the daemon)
+#
+# What this replaces: "ready work exists and 0 workers spawned for N ticks" —
+# which is the steady state on a healthy but LOADED host, so the warning fires
+# forever while nothing is wrong. `_tick_spawn_budget` declines an entire tick
+# without recording any skip bucket once `kanban.max_spawn` /
+# `kanban.max_in_progress` are consumed, so a deep queue and a wedged dispatcher
+# looked identical; meanwhile a card that was claimed and could not be launched
+# at all (the one signal an operator must act on) raised no alarm. The rules
+# below tell the three states apart: deferred (silent), failed (warn at once,
+# naming board/profile/task/reason), and stalled (nothing attempted, nothing
+# explains it, old work waiting — warn after HEALTH_WINDOW ticks).
+# ---------------------------------------------------------------------------
+HEALTH_WINDOW = 6
+"""Consecutive unexplained no-op ticks before the stall warning."""
+
+HEALTH_STALL_AGE_SECONDS = 1800.0
+"""Pending work younger than this is not stalled — it just arrived."""
+
+HEALTH_WARN_INITIAL_INTERVAL = 300.0
+"""Seconds before a repeat of an unchanged warning state (doubles per repeat)."""
+
+HEALTH_WARN_MAX_INTERVAL = 3600.0
+"""Ceiling for the repeat interval."""
+
+
+@dataclass(frozen=True)
+class PendingWork:
+    """Longest-waiting spawnable card on a board, as a health probe sees it."""
+
+    board: Optional[str] = None
+    task_id: Optional[str] = None
+    age_seconds: float = 0.0
+
+    @property
+    def pending(self) -> bool:
+        """Some board has ready/review work the dispatcher could spawn for."""
+        return self.task_id is not None
+
+
+@dataclass
+class HealthReport:
+    """One health judgement worth emitting: ``level`` is ``"warning"``/``"info"``."""
+
+    level: str
+    message: str
+
+
+# Fields whose non-empty value means the tick CHANGED something. A tick that did
+# any work is not evidence of a wedged dispatcher, whatever it left queued.
+_TICK_WORK_FIELDS = (
+    "spawned",
+    "reclaimed",
+    "promoted",
+    "crashed",
+    "timed_out",
+    "stale",
+    "auto_blocked",
+    "reconciled_orphans",
+    "rate_limited",
+    "auto_assigned_default",
+)
+
+
+def tick_did_work(result: Optional[object]) -> bool:
+    """Did this tick change any state (spawn, reclaim, promote, crash, ...)?"""
+    if result is None:
+        return False
+    return any(getattr(result, name, None) for name in _TICK_WORK_FIELDS)
+
+
+def tick_deferral_reason(result: Optional[object]) -> Optional[str]:
+    """Why this tick attempted no spawn ON PURPOSE, or ``None`` when it cannot say.
+
+    Every reason comes from a bucket the dispatcher itself recorded, so a tick
+    with a reason is loaded/guarded host behaviour doing the right thing — never a
+    stall. ``None`` means "no spawn and nothing explains it", the only state worth
+    watching.
+    """
+    if result is None:
+        return None
+    budget = getattr(result, "spawn_budget_blocked", None)
+    if budget:
+        return f"spawn_budget:{budget}"
+    pressure = getattr(result, "memory_pressure", None)
+    if pressure:
+        return f"memory_pressure:{pressure}"
+    if getattr(result, "skipped_locked", False):
+        return "board_held"
+    if getattr(result, "respawn_guarded", None):
+        return "respawn_guarded"
+    if getattr(result, "skipped_per_profile_capped", None):
+        return "per_profile_capped"
+    if getattr(result, "skipped_unassigned", None):
+        return "unassigned"
+    return None
+
+
+def collect_spawn_failures(
+    board_results: Optional[Iterable[tuple[str, Optional[object]]]],
+) -> list[tuple[str, str, str, str]]:
+    """``(board, task_id, assignee, reason)`` for every failed launch this tick."""
+    found: list[tuple[str, str, str, str]] = []
+    for slug, result in board_results or []:
+        for entry in getattr(result, "spawn_failed", None) or []:
+            task_id, assignee, reason = (list(entry) + ["", "", ""])[:3]
+            found.append(
+                (slug or "?", str(task_id), str(assignee or "unassigned"), str(reason))
+            )
+    return found
+
+
+def _boards_label(boards: list[str]) -> str:
+    if not boards:
+        return "an unnamed board"
+    if len(boards) <= 2:
+        return "board " + ", ".join(boards)
+    return f"{len(boards)} boards ({', '.join(boards[:2])}, …)"
+
+
+def spawn_failure_message(failures: list[tuple[str, str, str, str]], total: int) -> str:
+    """Operator-facing line for launches that failed (claimed, never started)."""
+    boards = sorted({b for b, *_ in failures})
+    hint_board = boards[0] if boards else "default"
+    detail = "; ".join(f"{tid} ({who}): {why}" for _b, tid, who, why in failures[:3])
+    extra = "" if len(failures) <= 3 else f" (+{len(failures) - 3} more)"
+    return (
+        f"kanban dispatcher: {len(failures)} worker spawn failure(s) on "
+        f"{_boards_label(boards)} this tick ({total} since the dispatcher was last "
+        f"healthy) — {detail}{extra}. A spawn failure means the worker could not be "
+        f"launched at all: check that profile's venv/PATH/credentials, "
+        f"`hermes kanban list --board {hint_board} --status blocked` and errors.log."
+    )
+
+
+def stall_message(ticks: int, oldest: PendingWork) -> str:
+    """Operator-facing line for a dispatcher that stopped attempting spawns."""
+    minutes = int(oldest.age_seconds // 60)
+    board = oldest.board or "?"
+    return (
+        f"kanban dispatcher[{board}]: {ticks} consecutive ticks spawned nothing and did "
+        f"no other work while {oldest.task_id} waited ~{minutes} min for a worker — "
+        f"spawnable, assigned, unclaimed, and no concurrency cap, guard or pause explains "
+        f"it. The dispatcher loop itself is the suspect: check the gateway log for repeated "
+        f"exceptions and `hermes kanban list --board {board} --status ready`."
+    )
+
+
+class DispatcherHealth:
+    """Backlog-aware health tracker for one dispatcher loop.
+
+    States: ``failed`` (a claimed card could not be launched — warn at once),
+    ``stalled`` (no spawn attempted, nothing deferred it, and work older than
+    :data:`HEALTH_STALL_AGE_SECONDS` is waiting — warn after
+    :data:`HEALTH_WINDOW` ticks), otherwise healthy and silent. Capacity
+    deferrals, guards, pauses and work that merely arrived are NOT trouble: on a
+    loaded host they are the steady state.
+
+    Repeats of an unchanged state wait an interval that doubles from
+    :data:`HEALTH_WARN_INITIAL_INTERVAL` to :data:`HEALTH_WARN_MAX_INTERVAL`, so
+    a long outage costs a handful of lines instead of one per tick, and returning
+    to health emits exactly one ``info`` line.
+    """
+
+    def __init__(
+        self,
+        *,
+        window: int = HEALTH_WINDOW,
+        stall_age_seconds: float = HEALTH_STALL_AGE_SECONDS,
+        warn_initial_interval: float = HEALTH_WARN_INITIAL_INTERVAL,
+        warn_max_interval: float = HEALTH_WARN_MAX_INTERVAL,
+    ) -> None:
+        self.window = max(1, int(window))
+        self.stall_age_seconds = float(stall_age_seconds)
+        self.warn_initial_interval = float(warn_initial_interval)
+        self.warn_max_interval = float(warn_max_interval)
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget all state — also used when dispatch is paused or slowed down."""
+        self.stalled_ticks = 0
+        self.failures_seen = 0
+        self.state = "healthy"
+        self._interval = self.warn_initial_interval
+        self._last_report_at: Optional[float] = None
+        self._reported = False
+
+    def pause(self) -> None:
+        """Dispatch is disallowed (``hermes pause``): an idle dispatcher, not a stall."""
+        self.stalled_ticks = 0
+
+    def observe_tick(
+        self,
+        board_results: Optional[Iterable[tuple[str, Optional[object]]]] = None,
+        *,
+        pending: Optional[PendingWork] = None,
+        now: Optional[float] = None,
+    ) -> Optional[HealthReport]:
+        """Judge one tick; returns the line to emit, or ``None`` to stay silent."""
+        at = time.time() if now is None else float(now)
+        failures = collect_spawn_failures(board_results)
+        if failures:
+            self.failures_seen += len(failures)
+            self.stalled_ticks = 0
+            return self._emit(
+                "warning", spawn_failure_message(failures, self.failures_seen), "failed", at
+            )
+        stalled = self._stall_message(board_results, pending or PendingWork())
+        if stalled is not None:
+            return self._emit("warning", stalled, "stalled", at)
+        return self._clear()
+
+    # -- internals --------------------------------------------------------
+    def _stall_message(
+        self,
+        board_results: Optional[Iterable[tuple[str, Optional[object]]]],
+        pending: PendingWork,
+    ) -> Optional[str]:
+        results = [res for _slug, res in board_results or []]
+        # A tick is only suspicious when it attempted nothing AND nothing
+        # explains why: any spawn, reclaim, promotion or crash is work, and any
+        # recorded deferral (budget, memory, guard, board lock, unassigned) is a
+        # decision. A deep queue under concurrency caps hits one of those every
+        # tick, which is exactly the false positive this replaced.
+        explained = any(tick_did_work(res) or tick_deferral_reason(res) for res in results)
+        if not results or explained:
+            self.stalled_ticks = 0
+            return None
+        if not pending.pending or pending.age_seconds < self.stall_age_seconds:
+            self.stalled_ticks = 0
+            return None
+        self.stalled_ticks += 1
+        if self.stalled_ticks < self.window:
+            return None
+        return stall_message(self.stalled_ticks, pending)
+
+    def _emit(self, level: str, message: str, state: str, at: float) -> Optional[HealthReport]:
+        if state != self.state:
+            self.state = state
+            self._interval = self.warn_initial_interval
+        elif self._last_report_at is not None and at - self._last_report_at < self._interval:
+            return None
+        else:
+            self._interval = min(self._interval * 2.0, self.warn_max_interval)
+        self._last_report_at = at
+        self._reported = True
+        return HealthReport(level, message)
+
+    def _clear(self) -> Optional[HealthReport]:
+        if self.state == "healthy":
+            return None
+        previous, ticks, failures = self.state, self.stalled_ticks, self.failures_seen
+        self.state = "healthy"
+        self.stalled_ticks = 0
+        self.failures_seen = 0
+        self._interval = self.warn_initial_interval
+        self._last_report_at = None
+        if not self._reported:
+            return None
+        self._reported = False
+        return HealthReport(
+            "info",
+            f"kanban dispatcher: healthy again — clearing {previous} "
+            f"({ticks} stalled tick(s), {failures} spawn failure(s) while unhealthy)",
+        )
+
+
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
@@ -911,12 +1221,54 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             # tick touched nothing (card t_17c9c847). Without this the refusal is
             # invisible to the "dispatcher stuck" line.
             counts["board_not_dispatch_enabled"] = counts.get("board_not_dispatch_enabled", 0) + 1
+        if res.deferred_host_capped:
+            # The HOST budget held these back: no per-card refusal of their own,
+            # so without this the tick reads like an idle queue.
+            counts["host_cap_deferred"] = counts.get("host_cap_deferred", 0) + len(res.deferred_host_capped)
+        if res.deferred_board_capped:
+            # The board's OWN ceiling held these back: like the host cap, no
+            # per-card refusal exists, so a capped board would otherwise read
+            # exactly like an idle one.
+            counts["board_cap_deferred"] = counts.get("board_cap_deferred", 0) + len(res.deferred_board_capped)
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def stuck_ready_message(stats: dict) -> str:
+    """Operator-facing line for ready cards nothing has ever attempted.
+
+    Distinct from the suppression summary (``describe_suppression``: what the
+    last tick held back) and from the ``skipped_nonspawnable`` bucket, which
+    health telemetry suppresses precisely because ``hermes kanban assign`` — not
+    the dispatcher — is the fix.
+    """
+    count = int(stats.get("count") or 0)
+    task_id = stats.get("oldest_task_id") or "?"
+    assignee = stats.get("oldest_assignee") or "(unassigned)"
+    minutes = int((stats.get("oldest_age_seconds") or 0) // 60)
+    board = stats.get("board")
+    where = f"kanban dispatcher[{board}]" if board else "kanban dispatcher"
+    if stats.get("oldest_spawnable") is False:
+        why = (
+            f"the oldest card's assignee {assignee!r} is not a live profile, so every "
+            f"tick buckets it skipped_nonspawnable and no worker will EVER launch for "
+            f"it — reassign it to a real profile or recreate it unassigned."
+        )
+    else:
+        why = (
+            f"the oldest card's assignee {assignee!r} is spawnable and unclaimed, so "
+            f"nothing running it means the lane is starved (caps, guards, memory "
+            f"pressure) or that worker never polls; check "
+            f"`hermes kanban list --status ready` and the gateway log."
+        )
+    return (
+        f"{where}: {count} ready card(s) have never been attempted by any worker; "
+        f"oldest is {task_id} ({assignee}) waiting ~{minutes} min. {why}"
+    )
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -3082,6 +3434,49 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     return any(profile_exists(row["assignee"]) for row in rows)
 
 
+def oldest_spawnable_pending(
+    conn: sqlite3.Connection, *, include_review: bool = True
+) -> tuple[Optional[str], float]:
+    """``(task_id, age_seconds)`` of the longest-waiting spawnable card.
+
+    Same filter as :func:`has_spawnable_ready` (assigned, unclaimed, and the
+    assignee maps to a real profile — control-plane lanes excluded), plus WHICH
+    card and how long it has waited, so health telemetry can tell "work just
+    arrived" from "work has been waiting since before the stall".
+
+    ``age_seconds`` counts from ``created_at``: the tasks table keeps no
+    "ready since" stamp, so this is an UPPER bound on time-in-ready — a card
+    created days ago and readied a minute ago looks old. That is enough to decide
+    whether a silent dispatcher is worth reporting; it is not evidence that a
+    card has been waiting that long. ``(None, 0.0)`` when nothing is spawnable.
+    """
+    statuses = ["ready"]
+    if include_review and review_dispatch_enabled():
+        statuses.append("review")
+    try:
+        rows = conn.execute(
+            "SELECT id, assignee, created_at FROM tasks "
+            f"WHERE status IN ({','.join('?' for _ in statuses)}) "
+            "AND assignee IS NOT NULL AND claim_lock IS NULL "
+            "ORDER BY created_at ASC",
+            tuple(statuses),
+        ).fetchall()
+    except sqlite3.Error:
+        return None, 0.0
+    if not rows:
+        return None, 0.0
+    profile_exists = _profile_exists_fn()
+    now = time.time()
+    for row in rows:
+        if profile_exists is not None and not profile_exists(row["assignee"]):
+            continue
+        created = row["created_at"]
+        # No usable timestamp -> age 0, i.e. "cannot show this is old", never a
+        # fabricated age that would trip the stall warning on its own.
+        return row["id"], (0.0 if created is None else max(0.0, now - float(created)))
+    return None, 0.0
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """True iff a ready+assigned+unclaimed task maps to a real Hermes profile.
 
@@ -3603,6 +3998,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    host_budget_share: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -3654,6 +4050,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            host_budget_share=host_budget_share,
         )
 
     try:
@@ -3691,6 +4088,29 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
+
+
+def _self_review_reason(
+    conn: sqlite3.Connection, task_id: str, assignee: str,
+) -> Optional[str]:
+    """Why ``assignee`` must not be spawned to review ``task_id``, else ``None``.
+
+    ``"assignee_is_implementer"`` — the card's recorded implementer IS this
+    assignee (canonicalised the same way ``request_review`` canonicalises a
+    reviewer, so capitalization/case-only differences cannot slip past).
+    ``"implementer_unknown"`` — the card carries no ``review_requested``
+    implementer provenance at all, so a distinct reviewer cannot be PROVEN.
+    Fail-closed: unknown provenance parks rather than trusts, since the default
+    ``reviewer=None`` handoff records no reviewer and leaves the author as the
+    assignee.
+    """
+    implementer = _kb.review_implementer(conn, task_id)
+    if not implementer:
+        return "implementer_unknown"
+    if _kb._canonical_assignee(implementer) == _kb._canonical_assignee(assignee):
+        return "assignee_is_implementer"
+    return None
+
 
 
 def _dispatch_lane_task(
@@ -3734,6 +4154,18 @@ def _dispatch_lane_task(
                         or last["payload"] != _kb._json_or_null({"assignee": assignee})):
                     _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
         return False
+    # Author exclusion: the review lane must never spawn a task's own
+    # implementer with the review skill — the bot that wrote the change would be
+    # grading (and could land) its own work. Fail-closed: park the row until a
+    # distinct reviewer is named. Placed before the cap / respawn guards so
+    # ``dry_run`` sees exactly the same decision. Deliberately no task event:
+    # this guard can stay engaged for many ticks and an event per tick would
+    # spam ``hermes kanban tail``.
+    if lane == "review":
+        self_review = _self_review_reason(conn, task_id, assignee)
+        if self_review is not None:
+            result.skipped_self_review.append((task_id, self_review))
+            return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
@@ -3777,6 +4209,7 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        result.spawn_failed.append((claimed.id, claimed.assignee or "", f"workspace: {exc}"))
         if _record_spawn_failure(
             conn, claimed.id, exc, failure_limit=failure_limit, board=board, prefix="workspace: ",
         ):
@@ -3803,6 +4236,7 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        result.spawn_failed.append((claimed.id, claimed.assignee or "", str(exc)))
         # ONE classifier decides the owner of this failure (D5): the host refusing to place
         # the worker, THIS tree's own modules disagreeing, or the card. Only the last one
         # spends the card's retry budget.
@@ -3921,14 +4355,24 @@ def _tick_spawn_budget(
     max_spawn: Optional[int],
     max_in_progress: Optional[int],
     board: Optional[str],
+    host_budget_share: Optional[int] = None,
 ) -> tuple[bool, Optional[int]]:
     """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
 
     ``max_spawn`` is a live per-board concurrency cap (running + this tick's
     spawns), not a per-tick budget — a per-tick reading would grow concurrency
-    by N every tick. ``max_in_progress`` is a HOST-level cap: running workers on
+    by N every tick. It is the board's OWN ceiling: ``kanban.max_spawn_by_board``
+    when the board is named there, else ``kanban.max_spawn``.
+    ``max_in_progress`` is a HOST-level cap: running workers on
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
+    ``host_budget_share`` is this board's slice of the FREE host slots for this
+    tick, allocated across the boards by the gateway dispatcher
+    (``gateway.kanban_watchers_dispatcher.host_budget_shares_by_ceiling``): the
+    host cap still bounds the fleet, and the share stops one board's queue from
+    taking the slots every other board is waiting for. ``None`` = no share was
+    allocated, which is every single-board caller (the CLI daemon and
+    ``hermes kanban dispatch``).
     """
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
@@ -3941,16 +4385,37 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            # The board is at its OWN ceiling (its per-board value, or the
+            # global max_spawn). Nothing starts until it drains, and from the
+            # outside the queue looks idle — name what the ceiling held back so
+            # the tick is reportable, never a silent no-op. Also name the cap on
+            # the result: health telemetry must read this as "deferred, capacity
+            # full" and stay quiet, not as "nothing spawned, something is broken".
+            result.spawn_budget_blocked = "max_spawn"
+            result.deferred_board_capped = spawnable_pending_ids(conn)
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.spawn_budget_blocked = "max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
+
+    # This board's SHARE of the host budget, handed out by the gateway
+    # dispatcher. 0 means more boards had startable work than there were free
+    # slots, so this board waits a tick: a rotation, not a fault, and recorded
+    # the same way so a board that keeps losing the race is still visible.
+    if host_budget_share is not None:
+        share = max(int(host_budget_share), 0)
+        if share <= 0:
+            result.deferred_host_capped = spawnable_pending_ids(conn)
+            return False, None
+        if spawn_budget is None or spawn_budget > share:
+            spawn_budget = share
 
     # Memory-pressure guard: a static cap can't see the host's actual state.
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
@@ -3975,13 +4440,65 @@ def _tick_spawn_budget(
     return True, spawn_budget
 
 
+def zero_run_ready(
+    conn: sqlite3.Connection, *, now: Optional[float] = None,
+    min_age_seconds: Optional[float] = None,
+) -> dict:
+    """Stuck-ready probe — see :func:`hermes_cli.kanban_db.zero_run_ready`.
+
+    Defined ONCE in ``kanban_db`` so every dispatcher health surface (the
+    gateway watcher, the standalone daemon, the board-stats / ops-API export)
+    reads the same query; this module only forwards, and is the board-aware
+    entry point plugin consumers reach through ``kanban_db``.
+    """
+    if min_age_seconds is None:
+        return _kb.zero_run_ready(conn, now=now)
+    return _kb.zero_run_ready(conn, now=now, min_age_seconds=min_age_seconds)
+
+
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed rows of one lane in dispatch order.
+
+    Ordering is the shared age-aware effective priority
+    (``kanban_db.effective_priority_order_sql``): a card that has waited long
+    enough outranks fresher higher-priority work, so a low-priority lane can
+    never be starved indefinitely by a steady trickle of P0/P1 cards. Both lane
+    orders (ready and review) call the one helper so they cannot drift.
+    """
+    order_body, order_params = _kb.effective_priority_order_sql()
     return conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        f"ORDER BY {order_body}",
+        order_params,
     ).fetchall()
+
+
+def _spawnable_lane_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Ready (and, when enabled, review) rows a worker could start, head first.
+
+    "Spawnable" is the dispatcher's own gate as far as a read-only pass can
+    apply it: review rows only when review dispatch is on, and never a card
+    without an assignee or assigned to a profile this host cannot spawn — those
+    wait for ROUTING, not for a free slot.
+    """
+    rows = _lane_rows(conn, "ready")
+    if review_dispatch_enabled():
+        rows = rows + _lane_rows(conn, "review")
+    profile_exists = _profile_exists_fn()
+    if profile_exists is None:
+        return [row for row in rows if row["assignee"]]
+    return [row for row in rows if row["assignee"] and profile_exists(row["assignee"])]
+
+
+def spawnable_pending_ids(conn: sqlite3.Connection) -> list[str]:
+    """Ids of this board's spawnable cards waiting for a worker, head of line first.
+
+    Everything named here is something a free slot would really have started,
+    which is what makes a ceiling deferral reportable: "6 cards were ready and
+    nothing could start" is actionable, "the queue is non-empty" is not.
+    """
+    return [row["id"] for row in _spawnable_lane_rows(conn)]
 
 
 def _any_spawnable_review(
@@ -3995,7 +4512,8 @@ def _any_spawnable_review(
 
     Unavailable profile metadata retains the historic fail-open behavior. A
     review row that :func:`_dispatch_lane_task` would refuse this tick — its
-    assignee already at the per-profile cap, or respawn-guarded — cannot
+    assignee already at the per-profile cap, respawn-guarded, or parked by
+    the author-exclusion guard — cannot
     consume the reservation, so it must not withhold capacity from an
     otherwise ready task (one such row would pin ``ready_budget`` to 0).
     """
@@ -4010,6 +4528,8 @@ def _any_spawnable_review(
         if profile_exists is not None and not profile_exists(assignee):
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
+            continue
+        if _self_review_reason(conn, row["id"], assignee) is not None:
             continue
         if check_respawn_guard(conn, row["id"], lane="review") is None:
             return True
@@ -4048,6 +4568,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    host_budget_share: Optional[int] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -4061,6 +4582,7 @@ def _dispatch_once_locked(
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+        host_budget_share=host_budget_share,
     )
     if not may_spawn:
         return result
