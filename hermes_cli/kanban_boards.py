@@ -182,6 +182,50 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_set_project(args: argparse.Namespace) -> int:
+    """``hermes kanban boards set-project <board> <project|--clear>``.
+
+    The direct writer for a board's DEFAULT PROJECT (``board.json:project_id``) — the same
+    seam ``hermes project bind-board`` uses, so a board can be scoped without a project
+    round-trip. ``create_task`` reads that key and scopes every new task on the board to the
+    project (deterministic worktree + branch under its primary repo).
+
+    The project must exist in **this profile's** registry (``$HERMES_HOME/projects.db``): a
+    project written by another profile is invisible here, and a board default this profile
+    cannot resolve scopes nothing. The stored value is the project's **slug** — a slug is
+    stable across the per-profile registries, an id is not.
+    """
+    normed, rc = _board_slug_arg(args, "set-project", must_exist=True)
+    if rc:
+        return rc
+    ident = (getattr(args, "project", None) or "").strip()
+    clearing = bool(getattr(args, "clear", False))
+    if clearing and ident:
+        return _err("kanban boards set-project: pass a project or --clear, not both", 2)
+    if clearing or not ident:
+        kb.write_board_metadata(normed, project_id="")
+        print(f"Board {normed!r}: default project cleared.")
+        return 0
+    from hermes_cli import projects_db as pdb
+
+    with pdb.connect_closing() as conn:
+        proj = pdb.get_project(conn, ident)
+    if proj is None:
+        return _err(
+            f"kanban boards set-project: no such project {ident!r} in this profile's registry "
+            f"({pdb.projects_db_path()}) — a project created by another profile is not visible "
+            f"here. Create it with `hermes project create <name> --slug {ident}`, or pass a "
+            f"slug this profile knows (`hermes project list`).", 2,
+        )
+    kb.write_board_metadata(normed, project_id=proj.slug)
+    print(f"Board {normed!r}: default project {proj.slug!r} — new tasks on it inherit the "
+          f"project (deterministic worktree + branch).")
+    if not proj.primary_path:
+        print("  note: the project has no primary folder, so tasks are grouped but keep "
+              "the workspace they asked for.")
+    return 0
+
+
 def _cmd_boards_set_dispatch(args: argparse.Namespace) -> int:
     """Admit or exclude a board from the dispatcher's set.
 
@@ -263,6 +307,7 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-project": _cmd_boards_set_project,
     "set-dispatch": _cmd_boards_set_dispatch,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,

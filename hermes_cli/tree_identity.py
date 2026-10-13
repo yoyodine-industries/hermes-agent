@@ -88,7 +88,7 @@ ESTATE_MUTATING_ACTIONS: frozenset[str] = frozenset({
 #: ``hermes kanban boards …`` sub-actions that write board metadata or move the current board.
 ESTATE_MUTATING_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
-    "set-default-workdir", "set-priority-policy", "import",
+    "set-default-workdir", "set-project", "set-priority-policy", "import",
 })
 
 
