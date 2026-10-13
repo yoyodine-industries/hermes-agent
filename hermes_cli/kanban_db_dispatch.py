@@ -988,9 +988,25 @@ def tick_deferral_reason(result: Optional[object]) -> Optional[str]:
     with a reason is loaded/guarded host behaviour doing the right thing — never a
     stall. ``None`` means "no spawn and nothing explains it", the only state worth
     watching.
+
+    The whole-tick REFUSALS are deferrals too, and they have to be named here or
+    moving to this tracker re-breaks the rulings that added them: a tick that
+    yielded on the content-skew gate (``tick_yielded``, ruling ``t_8fed34c8``) and
+    a board refused as not dispatch-enabled (``skipped_board_disabled``, card
+    ``t_17c9c847``) are deliberate, loud, self-recorded decisions. Counted as
+    unexplained no-ops, six of either with old work waiting accuse the healthy
+    gate itself. ``deferred_host_capped`` is the same class — the board drew no
+    share of this tick's free host slots, which its own field documents as "a
+    rotation, not a fault".
     """
     if result is None:
         return None
+    if getattr(result, "tick_yielded", ""):
+        return "tick_yielded"
+    if getattr(result, "skipped_board_disabled", False):
+        return "board_disabled"
+    if getattr(result, "deferred_host_capped", None):
+        return "host_cap_deferred"
     budget = getattr(result, "spawn_budget_blocked", None)
     if budget:
         return f"spawn_budget:{budget}"
@@ -1210,6 +1226,21 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def suppression_note(
+    board_results: Optional[Iterable[tuple[str, Optional[Any]]]] = None,
+) -> str:
+    """``" Last tick held back: <reasons>."`` for a warning line, or ``""``.
+
+    The live line's dispatcher-health warnings carry this annotation so an
+    operator reads WHY ready work was held back instead of a bare zero-spawn
+    count (rulings ``t_17c9c847`` / #111910). The prose lives here, beside the
+    messages it annotates, so both surfaces emit one vocabulary rather than
+    re-authoring the sentence at each call site.
+    """
+    held = describe_suppression([res for _slug, res in board_results or []])
+    return f" Last tick held back: {held}." if held else ""
 
 
 def stuck_ready_message(stats: dict) -> str:

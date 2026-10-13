@@ -274,12 +274,18 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
         await asyncio.sleep(5)
 
-        # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
-        # is non-empty but spawns are 0 for N consecutive ticks — usually a
-        # broken PATH, missing venv, or credential loss.
-        bad_ticks = 0
-        last_warn_at = 0
-        last_stuck_probe_at = 0  # stuck-ready probe cadence (see below), independent of bad_ticks
+        # Health telemetry (shared with `_cmd_daemon` via DispatcherHealth): a
+        # warning here must mean the dispatcher is BROKEN, not merely busy.
+        # Capacity deferrals (kanban.max_spawn / max_in_progress / per-profile
+        # cap), guards (respawn, board-held, memory pressure) and work that just
+        # arrived are the steady state on a loaded host and stay silent; a card
+        # claimed but never launched warns at once, naming board, profile, task
+        # and reason. Imported under a distinct name because `_kbd` is bound (as
+        # a local) further down in the loop below.
+        from hermes_cli import kanban_db_dispatch as _kbd_health
+
+        health = _kbd_health.DispatcherHealth(window=_HEALTH_WINDOW)
+        last_stuck_probe_at = 0  # stuck-ready probe cadence (see below), independent of the tracker
         results: Optional[list] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
 
@@ -299,7 +305,7 @@ class GatewayKanbanWatchersMixin:
                 # Emergency stop (`hermes pause`): no auto-decompose or
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
-                    bad_ticks = 0
+                    health.pause()
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
@@ -308,11 +314,16 @@ class GatewayKanbanWatchersMixin:
                     if _ad_enabled:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(dispatcher.tick_once)
-                    any_spawned = _log_spawn_results(results)
+                    _log_spawn_results(results)
+                    # A skew-yielded or board-disabled tick is its own loud refusal
+                    # (rulings t_8fed34c8, t_17c9c847); this call only emits that
+                    # line. The shared classifier counts both as EXPLAINED, so the
+                    # tracker below stays silent rather than accusing a healthy gate.
+                    _log_tick_yields(results)
                     # Stuck-ready probe (card t_d6ae62e7, PART B): ready cards nothing has
                     # EVER attempted. It runs on its own cadence because the dead-assignee
                     # case it exists for is bucketed ``skipped_nonspawnable``, which the
-                    # bad-tick rule below deliberately ignores — that rule is silent on
+                    # stall rule below deliberately ignores — that rule is silent on
                     # exactly the fault that matters most. Throttled: a read-only probe of
                     # every board every 5s is a cost with no matching benefit.
                     _now_tick = int(time.time())
@@ -320,27 +331,20 @@ class GatewayKanbanWatchersMixin:
                         last_stuck_probe_at = _now_tick
                         stuck = await _to_thread_process_service(dispatcher.zero_run_ready)
                         if stuck:
-                            logger.warning("%s", _kbd.stuck_ready_message(stuck))
-                    if _log_tick_yields(results):
-                        # Working as designed: the content-skew gate refused to spawn from a mixed
-                        # revision. Counting it as a "stuck dispatcher" would mislabel a healthy
-                        # refusal as a broken profile; the non-green status record and the acting
-                        # card are the signal (ruling t_8fed34c8).
-                        bad_ticks = 0
-                    else:
-                        ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                        bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
-                now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
-                    logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned.%s Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks, f" Last tick held back: {held}." if held else "",
-                    )
-                    last_warn_at = now
+                            logger.warning("%s", _kbd_health.stuck_ready_message(stuck))
+                    pending = await _to_thread_process_service(dispatcher.oldest_pending)
+                    report = health.observe_tick(results, pending=pending, now=time.time())
+                    if report is not None:
+                        # One vocabulary, owned by kanban_db_dispatch: the
+                        # tracker's own message, plus the live line's "held back"
+                        # annotation on warnings.
+                        note = (
+                            _kbd_health.suppression_note(results)
+                            if report.level == "warning"
+                            else ""
+                        )
+                        log = logger.warning if report.level == "warning" else logger.info
+                        log("%s", report.message + note)
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()

@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -193,6 +194,29 @@ _DAEMON_DEPRECATED = (
 )
 
 
+def _daemon_health_step(
+    health: kbd.DispatcherHealth,
+    board: str,
+    res: object,
+    pending: Optional[kbd.PendingWork] = None,
+    now: Optional[float] = None,
+) -> Optional[kbd.HealthReport]:
+    """One standalone-daemon tick through the shared health tracker.
+
+    Module-level and importable ON PURPOSE (card t_bda9ac11, D7). The tracker
+    itself is unit-tested elsewhere, but what was broken on the live line is the
+    WIRING: ``observe_tick`` iterates its first argument, so a bare
+    ``DispatchResult`` raises ``TypeError: 'DispatchResult' object is not
+    iterable`` inside ``collect_spawn_failures`` — and ``run_daemon`` wraps
+    ``on_tick(res)`` in ``contextlib.suppress(Exception)``, which turns that into
+    a CLI telemetry surface that is silently dead. The tick's result MUST go in
+    board-tagged (``[(board, res)]``), and this seam is what a test can hold.
+
+    Returns the report to emit, or ``None`` to stay silent.
+    """
+    return health.observe_tick([(board, res)], pending=pending, now=now)
+
+
 def _cmd_daemon(args: argparse.Namespace) -> int:
     """Deprecated — the dispatcher now runs inside the gateway. Kept so old
     scripts/systemd units get a clear migration message; ``--force`` (hidden
@@ -222,20 +246,36 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
 
-    # Health telemetry: warn when every tick finds ready work but spawns
-    # nothing (broken profile, PATH drift, missing venv, credential loss) —
-    # the per-task breaker auto-blocks quietly, so the operator needs a signal.
+    # Health telemetry (shared with the gateway watcher via DispatcherHealth): a
+    # warning here must mean the dispatcher is BROKEN, not merely busy. Capacity
+    # deferrals (kanban.max_spawn / max_in_progress / per-profile cap), guards
+    # (respawn, board-held, memory pressure) and work that just arrived are the
+    # steady state on a loaded host and stay silent; a card claimed but never
+    # launched warns at once, naming board, profile, task and reason.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0, "last_stuck_probe_at": 0}
+    health = kbd.DispatcherHealth(window=HEALTH_WINDOW)
+    # The board this daemon ticks: the health line's label and the pending
+    # probe's board. `run_daemon` connects with no board kwarg, so the current
+    # board IS the daemon's board.
+    health_board = getattr(args, "board", None)
+    try:
+        health_board = health_board or kb.get_current_board()
+    except Exception:
+        health_board = health_board or kb.DEFAULT_BOARD
+    last_stuck_probe_at = 0
 
-    def _ready_queue_nonempty() -> bool:
-        """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
-        Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
+    def _oldest_pending():
+        """Longest-waiting spawnable card on this board, ``None`` when nothing is."""
         try:
             with kbc.connect_closing() as conn:
-                return kbd.has_spawnable_ready(conn)
+                task_id, age = kbd.oldest_spawnable_pending(conn)
         except Exception:
-            return False
+            return None
+        if not task_id:
+            return None
+        return kbd.PendingWork(
+            board=health_board, task_id=task_id, age_seconds=age
+        )
 
     def _zero_run_ready():
         """Stuck-ready probe on this board: ready cards nothing has attempted."""
@@ -247,33 +287,30 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         return stats if int(stats.get("count") or 0) else None
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
-            health_state["bad_ticks"] += 1
-        else:
-            health_state["bad_ticks"] = 0
-        # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
-        if health_state["bad_ticks"] >= HEALTH_WINDOW:
-            now = int(time.time())
-            if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
-                print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
-                    file=sys.stderr, flush=True,
-                )
-                health_state["last_warn_at"] = now
+        nonlocal last_stuck_probe_at
+        report = _daemon_health_step(
+            health, health_board, res, _oldest_pending(), time.time()
+        )
+        if report is not None:
+            # One vocabulary, owned by kanban_db_dispatch: the tracker's own
+            # message, plus the live line's "held back" annotation on warnings.
+            note = (
+                kbd.suppression_note([(health_board, res)])
+                if report.level == "warning"
+                else ""
+            )
+            print(
+                f"[{_fmt_ts(int(time.time()))}] {report.message}{note}",
+                file=sys.stderr if report.level == "warning" else sys.stdout,
+                flush=True,
+            )
         # Stuck-ready probe, on its own (throttled) cadence: ready cards nothing has
         # EVER attempted. The dead-assignee case it exists for is bucketed
-        # ``skipped_nonspawnable``, which the rule above deliberately ignores — so
-        # the old signal is silent on exactly the fault that matters most.
+        # ``skipped_nonspawnable``, which the stall rule deliberately ignores — so
+        # the tracker is silent on exactly the fault that matters most.
         now_stuck = int(time.time())
-        if now_stuck - health_state["last_stuck_probe_at"] >= 300:
-            health_state["last_stuck_probe_at"] = now_stuck
+        if now_stuck - last_stuck_probe_at >= 300:
+            last_stuck_probe_at = now_stuck
             stuck = _zero_run_ready()
             if stuck:
                 print(
