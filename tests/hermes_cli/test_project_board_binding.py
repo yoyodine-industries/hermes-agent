@@ -207,3 +207,40 @@ def test_a_resolvable_project_warns_about_nothing(home, tmp_path, capsys):
         tid = kb.create_task(conn, title="grouped", project_id="widget")
     assert capsys.readouterr().err == ""
     assert "project_link_unresolved" not in _created_payload(tid)
+
+
+# --- G4c: a REFUSED board write is not a missing board ---------------------------------
+
+
+def test_bind_board_reports_a_refused_board_write(home, tmp_path, monkeypatch, capsys):
+    """Fail-soft is for a board that does not RESOLVE; a fence refusal is not that.
+
+    Measured 2026-10-13 from a dispatched worker's own session (this card's session): the
+    verb printed ``Bound widget -> board default`` and wrote NOTHING — ``write_board_metadata``
+    had been refused by the delegated-child fence and the swallow dressed it as success.
+    """
+    _new_project(tmp_path)
+
+    def _refuse(*_a, **_k):
+        raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
+
+    monkeypatch.setattr(kb, "write_board_metadata", _refuse)
+    assert _project("bind-board", "widget", "default") == 1
+    captured = capsys.readouterr()
+    assert "Bound" not in captured.out
+    assert "did NOT land" in captured.err
+    assert kb.read_board_metadata("default")["project_id"] is None
+
+
+def test_unbind_reports_a_refused_board_write(home, tmp_path, monkeypatch, capsys):
+    _new_project(tmp_path)
+    assert _project("bind-board", "widget", "default") == 0
+
+    def _refuse(*_a, **_k):
+        raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
+
+    monkeypatch.setattr(kb, "write_board_metadata", _refuse)
+    assert _project("bind-board", "widget") == 1
+    captured = capsys.readouterr()
+    assert "Unbound" not in captured.out
+    assert "did NOT land" in captured.err

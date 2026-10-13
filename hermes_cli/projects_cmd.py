@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import functools
 import sys
+from typing import Optional
 
 from hermes_cli import projects_db as pdb
 
@@ -226,23 +227,56 @@ def _board_meta_writer(board: str):
     return None, None
 
 
-def _clear_board_project(board: str, proj) -> None:
-    """Fail-soft: drop ``board``'s default project when it points at ``proj``."""
+def _board_project_write(board: str, **fields) -> Optional[str]:
+    """Write ``board``'s metadata; return a refusal message, or ``None`` on success/skip.
+
+    Fail-soft is the ruling for a board that does not RESOLVE (``_board_meta_writer`` gives
+    ``(None, None)``): the project row is what the caller asked for and it must not fail on the
+    board convenience. A REFUSAL is not a missing board. ``write_board_metadata`` calls
+    ``_assert_not_delegated_child_mutation``, which refuses a board write from a session
+    descended from a live dispatched worker — and swallowing that made ``bind-board`` print
+    ``Bound … -> board …`` while nothing landed (measured 2026-10-13 from a dispatched worker's
+    own session, i.e. the very lane that files workstream cards): a false green of exactly the
+    class this card closes. A refusal comes back as a message the caller reports.
+    """
     slug, write = _board_meta_writer(board)
     if write is None:
-        return
+        return None
+    try:
+        write(slug, **fields)
+    except PermissionError as exc:
+        return str(exc) or "the board write was refused"
+    except Exception:
+        return None
+    return None
+
+
+def _clear_board_project(board: str, proj) -> Optional[str]:
+    """Fail-soft: drop ``board``'s default project when it points at ``proj``."""
+    slug, _write = _board_meta_writer(board)
+    if slug is None:
+        return None
     try:
         from hermes_cli import kanban_db as kb
 
         current = (kb.read_board_metadata(slug).get("project_id") or "").strip()
-        if current and current in {proj.slug, proj.id}:
-            write(slug, project_id="")
     except Exception:
-        pass
+        return None
+    if current and current in {proj.slug, proj.id}:
+        return _board_project_write(slug, project_id="")
+    return None
+
+
+def _board_refusal(proj, board: str, refusal: str) -> int:
+    """The project row landed, the board link did not: say so and exit non-zero."""
+    return _err(
+        f"project: {proj.slug} -> board {board}: the project row was updated, but the board's "
+        f"default project did NOT land — {refusal}"
+    )
 
 
 @_with_project
-def _cmd_bind_board(args, conn, proj) -> str:
+def _cmd_bind_board(args, conn, proj) -> "int | str":
     """``hermes project bind-board <project> [board]`` — the board half of the link.
 
     Binding writes the board's DEFAULT PROJECT (``board.json:project_id``) beside the
@@ -251,23 +285,24 @@ def _cmd_bind_board(args, conn, proj) -> str:
     groups the cards" no longer rests on every creator remembering ``--project``. The value
     stored is the project's **slug**, never its ``p_…`` id: a slug is stable across the
     per-profile registries (``$HERMES_HOME/projects.db``), an id is not. Unbinding (no board
-    argument) clears the key again. Both writes stay fail-soft, like the ``default_workdir``
-    write they sit beside.
+    argument) clears the key again. The board writes stay fail-soft for a board that does not
+    resolve, but a REFUSED write is reported rather than dressed as success.
     """
     previous_board = (proj.board_slug or "").strip()
     board = (args.board or "").strip()
     pdb.update_project(conn, proj.id, board_slug=args.board)
     if not board:
-        _clear_board_project(previous_board, proj)
+        refusal = _clear_board_project(previous_board, proj)
+        if refusal:
+            return _board_refusal(proj, previous_board, refusal)
         return f"Unbound board from {proj.slug}"
-    slug, write = _board_meta_writer(board)
-    if write is not None:
-        try:
-            write(slug, default_workdir=proj.primary_path, project_id=proj.slug)
-        except Exception:
-            pass
+    refusal = _board_project_write(
+        board, default_workdir=proj.primary_path, project_id=proj.slug,
+    )
     if previous_board and previous_board != board:
         _clear_board_project(previous_board, proj)
+    if refusal:
+        return _board_refusal(proj, board, refusal)
     return f"Bound {proj.slug} -> board {board}"
 
 
