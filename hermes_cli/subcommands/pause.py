@@ -44,11 +44,20 @@ from pathlib import Path
 # The lanes the operator's ruling names as the always-on set ("ops BOTS should always be
 # enabled, but not ops BOARD", defcon t_067be5b6, 2026-09-27). Printed as the recommendation
 # when a lockdown names no lane; never applied silently — the allowlist is the operator's.
-RECOMMENDED_LANES = ("default", "platform-stl", "platform-worker", "platform-coder")
+#
+# This is the POLICY seed, not a roster: each member must be a LIVE profile id, and the tuple
+# is projected onto the live roster by :func:`recommended_lanes` before it is ever printed.
+# `platform-worker` sat here until 2026-10-13 — a lane RENAMED to `default`, which the set
+# already named — so the advice the refusal printed was itself refused by the arm path's own
+# `_profile_is_real` gate: following the recommendation broke the pause it recommended.
+RECOMMENDED_LANES = ("default", "platform-stl", "platform-coder")
 
-# D9: the ops board and the lane the re-arm alert is filed to.
+# D9: the ops board and the lane the re-arm alert is filed to — the lane that owns host
+# administration, `default` today (the seat `platform-worker` was renamed to). The pre-rename
+# DISPLAY handle `yoyodine-majordomo` resolves nowhere, and a dispatched worker's filer fails
+# CLOSED on it (kanban_db.create_task -> gate_assignee), so the alert could not be filed at all.
 OPS_BOARD = "ops"
-OPS_ALERT_ASSIGNEE = "yoyodine-majordomo"
+OPS_ALERT_ASSIGNEE = "default"
 
 
 def _say(message: str, json_mode: bool) -> None:
@@ -204,6 +213,23 @@ def _profile_is_real(name: str) -> bool:
         return True
 
 
+def recommended_lanes() -> tuple[str, ...]:
+    """The always-on set, MINUS any name that is no longer a live profile.
+
+    Keyed to the live roster through the SAME predicate the arm path judges by
+    (:func:`_profile_is_real` -> ``hermes_cli.profiles.profile_exists``), never to the literal
+    tuple, so a renamed lane leaves the recommendation instead of being printed as advice that
+    the arming call then refuses. Fails OPEN with the full set when the predicate cannot be
+    consulted: an unreadable roster is not evidence that a lane is dead.
+    """
+    return tuple(name for name in RECOMMENDED_LANES if _profile_is_real(name))
+
+
+def _stale_recommended_lanes(live: tuple[str, ...]) -> list[str]:
+    """The members :func:`recommended_lanes` DROPPED — a rename is reported, never silent."""
+    return [name for name in RECOMMENDED_LANES if name not in live]
+
+
 def cmd_pause(args: argparse.Namespace) -> int:
     """Engage the global emergency stop (total, or lane-scoped with ``--lockdown``)."""
     from agent.estop import (
@@ -245,7 +271,18 @@ def cmd_pause(args: argparse.Namespace) -> int:
 
     if not lanes:
         print("⛔ --lockdown names no lane — refusing to arm a lockdown that admits nobody.")
-        print(f"   Pass --allow-profile for at least one lane (recommended: {', '.join(RECOMMENDED_LANES)}).")
+        live = recommended_lanes()
+        if live:
+            print("   Pass --allow-profile for at least one lane "
+                  f"(recommended: {', '.join(live)}).")
+        else:
+            print("   Pass --allow-profile for at least one lane.")
+        stale = _stale_recommended_lanes(live)
+        if stale:
+            # A RENAME, not a silent drop: the operator learns the lane moved instead of being
+            # handed a shorter list with no reason beside it.
+            print(f"   note: no live profile named {', '.join(stale)} — the recommendation is"
+                  " drawn from the live roster, so a renamed lane is dropped, never advised.")
         print("   An empty lockdown holds the very lanes it was meant to let through.")
         return 2
 
