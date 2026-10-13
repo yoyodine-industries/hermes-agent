@@ -270,8 +270,8 @@ def _clear_board_project(board: str, proj) -> Optional[str]:
 def _board_refusal(proj, board: str, refusal: str) -> int:
     """The project row landed, the board link did not: say so and exit non-zero."""
     return _err(
-        f"project: {proj.slug} -> board {board}: the project row was updated, but the board's "
-        f"default project did NOT land — {refusal}"
+        f"{proj.slug} -> board {board}: the project row was updated, but the board's "
+        f"default project did NOT land \u2014 {refusal}"
     )
 
 
