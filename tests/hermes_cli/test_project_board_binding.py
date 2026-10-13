@@ -244,3 +244,21 @@ def test_unbind_reports_a_refused_board_write(home, tmp_path, monkeypatch, capsy
     captured = capsys.readouterr()
     assert "Unbound" not in captured.out
     assert "did NOT land" in captured.err
+
+
+# --- the acceptance's own proof: `hermes kanban show <id>` names the project -----------
+
+
+def test_kanban_show_names_the_project_the_card_carries(home, tmp_path, capsys):
+    proj, _repo = _new_project(tmp_path)
+    assert _create(["scoped", "--project", "widget", "--workspace", "worktree"]) == 0
+    capsys.readouterr()
+    with kbc.connect_closing() as conn:
+        tid = kb.list_tasks(conn)[-1].id
+
+    root = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(root.add_subparsers(dest="command"))
+    assert kc.kanban_command(root.parse_args(["kanban", "show", tid])) == 0
+    out = capsys.readouterr().out
+    line = next((l for l in out.splitlines() if l.strip().startswith("project:")), "")
+    assert proj.id in line, out

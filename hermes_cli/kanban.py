@@ -655,6 +655,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.tenant:
         field("tenant", task.tenant)
     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
+    if task.project_id:
+        # The project the card is scoped to (kanban_db.create_task stores it, and a
+        # project-scoped board supplies it with no --project flag). Printed because
+        # "which project is this card in" is otherwise only visible under --json.
+        field("project", task.project_id)
     if task.branch_name:
         field("branch", task.branch_name)
     if task.skills:
