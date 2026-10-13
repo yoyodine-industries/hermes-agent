@@ -2,9 +2,13 @@
 
 import json
 import threading
+import urllib.error
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
+import hermes_yaml
 import pytest
 
 from agent.turn_author import TURN_AUTHOR_ENV
@@ -587,3 +591,175 @@ def test_request_strips_bearer_key_across_redirect_origin():
     assert all(header is None for header in _AttackerOrigin.auth_seen), (
         f"peer's Bearer key leaked to the redirect target: {_AttackerOrigin.auth_seen}"
     )
+
+
+# ── the registry's HOME (measured 2026-10-13) ─────────────────────────────────
+#
+# The registry lived in the ROOT ~/.hermes/config.yaml only, while a profile-scoped session
+# resolves load_config() against its OWN home: every lane's `hermes peer dm` died with
+# `No peer named 'yoyodine'`, and the one profile that had been re-registered by hand worked
+# alone. The registry is a host-level fact - one home, the root - never a copy per profile.
+
+ROOT_PEERS = {"yoyodine": {"url": "http://127.0.0.1:8644"}}
+
+
+@pytest.fixture
+def farm(tmp_path, monkeypatch):
+    """The root ~/.hermes (the registry's home) plus one named profile under it, with
+    Path.home() and HERMES_HOME pointed into the fixture the way a profile session runs."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "platform-coder"
+    profile.mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        "bot_peers:\n  yoyodine:\n    url: http://127.0.0.1:8644\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    return root, profile
+
+
+def test_a_profile_session_resolves_the_root_registry(farm, monkeypatch, capsys):
+    """(a) The review gate: `hermes peer list` resolves the peer from a profile session whose
+    own config declares no `bot_peers`."""
+    root, profile = farm
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    assert peer_cmd._registry_home() == root
+    assert peer_cmd._load_peers() == ROOT_PEERS
+    assert peer_cmd.cmd_peer(SimpleNamespace(peer_action="list")) == 0
+    assert "yoyodine" in capsys.readouterr().out
+
+
+def test_a_profile_that_declares_its_own_registry_owns_it(farm, monkeypatch):
+    """A profile pointing at its OWN gateway keeps it: the fallback must not override a
+    deliberate per-profile registry."""
+    _root, profile = farm
+    (profile / "config.yaml").write_text(
+        "bot_peers:\n  homelab:\n    url: http://10.0.0.9:8377\n")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    assert peer_cmd._registry_home() == profile
+    assert peer_cmd._load_peers() == {"homelab": {"url": "http://10.0.0.9:8377"}}
+
+
+def test_the_default_home_resolves_its_own_registry(farm, monkeypatch):
+    root, _profile = farm
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    assert peer_cmd._registry_home() == root
+    assert peer_cmd._load_peers() == ROOT_PEERS
+
+
+def test_peer_add_from_a_profile_writes_the_root_registry(farm, monkeypatch):
+    """`hermes peer add` must not fork the registry into a profile copy - the write lands in
+    the home that OWNS it (one fact, one home)."""
+    root, profile = farm
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "k" * 20)
+
+    rc = peer_cmd.cmd_peer(SimpleNamespace(peer_action="add", name="homelab",
+                                           url="http://10.0.0.9:8377", key="", note=""))
+
+    assert rc == 0
+    written = hermes_yaml.safe_load((root / "config.yaml").read_text())
+    assert set(written["bot_peers"]) == {"yoyodine", "homelab"}
+    assert not (profile / "config.yaml").exists(), "the registry was forked into a profile copy"
+
+
+# ── a REFUSAL must land where a human reads it ────────────────────────────────
+#
+# Measured cost: a fleet-wide DM outage reached only callers' stderr and nobody noticed until
+# the operator asked why DMs were broken. A refusal that means "the DM path is broken" now
+# files ONE idempotency-keyed card on the ops board.
+
+
+def _recording_filer(calls, card_id="t_card1234"):
+    def filer(**kwargs):
+        calls.append(kwargs)
+        return card_id
+    return filer
+
+
+def test_a_no_peer_refusal_files_one_card_on_the_ops_board(monkeypatch, capsys):
+    """(c) The review gate: one DM failure files a card, and the caller still exits 1."""
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+    monkeypatch.setattr(peer_cmd, "_load_peers", dict)          # EMPTY registry: the outage
+
+    rc = peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="yoyodine/default",
+                                           message="hi", json=False))
+
+    assert rc == 1
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["board"] == peer_cmd.REFUSAL_BOARD
+    assert call["assignee"] == peer_cmd.REFUSAL_ASSIGNEE
+    assert call["idempotency_key"] == "peer-refusal-yoyodine-no-peer"
+    assert "yoyodine" in call["title"] and "no-peer" in call["title"]
+    assert "no-peer" in call["body"]
+    err = capsys.readouterr().err
+    assert "Reported:" in err and "t_card1234" in err
+
+
+def test_a_missing_key_refusal_files_a_card_keyed_by_class(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"yoyodine": {"url": "http://x"}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "")
+
+    assert peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="yoyodine", message="hi",
+                                             json=False)) == 1
+
+    assert calls[0]["idempotency_key"] == "peer-refusal-yoyodine-no-key"
+
+
+def test_a_capacity_refusal_files_a_card_keyed_by_status(monkeypatch, capsys):
+    """The 429 the peer's own cap returns (`Too many concurrent runs`) is a control-channel
+    starvation, not a transport blip: it is reported."""
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+    err = urllib.error.HTTPError("http://peer/v1/runs", 429, "Too many concurrent runs",
+                                 Message(), None)
+
+    assert peer_cmd._peer_failure("yoyodine", err) == 1
+
+    assert calls[0]["idempotency_key"] == "peer-refusal-yoyodine-http-429"
+    assert "429" in calls[0]["body"]
+    assert "Too many concurrent runs" in calls[0]["body"]
+
+
+def test_a_transport_failure_files_no_card(monkeypatch, capsys):
+    """A peer that is briefly unreachable is the reachability probe's business: a card per
+    blip is noise, so the reported classes are the DETERMINISTIC refusals only."""
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+
+    assert peer_cmd._peer_failure("yoyodine", urllib.error.URLError("connection refused")) == 1
+
+    assert calls == []
+    assert "Could not reach peer" in capsys.readouterr().err
+
+
+def test_a_board_write_failure_never_breaks_the_refusal(monkeypatch, capsys):
+    """Reporting is a side effect of failing: it must never turn one failure into two."""
+    def boom(**kwargs):
+        raise RuntimeError("the board is locked")
+
+    monkeypatch.setattr(peer_cmd, "_create_card", boom)
+    monkeypatch.setattr(peer_cmd, "_load_peers", dict)
+
+    rc = peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="yoyodine", message="hi",
+                                           json=False))
+
+    assert rc == 1
+    assert "NO CARD FILED" in capsys.readouterr().err
+
+
+def test_the_refusal_target_is_configurable(farm, monkeypatch):
+    """The fleet's own board/owner for these reports is config, not a code change."""
+    root, _profile = farm
+    (root / "config.yaml").write_text(
+        "bot_peers:\n  yoyodine:\n    url: http://127.0.0.1:8644\n"
+        "bot_peer_refusals:\n  board: platform\n  assignee: platform-worker\n  priority: 7\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    assert peer_cmd._refusal_target() == {"board": "platform", "assignee": "platform-worker",
+                                          "priority": 7}

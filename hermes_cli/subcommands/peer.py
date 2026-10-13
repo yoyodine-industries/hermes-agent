@@ -12,6 +12,8 @@ config.yaml (``bot_peers``); the key lives in ``~/.hermes/.env`` as
 from __future__ import annotations
 
 import argparse
+import contextlib
+import datetime
 import json
 import re
 import sys
@@ -19,6 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 
 BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -28,15 +31,89 @@ _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 DM_TIMEOUT_S = 600
 LIST_TIMEOUT_S = 30
 
+# ── where a REFUSED dm is reported ───────────────────────────────────────────
+# A refusal used to reach only the caller's stderr, and the measured cost (2026-10-13) was a
+# FLEET-WIDE DM outage nobody heard about until the operator asked why DMs were broken.
+# Every refusal that means "the DM path is broken" - not "you typed it wrong" -
+# therefore files ONE card on the ops board, keyed per (peer, class) so a repeat never spams
+# the board. `bot_peer_refusals: {board:, assignee:, priority:}` in the registry home's
+# config.yaml overrides the shipped defaults (non-secret plumbing, so it is config, not .env).
+REFUSAL_BOARD = "default"
+REFUSAL_ASSIGNEE = "platform-stl"
+REFUSAL_PRIORITY = 3
+
 
 def _peer_key_env(name: str) -> str:
     return f"HERMES_PEER_{name.upper().replace('-', '_')}_KEY"
 
 
+def _hermes_root(home: Path) -> Path:
+    """The machine-level ``~/.hermes`` for a profile home, and for the default home itself."""
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
+def _declares_registry(home: Path) -> bool:
+    """True when ``home``'s OWN config.yaml declares a ``bot_peers`` mapping.
+
+    Read from the raw file on purpose: which home OWNS the registry is settled before any
+    loader runs, and a merged view would report the root's entry as the profile's own.
+    """
+    path = home / "config.yaml"
+    if not path.is_file():
+        return False
+    try:
+        import hermes_yaml as yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8-sig", errors="replace"))
+    except Exception:
+        return False
+    return isinstance(raw, dict) and isinstance(raw.get("bot_peers"), dict)
+
+
+def _registry_home() -> Path:
+    """The home whose ``bot_peers`` registry THIS session resolves.
+
+    THE REGISTRY IS A HOST-LEVEL FACT AND ITS HOME IS THE ROOT ONE (measured 2026-10-13).
+    ``load_config()`` resolves against the session's own home, so a
+    profile-scoped session whose config declares no ``bot_peers`` saw an EMPTY registry while
+    the machine's root ``~/.hermes/config.yaml`` carried the peer: every lane's ``hermes peer
+    dm`` died with ``No peer named '<peer>'``, and the one profile that had been re-registered
+    by hand worked alone. A home that declares its own registry owns it (an install may
+    legitimately point one profile at a different gateway); a home that declares none resolves
+    the root's - one fact, one home, never a copy of the block per profile.
+    """
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    if _declares_registry(home):
+        return home
+    return _hermes_root(home)
+
+
+@contextlib.contextmanager
+def _config_home(home: Path):
+    """Pin config resolution (read AND write) to ``home`` for the block.
+
+    The same context-local override the gateway and the Bot-Mode prompt builder use, so the
+    process-wide ``HERMES_HOME`` is never touched: one process may serve several profiles.
+    """
+    from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+    if home == get_hermes_home():
+        yield
+        return
+    token = set_hermes_home_override(str(home))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _load_peers() -> dict:
     from hermes_cli.config import load_config
 
-    cfg = load_config() or {}
+    with _config_home(_registry_home()):
+        cfg = load_config() or {}
     peers = cfg.get("bot_peers")
     return peers if isinstance(peers, dict) else {}
 
@@ -44,9 +121,10 @@ def _load_peers() -> dict:
 def _save_peers(peers: dict) -> None:
     from hermes_cli.config import load_config, save_config
 
-    cfg = load_config() or {}
-    cfg["bot_peers"] = peers
-    save_config(cfg)
+    with _config_home(_registry_home()):
+        cfg = load_config() or {}
+        cfg["bot_peers"] = peers
+        save_config(cfg)
 
 
 def _peer_secret(name: str) -> str:
@@ -202,14 +280,141 @@ def _peer_run_durability(base: str, key: str) -> bool | None:
     return bool(contract.get("durable"))
 
 
+def _target_peer(target: str) -> str:
+    """The peer name a ``<peer>[/<agent>]`` target names, for a report filed before
+    resolution. Never raises, never empty."""
+    return (str(target or "").split("/", 1)[0].strip() or "?")
+
+
+def _refusal_class(exc: BaseException) -> str:
+    """A stable slug for a refusal that must be REPORTED, or ``''`` when it is not one.
+
+    Reported: no such peer, no key for the peer, and any HTTP status the peer itself returned
+    (401/403/404 and 429 - the capacity cap that starves the control channel - measured
+    2026-10-13).
+    NOT reported: transport failures (timeout, refused connection, DNS). A peer that is briefly
+    unreachable is the reachability probe's business, and a card per blip is noise.
+    """
+    if isinstance(exc, LookupError):
+        return "no-peer"
+    if isinstance(exc, PermissionError):
+        return "no-key"
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"http-{exc.code}"
+    return ""
+
+
+def _refusal_target() -> dict:
+    """`bot_peer_refusals` from the registry home, over the shipped defaults."""
+    from hermes_cli.config import load_config
+
+    with _config_home(_registry_home()):
+        cfg = load_config() or {}
+    block = cfg.get("bot_peer_refusals")
+    block = block if isinstance(block, dict) else {}
+    try:
+        priority = int(block.get("priority", REFUSAL_PRIORITY))
+    except (TypeError, ValueError):
+        priority = REFUSAL_PRIORITY
+    return {"board": str(block.get("board") or REFUSAL_BOARD),
+            "assignee": str(block.get("assignee") or REFUSAL_ASSIGNEE),
+            "priority": priority}
+
+
+def _create_card(*, title, body, assignee, priority, board, idempotency_key) -> str:
+    """The ONE seam the tests stub: the fork's own board API, so the report is a first-class
+    board row written by the same code path as ``hermes kanban create``."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing(board=board) as conn:
+        return kb.create_task(conn, title=title, body=body, assignee=assignee,
+                              created_by="peer-dm", priority=priority,
+                              idempotency_key=idempotency_key)
+
+
+def _refusal_key(peer_name: str, klass: str) -> str:
+    return f"peer-refusal-{peer_name}-{klass}"
+
+
+def _refusal_body(peer_name: str, klass: str, detail: str) -> str:
+    from hermes_constants import get_hermes_home
+
+    return "\n".join([
+        f"A `hermes peer dm`/`hermes peer run` to peer `{peer_name}` was REFUSED and the "
+        "caller could not deliver it. Cross-lane DM is the control channel between lanes, so a "
+        "refusal that reaches only the caller's stderr is a comms outage nobody hears about "
+        "(measured 2026-10-13: the whole fleet's DM was dead and nothing "
+        "reported it).",
+        "",
+        f"- class: `{klass}`",
+        f"- detail: {detail}",
+        f"- sender home: `{get_hermes_home()}`",
+        f"- registry home: `{_registry_home()}`",
+        f"- when: {datetime.datetime.now().isoformat(timespec='seconds')}",
+        "",
+        "## What the classes mean",
+        "- `no-peer`: this session resolves no registry entry for that peer name. The "
+        "2026-10-13 fleet outage was exactly this: `bot_peers` existed in the root "
+        "`~/.hermes/config.yaml` while a profile-scoped session resolves its OWN home.",
+        "- `no-key`: no `HERMES_PEER_<PEER>_KEY` for that peer (auth).",
+        "- `http-429`: the peer's own capacity cap refused the turn (`Too many concurrent "
+        "runs`) - bulk work starving the control channel.",
+        "- other `http-4xx`: the peer refused the request (401/403 auth, 404 unknown endpoint "
+        "or unserved profile).",
+        "",
+        f"Filed by `hermes peer` - one card per (peer, class): idempotency key "
+        f"`{_refusal_key(peer_name, klass)}`.",
+    ])
+
+
+def _file_refusal_card(peer_name: str, klass: str, detail: str, *, create=None,
+                       target: dict | None = None) -> str:
+    """File ONE idempotency-keyed card for a refusal; return its id (``''`` when not filed).
+
+    NEVER raises: a report that broke the refusal path would be worse than no report at all,
+    so a failure here returns ``''`` and the caller says so on stderr.
+    """
+    target = target or _refusal_target()
+    filer = create or _create_card
+    title = f"[peer-dm] '{peer_name}' refused a cross-lane DM ({klass})"
+    try:
+        return str(filer(title=title, body=_refusal_body(peer_name, klass, detail),
+                         assignee=target["assignee"], priority=target["priority"],
+                         board=target["board"],
+                         idempotency_key=_refusal_key(peer_name, klass)) or "")
+    except Exception:
+        return ""
+
+
+def _report_refusal(peer_name: str, klass: str, detail: str) -> str:
+    """File the refusal card and SAY SO on stderr, with the card id."""
+    target = _refusal_target()
+    card = _file_refusal_card(peer_name, klass, detail, target=target)
+    where = (f"card {card} on the '{target['board']}' board" if card
+             else "NO CARD FILED (the board write failed; see this session's logs)")
+    print(f"Reported: peer '{peer_name}' refused the request ({klass}) -> {where}",
+          file=sys.stderr)
+    return card
+
+
 def _peer_failure(peer_name: str, exc: Exception) -> int:
-    """Print a peer HTTP rejection or transport failure to stderr; always exit 1."""
+    """Print a peer HTTP rejection or transport failure to stderr; always exit 1.
+
+    A refusal that means the DM path is broken is ALSO filed on the ops board: stderr reaches
+    nobody who is not already looking, and the measured cost of that was a fleet-wide DM
+    outage discovered by accident.
+    """
     if isinstance(exc, urllib.error.HTTPError):
         detail = _http_error_detail(exc)
         print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {detail}",
               file=sys.stderr)
     else:
+        detail = str(exc)
         print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
+    klass = _refusal_class(exc)
+    if klass:
+        _report_refusal(peer_name, klass, detail)
     return 1
 
 
@@ -408,6 +613,9 @@ def cmd_peer(args) -> int:
         return 2
     except (LookupError, PermissionError) as exc:
         print(str(exc), file=sys.stderr)
+        # A no-peer/no-key refusal IS the fleet's DM path failing - not a local typo to
+        # swallow. It goes on the board under the peer the caller named.
+        _report_refusal(_target_peer(args.target), _refusal_class(exc), str(exc))
         return 1
     base = _base_url(peer, profile)
     if action in {"status", "stop"}:
