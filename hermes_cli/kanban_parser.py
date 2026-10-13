@@ -161,6 +161,17 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-project", [
+        _SLUG,
+        _arg("project", nargs="?", default=None,
+             help="Project SLUG (or id) to make this board's default project: new tasks "
+                  "on the board inherit it (deterministic worktree + branch under the "
+                  "project's primary repo) with no --project flag. A SLUG is the portable "
+                  "handle — the registry is per-profile, so an id is not. Omit with "
+                  "--clear to unscope the board."),
+        _arg("--clear", action="store_true",
+             help="Clear the board's default project (new tasks are unscoped again)."),
+    ], help="Set (or clear) the board's default project"),
     _cmd("set-dispatch", [
         _SLUG,
         _arg("state", choices=("on", "off"),
@@ -219,9 +230,13 @@ _SPECS = [
                   "an explicit 'scratch' also opts out of a project-scoped board's project)"),
         _arg("--branch", help="Branch name for worktree tasks, e.g. wt/t6-wire"),
         _arg("--project",
-             help="Link to a project (id or slug). Anchors the task's "
-                  "worktree under the project's primary repo with a "
-                  "deterministic branch. See `hermes project list`."),
+             help="Link to a project (by slug; an id resolves only in this profile's "
+                  "registry). Anchors the task's worktree under the project's primary "
+                  "repo with a deterministic branch. A SLUG is the portable handle \u2014 the "
+                  "registry is per-profile, so another profile's id does not resolve "
+                  "here. An unresolvable ident is DROPPED loudly (a stderr warning plus "
+                  "`project_link_unresolved` on the created event), leaving the card "
+                  "unscoped. See `hermes project list`."),
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",
