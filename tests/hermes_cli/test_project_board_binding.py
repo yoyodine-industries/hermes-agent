@@ -229,6 +229,7 @@ def test_bind_board_reports_a_refused_board_write(home, tmp_path, monkeypatch, c
     captured = capsys.readouterr()
     assert "Bound" not in captured.out
     assert "did NOT land" in captured.err
+    assert captured.err.count("project:") == 1, captured.err
     assert kb.read_board_metadata("default")["project_id"] is None
 
 
@@ -244,6 +245,7 @@ def test_unbind_reports_a_refused_board_write(home, tmp_path, monkeypatch, capsy
     captured = capsys.readouterr()
     assert "Unbound" not in captured.out
     assert "did NOT land" in captured.err
+    assert captured.err.count("project:") == 1, captured.err
 
 
 # --- the acceptance's own proof: `hermes kanban show <id>` names the project -----------
@@ -262,3 +264,24 @@ def test_kanban_show_names_the_project_the_card_carries(home, tmp_path, capsys):
     out = capsys.readouterr().out
     line = next((l for l in out.splitlines() if l.strip().startswith("project:")), "")
     assert proj.id in line, out
+
+
+# --- the settled ruling: the portability note belongs in the `--project` help --------
+
+
+def test_the_project_flag_help_names_the_portable_handle_and_the_loud_drop(capsys):
+    """``hermes kanban create --help`` is the surface a filing worker actually reads.
+
+    The card's settled ruling puts the slug-portability guidance HERE, not only in the
+    runtime warning a caller meets after the card is already filed: an id from another
+    profile's per-profile registry is exactly the trap G4 closes.
+    """
+    root = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(root.add_subparsers(dest="command"))
+    with pytest.raises(SystemExit):
+        root.parse_args(["kanban", "create", "--help"])
+    text = " ".join(capsys.readouterr().out.split()).lower()
+    assert "--project" in text
+    assert "slug" in text, text
+    assert "registry" in text, text
+    assert "dropped" in text, text
