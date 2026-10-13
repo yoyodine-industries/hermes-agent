@@ -308,6 +308,12 @@ RECLAIM_CHUNK_PAGES = 512           # pages bound passed to each `PRAGMA increme
 RECLAIM_MAX_PAGES_PER_PASS = 4096   # per-pass ceiling: <= ~16 MiB of writes per store per pass at 4 KiB pages
 RECLAIM_MAX_SECONDS_PER_PASS = 5.0  # per-pass wall-clock ceiling; the pass stops here even mid-freelist
 RECLAIM_MIN_FREELIST_PAGES = 64     # below this many free pages a bounded pass is not worth opening a txn for
+# Cooperative yield between chunks. One `PRAGMA incremental_vacuum(N)` statement returns ONE page
+# (measured, SQLite 3.54.0), so a large freelist is drained by many back-to-back statements; a loop
+# that re-acquires the write lock immediately starves a competing writer for the WHOLE pass (measured
+# 2026-10-13: a 839-chunk drain starved a competing writer for 428 ms, worse than the 46 ms the
+# old full VACUUM of the same store cost it). This sleep hands the lock over between chunks.
+RECLAIM_CHUNK_YIELD_MS = 1.0
 # The ONE-TIME migration is the only `VACUUM` the automatic path may issue. It is an
 # exclusive rewrite, so it keeps AUTO_VACUUM_MIN_FREELIST_RATIO as its admission gate:
 # below it a rewrite costs more I/O than it returns.

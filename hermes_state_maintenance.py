@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_state_common import (
-    AUTO_VACUUM_MIN_FREELIST_RATIO, RECLAIM_CHUNK_PAGES, RECLAIM_MAX_PAGES_PER_PASS,
-    RECLAIM_MAX_SECONDS_PER_PASS, RECLAIM_MIN_FREELIST_PAGES, RECLAIM_MIGRATE_MIN_FREELIST_RATIO,
+    AUTO_VACUUM_MIN_FREELIST_RATIO, RECLAIM_CHUNK_PAGES, RECLAIM_CHUNK_YIELD_MS,
+    RECLAIM_MAX_PAGES_PER_PASS, RECLAIM_MAX_SECONDS_PER_PASS, RECLAIM_MIN_FREELIST_PAGES,
+    RECLAIM_MIGRATE_MIN_FREELIST_RATIO,
     _id_chunks, _non_continuation_child_sql, _placeholders, _sql_session_last_active,
     escape_like as _escape_like
 )
@@ -468,6 +469,11 @@ class SessionMaintenanceMixin:
                 stopped = "drained"
                 break
             freed += gained
+            if freed < max_pages:
+                # Hand the write lock over between chunks: without this the loop re-acquires it
+                # immediately and starves a competing writer for the whole pass (see
+                # RECLAIM_CHUNK_YIELD_MS). The seconds budget below still bounds the pass.
+                time.sleep(RECLAIM_CHUNK_YIELD_MS / 1000.0)
         _, out["freelist_after"] = self._freelist_pages()
         out["pages"] = freed
         out["bytes"] = freed * page_size
