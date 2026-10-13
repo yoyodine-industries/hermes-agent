@@ -89,6 +89,15 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Cooldown after a storage-locked (state-store contention) requeue before
+# re-spawning. Default 0 is DELIBERATE and is the contract's "immediately": the
+# reclaim pass already re-queued the card on this tick and the dispatcher's own
+# 60 s cadence is the spacing, so nothing is consumed and there is no hot loop.
+# The env override (``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS``) exists for
+# tests and for an operator who wants wider spacing around a known maintenance
+# window.
+DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS = 0
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -870,6 +879,12 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    storage_locked: list[str] = field(default_factory=list)
+    """Task ids whose workers were stopped by the profile state DB's write lock
+    being held by a peer (``KANBAN_STORAGE_LOCKED_EXIT_CODE``) and were released
+    to ``ready`` WITHOUT counting a failure. The VISIBILITY surface for this
+    class: a card looping on a wedged store must be readable in the tick
+    summary, never silent."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1214,6 +1229,10 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.storage_locked:
+            # A card looping on a contended state store: this counter is the whole
+            # visibility surface for the class, so it must never be silent.
+            counts["storage_locked"] = counts.get("storage_locked", 0) + len(res.storage_locked)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.skipped_board_disabled:
@@ -1315,6 +1334,8 @@ def _classify_worker_exit(pid: int) -> tuple[str, Optional[int]]:
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
     (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
+    ``storage_locked`` (``KANBAN_STORAGE_LOCKED_EXIT_CODE``, a state-store
+    lock-stop — infrastructure, never counts as a failure),
     ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
     not in the reap registry; ``code`` None)."""
     entry = _recent_worker_exits.get(int(pid))
@@ -1340,6 +1361,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("clean_exit", 0)
     if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
         return ("rate_limited", code)
+    if code == _kb.KANBAN_STORAGE_LOCKED_EXIT_CODE:
+        return ("storage_locked", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
     return ("nonzero_exit", code)
@@ -2442,11 +2465,19 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    storage_locked: bool = False
+    """``KANBAN_STORAGE_LOCKED_EXIT_CODE``: the turn was stopped by the profile
+    state store's write lock being held by a peer — infrastructure, so the run is
+    booked ``storage_locked`` and NEVER counted against the breaker."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall; a storage-locked requeue
+        # likewise records ``storage_locked`` so neither a quota wall nor a busy
+        # store reads as a crash of the card's own work.
+        if self.storage_locked:
+            return "storage_locked"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -2457,10 +2488,13 @@ def _classify_dead_worker(
 
     A clean exit or a crash carries the worker's own last output (``worker_output``
     in the event payload, appended to the error text) so the board and the retry
-    worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+    worker see WHY instead of a bare label; a rate-limited or storage-locked
+    requeue does not need it. Excluding the storage-locked branch is load-bearing:
+    that requeue's stamped error text must stay free of arbitrary worker prose,
+    which ``check_respawn_guard`` re-scans against ``_RESPAWN_BLOCKER_RE``.
     """
     dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
-    if task_id and not dead.rate_limited:
+    if task_id and not (dead.rate_limited or dead.storage_locked):
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
@@ -2510,6 +2544,24 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
         )
+    if kind == "storage_locked":
+        # The profile state DB's single write lock was held by a peer past the
+        # transcript patience (another worker of this lane, the gateway, the
+        # dashboard, or a maintenance checkpoint/VACUUM) — infrastructure, not this
+        # card. Release to the source phase and do NOT count a failure, so a busy
+        # store can never park a card whose own work was fine. The text is the
+        # ONLY thing stamped for this outcome (no worker output is appended, see
+        # ``_classify_dead_worker``) and it deliberately avoids every
+        # ``_RESPAWN_BLOCKER_RE`` word, so ``check_respawn_guard`` reads the RUN
+        # OUTCOME instead of trapping the card on the stamped line.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited with code {code}: the turn stopped on a transient state-store lock; "
+            "the card was re-queued without counting a failure",
+            "storage_locked",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
+            storage_locked=True,
+        )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
         # revoked, model gone): every further spawn would hit the same wall, so
@@ -2541,6 +2593,11 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    # Requeued WITHOUT counting a failure because the profile state store's write
+    # lock was held by a peer (``KANBAN_STORAGE_LOCKED_EXIT_CODE``). Held apart
+    # from ``crash_details`` so a storage lock-stop can never reach
+    # ``_account_crashes`` and never trips the breaker.
+    storage_locked: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -2801,10 +2858,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.storage_locked or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
+                # blocker; a storage-locked requeue shows it its own transient kind;
+                # a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
                 # board UI and retry worker need the corrective message.
                 conn.execute(
@@ -2813,6 +2871,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.storage_locked:
+                # NEVER crash_details: a lock-stop is infrastructure, so it must not
+                # reach ``_account_crashes`` (the breaker) and must not count toward
+                # the mass-crash abort either.
+                sweep.storage_locked.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -2906,8 +2969,10 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     tasks claimed by *this host* only — other hosts' PIDs are meaningless.
     Clean exit while ``running`` is a protocol violation with a bounded
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
-    wall, released WITHOUT counting a failure and surfaced via the
-    ``_last_rate_limited`` attribute (the return stays crashed-only).
+    wall and ``KANBAN_STORAGE_LOCKED_EXIT_CODE`` is a state-store lock-stop —
+    both are infrastructure, released WITHOUT counting a failure and surfaced
+    via the ``_last_rate_limited`` / ``_last_storage_locked`` attributes (the
+    return stays crashed-only).
     """
     sweep = _reclaim_dead_workers(conn, board=board)
     if sweep.assessment is not None and sweep.assessment.alerting:
@@ -2928,14 +2993,16 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
         # crash accounting below must not run.
         detect_crashed_workers._last_auto_blocked = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_rate_limited = []  # type: ignore[attr-defined]
+        detect_crashed_workers._last_storage_locked = []  # type: ignore[attr-defined]
         return []
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
-    # requeues did NOT count a failure and are NOT crashes.
+    # and storage-locked requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_storage_locked = sweep.storage_locked  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -3177,7 +3244,11 @@ def check_respawn_guard(
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
+    path never increments ``consecutive_failures``), ``"storage_locked_cooldown"``
+    (latest run ``storage_locked`` within its own cooldown; same placement and
+    the same reason — the stamped state-store line is infrastructure text, not a
+    blocker, and the run never incremented ``consecutive_failures``),
+    ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
@@ -3238,6 +3309,23 @@ def check_respawn_guard(
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        return None
+
+    # 1b. Storage-lock cooldown — the same contract as the rate-limit branch above,
+    #     on its own kind and its own cooldown so the two never share a notice. The
+    #     stamped text is infrastructure prose, so ``blocker_auth`` must not see it:
+    #     the card is spaced by this cooldown and never consumes its give-up budget.
+    if latest_run is not None and latest_run["outcome"] == "storage_locked":
+        sl_cooldown = _kb._resolve_storage_locked_cooldown_seconds()
+        if sl_cooldown <= 0:
+            # Default 0: respawn immediately (the reclaim pass already spaced it by
+            # a tick and the dispatcher's own cadence is the interval), skipping
+            # blocker_auth so the stamped storage-lock line cannot re-trap the card.
+            return None
+        ended_at = latest_run["ended_at"]
+        if ended_at is not None and (now - int(ended_at)) < sl_cooldown:
+            return "storage_locked_cooldown"
+        # Cooldown elapsed — return early, exactly as the rate-limit path does.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
@@ -4550,9 +4638,12 @@ def _run_reclaim_phase(
         }
     result.crash_sweep_held = list(getattr(detect_crashed_workers, "_last_crash_sweep_held", []) or [])
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
-    # went back to ``ready`` and the respawn guard defers them until quota clears.
+    # went back to ``ready`` and the respawn guard defers them until quota clears;
+    # storage-locked tasks went back to ``ready`` the same way and the guard spaces
+    # them on their own cooldown.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.storage_locked.extend(getattr(detect_crashed_workers, "_last_storage_locked", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

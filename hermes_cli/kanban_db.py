@@ -428,6 +428,14 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
 
+# Worker exit "the profile state DB's write lock was held by a peer": the turn was aborted because
+# the profile state DB's single SQLite write lock was held by a peer process (another worker of the
+# same lane, the gateway, the dashboard, or a maintenance checkpoint/VACUUM) past the transcript
+# write patience. Infrastructure, NOT the card — the dispatcher re-queues the card WITHOUT consuming
+# its give-up budget, so a busy store can never park a card whose own work was fine.
+# 76 is unused elsewhere in this tree (75 = rate limit, 78 = terminal provider).
+KANBAN_STORAGE_LOCKED_EXIT_CODE = 76
+
 
 def _resolve_crash_grace_seconds() -> int:
     """``HERMES_KANBAN_CRASH_GRACE_SECONDS`` (0 = immediate, for tests) else default."""
@@ -437,6 +445,13 @@ def _resolve_crash_grace_seconds() -> int:
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default."""
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
+
+
+def _resolve_storage_locked_cooldown_seconds() -> int:
+    """``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default."""
+    return _env_int(
+        "HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS,
+    )
 
 
 # build_worker_context() caps, sized for a ~100k-char prompt with headroom.
@@ -6271,6 +6286,7 @@ from hermes_cli.kanban_db_workspace import (
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
+    DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS,
     DispatchResult,
     WORKER_ALIVE,
     WORKER_DEAD,

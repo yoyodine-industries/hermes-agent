@@ -149,6 +149,21 @@ _TERMINAL_PROVIDER_REASONS = frozenset({
 })
 
 
+# ``failure_reason`` values that mean the TURN was killed by the profile state store, not by
+# anything about the card: the store's single write lock was held by a peer past the patience, or
+# a compression/lease rotation refused this writer. A Kanban worker exits
+# ``KANBAN_STORAGE_LOCKED_EXIT_CODE`` so the dispatcher re-queues the card and releases the claim
+# WITHOUT consuming its give-up budget. ADDITIONS ARE DELIBERATE: a member of this set grants a
+# card an unbounded retry budget, so every entry must be an infrastructure condition that a fresh
+# turn can win, never a real task failure.
+_TRANSIENT_STORAGE_REASONS = frozenset({
+    "session_persistence_failed:locked",              # state DB write lock held by a peer
+    "session_persistence_failed:compression",         # compaction held the store/lease
+    "session_persistence_failed:compression_closed",  # lease rotated; a fresh turn re-acquires
+    "session_persistence_failed:turn_lease",          # a peer took the session; a fresh turn wins it
+})
+
+
 def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
                             credentials_terminal: bool = False) -> int:
     """Map a one-shot turn result onto a process exit code, for both `-q` and `-Q`.
@@ -162,7 +177,12 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
     The same sentinel applies when credential resolution itself is a quota/rate-limit
     AuthError (no turn result object is produced). One that failed on a terminal provider
     error (credential revoked, model gone) exits ``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``
-    (EX_CONFIG): the dispatcher blocks the card at once. The same code applies
+    (EX_CONFIG): the dispatcher blocks the card at once. One that was killed by the
+    profile state store rather than by the card (the state DB's write lock held by a
+    peer, or a compression/lease rotation refusing this writer —
+    ``_TRANSIENT_STORAGE_REASONS``) exits ``KANBAN_STORAGE_LOCKED_EXIT_CODE``: the
+    dispatcher re-queues the card WITHOUT counting a failure, because a fresh turn
+    can win the same write. The same code applies
     before a turn when credential resolution explicitly requires re-authentication;
     unknown startup failures retain exit 1.
 
@@ -193,6 +213,12 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
         if reason in _TERMINAL_PROVIDER_REASONS:
             from hermes_cli.kanban_db import KANBAN_TERMINAL_PROVIDER_EXIT_CODE
             return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+        if reason in _TRANSIENT_STORAGE_REASONS:
+            # The turn was killed by the profile state store, not by the card: a
+            # fresh turn can win the same write, so the dispatcher re-queues the
+            # card WITHOUT consuming its give-up budget.
+            from hermes_cli.kanban_db import KANBAN_STORAGE_LOCKED_EXIT_CODE
+            return KANBAN_STORAGE_LOCKED_EXIT_CODE
     return 1
 
 

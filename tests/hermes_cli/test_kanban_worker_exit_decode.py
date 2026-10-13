@@ -38,3 +38,16 @@ def test_native_windows_reaper_and_decode(monkeypatch):
     kbd._live_worker_procs[proc.pid] = proc
     assert kbd.reap_worker_zombies() == [proc.pid]
     assert kbd._classify_worker_exit(proc.pid) == ("rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+
+
+def test_storage_locked_exit_gets_its_own_kind():
+    """76 is the state-store lock-stop sentinel and must NOT decode as ``nonzero_exit``:
+    every nonzero code the dispatcher could not name was what made a lock-stop read as a
+    genuine crash of the card (``_reclaim_dead_workers`` -> ``consecutive_failures`` -> the
+    give-up limit at 2)."""
+    assert kb.KANBAN_STORAGE_LOCKED_EXIT_CODE == 76
+    assert kbd._exit_code_kind(kb.KANBAN_STORAGE_LOCKED_EXIT_CODE) == ("storage_locked", 76)
+    # The neighbouring sentinels still own their own kinds, and a bare failure still crashes.
+    assert kbd._exit_code_kind(kb.KANBAN_RATE_LIMIT_EXIT_CODE) == ("rate_limited", 75)
+    assert kbd._exit_code_kind(kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE) == ("terminal_provider", 78)
+    assert kbd._exit_code_kind(1) == ("nonzero_exit", 1)
