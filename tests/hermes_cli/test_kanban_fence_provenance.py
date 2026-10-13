@@ -345,3 +345,90 @@ def test_board_override_verdict_is_independent_of_the_current_pointer(home, tmp_
         foreign = _run(script, home, BOARD, "--board", OTHER_BOARD, "create", "x", pin_board=False)
         assert foreign.returncode == 0, f"current={pointed_at}: {foreign.stdout}{foreign.stderr}"
 
+
+# --- A NAMED --board that does NOT resolve (card t_ecd51c9c) -------------------------------------
+#
+# ``_fence_target_store`` fell back to the AMBIENT board whenever the named ``--board`` did not
+# resolve, so ``--board <unregistered> create`` was judged against whatever board happened to be
+# current: from a process descended from a live worker on that board (or merely carrying the
+# delegated-child marker) the invocation was refused with the delegate-child message, MASKING the
+# honest ``kanban: board '<x>' does not exist``. A board that does not resolve is no board this
+# lineage can hold a claim on, so the fast-fail has no verdict to give and the CLI's own board
+# validation must speak. Measured in production on the sdlc birth node (runs 20261008-0844 =
+# gateway, honest error, item born; 20261008-0958 = worker-descended, fence message instead).
+
+UNREGISTERED = "fence-probe-unregistered"
+
+
+def _assert_honest_board_refusal(res) -> None:
+    """The invocation must fail on the BOARD, never on the fence (the two are both rc=1)."""
+    assert "child contexts cannot mutate" not in res.stderr, (
+        "the fast-fail judged a board the invocation never targeted: " + res.stderr
+    )
+    assert UNREGISTERED in res.stderr and "does not exist" in res.stderr, (
+        "expected the CLI's own board-resolution error: " + res.stdout + res.stderr
+    )
+
+
+def test_named_unregistered_board_reports_the_board_error_from_a_worker_descendant(home, tmp_path):
+    """CONTROL (passes before and after): pins only, marker stripped, descended from a live
+    claim. This shape was ALREADY honest — the would-be store of the named board carries no
+    claim — so it is here to keep the fix from turning into "any --board is admitted"."""
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    _assert_honest_board_refusal(_run(script, home, BOARD, "--board", UNREGISTERED, "create", "x"))
+
+
+def test_named_unregistered_board_reports_the_board_error_with_the_marker_set(home, tmp_path):
+    """REGRESSION (red before, green after): the delegated-child marker is set, so
+    ``explicit_board_intent_is_pinned`` wins the STORE resolution and the ambient/pinned board
+    — one this invocation never named, and one an ancestor DOES hold a live claim on — was
+    judged instead. The fence refused and masked the CLI's honest board error."""
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    _assert_honest_board_refusal(_run(script, home, BOARD, "--board", UNREGISTERED, "create", "x",
+                                      HERMES_DELEGATED_CHILD_CONTEXT="1"))
+
+
+def test_named_unregistered_board_reports_the_board_error_with_a_path_marker(home, tmp_path):
+    """REGRESSION (red before, green after): a PATH-valued marker (what ``scrub_kanban_env``
+    writes) with no pin — the store resolution hands back the NAMED board's would-be path,
+    which lies under the lineage's fenced root, so the root arm refused it."""
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    _assert_honest_board_refusal(_run(script, home, BOARD, "--board", UNREGISTERED, "create", "x",
+                                      pin_board=False,
+                                      HERMES_DELEGATED_CHILD_CONTEXT=str(home)))
+
+
+def test_named_unregistered_board_is_unchanged_from_a_top_level_process(home, tmp_path):
+    """Control: with no fenced lineage in the ancestry the refusal is the CLI's own, both
+    before and after the fix — the change moves only the fenced caller."""
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    top = _run(script, home, BOARD, "--board", UNREGISTERED, "create", "x")
+    assert top.returncode == 1, top.stdout + top.stderr
+    _assert_honest_board_refusal(top)
+
+
+def test_named_own_board_is_still_refused_by_the_marker_arm(home, tmp_path):
+    """GUARD: a mutation NAMING the board this lineage claims is still refused (marker arm)."""
+    _make_foreign_board(home, BOARD)
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    res = _run(script, home, BOARD, "--board", BOARD, "create", "x",
+               HERMES_DELEGATED_CHILD_CONTEXT="1")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "child contexts cannot mutate" in res.stderr
+
+
+def test_named_own_board_is_still_refused_by_the_provenance_arm(home, tmp_path):
+    """GUARD: the same, proven by ancestry alone (env -u state, marker stripped)."""
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    res = _run(script, home, BOARD, "--board", BOARD, "create", "x")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "child contexts cannot mutate" in res.stderr
+

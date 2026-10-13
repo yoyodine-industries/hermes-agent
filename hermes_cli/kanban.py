@@ -289,8 +289,8 @@ _DELEGATED_CHILD_CLI_REFUSAL: str = (
 _TREE_SKEW_DENIED_ACTIONS: frozenset[str] = _DELEGATED_CHILD_DENIED_ACTIONS
 
 
-def _fence_target_store(args: argparse.Namespace) -> Path:
-    """The board store the invocation actually TARGETS.
+def _fence_target_store(args: argparse.Namespace) -> Optional[Path]:
+    """The board store the invocation actually TARGETS, or ``None`` when a NAMED board resolves to none.
 
     ``--board`` names the board a command addresses; the ambient chain
     (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` -> ``<kanban>/current``) resolves only
@@ -298,20 +298,41 @@ def _fence_target_store(args: argparse.Namespace) -> Path:
     refuses a mutation targeting a board this lineage holds no claim on, and lets the verdict
     flip when ``<kanban>/current`` moves (card t_63a0c2d9).
 
+    A NAMED board that does not resolve answers ``None``, because the invocation then targets no
+    store at all: there is no board for a fence verdict to speak about, and substituting the
+    AMBIENT board judges the invocation against a board it never named — which both over-refuses
+    and MASKS the CLI's own ``board <x> does not exist`` refusal (card t_ecd51c9c, measured: the
+    same sdlc birth node reached the honest error from the gateway and the fence message from a
+    worker-descended process).
+
     The ``boards …`` actions are the exception: they ignore ``--board`` by construction (board
     metadata and the current-board pointer live at the root), so the caller keeps the ambient
     resolution for them.
     """
     named = getattr(args, "board", None)
     if named:
+        # The CLI's own board validation is the authority on whether a named board EXISTS
+        # (:func:`kanban_command` refuses an unregistered slug before dispatch), and it asks the
+        # board REGISTRY — not the store path, which a worker's env pin legitimately overrides
+        # (``explicit_board_intent_is_pinned``). Asking the registry first is what keeps the
+        # verdict scoped to the board that was NAMED: with the delegated-child marker set the pin
+        # wins the store resolution, so a store-path-only check would judge --board <unregistered>
+        # against the PINNED board and mask the honest board error all over again.
+        try:
+            normed = kb._normalize_board_slug(named)
+        except ValueError:
+            return None
+        if not normed or (normed != kb.DEFAULT_BOARD and not kb.board_exists(normed)):
+            return None
         try:
             return kb.kanban_db_path(board=named)
         except Exception:
-            # An unregistered/malformed ``--board`` is the CLI's own validation to refuse a
-            # moment later (:func:`kanban_command` validates it before dispatch); the fast-fail
-            # must never raise from here. Fall through to the ambient board, which is exactly
-            # what the pre-fix helper judged.
-            pass
+            # An unregistered/malformed ``--board`` names no store this lineage could hold a claim
+            # on. The fast-fail must never raise from here (that property is why the guard exists)
+            # — and what it must NOT do is fall back to the ambient board, which is a DIFFERENT
+            # board's verdict and would refuse this invocation before :func:`kanban_command` can
+            # print the honest board-resolution error.
+            return None
     return kb.kanban_db_path()
 
 
@@ -326,7 +347,9 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
 
     Both arms are judged against the board the invocation TARGETS (:func:`_fence_target_store`),
     never the host-global ambient board: a mutation aimed at another board is not this lineage's
-    to fence, and the verdict must not move when ``<kanban>/current`` does.
+    to fence, and the verdict must not move when ``<kanban>/current`` does. A NAMED board that does
+    not resolve is no board at all, so the verdict is ``False`` (no fence verdict, not a refusal)
+    and the CLI's own board validation produces the honest error (card t_ecd51c9c).
     """
     action = getattr(args, "kanban_action", None)
     if action == "boards":
@@ -338,6 +361,12 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
 
     # ``boards …`` ignores ``--board``, so its target is the ambient board (as before).
     target = kb.kanban_db_path() if action == "boards" else _fence_target_store(args)
+    if target is None:
+        # A NAMED board that did not resolve: no store exists for this lineage to hold a claim on,
+        # and there is nothing here to mutate. Answer "no fence verdict" — the CLI refuses the
+        # invocation itself, naming the board, instead of this fast-fail speaking for (and masking)
+        # a board the caller never touched.
+        return False
     if kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(target):
         return True
     # Durable arm: the marker is clearable, ancestry is not. Same fence, proven from the TARGET board.
