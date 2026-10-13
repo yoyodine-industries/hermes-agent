@@ -8,9 +8,9 @@ card with ``due_at IS NULL`` waits for a person, never for a clock, by design.
 
 The RELEASE leg for a fenced card is the deployed prod ``maintenance-sweep``
 workflow's ``scheduled_wake`` node (``scripts/kanban_unblocker_nodes/
-scheduled_wake.py`` reads ``due_at`` on ``scheduled`` cards). It is THE one
-releaser for that cohort and this module deliberately wires nothing: two
-releasers for one cohort is the two-implementations defect.
+scheduled_wake.py`` reads ``due_at`` on ``scheduled`` and ``blocked`` cards).
+It is THE one releaser for that cohort and this module deliberately wires
+nothing: two releasers for one cohort is the two-implementations defect.
 
 The waker that used to live here (``wake_due_cards``, its ``Band``/``WindowMap``
 execution-window map and its ``Deferral``/``WakeOutcome`` result types) was
