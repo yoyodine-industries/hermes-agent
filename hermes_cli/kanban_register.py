@@ -116,6 +116,7 @@ __all__ = [
     "dumps",
     "env_ref_for_worker",
     "find_card_board",
+    "guard_ask_home_on_move",
     "guard_new_ask_home",
     "is_task_id",
     "normalise_body",
@@ -635,6 +636,67 @@ def guard_new_ask_home(
         "If the cross-board filing is deliberate, re-run with allow_off_board_ask=True "
         f"(tool) or {ALLOW_ENV_VAR}=1 (CLI); the filing is then recorded in the card's "
         "events rather than silently."
+    )
+
+
+def guard_ask_home_on_move(
+    *, body: Optional[str | bytes], task_id: str, to_board: Optional[str],
+    title: Optional[str] = None,
+) -> Optional[dict]:
+    """Refuse a MOVE that would take an operator ask off its register's board.
+
+    THE MOVE-SEAM HALF OF THE ASK-HOME RULE. :func:`guard_new_ask_home` gates the card
+    that IS BORN an ask; this gates the ask that is RELOCATED, so the rule is stated once
+    and both write seams ask the same module. The discriminator is the one the
+    ``ask-placement-left-behind`` detector already uses, for the same reason: a card whose
+    own body carries ``Operator-ask: <register>/<its own id>`` IS the ask, and an ask must
+    live on its register's own board or the register's roll-up never sees it (a reference
+    is a stamp, never an edge, so no dependency edge can carry it across a board).
+    A card that only INHERITS an ask id by lineage is NOT gated: flow envelopes file
+    off-board by inheriting an ask, and relocating one is ordinary work.
+
+    ``to_board`` is the board the move would land the card on, so both directions of the
+    rule read as one test: a move away from the register's board refuses, and a move TO it
+    (the repair) passes. A card whose register's board cannot be told is inert, exactly as
+    at create.
+
+    Returns ``None`` when there is nothing to do; the payload ``dict`` when the
+    ``HERMES_KANBAN_ALLOW_OFF_BOARD_ASK=1`` hatch admits a deliberate relocation (the
+    caller writes the row, so the escape is on the record rather than silent); and raises
+    :class:`OperatorAskOffBoardError` on a refusal - before the move writes anything.
+    """
+    pair = parse_stamp(_text(body))
+    if pair is None:
+        return None  # carries no ask stamp at all
+    register, ask = pair
+    if ask != task_id:
+        return None  # names SOMEONE ELSE'S ask: the card SERVES it, it is not the ask
+    home = register_board(register)
+    if home is None:
+        return None  # the register's board cannot be told: nothing to compare against
+    target = _norm_board(to_board)
+    if target is None or target == _norm_board(home):
+        return None  # staying put, or landing on the ask's own home: no misplacement
+    record = {
+        "task_id": task_id,
+        "title": (title or "").strip(),
+        "register": register,
+        "register_board": home,
+        "to_board": target,
+    }
+    if os.environ.get(ALLOW_ENV_VAR, "").strip() == "1":
+        return record
+    raise OperatorAskOffBoardError(
+        "this card IS an operator ask and must stay on the register's own board; "
+        "moving it elsewhere puts the ask where its register's roll-up does not look.\n"
+        f"  card title:   {record['title']}\n"
+        f"  card:         {task_id}\n"
+        f"  moving to:    {target}\n"
+        f"  register:     {register} (its board: {home})\n"
+        f"  remedy:       move it with `--to {home}`, or re-designate the register\n"
+        "If the cross-board move is deliberate, re-run with "
+        f"{ALLOW_ENV_VAR}=1; the move is then recorded in the card's events rather "
+        "than silently."
     )
 
 
