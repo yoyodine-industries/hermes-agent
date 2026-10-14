@@ -1099,6 +1099,72 @@ def _resolve_project_link(
     return project_obj.id, project_obj, project_repo, workspace_kind
 
 
+NO_PROJECT_TOKEN = "NO_PROJECT"
+
+
+def set_task_project(
+    conn: sqlite3.Connection, task_id: str, project_ref: Optional[str],
+    reason: Optional[str] = None,
+) -> dict:
+    """Set ONE existing task's project reference IN PLACE (card t_b19cbf42).
+
+    No CLI verb could do this, so an existing card's project could only be
+    changed by recreating the card - unacceptable across ~17k cards, because
+    recreation loses ids, parent/child links, comments, attachments and the
+    ``card_id`` references approvals hold. This writes the column and nothing
+    else: no recreation, no board move, no workspace change.
+
+    Semantics the door card fixes:
+    - ``NO_PROJECT`` (the token) CLEARS the reference and says so. That is a
+      different outcome from a reference that does not resolve, and the two
+      must stay distinguishable.
+    - An UNRESOLVABLE reference is REFUSED with a named reason. ``create_task``
+      drops such a link silently and makes an ordinary task; a re-tag door must
+      not, because at 15,904 cards a dropped write is indistinguishable from a
+      successful one.
+    - IDEMPOTENT: re-running the same mapping writes nothing and reports
+      ``unchanged``.
+
+    Returns ``{"task_id", "before", "proposed", "action", "reason"}``, so a dry
+    run and a real run produce the SAME shape; ``action`` is one of ``set``,
+    ``cleared``, ``unchanged`` or ``refused``.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return {"task_id": task_id, "before": None, "proposed": None,
+                "action": "refused", "reason": "no such task"}
+
+    before = task.project_id
+    raw = str(project_ref).strip() if project_ref is not None else ""
+    if not raw:
+        return {"task_id": task_id, "before": before, "proposed": None,
+                "action": "refused", "reason": "no project reference given"}
+
+    if raw == NO_PROJECT_TOKEN:
+        proposed: Optional[str] = None
+        action = "unchanged" if before is None else "cleared"
+    else:
+        # The SAME resolver the create path uses, so an id, a slug and a
+        # differently-cased slug all land on the one canonical id.
+        resolved, _obj, _repo, _kind = _resolve_project_link(
+            conn, raw, None, "scratch", None,
+        )
+        if resolved is None:
+            return {"task_id": task_id, "before": before, "proposed": None,
+                    "action": "refused",
+                    "reason": "project reference does not resolve: %r" % raw}
+        proposed = resolved
+        action = "unchanged" if before == proposed else "set"
+
+    if action != "unchanged":
+        conn.execute("UPDATE tasks SET project_id = ? WHERE id = ?",
+                     (proposed, task_id))
+        conn.commit()
+
+    return {"task_id": task_id, "before": before, "proposed": proposed,
+            "action": action, "reason": reason or ""}
+
+
 def _project_from_source_task(
     conn: sqlite3.Connection, _pdb: Any, project_id: str, source_task_id: str,
 ) -> tuple[Any, Optional[str]]:
