@@ -452,9 +452,16 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
         # never ran — tell the sender plainly instead of leaking a raw lease error.
         # See #100523.
         who = argv[argv.index("-p") + 1] if "-p" in argv[:-1] else "the teammate"
+        # The child's refusal already names the holder and its age (the ``Details:`` line
+        # hermes_cli.active_sessions puts under the owner refusal). This is the ONLY place the
+        # sender can learn who holds the seat, and without it the fleet's only routable entry
+        # point is an unnameable busy turn nobody can route around (card t_bba953e6).
+        detail = next((line.strip() for line in stderr_text.splitlines()
+                       if line.strip().startswith("Details:")), "")
         print(json.dumps({
             "error": f"Delivery failed: @{who}'s Bot Chat is open on another "
-                     "surface right now, so your message was NOT delivered. Try again later.",
+                     "surface right now, so your message was NOT delivered. Try again later."
+                     + (f" {detail}" if detail else ""),
             "reason": "target_busy",
         }))
         return 1
