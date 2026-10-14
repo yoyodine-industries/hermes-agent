@@ -629,15 +629,19 @@ class TurnBusyError(RuntimeError):
     """A delivery turn is already running for the target profile (``waited_seconds`` ≈ time queued).
 
     ``reason`` is 'target_busy' — extends the #93091 item-1 structured refusal enum. ``waited_seconds`` is
-    roughly how long the caller queued behind the current turn before giving up.
+    roughly how long the caller queued behind the current turn before giving up. ``holder`` is the current
+    holder's own stamp (``pid`` / ``surface`` / ``acquired_at``) when the lock carries one, and the refusal
+    text names it: an unnameable busy seat is one a caller can only queue behind, never route around
+    (card t_bba953e6).
     """
 
     reason = "target_busy"
 
-    def __init__(self, profile: str, waited_seconds: float):
-        self.profile, self.waited_seconds = profile, waited_seconds
+    def __init__(self, profile: str, waited_seconds: float, holder: dict[str, Any] | None = None):
+        self.profile, self.waited_seconds, self.holder = profile, waited_seconds, holder
         super().__init__(f"target_busy: another delivery turn is already running for profile '{profile}' — "
-                         f"queued behind it for ~{round(waited_seconds)}s without it finishing. "
+                         f"queued behind it for ~{round(waited_seconds)}s without it finishing."
+                         f"{_holder_phrase(holder)} "
                          "The message was NOT delivered; retry shortly.")
 
 
@@ -653,13 +657,91 @@ def turn_lock_path(root: Path | str, profile: str) -> Path:
     return relay_root(root) / LOCKS_DIR / f"{safe}.lock"
 
 
+# While a turn holds a profile's lock, the lock FILE carries a small JSON stamp saying who holds it:
+# a queued caller's refusal can then name the holder and its age instead of only counting its own wait,
+# which is what lets the fleet route around a busy seat rather than queue blind (card t_bba953e6).
+# Reading is best effort: an unstamped lock (an older writer, a hand-made flock) still refuses, it just
+# cannot name anyone. The stamp is written only while the exclusive flock is held, so it always
+# describes the current holder; a released lock keeps the last holder's stamp, which is never read
+# because the caller only reads it after failing to take the lock.
+TURN_HOLDER_MAX_BYTES = 512
+
+
+def _turn_holder_stamp(profile: str) -> bytes:
+    """The holder record for ``profile``'s lock file: pid, profile, when, and the surface holding it."""
+    surface = (sys.argv[0] if sys.argv else "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+    record: dict[str, Any] = {"pid": os.getpid(), "profile": str(profile or ""),
+                              "acquired_at": round(time.time(), 3)}
+    # An inline ``-c``/``-m`` holder has no executable name to report; name nobody rather than junk.
+    if surface and not surface.startswith("-"):
+        record["surface"] = surface[:64]
+    return json.dumps(record, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _stamp_turn_holder(fd: int, profile: str) -> None:
+    """Write the holder stamp into an fd that already holds the exclusive flock. Never raises."""
+    try:
+        payload = _turn_holder_stamp(profile)[:TURN_HOLDER_MAX_BYTES]
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, payload)
+    except OSError:  # pragma: no cover — a read-only lock dir still locks; it just cannot name itself
+        logger.debug("bot turn lock holder stamp failed", exc_info=True)
+
+
+def read_turn_holder(root: Path | str, profile: str) -> dict[str, Any] | None:
+    """The stamp of whoever holds ``profile``'s turn lock, or None when it carries none. Never raises.
+
+    Called AFTER a failed acquire, so a stamp it returns is the holder that refused us.
+    """
+    try:
+        raw = turn_lock_path(root, profile).read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return None
+    if not raw or len(raw) > TURN_HOLDER_MAX_BYTES:
+        return None
+    try:
+        holder = json.loads(raw)
+    except ValueError:
+        return None
+    return holder if isinstance(holder, dict) and holder.get("pid") else None
+
+
+def _holder_phrase(holder: dict[str, Any] | None, *, now: float | None = None) -> str:
+    """`` Held by pid 4321 (hermes) for 4m.`` — the empty string when nobody can be named."""
+    if not holder:
+        return ""
+    who = f"pid {holder.get('pid')}"
+    surface = str(holder.get("surface") or "").strip()
+    if surface:
+        who += f" ({surface})"
+    try:
+        started = float(str(holder.get("acquired_at") or ""))
+    except (TypeError, ValueError):
+        started = None
+    age = ""
+    if started is not None:
+        age = f" for {_holder_age(max(0.0, (time.time() if now is None else now) - started))}"
+    return f" Held by {who}{age}."
+
+
+def _holder_age(seconds: float) -> str:
+    """Compact age: ``45s`` / ``4m`` / ``2h10m`` (the shape the active-session refusals use)."""
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return f"{int(seconds)}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h" if not minutes else (f"{hours}h{minutes}m" if hours else f"{minutes}m")
+
+
 @contextlib.contextmanager
 def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | None = None) -> Iterator[Path]:
     """Hold ``profile``'s cross-process turn lock for the ``with`` body: non-blocking
     flock probe + short-sleep retry up to the budget (``bot_mode.turn_wait_seconds``
-    unless ``timeout_seconds``); raises :class:`TurnBusyError` when exhausted. No
-    ordering among waiters, but every waiter is bounded. Without ``fcntl`` (Windows)
-    the lock is a no-op — those installs never had this race path."""
+    unless ``timeout_seconds``); raises :class:`TurnBusyError` when exhausted, naming the
+    holder and its age when the lock carries a stamp. No ordering among waiters, but every
+    waiter is bounded. Without ``fcntl`` (Windows) the lock is a no-op — those installs never
+    had this race path."""
     try:
         import fcntl
     except ImportError:  # pragma: no cover — Windows
@@ -681,8 +763,10 @@ def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | N
             except OSError:
                 now = time.monotonic()
                 if now >= deadline:
-                    raise TurnBusyError(profile, now - start)
+                    raise TurnBusyError(profile, now - start, read_turn_holder(root, profile))
                 time.sleep(min(0.1, max(0.005, deadline - now)))
+        # Only under the held flock, so the stamp always describes the current holder.
+        _stamp_turn_holder(fd, profile)
         try:
             yield path
         finally:

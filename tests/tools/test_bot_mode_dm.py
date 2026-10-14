@@ -897,6 +897,34 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
     assert payload["reason"] == "target_busy"
 
 
+def test_delivery_runner_carries_the_holders_own_detail(tmp_path, capsys):
+    """The child's lease refusal already names the holder and its age; the runner must
+    forward it, because this refusal is the ONLY place the sender learns who holds the
+    seat and can route around it (card t_bba953e6)."""
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("hi", encoding="utf-8")
+    child = tmp_path / "owned.py"
+    detail = "Details: session 20261013_223229_f78ac5 opened by desktop 4m ago."
+    child.write_text(
+        "import sys\n"
+        "print('hermes-refusal-reason: SESSION_NOT_OWNED', file=sys.stderr)\n"
+        "print('This chat is open in another Hermes window/terminal.', file=sys.stderr)\n"
+        f"print({detail!r}, file=sys.stderr)\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+
+    returncode = bot_mode_dm._run_delivery(
+        [sys.executable, str(child), "-p", "default"], str(dm_file), stdin_file=False
+    )
+
+    assert returncode == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reason"] == "target_busy"
+    assert detail in payload["error"]
+    assert "NOT delivered" in payload["error"]
+
+
 def test_local_turn_reemits_empty_stdout_for_a_bare_silence_marker(tmp_path, capsys):
     """#110782: the one-shot ``hermes chat -c "Bot Chat"`` transport applies the gateway's
     silence rule — a successful bare marker reaches the sender as "", prose stays verbatim."""
