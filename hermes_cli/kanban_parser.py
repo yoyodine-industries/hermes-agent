@@ -250,6 +250,12 @@ _SPECS = [
          help="Show a task with comments + events"),
     _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
          help="Assign or reassign a task"),
+    _cmd("set-project", [
+        _TASK_ID,
+        _arg("project",
+             help="Project id or slug to tag the task with, or NO_PROJECT to clear it"),
+        _arg("--reason", help="Why this card is being re-tagged (recorded with the change)"),
+    ], help="Set an existing task's project reference IN PLACE (no recreation; card t_b19cbf42)"),
     _cmd("set-model", [
         _TASK_ID,
         _arg("model", nargs="?", help="Model to pin the worker to (or 'none' to clear the override)"),

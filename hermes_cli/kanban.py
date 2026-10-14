@@ -578,6 +578,24 @@ def _cmd_assign(args: argparse.Namespace) -> int:
                       f"Assigned {args.task_id} to {profile or '(unassigned)'}")
 
 
+def _cmd_set_project(args: argparse.Namespace) -> int:
+    """Tag an EXISTING task's project reference in place (card t_b19cbf42).
+
+    The result dict separates a REFUSAL from a write on purpose: an
+    unresolvable reference exits nonzero with the reason the kernel named, so a
+    bulk re-tag can never read a dropped write as a success.
+    """
+    with kbc.connect_closing() as conn:
+        result = kb.set_task_project(conn, args.task_id, args.project,
+                                     reason=getattr(args, "reason", None))
+    if result["action"] == "refused":
+        return _err(f"kanban: {result['reason']}", 2)
+    return _ok_or_err(
+        True, f"no such task: {args.task_id}",
+        f"{args.task_id}: project {result['before'] or '(unset)'} -> "
+        f"{result['proposed'] or '(unset)'} ({result['action']})")
+
+
 def _cmd_set_model(args: argparse.Namespace) -> int:
     model = args.model
     if model is not None and model.lower() in {"none", "-", "null", ""}:
@@ -1321,6 +1339,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "set-project": _cmd_set_project,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
