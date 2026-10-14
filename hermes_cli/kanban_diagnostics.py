@@ -752,6 +752,154 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+# --- A ready card the DISPATCHER has decided not to spawn --------------------
+#
+# ``hermes kanban dispatch`` appends a ``respawn_guarded`` event on every tick it
+# skips a card, naming WHY it skipped it. That event is the card's only record
+# that it is HELD; the row itself still reads ``ready``, and
+# ``_rule_stranded_in_ready`` reads the same row and reports the OPPOSITE cause
+# ("no worker", "the assignee may be misspelled"). That false cause is what kept
+# three held cards invisible for the better part of a day (re-measured live
+# 2026-10-13: migrations/t_15763252 held 8.8h, t_9b3e8688 15h, t_293d8ddf 35h --
+# all ``active_pr``). This rule names the dispatcher's own reason;
+# ``_rule_stranded_in_ready`` stands down whenever one is present.
+#
+# Plain words for the dispatcher's guard reasons. An unmapped reason still
+# fires -- it is named by its raw token rather than silently dropped.
+_DISPATCH_HOLD_LABELS = {
+    "active_pr": "a GitHub PR URL on the card holds every spawn for 24h",
+    "recent_success": "the card already ran successfully inside the guard window",
+    "blocker_auth": "the last failure reads as an auth/quota blocker",
+    "rate_limit_cooldown": "the provider rate limit is still cooling down",
+    "infrastructure_cooldown": "the host refused the last spawn",
+    "substrate_cooldown": "this tree's own modules disagree with the dispatcher",
+    "storage_locked_cooldown": "the state store is still locked",
+}
+# How the hold ends, per reason, so the reader is never left with a dead end.
+# ``active_pr`` is the one that bit us, so it names both legs.
+_DISPATCH_HOLD_RELEASES = {
+    "active_pr": "It lifts by itself 24h after the newest PR-URL comment, or "
+                 "early on a handoff that follows that comment: reassign to a "
+                 "DIFFERENT profile, changes_requested, or review_reopened (a "
+                 "no-op reassign back to the same lane does not lift it).",
+}
+_DISPATCH_HOLD_DEFAULT_RELEASE = (
+    "It lifts when the underlying condition clears; the reason above names it."
+)
+# Events that ANSWER a hold: a claim/spawn means the guard lifted and the card
+# ran, and a status write means it was requeued. A ``commented`` event is
+# deliberately NOT one of them -- a PR-URL comment is exactly what ARMS
+# ``active_pr``, so a comment must never read as a release.
+_DISPATCH_HOLD_ANSWERING_EVENTS = frozenset({
+    "claimed", "spawned", "unblocked", "promoted", "promoted_manual",
+    "reclaimed", "status", "changes_requested", "review_reopened",
+    "dependency_cleared", "reopened", "completed", "archived",
+})
+# How long a hold must persist before it is a signal rather than dispatcher
+# spacing (a rate-limit cooldown, a 1h ``recent_success`` window). Matches
+# ``stranded_in_ready``'s "below 30 min the signal is dominated by tasks about
+# to be claimed" rationale, so the two rules hand over at one threshold.
+_HOLD_GRACE_SECONDS = 30 * 60
+_HOLD_ERROR_SECONDS = 6 * 3600
+_HOLD_CRITICAL_SECONDS = 24 * 3600
+
+
+def _is_profile_handoff(ev) -> bool:
+    """Mirror of ``kanban_db_dispatch._is_handoff_event``: only an ``assigned``
+    event that moves the card to a DIFFERENT profile answers a hold. A no-op
+    reassign back to the same lane, an unassign, and the dispatcher's own
+    ``kanban.default_assignee`` write do not; events without ``from`` are not
+    trusted (fail closed)."""
+    data = _parse_payload(ev)
+    if data.get("source") == "kanban.default_assignee":
+        return False
+    to = data.get("assignee")
+    return bool(to) and "from" in data and data["from"] != to
+
+
+def _dispatch_hold(events: Iterable[Any]) -> Optional[tuple[int, int, str]]:
+    """``(held_since, skipped_ticks, reason)`` for the newest UNBROKEN run of
+    ``respawn_guarded`` skips, else ``None``.
+
+    A run ends at the last event that changed the card's dispatchability -- a
+    claim/spawn that answered the guard, a status write that requeued it, or an
+    ``assigned`` handoff to a different profile. Requires id-sorted
+    (arrival-order) input, which the DB provides.
+    """
+    held_since: Optional[int] = None
+    ticks = 0
+    reason = ""
+    for ev in events:
+        kind = _event_kind(ev)
+        if kind == "respawn_guarded":
+            if held_since is None:
+                held_since = _event_ts(ev)
+            ticks += 1
+            reason = str(_parse_payload(ev).get("reason") or "").strip() or "unknown"
+        elif kind in _DISPATCH_HOLD_ANSWERING_EVENTS:
+            held_since, ticks, reason = None, 0, ""
+        elif kind == "assigned" and _is_profile_handoff(ev):
+            held_since, ticks, reason = None, 0, ""
+    if held_since is None:
+        return None
+    return held_since, ticks, reason
+
+
+def _rule_dispatcher_hold(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``ready`` card the dispatcher last answered with a skip: it is HELD,
+    not waiting, and the reason is already on its own event log.
+
+    Fleet shape: ``stranded_in_ready`` blames the worker pool for the same row.
+    Only one of the two can be true, so that rule stands down while a hold is
+    engaged (it returns early on ``_dispatch_hold``).
+    """
+    if _task_field(task, "status") != "ready":
+        return []
+    # A live claim means a worker owns it; whatever the guard said is stale.
+    if _task_field(task, "claim_lock"):
+        return []
+    hold = _dispatch_hold(events)
+    if hold is None:
+        return []
+    held_since, ticks, reason = hold
+    held = max(0, int(now) - held_since)
+    grace = _positive_int(cfg.get("hold_grace_seconds"), _HOLD_GRACE_SECONDS)
+    if held < grace:
+        return []
+    if held >= _HOLD_CRITICAL_SECONDS:
+        severity = "critical"
+    elif held >= _HOLD_ERROR_SECONDS:
+        severity = "error"
+    else:
+        severity = "warning"
+    task_id = _task_field(task, "id", "") or ""
+    assignee = _task_field(task, "assignee") or ""
+    label = _DISPATCH_HOLD_LABELS.get(
+        reason, f"the dispatcher's {reason!r} guard is engaged")
+    release = _DISPATCH_HOLD_RELEASES.get(reason, _DISPATCH_HOLD_DEFAULT_RELEASE)
+    age_str = f"{held / 3600:.1f}h" if held >= 3600 else f"{int(held / 60)}m"
+    actions: list[DiagnosticAction] = []
+    if task_id:
+        cmd = f"hermes kanban events {task_id}"
+        actions.append(_cli_hint(f"See the hold in the card's log: {cmd}", cmd, suggested=True))
+    actions.append(DiagnosticAction(
+        kind="reassign", label="Reassign to a different worker",
+        payload={"current_assignee": assignee}))
+    return [Diagnostic(
+        kind="dispatcher_hold", severity=severity,
+        title=f"Held by the dispatcher ({reason}) for {age_str} — not queued",
+        detail=f"The dispatcher has skipped this card {ticks} time(s) since "
+               f"{held_since}, so it is held, not waiting its turn: {label}. "
+               f"{release} Nothing is wrong with assignee {assignee!r} or the "
+               f"worker pool; `stranded_in_ready` does not apply while a hold "
+               f"is engaged.",
+        actions=actions,
+        first_seen_at=held_since, last_seen_at=held_since, count=ticks,
+        data={"reason": reason, "held_since": held_since, "held_seconds": int(held),
+              "skipped_ticks": ticks, "assignee": assignee},
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
     (default 30 min). Deliberately age-based and identity-agnostic so it
@@ -766,6 +914,13 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
     assignee = _task_field(task, "assignee") or ""
     if not assignee.strip():
+        return []
+
+    # A card the dispatcher is HOLDING has been seen and deliberately skipped,
+    # and ``_rule_dispatcher_hold`` names why. Blaming the assignee or the
+    # worker pool here is the false cause this pair of rules exists to end
+    # (migrations/t_15763252: "ready 12.3h with no worker" over 57 skips).
+    if _dispatch_hold(events) is not None:
         return []
 
     # Most recent event that put the task into ready; with none (old task /
@@ -820,6 +975,7 @@ _RULES: list[RuleFn] = [
     _rule_running_with_open_parents,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_dispatcher_hold,
     _rule_stranded_in_ready,
     _rule_overdue_scheduled,
 ]
@@ -836,6 +992,9 @@ DEFAULT_CONFIG = {
     # Below 30 min the signal is dominated by tasks about to be claimed on
     # the next dispatcher tick.
     "stranded_threshold_seconds": 30 * 60,
+    # A dispatch hold must persist this long before it is a signal rather than
+    # normal dispatcher spacing (cooldowns, the 1h recent_success window).
+    "hold_grace_seconds": 30 * 60,
     # Lateness (seconds) before a parked card whose clock fence has passed is
     # called overdue: one release interval plus slack, so a healthy board stays
     # quiet.
