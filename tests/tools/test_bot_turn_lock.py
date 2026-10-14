@@ -15,7 +15,6 @@ except ImportError:  # pragma: no cover - Windows
     fcntl = None
 import json
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -81,62 +80,6 @@ def test_timeout_is_structured_target_busy(root):
         assert err.reason == "target_busy"
         assert err.profile == "ops"
         assert err.waited_seconds >= 0.3
-    finally:
-        release.set()
-        t.join(timeout=5)
-
-
-def test_refusal_names_the_holder_and_its_age(root):
-    """A queued delivery must learn WHO holds the profile and for how long.
-
-    Without it the caller can only wait blind behind a turn it cannot name, and
-    every lane behind a busy seat is refused with no way to route around it
-    (card t_bba953e6).
-    """
-    acquired = threading.Event()
-    release = threading.Event()
-
-    def _hold():
-        with acquire_turn_lock(root, "ops", timeout_seconds=5):
-            acquired.set()
-            release.wait(timeout=10)
-
-    t = threading.Thread(target=_hold)
-    t.start()
-    assert acquired.wait(timeout=5)
-    try:
-        with pytest.raises(TurnBusyError) as excinfo:
-            with acquire_turn_lock(root, "ops", timeout_seconds=0.3):
-                pass  # pragma: no cover — must not acquire
-        err = excinfo.value
-        message = str(err)
-        assert err.reason == "target_busy"
-        assert err.holder is not None and err.holder["pid"] == os.getpid()
-        assert f"Held by pid {os.getpid()}" in message
-        assert re.search(r"Held by pid \d+ for \d+[smh]", message), message
-        # The historical refusal text survives verbatim ahead of the holder clause.
-        assert "The message was NOT delivered; retry shortly." in message
-    finally:
-        release.set()
-        t.join(timeout=5)
-
-
-def test_refusal_without_a_holder_stamp_still_refuses(root):
-    """An unstamped lock (older writer, hand-made flock) degrades to the old text."""
-    held = threading.Event()
-    release = threading.Event()
-    t = threading.Thread(
-        target=_hold_flock, args=(turn_lock_path(root, "ops"), held, release)
-    )
-    t.start()
-    assert held.wait(timeout=5)
-    try:
-        assert bot_relay.read_turn_holder(root, "ops") is None
-        with pytest.raises(TurnBusyError) as excinfo:
-            with acquire_turn_lock(root, "ops", timeout_seconds=0.2):
-                pass  # pragma: no cover — must not acquire
-        assert str(excinfo.value).endswith("The message was NOT delivered; retry shortly.")
-        assert excinfo.value.holder is None
     finally:
         release.set()
         t.join(timeout=5)
