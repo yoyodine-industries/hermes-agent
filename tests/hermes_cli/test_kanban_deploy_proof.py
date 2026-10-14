@@ -339,10 +339,14 @@ def _ledger_with(tmp_path: Path, rows: list, name: str = "ledger.jsonl"):
     return path
 
 
-def _landing_row(at: str, sha: str = REF, admission: str = "admitted", exit_code: int = 0):
-    return {"kind": "landing", "admission": admission, "exit": exit_code, "at": at,
-            "landed_sha": sha, "card": "t_witness1", "pr": 210,
-            "repo": "/opt/hermes_sandbox/unit"}
+def _landing_row(at: str, sha: str = REF, admission: str = "admitted", exit_code: int = 0,
+                 row_recorded: bool | None = None):
+    row = {"kind": "landing", "admission": admission, "exit": exit_code, "at": at,
+           "landed_sha": sha, "card": "t_witness1", "pr": 210,
+           "repo": "/opt/hermes_sandbox/unit"}
+    if row_recorded is not None:
+        row["row_recorded"] = row_recorded
+    return row
 
 
 def _deploy_row(at: str, sha: str, dest: str, *, stamped: bool = True,
@@ -487,6 +491,69 @@ def test_an_admitted_landing_beats_a_newer_unadmitted_one(tmp_path):
                             run_store_path=str(store))
     assert verdict.ok is True, verdict.detail
     assert verdict.facts["landing_row_at"] == "2026-09-26T22:00:00Z"
+
+
+# --- land.sh's documented exit 3 is a LANDED row (t_04bd0287) -----------------
+#
+# land.sh's exit table gives exit 3 to "landed": the merge is real, and the only
+# post-merge step it skips is the flow's `merged` transition, which the next sdlc
+# sync tick records. So the exit must not be read alone -- the one sub-case that
+# IS a provenance gap (the merge sha's review row was never recorded) carries
+# `row_recorded: false` on the same row.
+
+
+@pytest.mark.parametrize("admission, exit_code, row_recorded, admitted", [
+    # Every (admission, exit, row_recorded) class present on the live deploy ledger,
+    # measured 2026-10-11 (1158 landing rows) -- with the verdict each one owes.
+    ("admitted", 0, True, True),
+    ("admitted", 0, None, True),
+    (None, 3, False, False),        # genuinely non-admitted: must STAY refused
+    ("admitted", 3, True, True),    # land.sh's "landed" leg (t_04bd0287)
+    (None, 6, False, False),
+    ("refused", 5, False, False),
+    (None, 1, False, False),
+    ("admitted", 0, False, True),
+    (None, 0, False, True),
+    ("waived", 0, True, False),
+    ("refused", 5, True, False),
+    (None, 4, False, False),
+    ("admitted", 6, True, False),
+    ("refused", 0, False, False),
+    # the exit-3 sub-cases the class rule must not blur
+    ("admitted", 3, False, False),  # the provenance gap the exit half exists for
+    ("admitted", 3, None, False),   # an unstated row is not a "recorded" one
+    # regression: every class the gate admitted before is unchanged
+    ("admitted", None, None, True),
+    (None, None, None, True),
+])
+def test_the_admitted_landing_classes(admission, exit_code, row_recorded, admitted):
+    row = {"admission": admission, "exit": exit_code}
+    if row_recorded is not None:
+        row["row_recorded"] = row_recorded
+    assert gate._is_admitted(row) is admitted
+
+
+def test_an_exit3_landed_row_is_admitted_end_to_end(tmp_path):
+    """The card's own shape: the only landing row is (admitted, exit 3, row_recorded true)."""
+    path, digest = _artifact(tmp_path)
+    ledger = _ledger_with(tmp_path, [_landing_row(LANDING_AT, exit_code=3, row_recorded=True)])
+    store = _run_store(tmp_path, finished_at=RUN_AFTER)
+    verdict = gate.evaluate(_proof(path, digest), ledger_path=str(ledger),
+                            run_store_path=str(store))
+    assert verdict.ok is True, verdict.detail
+    assert verdict.facts["landing_source"] == "ledger"
+    assert verdict.facts["landing_row_at"] == "2026-09-26T22:47:50Z"
+
+
+def test_an_exit3_row_without_its_review_record_stays_refused_end_to_end(tmp_path):
+    """The gap the exit half exists for: exit 3 with row_recorded false is NOT admitted."""
+    path, digest = _artifact(tmp_path)
+    ledger = _ledger_with(tmp_path, [_landing_row(LANDING_AT, exit_code=3, row_recorded=False)])
+    store = _run_store(tmp_path, finished_at=RUN_AFTER)
+    verdict = gate.evaluate(_proof(path, digest), ledger_path=str(ledger),
+                            run_store_path=str(store))
+    assert verdict.ok is False
+    assert verdict.cause == "landing_not_admitted"
 
 
 def _git_repo(tmp_path: Path, rel: str = "cron/deploy-train.sh", body: str = "landed bytes\n"):
