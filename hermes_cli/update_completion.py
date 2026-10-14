@@ -272,7 +272,13 @@ def settle_lost_completion(request: dict, reason: str) -> dict:
         update_receipt.finalize_pending_update_receipt(1 if parked else 0, "completion owed after the code was updated")
         receipt = _read_terminal_receipt(request)
     outcome = (receipt or {}).get("outcome")
-    code = 130 if outcome == "interrupted" else 1 if outcome == "partial" else 0
+    # A run that stashed the user's overrides and did NOT restore them finalizes ``failed``
+    # (update_receipt.UpdateReceipt.finalize), so read the hard failure, not only ``partial``:
+    # the exit status must stay 1 for a stripped tree, never 0.
+    from hermes_cli import update_hard_failure
+
+    hard = update_hard_failure.unrestored_local_changes(receipt or {})
+    code = 130 if outcome == "interrupted" else 1 if outcome == "partial" or hard else 0
     if code == 0:
         _publish_gateway_success(request)
     return {"exit_code": code, "receipt": receipt, "windows_resume": None, "pm_receipt": None}
@@ -376,9 +382,10 @@ def _complete_selected(request: dict) -> bool:
     and keeps its own obligation armed (``source-completion-pending`` for the tail, the fleet
     restart obligation for gateways), so the next launch or ``hermes update`` retries it.
     Returns False only when the user's local changes were left parked in the stash: nothing
-    retries that, so the run is ``partial`` and exits 1 (#122557), never "Update complete".
+    retries that, so the run is ``partial`` (``failed`` when the override set was not restored at
+    all) and exits 1 (#122557), never "Update complete".
     """
-    from hermes_cli import main, update_cmd, update_cmd_config
+    from hermes_cli import main, update_cmd, update_cmd_config, update_hard_failure
     from hermes_cli.source_completion import complete_source_checkout
     from hermes_cli.update_inventory import RuntimeRecord, UpdatePlan
     from hermes_cli.update_receipt import (
@@ -424,6 +431,15 @@ def _complete_selected(request: dict) -> bool:
     # the user's own changes are still parked.
     if request["gateway_mode"]:
         update_cmd._write_gateway_update_exit_code(complete)
+    # HARD FAILURE (standing No-silent-failures rule): the run stashed the user's local overrides
+    # and did NOT restore them, so the tree the fleet would restart onto is missing them. A restart
+    # there is the event that turns a parked file into a live outage: the fleet keeps serving, a
+    # deterministic card names the recovery, and the run's own verdict stays non-green. The verdict
+    # is keyed on the run's own `local_changes_stash` step -- never on inference.
+    hard = update_hard_failure.from_request(request)
+    if hard is not None:
+        update_hard_failure.hold_fleet_and_file_card(hard)
+        return False
     if request.get("no_gateway_restart", False):
         record_skip("gateway_restart", "--no-gateway-restart: deferred, marker kept")
         record_stage("restart", "skipped")

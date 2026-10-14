@@ -221,6 +221,15 @@ class UpdateReceipt:
     def finalize(self, outcome: str) -> None:
         if outcome == "success" and self.data.get("user_action"):
             outcome = "partial"  # committed, but the user still has to act (record_user_action)
+        from hermes_cli.update_hard_failure import unrestored_local_changes
+
+        if unrestored_local_changes(self.data) is not None and outcome not in ("failed", "interrupted"):
+            # HARD FAILURE: this run stashed the user's local override set and did not restore it,
+            # so the tree the fleet serves is stripped. The verdict reports the RUN, never the
+            # launcher (the checkout did move). ``failed`` is also the only non-green outcome a
+            # downstream verifier leaves alone -- ``partial`` is exactly what gets reconciled back
+            # to ``success`` once the fleet is proven current (the false green of 2026-10-10).
+            outcome = "failed"
         self.data["outcome"] = outcome
         self.data["finished_at"] = _utc_now_iso()
         self.data["post_update"] = _code_identity(refresh=True)
@@ -436,8 +445,9 @@ def record_user_action(step: str, reason: str) -> None:
     """The code committed, but something only the user can do is still owed. Never raises.
 
     Unlike a follow-up nothing retries it (a stash whose restore conflicted stays parked until the
-    user re-applies it), so the run can never be a plain success: it finalizes ``partial`` and
-    ``hermes update`` exits 1, as #122557 established for an unrestored autostash.
+    user re-applies it), so the run can never be a plain success: it finalizes ``partial`` (``failed``
+    when the local override set was not restored at all -- see update_hard_failure) and ``hermes
+    update`` exits 1, as #122557 established for an unrestored autostash.
     """
     _record("fact", f"update user action {step}", "user_action", {"step": step, "reason": " ".join(str(reason).split())[:500]})
     persist_running_receipt()
