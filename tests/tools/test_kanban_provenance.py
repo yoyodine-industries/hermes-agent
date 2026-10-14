@@ -6,6 +6,21 @@ import pytest
 from hermes_state import SessionDB
 
 
+@pytest.fixture(autouse=True)
+def _name_a_board(tmp_path, monkeypatch):
+    """A filing must NAME its board (operator mandate, 2026-10-10, card t_b56e48c1).
+
+    This suite is about provenance, not board routing, so it registers one real
+    (non-``default``) board once here and binds it for the whole test, rather than
+    naming it at each of the call sites below. `default` is never a filing destination.
+    """
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    kb.create_board("provenance-board")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "provenance-board")
+
+
 @pytest.mark.parametrize("linked,explicit", [(False, None), (True, None), (False, "override")])
 def test_worker_create_keeps_durable_origin(tmp_path, monkeypatch, linked, explicit):
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kn

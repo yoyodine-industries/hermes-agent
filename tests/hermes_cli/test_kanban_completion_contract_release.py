@@ -229,12 +229,19 @@ def test_set_contract_requires_a_reason_and_refuses_a_terminal_card(board):
         assert changed == 1  # a refusal writes no event
 
 
+# A filing must NAME its board (operator mandate, 2026-10-10, card t_b56e48c1):
+# `default` is never a filing destination, so every e2e child addresses this
+# registered board instead of falling to the ambient default.
+BOARD = "contract-probe"
+
+
 def _run_hermes(home: Path, *args: str, marker: bool = False) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
     env["HERMES_KANBAN_HOME"] = str(home)
-    for name in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT"):
+    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT"):
         env.pop(name, None)
+    env["HERMES_KANBAN_BOARD"] = BOARD
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     if marker:
         env["HERMES_DELEGATED_CHILD_CONTEXT"] = "1"
@@ -244,10 +251,19 @@ def _run_hermes(home: Path, *args: str, marker: bool = False) -> subprocess.Comp
                           cwd=ROOT, env=env, capture_output=True, text=True, check=False, timeout=60)
 
 
-def test_cli_set_contract_is_the_documented_release_and_top_level_only(tmp_path):
+def _register_board(home: Path, monkeypatch) -> None:
+    """Register BOARD in the temp home; a filing never mints a board."""
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    kb.create_board(BOARD)
+
+
+def test_cli_set_contract_is_the_documented_release_and_top_level_only(tmp_path, monkeypatch):
     """The operator's verb, end to end: create warns, set-contract releases, children cannot."""
     home = tmp_path / "hermes"
     home.mkdir()
+    _register_board(home, monkeypatch)
 
     created = _run_hermes(home, "kanban", "create", "contract probe",
                           "--completion-contract", "acme/repo")

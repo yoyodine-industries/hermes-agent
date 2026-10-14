@@ -20,6 +20,10 @@ from hermes_cli import kanban_db_connect as kbc
 
 BODY = "line one\nline two\n--json\n--body should survive verbatim\n"
 
+# A filing must NAME its board (operator mandate, 2026-10-10, card t_b56e48c1): this
+# suite is about body delivery, so it registers and names one board throughout.
+BOARD = "bodyboard"
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -29,6 +33,7 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    kb.create_board(BOARD)
     return home
 
 
@@ -36,14 +41,15 @@ def _create(argv, monkeypatch=None, stdin=None):
     """Drive the real ``hermes kanban create`` parser into ``_cmd_create``."""
     root = argparse.ArgumentParser(prog="hermes")
     kc.build_parser(root.add_subparsers())
-    args = root.parse_args(["kanban", "create", *argv])
+    args = root.parse_args(["kanban", "--board", BOARD, "create", *argv])
     if stdin is not None:
         monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
     return kc._cmd_create(args)
 
 
 def _latest_body():
-    with kbc.connect_closing() as conn:
+    # The filing addresses BOARD (see ``_create``), so read THAT board's store.
+    with kbc.connect_closing(board=BOARD) as conn:
         tasks = kb.list_tasks(conn)
     assert tasks, "expected _cmd_create to have stored a task"
     return tasks[-1]

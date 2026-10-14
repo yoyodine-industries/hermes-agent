@@ -1356,6 +1356,12 @@ def _handle_create(args: dict, **kw) -> str:
     # stale or wrong ambient pin cannot re-home the work.
     fired_board = _kb_board.board_for_fired_card(args.get("board"),
                                                  source_task_id=self_tid)
+    # OPERATOR MANDATE (2026-10-10, card t_b56e48c1): every card must NAME its board.
+    # The tool is the second door into the same filing seam, so it reads the ONE
+    # refusal text (never a copy of it) and refuses BEFORE any write.
+    _board_refusal = _kb_board.filing_board_refusal(args.get("board"),
+                                                    source_task_id=self_tid)
+    _check(not _board_refusal, _board_refusal or "")
     with _board(fired_board) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id

@@ -186,14 +186,21 @@ def test_tool_create_with_an_unregistered_board_is_refused(kanban_home, monkeypa
     assert kb.source_board_for_task(kanban_home[1]) == SOURCE_BOARD
 
 
-def test_cli_create_with_no_board_and_no_source_mints_nothing(kanban_home, monkeypatch):
-    """A source-less filing falls to the documented default, never to a new board."""
+def test_cli_create_with_no_board_and_no_source_is_refused(kanban_home, monkeypatch):
+    """A source-less filing must NAME a board — it may not fall to the default.
+
+    INVERTED 2026-10-10 (card t_b56e48c1). This case used to assert the OPPOSITE
+    ("a source-less filing falls to the documented default"), which is exactly the
+    silent fallback the operator mandate removes: a create that named no board
+    landed on ``default`` with nobody having chosen the estate.
+    """
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     before = {b["slug"] for b in kb.list_boards()}
-    assert kb_cli._cmd_create(_create_args()) == 0
-    assert {b["slug"] for b in kb.list_boards()} == before
-    assert _ids_on(kb.DEFAULT_BOARD) != set(), "it landed on the documented default"
+    assert kb_cli._cmd_create(_create_args()) != 0, "a boardless filing must be refused"
+    assert {b["slug"] for b in kb.list_boards()} == before, "the refusal mints no board"
+    assert _ids_on(kb.DEFAULT_BOARD) == set(), "nothing may land on the default board"
 
 
 # --- the READ/tool door: ``_board()`` refuses an unregistered slug BEFORE connecting -------
