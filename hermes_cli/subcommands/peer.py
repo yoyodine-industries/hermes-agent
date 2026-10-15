@@ -7,6 +7,13 @@ cross-machine twin of ``hermes -p <bot> chat --in ~ -c "Bot Chat"``. ``run``/``s
 /``stop`` do the same turn through the async Runs API. Peer labels/URLs live in
 config.yaml (``bot_peers``); the key lives in ``~/.hermes/.env`` as
 ``HERMES_PEER_<NAME>_KEY``. ``<peer>/<profile>`` targets the ``/p/<profile>/`` mirror.
+
+``dm`` waits only as long as ITS CALLER lets it (``--timeout``, default 60 s; or
+``--no-wait``): the verdict that says "delivered, still running, do NOT resend" is printed
+by this client, so a hard-coded wait longer than the caller's own bound made silence the
+default answer. When the reply does not come back on the call, the message row is pinned in
+the peer's transcript and ``hermes peer reply`` (read-only) collects what the peer answered.
+Exit 3 says exactly that: the message was TAKEN, so collect it — never resend it.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ import os
 import re
 import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,8 +37,47 @@ BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
-# One synchronous agent turn can legitimately take minutes.
+# One synchronous agent turn can legitimately take minutes. This stays the SERVER-budget
+# default: it is the wait budget the client ASKS THE PEER FOR (``X-Hermes-Wait-Seconds``),
+# and the peer runs the turn to completion whatever this client does. It is NOT this
+# client's own bound -- that is ``_dm_ceiling`` below.
 DM_TIMEOUT_S = 600
+
+# ── how long `dm` waits, and how a caller still gets the reply ───────────────
+# `dm` used to wait a hard-coded 600 s for the peer's reply, with no caller override. The
+# only correct verdict ("delivered, still running, do NOT resend") is printed BY THIS CLIENT,
+# so any caller bound shorter than 600 s — an agent terminal cap, a cron shim, `timeout N` —
+# killed the client before it printed anything: delivered and never-arrived became
+# indistinguishable, the natural next move was a resend, and the peer ran the same turn
+# twice. The wait is therefore caller-bounded and short by default, and the outcome is
+# mechanically readable off the exit code: 0 the reply came back, 3 accepted-but-reply-not-
+# collected (collect it with `hermes peer reply`), 1 nothing on the wire, 2 usage.
+DM_DEFAULT_TIMEOUT_S = 60
+#: Floor for the delivery POST's socket timeout. `hermes <subcommand>` costs ~10 s of
+#: launcher/bootstrap on this host before the client does any work, so a bound far below this
+#: usually expires before the request even leaves; the POST must get a real chance to be SENT
+#: or the caller reads "not delivered" for a message that was about to go out. The verdict
+#: prints the ACTUAL elapsed wait, so nothing is overclaimed.
+MIN_DELIVERY_S = 5
+#: `dm --no-wait`: deliver, then give an already-finished reply this short grace. Never waits
+#: for the reply past it.
+NO_WAIT_GRACE_S = 3
+#: `reply --wait`: how often to re-read the transcript while the peer's turn runs.
+REPLY_POLL_S = 2
+#: Transcript page the post-timeout confirm-read and `reply` both request.
+REPLY_PAGE_LIMIT = 50
+#: How much of the message a reply is answering `reply` attributes back (chars).
+REPLY_TO_MAX_CHARS = 200
+#: Bounds of the confirm-read that pins OUR message row to a transcript id. It runs only after
+#: the reply is already lost, so it is short, bounded, and NEVER fatal — and it runs only while
+#: budget remains inside the call's ceiling.
+CONFIRM_READ_ATTEMPTS = 3
+CONFIRM_READ_INTERVAL_S = 1.0
+CONFIRM_READ_TIMEOUT_S = 5.0
+#: A confirm-read attempt is made only while at least this much of the ceiling remains. A slice
+#: too small to carry a read fires a request the client cannot wait for — a wasted round trip,
+#: which is not evidence of anything — so it is no budget at all, deterministically.
+CONFIRM_READ_MIN_BUDGET_S = 0.05
 LIST_TIMEOUT_S = 30
 
 # ── where a REFUSED dm is reported ───────────────────────────────────────────
@@ -405,7 +452,7 @@ def _refusal_body(peer_name: str, klass: str, detail: str) -> str:
     ])
 
 
-def _refusal_store(board: str) -> tuple[str, "Path"]:
+def _refusal_store(board: str) -> tuple[str, Path]:
     """``(a label for the store the card goes to, its resolved DB path)`` — resolved ONCE.
 
     A dispatched worker's ``HERMES_KANBAN_DB`` pin (and the current-board pointer) are read
@@ -481,7 +528,7 @@ def _file_refusal_card(peer_name: str, klass: str, detail: str, *, create=None,
                          board=target["board"], db_path=db_path,
                          idempotency_key=_refusal_key(peer_name, klass))
         return str(card or ""), ""
-    except Exception as exc:  # noqa: BLE001 - reporting must never raise
+    except Exception as exc:  # reporting must never raise
         return "", f"{exc.__class__.__name__}: {exc}"
 
 
@@ -509,6 +556,374 @@ def _report_refusal(peer_name: str, klass: str, detail: str) -> str:
     print(f"Reported: peer '{peer_name}' refused the request ({klass}) -> {outcome}",
           file=sys.stderr)
     return card
+
+
+def _coerce_int(raw) -> int | None:
+    """A flag value as an ``int``, or None when it is not an integer at all.
+
+    ``--timeout``/``--wait``/``--after`` are integers: a bool is not a number here, ``1.5`` is
+    not an integer, and only a float that IS integral (``3.0``) or a numeric string (``"3"``)
+    converts. ``None`` (flag absent) converts to None.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw) if raw.is_integer() else None
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _validate_dm_flags(args) -> str | None:
+    """Usage check for ``dm --timeout``/``--no-wait``/``--wait``: the message, or None when valid."""
+    no_wait = bool(getattr(args, "no_wait", False))
+    raw = getattr(args, "timeout", None)
+    raw_wait = getattr(args, "wait_seconds", None)
+    if no_wait and raw is not None:
+        return ("--no-wait and --timeout are mutually exclusive: --no-wait never waits for the "
+                "reply, --timeout bounds that wait.")
+    if no_wait and raw_wait is not None:
+        return ("--no-wait and --wait are mutually exclusive: --wait is the budget this client "
+                "ASKS THE PEER FOR, --no-wait never waits for its reply.")
+    if raw is None:
+        return None
+    seconds = _coerce_int(raw)
+    if seconds is None:
+        return f"--timeout must be an integer number of seconds (got {raw!r})."
+    if seconds < 1:
+        return ("--timeout must be at least 1 second; there is no --timeout 0 alias for "
+                "--no-wait.")
+    return None
+
+
+def _validate_reply_flags(args) -> str | None:
+    """Usage check for ``reply --wait``/``--after``: the message, or None when they are valid."""
+    raw_wait = getattr(args, "wait", None)
+    if raw_wait is not None:
+        seconds = _coerce_int(raw_wait)
+        if seconds is None:
+            return f"--wait must be an integer number of seconds (got {raw_wait!r})."
+        if seconds < 0:
+            return "--wait must be 0 (a single read) or a whole number of seconds."
+    raw_after = getattr(args, "after", None)
+    if raw_after is not None and _coerce_int(raw_after) is None:
+        return f"--after must be a transcript row id (an integer) (got {raw_after!r})."
+    return None
+
+
+def _validate_action_flags(action: str, args) -> str | None:
+    """The per-action usage check ``cmd_peer`` runs BEFORE it resolves the target.
+
+    A bad flag is a typo the caller can fix; resolving the peer first would answer a missing
+    peer or a missing key instead, which is the wrong error for a malformed command.
+    """
+    if action == "dm":
+        return _validate_dm_flags(args)
+    if action == "reply":
+        return _validate_reply_flags(args)
+    return None
+
+
+def _dm_ceiling(args) -> float:
+    """The client's HARD ceiling on its OWN network phase for one ``dm`` call, in seconds.
+
+    The whole phase — the delivery POST, any replay, and the confirm-read together — never
+    runs past this, so a caller bound shorter than the client (an agent terminal cap, a cron
+    shim, ``timeout N``) is never left with silence in place of the verdict.
+
+    ``--wait W`` keeps its landed meaning: it is the budget this client ASKS THE PEER FOR,
+    sent as ``X-Hermes-Wait-Seconds``. It is not, by itself, this client's bound — an explicit
+    budget gets today's arithmetic (``W`` plus the receipt-window slack), so existing callers
+    see no change; the no-flag default is ``DM_DEFAULT_TIMEOUT_S``; ``--timeout N`` sets the
+    ceiling exactly, floored at ``MIN_DELIVERY_S`` so the request actually gets onto the wire.
+    """
+    if bool(getattr(args, "no_wait", False)):
+        return float(NO_WAIT_GRACE_S)
+    seconds = _coerce_int(getattr(args, "timeout", None))
+    if seconds is not None:
+        return float(max(MIN_DELIVERY_S, seconds))
+    raw_wait = getattr(args, "wait_seconds", None)
+    if raw_wait is not None:
+        try:
+            wait = float(raw_wait)
+        except (TypeError, ValueError):
+            wait = float(DM_DEFAULT_TIMEOUT_S)
+        return max(1.0, wait) + _DM_TIMEOUT_SLACK_S
+    return float(DM_DEFAULT_TIMEOUT_S)
+
+
+def _row_id(row: dict) -> int | None:
+    """A transcript row's integer ``id``, or None when the peer did not give one."""
+    raw = row.get("id")
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return None
+
+
+def _by_row_id(rows: list[dict]) -> list[dict]:
+    """Rows in transcript order (insertion order IS id order); a row with no id sorts first."""
+    return sorted(rows, key=lambda row: (_row_id(row) is None, _row_id(row) or 0))
+
+
+def _transcript(base: str, key: str, session_id: str,
+                *, timeout: float = CONFIRM_READ_TIMEOUT_S) -> list[dict]:
+    """One newest-page read of a session's transcript, as the peer returns it.
+
+    ``order=latest`` pages back from the newest but the peer returns chronological order, so the
+    LAST element is the newest row. Every caller here goes through ``_row_id`` maxima instead,
+    which is order-independent.
+    """
+    query = urllib.parse.urlencode({"order": "latest", "limit": REPLY_PAGE_LIMIT})
+    payload = _request(
+        f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/messages?{query}",
+        key, timeout=timeout)
+    rows = payload.get("data")
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _pin_message_row(base: str, key: str, session_id: str, message: str,
+                     *, deadline: float | None) -> int | None:
+    """Run the bounded confirm-read and pin OUR message row; return its id, or None.
+
+    Pinned means the newest ``role == "user"`` row whose content equals the message we sent —
+    our row, named by the transcript itself, so ``reply --after`` cannot be pointed at an older
+    turn by accident. Anything else (unreadable transcript, a different message, no transcript
+    row at all) pins nothing and the caller says ``accepted``: the request was sent, nothing
+    more is claimed. Bounded by ``CONFIRM_READ_ATTEMPTS`` and by the call's own ceiling —
+    it runs only while budget remains inside it — and NEVER raises, never fatal.
+    """
+    for attempt in range(CONFIRM_READ_ATTEMPTS):
+        remaining: float | None = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining < CONFIRM_READ_MIN_BUDGET_S:
+                return None
+        if attempt:
+            time.sleep(CONFIRM_READ_INTERVAL_S)
+        try:
+            rows = _transcript(
+                base, key, session_id,
+                timeout=CONFIRM_READ_TIMEOUT_S if remaining is None
+                else min(CONFIRM_READ_TIMEOUT_S, remaining))
+        except Exception:
+            continue
+        matched: int | None = None
+        for row in rows:
+            if str(row.get("role") or "") != "user" or row.get("content") != message:
+                continue
+            row_id = _row_id(row)
+            if row_id is not None and (matched is None or row_id > matched):
+                matched = row_id
+        if matched is not None:
+            return matched
+    return None
+
+
+def _emit_pending_delivery(args, *, peer_name: str, profile: str | None, target: str,
+                           session_id: str, row_id: int | None, elapsed_s: float,
+                           idempotency_key: str = "", unknown_detail: str = "") -> int:
+    """Report "accepted, reply not collected" and hand the caller a way to collect it; exit 3.
+
+    Exit 3 is deliberately distinct from 1 ("nothing on the wire") so a caller can tell delivered
+    from not-delivered MECHANICALLY, and the collect command is the post-hoc handle to the reply
+    the peer is going to produce anyway. A pinned ``row_id`` names our own message row, so
+    ``reply --after`` cannot be pointed at an older turn by accident. ``unknown_detail`` carries
+    the delivery-outcome-unknown wording (the idempotency key a resend must reuse) for the path
+    where both the delivery POST and its idempotent replay went unanswered.
+    """
+    where = f"session {session_id}, row {row_id}" if row_id is not None else f"session {session_id}"
+    after = f" --after {row_id}" if row_id is not None else ""
+    payload = {
+        "peer": peer_name, "profile": profile, "session_id": session_id,
+        "after": row_id, "status": "pending",
+        "delivery": "confirmed" if row_id is not None else "accepted",
+        "elapsed_s": round(elapsed_s, 1),
+    }
+    if idempotency_key:
+        # The retry key stays reported: a resend of a once-ambiguous delivery MUST reuse it.
+        payload["idempotency_key"] = idempotency_key
+    if getattr(args, "json", False):
+        print(json.dumps(payload))
+        return 3
+    if unknown_detail:
+        print(unknown_detail, file=sys.stderr)
+    print(f"Peer '{peer_name}' accepted the message but its turn is still running after "
+          f"{int(elapsed_s)}s: the message is already in its Bot Chat ({where}) and will be "
+          "answered there. The reply cannot come back on this call. Do NOT resend.",
+          file=sys.stderr)
+    print("Collect it with:", file=sys.stderr)
+    print(f"  hermes peer reply {target} --session {session_id}{after}", file=sys.stderr)
+    if row_id is None:
+        print("Check that the newest user row `hermes peer reply` prints is yours.", file=sys.stderr)
+    return 3
+
+
+def _reply_window(rows: list[dict], after: int | None) -> list[dict]:
+    """Rows to consider: with a cursor, only rows whose integer id is greater than it."""
+    if after is None:
+        return list(rows)
+    kept = []
+    for row in rows:
+        row_id = _row_id(row)
+        if row_id is not None and row_id > after:
+            kept.append(row)
+    return kept
+
+
+def _assistant_reply(ordered: list[dict]) -> dict | None:
+    """The LAST (highest-id) ``role == "assistant"`` row carrying non-empty content."""
+    best = None
+    for row in ordered:
+        if str(row.get("role") or "") == "assistant" and str(row.get("content") or ""):
+            best = row
+    return best
+
+
+def _reply_state(window: list[dict], *, has_cursor: bool) -> tuple[str, dict | None]:
+    """``(status, reply_row)`` for the rows in the window.
+
+    With a cursor all three outcomes are decided by the peer's own transcript: ``completed`` an
+    assistant row landed after the cursor, ``pending`` a turn is in flight (a user row did and
+    nothing answered it), ``not_delivered`` nothing landed at all. Without a cursor there is no
+    baseline that could call anything missing, so the TAIL is reported — the newest conversational
+    row is an assistant row (``completed``) or a user row (``pending``) — and ``not_delivered`` is
+    never claimed.
+    """
+    ordered = _by_row_id(window)
+    if not ordered:
+        # Nothing after the cursor. Only a cursor makes "not delivered" a claim we can support:
+        # without one an empty transcript is not evidence of a lost message.
+        return ("not_delivered" if has_cursor else "pending"), None
+    if not has_cursor:
+        newest = next((row for row in reversed(ordered)
+                       if str(row.get("role") or "") in ("user", "assistant")), None)
+        if newest is not None and str(newest.get("role") or "") == "assistant":
+            return "completed", _assistant_reply(ordered)
+        return "pending", None
+    if any(str(row.get("role") or "") == "assistant" for row in ordered):
+        # An assistant row after the cursor IS the answer — including an empty one, which is the
+        # peer's silence marker rather than a missing reply.
+        return "completed", _assistant_reply(ordered)
+    if any(str(row.get("role") or "") == "user" for row in ordered):
+        return "pending", None
+    # Rows landed but none is a turn boundary (tool rows, say): the turn is still in flight, so
+    # this is not evidence that our message went missing.
+    return "pending", None
+
+
+def _reply_to(ordered: list[dict], anchor: dict | None) -> str | None:
+    """What that row answers: the nearest preceding user row's content, truncated.
+
+    This is the answer to "is this reply to MY message?" — the reply alone cannot say.
+    """
+    anchor_id = _row_id(anchor) if anchor is not None else None
+    if anchor_id is None:
+        return None
+    best = None
+    best_id = None
+    for row in ordered:
+        row_id = _row_id(row)
+        if row_id is None or row_id >= anchor_id or str(row.get("role") or "") != "user":
+            continue
+        if best_id is None or row_id > best_id:
+            best, best_id = row, row_id
+    if best is None:
+        return None
+    return str(best.get("content") or "")[:REPLY_TO_MAX_CHARS]
+
+
+def _peer_reply(args, peer_name: str, profile: str | None, base: str, key: str) -> int:
+    """``hermes peer reply`` — collect the reply one ``dm`` could not wait for. READ-ONLY.
+
+    It resolves an EXISTING session only (``_find_bot_chat``, never ``_ensure_bot_chat``): a read
+    verb must not create a session on the peer, so `reply` can never be the reason a Bot Chat
+    appears. Without a cursor it is the "any bound" guarantee — even when a caller killed ``dm``
+    before it printed a handle, the sender can always ask the peer what it received and what it
+    answered. stdout is the reply text ALONE (parity with ``dm``, so callers reuse their parsing);
+    a non-completed status has no reply to print and reports itself on stderr.
+    """
+    usage = _validate_reply_flags(args)
+    if usage is not None:
+        print(usage, file=sys.stderr)
+        return 2
+    after = _coerce_int(getattr(args, "after", None))
+    wait_seconds = _coerce_int(getattr(args, "wait", None)) or 0
+    session_arg = (getattr(args, "session", None) or "").strip()
+    started = time.monotonic()
+
+    if session_arg:
+        session_id = session_arg
+    else:
+        try:
+            found = _find_bot_chat(base, key)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError,
+                RuntimeError) as exc:
+            return _peer_failure(peer_name, exc)
+        if not found:
+            print(f"Peer '{peer_name}' has no '{BOT_CHAT_TITLE}' session to read, so there is "
+                  "nothing to collect there.", file=sys.stderr)
+            return 1
+        session_id = found
+
+    deadline = started + wait_seconds
+    window: list[dict] = []
+    reply_row: dict | None = None
+    status = "pending"
+    while True:
+        try:
+            rows = _transcript(base, key, session_id)
+        except urllib.error.HTTPError as exc:
+            if session_arg and exc.code == 404:
+                print(f"Peer '{peer_name}': no session {session_id} to read "
+                      f"(HTTP 404: {_http_error_detail(exc)}).", file=sys.stderr)
+                return 1
+            return _peer_failure(peer_name, exc)
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+            return _peer_failure(peer_name, exc)
+        window = _reply_window(rows, after)
+        status, reply_row = _reply_state(window, has_cursor=after is not None)
+        now = time.monotonic()
+        if status == "completed" or now >= deadline:
+            break
+        time.sleep(min(REPLY_POLL_S, deadline - now))
+
+    ordered = _by_row_id(window)
+    anchor = reply_row if reply_row is not None else (ordered[-1] if ordered else None)
+    reply_text = ""
+    if reply_row is not None:
+        # A bare silence marker is a delivery decision, not a message: the sender never sees
+        # NO_REPLY/[SILENT] as a real reply. Same rule as `dm` and the other Bot Mode doors.
+        from gateway.response_filters import is_intentional_silence_response
+
+        raw = str(reply_row.get("content") or "")
+        reply_text = "" if is_intentional_silence_response(raw) else raw
+    payload = {
+        "peer": peer_name, "profile": profile, "session_id": session_id, "after": after,
+        "status": status, "reply": reply_text, "reply_to": _reply_to(ordered, anchor),
+        "message_id": _row_id(anchor) if anchor is not None else None,
+        "rows_seen": len(window), "elapsed_s": round(time.monotonic() - started, 1),
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload))
+    elif status == "completed":
+        print(reply_text or "(no reply)")
+    elif status == "pending":
+        print(f"Peer '{peer_name}': the message is in its Bot Chat (session {session_id}) but "
+              "its turn has not answered yet. Do NOT resend; ask again later.", file=sys.stderr)
+    else:
+        print(f"Peer '{peer_name}': no row after the cursor in session {session_id} — the "
+              "message has not reached that transcript.", file=sys.stderr)
+    return {"completed": 0, "pending": 3, "not_delivered": 1}[status]
 
 
 def _peer_failure(peer_name: str, exc: Exception) -> int:
@@ -559,7 +974,8 @@ class _DeliveryOutcomeUnknown(Exception):
 
 
 def _deliver_with_replay(url: str, key: str, *, body: dict, timeout: float,
-                         headers: dict, idempotency_key: str) -> dict:
+                         headers: dict, idempotency_key: str,
+                         deadline: float | None = None) -> dict:
     """POST one delivery, replaying it once on a read timeout (§D3).
 
     A read timeout on the *delivery* POST does not mean the peer was
@@ -570,6 +986,13 @@ def _deliver_with_replay(url: str, key: str, *, body: dict, timeout: float,
     the key, so this cannot deliver twice: the server replays the reservation
     and returns the true envelope (the ``receipt``, or the settled result if
     the turn has since finished).
+
+    ``deadline`` is the call's own ceiling: the replay runs ONLY if ITS whole
+    allowance still fits inside what remains of it. A ceiling that lets the
+    client run 30 s past itself is the defect this bound exists to remove — the
+    read timeout has already spent the ceiling by the time it fires, so there
+    the outcome is reported as ``unknown`` (exit 3, "accepted — collect it")
+    rather than by spending another 30 s nobody budgeted for.
     """
     try:
         return _request(url, key, method="POST", body=body, timeout=timeout, headers=headers)
@@ -578,10 +1001,15 @@ def _deliver_with_replay(url: str, key: str, *, body: dict, timeout: float,
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         if not _is_read_timeout(exc):
             raise
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining < _DM_REPLAY_TIMEOUT_S:
+        raise _DeliveryOutcomeUnknown(idempotency_key)
     replay_headers = {**headers, "X-Hermes-Wait-Seconds": str(int(_DM_REPLAY_WAIT_SECONDS))}
     try:
         return _request(url, key, method="POST", body=body,
-                        timeout=_DM_REPLAY_TIMEOUT_S, headers=replay_headers)
+                        timeout=_DM_REPLAY_TIMEOUT_S if remaining is None
+                        else min(_DM_REPLAY_TIMEOUT_S, remaining),
+                        headers=replay_headers)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError,
             RuntimeError) as exc:
         # Deliberately broad: the first POST may have been admitted, so *any*
@@ -721,8 +1149,13 @@ def _peer_refusal(peer_name: str, exc: urllib.error.HTTPError) -> int:
 
 
 def _emit_dm_envelope(args, envelope: dict, *, session_id: str, idempotency_key: str,
-                      peer_name: str) -> int:
-    """Print one delivery envelope and translate ENUM A into an exit code (§1.5)."""
+                      peer_name: str, target: str = "") -> int:
+    """Print one delivery envelope and translate ENUM A into an exit code (§1.5).
+
+    ENUM A is unchanged: ``receipt`` is SUCCESS and stays exit 0. What is new is
+    that the receipt — a message the peer accepted and queued — also hands the
+    caller the way to collect its reply, so "accepted" is never a dead end.
+    """
     result = str(envelope.get("result") or "")
     status = str(envelope.get("status") or "")
     if getattr(args, "json", False):
@@ -733,6 +1166,8 @@ def _emit_dm_envelope(args, envelope: dict, *, session_id: str, idempotency_key:
         print(f"{status}: {envelope.get('detail') or ''}")
         print(f"session_id: {session_id}")
         print(f"idempotency_key: {idempotency_key}")
+        print("Collect it with:")
+        print(f"  hermes peer reply {target or peer_name} --session {session_id}")
     else:
         why = envelope.get("error") or envelope.get("detail") or envelope.get("reason") or result
         print(f"Peer '{peer_name}' {status or result}: {why}", file=sys.stderr)
@@ -740,32 +1175,40 @@ def _emit_dm_envelope(args, envelope: dict, *, session_id: str, idempotency_key:
 
 
 def _emit_unknown_delivery(args, *, peer_name: str, profile: str | None, session_id: str,
-                           idempotency_key: str) -> int:
-    """Report an accepted-but-unverifiable delivery (§D3) without blaming the peer.
+                           idempotency_key: str, target: str = "", message: str = "",
+                           base: str = "", key: str = "", deadline: float | None = None,
+                           started: float | None = None) -> int:
+    """Report an accepted-but-unverifiable delivery (§D3) without blaming the peer; exit 3.
 
     Both the delivery POST and its idempotent replay went unanswered, so the
     message may still have landed. The wording must never read as "the peer was
     unreachable" (it wasn't) and must warn against a blind resend.
+
+    This is the same outcome the ceiling produces when it fires after the POST —
+    "accepted, reply not collected" — so it reports through the SAME verdict and
+    carries the same handle (``hermes peer reply``), including the row the
+    confirm-read could pin OUR message to. Exit 3 is what makes it mechanically
+    distinguishable from 1 ("nothing on the wire"): never resend either way.
     """
-    envelope = {
-        "object": SEND_RESULT_OBJECT,
-        "result": "unknown",
-        "status": "unknown",
-        "reason": "unknown",
-        "retryable": False,
-        "peer": peer_name,
-        "profile": profile,
-        "session_id": session_id,
-        "idempotency_key": idempotency_key,
-        "detail": _unknown_delivery_detail(idempotency_key),
-    }
+    detail = _unknown_delivery_detail(idempotency_key)
+    row_id = None
+    if base and key and session_id:
+        row_id = _pin_message_row(base, key, session_id, message, deadline=deadline)
+    elapsed_s = 0.0 if started is None else time.monotonic() - started
     if getattr(args, "json", False):
-        print(json.dumps(envelope))
-    else:
-        print(envelope["detail"], file=sys.stderr)
-        print(f"session_id: {session_id}")
-        print(f"idempotency_key: {idempotency_key}")
-    return RESULT_EXIT_CODES.get("unknown", 1)
+        payload = {
+            "peer": peer_name, "profile": profile, "session_id": session_id,
+            "after": row_id, "status": "pending",
+            "delivery": "confirmed" if row_id is not None else "accepted",
+            "elapsed_s": round(elapsed_s, 1),
+            "idempotency_key": idempotency_key,
+            "detail": detail,
+        }
+        print(json.dumps(payload))
+        return 3
+    return _emit_pending_delivery(args, peer_name=peer_name, profile=profile, target=target,
+                                  session_id=session_id, row_id=row_id, elapsed_s=elapsed_s,
+                                  idempotency_key=idempotency_key, unknown_detail=detail)
 
 
 def _emit(args, payload: dict, text_lines: list[str]) -> int:
@@ -919,7 +1362,8 @@ def _peer_run(args, message: str, peer_name: str, profile: str | None, base: str
         envelope.setdefault("peer", peer_name)
         envelope.setdefault("profile", profile)
         return _emit_dm_envelope(args, envelope, session_id=session_id,
-                                 idempotency_key=idempotency_key, peer_name=peer_name)
+                                 idempotency_key=idempotency_key, peer_name=peer_name,
+                                 target=str(getattr(args, "target", "") or peer_name))
     run_id = str(result.get("run_id") or result.get("delivery_id") or "")
     if not run_id:
         print(f"Peer '{peer_name}' did not return a run ID.", file=sys.stderr)
@@ -935,8 +1379,17 @@ def _peer_run(args, message: str, peer_name: str, profile: str | None, base: str
 
 
 def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str, key: str) -> int:
+    usage = _validate_dm_flags(args)
+    if usage is not None:
+        print(usage, file=sys.stderr)
+        return 2
+    target = str(getattr(args, "target", "") or peer_name)
     session_id = ""
     wait_seconds = _resolve_wait_seconds(args)
+    # The wait ASKED OF the peer (--wait) and this client's own ceiling are two different
+    # things: the peer runs the turn to completion whatever we do, so the ceiling only decides
+    # how long WE are willing to hold the call open for the reply.
+    ceiling = _dm_ceiling(args)
     sender_profile = _sender_profile()
     try:
         session_id = _ensure_bot_chat(base, key)
@@ -955,16 +1408,23 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
         print(str(exc), file=sys.stderr)
         return 2
     headers = _delivery_headers(idempotency_key, sender_profile, wait_seconds)
+    # THE CEILING starts here: the delivery POST, any replay and the confirm-read all live
+    # inside it, so a caller whose own bound is shorter than this client's is never killed
+    # before the verdict is printed.
+    started = time.monotonic()
+    deadline = started + ceiling
     try:
         result = _deliver_with_replay(
             f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat", key,
-            body=_turn_body(message, message_key="message"), timeout=wait_seconds + _DM_TIMEOUT_SLACK_S,
-            headers=headers, idempotency_key=idempotency_key)
+            body=_turn_body(message, message_key="message"), timeout=ceiling,
+            headers=headers, idempotency_key=idempotency_key, deadline=deadline)
     except urllib.error.HTTPError as exc:
         return _peer_refusal(peer_name, exc)
     except _DeliveryOutcomeUnknown:
-        return _emit_unknown_delivery(args, peer_name=peer_name, profile=profile,
-                                      session_id=session_id, idempotency_key=idempotency_key)
+        return _emit_unknown_delivery(
+            args, peer_name=peer_name, profile=profile, session_id=session_id,
+            idempotency_key=idempotency_key, target=target, message=message,
+            base=base, key=key, deadline=deadline, started=started)
     except RuntimeError as exc:
         print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
         return 1
@@ -974,12 +1434,14 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
         # completion regardless of this client, so reporting it unreachable makes the sender resend
         # and deliver it twice. urllib raises that timeout bare; one it wraps in URLError hit while
         # connecting or sending, so the request never arrived and "could not reach" is the truth.
+        # The verdict carries the ACTUAL elapsed wait (never a hard-coded budget), pins OUR row
+        # when the transcript shows it inside the remaining budget, and is exit 3 — "accepted,
+        # reply not collected" — so it is mechanically distinct from 1, "nothing on the wire".
         if session_id and isinstance(exc, TimeoutError):
-            print(f"Peer '{peer_name}' accepted the message but its turn is still running after "
-                  f"{DM_TIMEOUT_S}s: the message is already in its Bot Chat (session {session_id}) "
-                  "and will be answered there. The reply cannot come back on this call. Do NOT resend.",
-                  file=sys.stderr)
-            return 1
+            return _emit_pending_delivery(
+                args, peer_name=peer_name, profile=profile, target=target, session_id=session_id,
+                row_id=_pin_message_row(base, key, session_id, message, deadline=deadline),
+                elapsed_s=time.monotonic() - started, idempotency_key=idempotency_key)
         return _peer_failure(peer_name, exc)
     if result.get("object") == "hermes.session.chat.queued":
         # The peer's Bot Chat is open in its Desktop and that turn outlasted the peer's wait: the
@@ -988,13 +1450,16 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
         return _emit(args, {"peer": peer_name, "profile": profile, "session_id": queued_in,
                             "status": result.get("status") or "queued", "delivery_id": result.get("delivery_id")},
                      [f"Peer '{peer_name}' has its Bot Chat open, so the message went into that chat (session "
-                      f"{queued_in}) and is answered there. The reply cannot come back on this call. Do NOT resend."])
+                      f"{queued_in}) and is answered there. The reply cannot come back on this call. Do NOT resend.",
+                      "Collect it with:",
+                      f"  hermes peer reply {target} --session {queued_in}"])
     if result.get("object") == SEND_RESULT_OBJECT:
         envelope = dict(result)
         envelope.setdefault("peer", peer_name)
         envelope.setdefault("profile", profile)
         return _emit_dm_envelope(args, envelope, session_id=session_id,
-                                 idempotency_key=idempotency_key, peer_name=peer_name)
+                                 idempotency_key=idempotency_key, peer_name=peer_name,
+                                 target=target)
     # Legacy peer without the delivery envelope: keep the pre-receipt reply shape.
     msg = result.get("message")
     reply = str(msg.get("content") or "") if isinstance(msg, dict) else ""
@@ -1022,8 +1487,12 @@ def cmd_peer(args) -> int:
     action = getattr(args, "peer_action", None)
     if action in _REGISTRY_ACTIONS:
         return _REGISTRY_ACTIONS[action](args)
-    if action not in {"dm", "run", "status", "stop"}:
+    if action not in {"dm", "run", "status", "stop", "reply"}:
         print("Unknown peer action. See: hermes peer --help", file=sys.stderr)
+        return 2
+    usage = _validate_action_flags(action, args)
+    if usage is not None:
+        print(usage, file=sys.stderr)
         return 2
     try:
         peer_name, profile, peer, key = _resolve_peer_target(args.target)
@@ -1039,6 +1508,8 @@ def cmd_peer(args) -> int:
     base = _base_url(peer, profile)
     if action in {"status", "stop"}:
         return _peer_run_ctl(args, action, peer_name, profile, base, key)
+    if action == "reply":
+        return _peer_reply(args, peer_name, profile, base, key)
     message = _message_from_args(args)
     if not message:
         print("Message required (argument or stdin).", file=sys.stderr)
@@ -1055,6 +1526,10 @@ def build_peer_parser(subparsers) -> None:
             "'hermes peer dm <peer>[/<agent>] \"...\"' delivers into the remote "
             "agent's canonical Bot Chat over the peer's API server and prints "
             "the reply — the cross-machine twin of 'hermes -p <bot> chat'. "
+            "'dm --timeout N' bounds THIS client's wait for that reply and 'dm --no-wait' "
+            "returns as soon as the message is delivered; in either case a reply that does not "
+            "come back on the call is collectable afterwards with 'hermes peer reply', which "
+            "reads the peer's Bot Chat and never writes to it. "
             "The peer must run the api_server platform; its API_SERVER_KEY is "
             "stored locally as a credential in ~/.hermes/.env.",
         epilog=(
@@ -1064,16 +1539,39 @@ def build_peer_parser(subparsers) -> None:
             '  hermes peer dm spark "Message from 🤖 dixie (@dixie): disk status?"\n'
             '  hermes peer dm spark/researcher "..."   # named profile on a multiplexed peer\n'
             "  hermes peer dm spark --wait 30 \"...\"    # short wait; a busy peer returns a receipt\n"
+            '  hermes peer dm spark "..." --timeout 30 # bound THIS client\'s wait for the reply\n'
+            '  hermes peer dm spark "..." --no-wait     # deliver now, collect the reply later\n'
+            "  hermes peer reply spark --session <sid> --after <row>   # collect it\n"
             "  hermes peer run spark --idempotency-key ticket-123 < long-task.txt\n"
             "  hermes peer status spark run_abc123\n"
             "  hermes peer stop spark run_abc123\n"
             "  hermes peer remove spark\n"
             "\n"
-            "Exit codes: 0 delivered or accepted (queued receipt), "
-            "1 delivery/peer error, 2 usage or refused request.\n"
-            "A receipt means the peer accepted and queued the message — do NOT resend it.\n"
+            "Exit codes: 0 the reply came back, or the peer accepted the message (a queued "
+            "receipt, or a turn handed to an open Bot Chat); 1 delivery/peer error — nothing "
+            "arrived; 2 usage or a refused request; 3 ACCEPTED but the reply was not collected "
+            "on this call — the message IS in the peer's Bot Chat, so run the 'hermes peer "
+            "reply' line printed with the verdict instead of resending it.\n"
+            "The invariant: exit 3 means delivered — never resend; exit 1 means nothing "
+            "arrived.\n"
+            "Collecting a reply is the standard follow-up: 'hermes peer reply <peer> "
+            "[--session <sid>] [--after <row_id>] [--wait N]' reads the peer's own transcript "
+            "(it performs NO POST), so a reply that missed the dm's wait is never lost.\n"
+            "--wait W is the budget this client ASKS THE PEER FOR ('X-Hermes-Wait-Seconds', "
+            f"default peer.dm_wait_seconds, {DM_TIMEOUT_S}); the client's own ceiling on the "
+            f"call is --timeout (default {DM_DEFAULT_TIMEOUT_S}), because the shipped default "
+            "budget is 600 s and the client adds 30 s of slack, so a bare `dm` outlives every "
+            "ordinary caller bound (an agent terminal cap, a cron shim, `timeout N`) and the "
+            "caller sees silence. `--wait 600` still buys the long inline wait; `--timeout` "
+            "sets the client ceiling exactly.\n"
+            "`--wait 1` is the receipt idiom against an envelope-capable peer; `--no-wait` is "
+            "the same idea for a legacy peer that has no receipt to return.\n"
             "A post-retention 'hermes peer status' 404 is reported as unknown, exit 0 — "
-            "it is not a delivery failure."),
+            "it is not a delivery failure.\n"
+            "Budget --timeout with a startup margin: 'hermes <subcommand>' costs seconds of "
+            "launcher/bootstrap before the client does any work (1.9 s measured warm "
+            "2026-10-14, 8-11 s cold), so budget --timeout with that margin — the margin is "
+            "spent BEFORE the network phase, so it is the CALLER's bound that must cover it."),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     peer_sub = parser.add_subparsers(dest="peer_action")
 
@@ -1100,10 +1598,33 @@ def build_peer_parser(subparsers) -> None:
             sp.add_argument(
                 "--idempotency-key", default=None,
                 help="Stable retry key; a retry MUST reuse it (derived from the message when omitted)")
-            sp.add_argument(
-                "--wait", dest="wait_seconds", type=float, default=None,
-                help="Seconds to wait for a reply before a queued receipt is returned "
-                     f"(default: peer.dm_wait_seconds, {DM_TIMEOUT_S})")
+            if name == "dm":
+                budget = sp.add_mutually_exclusive_group()
+                budget.add_argument(
+                    "--wait", dest="wait_seconds", type=float, default=None, metavar="W",
+                    help="Seconds of reply budget to ASK THE PEER FOR "
+                         f"(default: peer.dm_wait_seconds, {DM_TIMEOUT_S}); an envelope-capable "
+                         "peer answers with a receipt when its turn outlasts it, and --wait 1 is "
+                         "the receipt idiom. This is not this client's own ceiling: see --timeout.")
+                budget.add_argument(
+                    "--timeout", type=int, default=None, metavar="N",
+                    help="Seconds THIS client waits for the peer's reply before it prints the "
+                         f"'accepted, collect it later' verdict (default: {DM_DEFAULT_TIMEOUT_S}, "
+                         "exit 3). The old 600 s default outlived every ordinary caller bound — "
+                         "an agent terminal cap, a cron shim, `timeout N` — which made silence "
+                         "the default answer; pass --timeout 600 for a long inline wait, or use "
+                         "run/status. Never below 5 s, so the request actually leaves; budget the "
+                         "~10 s launcher margin on top.")
+                budget.add_argument(
+                    "--no-wait", dest="no_wait", action="store_true",
+                    help="Deliver and return at once; never waits for the reply, and works "
+                         "against a peer that has no receipt to return. Collect the reply with "
+                         "'hermes peer reply'.")
+            else:
+                sp.add_argument(
+                    "--wait", dest="wait_seconds", type=float, default=None,
+                    help="Seconds to wait for a reply before a queued receipt is returned "
+                         f"(default: peer.dm_wait_seconds, {DM_TIMEOUT_S})")
         sp.add_argument("--json", action="store_true", default=False, help="Emit a JSON result")
 
     _remote("dm", "Message an agent on a peer gateway; returns its reply, else a queued receipt",
@@ -1111,5 +1632,20 @@ def build_peer_parser(subparsers) -> None:
     _remote("run", "Start a long peer turn asynchronously and return its run ID", run_id=False)
     _remote("status", "Read the status and final output of an asynchronous peer run", run_id=True)
     _remote("stop", "Stop one asynchronous peer run without affecting another turn", run_id=True)
+
+    reply_p = peer_sub.add_parser(
+        "reply", help="Collect the reply a 'peer dm' could not wait for (read-only)")
+    reply_p.add_argument(
+        "target", help="<peer> or <peer>/<agent> (named profile on a multiplexed peer)")
+    reply_p.add_argument(
+        "--session", default=None,
+        help="Session id to read (default: the peer's canonical Bot Chat; a read never creates one)")
+    reply_p.add_argument(
+        "--after", type=int, default=None, metavar="ROW_ID",
+        help="Only consider rows newer than this transcript row id — the row 'peer dm' pinned")
+    reply_p.add_argument(
+        "--wait", type=int, default=0, metavar="N",
+        help="Poll for up to N seconds while the peer's turn finishes (default 0: a single read)")
+    reply_p.add_argument("--json", action="store_true", default=False, help="Emit a JSON result")
 
     parser.set_defaults(func=cmd_peer)

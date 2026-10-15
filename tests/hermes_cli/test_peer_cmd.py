@@ -1,5 +1,6 @@
 """Tests for ``hermes peer`` — cross-machine bot-to-bot DMs."""
 
+import argparse
 import json
 import threading
 import time
@@ -1015,7 +1016,7 @@ class _SlowDeliveryPeer(BaseHTTPRequestHandler):
             "retryable": False,
         })
 
-    def log_message(self, *args):  # noqa: D102 — silence test server logging
+    def log_message(self, *args):  # silence test server logging
         pass
 
 
@@ -1035,29 +1036,388 @@ def slow_delivery_peer_server():
         thread.join(timeout=5)
 
 
-def test_dm_read_timeout_replays_over_a_real_socket(monkeypatch, capsys, slow_delivery_peer_server):
-    """A real socket timeout must yield the replayed receipt, never 'unreachable'."""
+def test_dm_read_timeout_over_a_real_socket_hands_back_the_handle(monkeypatch, capsys, slow_delivery_peer_server):
+    """A real mid-body read timeout, under the ceiling contract.
+
+    The socket timeout IS this call's ceiling, so a real read timeout has spent it: there is no
+    budget left for the idempotent replay, and the client must not spend another 30 s nobody
+    budgeted for (the old behaviour the ceiling removes). What it must do instead is report the
+    delivery it knows about — ONE turn, exit 3, "accepted ... Do NOT resend", and the
+    `hermes peer reply` handle — and never call the peer unreachable.
+
+    (The replay itself is proven by the mocked tests in test_peer_receipt_client.py, where the
+    response is lost before the ceiling is spent.)
+    """
     _peer_for(monkeypatch, slow_delivery_peer_server)
     # Shrink only the HTTP headroom so the real read timeout fires in ~1.3s.
     monkeypatch.setattr(peer_cmd, "_DM_TIMEOUT_SLACK_S", 0.3)
+    monkeypatch.setattr(peer_cmd, "CONFIRM_READ_INTERVAL_S", 0)
 
     rc = peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="spark",
                                            message="status?", wait_seconds=1, json=True))
 
     captured = capsys.readouterr()
-    assert rc == 0, captured.err
-    assert len(_SlowDeliveryPeer.posts) == 2, "the delivery was not replayed"
-    first_headers, first_body = _SlowDeliveryPeer.posts[0]
-    second_headers, second_body = _SlowDeliveryPeer.posts[1]
-    # Same request, same idempotency key — so it can only replay, not re-deliver.
-    assert first_headers["idempotency-key"] == second_headers["idempotency-key"]
-    assert first_body == second_body == {"message": "status?"}
-    # The replay pins the server's wait budget to 1s.
-    assert second_headers["x-hermes-wait-seconds"] == "1"
-    # The true envelope comes back from the replayed reservation, not a guess.
+    assert rc == 3, captured.err
+    # Exactly ONE delivery POST: the ceiling leaves no room for the replay.
+    assert len(_SlowDeliveryPeer.posts) == 1, "the client re-POSTed past its own ceiling"
+    headers, body = _SlowDeliveryPeer.posts[0]
+    assert body == {"message": "status?"}
+    assert headers["x-hermes-wait-seconds"] == "1"
     payload = json.loads(captured.out)
-    assert payload["result"] == "receipt"
-    assert payload["retryable"] is False
+    assert payload["status"] == "pending"
+    assert payload["delivery"] == "accepted"
     assert payload["session_id"] == "bc_1"
-    assert "unreachable" not in (captured.out + captured.err).lower()
+    assert payload["elapsed_s"] <= 2.0
+    text = (captured.out + captured.err).lower()
+    assert "unreachable" not in text
     assert "Could not reach peer" not in captured.err
+
+
+# ── `dm --timeout` / `--no-wait` (caller-bounded wait) ───────────────────────
+
+
+def _peer_parser():
+    """The real ``hermes peer`` parser, exactly as ``hermes_cli.main`` attaches it."""
+    root = argparse.ArgumentParser(prog="hermes")
+    subs = root.add_subparsers(dest="command")
+    peer_cmd.build_peer_parser(subs)
+    return root
+
+
+def test_dm_parser_takes_timeout_and_no_wait():
+    parser = _peer_parser()
+
+    args = parser.parse_args(["peer", "dm", "spark", "hi", "--timeout", "30"])
+    assert (args.peer_action, args.target, args.message) == ("dm", "spark", "hi")
+    assert (args.timeout, args.no_wait) == (30, False)
+
+    args = parser.parse_args(["peer", "dm", "spark", "hi", "--no-wait"])
+    assert (args.timeout, args.no_wait) == (None, True)
+
+
+@pytest.mark.parametrize("bad", [["--timeout", "1.5"], ["--timeout", "soon"], ["--timeout", ""]])
+def test_dm_parser_rejects_a_non_integer_timeout(bad):
+    with pytest.raises(SystemExit) as excinfo:
+        _peer_parser().parse_args(["peer", "dm", "spark", "hi", *bad])
+    assert excinfo.value.code == 2
+
+
+def test_dm_parser_rejects_timeout_together_with_no_wait():
+    with pytest.raises(SystemExit) as excinfo:
+        _peer_parser().parse_args(["peer", "dm", "spark", "hi", "--timeout", "30", "--no-wait"])
+    assert excinfo.value.code == 2
+
+
+def test_dm_parser_rejects_wait_together_with_no_wait():
+    """`--wait` is the budget asked OF the peer; `--no-wait` never waits for its reply."""
+    with pytest.raises(SystemExit) as excinfo:
+        _peer_parser().parse_args(["peer", "dm", "spark", "hi", "--wait", "30", "--no-wait"])
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize("value", [0, -1, "0", "-1"])
+def test_dm_rejects_a_timeout_below_one_second(monkeypatch, capsys, value):
+    """There is deliberately no ``--timeout 0`` alias for ``--no-wait``: a bound under a second is
+    a typo, not a request."""
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": "http://x"}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "k" * 12)
+
+    code = peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="spark", message="hi",
+                                             json=False, timeout=value, no_wait=False))
+
+    assert code == 2
+    assert "--timeout" in capsys.readouterr().err
+
+
+def test_dm_timeout_and_no_wait_together_is_a_usage_error(monkeypatch, capsys):
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": "http://x"}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "k" * 12)
+
+    code = peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="spark", message="hi",
+                                             json=False, timeout=30, no_wait=True))
+
+    assert code == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+# ── `hermes peer reply` — collect a reply the dm could not wait for ──────────
+
+
+class _RepliesPeer(BaseHTTPRequestHandler):
+    """A read-only peer: sessions listing + scripted message snapshots, and a POST counter.
+
+    ``snapshots`` is a list of transcript pages; each read advances to the next and the last one
+    repeats, so ``--wait`` polling is testable.
+    """
+
+    sessions: list = []
+    snapshots: list = []
+    reads: int = 0
+    gets: list = []
+    posts: list = []
+    messages_status: int = 200
+
+    def _json(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        type(self).gets.append(self.path)
+        if "/messages" in self.path:
+            if type(self).messages_status != 200:
+                return self._json({"error": {"message": "Session not found: gone"}},
+                                  type(self).messages_status)
+            index = min(type(self).reads, len(type(self).snapshots) - 1)
+            type(self).reads += 1
+            rows = [dict(row) for row in type(self).snapshots[index]] if type(self).snapshots else []
+            return self._json({"object": "list", "session_id": "bc_1", "data": rows})
+        if self.path.startswith("/api/sessions"):
+            data = [{"id": s, "title": "Bot Chat"} for s in type(self).sessions]
+            return self._json({"object": "list", "data": data})
+        return self._json({"error": {"message": "not found"}}, 404)
+
+    def do_POST(self):
+        # A read verb must never write; the tests assert this stays empty.
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        type(self).posts.append(self.path)
+        return self._json({"error": {"message": "not found"}}, 404)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture()
+def replies_peer():
+    _RepliesPeer.sessions = ["bc_1"]
+    _RepliesPeer.snapshots = [[]]
+    _RepliesPeer.reads = 0
+    _RepliesPeer.gets = []
+    _RepliesPeer.posts = []
+    _RepliesPeer.messages_status = 200
+    server = HTTPServer(("127.0.0.1", 0), _RepliesPeer)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def _reply(monkeypatch, url, *, session=None, after=None, wait=0, json_mode=False, target="spark"):
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": url}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+    return peer_cmd.cmd_peer(SimpleNamespace(peer_action="reply", target=target, session=session,
+                                            after=after, wait=wait, json=json_mode))
+
+
+def test_reply_prints_the_answered_text_alone(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "ping"},
+                               {"id": 2, "role": "assistant", "content": "pong"}]]
+
+    code = _reply(monkeypatch, replies_peer)
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert out == "pong\n"                      # parity with `dm` so callers reuse their parsing
+    assert _RepliesPeer.posts == []             # a read never writes
+
+
+def test_reply_reports_attribution_and_the_tail_in_json(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "x" * 500},
+                               {"id": 2, "role": "assistant", "content": "pong"}]]
+
+    code = _reply(monkeypatch, replies_peer, json_mode=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["status"] == "completed"
+    assert payload["reply"] == "pong"
+    assert payload["reply_to"] == "x" * 200     # truncated for attribution
+    assert payload["message_id"] == 2
+    assert payload["rows_seen"] == 2
+    assert payload["after"] is None             # no cursor: the transcript tail was reported
+    assert payload["session_id"] == "bc_1"
+
+
+def test_reply_without_a_cursor_reports_a_pending_tail(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "assistant", "content": "an older answer"},
+                               {"id": 2, "role": "user", "content": "ping"}]]
+
+    code = _reply(monkeypatch, replies_peer, json_mode=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 3
+    assert payload["status"] == "pending"
+    assert payload["reply"] == ""
+
+
+def test_reply_without_a_cursor_never_claims_not_delivered(monkeypatch, capsys, replies_peer):
+    """Without a cursor there is no baseline that could call a message missing."""
+    _RepliesPeer.snapshots = [[]]
+
+    code = _reply(monkeypatch, replies_peer, json_mode=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 3
+    assert payload["status"] == "pending"
+
+
+def test_reply_with_a_cursor_hides_an_older_answer(monkeypatch, capsys, replies_peer):
+    """The cursor is what makes "is this reply to MY message?" answerable: an answer that predates
+    it must not be handed back as if it were ours."""
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "old"},
+                               {"id": 2, "role": "assistant", "content": "old answer"},
+                               {"id": 3, "role": "user", "content": "ping"}]]
+
+    code = _reply(monkeypatch, replies_peer, after=2, json_mode=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 3
+    assert payload["status"] == "pending"
+    assert payload["rows_seen"] == 1
+    assert payload["reply"] == ""
+
+
+def test_reply_after_the_cursor_is_completed(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "old"},
+                               {"id": 2, "role": "assistant", "content": "old answer"},
+                               {"id": 3, "role": "user", "content": "ping"},
+                               {"id": 4, "role": "assistant", "content": "pong"}]]
+
+    code = _reply(monkeypatch, replies_peer, after=2)
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert out == "pong\n"
+
+
+def test_reply_after_a_cursor_with_nothing_after_it_is_not_delivered(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "old"},
+                               {"id": 2, "role": "assistant", "content": "old answer"}]]
+
+    code = _reply(monkeypatch, replies_peer, after=2, json_mode=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert payload["status"] == "not_delivered"
+    assert payload["reply"] == ""
+
+
+def test_reply_keeps_a_bare_silence_marker_from_the_sender(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "ping"},
+                               {"id": 2, "role": "assistant", "content": "NO_REPLY"}]]
+
+    code = _reply(monkeypatch, replies_peer)
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert out.strip() == "(no reply)"
+    assert "NO_REPLY" not in out
+
+
+def test_reply_ends_with_the_last_assistant_row_with_non_empty_content(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "ping"},
+                               {"id": 2, "role": "assistant", "content": "first"},
+                               {"id": 3, "role": "assistant", "content": "second"}]]
+
+    code = _reply(monkeypatch, replies_peer, json_mode=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["reply"] == "second"
+
+
+def test_reply_never_creates_a_session(monkeypatch, capsys, replies_peer):
+    """A READ verb must not write: with no canonical Bot Chat on the peer, `reply` says so and
+    stops — it does not create one (that is `dm`/`run`'s job)."""
+    _RepliesPeer.sessions = []
+
+    code = _reply(monkeypatch, replies_peer)
+    err = capsys.readouterr().err
+
+    assert code == 1
+    assert "no 'Bot Chat' session" in err
+    assert _RepliesPeer.posts == []
+
+
+def test_reply_performs_no_post_at_all(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "ping"},
+                               {"id": 2, "role": "assistant", "content": "pong"}]]
+
+    code = _reply(monkeypatch, replies_peer)
+    capsys.readouterr()
+
+    assert code == 0
+    assert _RepliesPeer.posts == []
+
+
+def test_reply_honours_an_explicit_session(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.sessions = []      # no lookup may be needed: the session was named
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "assistant", "content": "pong"}]]
+
+    code = _reply(monkeypatch, replies_peer, session="bc_named")
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert out == "pong\n"
+    assert not any(path.startswith("/api/sessions?") for path in _RepliesPeer.gets)
+
+
+def test_reply_reports_an_unknown_session_with_the_peers_detail(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.messages_status = 404
+
+    code = _reply(monkeypatch, replies_peer, session="gone")
+    err = capsys.readouterr().err
+
+    assert code == 1
+    assert "gone" in err
+    assert "Session not found: gone" in err
+
+
+def test_reply_wait_polls_until_the_turn_answers(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "ping"}],
+                              [{"id": 1, "role": "user", "content": "ping"},
+                               {"id": 2, "role": "assistant", "content": "pong"}]]
+    monkeypatch.setattr(peer_cmd, "REPLY_POLL_S", 0.05)
+
+    code = _reply(monkeypatch, replies_peer, after=0, wait=5)
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert out == "pong\n"
+    assert _RepliesPeer.reads >= 2
+
+
+def test_reply_wait_gives_up_at_the_budget_as_pending(monkeypatch, capsys, replies_peer):
+    _RepliesPeer.snapshots = [[{"id": 1, "role": "user", "content": "ping"}]]
+    monkeypatch.setattr(peer_cmd, "REPLY_POLL_S", 0.05)
+
+    code = _reply(monkeypatch, replies_peer, after=0, wait=1, json_mode=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 3
+    assert payload["status"] == "pending"
+    assert payload["rows_seen"] == 1
+
+
+@pytest.mark.parametrize("wait", [-1, "-2"])
+def test_reply_rejects_a_negative_wait(monkeypatch, capsys, replies_peer, wait):
+    code = _reply(monkeypatch, replies_peer, wait=wait)
+
+    assert code == 2
+    assert "--wait" in capsys.readouterr().err
+    assert _RepliesPeer.gets == []              # a usage error never touches the wire
+
+
+def test_reply_rejects_a_non_integer_cursor(monkeypatch, capsys, replies_peer):
+    code = _reply(monkeypatch, replies_peer, after="row-two")
+
+    assert code == 2
+    assert "--after" in capsys.readouterr().err
+    assert _RepliesPeer.gets == []

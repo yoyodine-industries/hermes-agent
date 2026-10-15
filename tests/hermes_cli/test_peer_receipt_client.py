@@ -157,6 +157,16 @@ def test_receipt_text_mode_says_do_not_resend_and_never_failed(peer_env, capsys)
     assert "session_id: bc_1" in out
 
 
+def test_receipt_text_mode_hands_back_the_collect_command(peer_env, capsys):
+    """A receipt keeps exit 0 — the peer accepted the message — and now also hands back the way to
+    collect the reply that cannot come back on this call (t_4d621ae4, E2)."""
+    peer_env.response = _envelope()
+    assert peer_cmd.cmd_peer(_args(json=False)) == 0
+    out = capsys.readouterr().out
+    assert "Collect it with:" in out
+    assert "hermes peer reply spark --session bc_1" in out
+
+
 def test_failed_envelope_exits_1_and_still_emits_stdout_json(peer_env, capsys):
     peer_env.response = _envelope(result="failed", status="failed", error="queue_full")
     assert peer_cmd.cmd_peer(_args()) == 1
@@ -305,32 +315,45 @@ def test_dm_replay_can_report_a_settled_result(peer_env, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["reply"] == "pong"
 
 
-def test_dm_double_timeout_reports_unknown_and_never_unreachable(peer_env, monkeypatch, capsys):
-    """Both attempts lost: the delivery MAY have landed — never say unreachable."""
+def test_dm_double_timeout_reports_accepted_not_collected_and_never_unreachable(peer_env, monkeypatch, capsys):
+    """Both attempts lost: the delivery MAY have landed — never say unreachable.
+
+    And, per the peer-dm reply-loss contract, never call it a plain delivery error either:
+    exit 3 says "accepted, the reply was not collected", which is mechanically distinct from 1
+    ("nothing on the wire") so the sender collects instead of resending. The wording and the
+    retry key are kept: the collect command is printed, `do not resend` survives, and the
+    idempotency key a resend MUST reuse is reported.
+    """
+    monkeypatch.setattr(peer_cmd, "CONFIRM_READ_INTERVAL_S", 0)
     calls = _scripted_request(monkeypatch, [_timeout(), _timeout()])
     rc = peer_cmd.cmd_peer(_args())
-    assert rc == peer_cmd.RESULT_EXIT_CODES["unknown"] == 1
-    assert len(calls) == 2
+    assert rc == 3
+    # Two delivery POSTs (the idempotent replay), plus the bounded confirm-read's GETs.
+    posts = [call for call in calls if call["url"].endswith("/chat")]
+    assert len(posts) == 2
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
-    assert payload["object"] == peer_cmd.SEND_RESULT_OBJECT
-    assert payload["result"] == "unknown"
-    assert payload["status"] == "unknown"
-    assert payload["retryable"] is False
+    assert payload["status"] == "pending"
+    assert payload["delivery"] in ("accepted", "confirmed")
+    assert payload["session_id"] == "bc_1"
+    assert payload["peer"] == "spark"
+    assert payload["idempotency_key"] == posts[0]["headers"]["Idempotency-Key"]
     assert "do not resend" in payload["detail"].lower()
-    assert payload["idempotency_key"] == calls[0]["headers"]["Idempotency-Key"]
     text = (captured.out + captured.err).lower()
     assert "unreachable" not in text
     assert "could not reach peer" not in text
 
 
 def test_dm_double_timeout_text_mode_says_do_not_resend(peer_env, monkeypatch, capsys):
+    monkeypatch.setattr(peer_cmd, "CONFIRM_READ_INTERVAL_S", 0)
     _scripted_request(monkeypatch, [_timeout(), _timeout()])
-    assert peer_cmd.cmd_peer(_args(json=False)) == 1
+    assert peer_cmd.cmd_peer(_args(json=False)) == 3
     captured = capsys.readouterr()
     text = (captured.out + captured.err).lower()
     assert "do not resend" in text
     assert "unreachable" not in text
+    assert "collect it with" in text
+    assert "hermes peer reply spark --session bc_1" in (captured.out + captured.err)
 
 
 def test_bare_socket_timeout_is_also_a_read_timeout(peer_env, monkeypatch, capsys):
