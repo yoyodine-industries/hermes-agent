@@ -474,6 +474,18 @@ class SessionDB(
         "cli", "cron", "kanban", "acp", "api_server", "subagent", "tool", "recovered",
     )
 
+    # Message-level retention (card t_3e9bccd0): only rows owned by a session of one of these
+    # sources may be deleted by :meth:`SessionMaintenanceMixin.prune_archived_messages`, and only
+    # rows no reader can see (``active = 0``, compaction-archived, not a compaction summary) — so
+    # the declared ``sessions.retention_days`` window applies to ROWS, not only to sessions, for
+    # the sources where a session-level rule structurally cannot reach (a session that never goes
+    # idle can never be pruned). Widening takes evidence that the source HAS such a session:
+    # ``api_server`` is the only one on this host — its canonical Bot Chat session held 176,834
+    # rows (62% of the store) over 43 days with only 50 of them ``active``. Every other source's
+    # sessions end and their rows age out through ``prune_sessions``. Unknown sources fail closed:
+    # a source absent from this tuple is simply out of reach of the rule (see #60609's shape).
+    MESSAGE_RETENTION_SOURCES: tuple[str, ...] = ("api_server",)
+
     # ── Write-contention tuning ──
     # SQLite's deterministic busy handler convoys under many hermes processes: keep its
     # timeout short (1s) and retry with random jitter. Patience is TIME-based (a sibling
