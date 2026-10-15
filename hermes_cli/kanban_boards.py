@@ -23,11 +23,23 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` for a board. Safe to call on an empty DB."""
+    """``{status: count}`` read from THIS board's OWN store. Safe on an empty/missing DB.
+
+    The store is resolved by SLUG (``kb.board_store_path``), never through the ambient
+    board context. A ``HERMES_KANBAN_DB``-pinned worker — or a scoped ``--board``, or a
+    delegated child — otherwise answers every row with the pinned board's census, so six
+    boards read as one identical store while the counts that differ (``platform``'s
+    10,515 vs an archived ``ops`` 0) are exactly what this surface exists to show (card
+    t_5723473b). The rows are an INVENTORY: the board is the row's own subject, not the
+    caller's routing target, so the pin must not resolve it.
+    """
     try:
-        if not kb.kanban_db_path(board=slug).exists():
+        path = kb.board_store_path(slug)
+        if not path.exists():
             return {}
-        with kbc.connect_closing(board=slug) as conn:
+        # `board=slug` rides along for the dead-board guard only; the path is the
+        # resolved one, so the pin cannot retarget the read.
+        with kbc.connect_closing(db_path=path, board=slug) as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
     except Exception:
@@ -53,6 +65,10 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     current = kb.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
+        # Every per-board field of the row is the ROW's board, resolved from its own
+        # directory: an inventory enumerates the home, so the ambient pin must not
+        # relabel all six rows as the caller's board (card t_5723473b).
+        b["db_path"] = str(kb.board_store_path(b["slug"]))
         b["counts"] = _board_task_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
     if _json_out(args, boards):
