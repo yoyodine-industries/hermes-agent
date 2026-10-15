@@ -250,33 +250,6 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
 
 
-def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None:
-    """Reject Kanban mutations from ``delegate_task`` child contexts.
-
-    The tool/CLI fast-fail guards are UX, not a trust boundary (a child can shell
-    out or import this module); the invariant lives here so every ``write_txn``
-    user and board-metadata mutator fails closed before touching durable state.
-    *path* is the board DB / metadata root being mutated; ``None`` means the
-    lineage's own board (``kanban_home()``).
-
-    Three arms, all additive (ruling t_fcf7a321, Decision 1): the ContextVar and the
-    ``HERMES_DELEGATED_CHILD_CONTEXT`` marker (both inside :func:`kanban_path_is_fenced`), plus
-    the PROVENANCE arm — a process descended from a LIVE dispatched worker is refused even when
-    the cooperatively-clearable marker has been stripped. Reads never call this.
-    """
-    from agent.delegation_context import (
-        PROVENANCE_REFUSAL_MESSAGE,
-        ancestor_owns_live_kanban_claim,
-        kanban_path_is_fenced,
-    )
-
-    target = kanban_home() if path is None else path
-    if kanban_path_is_fenced(target):
-        raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
-    if ancestor_owns_live_kanban_claim(target):
-        raise PermissionError(PROVENANCE_REFUSAL_MESSAGE)
-
-
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Best-effort lifecycle hook. Call AFTER the write txn commits (plugins never
     run under the SQLite write lock, always see durable state); failures are
@@ -2673,7 +2646,7 @@ def designate_priority(conn: sqlite3.Connection, task_id: str, *, reason: str,
     no post-commit side effect can fire while an outer txn can still roll back.
     """
     policy = _designation_policy()
-    _assert_not_delegated_child_mutation(kanban_db_path(board=board))
+    _assert_not_delegated_child_write(conn, board=board)
     reason = (reason or "").strip()
     if not reason:
         raise ValueError("a designation needs a reason (it is the audit answer)")
@@ -6243,6 +6216,10 @@ from hermes_cli.kanban_db_connect import (
     _INITIALIZED_PATHS,
     init_db,
     write_txn,
+)
+from hermes_cli.kanban_db_fence import (
+    _assert_not_delegated_child_mutation,
+    _assert_not_delegated_child_write,
 )
 from hermes_cli.kanban_db_workspace import (
     _cleanup_workspace,
