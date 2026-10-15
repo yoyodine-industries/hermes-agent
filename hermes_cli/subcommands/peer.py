@@ -406,21 +406,26 @@ def _refusal_body(peer_name: str, klass: str, detail: str) -> str:
 
 
 def _refusal_store(board: str) -> tuple[str, "Path"]:
-    """``(the slug the store really is, its resolved DB path)`` — resolved ONCE.
+    """``(a label for the store the card goes to, its resolved DB path)`` — resolved ONCE.
 
     A dispatched worker's ``HERMES_KANBAN_DB`` pin (and the current-board pointer) are read
     HERE, once, and then used for the lookup AND the write: the key can never be checked
     against one store and spent on another, and the stderr line names where the card IS,
     never where it was asked to be (defect D11, card t_703af8d1). Measured 2026-10-14: with
     the board resolution read twice the two calls could disagree once a pin was in play.
+
+    The label is the board SLUG when the resolved store can be identified as one, and the
+    store PATH when it cannot (a custom ``HERMES_HOME`` beside a pin): a line that names a
+    board it did not write to is the defect this report exists to end.
     """
     from hermes_cli import kanban_db as kb
 
     db_path = kb.kanban_db_path(board=board)
     try:
-        return str(kb.board_for_store_path(db_path) or board), db_path
+        slug = kb.board_for_store_path(db_path)
     except Exception:
-        return board, db_path
+        slug = None
+    return (f"board '{slug}'" if slug else f"store {db_path}"), db_path
 
 
 def _existing_refusal_card(db_path, idempotency_key: str) -> str:
@@ -492,14 +497,14 @@ def _report_refusal(peer_name: str, klass: str, detail: str) -> str:
     (``REFUSAL_WRITE_PURPOSE``) so it can act from a dispatcher-spawned worker.
     """
     target = _refusal_target()
-    board, db_path = _refusal_store(target["board"])
+    where, db_path = _refusal_store(target["board"])
     key = _refusal_key(peer_name, klass)
     card = _existing_refusal_card(db_path, key)
     if card:
-        outcome = f"already filed: card {card} on the '{board}' board (idempotency key {key})"
+        outcome = f"already filed: card {card} on the {where} (idempotency key {key})"
     else:
         card, reason = _file_refusal_card(peer_name, klass, detail, target=target, db_path=db_path)
-        outcome = (f"filed: card {card} on the '{board}' board" if card
+        outcome = (f"filed: card {card} on the {where}" if card
                    else f"NOT FILED: {reason or 'the board write failed'}")
     print(f"Reported: peer '{peer_name}' refused the request ({klass}) -> {outcome}",
           file=sys.stderr)
