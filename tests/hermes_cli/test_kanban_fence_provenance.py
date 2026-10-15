@@ -345,3 +345,157 @@ def test_board_override_verdict_is_independent_of_the_current_pointer(home, tmp_
         foreign = _run(script, home, BOARD, "--board", OTHER_BOARD, "create", "x", pin_board=False)
         assert foreign.returncode == 0, f"current={pointed_at}: {foreign.stdout}{foreign.stderr}"
 
+
+# --- the designation door fences the store the WRITE LANDS ON (card t_57e33100) ----------------
+#
+# ``designate_priority(conn, task_id, board=<name>)`` may NAME a board for its ledger row, but the
+# write lands on ``conn``'s store. The fast-fail judged ``kanban_db_path(board=<name>)``, which
+# answers the ENV-PINNED store whenever a worker's pin is authoritative
+# (``_explicit_board_intent_pinned``: a dispatched worker, or any delegated child carrying the
+# marker). From a delegated child the verdict therefore spoke about a board that was neither the
+# write's board nor the board the invocation named: a designation whose write landed OUTSIDE the
+# fence was refused because the PIN - this lineage's own store - was fenced.
+#
+# The subject is now the connection's store (``_write_fence_target_store``), with the named board
+# only as the fallback for a connection whose store cannot be told. These tests pin the subject,
+# and prove the arm is not weakened by it.
+
+DESIGNATE_OWN = "fence-probe-designate"
+DESIGNATE_ELSEWHERE = "fence-probe-elsewhere"
+UNREGISTERED = "fence-probe-unregistered"
+
+DESIGNATE_PROBE_SRC = """\
+import sys
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+
+task_id = sys.argv[1]
+try:
+    conn = kbc.connect()
+    kb.designate_priority(conn, task_id, reason="provenance probe")
+except PermissionError as exc:
+    print("REFUSED:", exc)
+    raise SystemExit(7)
+print("ADMITTED")
+raise SystemExit(0)
+"""
+
+
+def _rooted(monkeypatch, root: Path) -> None:
+    """Point the board resolution at *root* (the caller then creates/opens boards there)."""
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
+
+
+def _store_under(root: Path, slug: str) -> Path:
+    return root / "kanban" / "boards" / slug / "kanban.db"
+
+
+def _board_and_card(monkeypatch, root: Path, slug: str):
+    """Create board *slug* under *root* with one ordinary card; returns (store, conn, task_id)."""
+    _rooted(monkeypatch, root)
+    kb.create_board(slug, name=slug)
+    store = _store_under(root, slug)
+    conn = kbc.connect(db_path=store)
+    task_id = kb.create_task(conn, title="an ordinary card", assignee="platform-coder", board=slug)
+    return store, conn, task_id
+
+
+def test_designate_is_judged_by_the_connection_store_not_the_pin(home, tmp_path, monkeypatch):
+    """REGRESSION (red on the pre-fix base, green after): the connection's store decides.
+
+    The lineage is fenced for ``lineage/`` and PINNED to its own store there; the designation
+    writes to a store in ``elsewhere/`` while naming an unregistered board. Judged against the pin
+    (pre-fix) the write is refused although it lands outside the fence; judged against the
+    connection (post-fix) it is admitted and the card really does take the designated rank.
+    """
+    lineage = tmp_path / "lineage"
+    elsewhere = tmp_path / "elsewhere"
+    pinned_store, pinned_conn, _ = _board_and_card(monkeypatch, lineage, DESIGNATE_OWN)
+    _, conn, task_id = _board_and_card(monkeypatch, elsewhere, DESIGNATE_ELSEWHERE)
+    try:
+        assert pinned_store.is_file() and conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        # Arm the fence exactly as a delegated child's shell carries it: the marker names the
+        # lineage root, and the env pin names this lineage's OWN store (both are the child's).
+        monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(lineage))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned_store))
+        _rooted(monkeypatch, elsewhere)
+
+        result = kb.designate_priority(
+            conn, task_id, reason="fenced-target probe", board=UNREGISTERED)
+
+        assert result["board"] == UNREGISTERED, result
+        assert result["task_id"] == task_id
+        row = kb.priority_designation(conn, task_id)
+        assert row is not None and not row["revoked_at"], row
+        assert int(conn.execute("SELECT priority FROM tasks WHERE id = ?",
+                                (task_id,)).fetchone()["priority"]) == result["priority"]
+    finally:
+        conn.close()
+        pinned_conn.close()
+
+
+def test_designate_subject_is_the_connection_not_the_named_board(home, tmp_path, monkeypatch):
+    """The pre-check's SUBJECT, both ways: the fenced connection refuses, the other one does not.
+
+    The named board is foreign and unregistered in both calls, so only the connection can be
+    deciding the verdict.
+    """
+    lineage = tmp_path / "lineage"
+    elsewhere = tmp_path / "elsewhere"
+    _, own_conn, _ = _board_and_card(monkeypatch, lineage, DESIGNATE_OWN)
+    _, other_conn, _ = _board_and_card(monkeypatch, elsewhere, DESIGNATE_ELSEWHERE)
+    try:
+        monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(lineage))
+        _rooted(monkeypatch, elsewhere)
+        # The lineage's own store is fenced, so the named board cannot be used to escape it.
+        with pytest.raises(PermissionError):
+            kb._assert_not_delegated_child_write(own_conn, board=UNREGISTERED)
+        # A store outside the fence is the caller's to write, whatever foreign board it names.
+        kb._assert_not_delegated_child_write(other_conn, board=UNREGISTERED)
+    finally:
+        own_conn.close()
+        other_conn.close()
+
+
+def test_designate_from_a_delegated_child_on_its_own_board_is_still_refused(home, tmp_path,
+                                                                            monkeypatch):
+    """GUARD (marker arm): naming a paper board does not buy a delegated child its own store back."""
+    _, conn, task_id = _board_and_card(monkeypatch, tmp_path / "lineage", DESIGNATE_OWN)
+    try:
+        monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(tmp_path / "lineage"))
+        with pytest.raises(PermissionError) as raised:
+            kb.designate_priority(conn, task_id, reason="self-service", board=UNREGISTERED)
+        assert "child contexts cannot mutate" in str(raised.value)
+        assert kb.priority_designation(conn, task_id) is None
+    finally:
+        conn.close()
+
+
+def test_designate_from_a_worker_descendant_is_still_refused(home, tmp_path, monkeypatch):
+    """GUARD (provenance arm): ``env -u`` does not clear this one — ancestry alone refuses.
+
+    The child process below carries no marker and no pin beyond the dispatcher's; its parent is
+    the ``worker_pid`` of a LIVE claim on the board, which is the only thing left to judge it by.
+    """
+    task_id = _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                          fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "designate.py", DESIGNATE_PROBE_SRC)
+    res = _run(script, home, BOARD, task_id)
+    assert res.returncode == 7, f"designation was ADMITTED from a worker descendant: {res.stdout}{res.stderr}"
+    assert "descends from a LIVE dispatched worker" in res.stdout, res.stdout + res.stderr
+
+
+def test_designate_from_a_top_level_process_is_unaffected(home, tmp_path, monkeypatch):
+    """CONTROL: no marker, no claim — the ordinary caller still designates."""
+    _, conn, task_id = _board_and_card(monkeypatch, tmp_path / "top", DESIGNATE_OWN)
+    try:
+        result = kb.designate_priority(conn, task_id, reason="ordinary", board=DESIGNATE_OWN)
+        assert result["board"] == DESIGNATE_OWN
+        assert kb.priority_designation(conn, task_id) is not None
+    finally:
+        conn.close()
+
+
