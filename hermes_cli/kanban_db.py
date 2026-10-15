@@ -1871,6 +1871,10 @@ def create_task(
     # CONNECTION), never the ambient board's - the whole defect this restores was a policy asked
     # about the wrong board. `None` provenance is the inert case: an unwired board keeps the
     # caller's value and the event payload it has always written, byte for byte.
+    # The REQUESTED value is kept before the policy touches it: the above-tranche
+    # door below judges the CALLER'S number, so a wired board's clamp can never
+    # silently absorb (and hide) an over-claim (card t_2e107499).
+    requested_priority = int(priority)
     priority, policy_provenance = _apply_board_priority_policy(
         priority, assignee=assignee, board=dest_board, title=title, body=body,
     )
@@ -1893,6 +1897,17 @@ def create_task(
         ask_ref, board=_ask_board, title=title,
         allow_off_board=allow_off_board_ask, caller=created_by,
     )
+
+    # THE ABOVE-TRANCHE DOOR (operator ruling 2026-09-28, card t_6ce41549; restored by card
+    # t_2e107499). Applies at the same seam, on the REQUESTED value and for EVERY board: the
+    # ceiling is not a board's property, it is the scale's. `dest_board` - the one slug resolved
+    # from the CONNECTION above (ruling t_2187558e D1) - is what the deviation row is filed
+    # against and what the marker's designation read is answered from.
+    priority, above_tranche_record = apply_above_tranche_guard(
+        conn, requested_priority, priority, board=dest_board, lane=created_by, title=title,
+        body=body, ask_ref=ask_ref, tenant=tenant,
+    )
+    policy_provenance = _merge_policy_record(policy_provenance, above_tranche_record)
 
     now = int(time.time())
 
@@ -3297,6 +3312,391 @@ def _task_text(conn: sqlite3.Connection, task_id: str) -> str:
         return ""
     return "{}\n{}".format((row["title"] or ""), (row["body"] or ""))
 
+
+#: The identity every deviation row carries - the guard, never the filer.
+ABOVE_TRANCHE_GUARD_IDENTITY = "kanban-priority-guard"
+
+#: Prefix of the public deviation rows this guard files (one per distinct violation).
+ABOVE_TRANCHE_DEVIATION_PREFIX = "PRIORITY OVER-CLAIM (above the reserved tranche)"
+
+
+def above_tranche_marker(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+    task_id: Optional[str] = None, title: Optional[str] = "", body: Optional[str] = "",
+    ask_ref: Optional[Any] = None,
+) -> str:
+    """Which MARKER admits this card above the reserved tranche - ``""`` when it has none.
+
+    Read-only, and the same answer for a filing (title/body/``ask_ref``) and for a row that
+    already exists (``task_id`` reads the designation ledger). Deterministic order, so the
+    record is reproducible: the filing's own ask reference, then the register's stamp, then a
+    live designation, then a declared SEV1.
+    """
+    ref = ask_ref
+    if ref is not None and not getattr(ref, "unresolved", "") and getattr(ref, "register", None):
+        # The source is part of the label: an explicit `serves=`, the worker's env, a body
+        # stamp and a parent chain are different evidence, and the record must say which.
+        return "operator-ask-ref:%s" % (getattr(ref, "source", "") or "ref")
+    if _ASK_STAMP_RE.search(body or ""):
+        return "operator-ask-stamp"
+    if task_id and is_priority_designated(conn, task_id, board=board):
+        return "designation"
+    if sev1_declared("{}\n{}".format(title or "", body or "")):
+        return "sev1"
+    return ""
+
+
+ABOVE_TRANCHE_ALTERNATIVES = (
+    "Legitimate move 1 - file it INSIDE the domain: any value up to %d (the maximum band top) "
+    "is accepted as filed, and that is where a lane's own work belongs. "
+    "Legitimate move 2 - if the card IS the operator's ask (a card under the register, or one "
+    "filed in service of it) or a DECLARED SEV1, CARRY THE MARKER and it is admitted into the "
+    "reserved tranche at %d: pass `serves=` / write the `Operator-ask: <register>/<ask>` line / "
+    "declare `Severity: SEV1` on a labelled line. "
+    "Legitimate move 3 - a card that must RANK inside the tranche is DESIGNATED, and that is a "
+    "host/operator act: `hermes kanban defcon designate <id> --reason ...` (see "
+    "hermes_cli/kanban_register.py)."
+)
+
+
+class AboveTrancheRefused(ValueError):
+    """Raised when a filing or a re-rank claims a value above the reserved tranche.
+
+    Carries the structured facts a caller needs to fix the call rather than the guard:
+    ``lane`` (the filing lane, by name), ``attempted_priority``, ``board``, ``marker`` (always
+    empty on this path), ``deviation_task_id`` (the public refusal row) and ``deviation_error``.
+    """
+
+    def __init__(self, message: str, *, lane: str = "", title: str = "",
+                 attempted_priority: int = 0, board: str = "", ceiling: int = 0,
+                 deviation_task_id: Optional[str] = None,
+                 deviation_error: Optional[str] = None):
+        super().__init__(message)
+        self.lane = lane or ""
+        self.title = title or ""
+        self.attempted_priority = int(attempted_priority or 0)
+        self.board = board or ""
+        self.ceiling = int(ceiling or 0)
+        self.deviation_task_id = deviation_task_id
+        self.deviation_error = deviation_error
+
+
+def above_tranche_refusal_message(
+    title, lane, attempted_priority, ceiling, deviation_task_id=None, deviation_error=None,
+) -> str:
+    """The refusal text; returned verbatim by every surface (tool, CLI, kernel)."""
+    who = lane or "an unidentified caller"
+    return " ".join([
+        f"refused: priority {int(attempted_priority)} is above the reserved top tranche "
+        f"({int(ceiling)} is the maximum). Attempted title {title!r}, filer {who}. "
+        f"NOTHING WAS CREATED - no task row and no event.",
+        "Why: the operator's asks and SEVs hold the reserved top tranche "
+        "(operator ruling 2026-09-28), nothing else is admitted above them, and a lane's own "
+        "work outranking an ask is what the ruling ends. The value is not clamped silently: a "
+        "hand-lift above the ceiling is the door that put 52 rows over the ask band on `defcon` "
+        "(measured 2026-09-28).",
+        ABOVE_TRANCHE_ALTERNATIVES % (_ordinary_edge(), ceiling),
+    ] + ([
+        f"Enforcement: the attempt is escalated and the deviation is filed on this board "
+        f"against the filing lane by name - task {deviation_task_id}. Fix the call, not the "
+        f"guard."
+    ] if deviation_task_id else [
+        "Enforcement: the deviation row could NOT be filed"
+        + (f" ({deviation_error})" if deviation_error else "")
+        + " - the refusal stands regardless; report this to platform-stl."
+    ]))
+
+
+def _ordinary_edge() -> int:
+    """The ordinary domain's edge, read through the policy module (never a second copy)."""
+    return int(_policy_module().ORDINARY_MAX)
+
+
+def _above_tranche_deviation_key(board, lane, priority, title) -> str:
+    """One durable deviation row per distinct violation - never a card per retry."""
+    from hashlib import sha1
+
+    digest = sha1((title or "").strip().encode("utf-8")).hexdigest()[:12]
+    return f"above-tranche-refused:{board or ''}:{lane or 'unknown'}:{int(priority)}:{digest}"
+
+
+def file_above_tranche_deviation(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, lane: Optional[str] = None,
+    title: Optional[str] = "", attempted_priority: int = 0, tenant: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """File the public refusal row for an above-tranche attempt. Returns ``(task_id, error)``.
+
+    Never raises: the refusal must not depend on its own side effect, so a filing failure is
+    carried in the refusal message (and on the exception) instead of being swallowed or turning
+    the refusal into an error. The row is filed against the FILING LANE by name.
+    """
+    policy = _policy_module()
+    who = (lane or "").strip()
+    assignee = _canonical_assignee(who) if who else None
+    if not assignee:
+        # An unidentified caller still gets a public row; the ops head owns the chase.
+        assignee = "default"
+    attempt = " ".join((title or "").split())[:120] or "(untitled)"
+    body = "\n".join([
+        "**Enforcement record - a filing above the reserved tranche was REFUSED at the "
+        "create path.**",
+        "",
+        f"* **filing lane (by name):** `{who or 'unidentified caller - row filed to default'}`",
+        f"* **attempted priority:** `{int(attempted_priority)}` "
+        f"(the ceiling is `{policy.MAX_PRIORITY}`, the reserved tranche is "
+        f"`{policy.TRANCHE_FLOOR}..{policy.TRANCHE_TOP}`)",
+        f"* **attempted title:** `{attempt}`",
+        "* **enforcement action:** REFUSED. Nothing was created - no task row and no `created` "
+        "event.",
+        "* **standard:** the operator's asks and SEVs hold the reserved top tranche; nothing "
+        "else is admitted above them (operator ruling 2026-09-28, design record platform-stl "
+        "`t_6ce41549`).",
+        f"* **what to do instead:** {ABOVE_TRANCHE_ALTERNATIVES % (policy.ORDINARY_MAX, policy.TRANCHE_TOP)}",
+        "",
+        "This row is the escalation of the attempt AND the public reprimand: filed on the board "
+        "the attempt targeted, against the filing lane by name, in the open.",
+        "",
+        "The lane owns the correction: (a) the **fix** - file inside the domain, carry the ask "
+        "marker if the card IS the operator's ask or a declared SEV1, or ask the ops head to "
+        "designate it; (b) the **cost** - an above-tranche filing is refused, and repeats "
+        "collapse onto this same row; (c) the **acceptance** - reply on this card naming which "
+        "of the three moves the lane used, and re-run the call.",
+    ])
+    try:
+        tid = create_task(
+            conn,
+            title=f"{ABOVE_TRANCHE_DEVIATION_PREFIX}: {who or 'unidentified lane'} attempted "
+                  f"p{int(attempted_priority)} on {attempt!r}",
+            body=body,
+            assignee=assignee,
+            board=board,
+            tenant=tenant,
+            created_by=ABOVE_TRANCHE_GUARD_IDENTITY,
+            idempotency_key=_above_tranche_deviation_key(board, who, attempted_priority, title),
+        )
+    except Exception as exc:  # the record's failure must never replace the refusal
+        return None, f"{type(exc).__name__}: {exc}"
+    return str(tid), None
+
+
+def _refuse_above_tranche(
+    conn: sqlite3.Connection, *, board: Optional[str], lane: Optional[str],
+    title: Optional[str], attempted_priority: int, tenant: Optional[str] = None,
+) -> AboveTrancheRefused:
+    """File the deviation, then build the refusal. The refusal is unconditional."""
+    policy = _policy_module()
+    deviation_id, deviation_error = file_above_tranche_deviation(
+        conn, board=board, lane=lane, title=title,
+        attempted_priority=attempted_priority, tenant=tenant)
+    return AboveTrancheRefused(
+        above_tranche_refusal_message(
+            title, lane, attempted_priority, policy.MAX_PRIORITY,
+            deviation_id, deviation_error),
+        lane=lane or "", title=title or "", attempted_priority=attempted_priority,
+        board=board or "", ceiling=policy.MAX_PRIORITY,
+        deviation_task_id=deviation_id, deviation_error=deviation_error,
+    )
+
+
+def apply_above_tranche_guard(
+    conn: sqlite3.Connection, requested: int, applied: int, *, board: Optional[str] = None,
+    lane: Optional[str] = None, title: Optional[str] = "", body: Optional[str] = "",
+    ask_ref: Optional[Any] = None, tenant: Optional[str] = None,
+) -> tuple[int, Optional[dict]]:
+    """The create seam's above-tranche half: ``(priority, record)``.
+
+    Reads the REQUESTED value (not the board policy's output) so a wired board's clamp cannot
+    silently absorb an over-claim, and runs for every board - the ceiling is not a board's
+    property, it is the scale's. A clean filing comes back with the applied value and ``None``,
+    so a correctly filed card keeps today's byte-identical event.
+    """
+    policy = _policy_module()
+    ceiling = int(policy.MAX_PRIORITY)
+    asked = int(requested)
+    if asked <= ceiling:
+        return int(applied), None
+    marker = above_tranche_marker(
+        conn, board=board, title=title, body=body, ask_ref=ask_ref)
+    if not marker:
+        raise _refuse_above_tranche(
+            conn, board=board, lane=lane, title=title, attempted_priority=asked,
+            tenant=tenant,
+        )
+    return ceiling, {
+        "above_tranche": {
+            "requested": asked,
+            "applied": ceiling,
+            "marker": marker,
+            "reason": (
+                f"carries the {marker} marker: admitted into the reserved tranche at its top "
+                f"({ceiling}); the scale ends there"
+            ),
+            "bounds": [int(policy.TRANCHE_FLOOR), ceiling],
+        },
+    }
+
+
+def _merge_policy_record(record: Optional[dict], extra: Optional[dict]) -> Optional[dict]:
+    """Merge the above-tranche record into the one the ``created`` event carries, or ``None``.
+
+    When the above-tranche door placed the card, the ordinary-domain clamp clause (if the board
+    policy had one) no longer describes what happened - it would carry a second, contradicting
+    ``applied`` value - so it is dropped rather than left to be read as the outcome.
+    """
+    if not extra:
+        return record
+    merged = dict(record or {})
+    merged.update(extra)
+    if "above_tranche" in merged:
+        merged["applied"] = merged["above_tranche"]["applied"]
+        merged["clamped"] = True
+        merged.pop("domain", None)
+    return merged
+
+
+def _refuse_above_tranche_rerank(
+    conn: sqlite3.Connection, task_id: str, priority: int, *, board: Optional[str] = None,
+) -> None:
+    """Door 2b: a RE-RANK above the ceiling is refused unless the CARD carries a marker.
+
+    Deliberately not gated on the board's ``priority_policy``, unlike the ordinary-domain door
+    above it: the board-gated version is inert everywhere the domain is unwired, and the
+    hand-lift it would have caught is how 52 rows came to sit over the asks on ``defcon``
+    (measured 2026-09-28). The refusal names the card, the ceiling and the three legitimate
+    moves; the card's own lane already owns it, so no deviation row is filed - the caller is
+    standing at the card.
+    """
+    policy = _policy_module()
+    value = int(priority)
+    if value <= int(policy.MAX_PRIORITY):
+        return
+    slug = board or board_for_connection(conn)
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no such task {task_id} on this board")
+    ask_ref = _resolve_operator_ask(
+        conn, board=slug, parents=(task_id,), body=row["body"] or "", serves=None,
+    )
+    marker = above_tranche_marker(
+        conn, board=slug, task_id=task_id, title=row["title"] or "", body=row["body"] or "",
+        ask_ref=ask_ref,
+    )
+    if marker:
+        return
+    raise AboveTrancheRefused(
+        " ".join([
+            f"refused: priority {value} is above the reserved top tranche "
+            f"({int(policy.MAX_PRIORITY)} is the maximum) and {task_id} carries no "
+            f"operator-ask/SEV marker, so the re-rank would put plain lane work over the "
+            f"operator's asks. Nothing was written.",
+            "Why: the operator's asks and SEVs hold the reserved top tranche (operator ruling "
+            "2026-09-28); a non-ask card already above it is lowered, not argued with, and "
+            "every board carries the same ceiling because the hand-lift is door-inert "
+            "nowhere. A card that must rank in the tranche is DESIGNATED - "
+            "`hermes kanban defcon designate <id> --reason ...`.",
+            ABOVE_TRANCHE_ALTERNATIVES % (int(policy.ORDINARY_MAX), int(policy.TRANCHE_TOP)),
+        ]),
+        attempted_priority=value, board=slug or "", ceiling=int(policy.MAX_PRIORITY),
+    )
+
+
+def demote_above_tranche(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, reason: str = "",
+) -> list[dict]:
+    """THE REPAIR PASS: lower every row holding a value above the ceiling into its class ceiling.
+
+    Deterministic, idempotent, board-local, and keyed on the SAME predicate the STORAGE guard
+    reads (``tranche_entitlement`` - the row's own evidence, which is the only evidence a trigger
+    can see):
+
+    * a row carrying that evidence (the register's stamp - which every ask-filed card carries -
+      a live designation, or a declared SEV1) belongs INSIDE the reserved tranche, so it is
+      lowered to ``TRANCHE_TOP``: the top of the scale, but not above it;
+    * anything else is the class the ruling bans above the asks, so it is lowered to
+      ``ORDINARY_MAX`` - exactly where the create door files a card that claims too much today.
+
+    Each lowering is recorded on the card as a ``priority_demoted`` event, so the repair is
+    visible to the lane whose card moved, and a clean board costs one SELECT. Returns the ledger
+    (``task_id``, ``was``, ``now``, ``marker``) for the tick that ran it.
+
+    THE LANDING VALUE IS THE STORAGE GUARD'S PREDICATE (``tranche_entitlement``), not a wider
+    reading of the same row: a value written into the reserved band on evidence the guard cannot
+    see is a write the guard aborts, and an abort here used to take the whole board's dispatching
+    with it (2026-10-01). A row whose marker is only inherited - an ask on an ancestor, which
+    every card born under an ask carries in its own body as the register's stamp - is therefore
+    landed in the ordinary domain, which is also where the guard will accept it.
+
+    ONE ROW CANNOT STOP THE REST. Each lowering is its own transaction, and a refused write is
+    reported as a ledger row carrying ``error`` (with ``now`` ``None``) instead of raising: this
+    pass is a best-effort repair of an invariant that is already broken, and the rows after a
+    refused one still deserve the repair. A ledger row with an ``error`` is NOT a success - the
+    dispatcher records it and logs it.
+
+    THE ORDINARY LANDING MUST BE A VALUE THE BOARD'S OWN GUARD ACCEPTS. A board may declare a
+    floor ABOVE ``ORDINARY_MAX`` - ``defcon`` declares 990000, which is where every ordinary card
+    on that board belongs (its birth door lifts below-floor filings there) - and the armed floor
+    clause refuses any write below it. Landing at ``ORDINARY_MAX`` there is a write the guard
+    aborts, so the pass could not repair the very board the ruling is about (measured
+    2026-10-15: 13 unmarked rows at 1000000, every one of them unrepairable and one ERROR line
+    per tick). The landing is therefore ``max(ORDINARY_MAX, the board's floor)``; on a board
+    that declares no floor it stays ``ORDINARY_MAX``, byte-identical to the ported behaviour.
+    The floor read is fail-soft like everything else here: a floor that cannot be answered
+    leaves the ordinary edge, because a best-effort repair must never raise.
+    """
+    policy = _policy_module()
+    slug = board or board_for_connection(conn) or ""
+    ceiling = int(policy.MAX_PRIORITY)
+    ordinary = int(policy.ORDINARY_MAX)
+    try:
+        floor = _board_priority_floor(slug or None)
+    except Exception:
+        floor = None
+    if floor is not None:
+        ordinary = max(ordinary, int(floor))
+    rows = conn.execute(
+        "SELECT id, priority, assignee, title, body FROM tasks "
+        "WHERE priority > ? AND status != 'archived' ORDER BY priority DESC, created_at ASC",
+        (ceiling,),
+    ).fetchall()
+    ledger: list[dict] = []
+    for row in rows:
+        marker = tranche_entitlement(
+            conn, board=slug, task_id=row["id"], title=row["title"] or "",
+            body=row["body"] or "",
+        )
+        now = ceiling if marker else ordinary
+        was = int(row["priority"])
+        if now == was:
+            continue
+        try:
+            with write_txn(conn):
+                conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (now, row["id"]))
+                _append_event(conn, row["id"], "priority_demoted", {
+                    "from": was,
+                    "to": now,
+                    "ceiling": ceiling,
+                    "marker": marker,
+                    "reason": reason or (
+                        "above the reserved tranche: {}".format(
+                            f"marker {marker} - lowered to the tranche top" if marker
+                            else "no operator-ask/SEV marker - lowered into the ordinary domain")),
+                })
+        except sqlite3.Error as exc:
+            # Not swallowed: the row is returned with the refusal and logged at ERROR, and the
+            # rest of the pass continues (one unrepairable row must not strand every other one).
+            detail = f"{type(exc).__name__}: {exc}"
+            _log.error(
+                "kanban: the above-tranche repair could not lower %s on board %s (%s -> %s, "
+                "marker %r): %s",
+                row["id"], slug or "-", was, now, marker, detail,
+            )
+            ledger.append({"task_id": row["id"], "was": was, "now": None, "marker": marker,
+                           "error": detail})
+            continue
+        ledger.append({"task_id": row["id"], "was": was, "now": now, "marker": marker})
+    return ledger
 
 def priority_designation(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
     """The card's designation row - live or revoked - or ``None``."""
@@ -5424,6 +5824,11 @@ def edit_task(
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
     if priority is not None:
+        # Door 2b of the above-tranche guard (card t_2e107499, operator ruling 2026-09-28): the
+        # CEILING, deliberately NOT policy-gated - the hand-lift above it is how the class was
+        # created on ``defcon``. Runs BEFORE the domain door below, which returns early for any
+        # value over ``MAX_PRIORITY`` (the marker-carrying lift is this door's call, not its).
+        _refuse_above_tranche_rerank(conn, task_id, priority, board=board)
         # Door 2 of the priority domain (card t_ecbfb34b): a re-rank outside the ordinary
         # domain, or below the destination board's own declared floor, is REFUSED before
         # anything is written. The DOMAIN half is the KERNEL's - unconditional on an unwired

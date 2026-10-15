@@ -814,6 +814,23 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    priority_demoted: list[tuple[str, int, int]] = field(default_factory=list)
+    """The above-tranche repair pass's report (``t_6ce41549``, restored by card ``t_2e107499``):
+    ``(task_id, was, now)`` for each row LOWERED into its class ceiling this tick. Empty in the
+    steady state — a clean board costs one SELECT — and the durable per-card record is the
+    ``priority_demoted`` event the pass writes, so a lane can see its own card was moved instead
+    of finding out by order."""
+    priority_demote_refused: list[str] = field(default_factory=list)
+    """``"<task_id> (<was> -> <now>): <error>"`` for each row the above-tranche repair pass could
+    NOT lower this tick. A refusal is NOT a success: the row still carries its over-claim, so it
+    is named on the tick's own record and logged at ERROR. Never expected — the pass and the
+    storage guard read one predicate (``kanban_db.tranche_entitlement``) — and this bucket is
+    what makes a disagreement visible instead of silent."""
+    priority_demote_error: Optional[str] = None
+    """Set when the above-tranche repair pass itself raised instead of returning. The tick
+    CONTINUES and dispatches anyway (2026-10-01: an abort in this pass took the whole ``defcon``
+    board's dispatching down for 6.5 h, before the spawn loop was reached), so the failure — not
+    the tick — is what this field reports."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -4555,6 +4572,36 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    # Door 3 of the above-tranche guard (t_6ce41549, restored by card t_2e107499): a row ABOVE
+    # the reserved tranche is LOWERED into its class ceiling, board-locally, on every tick.
+    # Deterministic and idempotent, and placed after promotion because a promoted row is exactly
+    # the kind of row a later door could have written above the ceiling: the invariant is
+    # restored before the spawn decision is taken, never after it.
+    result.priority_demoted = []
+    result.priority_demote_refused = []
+    try:
+        demoted = _kb.demote_above_tranche(conn, board=board)
+    except Exception as exc:  # a repair must never stop the board dispatching
+        # THE PASS CANNOT TAKE THE TICK DOWN (measured 2026-10-01: an abort in this pass — door 3
+        # refusing the pass's own write — killed every `defcon` tick for 6.5 h, and the tick died
+        # BEFORE the spawn loop, so 452 ready cards spawned nothing). Whatever the guard and the
+        # doors disagree about, the repair of an already-broken invariant is not what stops the
+        # board's dispatching: it is recorded on the tick's own result and logged at ERROR.
+        demoted = []
+        result.priority_demote_error = f"{type(exc).__name__}: {exc}"
+        _kb._log.error(
+            "kanban: the above-tranche repair pass FAILED on board %s; the tick continues and "
+            "dispatches from a board still carrying an over-claim: %s",
+            board or "-", result.priority_demote_error,
+        )
+    result.priority_demoted = [
+        (row["task_id"], row["was"], row["now"])
+        for row in demoted if row.get("now") is not None
+    ]
+    result.priority_demote_refused = [
+        f"{row['task_id']} ({row['was']} -> {row['now']}): {row.get('error')}"
+        for row in demoted if row.get("error")
+    ]
 
 
 def _tick_spawn_budget(
