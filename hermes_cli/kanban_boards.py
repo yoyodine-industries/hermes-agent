@@ -147,10 +147,13 @@ def _cmd_boards_switch(args: argparse.Namespace) -> int:
 
 
 def _cmd_boards_show(args: argparse.Namespace) -> int:
-    current = kb.get_current_board()
-    meta = kb.read_board_metadata(current)
-    counts = _board_task_counts(current)
-    print(f"Current board: {current}\n  Display name: {meta.get('name', '')}")
+    slug = getattr(args, "slug", None) or kb.get_current_board()
+    meta = kb.read_board_metadata(slug)
+    counts = _board_task_counts(slug)
+    if _json_out(args, meta):
+        return 0
+    label = "Current board" if getattr(args, "slug", None) is None else "Board"
+    print(f"{label}: {slug}\n  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}\n"
@@ -253,6 +256,66 @@ def _cmd_boards_set_dispatch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_set_priority_policy(args: argparse.Namespace) -> int:
+    """Wire (or clear) a board's birth-time priority policy, and sync its storage guard.
+
+    The WRITING half of the birth seam (card t_2187558e, REQUIRED 2). Three things happen
+    here and nowhere else:
+
+    * the module is VALIDATED by LOADING it (``load_callable``) and by READING the board's
+      floor through it (``board_floor``). A policy that cannot be loaded, or whose floor
+      cannot be read, is refused with *nothing written* - the writer stores what it is
+      given, so this verb is the surface that has to refuse, and a refusal must leave no
+      half-wired board behind;
+    * the key is written through ``write_board_metadata(..., priority_policy=...)``, storing
+      the NORMALISED spec so ``board.json`` holds the canonical shape (``{module, function}``);
+    * the storage guard is synced to the key (``sync_priority_tranche_guard``) — armed for a
+      wired board, dropped for an unwired one — so the guard can never drift from the key
+      that turns the domain on. The floor is baked into the DDL at this moment.
+    """
+    from hermes_cli import kanban_priority_policy as kpp
+
+    normed, rc = _board_slug_arg(args, "set-priority-policy", must_exist=True)
+    if rc:
+        return rc
+    module = (getattr(args, "module", None) or "").strip()
+    spec = None
+    if module:
+        try:
+            spec = kpp.normalize_spec({
+                "module": module,
+                "function": (getattr(args, "function", None) or "").strip() or kpp.DEFAULT_FUNCTION,
+            })
+            kpp.load_callable(spec)                      # the callable must LOAD
+            kpp.board_floor(spec, normed)                # and its floor must be READABLE
+        except Exception as exc:
+            return _err(f"kanban boards set-priority-policy: {exc} — nothing written", 2)
+    try:
+        kb.write_board_metadata(normed, priority_policy=spec if module else "")
+        state = kb.sync_priority_tranche_guard(normed)
+    except Exception as exc:
+        return _err(f"kanban boards set-priority-policy: {exc} — nothing written", 2)
+    payload = {
+        "board": normed,
+        "priority_policy": kb.board_priority_policy(normed),
+        "storage_guard": state,
+    }
+    if _json_out(args, payload):
+        return 0
+    if module:
+        print(f"Board {normed!r}: priority policy set to "
+              f"{payload['priority_policy']['module']!r}"
+              f"::{payload['priority_policy']['function']}.\n"
+              f"  Birth priority is that policy's call from now on; the caller's value is "
+              f"the ASK.\n"
+              f"  Storage guard: {state}.")
+    else:
+        print(f"Board {normed!r}: priority policy cleared.\n"
+              f"  Storage guard: {state} — the board behaves exactly as it did before it "
+              f"ever opted in.")
+    return 0
+
+
 def _cmd_boards_export(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
     from hermes_cli.sizefmt import format_bytes
@@ -309,6 +372,7 @@ _BOARD_HANDLERS = {
     "set-default-workdir": _cmd_boards_set_default_workdir,
     "set-project": _cmd_boards_set_project,
     "set-dispatch": _cmd_boards_set_dispatch,
+    "set-priority-policy": _cmd_boards_set_priority_policy,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

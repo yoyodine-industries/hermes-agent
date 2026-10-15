@@ -170,7 +170,7 @@ def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
-    dispatch: Optional[bool] = None,
+    dispatch: Optional[bool] = None, priority_policy: Any = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
@@ -178,7 +178,21 @@ def write_board_metadata(
     unchanged — the synthesized ``True`` default is applied at READ time by
     :func:`board_dispatch_enabled`, so a board that never touched the key keeps its
     ``board.json`` byte-identical; ``False`` marks an estate/scratch board the dispatcher
-    must not serve."""
+    must not serve.
+
+    ``priority_policy`` — the birth-time policy a board declares (the key
+    ``kanban_priority_policy`` reads, card t_2187558e) — is tri-state too: ``None`` leaves
+    the key EXACTLY as the file holds it (every board that predates the restore carries an
+    orphaned copy, and an unrelated write must not clear or rewrite it), a value that is
+    falsy per :func:`kanban_priority_policy.board_is_wired`/``normalize_spec`` (``""``,
+    ``{}``) CLEARS it by removing the key, and a string or dict spec is STORED as given.
+
+    Storing what it is given (rather than a re-normalised copy) is deliberate: this is the
+    WRITER, and the verb that wires a board — ``hermes kanban boards set-priority-policy`` —
+    is the surface that validates, because it is the one with somewhere to report a
+    refusal ("nothing written", exit 2). A policy that cannot be loaded must stay
+    storeable so the birth seam can be exercised against one and watch it report
+    ``unavailable`` rather than fail the filing."""
     _kb._assert_not_delegated_child_mutation()
     slug = _kb._slug_or_default(board)
     meta = read_board_metadata(slug)
@@ -193,6 +207,13 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if dispatch is not None:
         meta["dispatch"] = bool(dispatch)
+    if priority_policy is not None:
+        if isinstance(priority_policy, dict) and not priority_policy:
+            priority_policy = ""  # a spec that names nothing is the CLEAR, not a policy
+        if isinstance(priority_policy, str) and not priority_policy.strip():
+            meta.pop("priority_policy", None)
+        else:
+            meta["priority_policy"] = priority_policy
     for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
         if value is not None:
             meta[key] = str(value) if value else None
