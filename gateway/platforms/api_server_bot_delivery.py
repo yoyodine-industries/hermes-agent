@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from tools import bot_delivery_queue as delivery_queue
+from tools import bot_delivery_strand_alert as strand_alert
 
 #: One log line per delivery decision, in the queue module's own format.
 log_delivery_event = delivery_queue._log
@@ -270,6 +271,12 @@ async def sweep_loop(adapter: Any) -> None:
             drained = await drain_once(adapter, home)
             if drained:
                 log_delivery_event("sweep_drained", None, drained=drained)
+            # Trigger 5, the recurrence guard (DoD 4 of the peer-delivery project):
+            # ONE census evaluation per tick, ONE log line, and -- when the stranded
+            # count GREW -- exactly one idempotency-keyed card, filed from HERE (the
+            # live gateway) because a worker's CLI cannot write to the board. It never
+            # raises: an alarm must not be able to kill the drainer's sweep.
+            strand_alert.evaluate_and_alert(home)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - a sweep failure must never kill the loop

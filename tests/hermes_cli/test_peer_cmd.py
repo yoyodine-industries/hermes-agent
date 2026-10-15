@@ -740,7 +740,11 @@ def test_a_transport_failure_files_no_card(monkeypatch, capsys):
 
 
 def test_a_board_write_failure_never_breaks_the_refusal(monkeypatch, capsys):
-    """Reporting is a side effect of failing: it must never turn one failure into two."""
+    """Reporting is a side effect of failing: it must never turn one failure into two.
+
+    And the reason it prints must be the REAL one -- 'the board write failed' used to be
+    printed for a fenced-context refusal, which sent the reader after the wrong problem.
+    """
     def boom(**kwargs):
         raise RuntimeError("the board is locked")
 
@@ -751,7 +755,111 @@ def test_a_board_write_failure_never_breaks_the_refusal(monkeypatch, capsys):
                                            json=False))
 
     assert rc == 1
-    assert "NO CARD FILED" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "NOT FILED" in err and "RuntimeError: the board is locked" in err
+
+
+def test_the_idempotency_hit_is_not_reported_as_a_failure(monkeypatch, capsys):
+    """Two outcomes, two lines: 'already filed' carries the SAME id and files no second row."""
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls, "t_seen0001"))
+    monkeypatch.setattr(peer_cmd, "_existing_refusal_card", lambda board, key: "")
+
+    first = peer_cmd._report_refusal("yoyodine", "no-peer", "detail")
+    assert first == "t_seen0001"
+    assert "filed: card t_seen0001" in capsys.readouterr().err
+
+    monkeypatch.setattr(peer_cmd, "_existing_refusal_card", lambda board, key: "t_seen0001")
+    second = peer_cmd._report_refusal("yoyodine", "no-peer", "detail")
+    err = capsys.readouterr().err
+    assert second == "t_seen0001"
+    assert "already filed: card t_seen0001" in err
+    assert "NOT FILED" not in err
+    assert len(calls) == 1, "the idempotency hit filed a second row"
+
+
+def test_the_refusal_write_runs_under_the_reviewed_child_context_allowance(monkeypatch):
+    """The fence admits exactly ONE named purpose, and the report sets it around the write."""
+    from agent import delegation_context as dc
+
+    seen = []
+
+    def filer(**kwargs):
+        seen.append(dc.child_kanban_write_purpose())
+        return "t_allowed1"
+
+    monkeypatch.setattr(peer_cmd, "_create_card", filer)
+    card, reason = peer_cmd._file_refusal_card(
+        "yoyodine", "no-peer", "detail",
+        target={"board": "default", "assignee": "platform-stl", "priority": 3})
+
+    assert (card, reason) == ("t_allowed1", "")
+    assert seen == [peer_cmd.REFUSAL_WRITE_PURPOSE]
+    assert dc.child_kanban_write_purpose() == "", "the allowance leaked past the write"
+
+
+def test_the_child_write_allowance_is_closed_outside_its_named_purpose(tmp_path, monkeypatch):
+    import sqlite3
+
+    from agent import delegation_context as dc
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(tmp_path))
+
+    with pytest.raises(ValueError):
+        with dc.child_kanban_write_allowance("because-i-want-to"):
+            pass
+
+    (tmp_path / "kanban").mkdir()
+    conn = sqlite3.connect(str(tmp_path / "kanban" / "kanban.db"))
+    try:
+        with pytest.raises(PermissionError):
+            with kbc.write_txn(conn):
+                pass
+        with pytest.raises(PermissionError):
+            kb._assert_not_delegated_child_mutation(tmp_path / "kanban" / "kanban.db")
+
+        with dc.child_kanban_write_allowance(dc.CHILD_KANBAN_WRITE_PURPOSES[0]):
+            with kbc.write_txn(conn):
+                pass
+    finally:
+        conn.close()
+
+
+def test_a_dispatcher_spawned_worker_files_the_refusal_card_and_the_repeat_is_a_hit(
+        tmp_path, monkeypatch, capsys):
+    """The D11 acceptance: the report ACTS from a fenced context, and the second refusal of
+    the same (peer, class) prints the SAME card id and writes no second row."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    root = tmp_path / "home"
+    (root / "profiles" / "platform-stl").mkdir(parents=True)
+    (root / "profiles" / "platform-stl" / "config.yaml").write_text("model: {}\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setattr(peer_cmd, "_refusal_target",
+                        lambda: {"board": "default", "assignee": "platform-stl", "priority": 3})
+
+    with kbc.connect_closing(board="default"):     # the owner initializes the store
+        pass
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(root))   # now: a worker
+
+    first = peer_cmd._report_refusal("yoyodine", "no-peer", "detail")
+    assert first.startswith("t_"), capsys.readouterr().err
+    assert f"filed: card {first}" in capsys.readouterr().err
+
+    second = peer_cmd._report_refusal("yoyodine", "no-peer", "detail")
+    err = capsys.readouterr().err
+    assert second == first, err
+    assert f"already filed: card {first}" in err
+
+    with kbc.connect_closing(board="default") as conn:
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
+            (peer_cmd._refusal_key("yoyodine", "no-peer"),)).fetchone()[0]
+    assert rows == 1
 
 
 def test_the_refusal_target_is_configurable(farm, monkeypatch):

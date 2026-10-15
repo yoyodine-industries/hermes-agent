@@ -398,32 +398,101 @@ def _refusal_body(peer_name: str, klass: str, detail: str) -> str:
     ])
 
 
-def _file_refusal_card(peer_name: str, klass: str, detail: str, *, create=None,
-                       target: dict | None = None) -> str:
-    """File ONE idempotency-keyed card for a refusal; return its id (``''`` when not filed).
+def _refusal_board_slug(board: str) -> str:
+    """The board the write will ACTUALLY land on: the resolver's answer, not the config's.
 
-    NEVER raises: a report that broke the refusal path would be worse than no report at all,
-    so a failure here returns ``''`` and the caller says so on stderr.
+    A dispatched worker carries ``HERMES_KANBAN_DB``, which the board resolver honours for
+    machine flows, so the pin can retarget a report onto the worker's own board. The reader
+    must be told where the card IS, never where it was asked to be (defect D11, card
+    t_703af8d1).
     """
+    try:
+        from hermes_cli import kanban_db as kb
+
+        return str(kb.board_for_store_path(kb.kanban_db_path(board=board)) or board)
+    except Exception:
+        return board
+
+
+def _existing_refusal_card(board: str, idempotency_key: str) -> str:
+    """The id of the card this key already filed, or ``''`` -- a READ, never a write.
+
+    Read-only on purpose. The caller may be in the fenced context a dispatcher-spawned
+    worker runs in, where a read is permitted and a write is not; and a lookup that
+    CONNECTED a missing store would itself be a write. Nothing is created here.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+
+        db_path = kb.kanban_db_path(board=board)
+        if not Path(db_path).exists():
+            return ""
+        with kbc.connect_closing(board=board) as conn:
+            row = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (idempotency_key,),
+            ).fetchone()
+    except Exception:
+        return ""
+    return str(row["id"]) if row is not None else ""
+
+
+#: The ONE named purpose the Kanban write fence admits from a child context
+#: (``agent.delegation_context.CHILD_KANBAN_WRITE_PURPOSES``): a refusal report is a NEW,
+#: idempotency-keyed row about a broken control channel, filed from the context the
+#: channel broke in -- it moves no existing card.
+REFUSAL_WRITE_PURPOSE = "peer-refusal-report"
+
+
+def _file_refusal_card(peer_name: str, klass: str, detail: str, *, create=None,
+                       target: dict | None = None) -> tuple[str, str]:
+    """File ONE idempotency-keyed card for a refusal.
+
+    Returns ``(card_id, reason)``: a non-empty id means the row is on the board; an empty
+    one carries the REAL reason it is not, so the caller can print it instead of guessing
+    (the old code swallowed every exception and called it "the board write failed", which
+    mis-attributed a fenced-context refusal as an I/O failure).
+
+    NEVER raises: a report that broke the refusal path would be worse than no report at all.
+    """
+    from agent.delegation_context import child_kanban_write_allowance
+
     target = target or _refusal_target()
     filer = create or _create_card
     title = f"[peer-dm] '{peer_name}' refused a cross-lane DM ({klass})"
     try:
-        return str(filer(title=title, body=_refusal_body(peer_name, klass, detail),
+        with child_kanban_write_allowance(REFUSAL_WRITE_PURPOSE):
+            card = filer(title=title, body=_refusal_body(peer_name, klass, detail),
                          assignee=target["assignee"], priority=target["priority"],
                          board=target["board"],
-                         idempotency_key=_refusal_key(peer_name, klass)) or "")
-    except Exception:
-        return ""
+                         idempotency_key=_refusal_key(peer_name, klass))
+        return str(card or ""), ""
+    except Exception as exc:  # noqa: BLE001 - reporting must never raise
+        return "", f"{exc.__class__.__name__}: {exc}"
 
 
 def _report_refusal(peer_name: str, klass: str, detail: str) -> str:
-    """File the refusal card and SAY SO on stderr, with the card id."""
+    """File the refusal card and SAY SO on stderr, in one of THREE outcomes.
+
+    ``filed`` / ``already filed`` / ``not filed: <the real reason>``. The three are
+    different facts: the idempotency hit used to be indistinguishable from a failure, and
+    a fenced-context refusal used to be reported as an I/O error. The card is looked up
+    FIRST so the hit is knowable, and the write runs under the reviewed child-context
+    allowance (``REFUSAL_WRITE_PURPOSE``) so it can act from a dispatcher-spawned worker.
+    """
     target = _refusal_target()
-    card = _file_refusal_card(peer_name, klass, detail, target=target)
-    where = (f"card {card} on the '{target['board']}' board" if card
-             else "NO CARD FILED (the board write failed; see this session's logs)")
-    print(f"Reported: peer '{peer_name}' refused the request ({klass}) -> {where}",
+    board = _refusal_board_slug(target["board"])
+    key = _refusal_key(peer_name, klass)
+    card = _existing_refusal_card(target["board"], key)
+    if card:
+        outcome = f"already filed: card {card} on the '{board}' board (idempotency key {key})"
+    else:
+        card, reason = _file_refusal_card(peer_name, klass, detail, target=target)
+        outcome = (f"filed: card {card} on the '{board}' board" if card
+                   else f"NOT FILED: {reason or 'the board write failed'}")
+    print(f"Reported: peer '{peer_name}' refused the request ({klass}) -> {outcome}",
           file=sys.stderr)
     return card
 

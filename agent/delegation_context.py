@@ -163,6 +163,57 @@ def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
     return True
 
 
+# --- the ONE reviewed exception to the child-context Kanban write fence -------------------------
+#
+# WHY IT EXISTS. A `hermes peer dm` refusal is how a lane learns that the control channel
+# between lanes is broken, and the context where it breaks is a DISPATCHER-SPAWNED WORKER:
+# that worker's CLI inherits this marker AND descends from the live claim, so every board
+# write is refused. Measured 2026-10-14 (card t_703af8d1): the refusal report printed
+# "NO CARD FILED (the board write failed)" -- mis-attributing a fenced-context refusal as an
+# I/O failure -- and the report of a fleet-wide DM outage vanished into a stderr line nobody
+# reads. That is the exact failure the report existed to end.
+#
+# WHY THIS WRITE IS SAFE FROM A CHILD CONTEXT. The fence exists so a worker cannot MOVE the
+# estate it holds a claim on -- re-rank it, complete its own card, dispatch itself, tear a
+# board down. A refusal report is none of that: it is a NEW row on the OPS board, addressed
+# to a lane other than the filer, idempotency-keyed so a repeat is a no-op, and it mutates
+# no existing row. It is the REPORT of a failure, never an act on the estate.
+#
+# HOW IT IS KEPT NARROW. Not a fence flag, not an environment variable (a worker's shell can
+# strip either): a ContextVar a caller MUST set explicitly, for one of the NAMED purposes
+# below, around the single write. The write door logs every use at WARNING, so an abuse is
+# visible rather than silent, and a purpose that is not named here is refused AT THE SEAM.
+CHILD_KANBAN_WRITE_PURPOSES: tuple[str, ...] = ("peer-refusal-report",)
+_CHILD_KANBAN_WRITE_PURPOSE: ContextVar[str] = ContextVar(
+    "hermes_child_kanban_write_purpose", default=""
+)
+
+
+@contextmanager
+def child_kanban_write_allowance(purpose: str) -> Iterator[str]:
+    """Allow ONE named child-context Kanban write (the reviewed exception above).
+
+    Set only around the single filing it is granted for; a purpose not in
+    :data:`CHILD_KANBAN_WRITE_PURPOSES` is refused here, so the exception cannot be
+    widened by a caller that merely wants a write.
+    """
+    if purpose not in CHILD_KANBAN_WRITE_PURPOSES:
+        raise ValueError(
+            f"unknown child-context kanban write purpose {purpose!r}; "
+            f"named purposes: {', '.join(CHILD_KANBAN_WRITE_PURPOSES)}"
+        )
+    token = _CHILD_KANBAN_WRITE_PURPOSE.set(purpose)
+    try:
+        yield purpose
+    finally:
+        _CHILD_KANBAN_WRITE_PURPOSE.reset(token)
+
+
+def child_kanban_write_purpose() -> str:
+    """The purpose of the allowance in force, or ``""`` -- in which case the fence holds."""
+    return str(_CHILD_KANBAN_WRITE_PURPOSE.get() or "")
+
+
 # --- provenance arm (ruling t_fcf7a321, Decision 1) --------------------------------------------
 #
 # The ContextVar arm above and the marker arm inside ``kanban_path_is_fenced`` are COOPERATIVE:

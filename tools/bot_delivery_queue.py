@@ -1060,6 +1060,142 @@ def queued_target_profiles(home: str | os.PathLike[str]) -> list[str]:
     return profiles
 
 
+# --------------------------------------------------------------------------
+# stranded census (DoD 4 of the peer-delivery project; card t_703af8d1)
+# --------------------------------------------------------------------------
+#: The census' own field set. ``stranded`` is the alarm's number; the rest is
+#: evidence a reader needs to act without any other tooling.
+_CENSUS_COUNT_KEYS = ("queued", "pending_over_ttl", "expired", "ambiguous", "failed",
+                      "delivered", "stranded")
+_CENSUS_AGE_KEYS = ("oldest_age_seconds", "oldest_delivery_id", "oldest_path")
+
+
+def _empty_census_seat() -> dict[str, Any]:
+    seat: dict[str, Any] = {key: 0 for key in _CENSUS_COUNT_KEYS}
+    seat.update({key: None for key in _CENSUS_AGE_KEYS})
+    return seat
+
+
+def _waited_seconds(record: dict[str, Any], *, now_ns: int) -> float:
+    """How long a record waited: the queued intervals it accumulated (§2.6).
+
+    For a terminal record this is the whole wait up to its settlement; for a
+    pending one, the wait so far. Never negative, never raising -- a malformed
+    record must not be able to break the census.
+    """
+    try:
+        return max(0.0, float(queued_seconds(record, now_ns=now_ns)))
+    except Exception:  # pragma: no cover - defensive
+        return 0.0
+
+
+def _note_oldest(seat: dict[str, Any], record: dict[str, Any], path: Path, *,
+                 now_ns: int) -> None:
+    age = _waited_seconds(record, now_ns=now_ns)
+    if seat["oldest_age_seconds"] is None or age > float(seat["oldest_age_seconds"]):
+        seat["oldest_age_seconds"] = age
+        seat["oldest_delivery_id"] = str(record.get("delivery_id") or "")
+        seat["oldest_path"] = str(path)
+
+
+def seat_strand_census(home: str | os.PathLike[str], *, now_ns: int | None = None) -> dict[str, Any]:
+    """One home's stranded-delivery census, read WITHOUT taking the spool lock.
+
+    The count is the rule the peer-delivery project ruled (card t_703af8d1):
+
+        stranded = queued records that waited past the queue TTL
+                 + settled ``expired`` records (accepted and never delivered)
+
+    ``ambiguous`` -- the crash-mid-turn "outcome unknown", an HONEST unknown own
+    terminal state, not a strand -- and ``failed`` are counted and REPORTED but
+    never added to ``stranded``: they are different defects and nothing here
+    decides their fix. The census reads with the same atomic-write/rename idiom
+    the spool uses (temp file + ``os.replace``), so a reader sees whole records
+    only and a concurrent drain cannot tear one.
+    """
+    now_ns = time.time_ns() if now_ns is None else int(now_ns)
+    root = delivery_root(home)
+    ttl = queue_ttl_seconds()
+    seat = _empty_census_seat()
+    for sub in (QUEUE_DIR, CLAIMED_DIR):
+        for record in _list(root, sub):
+            if record.get("status") in TERMINAL_STATUSES:
+                continue
+            seat["queued"] += 1
+            if queued_seconds(record, now_ns=now_ns) > ttl:
+                seat["pending_over_ttl"] += 1
+                _note_oldest(
+                    seat, record,
+                    root / sub / f"{record.get('delivery_id')}.json", now_ns=now_ns,
+                )
+    for record in _list(root, SETTLED_DIR):
+        status = str(record.get("status") or "")
+        if status in seat:
+            seat[status] += 1
+        if status == STATUS_EXPIRED:
+            _note_oldest(
+                seat, record,
+                root / SETTLED_DIR / f"{record.get('delivery_id')}.json", now_ns=now_ns,
+            )
+    seat["stranded"] = int(seat["pending_over_ttl"]) + int(seat["expired"])
+    return seat
+
+
+def spool_homes(root_home: str | os.PathLike[str]) -> list[tuple[str, Path]]:
+    """``(seat, home)`` for the routable seat and EVERY live named profile.
+
+    The same identity predicate ``profile list`` uses (``bot_mode_probe._roster``):
+    infra dirs and tombstones are not lanes, and a marker-carrying directory whose
+    name is not a profile id is not one either.
+    """
+    from tools.bot_mode_probe import _roster
+
+    return [(str(name), Path(home)) for name, home in _roster(Path(root_home))]
+
+
+def _sum_census_seats(seats: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    totals = _empty_census_seat()
+    for seat in seats.values():
+        for key in _CENSUS_COUNT_KEYS:
+            totals[key] += int(seat.get(key) or 0)
+        age = seat.get("oldest_age_seconds")
+        if age is not None and (totals["oldest_age_seconds"] is None
+                                or float(age) > float(totals["oldest_age_seconds"])):
+            totals["oldest_age_seconds"] = float(age)
+            totals["oldest_delivery_id"] = seat.get("oldest_delivery_id")
+            totals["oldest_path"] = seat.get("oldest_path")
+    return totals
+
+
+def strand_census(root_home: str | os.PathLike[str], *,
+                  now_ns: int | None = None) -> dict[str, Any]:
+    """The FLEET census: every spool under ``root_home``, plus the totals.
+
+    Reproducible by one command (the alarm module's ``__main__`` prints exactly
+    this), so the number in a log line can always be re-measured by hand.
+    """
+    now_ns = time.time_ns() if now_ns is None else int(now_ns)
+    seats = {seat: seat_strand_census(home, now_ns=now_ns)
+             for seat, home in spool_homes(root_home)}
+    return {
+        "root": str(Path(root_home)),
+        "ttl_seconds": queue_ttl_seconds(),
+        "now_ns": now_ns,
+        "seats": seats,
+        "totals": _sum_census_seats(seats),
+    }
+
+
+def stranded_breakdown(census: dict[str, Any]) -> str:
+    """``seat:stranded`` for every seat with a non-zero count, sorted, or ``none``."""
+    parts = [
+        f"{seat}:{int(data.get('stranded') or 0)}"
+        for seat, data in sorted((census.get("seats") or {}).items())
+        if int(data.get("stranded") or 0)
+    ]
+    return ",".join(parts) or "none"
+
+
 def check_capacity(
     home: str | os.PathLike[str],
     *,
