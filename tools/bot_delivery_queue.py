@@ -90,7 +90,9 @@ RESULTS = (
 
 OBJECT_NAME = "hermes.peer.send_result"
 
-#: Envelope field order (§1.2/§1.3) -- exactly 23 fields, ``object`` first.
+#: Envelope field order (§1.2/§1.3) -- exactly 24 fields, ``object`` first.
+#: ``holder`` (the call-time holder observation, §2) is appended LAST so every field
+#: before it keeps its index and "no field order, no extras" stays true by construction.
 ENVELOPE_FIELDS = (
     "object",
     "result",
@@ -115,6 +117,7 @@ ENVELOPE_FIELDS = (
     "reason",
     "detail",
     "at",
+    "holder",
 )
 
 #: Durable queue-record field order (§2.3) -- exactly 20 fields.
@@ -1253,12 +1256,16 @@ def build_envelope(
     busy: bool | None = None,
     waited_seconds: float = 0.0,
     replayed: bool = False,
+    holder: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the 23-field sender-visible envelope for a durable record.
+    """Build the 24-field sender-visible envelope for a durable record.
 
     ``busy`` defaults to what the record's own ``status_detail`` asserts, so a
     replayed envelope cannot contradict the cause it prints (VERIFICATION D7)
     and a receipt for a free-slot backlog never claims the slot was held (D2).
+    ``holder`` is the OBSERVED holder of a held slot — a call-time observation like
+    ``waited_seconds``, never persisted (§2) and never part of ``status_detail``, which
+    ``busy_from_detail`` derives ``busy`` from by equality. Unknown ⇒ ``None``, never ``{}``.
     """
     status = record.get("status") or STATUS_QUEUED
     if busy is None:
@@ -1323,6 +1330,7 @@ def build_envelope(
         ),
         "detail": detail,
         "at": int(time.time()),
+        "holder": holder or None,
     }
     return {field: envelope[field] for field in ENVELOPE_FIELDS}
 
@@ -1333,11 +1341,16 @@ def build_receipt(
     busy: bool | None = None,
     replayed: bool = False,
     waited_seconds: float | None = None,
+    holder: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The acceptance receipt for a queued delivery (``result: receipt``).
 
     ``busy`` is the OBSERVED slot state (VERIFICATION D2): a receipt handed out
-    while the target's turn slot is free must not report it as held.
+    while the target's turn slot is free must not report it as held. ``holder`` is the
+    OBSERVED holder of a held slot (§2): it rides the envelope's ``holder`` field AND a
+    fragment appended at the END of the human ``detail``, because the Desktop forwards only
+    ``data.reason`` and the refusal TEXT — the text is the channel that reaches a sender.
+    An unknown holder appends nothing, so every live substring survives verbatim.
     """
     waited = receipt_after_seconds() if waited_seconds is None else waited_seconds
     envelope = build_envelope(
@@ -1346,9 +1359,18 @@ def build_receipt(
         busy=busy,
         waited_seconds=waited,
         replayed=replayed,
+        holder=holder,
     )
     envelope["result"] = RESULT_RECEIPT
     envelope["detail"] = build_notification_text(record)
+    if holder:
+        # Lazy: tools.bot_relay imports this module at module level (a top-level back-import
+        # would be a cycle), and the wording lives there so receipt and refusal cannot drift.
+        from tools.bot_relay import holder_fragment
+
+        fragment = holder_fragment(holder)
+        if fragment:
+            envelope["detail"] = f"{envelope['detail']} — {fragment}" if envelope["detail"] else fragment
     if record.get("status") != STATUS_RUNNING:
         envelope["attempts"] = 0
     return envelope

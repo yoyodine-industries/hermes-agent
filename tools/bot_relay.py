@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import sys
 import time
 import uuid
@@ -628,6 +629,184 @@ def delivery_env(author: Optional[dict], profile_home: str | Path | None = None)
 # (§2.5 step 1): a held lock raises at once and the delivery is handed to the receiver queue, which re-offers
 # it when the turn slot frees. ``bot_mode.turn_wait_seconds`` stays the budget for callers that take the
 # lock without their own timeout.
+# The holder publishes WHO it is into its own lockfile while it holds the turn (t_4a32d803 SEV1 residual,
+# t_f93b2489). flock alone leaves the file empty, so a wedged profile could not be attributed to a process:
+# every waiter got a bare "another delivery turn is already running", the operator had no pid to reclaim,
+# and the routable seat could stay dead for hours with nothing naming the culprit. The record is advisory —
+# a waiter that cannot read it (empty, torn, written by an older build) reports the holder as UNKNOWN, never
+# as an error, and the flock stays the single authority for who holds the turn.
+TURN_LOCK_HOLDER_MAX_BYTES = 4096
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        parsed = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and abs(parsed) != float("inf") else None
+
+
+def _format_holder_age(seconds: Any) -> str:
+    """Compact age for a refusal line: ``42s`` / ``4m 12s`` / ``2h 07m``."""
+    try:
+        total = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "?"
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m {total % 60:02d}s"
+    return f"{total // 3600}h {(total % 3600) // 60:02d}m"
+
+
+def _pid_alive(pid: Any) -> Optional[bool]:
+    """Liveness of ``pid``: True/False, or None when the OS refuses the probe (unknown ≠ dead).
+
+    ``OverflowError`` matters as much as an OSError here: a torn lockfile can carry a pid outside
+    the host's ``pid_t`` range, and the advisory probe must report that as *unknown* rather than
+    letting it escape a read that is contracted never to raise.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists, owned by someone else
+        return True
+    except (OSError, OverflowError):
+        return None
+    return True
+
+
+def publish_turn_lock_holder(fd: int, profile: str) -> None:
+    """Publish this process as ``profile``'s turn holder, in place on the flocked fd.
+
+    Written through the SAME fd that holds the lock — a rename would swap the inode out from under the
+    flock and let the next waiter acquire a second, unrelated lock. Best-effort: an unwritable lockfile
+    costs the refusal its pid, never the turn its lock.
+    """
+    record = {
+        "pid": os.getpid(), "ppid": os.getppid(), "profile": str(profile or ""),
+        "started_at": time.time(), "host": socket.gethostname(),
+    }
+    payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")[:TURN_LOCK_HOLDER_MAX_BYTES]
+    try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload)
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - a vanished/full lockfile
+        logger.debug("turn lock: could not publish the holder record", exc_info=True)
+
+
+def clear_turn_lock_holder(fd: int) -> None:
+    """Drop the holder record at the end of the turn window; the flock is what actually gates."""
+    with contextlib.suppress(OSError):
+        os.ftruncate(fd, 0)
+        os.fsync(fd)
+
+
+def read_turn_lock_holder(root: Path | str, profile: str) -> Optional[dict]:
+    """The holder a live turn published for ``profile``, or None when absent/unreadable.
+
+    Never raises and never trusts the record: it is a claim written by another process, so a waiter uses
+    it to NAME the holder, never to acquire the turn. ``alive`` is probed here rather than trusted from it.
+    An absent, empty, torn or pid-less record is UNKNOWN (None) — never an error — and the projection keeps
+    only the documented keys, non-empty, so a stray field in a stale lockfile cannot reach a wire payload.
+    """
+    try:
+        raw = turn_lock_path(root, profile).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    pid = _int_or_none(record.get("pid"))
+    if pid is None or pid <= 0:
+        return None
+    started = _float_or_none(record.get("started_at"))
+    fields = (
+        ("kind", "turn_lock"),
+        ("pid", pid),
+        ("ppid", _int_or_none(record.get("ppid"))),
+        ("profile", str(record.get("profile") or "").strip() or None),
+        ("host", str(record.get("host") or "").strip() or None),
+        ("started_at", started),
+        ("age_seconds", (round(max(0.0, time.time() - started), 3) if started is not None else None)),
+        ("alive", _pid_alive(pid)),
+    )
+    return {key: value for key, value in fields if value is not None}
+
+
+def holder_from_live_owner(entry: Mapping[str, Any], *, now: Optional[float] = None) -> Optional[dict]:
+    """The ``live_owner`` holder a live-owner registry entry describes; None when it names nobody.
+
+    The fields are read straight off the entry the caller already holds (``surface``, ``session_id``,
+    ``started_at``, ``pid``) — the same entry ``hermes_cli.active_sessions`` prints in its owner
+    refusals, so this wording and that one cannot drift. No new plumbing into that registry.
+    """
+    if not entry:
+        return None
+    surface = str(entry.get("surface") or "").strip()
+    session_id = str(entry.get("session_id") or "").strip()
+    if not surface and not session_id:
+        return None
+    started = _float_or_none(entry.get("started_at"))
+    moments = time.time() if now is None else float(now)
+    fields = (
+        ("kind", "live_owner"),
+        ("surface", surface or None),
+        ("session_id", session_id or None),
+        ("pid", _int_or_none(entry.get("pid"))),
+        ("started_at", started),
+        ("age_seconds", (round(max(0.0, moments - started), 3) if started is not None else None)),
+        ("alive", True),
+    )
+    return {key: value for key, value in fields if value is not None}
+
+
+def holder_fragment(holder: Optional[Mapping[str, Any]]) -> str:
+    """The human fragment naming a slot's holder; ``""`` when the holder is unknown (§2).
+
+    ONE wording source for every surface that names a holder: the delivery receipt's ``detail``, the
+    :class:`TurnBusyError` message and the gateway refusal all append this. An unknown holder (None, an
+    empty dict, a record with no pid) yields ``""`` — the caller then appends nothing, so an unreadable
+    lockfile can never invent a holder.
+    """
+    if not holder:
+        return ""
+    if str(holder.get("kind") or "turn_lock") == "live_owner":
+        surface = str(holder.get("surface") or "").strip() or "another surface"
+        session_id = str(holder.get("session_id") or "").strip()
+        who = f"seat held live by {surface}" + (f" (session {session_id})" if session_id else "")
+        age = holder.get("age_seconds")
+        return who if age is None else f"{who} for {_format_holder_age(age)}"
+    pid = holder.get("pid")
+    if not pid:
+        return ""
+    if holder.get("alive") is False:
+        return f"held by pid {pid}, no longer running"
+    age = holder.get("age_seconds")
+    return f"held by pid {pid}" if age is None else f"held by pid {pid} for {_format_holder_age(age)}"
+
+
 class TurnBusyError(RuntimeError):
     """A delivery turn is already running for the target profile (``waited_seconds`` ≈ time queued).
 
@@ -635,6 +814,9 @@ class TurnBusyError(RuntimeError):
     roughly how long the caller queued behind the current turn before the delivery was handed to the
     receiver queue. This is no longer a failure: the delivery is durably queued and the drainer re-offers
     it, so the sender gets a receipt (``attempts`` 0, ``busy`` true) and must NOT resend (§3.1).
+    ``holder`` — when the lockfile carries one — names the process that did not finish (pid, start, age,
+    liveness), so the sender (and an operator) can route around it without touching the seat. Unknown
+    holder ⇒ the message is byte-identical to the pre-holder refusal.
     """
 
     reason = "target_busy"
@@ -642,12 +824,29 @@ class TurnBusyError(RuntimeError):
     #: stamps, so a sender that greps for ``target_busy`` still finds it there, never as a reason.
     status_detail = STATUS_DETAIL_TARGET_BUSY
 
-    def __init__(self, profile: str, waited_seconds: float):
+    def __init__(self, profile: str, waited_seconds: float, holder: Optional[dict] = None):
         self.profile, self.waited_seconds = profile, waited_seconds
+        self.holder = holder or None
+        fragment = holder_fragment(self.holder)
         super().__init__(f"target_busy: another delivery turn is already running for profile '{profile}' — "
                          f"queued behind it for ~{int(round(waited_seconds))}s. The delivery is durably "
                          "queued; the receiver re-offers it when the turn slot frees "
-                         f"(status_detail: '{STATUS_DETAIL_TARGET_BUSY}'). Do not resend.")
+                         f"(status_detail: '{STATUS_DETAIL_TARGET_BUSY}'). Do not resend."
+                         + (f" — {fragment}" if fragment else ""))
+
+    def holder_payload(self) -> dict:
+        """The holder as machine-readable data for a receipt/refusal; ``{}`` when the holder is unknown.
+
+        Non-empty keys only, and a record that names no pid (a torn or foreign lockfile) is unknown too:
+        it must reach the sender as ``holder: null``, never as an empty object. Never raises — an
+        unreadable lockfile is *unknown*, not an error.
+        """
+        if not self.holder:
+            return {}
+        if str(self.holder.get("kind") or "turn_lock") == "turn_lock" and not self.holder.get("pid"):
+            return {}
+        return {key: value for key, value in self.holder.items() if value is not None}
+
 
 
 def acquire_delivery_turn_lock(root: Path | str, profile: str) -> Iterator[Path]:
@@ -678,7 +877,8 @@ def turn_lock_path(root: Path | str, profile: str) -> Path:
 def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | None = None) -> Iterator[Path]:
     """Hold ``profile``'s cross-process turn lock for the ``with`` body: non-blocking
     flock probe + short-sleep retry up to the budget (``bot_mode.turn_wait_seconds``
-    unless ``timeout_seconds``); raises :class:`TurnBusyError` when exhausted. No
+    unless ``timeout_seconds``); raises :class:`TurnBusyError` when exhausted — naming
+    the holder and its age when the lockfile carries a holder record. No
     ordering among waiters, but every waiter is bounded. Without ``fcntl`` (Windows)
     the lock is a no-op — those installs never had this race path."""
     try:
@@ -702,11 +902,20 @@ def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | N
             except OSError:
                 now = time.monotonic()
                 if now >= deadline:
-                    raise TurnBusyError(profile, now - start)
+                    holder = read_turn_lock_holder(root, profile)
+                    # One line per refusal: a seat held past the budget is the signal (t_9acf5894 item 3)
+                    # and it must name the holder, or nothing downstream can route around it.
+                    logger.warning("bot turn lock busy: profile=%s waited=%.0fs holder=%s",
+                                   profile, now - start,
+                                   (f"pid {holder['pid']} age={_format_holder_age(holder.get('age_seconds'))}"
+                                    f" alive={holder.get('alive')}") if holder else "unknown")
+                    raise TurnBusyError(profile, now - start, holder)
                 time.sleep(min(0.1, max(0.005, deadline - now)))
+        publish_turn_lock_holder(fd, profile)
         try:
             yield path
         finally:
+            clear_turn_lock_holder(fd)
             with contextlib.suppress(OSError):  # kernel releases on close anyway
                 fcntl.flock(fd, fcntl.LOCK_UN)
     finally:

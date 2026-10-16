@@ -1170,6 +1170,23 @@ def _run_route_delegate(name: str):
     return _handler
 
 
+def _observed_turn_lock_holder(home: Any, profile: str) -> Optional[dict]:
+    """The current holder of ``profile``'s turn slot, as the §2 holder observation.
+
+    The slot this receipt reports as busy is held by a NON-queue holder as often as by a queued
+    delivery (a desktop or card session mid-turn takes the same relay lock), and the lockfile's own
+    published record is the only authority for who that is. Additive and best-effort: an
+    absent/unreadable record is *unknown* (None), never an error, so a receipt is never lost to it.
+    """
+    try:
+        from tools.bot_mode_probe import _hermes_root
+        from tools.bot_relay import read_turn_lock_holder
+
+        return read_turn_lock_holder(_hermes_root(Path(home)), profile)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -3577,6 +3594,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from tools import bot_delivery_queue as delivery_queue
 
         observed = delivery_queue.STATUS_DETAIL_TARGET_BUSY
+        holder: Optional[dict] = None
         if record.get("status") == delivery_queue.STATUS_QUEUED:
             # Report the slot state OBSERVED here, not the one assumed on admission
             # (VERIFICATION D2). With the slot free the honest cause is "queued
@@ -3588,10 +3606,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             observed = delivery_queue.observed_detail(home, target_profile)
             record = delivery_queue.mark_contended(
                 home, delivery_id, status_detail=observed) or record
+            if observed == delivery_queue.STATUS_DETAIL_TARGET_BUSY:
+                # A held slot names its holder (§2): the sender reads the receipt's `detail`, so
+                # without it the fleet's dominant delivery surface reports "busy" and nobody.
+                holder = _observed_turn_lock_holder(home, target_profile)
         envelope = delivery_queue.build_receipt(
             record,
             busy=observed == delivery_queue.STATUS_DETAIL_TARGET_BUSY,
-            waited_seconds=waited)
+            waited_seconds=waited,
+            holder=holder)
         self._bot_send_record_status(delivery_id, record,
                                      result=delivery_queue.RESULT_RECEIPT)
         return self._bot_send_json(envelope)

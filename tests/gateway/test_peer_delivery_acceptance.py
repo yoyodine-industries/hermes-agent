@@ -209,7 +209,12 @@ def test_busy_receipt_no_retry_loop_and_same_key_exactly_once(
     assert first["reply"] is None
     assert first["queue_position"] == 1
     assert first["status_detail"] == q.STATUS_DETAIL_TARGET_BUSY
-    assert first["detail"] == q.DETAIL_RECEIPT
+    # The receipt names the holder of the busy slot (§2): the live text survives verbatim and the
+    # fragment rides at the END, so a sender reading `detail` learns WHO holds the seat.
+    assert first["detail"].startswith(q.DETAIL_RECEIPT)
+    assert f" — held by pid {os.getpid()}" in first["detail"]
+    assert first["holder"]["kind"] == "turn_lock" and first["holder"]["pid"] == os.getpid()
+    assert list(first) == list(q.ENVELOPE_FIELDS)
     assert adapter.calls == [], "the held slot must not run the payload in-call"
 
     delivery_id = first["delivery_id"]

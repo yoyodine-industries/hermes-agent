@@ -75,9 +75,12 @@ def test_failure_reason_vocabulary_adds_only_queue_full():
 
 
 def test_field_counts():
-    assert len(q.ENVELOPE_FIELDS) == 23
+    # 24 since t_f93b2489: `holder` (the call-time holder observation) is appended LAST, so
+    # every existing envelope field keeps its index and "no extras" stays true by construction.
+    assert len(q.ENVELOPE_FIELDS) == 24
     assert q.ENVELOPE_FIELDS[0] == "object"
-    assert len(q.RECORD_FIELDS) == 20
+    assert q.ENVELOPE_FIELDS[-1] == "holder"
+    assert len(q.RECORD_FIELDS) == 20  # the DURABLE record is untouched: holder is never persisted
 
 
 # ---------------------------------------------------------------- enqueue

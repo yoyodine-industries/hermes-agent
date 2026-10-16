@@ -150,7 +150,8 @@ def test_wait_header_parsing(adapter):
 
 def test_free_target_delivers_in_call_and_settles_the_record(adapter, home):
     body = _send(adapter)
-    assert list(body.keys()) == list(q.ENVELOPE_FIELDS)  # 23 fields, §1.3 order
+    assert list(body.keys()) == list(q.ENVELOPE_FIELDS)  # 24 fields, §1.3 order
+    assert body["holder"] is None, "a free target names no holder — unknown, never {}"
     assert body["object"] == q.OBJECT_NAME
     assert body["result"] == "delivered"
     assert body["status"] == "delivered"
@@ -195,7 +196,14 @@ def test_locked_target_returns_an_acceptance_receipt(adapter, home):
     assert body["attempts"] == 0
     assert body["queue_position"] == 1
     assert body["status_detail"] == q.STATUS_DETAIL_TARGET_BUSY
-    assert body["detail"] == q.DETAIL_RECEIPT
+    # The receipt names the holder (§2): the live substring survives verbatim and the fragment is
+    # appended at the END, because the sender agent reads this `detail` and nothing else.
+    assert body["detail"].startswith(q.DETAIL_RECEIPT)
+    assert f" — held by pid {os.getpid()}" in body["detail"], body["detail"]
+    assert body["holder"]["kind"] == "turn_lock"
+    assert body["holder"]["pid"] == os.getpid()
+    assert body["holder"]["alive"] is True
+    assert body["holder"]["age_seconds"] is not None
     assert 0 < body["queued_seconds"] < 1
     assert body["reply"] is None
     assert adapter.calls == [], "no turn may start while the slot is held"
@@ -358,9 +366,18 @@ def test_a_live_delivery_id_answers_a_peer_status_poll(adapter, home):
 
 # ── envelope contract + ambiguous recovery (§1.3, §4.9) ──────────────────────
 
-def test_gateway_envelope_is_twenty_three_fields_in_spec_order(adapter, home):
-    """§1.3: every sender-visible envelope is the same 23 fields, in the same order."""
-    assert len(q.ENVELOPE_FIELDS) == 23
+def test_gateway_envelope_is_twenty_four_fields_in_spec_order(adapter, home):
+    """§1.3: every sender-visible envelope is the same 24 fields, in the same order.
+
+    The 24th (``holder``) was appended LAST (t_f93b2489): the first 23 are byte-for-byte the
+    frozen §1.3 tuple, so this is a schema DELTA of exactly one trailing additive field.
+    """
+    assert len(q.ENVELOPE_FIELDS) == 24
+    assert tuple(q.ENVELOPE_FIELDS[:23]) == (
+        "object", "result", "status", "status_detail", "send_id", "delivery_id",
+        "idempotency_key", "replayed", "peer", "profile", "session_id", "queue_position",
+        "attempts", "queued_seconds", "waited_seconds", "busy", "retryable",
+        "retry_after_seconds", "reply", "error", "reason", "detail", "at")
     delivered = _send(adapter)
     assert list(delivered) == list(q.ENVELOPE_FIELDS)
     assert "reoffer_count" not in delivered and "send_id" in delivered
@@ -371,6 +388,10 @@ def test_gateway_envelope_is_twenty_three_fields_in_spec_order(adapter, home):
     assert list(receipt) == list(q.ENVELOPE_FIELDS)
     assert receipt["busy"] is True and receipt["attempts"] == 0
     assert receipt["status_detail"] == q.STATUS_DETAIL_TARGET_BUSY
+    # Held ⇒ the slot's holder rides the receipt; free ⇒ None (never {}). Both directions are
+    # asserted here so the field cannot silently become always-on.
+    assert receipt["holder"]["pid"] == os.getpid()
+    assert delivered["holder"] is None
 
 
 def _make_ambiguous(home, delivery_id):

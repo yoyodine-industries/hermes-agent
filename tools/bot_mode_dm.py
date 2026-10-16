@@ -423,13 +423,53 @@ def _delivery_turn_env(base: Optional[dict] = None) -> dict:
     return {**(os.environ if base is None else base), DELIVERY_TURN_ENV: "1"}
 
 
+def _turn_busy_holder(exc: BaseException) -> Optional[dict]:
+    """The holder the busy slot's exception carries, or None when it names nobody (§3).
+
+    Guarded by construction: an exception without ``holder_payload`` (or one whose payload is
+    empty) yields None — the receipt then prints ``holder: null`` and no text fragment, exactly
+    as it did before the holder existed. A failed probe is *unknown*, never an error.
+    """
+    payload = getattr(exc, "holder_payload", None)
+    if not callable(payload):
+        return None
+    try:
+        holder = payload()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return holder if isinstance(holder, dict) and holder else None
+
+
+def _live_owner_holder(argv: list[str]) -> Optional[dict]:
+    """The live owner holding this target's Bot Chat, as a holder observation (§4).
+
+    Read off the SAME registry entry the owner refusals name (``find_canonical_owner``:
+    ``surface``/``session_id``/``started_at``/``pid``) — no new plumbing into
+    ``hermes_cli.active_sessions``. Best-effort by contract: an unresolvable home or a lookup
+    that fails is *unknown* (None), never an error, so the receipt is never lost to it.
+    """
+    try:
+        from tools.bot_live_delivery import find_canonical_owner
+
+        home = _local_delivery_home(argv)
+        if home is None:
+            return None
+        from tools.bot_relay import holder_from_live_owner
+
+        return holder_from_live_owner(find_canonical_owner(home) or {})
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def _delivery_receipt(delivery_id: str, profile: str, *, status_detail: str,
-                      waited_seconds: float = 0.0) -> dict:
+                      waited_seconds: float = 0.0, holder: Optional[dict] = None) -> dict:
     """The sender-visible receipt for a delivery that was RETAINED instead of failing (§3.1).
 
     The record is synthesized — the receiver's durable queue owns the real row — so this
     reports only what is true here: status ``queued``, ``attempts`` 0, ``busy`` true, and
-    ``result`` "receipt". Exactly the §1.3 envelope fields, no extras.
+    ``result`` "receipt". Exactly the §1.3 envelope fields (24 including the appended
+    ``holder``), no extras. ``holder`` is the call-time holder observation (§2): it is never
+    persisted and never rewritten into ``status_detail``.
     """
     from tools import bot_delivery_queue as delivery_queue
 
@@ -441,7 +481,7 @@ def _delivery_receipt(delivery_id: str, profile: str, *, status_detail: str,
         "attempts": 0,
         "created_at": time.time_ns(),
     }
-    return delivery_queue.build_receipt(record, waited_seconds=waited_seconds)
+    return delivery_queue.build_receipt(record, waited_seconds=waited_seconds, holder=holder)
 
 
 def _delivery_lock(argv: list[str], *, stdin_file: bool):
@@ -507,7 +547,7 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
 
         print(json.dumps(_delivery_receipt(
             _delivery_fingerprint(dm_file), _delivery_target(argv),
-            status_detail=STATUS_DETAIL_LIVE_OWNER)))
+            status_detail=STATUS_DETAIL_LIVE_OWNER, holder=_live_owner_holder(argv))))
         return 0
     # Re-emit the transport's streams: stdout is the reply text the
     # completion notification carries back to the sending agent. A successful bare
@@ -956,6 +996,7 @@ def _delivery_main(args: list[str]) -> int:
                 _delivery_fingerprint(args[2]), _delivery_target(argv),
                 status_detail=STATUS_DETAIL_TARGET_BUSY,
                 waited_seconds=float(getattr(exc, "waited_seconds", 0.0) or 0.0),
+                holder=_turn_busy_holder(exc),
             )))
             return 0
         # Every refusal ships a typed reason on stdout so the completion notification carries it
