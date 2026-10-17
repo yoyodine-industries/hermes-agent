@@ -25,6 +25,13 @@ def test_maintenance_steps_renew_the_armed_watchdog_lease(tmp_path, monkeypatch)
         monkeypatch.setattr(db, "_freelist_ratio", lambda: 1.0)
         monkeypatch.setattr(db, "vacuum", lambda: None)
         monkeypatch.setattr(db, "archive_stale_sessions", lambda *a, **kw: 0)
+        # The VACUUM step (and its lease renewal) is admitted only when no other process holds
+        # the store.  Prove that here rather than leaving it to the environment: the foreign
+        # scan reads the REAL home and trips this suite's own I/O guard on a worker session's
+        # kanban log, which would silently drop the last renewal from the count below.
+        monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", lambda path: [])
+        monkeypatch.setattr("hermes_state_holders.in_process_state_db_holders",
+                            lambda path, exclude=None: [])
         before = handle._lease_count
 
         db.maybe_auto_archive(idle_days=3, min_interval_hours=0)
@@ -32,9 +39,11 @@ def test_maintenance_steps_renew_the_armed_watchdog_lease(tmp_path, monkeypatch)
             retention_days=90, min_interval_hours=0, vacuum=True, min_vacuum_interval_days=0,
         )
 
-        # One renewal per long step (archive, prune, sweep, vacuum), the last one
-        # taken right before VACUUM so a multi-minute rewrite never outlives the clamp.
-        assert handle._lease_count - before == 4
+        # One renewal per long step (archive, prune, message-retention archive prune, orphan
+        # sweep, orphan-message reap, FTS merge, vacuum), the last one taken right before VACUUM
+        # so a multi-minute rewrite never outlives the clamp. The message-retention step renews
+        # per chunk — this store has one chunk's worth of work plus the drained discovery.
+        assert handle._lease_count - before == 7
         assert handle._lease_phase == "state_db_auto_vacuum"
         assert handle._lease_until > time.monotonic()
     finally:
