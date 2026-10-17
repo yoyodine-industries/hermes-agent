@@ -108,23 +108,33 @@ def test_unknown_slug_warns_and_is_ignored(kanban_home, caplog):
 
 def test_invalid_values_and_slugs_are_ignored(kanban_home, caplog):
     kb.create_board("ops")
+    kb.create_board("research")
+    kb.create_board("virgo")
+    kb.create_board("libra")
     with caplog.at_level("WARNING"):
         settings = kwd._resolve_dispatcher_settings(
             {
                 "max_spawn": 8,
                 "max_spawn_by_board": {
-                    "ops": "lots",     # not an int
-                    "defcon": 0,       # below 1
-                    "research": -4,    # below 1
-                    "": 5,             # empty slug
-                    "ghost": None,     # not an int (and unknown)
-                    "ops2": 3,         # unknown + valid -> also ignored
+                    "ops": "lots",          # not an int
+                    "defcon": 0,            # below 1
+                    "research": 2.5,        # non-integral float: a typo, never truncated to 2
+                    "virgo": float("inf"),  # non-finite float: must never reach int()
+                    "libra": True,          # a bool is not a ceiling (int subclass)
+                    "": 5,                  # empty slug
+                    "ghost": None,          # not an int (and unknown)
+                    "ops2": 3,              # unknown + valid -> also ignored
                 },
             },
             kb,
         )
     assert dict(settings.max_spawn_by_board) == {}
     assert settings.max_spawn_for_board("ops") == 8
+    for slug, value in (("research", 2.5), ("virgo", float("inf")), ("libra", True)):
+        assert any(
+            repr(slug) in r.getMessage() and repr(value) in r.getMessage()
+            for r in caplog.records
+        ), f"no warning naming {slug}={value!r}"
 
 
 def test_non_mapping_is_ignored(kanban_home, caplog):

@@ -139,11 +139,14 @@ def _parse_max_spawn_by_board(kanban_cfg: dict, kb: Any) -> dict:
     """Parse ``kanban.max_spawn_by_board``: board slug -> positive-int ceiling.
 
     Boards not named keep the global ``kanban.max_spawn``, so this map is purely
-    additive. A non-mapping value, a value below 1, and a slug that names no
-    board in the inventory are each IGNORED with a warning — a typo must be
-    visible, never fatal and never silently ineffective. An unreadable board
-    inventory leaves the map as configured: an entry for a board nothing serves
-    simply never matches, so a read failure can never drop a real ceiling.
+    additive. A non-mapping value, a value that is not a positive integer — a
+    non-integral float such as ``2.5`` included, never truncated, and a
+    non-finite ``.inf``, which must never reach ``int()`` — a value below 1, and
+    a slug that names no board in the inventory are each IGNORED with a warning:
+    a typo must be visible, never fatal and never silently ineffective. An
+    unreadable board inventory leaves the map as configured: an entry for a board
+    nothing serves simply never matches, so a read failure can never drop a real
+    ceiling.
     """
     raw = kanban_cfg.get("max_spawn_by_board")
     if raw is None:
@@ -164,9 +167,19 @@ def _parse_max_spawn_by_board(kanban_cfg: dict, kb: Any) -> dict:
     parsed: dict[str, int] = {}
     for slug, value in raw.items():
         key = str(slug).strip()
+        # A ceiling is a positive integer. A non-integral float (2.5) is a typo and
+        # must never be truncated into a different, dispatch-governing cap; a
+        # non-finite float (.inf/.nan) must never reach int() at all — that raises
+        # OverflowError out of config resolution. A bool is an int subclass but not
+        # a ceiling. All three are invalid, like any other unusable value.
+        if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.max_spawn_by_board[%r]=%r; ignoring", slug, value
+            )
+            continue
         try:
             ceiling = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             logger.warning(
                 "kanban dispatcher: invalid kanban.max_spawn_by_board[%r]=%r; ignoring", slug, value
             )
