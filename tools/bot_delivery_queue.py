@@ -146,6 +146,12 @@ RECORD_FIELDS = (
 
 # --- exact user-facing strings (§3.4); asserted verbatim by the tests.
 DETAIL_RECEIPT = "accepted and queued — do NOT resend; receipt is retained"
+#: The acceptance notice for a delivery queued behind a full AGENT-WORK cap (t_376b3fbd):
+#: names the cause, so the sender does not read a saturated gateway as a busy target.
+DETAIL_ADMISSION_CAP = (
+    "accepted and queued — the gateway's agent-work concurrency cap is full; "
+    "the turn runs when a slot frees. Do NOT resend; receipt is retained"
+)
 DETAIL_HELD_LIVE = (
     "Delivery remains pending or its outcome is unknown. "
     "Do not resend; receipt is retained."
@@ -158,6 +164,14 @@ STATUS_DETAIL_QUEUE_FULL = "queue_full"
 #: TARGET_BUSY, and the one a receipt must not misreport (VERIFICATION D2).
 STATUS_DETAIL_BACKLOG = (
     "target_free: turn slot free, delivery queued behind earlier deliveries"
+)
+#: A delivery ACCEPTED while the gateway's AGENT-WORK cap is full (t_376b3fbd): the turn
+#: waits for a concurrency slot, not for another turn to release the (free) target slot.
+#: A third cause, distinct from both TARGET_BUSY and BACKLOG: the receipt must not claim
+#: either, and the record is finished by the drainer, not by a resend.
+STATUS_DETAIL_ADMISSION_CAP = (
+    "admission_cap: gateway agent-work concurrency cap reached; "
+    "delivery queued for the drainer"
 )
 
 #: Which cap :func:`check_capacity`/:func:`admit` refused on (VERIFICATION D6).
@@ -365,6 +379,8 @@ def build_notification_text(record: dict[str, Any]) -> str:
     """Held-delivery notice for the target's live session (§3.5)."""
     if record.get("status_detail") == STATUS_DETAIL_LIVE_OWNER:
         return DETAIL_HELD_LIVE
+    if record.get("status_detail") == STATUS_DETAIL_ADMISSION_CAP:
+        return DETAIL_ADMISSION_CAP
     status = record.get("status")
     if status == STATUS_EXPIRED:
         return expired_detail()

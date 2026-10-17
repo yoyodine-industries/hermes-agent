@@ -238,8 +238,27 @@ async def drain_once(
     budget = SWEEP_DRAIN_BUDGET_SECONDS if budget_seconds is None else budget_seconds
     deadline = time.monotonic() + budget
     drained = 0
+
+    def _gate_has_room() -> bool:
+        """Whether the AGENT-WORK cap allows one more turn to start (t_376b3fbd).
+
+        A delivery accepted while the cap was full waits for a SLOT, so the drainer asks the
+        same gate the 429 does. Without this an accepted record would be run anyway and the
+        cap would bound HTTP admission only, which is not what it is for.
+        """
+        gate = getattr(adapter, "_agent_gate_has_room", None)
+        if not callable(gate):
+            return True
+        try:
+            return bool(gate())
+        except Exception:  # noqa: BLE001 - an unreadable gate must not stop the drainer
+            return True
+
     for profile in delivery_queue.queued_target_profiles(home):
         while time.monotonic() < deadline:
+            if not _gate_has_room():
+                log_delivery_event("drain_deferred", None, target=profile, reason="agent_cap")
+                return drained
             try:
                 with acquire_turn_lock(root, profile, timeout_seconds=0):
                     record = delivery_queue.claim_next(
