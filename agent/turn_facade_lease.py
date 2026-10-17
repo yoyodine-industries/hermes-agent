@@ -486,7 +486,7 @@ def _lease_queue_dir(home) -> str:
     return os.path.join(str(home), "runtime", DELIVERY_DIR_NAME)
 
 
-def _lease_waiter_observation(db, session_id: str) -> Dict[str, Any]:
+def _lease_waiter_observation(db, session_id: str) -> dict[str, Any]:
     """Holder / queue depth for the admission receipt.
 
     Each accessor is probed with its own default, so a store that predates the waiter queue reports
@@ -511,7 +511,7 @@ def _lease_waiter_observation(db, session_id: str) -> Dict[str, Any]:
 
 def _lease_admission_result(
     agent, db, session_id: str, conversation_history, inbound_delivery, *, waited: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Early result for a turn that could not take the conversation's lease.
 
     A human turn keeps the fail-closed timeout: nothing is spooled on its behalf, so the caller must
@@ -570,18 +570,21 @@ def _drain_lease_queue(session_id: str, conversation_history):
     ``_LEASE_DRAIN_MAX_RECORDS`` records and ``_LEASE_DRAIN_MAX_BYTES`` of bodies - and everything
     that does not fit stays queued, in order, for the next turn. Any unexpected failure leaves the
     transcript untouched — a turn admitted normally must not die because of what is in the spool.
+    When nothing is drained the caller's OWN transcript object comes back, not a copy: the
+    admission reports it as the turn's history and downstream identity checks compare objects.
     """
+    unchanged = conversation_history if conversation_history is not None else []
     history = list(conversation_history or [])
     if not session_id:
-        return history, []
+        return unchanged, []
     try:
         home = _lease_queue_home()
         if not os.path.isdir(_lease_queue_dir(home)):
-            return history, []
+            return unchanged, []
         from tools.bot_live_delivery import claim_lease_delivery, complete_lease_delivery
 
-        bodies: List[str] = []
-        drained: List[str] = []
+        bodies: list[str] = []
+        drained: list[str] = []
         claims = 0
         spent = 0
         while claims < _LEASE_DRAIN_MAX_RECORDS:
@@ -612,7 +615,7 @@ def _drain_lease_queue(session_id: str, conversation_history):
                     "Queued delivery %s drained but not settled", delivery_id, exc_info=True,
                 )
         if not bodies:
-            return history, drained
+            return unchanged, drained
         text = "\n\n".join(bodies)
         if history and history[-1].get("role") == "user":
             merged = dict(history[-1])
@@ -626,7 +629,7 @@ def _drain_lease_queue(session_id: str, conversation_history):
         return history, drained
     except Exception:
         logger.warning("Could not drain queued deliveries for %s", session_id, exc_info=True)
-        return list(conversation_history or []), []
+        return unchanged, []
 
 
 def _lease_not_acquired_result(agent, session_id: str, conversation_history, *, waited: bool) -> dict[str, Any]:
