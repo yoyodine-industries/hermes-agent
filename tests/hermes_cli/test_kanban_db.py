@@ -1665,8 +1665,56 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
     for resolved in ([sys.executable, "-m", "hermes_cli.main"], ["/opt/hermes/bin/hermes"]):
         monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda resolved=resolved: resolved)
         kbd._default_spawn(task, str(tmp_path / "ws"))
-        assert captured["cmd"][-3:] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+        assert captured["cmd"][-4:] == [
+            sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client",
+        ]
         assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
+
+
+def test_worker_argv_keeps_the_workspace_off_sys_path(tmp_path):
+    """A worker whose workspace IS a worktree of this repo must still boot the install.
+
+    Cards that change Hermes are anchored on a worktree of the repository,
+    which carries its own ``hermes_cli/`` and ``pm/``. The module child ran with
+    ``cwd`` = the workspace, so cwd came first on ``sys.path``, the child
+    imported the worktree copy, resolved the project root to the worktree,
+    found no committed dependency environment under that install key and exited
+    1 at boot — every retry, leaving the card ``ready`` looking unattended. The
+    install root travels on ``PYTHONPATH`` instead, so ``-P`` costs nothing.
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    workspace = tmp_path / "ws"
+    (workspace / "hermes_cli").mkdir(parents=True)
+    (workspace / "hermes_cli" / "__init__.py").write_text(
+        "raise ImportError('imported the worktree copy of the install')\n",
+        encoding="utf-8",
+    )
+    root = str(Path(kbd.__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": root}
+
+    argv = kbd._worker_argv(
+        kb.Task(
+            id="t_argv", title="x", body=None, assignee="coder", status="ready",
+            priority=0, created_by=None, created_at=0, started_at=None, completed_at=None,
+            workspace_kind="worktree", workspace_path=str(workspace), claim_lock=None,
+            claim_expires=None, tenant=None, branch_name=None,
+        ),
+        "",
+        None,
+    )
+    r = subprocess.run(
+        argv + ["--help"], cwd=workspace, env=env,
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert "worktree copy" not in (r.stdout + r.stderr), (
+        f"the worker imported the workspace's copy of the install: {r.stderr[:400]!r}"
+    )
+    assert argv[1] == "-P", f"the worker vector no longer drops cwd: {argv}"
 
 
 # ---------------------------------------------------------------------------
