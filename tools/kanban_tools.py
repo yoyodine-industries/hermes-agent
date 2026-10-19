@@ -16,12 +16,14 @@ from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_cli import kanban_cross_close as kb_cross_close
 from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+    KANBAN_CLOSE_SIBLING_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
@@ -1288,6 +1290,29 @@ def _handle_link(args: dict, **kw) -> str:
                    **({"gated_by": parent_id} if gated else {}))
 
 
+@_kanban_handler("kanban_close_sibling")
+def _handle_close_sibling(args: dict, **kw) -> str:
+    """Close a SIBLING card as delegated work, through the kernel's own completion path.
+
+    The auditing end is the card THIS session owns (``_default_task_id(None)`` restores
+    the dispatcher-scoped env default), never a caller-supplied id: a prompt-injected
+    worker must not be able to attribute its close to someone else's card.
+    """
+    _reject_delegated_child_mutation("kanban_close_sibling")
+    sibling = args.get("sibling_task_id")
+    _check(sibling, "sibling_task_id is required: name the sibling card whose work this "
+                    "lane absorbed. Nothing was closed.")
+    caller = _default_task_id(None)
+    with _board(None) as (_kb, conn):
+        receipt = kb_cross_close.close_sibling(
+            conn, str(sibling),
+            caller_task_id=caller,
+            caller_run_id=_worker_run_id(caller) if caller else None,
+            summary=args.get("summary"), result=args.get("result"),
+        )
+        return _ok(**receipt)
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
@@ -1307,7 +1332,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_close_sibling", KANBAN_CLOSE_SIBLING_SCHEMA, _handle_close_sibling, "🤝"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

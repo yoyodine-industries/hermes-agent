@@ -312,6 +312,41 @@ KANBAN_HEARTBEAT_SCHEMA = _schema(
     [],
 )
 
+KANBAN_CLOSE_SIBLING_SCHEMA = {
+    "name": "kanban_close_sibling",
+    "description": (
+        "Close a SIBLING card on this board as DELEGATED work — the door for a lane LEAD "
+        "that absorbed a sibling's task (the fix landed in your branch, the card was "
+        "superseded, or it duplicates work you just did). The close rides the kernel's own "
+        "completion path, so every gate still applies: a sibling that declares an unlanded "
+        "PR is REFUSED by the landing-carrier clause, a live run is REFUSED by the claim "
+        "fence, and an already-done or archived card is refused as nothing to close. Your "
+        "own card cannot be closed here — use kanban_complete, which carries the "
+        "run-ownership proof. The stored result and the closing run's summary record that "
+        "the close was DELEGATED and name your card, a comment naming you is written on the "
+        "sibling, and the closed card's incomplete children are re-promoted to ready (a "
+        "child with another unfinished parent stays put and is reported gated)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "sibling_task_id": _prop("string", (
+                    "The SIBLING card to close — not your own (your own closes through "
+                    "kanban_complete) and not a card whose work is still owed."
+            )),
+            "summary": _prop("string", (
+                    "What the absorb means, in one line. Stored on the closing run after the "
+                    "delegation provenance, and written into the comment on the sibling."
+            )),
+            "result": _prop("string", (
+                    "Optional: the sibling card's `result` line. Defaults to `summary`; both "
+                    "carry the DELEGATED provenance and the caller's card id."
+            )),
+        },
+        "required": ["sibling_task_id"],
+    },
+}
+
 KANBAN_COMMENT_SCHEMA = _schema(
     "kanban_comment",
     (
