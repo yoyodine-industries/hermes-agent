@@ -89,6 +89,23 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Cooldown after a storage-locked (state-store contention) requeue before
+# re-spawning. Default 0 is DELIBERATE and is the contract's "immediately": the
+# reclaim pass already re-queued the card on this tick and the dispatcher's own
+# 60 s cadence is the spacing, so nothing is consumed and there is no hot loop.
+# The env override (``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS``) exists for
+# tests and for an operator who wants wider spacing around a known maintenance
+# window.
+#
+# Landed on the reconciled line (card t_3286715e) because committed
+# ``hermes_cli/kanban_db.py`` imports this name (config default for
+# ``_resolve_storage_locked_cooldown_seconds``) while the constant itself lived
+# only in the live install's UNCOMMITTED dispatch file: a fresh clone of either
+# line could not import ``hermes_cli.kanban_db`` at all. The consumer half of
+# the feature (the storage-locked plumbing in the dispatcher) is still owed by
+# its own card, t_ccfb92a1 -- this constant alone changes no behaviour.
+DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS = 0
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -1063,9 +1080,25 @@ def tick_deferral_reason(result: Optional[object]) -> Optional[str]:
     with a reason is loaded/guarded host behaviour doing the right thing — never a
     stall. ``None`` means "no spawn and nothing explains it", the only state worth
     watching.
+
+    The whole-tick REFUSALS are deferrals too, and they have to be named here or
+    moving to this tracker re-breaks the rulings that added them: a tick that
+    yielded on the content-skew gate (``tick_yielded``, ruling ``t_8fed34c8``) and
+    a board refused as not dispatch-enabled (``skipped_board_disabled``, card
+    ``t_17c9c847``) are deliberate, loud, self-recorded decisions. Counted as
+    unexplained no-ops, six of either with old work waiting accuse the healthy
+    gate itself. ``deferred_host_capped`` is the same class — the board drew no
+    share of this tick's free host slots, which its own field documents as "a
+    rotation, not a fault".
     """
     if result is None:
         return None
+    if getattr(result, "tick_yielded", ""):
+        return "tick_yielded"
+    if getattr(result, "skipped_board_disabled", False):
+        return "board_disabled"
+    if getattr(result, "deferred_host_capped", None):
+        return "host_cap_deferred"
     budget = getattr(result, "spawn_budget_blocked", None)
     if budget:
         return f"spawn_budget:{budget}"
@@ -1294,6 +1327,21 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def suppression_note(
+    board_results: Optional[Iterable[tuple[str, Optional[Any]]]] = None,
+) -> str:
+    """``" Last tick held back: <reasons>."`` for a warning line, or ``""``.
+
+    The live line's dispatcher-health warnings carry this annotation so an
+    operator reads WHY ready work was held back instead of a bare zero-spawn
+    count (rulings ``t_17c9c847`` / #111910). The prose lives here, beside the
+    messages it annotates, so both surfaces emit one vocabulary rather than
+    re-authoring the sentence at each call site.
+    """
+    held = describe_suppression([res for _slug, res in board_results or []])
+    return f" Last tick held back: {held}." if held else ""
 
 
 def stuck_ready_message(stats: dict) -> str:
@@ -4522,7 +4570,22 @@ def _apply_default_assignee(
     Mutating the row keeps board state honest: the task is legitimately owned
     by the default, not "unassigned but secretly routed". ``dry_run`` reports
     without writing. Returns False when the write failed.
+
+    A row whose stored skills no worker for the default can load is refused
+    here as well: the assign would hand the dispatcher a card that crash-loops
+    on ``Unknown skill(s)`` and auto-blocks with the reason visible only in a
+    worker log. ``kanban.default_assignee`` is a config value, so this attach is
+    the one with no operator in the loop to read a refusal — it is logged.
     """
+    row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    try:
+        _kb._refuse_unloadable_skills(row["skills"] if row is not None else None, assignee)
+    except ValueError as exc:
+        _kb._log.warning(
+            "kanban dispatch: not applying default_assignee=%r to task %s: %s",
+            assignee, task_id, exc,
+        )
+        return False
     if dry_run:
         return True
     try:
@@ -5033,9 +5096,7 @@ def _module_hermes_argv() -> list[str]:
     migrations). ``PYTHONPATH`` already carries the running install's root
     (``_propagate_module_import_root``), so nothing is lost.
     """
-    if sys.version_info >= (3, 11):
-        return [sys.executable, "-P", "-m", "hermes_cli.main"]
-    return [sys.executable, "-m", "hermes_cli.main"]
+    return [sys.executable, "-P", "-m", "hermes_cli.main"]
 
 
 def _is_module_hermes_argv(cmd: list[str]) -> bool:

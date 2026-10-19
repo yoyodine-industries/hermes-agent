@@ -661,6 +661,13 @@ def get_untrusted_project_skills_root() -> Optional[tuple[Path, int]]:
 # write artifacts into the user's checkout).
 _PROJECT_SCAN_SOURCE = "project-local"
 _PROJECT_QUARANTINE_CACHE: dict[str, bool] = {}  # skill_dir -> quarantined
+# The scan behind each verdict, kept so a quarantine report can say WHY a skill was excluded
+# without scanning it again (None = the fail-closed scan crash, which has no result).
+_PROJECT_SCAN_RESULTS: dict[str, Any] = {}  # skill_dir -> ScanResult | None
+# What the iteration chokepoint skipped, keyed by the project dir it walked. Rewritten on every
+# walk of a root, so a listing reports the current truth for the dirs it just read — a silently
+# excluded skill is a defect, and re-walking the tree to find it out would pay for a second scan.
+_PROJECT_QUARANTINE_SKIPS: dict[str, list[str]] = {}  # project_dir -> [skill_dir]
 
 
 def is_quarantined_project_skill(skill_md) -> bool:
@@ -674,6 +681,7 @@ def is_quarantined_project_skill(skill_md) -> bool:
         key = str(skill_dir)
     if key in _PROJECT_QUARANTINE_CACHE:
         return _PROJECT_QUARANTINE_CACHE[key]
+    result = None
     try:
         from tools.skills_guard import scan_skill_cached
         from hermes_constants import get_hermes_home
@@ -685,6 +693,7 @@ def is_quarantined_project_skill(skill_md) -> bool:
     except Exception:
         logger.warning("Project skill scan failed — quarantining (fail closed): %s", skill_dir, exc_info=True)
         quarantined = True
+    _PROJECT_SCAN_RESULTS[key] = result
     _PROJECT_QUARANTINE_CACHE[key] = quarantined
     return quarantined
 
@@ -692,8 +701,42 @@ def is_quarantined_project_skill(skill_md) -> bool:
 def iter_project_skill_files(project_dir: Path):
     """Yield non-quarantined SKILL.md files under a trusted project dir — the
     single iteration chokepoint for the project tier, so the quarantine cannot
-    be bypassed by a call site forgetting the check."""
-    yield from (p for p in iter_skill_index_files(project_dir, "SKILL.md") if not is_quarantined_project_skill(p))
+    be bypassed by a call site forgetting the check.
+
+    What it excludes is recorded for this root (``_PROJECT_QUARANTINE_SKIPS``), so a
+    listing can REPORT the quarantine rather than leave the user with a skill that is
+    on disk and simply never loads: ``get_quarantined_project_skills()``."""
+    root_key = str(project_dir)
+    skipped: list[str] = []
+    _PROJECT_QUARANTINE_SKIPS[root_key] = skipped
+    for skill_md in iter_skill_index_files(project_dir, "SKILL.md"):
+        if is_quarantined_project_skill(skill_md):
+            skipped.append(str(_resolved_dir(skill_md)))
+        else:
+            yield skill_md
+
+
+def _resolved_dir(skill_md) -> Path:
+    d = Path(skill_md).parent
+    try:
+        return d.resolve()
+    except OSError:
+        return d
+
+
+def get_quarantined_project_skills(project_dirs=None) -> list[tuple[Path, Any, Path]]:
+    """``(skill_dir, ScanResult|None, project_dir)`` for every project skill the quarantine
+    excluded from the last walk of those roots — no scan, no re-walk: the verdicts and the
+    paths come from the walk that actually decided what loads. Missing dirs are ignored."""
+    wanted = {str(d) for d in project_dirs} if project_dirs is not None else None
+    seen: dict[str, tuple[Path, Any, Path]] = {}
+    for root_key, skill_dirs in _PROJECT_QUARANTINE_SKIPS.items():
+        if wanted is not None and root_key not in wanted:
+            continue
+        for skill_dir in skill_dirs:
+            seen.setdefault(skill_dir, (Path(skill_dir), _PROJECT_SCAN_RESULTS.get(skill_dir),
+                                        Path(root_key)))
+    return list(seen.values())
 
 
 def normalize_skill_lookup_name(identifier: str) -> str:

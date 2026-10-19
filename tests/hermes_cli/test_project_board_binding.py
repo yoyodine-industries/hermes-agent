@@ -122,7 +122,7 @@ def test_unbind_clears_the_board_project_and_leaves_the_workdir(home, tmp_path):
     assert _project("bind-board", "widget") == 0  # no board = unbind
     meta = kb.read_board_metadata("default")
     assert meta["project_id"] is None
-    assert meta["default_workdir"] != None
+    assert meta["default_workdir"] is not None  # the workdir write is not touched
 
 
 def test_a_card_created_on_the_bound_board_inherits_the_project_with_no_flag(home, tmp_path, capsys):
