@@ -519,6 +519,42 @@ def bump_patch(skill_name: str, *, action: str = "patch", task_id: Optional[str]
                      session_id=session_id)
 
 
+def _admission_refusal_file() -> Path:
+    """The admission-refusal ledger: append-only, bounded, beside `.usage.json`.
+
+    It lives in the skills dir (not inside `.usage.json`) on purpose: a refused draft is not a
+    skill, and a record in the usage map would make a phantom name show up wherever the ledger
+    is enumerated. This is the audit trail the acceptance criterion asks for — every refusal,
+    with what it collided with — and it is bounded so a leaking pen cannot grow it forever.
+    """
+    return _skills_dir() / ".admission_refusals.jsonl"
+
+
+JOURNAL_MAX_LINES = 500
+
+
+def record_admission_refusal(skill_name: str, *, disposition: str, existing_skill: str = "",
+                             reason: str = "") -> None:
+    """Record one pen-side refusal of a NEW skill (or a new support file) in the ledger.
+
+    Best-effort by contract: a refusal must still be returned when the ledger cannot be
+    written, and the caller DEBUG-logs that. The lifecycle hook is emitted beside the file so
+    the fleet sees refusals in the same stream as creates.
+    """
+    entry = {"at": _now_iso(), "skill": skill_name, "disposition": disposition,
+             "existing_skill": existing_skill, "reason": reason}
+    path = _admission_refusal_file()
+    try:
+        with skill_file_lock(path.with_suffix(".jsonl.lock")):
+            lines = _read_lines(path, "Failed to read %s: %s")
+            lines.append(json.dumps(entry, sort_keys=True, ensure_ascii=False))
+            atomic_write_text(path, "\n".join(lines[-JOURNAL_MAX_LINES:]) + "\n",
+                             tmp_prefix=".admission_")
+    except Exception as e:
+        logger.debug("Failed to record admission refusal for %s: %s", skill_name, e)
+    _emit_skill_lifecycle(skill_name, "create_refused", record={"created_by": None})
+
+
 def record_created(skill_name: str, *, agent_created: bool, task_id: Optional[str] = None,
                    session_id: Optional[str] = None) -> None:
     """Persist creation provenance and emit a create fact; the record is reset (a create is a new logical skill).
