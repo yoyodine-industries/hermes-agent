@@ -1873,7 +1873,7 @@ def create_task(
     recorded on the card rather than refused.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
-    from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_pr_acceptance import needs_repository_checks, validate_contract
     from hermes_cli.kanban_register import (
         OFF_BOARD_ASK_EVENT, apply_stamp, guard_new_ask_home, normalise_body,
     )
@@ -1883,6 +1883,51 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    # THE CONTRACT-VERIFICATION SEAM (cards t_b58332a4 -> t_4bec5cfe). A card born with an
+    # ``OWNER/REPO`` / PR-URL contract on a repository that requires NO status checks used to be
+    # downgraded to ``local-only`` here, because acceptance answered ``classification=missing``
+    # with ``required=[]`` and complete_task parked it with the work already done. That downgrade
+    # was one half of a mutual dead end (card t_9082c751): the gate then refused the downgraded
+    # card whose own metadata recorded the PR it published. Acceptance now accepts the PR's MERGED
+    # state as the evidence, so the declaration is KEPT and only the measured state is recorded.
+    # ``landed`` (the deploy-proof class) and every non-repo contract never enter this path, so a
+    # card that carries a deployed unit keeps its deploy-proof gate untouched.
+    contract_resolution = None
+    if needs_repository_checks(completion_contract):
+        # A missing/stale resolver module must never fail a FILING (t_b58332a4 review item B):
+        # an ImportError here would refuse every OWNER/REPO card, which is worse than the park
+        # this seam prevents. Keep the declared contract and warn.
+        try:
+            from hermes_cli import kanban_contract_resolve as _contracts
+        except Exception as _import_exc:
+            _log.warning("contract resolution unavailable, keeping declared completion_contract "
+                         "%s: %s", completion_contract, _import_exc)
+            _contracts = None
+        if _contracts is not None:
+            _contract_profile_home = None
+            try:
+                from hermes_cli.kanban_pr_acceptance import _assignee_profile_home
+                _contract_profile_home = _assignee_profile_home(assignee)
+            except Exception:
+                _contract_profile_home = None
+            try:
+                contract_resolution = _contracts.resolve_contract_at_set(
+                    completion_contract, profile_home=_contract_profile_home)
+            except Exception as _resolve_exc:  # a resolution fault must never fail a filing
+                _log.warning("contract resolution skipped for %s: %s", completion_contract,
+                             _resolve_exc)
+                contract_resolution = None
+            if contract_resolution is not None and contract_resolution.changed:
+                _log.warning("completion_contract %s -> %s: %s", completion_contract,
+                             contract_resolution.contract, contract_resolution.reason)
+                completion_contract = contract_resolution.contract
+            elif contract_resolution is not None and contract_resolution.reason:
+                # The declaration is KEPT and the measured state is recorded: a repository that
+                # requires no checks (or whose checks APIs are gated) satisfies a PR contract by
+                # MERGE STATE, so nothing is stripped for it any more (t_9082c751).
+                _log.info("completion_contract %s kept as declared (state=%s, repo=%s): %s",
+                          completion_contract, contract_resolution.state,
+                          contract_resolution.repo, contract_resolution.reason)
     # INVARIANT D at its earliest door (operator ruling 2026-10-05, card t_5bbf4e80): the
     # card's ATTRIBUTION (`created_by`) must name a LIVE fleet identity. A card filed under a
     # DELETED profile is MISATTRIBUTED -- its provenance points at nothing and no lane can be
@@ -2097,6 +2142,23 @@ def create_task(
                         **({"priority_policy": policy_provenance} if policy_provenance else {}),
                     },
                 )
+                # The measured reason travels WITH the card (t_b58332a4 -> t_4bec5cfe): the author
+                # sees WHY a declared repo contract became local-only, rather than discovering a
+                # silent downgrade. Only written when the contract actually moved; an unreadable
+                # repository keeps its declaration and writes no row.
+                if contract_resolution is not None and contract_resolution.changed:
+                    _append_event(
+                        conn, task_id, "contract_changed",
+                        {
+                            "old": contract_resolution.declared,
+                            "new": contract_resolution.contract,
+                            "state": contract_resolution.state,
+                            "repo": contract_resolution.repo,
+                            "branch": contract_resolution.branch,
+                            "reason": contract_resolution.reason,
+                            "actor": created_by or "user",
+                        },
+                    )
                 # The hatch's own record, so an off-board NEW ask that was let through on
                 # purpose is visible on the card rather than silent (a row naming the caller).
                 if ask_off_board is not None:
@@ -4948,25 +5010,48 @@ CONTRACT_RELEASE_VERB = "hermes kanban set-contract"
 
 
 def _contract_is_unsatisfiable(receipt: Mapping[str, Any]) -> bool:
-    """True when NO retry can pass: a repository contract whose repository requires no checks.
+    """True when NO retry can pass: a repository contract its repository cannot check.
 
-    ``collect_acceptance`` reports ``missing`` with an empty ``required`` list for that case --
-    there is no check to wait for and none that can ever appear -- so the refusal is terminal
-    (the card is PARKED) instead of respawning the worker against the same verdict forever.
-    The discriminator is the receipt's own data, never a guess: ``required`` is absent entirely
-    on a receipt that never reached the repository (a declaration/PR mismatch), and non-empty
-    when a required check simply has not reported yet.
+    ``collect_acceptance`` NO LONGER produces this shape: a repository that declares no
+    required checks resolves to ``pending`` (open) or ``success`` (merged) instead, because
+    MERGE STATE is its acceptance evidence (ruling 2026-10-18, card ``t_9082c751``). The
+    predicate is kept for receipts PERSISTED before that ruling, so a card parked on one can
+    still be recognised and released by the PR-aware remedy in
+    :func:`_unsatisfiable_contract_release`.
+
+    The discriminator is the receipt's own data, never a guess: ``required`` is absent
+    entirely on a receipt that never reached the repository (a declaration/PR mismatch),
+    and non-empty when a required check simply has not reported yet.
     """
     return receipt.get("classification") == "missing" and receipt.get("required") == []
 
 
-def _unsatisfiable_contract_release(task_id: str, contract: str) -> str:
-    """The remedy a refusal about an unsatisfiable contract must NAME, in one sentence."""
+def _unsatisfiable_contract_release(
+    task_id: str, contract: str, receipt: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """The remedy a refusal about an unsatisfiable contract must NAME, in one sentence.
+
+    A card that has ALREADY PUBLISHED is never told to use ``local-only`` (ruling
+    2026-10-18, card ``t_9082c751``): that is the claim its own record refutes, and
+    offering it was half of a mutual dead end -- the landing fence refused ``local-only``
+    beside a publication while this door refused every PR contract. Such a card is
+    offered the route that exists: the PR's MERGED state.
+    """
+    published = bool((receipt or {}).get("pr_url") or (receipt or {}).get("published_pr"))
+    if published:
+        return (
+            f"The contract {contract!r} waits on repository checks this repository does not "
+            f"declare, so there is nothing to wait for. A PR contract is satisfied by the PR's "
+            f"MERGED state: merge the PR this card published, then retry completion -- the card "
+            f"already refuted any claim that nothing was published, so the merge is the only "
+            f"remaining step."
+        )
     return (
         f"The contract {contract!r} requires repository checks, but the repository declares "
         f"none, so no retry can satisfy it. Release the declaration with "
         f"`{CONTRACT_RELEASE_VERB} {task_id} local-only --reason '<why no repository checks>'` "
-        f"if the unit genuinely needs no repository checks, or set the exact PR URL it lands on."
+        f"if the unit genuinely needs no repository checks, or set the exact PR URL it lands on "
+        f"-- a repository that requires no checks accepts the PR's MERGED state."
     )
 
 
@@ -5267,18 +5352,21 @@ def _close_run_fence(
 
 def _park_unsatisfiable_contract(
     conn: sqlite3.Connection, task_id: str, contract: str, *,
+    receipt: Optional[Mapping[str, Any]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Park a card whose repository contract NO retry can satisfy: ``blocked`` / ``capability``.
 
     ``capability``, not ``transient``: the fence cannot clear on its own, so the failure breaker
     must not respawn the worker against the same verdict. The reason names the contract AND the
-    release door, because the card's own record is what a human reads next.
+    release door, because the card's own record is what a human reads next. The receipt decides
+    which release door is offered: a card that has published is never sent back to ``local-only``
+    (t_9082c751).
     """
     return bool(block_task(
         conn, task_id, kind="capability",
         reason=f"completion contract {contract!r} is unsatisfiable. "
-               + _unsatisfiable_contract_release(task_id, contract),
+               + _unsatisfiable_contract_release(task_id, contract, receipt),
         expected_run_id=expected_run_id,
     ))
 
@@ -5368,9 +5456,10 @@ def complete_task(
         ).strip()
         if _contract_is_unsatisfiable(receipt):
             _park_unsatisfiable_contract(
-                conn, task_id, contract, expected_run_id=expected_run_id,
+                conn, task_id, contract, receipt=receipt,
+                expected_run_id=expected_run_id,
             )
-            detail = f"{detail} {_unsatisfiable_contract_release(task_id, contract)}"
+            detail = f"{detail} {_unsatisfiable_contract_release(task_id, contract, receipt)}"
         return CompletionRefusal("acceptance_refusal", detail)
     # The LANDING-CARRIER fence (t_88f6cb12, ruling t_9333ca24). A review close that DECLARES a
     # deliverable PR must name its landing leg: the landing is deliberately a SEPARATE card, and
@@ -5633,6 +5722,11 @@ def _gate_landing_carrier(
 
     A missing clause module fails CLOSED (a kernel that cannot judge the landing
     state must not admit the close blind) while keeping a no-network escape open.
+
+    WHAT TRIGGERS IT is an explicit publication declaration -- ``published_pr`` or an
+    exact PR-URL contract -- never a mere mention (``pr`` / ``pr_url`` / ``pr_number``):
+    those name the PR a card published as readily as one it only cited, and judging
+    them refused honest closes (ruling 2026-10-18, card ``t_9082c751``).
     """
     try:
         from hermes_cli import kanban_landing_carrier as clause
@@ -7260,7 +7354,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
-    _ctx_header(lines, task)
+    _ctx_header(lines, task, cap_defaulted=_runtime_cap_was_defaulted(conn, task_id))
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
@@ -7306,7 +7400,28 @@ def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
     )
 
 
-def _ctx_header(lines: list[str], task: Task) -> None:
+def _runtime_cap_was_defaulted(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card's ``max_runtime_seconds`` was stamped by the dispatcher.
+
+    Slot recycling (ruling ``t_b2865b89`` §4) writes a ``runtime_cap_defaulted`` event beside the
+    stamp (``kanban_db_dispatch._stamp_default_max_runtime_seconds``), so this audit trail is the
+    ONE durable record distinguishing a cap the AUTHOR set from a cap the SCHEDULER imposed. The
+    worker prompt must not claim a terminal timeout off the latter: ``_ctx_header`` would otherwise
+    tell a defaulted worker ``Terminal timeout: 7170s`` and it would start a command it is killed
+    in. Fails closed to "explicit" (the pre-existing rendering) on any read error.
+    """
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'runtime_cap_defaulted' "
+            "LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except Exception:
+        return False
+    return row is not None
+
+
+def _ctx_header(lines: list[str], task: Task, *, cap_defaulted: bool = False) -> None:
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
@@ -7315,13 +7430,18 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
     if task.max_runtime_seconds is not None:
-        terminal_timeout = _worker_terminal_timeout_env(
-            task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
-        )
-        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+        # The cap itself is always worth showing (a defaulted card really IS reaped at it), but the
+        # TERMINAL TIMEOUT is a property of the author's budget, not the scheduler's: a cap nobody
+        # authored widens nothing (``_dispatch_lane_task`` pins the explicit value back onto the
+        # Task it spawns), so claiming a terminal timeout here would be a lie.
         lines.append(f"Max runtime: {task.max_runtime_seconds}s")
-        if effective_terminal_timeout:
-            lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+        if not cap_defaulted:
+            terminal_timeout = _worker_terminal_timeout_env(
+                task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
+            )
+            effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+            if effective_terminal_timeout:
+                lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")

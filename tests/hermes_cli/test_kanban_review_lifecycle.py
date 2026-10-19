@@ -963,6 +963,7 @@ def test_review_lane_never_spawns_the_implementer(
 
     def spawn(task, workspace):
         spawned.append((task.id, task.assignee))
+        return None
 
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="author reviews own work", assignee="builder")
@@ -1020,6 +1021,7 @@ def test_parked_self_review_does_not_hold_the_ready_lane_reservation(
 
     def spawn(task, workspace):
         spawned.append(task.id)
+        return None
 
     with kbc.connect() as conn:
         ready_ids = [

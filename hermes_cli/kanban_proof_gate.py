@@ -38,6 +38,10 @@ Cause vocabulary (greppable, one ``cause`` per refusal):
   ``landing_live_tree_denied``        a live-tree declaration for bytes the ledger says a
                                       departure delivers — prove them on the train instead
   ``run_unknown`` / ``no_run_or_probe``  the named run/probe cannot be resolved
+  ``run_store_unavailable``           the run store could not be READ — a store OUTAGE, a
+                                      different fact from ``run_unknown`` (a READABLE store
+                                      that holds no such run). Never a verdict about the card:
+                                      see "A STORE OUTAGE IS NOT A VERDICT" below
   ``proof_predates_landing``          the run predates the artifact — the DoD clause
   ``run_not_green``                   the run finished red
   ``live_tree_unproven``              a ledger-less landing whose proof carries no probe, or
@@ -151,6 +155,34 @@ is now expressible, and it is paid for, not waived:
     card, not about live bytes), is refused ``live_tree_unproven``;
   * if the refs DO resolve in the ledger, the ledger leg wins and the declaration is merely
     recorded (``facts.live_tree_ignored``) — stronger evidence is never discarded.
+
+A STORE OUTAGE IS NOT A VERDICT (card t_66a21ced). The gate's questions are "did the reviewed
+bytes land?" and "did a run happen AFTER that landing?" — the run store is only where the
+second answer is STORED, never the answer itself. Reading it is therefore TRI-STATE:
+
+  * the store ANSWERS and holds the run — adjudicated exactly as it always was;
+  * the store ANSWERS and holds no such run — ``run_unknown``: a readable store that really
+    has no such run. That is a fact about the RUN, and it is unchanged;
+  * the store CANNOT ANSWER (missing, unopenable, corrupt, locked) — a store OUTAGE, which is
+    not evidence that any run is missing. The gate falls back to the run's OWN on-disk receipt
+    (``<run_details>/<run_id>/run.log``: the runner's line-delimited record of the run, its
+    node events and the OUTCOME the engine resolved — the same facts ``runs.verdict`` is
+    written from), and where no receipt stands the refusal is ``run_store_unavailable``, which
+    names the store and its repair instead of claiming the run is absent.
+
+The fallback keeps every anti-fabrication property of the store path. The receipt must EXIST as
+bytes for the declared run id (a card cannot claim a run whose receipt it cannot produce); its
+log must NAME that run (one run's log cannot be offered for another); its time is the latest
+event timestamp it carries, which feeds the ordinary ``proof_predates_landing`` clause
+unchanged (a run that finished before the landing is refused exactly as it would be from the
+store); and it is green only on the store's OWN rule (the last ``outcome_resolved`` is ``pass``,
+or the run CLOSED with no resolved outcome at all) — a ``not_pass`` outcome, or a truncated or
+in-flight log, can never manufacture a green run.
+
+It is never silent either: the facts carry ``run_store_state: "unavailable"``, the store's own
+error and ``degraded: True`` into the ``proof_gate_admitted`` audit event, and the pass text
+says the store was unreadable. One corrupted SQLite file can no longer make every landed card
+on every board unclosable at once.
 """
 
 from __future__ import annotations
@@ -198,6 +230,19 @@ GREEN_RUN_VERDICTS = frozenset({"pass"})
 GREEN_CARD_OUTCOMES = frozenset({"completed"})
 GREEN_PROBE_RESULTS = frozenset({"ok", "pass", "passed", "green", "healthy", "up"})
 
+#: The run's OWN on-disk receipt, beside the shared run store:
+#: ``<run_details>/<run_id>/run.log``. Written by the runner (never by a card), it records the
+#: run id, its node events with ISO timestamps, the engine's resolved ``outcome_resolved`` and
+#: the close marker — the same facts the store's ``runs`` row is written from. It is admissible
+#: as proof ONLY where the store cannot be read (card t_66a21ced).
+_RECEIPT_LOG = "run.log"
+_RECEIPT_CLOSE_EVENT = "pin_retired"
+_RECEIPT_CLOSE_BECAUSE = "run_close"
+_RECEIPT_BYTE_CAP = 4 * 1024 * 1024
+#: A run id is ONE path segment: it is joined onto the receipt root, so a separator or a ``..``
+#: in a handoff's ``run.id`` must never be able to name a file outside that root.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
 _CAUSES = (
     "no_proof",
     "malformed_proof",
@@ -209,6 +254,7 @@ _CAUSES = (
     "landing_not_admitted",
     "landing_live_tree_denied",
     "no_run_or_probe",
+    "run_store_unavailable",
     "run_unknown",
     "proof_predates_landing",
     "run_not_green",
@@ -227,6 +273,11 @@ _CAUSE_PRECEDENCE = (
     "landing_unresolved",
     "landing_not_admitted",
     "landing_live_tree_denied",
+    # A store OUTAGE (``run_store_unavailable``) outranks ``run_unknown``: the first says the
+    # instrument could not answer AND no receipt stood, the second says the store DID answer
+    # and holds no such run. Both rank below the timing clause, as before -- when a receipt
+    # does resolve, the ordinary ``proof_predates_landing`` judgment runs on its timestamp.
+    "run_store_unavailable",
     "run_unknown",
     "no_run_or_probe",
     "live_tree_unproven",
@@ -270,7 +321,10 @@ PROOF_SHAPE = (
     '{"kind": "override-manifest", "id": "<repo-relative path>"} (its untracked-overrides '
     'MANIFEST row + byte copy carry these bytes) or {"kind": "payload-record", "id": '
     '"<card>"} (the r5-preroll <card>-payload.diff + .sha256). A bare "path" + "sha256" is '
-    'refused on a landed card)'
+    'refused on a landed card) '
+    '(if the run store itself cannot be READ the gate stands on the run log receipt '
+    '(<run_details>/<run id>/run.log) and records the resolution as DEGRADED; with no receipt '
+    'it refuses "run_store_unavailable" -- a store outage is never reported as a missing run)'
 )
 
 
@@ -419,7 +473,13 @@ def _row_at(row: dict) -> Optional[float]:
 def _is_admitted(row: dict) -> bool:
     if row.get("admission") not in (None, "admitted"):
         return False
-    return row.get("exit") in (None, 0)
+    if row.get("exit") in (None, 0):
+        return True
+    # exit 3 is land.sh's "landed" leg (the merge is real; the flow's ``merged``
+    # transition is recorded by the next sdlc sync tick). The one sub-case that is a
+    # real provenance gap -- the merge sha's review row was NOT recorded -- rides the
+    # same row as ``row_recorded: false``, so the exit must not be read alone.
+    return row.get("exit") == 3 and row.get("row_recorded") is True
 
 
 def _is_ancestor_dest(dest: Any, artifact_path: str) -> bool:
@@ -1116,16 +1176,166 @@ def _card_run(conn: Optional[sqlite3.Connection], spec: dict) -> tuple:
     }, facts, None)
 
 
+def _receipt_dir(store_path: str, run_id: Any) -> Optional[str]:
+    """The run's OWN receipt directory beside the store, or None for an unsafe id.
+
+    The receipt root is the STORE'S OWN directory (``<run_details>/``), so a caller that points
+    ``run_store_path`` elsewhere (a suite, a rehearsal) reads ITS receipts and never the live
+    estate's. ``run_id`` is one path segment by construction: an id carrying a separator or a
+    ``..`` must never be able to name a file outside that root.
+    """
+    rid = str(run_id).strip()
+    if not _RUN_ID_RE.match(rid):
+        return None
+    return os.path.join(os.path.dirname(os.path.abspath(store_path)), rid)
+
+
+def _run_receipt(store_path: str, run_id: Any) -> tuple:
+    """(record, facts, why_not) read from the run's OWN on-disk receipt.
+
+    The receipt is the run's own ``run.log``: the runner's line-delimited record of the same
+    facts the store's ``runs`` row holds — the run id, its node events with ISO timestamps, the
+    engine's ``outcome_resolved`` (the event ``runs.verdict`` is written from) and the close
+    marker. Admissible ONLY on the store-outage path: a store that ANSWERS is the authority.
+
+    It is not a waiver, it is paid for exactly as the store path pays:
+
+      * it must EXIST as bytes for the declared run id — a card cannot claim a run whose
+        receipt it cannot produce;
+      * the log must NAME the run it is offered for, so one run's log cannot be offered for
+        another;
+      * its time is the LATEST event timestamp it carries (the run's own last recorded
+        moment), which feeds the ordinary ``proof_predates_landing`` clause — a run that
+        finished before the landing is refused exactly as it would be from the store;
+      * its greenness is the STORE'S OWN RULE read off the log (``status`` completed and
+        ``verdict`` absent-or-``pass``): the last ``outcome_resolved`` must be ``pass``, or the
+        run must have CLOSED with no resolved outcome at all. A ``not_pass`` outcome, or a log
+        that resolved nothing and never closed, is not green — a truncated or in-flight log
+        cannot manufacture a green run.
+
+    ``why_not`` is a sentence, not a refusal: the caller states the outage (that is what
+    happened) and this only says why no receipt stood in its place.
+    """
+    rid = str(run_id).strip()
+    directory = _receipt_dir(store_path, rid)
+    if directory is None:
+        return None, {}, (f"the run id {run_id!r} is not a single safe path segment, so no "
+                          f"receipt can be resolved for it")
+    log = os.path.join(directory, _RECEIPT_LOG)
+    if not os.path.isfile(log):
+        return None, {}, f"there is no receipt at {log}"
+    try:
+        with open(log, "rb") as handle:
+            payload = handle.read(_RECEIPT_BYTE_CAP)
+    except OSError as exc:
+        return None, {}, f"the receipt {log} could not be read: {exc}"
+    named = False
+    closed = False
+    outcome = None
+    stamps: list = []
+    events = 0
+    for line in payload.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        events += 1
+        if str(event.get("run_id") or "") == rid:
+            named = True
+        if (event.get("event") == _RECEIPT_CLOSE_EVENT
+                and str(event.get("because") or "") == _RECEIPT_CLOSE_BECAUSE):
+            closed = True
+        if event.get("event") == "outcome_resolved":
+            value = str(event.get("outcome") or "").strip().lower()
+            if value:
+                outcome = value
+        stamp = parse_ts(event.get("ts"))
+        if stamp is not None:
+            stamps.append(stamp)
+    if not named:
+        return None, {}, (f"the receipt {log} carries no event naming run {rid!r}, so it is not "
+                          f"that run's own log")
+    if not stamps:
+        return None, {}, f"the receipt {log} carries no parsable event timestamp"
+    at = max(stamps)
+    green = outcome in GREEN_RUN_VERDICTS or (outcome is None and closed)
+    facts = {
+        "run_id": rid,
+        "run_store": os.path.basename(store_path),
+        "run_store_state": "unavailable",
+        "run_store_path": store_path,
+        "run_receipt": log,
+        "run_receipt_events": events,
+        "run_outcome": outcome or None,
+        "run_closed": closed,
+        "started_at": _iso(min(stamps)),
+        "finished_at": _iso(at),
+        "degraded": True,
+    }
+    return ({
+        "at": at,
+        "green": green,
+        "label": (f"run {rid} receipt "
+                  f"({outcome or ('closed' if closed else 'not closed')})"),
+    }, facts, None)
+
+
+def _store_unavailable(store_path: str, run_id: Any, why: str, *, because: str) -> tuple:
+    """The store cannot answer: stand on the run's OWN receipt, else refuse BY NAME.
+
+    ``why`` is the SHORT reason the store is not an instrument right now ("it does not exist",
+    "the store could not be read: ..."), which is what a reader needs in the verdict; ``because``
+    is the full sentence, kept verbatim in the audit facts.
+
+    The store is where the answer is STORED, not the answer itself, so an unreadable store is an
+    OUTAGE rather than a verdict about this card. It resolves as degraded evidence when the
+    run's own receipt stands, and as ``run_store_unavailable`` — a clause that names the store
+    and its repair, and never claims the run is absent — when it does not. That distinction is
+    the whole point: the old behaviour reported a corrupt store and a missing run as the same
+    ``run_unknown``, beside text about a predating run, so a card whose unit was deployed and
+    running could not tell an outage from its own missing evidence (card t_66a21ced).
+    """
+    record, facts, why_not = _run_receipt(store_path, run_id)
+    if record is not None:
+        facts = dict(facts)
+        facts["run_store_error"] = because
+        facts["run_store_error_why"] = why
+        facts["degraded_reason"] = (
+            f"the run store {store_path} could not be read ({why}); the proof was resolved "
+            f"from the run's own on-disk receipt {facts.get('run_receipt')}")
+        return record, facts, None
+    receipt_root = os.path.join(os.path.dirname(os.path.abspath(store_path)), "<run id>",
+                                _RECEIPT_LOG)
+    return None, {}, {
+        "clause": "run_store_unavailable",
+        "detail": (
+            f"the run store {store_path} is UNAVAILABLE ({why}), so no run can be resolved "
+            f"from it, and run {run_id!r} has no receipt to stand on ({why_not}). This is a "
+            f"STORE OUTAGE, not a missing run: the store is where the answer is recorded, not "
+            f"the answer itself. The repair is the store's — integrity-check it and restore it, "
+            f"or restore the run's own receipt ({receipt_root}) — and it is not this card's. "
+            f"Re-pinning the artifact hash cannot clear it, and neither can re-running a unit "
+            f"that has already run"),
+    }
+
+
 def _store_run(path: str, run_id: Any) -> tuple:
     if not os.path.exists(path):
-        return None, {}, {"clause": "run_unknown",
-                          "detail": f"the run store {path} does not exist"}
+        return _store_unavailable(
+            path, run_id, "it does not exist",
+            because=f"the run store {path} does not exist")
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
     except sqlite3.Error as exc:
-        return None, {}, {"clause": "run_unknown",
-                          "detail": f"the run store {path} could not be opened: {exc}"}
+        return _store_unavailable(
+            path, run_id, f"the store could not be opened: {exc}",
+            because=f"the run store {path} could not be opened: {exc}")
     try:
         try:
             row = conn.execute(
@@ -1133,13 +1343,15 @@ def _store_run(path: str, run_id: Any) -> tuple:
                 "FROM runs WHERE id = ?", (run_id,),
             ).fetchone()
         except sqlite3.Error as exc:
-            return None, {}, {"clause": "run_unknown",
-                              "detail": f"the run store {path} could not be read: {exc}"}
+            return _store_unavailable(
+                path, run_id, f"the store could not be read: {exc}",
+                because=f"the run store {path} could not be read: {exc}")
     finally:
         conn.close()
     if row is None:
         return None, {}, {"clause": "run_unknown",
-                          "detail": f"run {run_id!r} is not in {path}"}
+                          "detail": f"run {run_id!r} is not in {path} — the store IS readable "
+                                    f"and holds no such run, so this is not a store outage"}
     status = str(row["status"] or "").strip().lower()
     verdict = str(row["verdict"] or "").strip().lower()
     started = parse_ts(row["started_at"])
@@ -1148,6 +1360,7 @@ def _store_run(path: str, run_id: Any) -> tuple:
         return None, {}, {"clause": "run_unknown",
                           "detail": f"run {run_id!r} carries no timestamp"}
     facts = {"run_id": row["id"], "run_store": os.path.basename(path),
+             "run_store_state": "available",
              "run_workflow": row["workflow_name"], "run_status": status or None,
              "run_verdict": verdict or None, "started_at": _iso(started),
              "finished_at": _iso(stamp)}
@@ -1360,6 +1573,13 @@ def evaluate(
         verdict.detail = (
             f"{record['label']} at {_iso(record['at'])} is after the landing at "
             f"{_iso(landing_at)} and covers the deployed artifact")
+        if facts.get("run_store_state") == "unavailable":
+            # Never a silent pass: a degraded resolution is SAID, not just recorded, so an
+            # operator reading a green close sees the outage that forced the fallback.
+            verdict.detail += (
+                f" — DEGRADED: the run store {facts.get('run_store_path')} is unreadable "
+                f"({facts.get('run_store_error_why')}), so the run was resolved from its own "
+                f"on-disk receipt {facts.get('run_receipt')}")
     return verdict
 
 
@@ -1373,9 +1593,17 @@ def render(task_id: str, verdict: Verdict) -> str:
         parts.append(
             "Also failing, and not fixed by the first clause (every one of these has to "
             "clear): " + "; ".join(f"[{f['clause']}] {f['detail']}" for f in others) + ".")
-    parts.append(
-        "Re-pinning the artifact hash cannot clear a timing failure: a stale pin beside a "
-        "predating run is still a predating run, and the run is what the contract is about.")
+    if verdict.cause == "run_store_unavailable":
+        parts.append(
+            "This refusal is about the INSTRUMENT, not the claim: the run store could not be "
+            "read and no receipt for the named run stood in its place, so nothing about this "
+            "card's deployed bytes was judged. Repair the store (integrity-check it and restore "
+            "it, or restore the run's own run.log receipt) and re-run this completion. "
+            "Re-pinning the artifact hash cannot help, and neither can re-running the unit.")
+    else:
+        parts.append(
+            "Re-pinning the artifact hash cannot clear a timing failure: a stale pin beside a "
+            "predating run is still a predating run, and the run is what the contract is about.")
     parts.append(
         f"Nothing changed — the card is still in flight. Retry kanban_complete with "
         f"{PROOF_SHAPE}; if the unit is genuinely not deployed, `hermes kanban set-contract "

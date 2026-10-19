@@ -34,13 +34,14 @@ def validate_contract(value: str | None) -> str:
 
 
 def needs_repository_checks(value: str | None) -> bool:
-    """True when the contract is signed off by repository-required CI rather than the local run.
+    """True when the contract is a repository claim rather than the local run.
 
-    A repository that requires no checks can never satisfy one: ``collect_acceptance``
-    reports ``missing`` with an empty ``required`` list and no retry can change that, which
-    is why authoring one warns and completion parks the card (see ``complete_task``).
-    ``landed`` is NOT a repository check: its fence is the deploy-proof gate, so routing it
-    into the GitHub path would park every proof-contract card as unsatisfiable.
+    A repository that declares no required checks cannot be WAITED on, but it can
+    still be CLOSED: ``collect_acceptance`` treats the PR's MERGED state as the
+    evidence (ruling of 2026-10-18, card ``t_9082c751``), so such a contract is
+    satisfiable and never parks the card. ``landed`` is NOT a repository check: its
+    fence is the deploy-proof gate, so routing it into the GitHub path would park
+    every proof-contract card as unsatisfiable.
     """
     return validate_contract(value) not in ("local-only", "landed")
 
@@ -138,7 +139,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
+        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state mergeCommit{{oid}}\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
         if repository is None:
             # A private repo the login cannot read resolves to null, not an error.
@@ -159,7 +160,25 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+            # A repository that declares no required checks cannot be WAITED on, and refusing
+            # its PR contract outright left a published card with no legal contract at all:
+            # `local-only` contradicts its own publication, and the PR contract was refused
+            # here (ruling of 2026-10-18, card ``t_9082c751``). MERGE STATE is the evidence.
+            if pr["state"] == "MERGED":
+                receipt["classification"] = "success"
+                receipt["ok"] = True
+                merge_sha = (pr.get("mergeCommit") or {}).get("oid")
+                if merge_sha:
+                    receipt["merge_sha"] = merge_sha
+                receipt["detail"] = (
+                    f"{repo}#{number} is MERGED (head {sha}); the repository declares no required "
+                    "checks, so merge state is this contract's acceptance evidence.")
+                return receipt
+            receipt["classification"] = "pending"
+            receipt["detail"] = (
+                f"{repo}#{number} is OPEN at {sha} and the repository declares no required checks, "
+                f"so the PR's MERGED state is this contract's acceptance evidence: merge the PR, "
+                f"then retry completion. Nothing is missing from the card.")
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)

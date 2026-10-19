@@ -370,6 +370,54 @@ KANBAN_HEARTBEAT_SCHEMA = _schema(
     [],
 )
 
+KANBAN_RECORD_LANDING_VERDICT_SCHEMA = _schema(
+    "kanban_record_landing_verdict",
+    (
+        "Record a LANDING VERDICT on the card that DECLARES the deliverable PR — "
+        "the one sanctioned door for a `[land]` carrier worker that has ruled a "
+        "landing not owed (superseded / re-cut / already live) or genuinely "
+        "deferred. Writes `landing_not_owed` or `landing_deferred` where the "
+        "completion clause and the landing reconciler both read it, WITHOUT "
+        "closing or otherwise moving the target card. Validation is the clause's "
+        "own: `landing_not_owed` needs a substantive reason that NAMES what the "
+        "landing rides instead (a repo#N ref, a card id, or a URL); "
+        "`landing_deferred` needs a substantive reason. The target must actually "
+        "declare a PR, or the call is refused (a verdict there discharges "
+        "nothing). Merges into the newest run's metadata — existing keys are "
+        "preserved — and audits both cards. Does NOT weaken the completion "
+        "gate: a close that declares an unlanded PR is still refused."
+    ),
+    {
+        "target_task_id": _prop("string", (
+                "The DECLARING card — the one whose own close declared the PR. "
+                "Not your own `[land]` carrier: a verdict written there is "
+                "invisible to the reconciler."
+        )),
+        "verdict": {
+            "type": "string",
+            "enum": ["landing_not_owed", "landing_deferred"],
+            "description": (
+                "`landing_not_owed` — this PR is not the landing (superseded, "
+                "re-cut, or already live); the reason must name the replacement. "
+                "`landing_deferred` — the landing is genuinely owed but not yet "
+                "carried; the deferral is the landing reconciler's own input "
+                "class."
+            ),
+        },
+        "reason": _prop("string", (
+                "Why, in words a reader does not have to interpret. For "
+                "`landing_not_owed` it must name the replacement it rides "
+                "(a repo#N ref, a t_... card id, or a URL) and clear the "
+                "clause's length floor."
+        )),
+        "result": _prop("string", (
+                "Optional: also set the target card's `result`. Omit unless you "
+                "mean to rewrite its handoff line — untouched when omitted."
+        )),
+    },
+    ["target_task_id", "verdict", "reason"],
+)
+
 KANBAN_CLOSE_SIBLING_SCHEMA = {
     "name": "kanban_close_sibling",
     "description": (

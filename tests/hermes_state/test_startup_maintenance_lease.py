@@ -23,7 +23,7 @@ def test_maintenance_steps_renew_the_armed_watchdog_lease(tmp_path, monkeypatch)
         monkeypatch.setattr(db, "prune_sessions", lambda **kw: 120)  # VACUUM only runs after a real prune
         monkeypatch.setattr(db, "sweep_orphaned_sessions", lambda **kw: [])
         monkeypatch.setattr(db, "_freelist_ratio", lambda: 1.0)
-        monkeypatch.setattr(db, "vacuum", lambda: None)
+        monkeypatch.setattr(db, "vacuum", lambda *_a, **_k: None)
         monkeypatch.setattr(db, "archive_stale_sessions", lambda *a, **kw: 0)
         before = handle._lease_count
 
