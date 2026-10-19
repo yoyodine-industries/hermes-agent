@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -128,11 +129,86 @@ def _archive_untracked(tree: Path, untracked: list[str]) -> Optional[Path]:
         return None
 
 
+_TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled", "failed"})
+
+
+def _card_status_for_tree(task_id: str) -> Optional[str]:
+    """Board status of *task_id*, or None when no board store knows the card.
+
+    Reads every board store read-only: the root ``kanban.db``, the legacy
+    ``kanban/kanban.db`` and every ``kanban/boards/<slug>/kanban.db``. A store
+    with no ``tasks`` table is skipped — it cannot hold the card, and treating
+    such a stub as unreadable is what made the completion path defer every
+    cleanup. Any board reporting a NON-terminal status wins: conservative.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+    except Exception:
+        return None
+    candidates = [home / "kanban.db", home / "kanban" / "kanban.db"]
+    boards = home / "kanban" / "boards"
+    if boards.is_dir():
+        with contextlib.suppress(OSError):
+            candidates.extend(sorted(p / "kanban.db" for p in boards.iterdir() if p.is_dir()))
+    statuses: list[str] = []
+    seen: set[str] = set()
+    for db in candidates:
+        if not db.is_file():
+            continue
+        try:
+            key = str(db.resolve())
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            conn = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=1.0)
+            try:
+                row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+        if row and row[0]:
+            statuses.append(str(row[0]))
+    if not statuses:
+        return None
+    for status in statuses:
+        if status not in _TERMINAL_CARD_STATUSES:
+            return status
+    return statuses[0]
+
+
 def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads) -> tuple[str, str, list[str]]:
-    """Return (verdict, reason, untracked) for one tree under ``.worktrees/``."""
-    path = str(entry)
+    """Return (verdict, reason, untracked) for one tree under ``.worktrees/``.
+
+    A ``t_<hex>`` tree belongs to a card, and the board's STATUS for that card
+    — not the existence of a row — decides whether it may be reclaimed. A
+    terminal card's tree is judged by the ordinary dirty/pushed rules below,
+    with one extra guard: its branch is kept, because the card's PR or its
+    landing door may still need it.
+    """
+    kanban_status: Optional[str] = None
     if _KANBAN_RE.match(entry.name):
-        return "keep", "kanban task tree (owned by kanban gc)", []
+        kanban_status = _card_status_for_tree(entry.name)
+        if kanban_status is None:
+            return "keep", "kanban task tree; no board row for this card", []
+        if kanban_status not in _TERMINAL_CARD_STATUSES:
+            return "keep", f"kanban task tree; card is {kanban_status}", []
+    verdict, reason, untracked = _classify_reapable(_ops, repo_root, entry, merge_cache, remote_heads)
+    if kanban_status is not None:
+        reason = f"card {kanban_status}; {reason}"
+        if verdict == "reap":
+            return "reap-keep-branch", f"{reason} (branch kept for the card)", []
+    return verdict, reason, untracked
+
+
+def _classify_reapable(_ops, repo_root: str, entry: Path, merge_cache, remote_heads) -> tuple[str, str, list[str]]:
+    """Reapability of one tree, ignoring card ownership."""
+    path = str(entry)
     if _ops._worktree_lock_is_live(repo_root, path, timeout=5) == "live":
         return "keep", "in use by a running hermes session", []
     tracked_dirty, untracked = _dirty_split(path)

@@ -344,6 +344,47 @@ def test_parent_worktree_deferred_until_children_done(
     assert not parent_wt.exists()
 
 
+def _set_status(conn, tid: str, status: str) -> None:
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+
+
+def test_prune_reclaims_tree_of_terminal_card(kanban_home: Path, repo: Path) -> None:
+    """`hermes worktree prune` must classify a t_<hex> tree by its card's STATUS.
+
+    It used to skip every kanban task tree by NAME alone, so the ~177 trees
+    whose cards were already done/archived could never be reclaimed by the one
+    instrument an operator runs. The branch is kept on the terminal path: the
+    card's PR or its landing door may still need it.
+    """
+    from hermes_cli import worktree_gc as gc
+
+    with kbc.connect_closing() as conn:
+        tid, _wt = _worktree_task(conn, repo)
+        _set_status(conn, tid, "done")
+
+    records = {r.name: r for r in gc.audit_worktrees(str(repo), with_sizes=False)}
+    record = records[tid]
+    assert record.verdict in {"reap", "reap-archive", "reap-keep-branch"}, record.reason
+    assert "done" in record.reason
+    assert record.verdict != "keep"
+
+
+def test_prune_keeps_tree_of_live_card(kanban_home: Path, repo: Path) -> None:
+    """Row existence is not enough either: a live card's tree stays."""
+    from hermes_cli import worktree_gc as gc
+
+    with kbc.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        _set_status(conn, tid, "running")
+
+    records = {r.name: r for r in gc.audit_worktrees(str(repo), with_sizes=False)}
+    record = records[tid]
+    assert record.verdict == "keep"
+    assert "running" in record.reason
+    assert wt.is_dir()
+
+
 def _running_scratch_parent(conn, title: str = "parent") -> tuple[str, Path]:
     tid = kb.create_task(conn, title=title)
     assert kb.claim_task(conn, tid) is not None  # -> running
