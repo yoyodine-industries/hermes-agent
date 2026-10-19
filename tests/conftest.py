@@ -152,6 +152,29 @@ if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
     os.environ["HERMES_TEST_SANDBOX_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
+# ── Inherited profile identity must not outlive the sandbox ─────────────────
+# ``HERMES_PROFILE`` / ``HERMES_PROFILE_NAME`` name the profile this process
+# serves; the kanban dispatcher pins them on the workers it spawns. Unlike
+# HERMES_HOME they are not a path, so the sandbox above cannot redirect them:
+# code that resolves the NAMED profile anchors it to
+# ``get_default_hermes_root()/profiles`` (``hermes_cli.profiles._get_profiles_root``),
+# and any child that reaches that root reaches the operator's REAL profile home
+# — including ``profiles/<lane>/projects.db``, which is live per-profile state.
+#
+# That identity outlives the sandbox — and a child process is exactly what the
+# in-process HomeIOGuard does not cover. A run in this shape left slug ``alpha``
+# -> a pytest tmpdir in platform-coder's live registry (t_7213e415): the store
+# resolution still saw a profile while the session's HERMES_HOME looked
+# isolated. Capture the values (the canary in
+# tests/test_project_store_isolation.py asserts they are gone), then drop them:
+# a test that needs a profile identity sets HERMES_PROFILE itself via
+# monkeypatch, and a test that needs a profile creates it under its own root.
+INHERITED_PROFILE_ENV = {
+    _name: os.environ.pop(_name)
+    for _name in ("HERMES_PROFILE", "HERMES_PROFILE_NAME")
+    if _name in os.environ
+}
+
 # PYTHONPYCACHEPREFIX is a bytecode-mirror escape hatch: when set (the
 # bundled desktop app exports it as %LOCALAPPDATA%\hermes\pycache),
 # importlib/pytest write .pyc files to <prefix>/<absolute source path>
@@ -1515,7 +1538,123 @@ def _forbid_real_hermes_home_io(monkeypatch, request):
         return
     from tests.home_io_guard import HomeIOGuard
 
-    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: _REAL_INSTALLED_GUI_APPS).install(monkeypatch)
+    global _HOME_IO_GUARD
+    _HOME_IO_GUARD = HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: _REAL_INSTALLED_GUI_APPS)
+    _HOME_IO_GUARD.install(monkeypatch)
+
+
+# ── Per-profile project-store write guard ──────────────────────────────────
+# ``projects.db`` is LIVE per-profile state: ``<root>/projects.db`` for the
+# launch home and ``<root>/profiles/<lane>/projects.db`` for each lane. The
+# HomeIOGuard above refuses in-process writes to both, but it explicitly does
+# NOT cover subprocesses — and a child resolves the profile root from its own
+# env, so a CLI-shaped test can still reach the real store the way one did in
+# t_7213e415 (slug ``alpha`` -> a pytest tmpdir in platform-coder's registry).
+#
+# This guard is mechanism-independent: it fingerprints every production project
+# store (plus the SQLite ``-wal``/``-shm`` sidecars a write actually touches)
+# around each test and FAILS the test that changed one, naming the store. It
+# only stats the files — it never opens them, so it cannot itself drag live
+# state into a test.
+_PROJECT_STORE_SIDECARS = ("", "-wal", "-shm")
+_HOME_IO_GUARD = None
+
+
+def _project_store_paths_for_roots(roots) -> list[Path]:
+    """Every project store (launch home + each ``profiles/<lane>``) under ``roots``."""
+    paths: list[Path] = []
+    for root in roots:
+        root = Path(root)
+        paths.append(root / "projects.db")
+        try:
+            profiles = sorted((root / "profiles").iterdir())
+        except OSError:
+            continue
+        paths.extend(profile / "projects.db" for profile in profiles if profile.is_dir())
+    return paths
+
+
+def _production_project_store_paths() -> list[Path]:
+    """Every live project store under the REAL (captured, pre-sandbox) roots.
+
+    Module-level and monkeypatchable on purpose: the guard's own negative
+    control redirects it at a throwaway store to prove the fixture fires.
+    """
+    return _project_store_paths_for_roots(_REAL_HERMES_ROOT_CANDIDATES)
+
+
+def _project_store_fingerprints() -> dict[str, tuple[int, int] | None]:
+    """``(mtime_ns, size)`` per production store and sidecar, stat'd unguarded."""
+    guard = _HOME_IO_GUARD
+    checking = getattr(guard, "checking", None)
+    if checking is not None:
+        # The HomeIOGuard refuses *reads* under the real roots too; a fingerprint
+        # read is the check itself, so it runs with the guard suspended.
+        checking.active = True
+    try:
+        found: dict[str, tuple[int, int] | None] = {}
+        for store in _production_project_store_paths():
+            for suffix in _PROJECT_STORE_SIDECARS:
+                candidate = store.with_name(store.name + suffix)
+                try:
+                    info = os.stat(candidate)
+                except OSError:
+                    found[str(candidate)] = None
+                else:
+                    found[str(candidate)] = (info.st_mtime_ns, info.st_size)
+        return found
+    finally:
+        if checking is not None:
+            checking.active = False
+
+
+def _project_store_changes(before, after) -> list[str]:
+    """Stores that appeared, vanished or changed between two fingerprints.
+
+    ``-shm`` is shared memory and a zero-length ``-wal`` is just an open handle,
+    so neither counts: a test that *reads* a store creates both and must not be
+    reported as a writer. A ``-wal`` holding frames (non-zero bytes) counts,
+    because that is where a WAL commit lands before a checkpoint.
+    """
+    changed: list[str] = []
+    for path in set(before) | set(after):
+        if path.endswith("-shm"):
+            continue
+        was, now = before.get(path), after.get(path)
+        if was == now:
+            continue
+        if path.endswith("-wal") and not ((was and was[1]) or (now and now[1])):
+            continue
+        changed.append(path)
+    return sorted(changed)
+
+
+def _project_store_failure(changed: list[str], test_id: str) -> str:
+    return (
+        f"TEST BUG: {test_id} wrote a LIVE Hermes project store "
+        "(per-profile projects.db):\n  " + "\n  ".join(changed)
+        + "\n\nproject state is per-profile and outlives the run. The verb reads"
+        " get_hermes_home(), so point HERMES_HOME at tmp_path (a profile store is"
+        " <HERMES_HOME>/projects.db) or pass the store path explicitly — never let"
+        " a test resolve the operator's root (t_7213e415, t_4ad44507)."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _forbid_production_project_store_writes(request, _forbid_real_hermes_home_io):
+    """Fail the test that writes a LIVE per-profile project store.
+
+    Runs after HomeIOGuard (whose instance the fingerprint reads suspend) and
+    therefore tears down before it. Opt out only for the guard's own tests.
+    """
+    if request.node.get_closest_marker("allow_real_project_store_io"):
+        yield
+        return
+    before = _project_store_fingerprints()
+    yield
+    changed = _project_store_changes(before, _project_store_fingerprints())
+    if changed:
+        pytest.fail(_project_store_failure(changed, request.node.nodeid), pytrace=False)
 
 
 @pytest.fixture
