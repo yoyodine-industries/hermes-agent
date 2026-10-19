@@ -438,9 +438,20 @@ _DO_NOT_CAPTURE_BLOCK = (
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be ACTIVE — most sessions produce "
-    "at least one skill update, even if small. A pass that does nothing is a missed learning "
-    "opportunity, not a neutral outcome.\n\n"
+    "Review the conversation above and update the skill library. EXTEND, DON'T ADD — prefer a "
+    "patch to an existing skill over a new one; a new skill is the last resort, not a default, "
+    "and a pass that patches nothing is a normal outcome when the session taught nothing durable. "
+    "A pass that adds a skill nobody needed is a COST, not a win: every skill is loaded into "
+    "context on every turn it is triggered.\n\n"
+    "A new skill is ADMISSION-GATED and is refused deterministically before it reaches disk: "
+    "skill_manage(action='create') judges the draft against the whole skill library first, and "
+    "refuses one whose intent surface is >=60% covered by an existing skill, or whose description "
+    "overlaps one >=80%, or whose content is under 15% new — naming the skill to extend and the "
+    "`references/` file to write instead. A NEW `references/` file that restates another skill is "
+    "refused too, and so is a Hub install that duplicates a skill the agent already has. So: when "
+    "a signal below fired, PATCH the skill that owns the territory, or add "
+    "`references/<topic>.md` under it; reach for create only when nothing in the library covers "
+    "the class at all.\n\n"
     "Target shape of the library: CLASS-LEVEL skills, each with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth. Not a flat list of narrow one-session skills, and "
     "not an umbrella hoarding a references/ file per session. This shapes HOW you update, not "
@@ -503,17 +514,23 @@ _SKILL_REVIEW_PROMPT = (
     "If you notice two existing skills that overlap, note it in your reply — the background "
     "curator handles consolidation at scale. Never delete a skill here.\n\n"
     "Do NOT capture" + _DO_NOT_CAPTURE_BLOCK +
-    "'Nothing to save.' is a real option but should NOT be the default. If the session ran "
-    "smoothly with no corrections and produced no new technique, just say 'Nothing to save.' and "
-    "stop. Otherwise, act."
+    "'Nothing to save.' is a real and common outcome: if the session ran smoothly with no "
+    "corrections and produced no new technique, say 'Nothing to save.' and stop — no write is "
+    "owed."
 )
 
 _COMBINED_REVIEW_PROMPT = (
     "Review the conversation above and update two things:\n\n"
     "**Memory**: " + _MEMORY_ROUTING_BLOCK +
-    "**Skills**: how to do this class of task. Be ACTIVE — most sessions produce at least one "
-    "skill update. A pass that does nothing is a missed learning opportunity, not a neutral "
-    "outcome.\n\n"
+    "**Skills**: how to do this class of task — EXTEND, DON'T ADD. Prefer a patch to an existing "
+    "skill over a new one; a new skill is the last resort, not a default, and a pass that patches "
+    "nothing is a normal outcome when the session taught nothing durable.\n\n"
+    "A new skill is ADMISSION-GATED and is refused deterministically before it reaches disk "
+    "(>=60% of its intent surface already covered by one skill, or >=80% description overlap, or "
+    "under 15% new content): the refusal names the skill to extend and the `references/` file to "
+    "write instead. A NEW `references/` file that restates another skill is refused too. So PATCH "
+    "the skill that owns the territory first, and reach for create only when nothing in the "
+    "library covers the class at all.\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth — not narrow one-session skills, and not an umbrella "
     "hoarding a references/ file per session.\n\n" + _LESSON_LAYER_BLOCK +
@@ -557,7 +574,7 @@ _COMBINED_REVIEW_PROMPT = (
     "consolidation. Never delete a skill here.\n\n"
     "Do NOT capture as skills" + _DO_NOT_CAPTURE_BLOCK +
     "Act on whichever of the two dimensions has real signal. If genuinely nothing stands out on "
-    "either, say 'Nothing to save.' and stop — but don't reach for that conclusion as a default."
+    "either, say 'Nothing to save.' and stop — that is a normal pass, not a missed one."
 )
 
 

@@ -140,6 +140,55 @@ def _check_install_target(install_dir: Path) -> None:
                              f"Use a different --name or install into a subcategory.")
 
 
+class AdmissionRefused(ValueError):
+    """A bundle the admission gate refused: refused for WHAT IT SAYS, not for a bad bundle."""
+
+
+def _check_admission(install_dir: Path, skill_name: str, quarantine_path: Path) -> None:
+    """Raise ValueError when the bundle restates a skill the agent already has.
+
+    The Hub is the second door a skill can arrive through, and it is the one that delivers a
+    COPY: an install that restates a local skill leaves the agent with two skills answering
+    one job, which is exactly the proliferation the pen gate stops. The judgement is the same
+    one `skill_manage(action='create')` applies (`tools.skill_admission.py`, the port of the
+    publish door's admission node), so a hub bundle cannot carry in what a hand-written draft
+    would be refused for.
+
+    A bundle that restates ITSELF (an update of an already-installed skill) is not a
+    collision: the corpus excludes the target directory, and same-name docs are skipped.
+    """
+    try:
+        from tools.skill_admission import refusal_message, verdict_for_content
+        from agent.skill_utils import get_all_skills_dirs
+    except Exception:
+        return
+    skill_md = Path(quarantine_path) / "SKILL.md"
+    try:
+        content = skill_md.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    roots = [Path(d) for d in get_all_skills_dirs()]
+    try:
+        verdict = verdict_for_content(skill_name, content, roots, exclude=[install_dir])
+    except Exception:
+        logger.warning("admission gate could not judge hub bundle %r; installing it", skill_name,
+                       exc_info=True)
+        return
+    if verdict.get("disposition") not in ("fold", "reject"):
+        return
+    try:
+        from tools.skill_usage import record_admission_refusal
+        record_admission_refusal(skill_name, disposition=str(verdict.get("disposition") or ""),
+                                 existing_skill=str(verdict.get("fold_target") or ""),
+                                 reason=str(verdict.get("reason") or ""))
+    except Exception:
+        logger.debug("admission refusal ledger write failed for %s", skill_name, exc_info=True)
+    hint = ""
+    if verdict.get("fold_path"):
+        hint = str(Path(str(verdict["fold_path"])).parent / "references" / f"{skill_name}.md")
+    raise AdmissionRefused(refusal_message(verdict, references_hint=hint))
+
+
 def install_from_quarantine(
     quarantine_path: Path, skill_name: str, category: str, bundle: SkillBundle, scan_result: ScanResult,
     scan_provenance: Optional[dict[str, Any]] = None,
@@ -157,6 +206,7 @@ def install_from_quarantine(
     # symlink-redirected target.
     install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
     _check_install_target(install_dir)
+    _check_admission(install_dir, safe_skill_name, quarantine_path)
     if install_dir.exists():
         shutil.rmtree(install_dir)
 
