@@ -81,12 +81,17 @@ def test_unlinked_task_unchanged(kanban_conn):
 # died with a ``workspace: ...`` failure before any checkout existed.
 
 _TITLE_CASES = [
-    "Design amend skills write route package.",  # trailing '.'
+    "x.md",  # the shape the card names: a '.md' title
+    "ends with dot.",
+    "a..b",
+    "name.lock",
+    "Design amend skills write route package.",  # trailing '.' on a long title
     "Fix a..b range handling",  # embedded '..'
     "Regenerate name.lock checks",  # component ends in '.lock'
-    "x" * 39 + ".md",  # 40-char cut lands before a '.'
+    "x" * 39 + ".md",  # 40-char cut lands right before a '.'
+    "a" * 300,  # 300-char title: the cut must still land on a valid ref
+    "...",  # only punctuation: nothing usable survives the slug
     "Ünïcode títle with émojis 🚀",  # non-ascii title
-    "ends with a dot.",
 ]
 
 
