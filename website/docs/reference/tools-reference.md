@@ -160,6 +160,7 @@ Registered when the agent is either (a) spawned by the kanban dispatcher (`HERME
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64). Stored as a real attachment under the task's attachments dir, capped at 25 MB. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_attach_url` | Attach a file to a task by URL — Hermes downloads it server-side and stores it as a real attachment (capped at 25 MB). Only http/https URLs. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_attachments` | List the files attached to a task: id, filename, content_type, size, uploader, and the absolute on-disk path. | `HERMES_KANBAN_TASK` or `kanban` toolset |
+| `kanban_close_sibling` | Close a SIBLING card as DELEGATED work from this session's own card — the door for a lane lead that absorbed a sibling's task. Rides the kernel's completion path, so the parent gate, the PR acceptance receipt and the landing-carrier clause all still apply and can refuse; a live run is refused by the claim fence. The stored result and run summary name the caller, a comment names the caller on the sibling, and the closed card's incomplete children are re-promoted to ready (`gated` when another parent is unfinished). | `HERMES_KANBAN_TASK` or `kanban` toolset |
 
 ## `project` toolset
 
