@@ -30,6 +30,7 @@ from hermes_cli.kanban_specify import (
     _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
 )
 from hermes_cli.kanban_specify import _profile_author as _specify_author
+from hermes_cli.kanban_route_role import route_children_by_role
 
 logger = logging.getLogger(__name__)
 
@@ -278,8 +279,26 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     children, reason = _clean_children(task_id, raw_tasks, routing)
     if reason:
         return DecomposeOutcome(task_id, False, reason)
+    # The post-route reads the PARENT's own text — the repo it names, the files its DoD/PR
+    # names — and this function is called with a task id (the CLI sweep, evals/), so the card
+    # is re-read here rather than threaded through the signature.
+    parent, _ = _load_triage_task(task_id)
     try:
         with kbc.connect_closing() as conn:
+            # Deterministic post-route (hermes_cli.kanban_route_role, card t_87e4e2e2): a
+            # code-shaped child must not sit on the OPS seat — that is the tier the card
+            # arrived on, and a code child there is a guaranteed hand-back. Runs on the
+            # cleaned list, before the graph is written; the record of the machine's choice
+            # is written onto the children once they exist.
+            route_plan = route_children_by_role(
+                children,
+                parent_title=parent.title if parent else "",
+                parent_body=(parent.body or "") if parent else "",
+                parent_assignee=parent.assignee if parent else None,
+                roster=routing.valid_names,
+                ops_seats=(routing.orchestrator, routing.default_assignee),
+                board=kb.board_for_connection(conn),
+            )
             child_ids = decompose_triage_task(
                 conn,
                 task_id,
@@ -288,6 +307,8 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 author=author,
                 auto_promote=routing.auto_promote,
             )
+            if child_ids:
+                route_plan.record(conn, child_ids, root_id=task_id)
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
