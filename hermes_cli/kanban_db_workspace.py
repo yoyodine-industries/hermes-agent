@@ -632,6 +632,136 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         return Path(out).expanduser()
 
 
+# ---------------------------------------------------------------------------
+# Spawn gate: a worktree anchor MUST be a git repository (card t_e5ff985b)
+# ---------------------------------------------------------------------------
+#
+# Measured 2026-10-18: 26 open cards on the migrations + platform boards carried a
+# ``workspace_path`` of ``/opt/hermes_sandbox/platform/<program>/.worktrees/<id>``. That
+# directory is the program's STATE folder (LOOPING / TASKS / EVIDENCE) -- a plain folder,
+# never a repo -- because the project was registered with ``primary`` pointing at the state
+# folder instead of at the repo it lands in. Every claim died at this seam, the dispatcher
+# retried once and gave up, and the card went back to ``ready`` looking unattended: 26 cards
+# dead with free workers, throughput down to 5/day.
+#
+# The seam already refused the spawn. What it could not do was (a) SAY WHY in the card's own
+# terms -- which project, which folder, which command fixes it -- or (b) STOP retrying, which
+# no retry can fix. Both belong here, at the one place an anchor is resolved: a distinct
+# exception type the dispatcher classifies deterministically (never prose), and a message
+# that names the repair.
+
+#: Greppable prefix of the marker the dispatcher writes on the card. It LEADS the comment and
+#: the stored error because ``_record_task_failure`` cuts the error at 500 chars.
+SPAWN_FAILED_NO_REPO_PREFIX = "spawn_failed: no repo at "
+
+
+def no_repo_refusal(
+    *,
+    anchor: Path | str,
+    task_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    project_slug: Optional[str] = None,
+) -> str:
+    """The ONE message for a worktree anchor that is not a git repo.
+
+    Names the anchor, the project that bound it, the card, and the two commands that fix it —
+    a refusal a lane can act on without reading this module.
+    """
+    anchor = str(anchor)
+    card = task_id or "<card>"
+    if project_slug and project_id:
+        who = f" Project {project_slug!r} ({project_id})."
+    elif project_slug or project_id:
+        who = f" Project {project_slug or project_id!r}."
+    else:
+        who = ""
+    slug = project_slug or "<project>"
+    fix_project = (
+        f"give the project a real repo primary (hermes project add-folder {slug} "
+        f"{slug} <git-repo> then hermes project set-primary {slug} <git-repo>)"
+    )
+    return (
+        f"{SPAWN_FAILED_NO_REPO_PREFIX}{anchor}; a worktree card materialises "
+        f"<repo>/.worktrees/{card}, so its anchor must be inside a git repository and this "
+        f"path is a plain folder.{who} Fix: either {fix_project}, or re-anchor this one card "
+        f"(hermes kanban retarget {card} --workspace worktree:<git-repo>). A project whose "
+        "cards land in SEVERAL repos must name the repo per card rather than declare a "
+        "primary folder. Not retried: no retry turns a folder into a repo."
+    )
+
+
+class WorktreeAnchorNotRepo(ValueError):
+    """A ``worktree`` card's anchor is not (inside) a git repository.
+
+    A NON-RETRYABLE class: a plain folder cannot become a repo by claiming the card again, so
+    the dispatcher blocks the card on the FIRST such failure and names the repair, instead of
+    spending the retry budget and leaving the card ``ready`` as if it were waiting its turn.
+    """
+
+    def __init__(
+        self,
+        anchor: Path | str,
+        *,
+        task_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        project_slug: Optional[str] = None,
+    ) -> None:
+        self.anchor = str(anchor)
+        self.task_id = task_id
+        self.project_id = project_id
+        self.project_slug = project_slug
+        super().__init__(
+            no_repo_refusal(
+                anchor=anchor, task_id=task_id, project_id=project_id, project_slug=project_slug
+            )
+        )
+
+
+def project_label(project_id: Optional[str]) -> Optional[str]:
+    """Best-effort project slug for a refusal message; ``None`` when unresolvable.
+
+    Cross-profile registry reads are optional here by design: the message must still name the
+    project id (which every board row carries) when no registry can be opened.
+    """
+    if not project_id:
+        return None
+    try:
+        from hermes_cli import projects_db as _pdb
+
+        with _pdb.connect_closing() as pconn:
+            row = pconn.execute(
+                "SELECT slug FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def assert_repo_anchor(
+    anchor: Path | str,
+    *,
+    task_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    project_slug: Optional[str] = None,
+) -> Path:
+    """Return the git root containing *anchor*, or refuse with ``WorktreeAnchorNotRepo``.
+
+    Used at BIRTH (a project's primary before it may anchor a worktree), at RETARGET (before a
+    card is re-pointed) and at CLAIM (before a worktree is materialised) — the same rule at
+    every door, so a misconfigured project cannot produce a card that is born impossible.
+    """
+    path = Path(str(anchor)).expanduser()
+    root = _git_toplevel(path) if path.exists() else None
+    if root is None:
+        raise WorktreeAnchorNotRepo(
+            path,
+            task_id=task_id,
+            project_id=project_id,
+            project_slug=project_slug if project_slug is not None else project_label(project_id),
+        )
+    return root
+
+
 def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     try:
         result = _git(repo_root, "show-ref", "--verify", f"refs/heads/{branch_name}", timeout=30)
@@ -736,9 +866,10 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             )
         repo_root = _git_toplevel(anchor)
         if repo_root is None:
-            raise ValueError(
-                f"task {task.id} has workspace_kind=worktree but board "
-                f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
+            raise WorktreeAnchorNotRepo(
+                anchor,
+                task_id=task.id,
+                project_id=getattr(task, "project_id", None),
             )
         return _anchored_worktree(repo_root, task.id, branch_name)
 
@@ -775,9 +906,10 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
-        raise ValueError(
-            f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
-            "and does not point at a git repo root"
+        raise WorktreeAnchorNotRepo(
+            requested,
+            task_id=task.id,
+            project_id=getattr(task, "project_id", None),
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name

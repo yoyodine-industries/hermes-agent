@@ -12,6 +12,7 @@ worker's claim).
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,19 @@ from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import projects_db as pdb
+
+
+def _repo(path):
+    """A real git repo.
+
+    t_e5ff985b: a project primary (and a board default_workdir) must be a git repo to anchor
+    a worktree; an existing plain folder is now refused at the birth and retarget doors. These
+    cases assert where the card is re-pointed, so their fixtures must be real repos.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main", str(path)],
+                   check=True, capture_output=True, text=True)
+    return path
 
 
 @pytest.fixture
@@ -62,10 +76,8 @@ def test_retarget_repoints_a_mis_born_card_onto_its_project(fresh_home, tmp_path
     re-points it to the project that owns the change and RECORDS the move, on a
     BLOCKED card, leaving it parked.
     """
-    wrong = tmp_path / "hermes-agent"
-    wrong.mkdir()
-    right = tmp_path / "yaan-web-services-dashboard"
-    right.mkdir()
+    wrong = _repo(tmp_path / "hermes-agent")
+    right = _repo(tmp_path / "yaan-web-services-dashboard")
     with pdb.connect_closing() as pconn:
         proj_id = pdb.create_project(pconn, name="Dashboard", primary_path=str(right))
 
@@ -115,8 +127,7 @@ def test_retarget_repoints_a_mis_born_card_onto_its_project(fresh_home, tmp_path
 def test_retarget_refuses_an_unknown_project_and_writes_nothing(fresh_home, tmp_path):
     """A named-but-unknown project is REFUSED (unlike create's silent drop): a
     retarget that quietly kept the old binding would defeat the verb."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _repo(tmp_path / "repo")
     kb.create_board("b1", name="B1", default_workdir=str(repo))
     conn = kbc.connect(board="b1")
     try:
@@ -149,8 +160,7 @@ def test_retarget_refuses_a_terminal_card(fresh_home):
 
 def test_retarget_clears_the_link_and_goes_scratch(fresh_home, tmp_path):
     """``--project none`` detaches: the card owns no repo again (scratch)."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _repo(tmp_path / "repo")
     with pdb.connect_closing() as pconn:
         proj_id = pdb.create_project(pconn, name="R", primary_path=str(repo))
     kb.create_board("b3", name="B3")
@@ -169,8 +179,7 @@ def test_retarget_clears_the_link_and_goes_scratch(fresh_home, tmp_path):
 
 
 def test_retarget_noop_records_no_event(fresh_home, tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _repo(tmp_path / "repo")
     with pdb.connect_closing() as pconn:
         proj_id = pdb.create_project(pconn, name="R2", primary_path=str(repo))
     kb.create_board("b4", name="B4")
@@ -191,8 +200,7 @@ def test_retarget_noop_records_no_event(fresh_home, tmp_path):
 
 
 def test_retarget_refuses_a_live_claim_unless_forced(fresh_home, tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _repo(tmp_path / "repo")
     with pdb.connect_closing() as pconn:
         proj_id = pdb.create_project(pconn, name="R3", primary_path=str(repo))
     kb.create_board("b5", name="B5")
@@ -215,8 +223,7 @@ def test_retarget_refuses_a_live_claim_unless_forced(fresh_home, tmp_path):
 def test_cli_retarget_verb_is_wired(fresh_home, tmp_path):
     """The verb is reachable end to end through the SAME entry the CLI and the
     gateway use (``run_slash`` drives ``build_parser`` + the handler map)."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _repo(tmp_path / "repo")
     with pdb.connect_closing() as pconn:
         pdb.create_project(pconn, name="CLIProj", primary_path=str(repo))
     kb.init_db()

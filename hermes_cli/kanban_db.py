@@ -1552,6 +1552,24 @@ def _resolve_project_link(
     if workspace_kind == "scratch" and project_obj.primary_path:
         workspace_kind = "worktree"
     if workspace_kind == "worktree" and workspace_path is None and project_obj.primary_path:
+        # A primary that is an EXISTING folder but not a git repo can never anchor a worktree
+        # (t_e5ff985b): the card would be born with an impossible
+        # ``<primary>/.worktrees/<id>`` and die at its first claim. Refuse at BIRTH — the
+        # honest answer names the project and the fix instead of filing a card that can never
+        # run. A primary that does not exist YET is left to the claim seam (which blocks the
+        # card on its first failure and annotates it), because registering a project before
+        # cloning its repo is a legitimate order; registering a plain folder as its repo is not.
+        from pathlib import Path as _Path
+
+        from hermes_cli import kanban_db_workspace as _wsm
+
+        _primary = _Path(str(project_obj.primary_path)).expanduser()
+        if _primary.exists():
+            _wsm.assert_repo_anchor(
+                _primary,
+                project_id=project_obj.id,
+                project_slug=project_obj.slug,
+            )
         # Concrete path is deferred to the insert loop: a fresh
         # ``<repo>/.worktrees/<task-id>`` keyed on the new task id.
         project_repo = str(project_obj.primary_path)
@@ -6026,6 +6044,17 @@ def retarget_task(
     else:  # worktree
         if not new_path:
             if project_obj is not None and project_obj.primary_path:
+                # The recovery door must not re-point a card onto the same impossible anchor
+                # it is fixing (t_e5ff985b): retarget is what a lane reaches for AFTER a
+                # spawn_failed, so it is the last place that may accept a non-repo primary.
+                from hermes_cli import kanban_db_workspace as _wsm
+
+                _wsm.assert_repo_anchor(
+                    project_obj.primary_path,
+                    task_id=task_id,
+                    project_id=project_obj.id,
+                    project_slug=project_obj.slug,
+                )
                 new_path = os.path.join(str(project_obj.primary_path), ".worktrees", task_id)
             elif project_obj is None and task.workspace_kind == "worktree" and task.workspace_path:
                 new_path = task.workspace_path

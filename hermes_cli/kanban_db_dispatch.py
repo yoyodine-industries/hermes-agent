@@ -127,6 +127,11 @@ TREE_IMPORT_INCONSISTENCY = "tree-import-inconsistency:"
 SPAWN_FAILURE_CARD = "card"
 SPAWN_FAILURE_SUBSTRATE_IMPORT = "substrate_import"
 SPAWN_FAILURE_HOST_CAPACITY = "host_capacity"
+#: The card's worktree anchor is not a git repository (``WorktreeAnchorNotRepo``). NOT
+#: infrastructure and NOT retryable: the wiring is the card's, and a plain folder does not
+#: become a repo between tick N and tick N+1. The card is blocked on the FIRST such failure and
+#: annotated with ``spawn_failed: no repo at <path>`` plus the repair (card t_e5ff985b).
+SPAWN_FAILURE_WORKSPACE_NOT_REPO = "workspace_not_repo"
 
 #: ``substrate_import:<provider-relpath>:<symbol>`` -- the lane-level dedupe key (D6).
 SUBSTRATE_SIGNATURE_PREFIX = "substrate_import:"
@@ -447,12 +452,19 @@ def classify_spawn_failure(exc: BaseException, *, tree: Optional[Path] = None) -
       tree and its provider is source under the tree that does not supply the name. Nothing of
       the card ran, so the failure must not spend the card's retry budget, and it must be counted
       for the LANE actor instead of parking the card.
+    * ``workspace_not_repo`` -- the card's own worktree anchor is not a git repository
+      (``WorktreeAnchorNotRepo``). The card's wiring is wrong and no retry can fix a folder, so
+      this is the one card-class verdict that trips the breaker on the FIRST failure.
     * ``card`` -- everything else, deliberately including a missing third-party dependency and a
       failure whose frames are all outside the tree. The classifier never widens its own reach:
       an import failure it cannot attribute to THIS tree stays the card's.
 
     Callers must not scatter ``isinstance`` checks beside this: one verdict per failure.
     """
+    from hermes_cli.kanban_db_workspace import WorktreeAnchorNotRepo
+
+    if isinstance(exc, WorktreeAnchorNotRepo):
+        return SPAWN_FAILURE_WORKSPACE_NOT_REPO
     try:
         from tools.process_registry import RestartSafeScopeUnavailable
     except Exception:  # pragma: no cover - a host without the module has no such refusal
@@ -766,6 +778,10 @@ def _record_spawn_failure(
     tree = _dispatching_tree_root()
     error_text, kind, metadata_extra = _spawn_failure_report(exc, task_id, tree=tree)
     infrastructure = kind in (SPAWN_FAILURE_SUBSTRATE_IMPORT, SPAWN_FAILURE_HOST_CAPACITY)
+    # A non-repo anchor is not retryable: blocking on the FIRST failure is the difference
+    # between a card that says "this is broken, here is the fix" and one that burns its
+    # retry budget and returns to ``ready`` looking unattended (card t_e5ff985b).
+    non_retryable = kind == SPAWN_FAILURE_WORKSPACE_NOT_REPO
     if kind == SPAWN_FAILURE_HOST_CAPACITY:
         _kb._log.warning(
             "kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s",
@@ -776,18 +792,43 @@ def _record_spawn_failure(
             "kanban dispatcher: spawn of %s refused, the dispatching tree's own modules "
             "disagree: %s", task_id, error_text,
         )
+    elif non_retryable:
+        _kb._log.error(
+            "kanban dispatcher: %s cannot spawn and no retry can fix it: %s", task_id, error_text,
+        )
     # The naming line leads for a substrate failure; an ordinary failure keeps its caller's
-    # context label ("workspace: ...").
-    text = error_text if kind == SPAWN_FAILURE_SUBSTRATE_IMPORT else f"{prefix}{error_text}"
+    # context label ("workspace: ..."). The no-repo refusal carries its own leading marker.
+    if kind == SPAWN_FAILURE_SUBSTRATE_IMPORT or non_retryable:
+        text = error_text
+    else:
+        text = f"{prefix}{error_text}"
     blocked = _record_task_failure(
         conn, task_id, text,
         outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-        infrastructure=infrastructure, metadata_extra=metadata_extra,
+        infrastructure=infrastructure, metadata_extra=metadata_extra, force_trip=non_retryable,
     )
     if kind == SPAWN_FAILURE_SUBSTRATE_IMPORT:
         _maybe_file_substrate_actor(
             conn, (metadata_extra or {}).get("substrate_signature"), tree=tree, board=board,
         )
+    if non_retryable:
+        # The refusal must be readable ON the card, not only in the dispatcher's log: a board
+        # listing shows status, and a card that failed to spawn for a reason no retry can fix
+        # has to SAY so where the next worker looks (D4).
+        try:
+            _kb.add_comment(
+                conn, task_id, "dispatcher",
+                f"{error_text}\n\n"
+                f"Blocked on the FIRST attempt: a spawn cannot be retried into a git "
+                f"repository. Repair the project's primary repo, or re-anchor this card with "
+                f"`hermes kanban retarget {task_id} --workspace worktree:<git-repo>`, then "
+                f"unblock it.",
+            )
+        except Exception as exc:  # pragma: no cover - annotation is best-effort, the block is not
+            _kb._log.warning(
+                "kanban dispatcher: could not annotate %s with its spawn refusal: %s",
+                task_id, exc,
+            )
     return blocked
 
 
