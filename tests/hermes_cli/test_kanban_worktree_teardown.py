@@ -11,6 +11,8 @@ remote-tracking ref. Any doubt preserves the worktree.
 
 from __future__ import annotations
 
+import os
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -157,12 +159,80 @@ def test_cleanup_retries_worktree_removal_once(
     assert not wt.exists()
 
 
-def test_dirty_worktree_preserved(repo: Path) -> None:
+def _archives_for(home: Path, task_id: str) -> list[Path]:
+    root = home / "archive" / "worktree-prune"
+    return sorted(root.glob(f"{task_id}-*")) if root.is_dir() else []
+
+
+def test_untracked_only_worktree_archived_then_removed(
+    kanban_home: Path, repo: Path
+) -> None:
+    """An UNTRACKED-only tree is reclaimed: its files are archived, then the
+    tree goes. Preserve-in-place is what grew the corpus .worktrees to 2.9 GB —
+    an agent's half-written scratch files are not a reason to leak a checkout
+    forever, they are a reason to copy them out first.
+    """
     wt = _make_worktree(repo, "t_bbbb2222")
     (wt / "wip.txt").write_text("uncommitted\n", encoding="utf-8")
     kbw._cleanup_worktree_workspace("t_bbbb2222", str(wt))
+
+    assert not wt.exists()
+    archives = _archives_for(kanban_home, "t_bbbb2222")
+    assert archives, "the untracked file must be archived, never silently discarded"
+    assert (archives[0] / "wip.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+
+def test_untracked_path_with_space_archived_then_removed(
+    kanban_home: Path, repo: Path
+) -> None:
+    """A path holding a SPACE must survive the round trip.
+
+    ``git status --porcelain`` C-quotes such a path (``"qa notes.md"``), so the
+    old line-slice produced a rel-path that never joined back onto the tree:
+    the archive came out empty, nothing was cleared, and ``worktree remove``
+    failed on the still-dirty tree — every such card leaked its checkout
+    forever.
+    """
+    wt = _make_worktree(repo, "t_space1234")
+    (wt / "qa notes.md").write_text("with a space\n", encoding="utf-8")
+    kbw._cleanup_worktree_workspace("t_space1234", str(wt))
+
+    assert not wt.exists()
+    archives = _archives_for(kanban_home, "t_space1234")
+    assert archives, "a spaced untracked path must be archived, not leak the tree"
+    assert (archives[0] / "qa notes.md").read_text(encoding="utf-8") == "with a space\n"
+
+
+def test_untracked_symlink_archived_as_link_then_removed(
+    kanban_home: Path, repo: Path
+) -> None:
+    """A tree whose only untracked content is a SYMLINK is archived, not lost.
+
+    The old archive loop skipped symlinks outright, so the tree was cleared
+    (and removed) with the link never captured while the caller logged that
+    the scratch had been preserved. The link must be recreated AS a link.
+    """
+    wt = _make_worktree(repo, "t_link12345")
+    (wt / "target.txt").write_text("points here\n", encoding="utf-8")
+    (wt / "alias").symlink_to("target.txt")
+    kbw._cleanup_worktree_workspace("t_link12345", str(wt))
+
+    assert not wt.exists()
+    archives = _archives_for(kanban_home, "t_link12345")
+    assert archives, "an untracked symlink must be archived, not silently dropped"
+    assert (archives[0] / "alias").is_symlink()
+    assert os.readlink(archives[0] / "alias") == "target.txt"
+
+
+def test_tracked_modification_preserved_in_place(kanban_home: Path, repo: Path) -> None:
+    """Tracked work is real work: preserve in place, do not archive-and-delete."""
+    wt = _make_worktree(repo, "t_track9999")
+    (wt / "README.md").write_text("edited in place\n", encoding="utf-8")
+    kbw._cleanup_worktree_workspace("t_track9999", str(wt))
+
     assert wt.is_dir()
-    assert (wt / "wip.txt").exists()
+    assert (wt / "README.md").read_text(encoding="utf-8") == "edited in place\n"
+    assert not _archives_for(kanban_home, "t_track9999")
 
 
 def test_unpushed_commits_preserved(repo: Path) -> None:
@@ -247,7 +317,9 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
     assert not _branch_exists(repo, f"wt/{tid}")
 
 
-def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -> None:
+def test_complete_task_archives_untracked_worktree(
+    kanban_home: Path, repo: Path
+) -> None:
     with kbc.connect_closing() as conn:
         tid, wt = _worktree_task(conn, repo)
         (wt / "wip.txt").write_text("unsaved\n", encoding="utf-8")
@@ -255,8 +327,33 @@ def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         assert kb.claim_task(conn, tid, claimer="worker") is not None
         assert kb.complete_task(conn, tid, summary="done")
-    assert wt.is_dir()
-    assert (wt / "wip.txt").exists()
+    assert not wt.exists()
+    archives = _archives_for(kanban_home, tid)
+    assert archives
+    assert (archives[0] / "wip.txt").exists()
+
+
+def test_stub_sibling_board_does_not_block_cleanup(
+    kanban_home: Path, repo: Path
+) -> None:
+    """A sibling board DB with no ``tasks`` table must not defer every cleanup.
+
+    The live home carries ``boards/default`` and ``boards/_archived`` stubs with
+    no ``tasks`` table. Scanning them raised ``sqlite3.Error``, which the caller
+    reads as "cannot tell whether another task uses this path" — so
+    ``_cleanup_workspace`` deferred for EVERY card on EVERY board and no
+    worktree was ever reclaimed. 203 done/archived rows kept a live workspace.
+    """
+    stub = kanban_home / "kanban" / "boards" / "default" / "kanban.db"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(stub)
+    conn.execute("CREATE TABLE kanban_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    conn.close()
+
+    with kbc.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        assert kbw._workspace_in_use_by_other(conn, tid, wt) is None
 
 
 def test_archive_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> None:
@@ -287,6 +384,84 @@ def test_parent_worktree_deferred_until_children_done(
         assert kb.complete_task(conn, child, summary="child done")
     # last child terminal -> deferred parent worktree reaped
     assert not parent_wt.exists()
+
+
+def _set_status(conn, tid: str, status: str) -> None:
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+
+
+def test_prune_reclaims_tree_of_terminal_card(kanban_home: Path, repo: Path) -> None:
+    """`hermes worktree prune` must classify a t_<hex> tree by its card's STATUS.
+
+    It used to skip every kanban task tree by NAME alone, so the ~177 trees
+    whose cards were already done/archived could never be reclaimed by the one
+    instrument an operator runs. The branch is kept on the terminal path: the
+    card's PR or its landing door may still need it.
+    """
+    from hermes_cli import worktree_gc as gc
+
+    with kbc.connect_closing() as conn:
+        tid, _wt = _worktree_task(conn, repo)
+        _set_status(conn, tid, "done")
+
+    records = {r.name: r for r in gc.audit_worktrees(str(repo), with_sizes=False)}
+    record = records[tid]
+    assert record.verdict in {"reap", "reap-archive", "reap-keep-branch"}, record.reason
+    assert "done" in record.reason
+    assert record.verdict != "keep"
+
+
+def test_prune_keeps_tree_of_live_card(kanban_home: Path, repo: Path) -> None:
+    """Row existence is not enough either: a live card's tree stays."""
+    from hermes_cli import worktree_gc as gc
+
+    with kbc.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        _set_status(conn, tid, "running")
+
+    records = {r.name: r for r in gc.audit_worktrees(str(repo), with_sizes=False)}
+    record = records[tid]
+    assert record.verdict == "keep"
+    assert "running" in record.reason
+    assert wt.is_dir()
+
+
+def test_prune_resolves_board_from_a_profile_home(
+    kanban_home: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pruner must find the SHARED board while running under a profile.
+
+    Boards are shared across profiles by design, so ``_card_status_for_tree``
+    resolves through ``kanban_db.kanban_home()`` (``HERMES_KANBAN_HOME`` else the
+    Hermes root), never the profile's ``HERMES_HOME``. Resolving through the
+    profile home made the pruner blind to every card: measured 0/173 resolved,
+    so ``prune`` returned the base 5-reap result and never touched the 122
+    reclaimable card trees. Both resolutions are asserted here — the profile
+    home alone, and the profile home with an explicit board root.
+    """
+    from hermes_cli import worktree_gc as gc
+
+    with kbc.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        _set_status(conn, tid, "done")
+
+    profile_home = kanban_home / "profiles" / "platform-coder"
+    profile_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    # 1. Profile HERMES_HOME only: the board root is still derived correctly.
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    record = {r.name: r for r in gc.audit_worktrees(str(repo), with_sizes=False)}[tid]
+    assert "no board row" not in record.reason, record.reason
+    assert record.verdict != "keep", record.reason
+
+    # 2. Profile HERMES_HOME plus an explicit shared board root.
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    record = {r.name: r for r in gc.audit_worktrees(str(repo), with_sizes=False)}[tid]
+    assert "no board row" not in record.reason, record.reason
+    assert record.verdict != "keep", record.reason
+    assert wt.is_dir(), "the audit alone must never remove anything"
 
 
 def _running_scratch_parent(conn, title: str = "parent") -> tuple[str, Path]:

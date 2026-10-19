@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -95,44 +96,160 @@ def _tree_size_mb(path: Path, timeout: int = 30) -> Optional[int]:
 
 
 def _dirty_split(path: str) -> tuple[bool, list[str]]:
-    """(has_tracked_modifications, untracked_paths) — tracked = real work, untracked = archivable."""
+    """(has_tracked_modifications, untracked_paths) — tracked = real work, untracked = archivable.
+
+    ``-z`` plus ``core.quotePath=false``: the human-readable form C-quotes every
+    path holding a space or a non-ASCII byte, so ``qa notes.md`` arrives as
+    ``"qa notes.md"``. Slicing that record yielded a rel-path that never joined
+    back onto the tree, the archive came out empty, and the tree leaked forever
+    with the log claiming its scratch had been preserved. Under ``-z`` each
+    record is ``XY <path>`` NUL-terminated, and a rename/copy carries its
+    ORIGINAL path as one extra NUL-separated field.
+    """
     try:
-        result = _git(["status", "--porcelain"], cwd=path, timeout=10)
+        result = _git(["-c", "core.quotePath=false", "status", "--porcelain", "-z"],
+                      cwd=path, timeout=10)
         if result.returncode != 0:
             return True, []  # fail safe: treat as real work
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
-        untracked = [line[3:].strip() for line in lines if line.startswith("??")]
-        return len(untracked) != len(lines), untracked
+        fields = result.stdout.split("\0")
+        untracked: list[str] = []
+        tracked = 0
+        index = 0
+        while index < len(fields):
+            record = fields[index]
+            index += 1
+            if not record:
+                continue
+            code, name = record[:2], record[3:]
+            if "R" in code or "C" in code:
+                index += 1  # the rename/copy source follows as its own field
+            if code == "??":
+                untracked.append(name)
+            else:
+                tracked += 1
+        return tracked > 0, untracked
     except Exception:
         return True, []
 
 
 def _archive_untracked(tree: Path, untracked: list[str]) -> Optional[Path]:
-    """Copy untracked files out of a doomed tree; None on any failure (caller must then keep)."""
+    """Copy untracked files out of a doomed tree; None on any failure (caller must then keep).
+
+    Symlinks are archived AS LINKS. Skipping them (the old behaviour) let a tree
+    whose only untracked content was a symlink be deleted with the link never
+    captured, while the caller logged that the scratch had been preserved.
+    """
     stamp = time.strftime("%Y%m%d-%H%M%S")
     from hermes_constants import get_hermes_home
     dest = get_hermes_home() / "archive" / "worktree-prune" / f"{tree.name}-{stamp}"
     try:
         for rel in untracked:
             src = tree / rel
-            if not src.exists() or src.is_symlink():
-                continue
-            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-            if src.is_dir():
-                shutil.copytree(src, dest / rel, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dest / rel)
-        return dest if dest.exists() else None
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_symlink():
+                if target.is_symlink() or target.exists():
+                    target.unlink()
+                os.symlink(os.readlink(src), target)
+            elif src.is_dir():
+                shutil.copytree(src, target, symlinks=True, dirs_exist_ok=True)
+            elif src.exists():
+                shutil.copy2(src, target)
+            # else: the path vanished between `status` and now — nothing to preserve
+        return dest
     except Exception as exc:
         logger.warning("Could not archive untracked files from %s: %s", tree, exc)
         return None
 
 
+_TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled", "failed"})
+
+
+def _card_status_for_tree(task_id: str) -> Optional[str]:
+    """Board status of *task_id*, or None when no board store knows the card.
+
+    Resolved through :func:`hermes_cli.kanban_db.kanban_home` — the board root,
+    which honours ``HERMES_KANBAN_HOME`` and ``get_default_hermes_root()`` —
+    NEVER the active profile's ``HERMES_HOME``. Boards are shared across
+    profiles by design, so resolving through the profile home made the pruner
+    blind to every card whenever it ran under ``HERMES_HOME=<profile>``:
+    measured 0/173 cards resolved that way, versus 122 reap / 57 keep (with no
+    live-card tree reaped) against the board root.
+
+    Reads every board store read-only: the root ``kanban.db``, the legacy
+    ``kanban/kanban.db`` and every ``kanban/boards/<slug>/kanban.db``. A store
+    with no ``tasks`` table is skipped — it cannot hold the card, and treating
+    such a stub as unreadable is what made the completion path defer every
+    cleanup. Any board reporting a NON-terminal status wins: conservative.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb  # late: import cycle
+
+        home = _kb.kanban_home()
+        boards = _kb.boards_root()
+    except Exception:
+        return None
+    candidates = [home / "kanban.db", home / "kanban" / "kanban.db"]
+    if boards.is_dir():
+        with contextlib.suppress(OSError):
+            candidates.extend(sorted(p / "kanban.db" for p in boards.iterdir() if p.is_dir()))
+    statuses: list[str] = []
+    seen: set[str] = set()
+    for db in candidates:
+        if not db.is_file():
+            continue
+        try:
+            key = str(db.resolve())
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            conn = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=1.0)
+            try:
+                row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+        if row and row[0]:
+            statuses.append(str(row[0]))
+    if not statuses:
+        return None
+    for status in statuses:
+        if status not in _TERMINAL_CARD_STATUSES:
+            return status
+    return statuses[0]
+
+
 def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads) -> tuple[str, str, list[str]]:
-    """Return (verdict, reason, untracked) for one tree under ``.worktrees/``."""
-    path = str(entry)
+    """Return (verdict, reason, untracked) for one tree under ``.worktrees/``.
+
+    A ``t_<hex>`` tree belongs to a card, and the board's STATUS for that card
+    — not the existence of a row — decides whether it may be reclaimed. A
+    terminal card's tree is judged by the ordinary dirty/pushed rules below,
+    with one extra guard: its branch is kept, because the card's PR or its
+    landing door may still need it.
+    """
+    kanban_status: Optional[str] = None
     if _KANBAN_RE.match(entry.name):
-        return "keep", "kanban task tree (owned by kanban gc)", []
+        kanban_status = _card_status_for_tree(entry.name)
+        if kanban_status is None:
+            return "keep", "kanban task tree; no board row for this card", []
+        if kanban_status not in _TERMINAL_CARD_STATUSES:
+            return "keep", f"kanban task tree; card is {kanban_status}", []
+    verdict, reason, untracked = _classify_reapable(_ops, repo_root, entry, merge_cache, remote_heads)
+    if kanban_status is not None:
+        reason = f"card {kanban_status}; {reason}"
+        if verdict == "reap":
+            return "reap-keep-branch", f"{reason} (branch kept for the card)", []
+    return verdict, reason, untracked
+
+
+def _classify_reapable(_ops, repo_root: str, entry: Path, merge_cache, remote_heads) -> tuple[str, str, list[str]]:
+    """Reapability of one tree, ignoring card ownership."""
+    path = str(entry)
     if _ops._worktree_lock_is_live(repo_root, path, timeout=5) == "live":
         return "keep", "in use by a running hermes session", []
     tracked_dirty, untracked = _dirty_split(path)
