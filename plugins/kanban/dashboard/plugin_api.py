@@ -213,6 +213,14 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     if task_ids is not None and not task_ids:
         return {}
     diag_config = kd.config_from_runtime_config(load_config())
+    # A path-less ``worktree`` card anchors on the board's ``default_workdir``; the workspace
+    # rule needs it to answer for one (card t_15dce81a). Best-effort: no metadata, no judgement.
+    try:
+        diag_config["board_default_workdir"] = str(
+            kanban_db.read_board_metadata(kanban_db.board_for_connection(conn)).get("default_workdir") or ""
+        )
+    except Exception:
+        pass
     if task_ids is not None:
         rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
     else:

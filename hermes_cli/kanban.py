@@ -711,7 +711,19 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
     diag_config = kd.config_from_runtime_config(load_config())
 
+    fleet_mode = not getattr(args, "task", None)
+    unresolved_workspaces: list[str] = []
     with kbc.connect_closing() as conn:
+        if fleet_mode:
+            # A path-less ``worktree`` card anchors on the board's ``default_workdir``, so the
+            # workspace rule needs that value to answer for one. Best-effort: a board with no
+            # metadata simply has no such card to judge.
+            try:
+                diag_config["board_default_workdir"] = str(
+                    kb.read_board_metadata(kb.board_for_connection(conn)).get("default_workdir") or ""
+                )
+            except Exception:
+                pass
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
@@ -735,6 +747,14 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                                                      graph=graph_by.get(tid), config=diag_config)
                     if dl:
                         diags_by_task[tid] = dl
+
+        # Computed BEFORE the severity filter: the board-level count is a property of the BOARD,
+        # not of the slice an operator asked to see, so ``--severity warning`` cannot hide the
+        # critical class this line exists to surface.
+        unresolved_workspaces = [
+            tid for tid, dl in diags_by_task.items()
+            if any(d.kind == "workspace_cannot_resolve" for d in dl)
+        ]
 
         sev = getattr(args, "severity", None)
         if sev:
@@ -762,6 +782,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         return 0
 
     print(f"kanban.dispatch_profiles: {allowlist}")
+    if fleet_mode:
+        named = f" ({', '.join(unresolved_workspaces)})" if unresolved_workspaces else ""
+        print(
+            f"workspace_unresolvable: {len(unresolved_workspaces)} ready card(s) whose "
+            f"workspace cannot resolve{named}"
+        )
     if not diags_by_task:
         print("No active diagnostics on this board.")
         return 0
