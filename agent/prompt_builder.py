@@ -250,10 +250,10 @@ SESSION_SEARCH_GUIDANCE = (
 # do not need. Bisected against the live API: that sentence alone reproduces the 400 and removing it alone
 # clears it; size and the system[0] identity gate were both ruled out. The reword is empirically validated,
 # not understood — if you rewrite this sentence, re-verify against a subscription OAuth token, not an
-# sk-ant-api… key, which does not hit the filter. Dieted (#95681, maintainer-directed): the record-it /
-# patch-it coaching that used to open this block duplicated the ## Skills section (which teaches both "offer
-# to save as a skill" and "fix it with skill_manage(action='patch')") and skill_manage's own schema. Only
-# the compaction-pruning contract lives here — nothing else teaches it.
+# sk-ant-api… key, which does not hit the filter. Dieted (#95681, maintainer-directed): only ONE record-it
+# line survives here, pointing at patch-first, plus the compaction-pruning contract that nothing else
+# teaches; the rest of the coaching lives in the ## Skills section (which now offers "record what it
+# taught ... a patch to that skill first" instead of the old "offer to save as a skill", t_6c0fb5f2).
 SKILL_SAFETY_HEADING = "## Skill Safety Rule"
 SKILLS_GUIDANCE = (
     "When you work out a non-trivial workflow, record it with skill_manage — patch the skill that "
