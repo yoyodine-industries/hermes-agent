@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import os
+import logging
 import shutil
 import sqlite3
 import subprocess
@@ -19,9 +20,12 @@ from typing import TYPE_CHECKING
 import contextlib
 
 from hermes_cli.worktree_ops import release_lsp_clients
+from hermes_cli.projects_db import sanitize_branch_name
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+
+_log = logging.getLogger(__name__)
 
 _REMOVABLE_KINDS = ("scratch", "worktree")
 
@@ -685,6 +689,49 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _git_ref_accepted(branch_name: str) -> bool:
+    """True when git itself accepts *branch_name* as a branch ref."""
+    try:
+        probe = subprocess.run(
+            ["git", "check-ref-format", "--branch", branch_name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        # No usable git: let ``git worktree add`` be the judge rather than
+        # rewriting a name we could not check.
+        return True
+    return probe.returncode == 0
+
+
+def safe_branch_name(branch_name: str, *, task_id: str = "") -> str:
+    """Return a branch name ``git worktree add`` accepts, repairing a bad one.
+
+    Derivation is sanitized at the source (``projects_db.branch_name_for``), but a
+    STORED ``branch_name`` can predate that fix, or be written straight to the
+    column by an API caller. git rejects the whole ref, so one trailing ``.``
+    turns into ``git worktree add`` failing and the dispatch dying with a
+    ``workspace: ...`` spawn failure, before any checkout exists. Verifying here —
+    the one seam every worktree path crosses — turns that dead card into a
+    repaired, logged name.
+    """
+    name = (branch_name or "").strip()
+    if not name or _git_ref_accepted(name):
+        return name
+    repaired = sanitize_branch_name(name, fallback=f"wt/{task_id}" if task_id else "")
+    if not repaired or not _git_ref_accepted(repaired):
+        repaired = f"wt/{task_id}" if task_id else "wt/branch"
+    _log.warning(
+        "kanban workspace: stored branch name %r is not a valid git ref; "
+        "using %r for task %s",
+        name,
+        repaired,
+        task_id or "?",
+    )
+    return repaired
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -717,7 +764,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
     launched from); with no anchor configured we fail loudly rather than guess."""
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = safe_branch_name(
+        (task.branch_name or "").strip() or f"wt/{task.id}", task_id=task.id
+    )
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()

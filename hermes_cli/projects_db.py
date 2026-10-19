@@ -71,6 +71,11 @@ CREATE TABLE IF NOT EXISTS discovered_repos (
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 # Deterministic branch slug: lowercase, separators collapsed, capped.
 _BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
+# What ``git check-ref-format`` forbids outright: every control character, space, and the seven
+# specials. Rewritten to '-' rather than dropped so a derived name stays readable.
+_GIT_REF_ILLEGAL_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]+")
+_GIT_REF_DOT_RUN_RE = re.compile(r"\.{2,}")
+_GIT_REF_LOCK_SUFFIX = ".lock"
 _INITIALIZED_PATHS: set[str] = set()
 # TEXT columns added to `projects` after v1; re-applied idempotently on every open so a legacy DB
 # upgrades in place.
@@ -477,9 +482,53 @@ def project_for_path(conn: sqlite3.Connection, path: str, *, include_archived: b
     return get_project(conn, max(owners, key=lambda r: len(r["folder"]))["pid"]) if owners else None
 
 
+def sanitize_branch_name(name: str, *, fallback: str = "") -> str:
+    """Rewrite *name* into a ref ``git check-ref-format --branch`` accepts.
+
+    A branch name derived from a card title inherits the title's free text, and
+    several ordinary titles yield a ref git REFUSES outright: a trailing ``.``
+    (``... package.``), an embedded ``..``, a component ending in ``.lock``, a
+    ``@{``, or a 40-char cut that lands right before a ``.``. git rejects the
+    WHOLE ref, so ``git worktree add`` fails and the dispatch dies before any
+    checkout exists. Derivation therefore goes through here.
+
+    The rules are git's, measured against ``check-ref-format``:
+
+    * control characters, space and ``~ ^ : ? * [ \\`` are not allowed;
+    * ``@{`` is not allowed;
+    * no component may begin with ``.``, end with ``.`` or end in ``.lock``;
+    * ``..`` may not appear anywhere;
+    * components are non-empty (no ``//``), and the ref may not begin with ``-``.
+
+    Substitutions are deterministic and idempotent (``sanitize(sanitize(x)) ==
+    sanitize(x)``), and an already-valid name comes back byte-identical, so no
+    existing branch name moves. An unrecoverable name becomes *fallback*, which
+    the caller supplies when it knows the task.
+    """
+    s = _GIT_REF_ILLEGAL_RE.sub("-", str(name or "").strip())
+    s = s.replace("@{", "-")
+    components: list[str] = []
+    for raw in s.split("/"):
+        comp = raw.lstrip(".")  # a component may not BEGIN with '.'
+        comp = _GIT_REF_DOT_RUN_RE.sub(".", comp)  # '..' is never allowed
+        comp = comp.rstrip(".")  # a component may not END with '.'
+        if comp.endswith(_GIT_REF_LOCK_SUFFIX):  # 'x.lock' is reserved by git
+            comp = comp[: -len(_GIT_REF_LOCK_SUFFIX)] + "-lock"
+        if comp:
+            components.append(comp)
+    s = "/".join(components).lstrip("-")  # a ref may not begin with '-'
+    return s or fallback
+
+
 def branch_name_for(project: Project, task_id: str, *, title: str = "") -> str:
     """Deterministic ``<project-slug>/<task-id>[-<title-slug>]`` branch name for a project-linked kanban
     task (stable and human-meaningful, replacing the random ``wt/<task-id>`` fallback)."""
     base = f"{project.slug or _slugify(project.name)}/{task_id}"
     tslug = _BRANCH_SAFE_RE.sub("-", str(title).strip().lower()).strip("-")[:40].strip("-") if title else ""
-    return f"{base}-{tslug}" if tslug else base
+    if tslug:
+        # The slug is the free-text half: sanitize it BEFORE it joins the name so a
+        # title that sanitizes down to separators leaves no dangling '-' behind.
+        tslug = sanitize_branch_name(tslug).strip("-")
+    return sanitize_branch_name(
+        f"{base}-{tslug}" if tslug else base, fallback=f"wt/{task_id}"
+    )
