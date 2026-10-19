@@ -5019,8 +5019,36 @@ def _rotate_worker_log(
 
 def _module_hermes_argv() -> list[str]:
     """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
+    console-script target — there is no top-level ``hermes`` package).
+
+    ``-P`` (3.11+) keeps the child's *working directory* off ``sys.path``. A
+    worker's cwd is its task workspace, and a workspace that is a worktree of
+    THIS repository (every card working on Hermes itself) carries its own
+    ``hermes_cli/`` and ``pm/``; with cwd first on ``sys.path`` the child
+    imported the worktree's copy, resolved its project root to the worktree,
+    found no committed dependency environment under that install key and died
+    at boot with ``no dependency environment is committed for this install``
+    — on every retry, leaving the card ``ready`` and looking unattended
+    (measured 2026-10-18: 24 crashed spawns across skills-refactor +
+    migrations). ``PYTHONPATH`` already carries the running install's root
+    (``_propagate_module_import_root``), so nothing is lost.
+    """
+    if sys.version_info >= (3, 11):
+        return [sys.executable, "-P", "-m", "hermes_cli.main"]
     return [sys.executable, "-m", "hermes_cli.main"]
+
+
+def _is_module_hermes_argv(cmd: list[str]) -> bool:
+    """Is this argv the interpreter-bound module form (``-P -m hermes_cli.main``)?
+
+    The prefix check tolerates the ``-P`` that keeps the worker's cwd off
+    ``sys.path``; the rest of the vector (``-p``, ``--cli``, ``chat -q ...``)
+    is appended by ``_worker_argv`` after the module pair.
+    """
+    tail = cmd[1:]
+    if tail[:1] == ["-P"]:
+        tail = tail[1:]
+    return tail[:2] == ["-m", "hermes_cli.main"]
 
 
 def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
@@ -5036,7 +5064,7 @@ def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
     then owns dependency activation as usual. A resolved shim path owns its
     imports and is left alone. Same pin cron's external worker uses (#112729).
     """
-    if cmd[1:3] != ["-m", "hermes_cli.main"]:
+    if not _is_module_hermes_argv(cmd):
         return
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
 

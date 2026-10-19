@@ -1586,7 +1586,8 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kbd._resolve_hermes_argv() == kbd._module_hermes_argv()
+    assert kbd._resolve_hermes_argv()[-2:] == ["-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
@@ -1612,11 +1613,57 @@ def test_resolve_hermes_argv_module_actually_runs():
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+    # The dispatcher always pins the install root on a module-form worker's
+    # PYTHONPATH (_propagate_module_import_root), and `-P` deliberately keeps
+    # cwd off sys.path, so the child must be launched the way it really is.
+    import pathlib
+    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(kbd.__file__).resolve().parents[1])}
+    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30, env=env)
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
     )
+
+
+def test_module_worker_ignores_a_worktree_copy_of_the_install_in_cwd(tmp_path):
+    """A worker whose task workspace IS a worktree of this repo must still boot
+    the install's own code.
+
+    Cards that change Hermes are anchored on a worktree of the hermes-agent
+    repo, which carries its own ``hermes_cli/`` + ``pm/``. The module-form
+    child used to put its cwd first on ``sys.path``, import the worktree copy,
+    resolve the project root to the worktree, find no committed dependency
+    environment under that install key and exit 1 at boot — every retry, so
+    the card stayed ``ready`` looking unattended (24 crashed spawns measured
+    2026-10-18). ``-P`` keeps cwd off ``sys.path``; the install root travels on
+    ``PYTHONPATH`` instead (``_propagate_module_import_root``).
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    workspace = tmp_path / "ws"
+    (workspace / "hermes_cli").mkdir(parents=True)
+    (workspace / "hermes_cli" / "__init__.py").write_text(
+        "raise ImportError('imported the worktree copy of the install')\n",
+        encoding="utf-8",
+    )
+    root = str(Path(kbd.__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": root}
+    env.pop("HERMES_BIN", None)
+
+    argv = kbd._module_hermes_argv()
+    r = subprocess.run(
+        argv + ["--version"], cwd=workspace, env=env,
+        capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, (
+        f"`{' '.join(argv)} --version` failed from a worktree cwd "
+        f"(rc={r.returncode}); stderr={r.stderr[:400]!r}"
+    )
+    assert "worktree copy" not in (r.stdout + r.stderr)
 
 
 def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monkeypatch):
