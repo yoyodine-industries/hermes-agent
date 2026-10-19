@@ -88,5 +88,8 @@ def test_cli_auto_maintenance_forwards_vacuum_interval(monkeypatch, tmp_path: Pa
         min_interval_hours=24,
         min_vacuum_interval_days=17,
         vacuum=True,
+        vacuum_chunk_pages=512,
+        vacuum_max_pages_per_pass=4096,
+        vacuum_max_seconds_per_pass=5.0,
         sessions_dir=tmp_path / "sessions",
     )

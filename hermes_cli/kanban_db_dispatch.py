@@ -53,6 +53,10 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 # and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
 # before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
+# Slot recycling (ruling t_b2865b89 §4): ``kanban.default_max_runtime_seconds`` — the cap
+# stamped onto a card that carries none AT CLAIM TIME, so ``enforce_max_runtime`` can always
+# reap the slot instead of leaving the tick budget at 0 for hours. ``0`` disables the stamp.
+DEFAULT_MAX_RUNTIME_SECONDS = 7200
 
 # A healthy worker is still alive for a while after kanban_complete /
 # kanban_request_review returns (final assistant turn, session persistence), so
@@ -88,6 +92,15 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # wall, burning a worker slot every tick for hours. Overridable via
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+
+# Cooldown after a storage-locked (state-store contention) requeue before
+# re-spawning. Default 0 is DELIBERATE and is the contract's "immediately": the
+# reclaim pass already re-queued the card on this tick and the dispatcher's own
+# 60 s cadence is the spacing, so nothing is consumed and there is no hot loop.
+# The env override (``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS``) exists for
+# tests and for an operator who wants wider spacing around a known maintenance
+# window.
+DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS = 0
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -928,6 +941,12 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    storage_locked: list[str] = field(default_factory=list)
+    """Task ids whose workers were stopped by the profile state DB's write lock
+    being held by a peer (``KANBAN_STORAGE_LOCKED_EXIT_CODE``) and were released
+    to ``ready`` WITHOUT counting a failure. The VISIBILITY surface for this
+    class: a card looping on a wedged store must be readable in the tick
+    summary, never silent."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1063,9 +1082,25 @@ def tick_deferral_reason(result: Optional[object]) -> Optional[str]:
     with a reason is loaded/guarded host behaviour doing the right thing — never a
     stall. ``None`` means "no spawn and nothing explains it", the only state worth
     watching.
+
+    The whole-tick REFUSALS are deferrals too, and they have to be named here or
+    moving to this tracker re-breaks the rulings that added them: a tick that
+    yielded on the content-skew gate (``tick_yielded``, ruling ``t_8fed34c8``) and
+    a board refused as not dispatch-enabled (``skipped_board_disabled``, card
+    ``t_17c9c847``) are deliberate, loud, self-recorded decisions. Counted as
+    unexplained no-ops, six of either with old work waiting accuse the healthy
+    gate itself. ``deferred_host_capped`` is the same class — the board drew no
+    share of this tick's free host slots, which its own field documents as "a
+    rotation, not a fault".
     """
     if result is None:
         return None
+    if getattr(result, "tick_yielded", ""):
+        return "tick_yielded"
+    if getattr(result, "skipped_board_disabled", False):
+        return "board_disabled"
+    if getattr(result, "deferred_host_capped", None):
+        return "host_cap_deferred"
     budget = getattr(result, "spawn_budget_blocked", None)
     if budget:
         return f"spawn_budget:{budget}"
@@ -1272,6 +1307,10 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.storage_locked:
+            # A card looping on a contended state store: this counter is the whole
+            # visibility surface for the class, so it must never be silent.
+            counts["storage_locked"] = counts.get("storage_locked", 0) + len(res.storage_locked)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.skipped_board_disabled:
@@ -1294,6 +1333,21 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def suppression_note(
+    board_results: Optional[Iterable[tuple[str, Optional[Any]]]] = None,
+) -> str:
+    """``" Last tick held back: <reasons>."`` for a warning line, or ``""``.
+
+    The live line's dispatcher-health warnings carry this annotation so an
+    operator reads WHY ready work was held back instead of a bare zero-spawn
+    count (rulings ``t_17c9c847`` / #111910). The prose lives here, beside the
+    messages it annotates, so both surfaces emit one vocabulary rather than
+    re-authoring the sentence at each call site.
+    """
+    held = describe_suppression([res for _slug, res in board_results or []])
+    return f" Last tick held back: {held}." if held else ""
 
 
 def stuck_ready_message(stats: dict) -> str:
@@ -1373,6 +1427,8 @@ def _classify_worker_exit(pid: int) -> tuple[str, Optional[int]]:
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
     (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
+    ``storage_locked`` (``KANBAN_STORAGE_LOCKED_EXIT_CODE``, a state-store
+    lock-stop — infrastructure, never counts as a failure),
     ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
     not in the reap registry; ``code`` None)."""
     entry = _recent_worker_exits.get(int(pid))
@@ -1398,6 +1454,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("clean_exit", 0)
     if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
         return ("rate_limited", code)
+    if code == _kb.KANBAN_STORAGE_LOCKED_EXIT_CODE:
+        return ("storage_locked", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
     return ("nonzero_exit", code)
@@ -2500,11 +2558,19 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    storage_locked: bool = False
+    """``KANBAN_STORAGE_LOCKED_EXIT_CODE``: the turn was stopped by the profile
+    state store's write lock being held by a peer — infrastructure, so the run is
+    booked ``storage_locked`` and NEVER counted against the breaker."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall; a storage-locked requeue
+        # likewise records ``storage_locked`` so neither a quota wall nor a busy
+        # store reads as a crash of the card's own work.
+        if self.storage_locked:
+            return "storage_locked"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -2515,10 +2581,13 @@ def _classify_dead_worker(
 
     A clean exit or a crash carries the worker's own last output (``worker_output``
     in the event payload, appended to the error text) so the board and the retry
-    worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+    worker see WHY instead of a bare label; a rate-limited or storage-locked
+    requeue does not need it. Excluding the storage-locked branch is load-bearing:
+    that requeue's stamped error text must stay free of arbitrary worker prose,
+    which ``check_respawn_guard`` re-scans against ``_RESPAWN_BLOCKER_RE``.
     """
     dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
-    if task_id and not dead.rate_limited:
+    if task_id and not (dead.rate_limited or dead.storage_locked):
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
@@ -2568,6 +2637,24 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
         )
+    if kind == "storage_locked":
+        # The profile state DB's single write lock was held by a peer past the
+        # transcript patience (another worker of this lane, the gateway, the
+        # dashboard, or a maintenance checkpoint/VACUUM) — infrastructure, not this
+        # card. Release to the source phase and do NOT count a failure, so a busy
+        # store can never park a card whose own work was fine. The text is the
+        # ONLY thing stamped for this outcome (no worker output is appended, see
+        # ``_classify_dead_worker``) and it deliberately avoids every
+        # ``_RESPAWN_BLOCKER_RE`` word, so ``check_respawn_guard`` reads the RUN
+        # OUTCOME instead of trapping the card on the stamped line.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited with code {code}: the turn stopped on a transient state-store lock; "
+            "the card was re-queued without counting a failure",
+            "storage_locked",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
+            storage_locked=True,
+        )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
         # revoked, model gone): every further spawn would hit the same wall, so
@@ -2599,6 +2686,11 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    # Requeued WITHOUT counting a failure because the profile state store's write
+    # lock was held by a peer (``KANBAN_STORAGE_LOCKED_EXIT_CODE``). Held apart
+    # from ``crash_details`` so a storage lock-stop can never reach
+    # ``_account_crashes`` and never trips the breaker.
+    storage_locked: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -2859,10 +2951,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.storage_locked or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
+                # blocker; a storage-locked requeue shows it its own transient kind;
+                # a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
                 # board UI and retry worker need the corrective message.
                 conn.execute(
@@ -2871,6 +2964,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.storage_locked:
+                # NEVER crash_details: a lock-stop is infrastructure, so it must not
+                # reach ``_account_crashes`` (the breaker) and must not count toward
+                # the mass-crash abort either.
+                sweep.storage_locked.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -2964,8 +3062,10 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     tasks claimed by *this host* only — other hosts' PIDs are meaningless.
     Clean exit while ``running`` is a protocol violation with a bounded
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
-    wall, released WITHOUT counting a failure and surfaced via the
-    ``_last_rate_limited`` attribute (the return stays crashed-only).
+    wall and ``KANBAN_STORAGE_LOCKED_EXIT_CODE`` is a state-store lock-stop —
+    both are infrastructure, released WITHOUT counting a failure and surfaced
+    via the ``_last_rate_limited`` / ``_last_storage_locked`` attributes (the
+    return stays crashed-only).
     """
     sweep = _reclaim_dead_workers(conn, board=board)
     if sweep.assessment is not None and sweep.assessment.alerting:
@@ -2986,14 +3086,16 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
         # crash accounting below must not run.
         detect_crashed_workers._last_auto_blocked = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_rate_limited = []  # type: ignore[attr-defined]
+        detect_crashed_workers._last_storage_locked = []  # type: ignore[attr-defined]
         return []
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
-    # requeues did NOT count a failure and are NOT crashes.
+    # and storage-locked requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_storage_locked = sweep.storage_locked  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -3235,7 +3337,11 @@ def check_respawn_guard(
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
+    path never increments ``consecutive_failures``), ``"storage_locked_cooldown"``
+    (latest run ``storage_locked`` within its own cooldown; same placement and
+    the same reason — the stamped state-store line is infrastructure text, not a
+    blocker, and the run never incremented ``consecutive_failures``),
+    ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
@@ -3296,6 +3402,23 @@ def check_respawn_guard(
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        return None
+
+    # 1b. Storage-lock cooldown — the same contract as the rate-limit branch above,
+    #     on its own kind and its own cooldown so the two never share a notice. The
+    #     stamped text is infrastructure prose, so ``blocker_auth`` must not see it:
+    #     the card is spaced by this cooldown and never consumes its give-up budget.
+    if latest_run is not None and latest_run["outcome"] == "storage_locked":
+        sl_cooldown = _kb._resolve_storage_locked_cooldown_seconds()
+        if sl_cooldown <= 0:
+            # Default 0: respawn immediately (the reclaim pass already spaced it by
+            # a tick and the dispatcher's own cadence is the interval), skipping
+            # blocker_auth so the stamped storage-lock line cannot re-trap the card.
+            return None
+        ended_at = latest_run["ended_at"]
+        if ended_at is not None and (now - int(ended_at)) < sl_cooldown:
+            return "storage_locked_cooldown"
+        # Cooldown elapsed — return early, exactly as the rate-limit path does.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
@@ -4266,6 +4389,9 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     host_budget_share: Optional[int] = None,
+    lane_fair_spawn: bool = True,
+    designated_pool_reserve: int = 1,
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -4318,6 +4444,9 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             host_budget_share=host_budget_share,
+            lane_fair_spawn=lane_fair_spawn,
+            designated_pool_reserve=designated_pool_reserve,
+            default_max_runtime_seconds=default_max_runtime_seconds,
         )
 
     try:
@@ -4394,6 +4523,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    default_max_runtime_seconds: int = 0,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -4469,6 +4599,20 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    # SLOT RECYCLING (ruling t_b2865b89 §4). A card that carried no ``max_runtime_seconds`` is
+    # stamped with the dispatcher default HERE — at claim time — so ``enforce_max_runtime`` can
+    # always reap the slot instead of leaving the tick budget at 0 for hours.
+    #
+    # THE BOUNDARY (do not remove this pin): the DEFAULTED cap must never reach
+    # ``_worker_terminal_timeout_env``. That call raises the child worker's ``TERMINAL_TIMEOUT`` to
+    # ``cap - 30 s``; letting a scheduling default through would jump every lane in the fleet from
+    # the generic terminal default to 7170 s, a behaviour change hidden inside a scheduling fix. So
+    # the card's EXPLICIT pre-stamp value is captured first and pinned back onto the Task handed to
+    # the spawn — the DB column gets the default, the spawned worker sees ONLY what the author set.
+    explicit_max_runtime_seconds = claimed.max_runtime_seconds
+    if default_max_runtime_seconds:
+        _stamp_default_max_runtime_seconds(conn, task_id, limit=default_max_runtime_seconds)
+    claimed.max_runtime_seconds = explicit_max_runtime_seconds
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -4608,9 +4752,12 @@ def _run_reclaim_phase(
         }
     result.crash_sweep_held = list(getattr(detect_crashed_workers, "_last_crash_sweep_held", []) or [])
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
-    # went back to ``ready`` and the respawn guard defers them until quota clears.
+    # went back to ``ready`` and the respawn guard defers them until quota clears;
+    # storage-locked tasks went back to ``ready`` the same way and the guard spaces
+    # them on their own cooldown.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.storage_locked.extend(getattr(detect_crashed_workers, "_last_storage_locked", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
     # Door 3 of the above-tranche guard (t_6ce41549, restored by card t_2e107499): a row ABOVE
@@ -4764,7 +4911,7 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """
     order_body, order_params = _kb.effective_priority_order_sql()
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, priority FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         f"ORDER BY {order_body}",
         order_params,
@@ -4786,6 +4933,72 @@ def _spawnable_lane_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     if profile_exists is None:
         return [row for row in rows if row["assignee"]]
     return [row for row in rows if row["assignee"] and profile_exists(row["assignee"])]
+
+
+def spawnable_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """This board's spawnable cards (``id``/``assignee``/``priority``), head first.
+
+    The gateway dispatcher allocates the host budget by ranking EVERY card on
+    EVERY board (``gateway.kanban_watchers_dispatcher.host_budget_shares_by_priority``),
+    so it needs the board's own dispatch-order rows — the same order
+    :func:`_spawnable_lane_rows` produces. Read-only.
+    """
+    return _spawnable_lane_rows(conn)
+
+
+def head_of_line_priority(conn: sqlite3.Connection) -> Optional[int]:
+    """Priority of the card this board would spawn next, or ``None``.
+
+    ``_lane_rows`` orders a lane by the shared effective priority, so the head
+    card's own ``priority`` is the priority of the work this board would start
+    next — ranking boards by it ranks them by exactly the order their own cards
+    will be spawned in.
+
+    ``None`` means nothing on this board could be started by a worker. A caller
+    allocating a SHARED budget must still visit such a board (reclaim,
+    promotion, decomposition and health work is board-local); it just cannot
+    rank it.
+    """
+    rows = _spawnable_lane_rows(conn)
+    if not rows:
+        return None
+    return int(rows[0]["priority"])
+
+
+def total_running_all_boards() -> Optional[int]:
+    """Running tasks across EVERY board — the host's whole occupancy.
+
+    This is the number a caller subtracts from the host cap to find the free
+    slots, so a partial answer is worse than none: ``None`` means at least one
+    board could not be read and the caller must fall back to its previous
+    behaviour instead of handing out slots it cannot prove are free. Boards are
+    matched by resolved DB path, so ``HERMES_KANBAN_DB`` (every board pinned to
+    one file) is counted once, exactly like ``count_running_tasks_other_boards``.
+    """
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        return None
+    seen: set[str] = set()
+    total = 0
+    for meta in boards:
+        slug = meta.get("slug") or _kb.DEFAULT_BOARD
+        try:
+            path = _kb.kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if resolved in seen or not path.exists():
+                continue
+            seen.add(resolved)
+            conn = _kbc.connect(board=slug)
+            try:
+                total += count_running_tasks(conn)
+            finally:
+                with contextlib.suppress(Exception):
+                    conn.close()
+        except Exception:
+            # Unknown occupancy: refuse to allocate rather than under-count.
+            return None
+    return total
 
 
 def spawnable_pending_ids(conn: sqlite3.Connection) -> list[str]:
@@ -4866,12 +5079,21 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     host_budget_share: Optional[int] = None,
+    lane_fair_spawn: bool = True,
+    designated_pool_reserve: int = 1,
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
     call ``spawn_fn(task, workspace_path, board) -> Optional[int]``, recording
     the PID so later ticks catch crashes before the TTL. Cap semantics:
-    :func:`_tick_spawn_budget`."""
+    :func:`_tick_spawn_budget`. ``lane_fair_spawn`` /
+    ``designated_pool_reserve`` shape the READY lane's order only:
+    :func:`_lane_fair_ready_order`. ``default_max_runtime_seconds`` (None =
+    resolve ``kanban.default_max_runtime_seconds`` now) is stamped onto a card
+    that carries no cap at claim time; ``0`` disables the stamp."""
+    if default_max_runtime_seconds is None:
+        default_max_runtime_seconds = default_max_runtime_seconds_config()
     result = DispatchResult()
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
@@ -4922,10 +5144,25 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        default_max_runtime_seconds=default_max_runtime_seconds,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
+    # Fair lane ordering (ruling t_b2865b89): the fairness passes only REORDER the
+    # ready rows — the budget, the per-profile cap and every other guard still
+    # apply in the loop below. Knob off returns ``ready_rows`` untouched, so the
+    # tick is byte-identical to the straight priority walk.
+    if lane_fair_spawn:
+        ready_order = _lane_fair_ready_order(
+            conn, ready_rows,
+            budget=ready_budget,
+            designated_pool_reserve=designated_pool_reserve,
+            per_profile_cap=per_profile_cap,
+            per_profile_running=per_profile_running,
+        )
+    else:
+        ready_order = ready_rows
     spawned = 0
-    for row in ready_rows:
+    for row in ready_order:
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
@@ -4963,6 +5200,261 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= minimum else default
+
+
+def lane_fair_ready_config(kanban_cfg: Optional[dict] = None) -> tuple[bool, int]:
+    """``(lane_fair_spawn, designated_pool_reserve)`` from the ``kanban`` block.
+
+    Production defaults are ``(True, 1)`` (``config_defaults.DEFAULT_CONFIG``).
+    ``kanban_cfg=None`` loads config itself (mtime-cached), so the standalone
+    daemon and ``hermes kanban dispatch`` resolve the fairness knobs exactly as
+    the gateway dispatcher, which passes the merged block it already holds. A
+    malformed value fails open to the default rather than disabling fairness or
+    raising into a tick.
+    """
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            kanban_cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+        except Exception:
+            kanban_cfg = {}
+    kanban_cfg = kanban_cfg or {}
+    raw_fair = kanban_cfg.get("lane_fair_spawn", True)
+    if isinstance(raw_fair, bool):
+        lane_fair = raw_fair
+    elif raw_fair is None:
+        lane_fair = True
+    else:
+        lane_fair = str(raw_fair).strip().lower() not in {"0", "false", "no", "off", ""}
+    reserve = _positive_int(kanban_cfg.get("designated_pool_reserve"), 1, minimum=0)
+    return lane_fair, reserve
+
+
+def default_max_runtime_seconds_config(kanban_cfg: Optional[dict] = None) -> int:
+    """``kanban.default_max_runtime_seconds`` — the cap stamped onto a card that carries none.
+
+    ``0`` disables the stamp entirely (no card behaviour changes at all). ``kanban_cfg=None``
+    loads config itself (mtime-cached), exactly as :func:`lane_fair_ready_config`, so the
+    standalone daemon, ``hermes kanban dispatch`` and the in-gateway dispatcher all resolve the
+    knob the same way. A malformed value fails open to the production default rather than
+    raising into a tick or silently disabling slot recycling.
+    """
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            kanban_cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+        except Exception:
+            kanban_cfg = {}
+    kanban_cfg = kanban_cfg or {}
+    # 0 is a REAL value (no stamp), so it cannot go through ``_positive_int`` (minimum=1); only a
+    # missing / non-integer / negative value falls back to the production default.
+    try:
+        parsed = int(kanban_cfg.get("default_max_runtime_seconds", DEFAULT_MAX_RUNTIME_SECONDS))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RUNTIME_SECONDS
+    return parsed if parsed >= 0 else DEFAULT_MAX_RUNTIME_SECONDS
+
+
+def _stamp_default_max_runtime_seconds(
+    conn: sqlite3.Connection, task_id: str, *, limit: int,
+) -> Optional[int]:
+    """Write ``limit`` onto ``tasks.max_runtime_seconds`` when the card carries none.
+
+    Slot recycling (ruling ``t_b2865b89`` §4): the runtime sweep is gated on ``max_runtime_seconds IS
+    NOT NULL``, so a card with no cap is never reaped and its spawn slot never recycles. ``IS NULL``
+    in the WHERE clause (rather than ``COALESCE``) is deliberate: it makes the stamp idempotent and
+    gives a card's OWN value precedence — including an explicit ``0``, the author's unlimited
+    opt-out — so re-claiming a card can never overwrite an author's budget.
+
+    Returns the value written, or ``None`` when the card already carried one. Opens its own write txn
+    (the caller holds no lock at this point) and records a ``runtime_cap_defaulted`` event, so the
+    defaulted cap is auditable rather than a silent column mutation.
+    """
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET max_runtime_seconds = ? "
+            "WHERE id = ? AND max_runtime_seconds IS NULL",
+            (int(limit), task_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        _kb._append_event(conn, task_id, "runtime_cap_defaulted", {
+            "max_runtime_seconds": int(limit),
+            "source": "kanban.default_max_runtime_seconds",
+        })
+    return int(limit)
+
+
+def _lane_fair_ready_order(
+    conn: sqlite3.Connection,
+    ready_rows: list[sqlite3.Row],
+    *,
+    budget: Optional[int],
+    designated_pool_reserve: int = 1,
+    per_profile_cap: Optional[int] = None,
+    per_profile_running: Optional[dict[str, int]] = None,
+) -> list[sqlite3.Row]:
+    """Order the ready lane so no LANE starves behind another lane's priority.
+
+    INTRA-BOARD ONLY. This never ranks one board against another: the cross-board
+    rotation keeps reading ``_lane_rows`` order through ``head_of_line_priority``
+    and ``spawnable_pending_ids``, which is why ``_lane_rows`` itself must not
+    change.
+
+    ``ready_rows`` is already the dispatch order. Walking it straight hands every
+    free slot to whichever lanes filed the highest cards, so a lane whose work is
+    merely ordinarily ranked — and therefore always below the designated tranche
+    (``>= TRANCHE_FLOOR``) — never starts while a designated lane has a queue.
+    This orders the SAME rows in three passes instead:
+
+    * **designated reach** — one slot per lane whose head card is designated, in
+      least-recently-run order, capped by ``max(budget - designated_pool_reserve,
+      0)`` so the tranche cannot hold every slot while ordinary work waits;
+    * **lane reach** — one slot per lane not served by the first pass, same
+      order; a lane whose head is a designated card already refused by the
+      ceiling is still reached through the first row of it the room test
+      admits, so the lane (not the head) is what a reach pass serves;
+    * **fill** — the remaining budget in global priority order.
+
+    Lanes are served least-recently-run first: a lane with no ``task_runs`` row
+    at all sorts BEFORE every lane that has one, then the oldest
+    ``started_at`` wins. Ties keep the lane's first-seen (priority) order, so
+    the result is deterministic. WITHIN a lane the order is untouched — the
+    tier still decides WHICH card of a lane runs.
+
+    Every pass skips a row whose assignee is already at
+    ``kanban.max_in_progress_per_profile``; ``per_profile_running`` already
+    counts this tick's own allocations (see ``_dispatch_lane_task``), so a lane
+    at its cap is not "reached" and cannot spend the slot a capped neighbour
+    would waste. The designated ceiling is lifted when NO spawnable ordinary
+    row waits (an all-designated board still gets the whole budget).
+
+    Returned rows are the allocation order first, then every remaining row in
+    its original order: a row the passes could not place is still tried by the
+    caller, never silently dropped from the tick. ``budget None`` = uncapped —
+    the reach order still applies an ordering, but nothing is held back.
+    """
+    if not ready_rows:
+        return ready_rows
+    from hermes_cli import kanban_priority_policy as policy
+
+    tranche_floor = int(policy.TRANCHE_FLOOR)
+    reserve = designated_pool_reserve if isinstance(designated_pool_reserve, int) else 1
+    reserve = max(reserve, 0)
+    running = dict(per_profile_running or {})
+
+    def _lane_of(row: sqlite3.Row) -> str:
+        # No assignee is its own bucket: the caller may still resolve it through
+        # kanban.default_assignee, and an unassigned card must not be able to
+        # consume a named lane's reach.
+        return row["assignee"] or ""
+
+    def _designated(row: sqlite3.Row) -> bool:
+        return int(row["priority"] or 0) >= tranche_floor
+
+    def _at_cap(lane: str) -> bool:
+        if per_profile_cap is None or not lane:
+            return False
+        return running.get(lane, 0) >= per_profile_cap
+
+    # Lanes in lane-local order: ready_rows is the dispatch order, so the first
+    # row seen for a lane is that lane's head.
+    lanes: dict[str, list[sqlite3.Row]] = {}
+    for row in ready_rows:
+        lanes.setdefault(_lane_of(row), []).append(row)
+
+    # ONE read-only query: the newest run start per lane. A lane that never ran
+    # has no row and ranks before every lane that has.
+    last_run: dict[str, int] = {}
+    for r in conn.execute(
+        "SELECT profile, MAX(started_at) AS last FROM task_runs "
+        "WHERE profile IS NOT NULL GROUP BY profile"
+    ):
+        last_run[str(r["profile"])] = int(r["last"] or 0)
+
+    def _lru_key(lane: str) -> tuple[int, int]:
+        if lane in last_run:
+            return (1, last_run[lane])
+        return (0, 0)
+
+    lru_lanes = sorted(lanes, key=_lru_key)  # stable: ties keep priority order
+    designated_lanes = [lane for lane in lru_lanes if _designated(lanes[lane][0])]
+
+    # The ceiling only exists while a spawnable ORDINARY row waits: if every
+    # waiting row is designated (or the ordinary ones are all capped), holding a
+    # slot back would idle it for nobody.
+    ordinary_waiting = any(
+        not _designated(row) and not _at_cap(_lane_of(row)) for row in ready_rows
+    )
+    designated_cap: Optional[int] = None if budget is None else budget
+    if budget is not None and ordinary_waiting:
+        designated_cap = max(budget - reserve, 0)
+
+    ordered: list[sqlite3.Row] = []
+    placed: set[str] = set()
+    served: set[str] = set()
+    spent = 0
+    designated_spent = 0
+
+    def _room(row: sqlite3.Row) -> bool:
+        if budget is not None and spent >= budget:
+            return False
+        if _at_cap(_lane_of(row)):
+            return False
+        if designated_cap is not None and _designated(row) and designated_spent >= designated_cap:
+            return False
+        return True
+
+    def _take(row: sqlite3.Row) -> None:
+        nonlocal spent, designated_spent
+        lane = _lane_of(row)
+        ordered.append(row)
+        placed.add(row["id"])
+        served.add(lane)
+        spent += 1
+        if per_profile_cap is not None and lane:
+            running[lane] = running.get(lane, 0) + 1
+        if _designated(row):
+            designated_spent += 1
+
+    def _has_budget() -> bool:
+        return budget is None or spent < budget
+
+    # Pass 1 — designated reach: one slot per designated lane, LRU first.
+    for lane in designated_lanes:
+        if not _has_budget():
+            break
+        head = lanes[lane][0]
+        if _room(head):
+            _take(head)
+    # Pass 2 — lane reach: one slot per lane pass 1 did not serve. A lane's
+    # HEAD can be refused here without the lane being skipped: when a designated
+    # head's ceiling slot is already spent but the lane also holds ordinary work,
+    # reach the lane through the first row of it that ``_room`` admits. Testing
+    # only the head would drop the lane for the whole reach phase and hand the
+    # slot back to a lane already served — two lanes with designated heads and
+    # ordinary work waiting would then never both be reached at budget 2
+    # (ruling t_b2865b89 P-Reach, §7.2).
+    for lane in lru_lanes:
+        if not _has_budget():
+            break
+        if lane in served:
+            continue
+        for row in lanes[lane]:
+            if _room(row):
+                _take(row)
+                break
+    # Pass 3 — fill: the rest of the budget in global priority order.
+    for row in ready_rows:
+        if not _has_budget():
+            break
+        if row["id"] in placed:
+            continue
+        if _room(row):
+            _take(row)
+
+    ordered.extend(row for row in ready_rows if row["id"] not in placed)
+    return ordered
 
 
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:

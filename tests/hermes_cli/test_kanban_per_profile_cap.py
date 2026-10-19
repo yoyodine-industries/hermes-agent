@@ -23,11 +23,22 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         with open(os.path.join(test_home, "profiles", prof, "config.yaml"), "w") as fh:
             fh.write("{}\n")  # identity marker: a bare dir is not a profile
     monkeypatch.setenv("HERMES_HOME", test_home)
+    saved = {m: sys.modules[m] for m in list(sys.modules)
+             if m.startswith("hermes_cli") or m.startswith("hermes_state")
+             or m == "hermes_constants"}
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
     yield kanban_db
+    # Hand the collection-time modules back: a later test file binds its hermes_cli / gateway
+    # objects at COLLECTION time, and leaving the re-imported modules in sys.modules hands that
+    # file a DIFFERENT module than the one it bound (its dispatcher then reads a board nobody
+    # seeded). Same teardown contract as test_kanban_default_max_runtime_seconds.py.
+    for mod in list(sys.modules.keys()):
+        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+            del sys.modules[mod]
+    sys.modules.update(saved)
 
 
 def _fake_spawn(*args, **kwargs):

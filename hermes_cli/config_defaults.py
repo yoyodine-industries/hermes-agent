@@ -1930,6 +1930,22 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Lane-fair spawn allocation (ruling t_b2865b89): the ready lane is walked in
+        # three passes — designated reach, lane reach, fill — so a lane with ready work
+        # and no running work is reached within ceil(L / budget) ticks instead of
+        # waiting behind whichever lane filed the highest cards. False = the plain
+        # ``priority DESC, created_at ASC`` walk (byte-identical to pre-fairness).
+        "lane_fair_spawn": True,
+        # Slots the designated tranche (priority >= TRANCHE_FLOOR) may NOT take while
+        # spawnable ordinary ready work waits: the tier can hold at most
+        # ``budget - designated_pool_reserve`` slots. 0 = unbounded tranche precedence
+        # (the pre-fairness tier behaviour).
+        "designated_pool_reserve": 1,
+        # Slot recycling (ruling t_b2865b89 §4): seconds stamped onto a card that carries
+        # no ``max_runtime_seconds`` AT CLAIM TIME, so every running slot stays reapable by
+        # ``enforce_max_runtime`` instead of a NULL cap holding it forever. A card's own
+        # value (including an explicit 0 = unlimited) always wins. 0 disables the stamp.
+        "default_max_runtime_seconds": 7200,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
@@ -2306,14 +2322,21 @@ DEFAULT_CONFIG = {
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,
-        # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
-        # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
-        # deleted AND freelist/page_count > 25%.
-        # SQLite does not reclaim disk space on DELETE — freed pages are just reused on subsequent INSERTs —
-        # so without VACUUM the file stays bloated even after pruning. See #54189.
+        # Reclaim space after a prune that deleted rows (SQLite never reclaims disk on DELETE).
+        # A store NOT already in auto_vacuum=INCREMENTAL is converted ONCE (the only full
+        # rewrite this path ever issues); every later pass drains bounded
+        # `PRAGMA incremental_vacuum(N)` chunks, holding the write lock for tens of ms each
+        # instead of for a whole multi-GB rewrite. See #54189 and card t_f8db44f6.
         "vacuum_after_prune": True,
-        # Minimum days between VACUUM rewrites; pruning keeps its normal cadence.
-        "min_vacuum_interval_days": 30,
+        # Minimum days between reclaim passes; pruning keeps its normal cadence. 1 = every day
+        # auto-maintenance runs. The pass is bounded (budgets below), so cadence is the lever.
+        "min_vacuum_interval_days": 1,
+        # Pages bound handed to each `PRAGMA incremental_vacuum(N)` chunk.
+        "vacuum_chunk_pages": 512,
+        # Per-pass ceiling on pages returned to the file system (~16 MiB at 4 KiB pages).
+        "vacuum_max_pages_per_pass": 4096,
+        # Per-pass wall-clock ceiling in seconds; the pass stops here even mid-freelist.
+        "vacuum_max_seconds_per_pass": 5.0,
         # Minimum hours between auto-maintenance runs (tracked in state.db state_meta, shared across
         # processes).
         "min_interval_hours": 24,

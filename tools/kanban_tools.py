@@ -25,7 +25,8 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_CLOSE_SIBLING_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+    KANBAN_LIST_SCHEMA, KANBAN_RECORD_LANDING_VERDICT_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
+    KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
@@ -1012,6 +1013,14 @@ def _handle_complete(args: dict, **kw) -> str:
             # against the same verdict.
             if isinstance(ok, kb.CompletionRefusal) and ok.cause == "acceptance_refusal":
                 raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
+            # The landing-carrier fence carries its own remedy inline: the declared PR, the exact
+            # ``kanban_create`` spec for the carrier, and the two RECORDED escapes. The REVIEW LANE
+            # closes through this door, so answering it from the live row would hand the refused
+            # reviewer a run-ownership sentence with no cause, no PR and no way out -- a fence
+            # nobody can read is a fence nobody can satisfy (t_88f6cb12).
+            if isinstance(ok, kb.CompletionRefusal) and ok.cause in (
+                    "landing_carrier_missing", "landing_state_unknown"):
+                raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
             # A reopened or never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.
             blockers = kb.unsatisfied_parents(conn, tid)
@@ -1209,6 +1218,33 @@ def _handle_comment(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
         return _ok(task_id=tid, comment_id=cid)
+
+
+@_kanban_handler("kanban_record_landing_verdict")
+def _handle_record_landing_verdict(args: dict, **kw) -> str:
+    """Record a landing verdict on the card that DECLARES the PR (one door, t_765136ce)."""
+    _reject_delegated_child_mutation("kanban_record_landing_verdict")
+    from hermes_cli.kanban_landing_verdict import record_landing_verdict
+
+    target = str(_require_text(args, "target_task_id")).strip()
+    verdict = str(_require_text(args, "verdict")).strip()
+    reason = _require_text(args, "reason")
+    # The caller's own card is the SECOND audit end. ``_default_task_id`` returns None for a
+    # delegated child and for a caller with no dispatcher task, and the writer records the
+    # target end only in that case -- it never guesses an author.
+    caller = _default_task_id(None)
+    result = args.get("result")
+    result = _redact(result) if isinstance(result, str) and result.strip() else None
+    board = args.get("board")
+    with _board(board) as (kb, conn):
+        receipt = record_landing_verdict(
+            conn, target, verdict, reason,
+            caller_task_id=caller,
+            caller_run_id=_worker_run_id(caller) if caller else None,
+            result=result,
+            board=board,
+        )
+    return _ok(**receipt)
 
 
 def _store_attachment(board, tid, filename, data, content_type) -> str:
@@ -1584,7 +1620,9 @@ _TOOLS = (
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
-    ("kanban_close_sibling", KANBAN_CLOSE_SIBLING_SCHEMA, _handle_close_sibling, "🤝"))
+    ("kanban_close_sibling", KANBAN_CLOSE_SIBLING_SCHEMA, _handle_close_sibling, "🤝"),
+    ("kanban_record_landing_verdict", KANBAN_RECORD_LANDING_VERDICT_SCHEMA,
+     _handle_record_landing_verdict, "🛬"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

@@ -14,6 +14,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1200,3 +1201,254 @@ def test_landed_completion_with_unadmitted_proof_is_refused_by_the_landed_clause
     assert "completion_blocked_proof_gate" in kinds
     assert "pr_acceptance" not in kinds
     assert "completed" not in kinds
+
+
+# -- a run store OUTAGE is not a verdict (card t_66a21ced) ---------------------
+#
+# The gate's questions are "did the reviewed bytes land?" and "did a run happen AFTER that
+# landing?". The run store is only where the second answer is STORED, so an unreadable store is
+# an OUTAGE — not evidence that any run is missing. These tests pin the three-way distinction
+# the old code could not make: answered / answered-without-the-run / could-not-answer.
+
+
+def _broken_store(tmp_path: Path):
+    """The incident's exact shape: a REAL SQLite store, truncated mid-page.
+
+    ``sqlite3`` OPENS it happily and the READ raises ``DatabaseError: database disk image is
+    malformed`` — measured on a truncated copy of the live store 2026-10-16, the same error that
+    refused card t_20fbada3's close on 2026-10-08. It is the OUTAGE arm: neither "the file is
+    absent" nor "the store answered and holds no such run".
+    """
+    path = _run_store(tmp_path)
+    path.write_bytes(path.read_bytes()[:512])
+    return path
+
+
+def _receipt(tmp_path: Path, run_id: str = "20260926-1835", *, outcome: str | None = "pass",
+             closed: bool = True, nodes: int = 3, at: str = "2026-09-26T22:50:00+00:00",
+             name: str = "run.log", directory: str | None = None, log_run_id: str | None = None):
+    """The run's OWN receipt: ``<run_details>/<run_id>/run.log`` beside the store.
+
+    ``at`` is the first event's ISO timestamp; every later event is one minute on, in the order
+    the runner writes them (node events, then the resolved outcome, then the close marker).
+    """
+    root = tmp_path if directory is None else tmp_path / directory
+    run_dir = root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    named = log_run_id or run_id
+    start = datetime.fromisoformat(at)
+    lines = []
+    for index in range(nodes):
+        lines.append(json.dumps({
+            "ts": (start + timedelta(minutes=index)).isoformat(), "event": "node_completed",
+            "run_id": named, "node_id": f"node{index}"}))
+    if outcome is not None:
+        lines.append(json.dumps({
+            "ts": (start + timedelta(minutes=nodes)).isoformat(), "event": "outcome_resolved",
+            "run_id": named, "node_id": "run", "outcome": outcome, "reason": outcome}))
+    if closed:
+        lines.append(json.dumps({
+            "ts": (start + timedelta(minutes=nodes + 1)).isoformat(), "event": "pin_retired",
+            "run_id": named, "node_id": "run", "because": "run_close"}))
+    (run_dir / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return run_dir
+
+
+def _outage_proof(tmp_path, *, ref: str = "abc123def4567890", run_id: str = "20260926-1835",
+                  digest: str | None = None, path: Path | None = None):
+    """The outage block's proof: the suite's own builder, with its artifact created for it."""
+    if path is None:
+        path, digest = _artifact(tmp_path)
+    return _proof(path, digest, ref=ref, run_id=run_id)
+
+
+def test_an_unreadable_store_resolves_on_the_runs_own_receipt(tmp_path):
+    """The card CLOSES: the store is down, the run's own receipt stands (and says it did)."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")  # landing before the run
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00")          # 22:50Z..22:54Z, outcome pass
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is True, verdict.failures
+    assert verdict.facts["run_store_state"] == "unavailable"
+    assert verdict.facts["degraded"] is True
+    assert verdict.facts["run_receipt"].endswith("20260926-1835/run.log")
+    assert verdict.facts["run_outcome"] == "pass"
+    assert "database disk image is malformed" in verdict.facts["run_store_error"]
+    # never a SILENT pass: the green close names the outage that forced the fallback
+    assert "DEGRADED" in verdict.detail and str(store) in verdict.detail
+    assert "DEGRADED" in gate.render("t_witness1", verdict)
+
+
+def test_an_unreadable_store_with_a_predating_receipt_is_still_refused(tmp_path):
+    """Anti-fabrication: the fallback buys no time. A receipt before the landing is refused."""
+    ledger = _ledger(tmp_path, at="2026-09-27T02:00:00-04:00")   # 06:00Z, AFTER the run
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00")           # only 22:50Z..22:54Z
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "proof_predates_landing", verdict.failures
+    assert verdict.facts["run_store_state"] == "unavailable"      # the outage IS recorded
+
+
+def test_an_unreadable_store_with_no_receipt_is_refused_by_name(tmp_path):
+    """No receipt: the refusal names the STORE and its repair — never "run_unknown"."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = tmp_path / "absent" / "yoyoflow-state.db"            # the store is not there at all
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_store_unavailable", verdict.failures
+    detail = gate.render("t_witness1", verdict)
+    assert str(store) in detail                                  # names the blocker
+    assert "UNAVAILABLE" in detail and "integrity-check" in detail
+    assert "cannot clear a timing failure" not in detail         # the misleading trailer is gone
+    assert "run_unknown" not in [f["clause"] for f in verdict.failures]
+
+
+def test_a_readable_store_that_holds_no_such_run_is_still_run_unknown(tmp_path):
+    """A store that ANSWERS is the authority: a green receipt cannot override its "no such run".
+
+    This is the distinction the card is about — and it holds in BOTH directions: the receipt is
+    not consulted while the store answers, and ``run_unknown`` still means exactly one thing.
+    """
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _run_store(tmp_path, run_id="20260926-9999")         # readable, other run
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00")           # a green receipt, ignored
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_unknown", verdict.failures
+    assert "not a store outage" in verdict.detail
+    assert "run_receipt" not in verdict.facts                    # the receipt was never read
+
+
+def test_an_unreadable_store_with_a_not_pass_receipt_is_not_green(tmp_path):
+    """The receipt's OUTCOME decides: a ``not_pass`` run is not evidence that the work was done."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, outcome="not_pass", at="2026-09-26T22:50:00+00:00")
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_not_green", verdict.failures
+
+
+def test_a_truncated_receipt_cannot_manufacture_a_green_run(tmp_path):
+    """No resolved outcome and no close marker: an in-flight or truncated log proves nothing."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, outcome=None, closed=False, at="2026-09-26T22:50:00+00:00")
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_not_green", verdict.failures
+
+
+def test_a_closed_receipt_with_no_resolved_outcome_mirrors_the_stores_rule(tmp_path):
+    """The store's own rule read off the log: completed with NO verdict is green, as it is there."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, outcome=None, closed=True, at="2026-09-26T22:50:00+00:00")
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is True, verdict.failures
+    assert verdict.facts["run_closed"] is True and verdict.facts["run_outcome"] is None
+
+
+def test_a_receipt_that_does_not_name_the_run_is_not_that_runs_log(tmp_path):
+    """One run's log cannot be offered for another: the events must name the declared id."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00", log_run_id="20260101-0000")
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_store_unavailable", verdict.failures
+    assert "carries no event naming run" in verdict.detail
+
+
+def test_a_run_id_outside_the_receipt_root_is_refused(tmp_path):
+    """``run.id`` is one path segment: a traversal must never reach a file outside the root."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+
+    verdict = gate.evaluate(_outage_proof(tmp_path, run_id="../20260926-1835"),
+                            ledger_path=str(ledger), run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_store_unavailable", verdict.failures
+    assert "not a single safe path segment" in verdict.detail
+
+
+def test_the_kernel_close_is_degraded_but_the_card_still_closes(conn, tmp_path, monkeypatch):
+    """End to end through the firing path: the landed card CLOSES and the audit says DEGRADED.
+
+    This is the acceptance of card t_66a21ced on the door the incident used: a landed card whose
+    unit is deployed and whose run is green closes on its recorded run while the shared store is
+    unreadable — and the ``proof_gate_admitted`` event carries the outage, so nothing is quiet.
+    """
+    path, digest = _artifact(tmp_path)
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00")
+    monkeypatch.setenv("HERMES_PROOF_LEDGER", str(ledger))
+    monkeypatch.setenv("HERMES_PROOF_RUN_STORE", str(store))
+    tid = _task(conn, contract="landed", title="landed work during a store outage")
+    proof = {"artifacts": [{"path": str(path), "sha256": digest}],
+             "landing": {"ref": "abc123def4567890"},
+             "run": {"store": "yoyoflow", "id": "20260926-1835"}}
+
+    assert kb.complete_task(conn, tid, summary="landed and proven, store down",
+                            metadata={"proof": proof}) is True
+
+    payload = json.loads(conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'proof_gate_admitted'",
+        (tid,)).fetchone()["payload"])
+    facts = payload["facts"]
+    assert facts["run_store_state"] == "unavailable"
+    assert facts["degraded"] is True and facts["run_receipt_events"] == 5
+    assert "run store" in facts["degraded_reason"]
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "done"
+
+
+def test_a_landed_card_with_no_receipt_and_no_store_is_refused_by_name(conn, tmp_path,
+                                                                      monkeypatch):
+    """End to end: the outage the incident hit refuses with ITS OWN cause, not "run_unknown"."""
+    path, digest = _artifact(tmp_path)
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = tmp_path / "absent" / "yoyoflow-state.db"
+    monkeypatch.setenv("HERMES_PROOF_LEDGER", str(ledger))
+    monkeypatch.setenv("HERMES_PROOF_RUN_STORE", str(store))
+    tid = _task(conn, contract="landed", title="landed work, store gone")
+    proof = {"artifacts": [{"path": str(path), "sha256": digest}],
+             "landing": {"ref": "abc123def4567890"},
+             "run": {"store": "yoyoflow", "id": "20260926-1835"}}
+
+    with pytest.raises(kb.ProofGateError) as caught:
+        kb.complete_task(conn, tid, summary="landed, but the store is gone",
+                         metadata={"proof": proof})
+
+    assert caught.value.clause == "run_store_unavailable"
+    assert "UNAVAILABLE" in str(caught.value)
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running"  # nothing mutated
+

@@ -13,7 +13,11 @@ from types import SimpleNamespace
 import pytest
 
 import cli
-from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE, KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+from hermes_cli.kanban_db import (
+    KANBAN_RATE_LIMIT_EXIT_CODE,
+    KANBAN_STORAGE_LOCKED_EXIT_CODE,
+    KANBAN_TERMINAL_PROVIDER_EXIT_CODE,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -107,3 +111,43 @@ def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(mo
     with pytest.raises(SystemExit) as exc:
         cli._run_single_query_mode(stub, "do the thing", None, True, True)
     assert exc.value.code == expected
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "session_persistence_failed:locked",
+        "session_persistence_failed:compression",
+        "session_persistence_failed:compression_closed",
+        "session_persistence_failed:turn_lease",
+    ],
+)
+def test_dispatcher_spawned_worker_signals_a_state_store_lock_stop(monkeypatch, reason):
+    """A turn killed by the profile state store — the store's write lock held by a peer, or a
+    compression/lease rotation refusing this writer — is INFRASTRUCTURE, not the card: the worker
+    exits ``KANBAN_STORAGE_LOCKED_EXIT_CODE`` so the dispatcher re-queues without consuming the
+    give-up budget. A person's run keeps 1."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    assert _run_non_quiet(monkeypatch, {"failed": True, "failure_reason": reason}) == KANBAN_STORAGE_LOCKED_EXIT_CODE
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    assert _run_non_quiet(monkeypatch, {"failed": True, "failure_reason": reason}) == 1
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "session_persistence_failed:disk",
+        "session_persistence_failed:corrupt",
+        "session_persistence_failed:fts_index",
+        "session_persistence_failed:deleted_wal",
+        "session_persistence_failed:unknown",
+        "session_persistence_failed",
+    ],
+)
+def test_a_non_transient_persistence_failure_still_exits_one(monkeypatch, reason):
+    """NEGATIVE CONTROL for the set above. A state-store failure a fresh turn cannot heal — a
+    full disk, corruption, a deleted WAL — is NOT a transient lock-stop: it keeps exit 1 and is
+    counted against the card, because the only thing ``storage_locked`` may ever grant is an
+    unbounded retry budget to a card whose own work was fine."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    assert _run_non_quiet(monkeypatch, {"failed": True, "failure_reason": reason}) == 1
