@@ -30,6 +30,16 @@ without this file, ``measure`` with it). It is kept as the DECLARATION, not as a
 suite already asserts the WIRED behaviour of the door; on the day the door is wired into the
 completion path again, a suite that closes cards with no evidence class by the hundred would
 refuse en masse without this file, and the failure would look like a product defect.
+
+THAT DAY ARRIVED, 2026-10-20 (card t_041d673a, ruling ESC-01650 / platform t_88cbc437 ->
+t_52183ba9): the door's call site was restored in ``kanban_db.complete_task`` (after
+``_gate_deploy_proof``, before ``prepare_acceptance``) and ``gate_assignee`` was wired onto the
+assign path with it. So this file is no longer INERT -- it is LOAD-BEARING: with it the suite
+closes its hundreds of evidence-free cards in ``measure`` (each one recording
+``evidence_gate_measure``), without it they would all refuse on the first run. Do not delete it,
+and do not "fix" it by turning it into a copy of ``tests/conftest.py`` (compose defect O-1,
+ruling t_f3eefbdb). The LIVE boards are a separate question: ``<kanban_home>/kanban/evidence_gate``
+is the prod switch, and the door must not reach the live tree before that file reads ``measure``.
 """
 
 import os

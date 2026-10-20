@@ -2718,6 +2718,17 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     will run again and can therefore be assigned for attribution.
     """
     profile = _canonical_assignee(profile)
+    # INVARIANT B at the OTHER door (ruling ESC-01650 / platform/t_52183ba9 item 3): create refuses
+    # an assignee that resolves to no profile on disk and to no declared pull lane (`:1947`,
+    # `where="kanban_create"`), but assign did not -- so a card could be handed to a handle that
+    # can never be spawned, strand silently, and never be reported as failed. Same rule, same call;
+    # this one is refuse-class and needs no soak, because create already refuses it and the
+    # asymmetry is a defect rather than a policy. `None`/empty (an unassign) stands down: unassigning
+    # a card is legal, and a terminal card can still be re-attributed, since a roster handle that
+    # exists passes and only a handle that resolves NOWHERE is refused.
+    if profile and str(profile).strip():
+        from hermes_cli import kanban_gate_invariants as _gates
+        _gates.gate_assignee(profile, board=board_for_connection(conn), where="kanban_assign")
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?", (task_id,)
@@ -5430,6 +5441,24 @@ def complete_task(
     # acceptance WITHOUT this call is a silent free pass — strictly worse than today's
     # unclosable card — so the two halves ship as one unit.
     _gate_deploy_proof(conn, task_id, metadata)
+    # INVARIANT A at the transition (design record platform-stl t_43be623a, ruling ESC-01650 /
+    # platform/t_88cbc437 -> t_52183ba9): a completion must DECLARE the evidence behind it. The
+    # seam sat here in the home of record and was dropped when this file became a tracked member
+    # of the ``overrides/live`` generation, which left ``kanban_gate_invariants
+    # .gate_completion_evidence`` with no call site at all: the door, its kill switch and its
+    # event vocabulary were dead code and the invariant was asserted nowhere that runs.
+    #
+    # Position is load-bearing and unchanged from the home of record: AFTER ``_gate_deploy_proof``
+    # (the ``landed`` contract owns its own ``metadata.proof`` block, and the evidence door returns
+    # early for it rather than judging the same claim twice) and BEFORE ``prepare_acceptance`` (a
+    # completion that declares no evidence is refused before an acceptance receipt is written).
+    # ``force`` is the operator's override and is passed through so it records ``evidence_waived``
+    # instead of refusing; a lane cannot reach that (``force`` is the operator path only).
+    # ARMED IN ``measure`` per the ruling: the door measures and records, the refusal is switched
+    # on per board when the soak shows it survivable. Flipping it here would be a fleet-wide close
+    # behaviour change, which is the STL's call, not this seam's.
+    from hermes_cli import kanban_gate_invariants as _gates
+    _gates.gate_completion_evidence(conn, task_id, metadata, force=force)
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
