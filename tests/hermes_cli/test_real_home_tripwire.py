@@ -108,6 +108,46 @@ def test_installed_desktop_app_can_be_read_but_never_changed(tmp_path, monkeypat
     assert plist.read_text(encoding="utf-8") == "unchanged"
 
 
+def test_the_installs_payload_manifest_is_readable_but_never_changed(tmp_path, monkeypatch):
+    """A default install keeps its checkout INSIDE the home, so the sealed-payload manifest that
+    ``pm`` reads at import (``<checkout>/../manifest.json``) sits under a guarded root. It
+    describes the installation the interpreter already runs from — the same class as the checkout
+    and its venv — so reads pass; writes and deletes stay refused, and no other home file follows.
+    """
+    from tests import conftest, home_io_guard
+
+    home = tmp_path / "home"
+    (home / "hermes-agent").mkdir(parents=True)
+    manifest = home / "manifest.json"
+    manifest.write_text('{"repo": "hermes-agent"}', encoding="utf-8")
+    monkeypatch.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [home])
+    monkeypatch.setattr(home_io_guard, "_INSTALL_PAYLOAD_MANIFESTS",
+                        frozenset({os.path.normcase(os.path.abspath(manifest))}))
+    try:
+        assert manifest.read_text(encoding="utf-8").startswith("{")
+        with pytest.raises((AssertionError, pytest.fail.Exception), match="REAL hermes home"):
+            manifest.write_text("clobbered", encoding="utf-8")
+        with pytest.raises((AssertionError, pytest.fail.Exception), match="REAL hermes home"):
+            manifest.unlink()
+        with pytest.raises((AssertionError, pytest.fail.Exception), match="REAL hermes home"):
+            manifest.replace(tmp_path / "elsewhere.json")
+        assert manifest.read_text(encoding="utf-8").startswith("{")
+        with pytest.raises((AssertionError, pytest.fail.Exception), match="REAL hermes home"):
+            (home / "config.yaml").read_text(encoding="utf-8")
+    finally:
+        monkeypatch.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [])
+
+
+def test_the_payload_manifest_exemption_serves_this_checkout():
+    """The exemption is anchored where the payload layout puts the manifest, not anywhere else."""
+    from tests import home_io_guard
+
+    checkout = Path(home_io_guard.__file__).resolve().parents[1]
+    assert home_io_guard._install_payload_manifests() == frozenset({
+        os.path.normcase(os.path.abspath(checkout.parent / "manifest.json")),
+    })
+
+
 def test_unprotected_paths_and_open_descriptors_still_work(protected_home, tmp_path):
     target = tmp_path / "allowed" / "file.txt"
     target.parent.mkdir()

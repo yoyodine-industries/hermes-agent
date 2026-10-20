@@ -46,6 +46,27 @@ def _contains(path: str, prefix: str) -> bool:
     return prefix.startswith(path) if path == os.sep else prefix.startswith(path + os.sep)
 
 
+def _normalize_for_guard(path: Path) -> str:
+    return os.path.normcase(os.fspath(path))
+
+
+def _install_payload_manifests() -> frozenset[str]:
+    """The sealed-payload manifest beside THIS checkout, normalized.
+
+    A default install checks the repo out inside the home (``<home>/hermes-agent``), so the
+    manifest ``pm`` reads at import to select a dependency generation (``<checkout>/../manifest.json``)
+    lands under a guarded root. It describes the installation this interpreter is already running
+    from — the same class as the checkout and its venv (see ``_INTERPRETER_PREFIXES``) — not Hermes
+    state. Reads only: tests still may not write, replace or delete it.
+    """
+    tests_dir = Path(__file__).resolve().parent
+    checkout = tests_dir.parent
+    return frozenset({_normalize_for_guard(checkout.parent / "manifest.json")})
+
+
+_INSTALL_PAYLOAD_MANIFESTS = _install_payload_manifests()
+
+
 class HomeIOGuard:
     def __init__(self, roots, installed_apps=lambda: ()):
         self.roots = roots
@@ -82,6 +103,11 @@ class HomeIOGuard:
                 return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
+            # The install's own payload manifest (``<checkout>/../manifest.json``) is install
+            # layout, not state: pm reads it at import to pick the dependency generation. Reads
+            # pass; writes, replaces and deletes fall through to the refusal below.
+            if not destructive and absolute in _INSTALL_PAYLOAD_MANIFESTS:
+                return
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
@@ -108,6 +134,8 @@ class HomeIOGuard:
             if resolved is None:
                 resolved = _normcase(os.path.realpath(absolute))
             if metadata and resolved in roots:
+                return
+            if not destructive and resolved in _INSTALL_PAYLOAD_MANIFESTS:
                 return
             # A fixture symlink to the running interpreter resolves into its installation.
             for prefix in _INTERPRETER_PREFIX_STRS:
