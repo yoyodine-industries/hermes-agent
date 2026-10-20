@@ -10,7 +10,23 @@ from types import SimpleNamespace
 
 import pytest
 
+# The module below exercises the nemo-relay 0.10 API, but pyproject.toml declares that floor
+# only for `python_version >= '3.14'`: on an older interpreter the requirement is inactive, so a
+# venv can import a 0.8.x wheel happily and every test here then fails for a reason that is not
+# the code's (card t_473047e1 - three reds a currency gate blamed on an innocent PR). ABSENCE
+# already skips; a STALE version must skip too, naming the version, instead of going red.
+from tests.agent._relay_floor import RELAY_FLOOR, below_relay_floor, installed_relay_version
+
 pytest.importorskip("nemo_relay")
+
+_RELAY_VERSION = installed_relay_version()
+if below_relay_floor(_RELAY_VERSION):
+    pytest.skip(
+        "nemo-relay "
+        f"{_RELAY_VERSION or 'of unknown version'} is below the "
+        f">={'.'.join(str(n) for n in RELAY_FLOOR)} floor these tests exercise",
+        allow_module_level=True,
+    )
 
 from agent import relay_llm, relay_runtime
 
