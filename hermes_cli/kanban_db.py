@@ -1584,43 +1584,9 @@ def _resolve_project_link(
     return project_obj.id, project_obj, project_repo, workspace_kind
 
 
-def _warn_unresolved_project_link(project_id: str, *, source: str) -> dict:
-    """The warning + the ``created``-event note for a project link this registry cannot resolve.
-
-    ``_resolve_project_link`` drops such a link by design (never a dangling reference, never a
-    crash) — but the registry is PER-PROFILE (``$HERMES_HOME/projects.db``), so the drop is easy
-    to walk into: a caller that passed ``--project``, or a board scoped to a project another
-    profile's registry holds, gets an ordinary scratch card and — before this seam — never
-    learned that its link did not land. Measured on the workstream board: 13 of 23 rows left
-    ``project_id`` NULL against 10 carrying the project.
-
-    A silent drop is a silent failure, so the drop STAYS and is made LOUD: a stderr warning that
-    names the ident, the registry that was searched and the two honest paths, plus the fields the
-    ``created`` event carries (``project_link_unresolved``, ``..._source``, ``..._registry``).
-    Never raises — a warning must never be the thing that fails a filing.
-    """
-    try:
-        from hermes_cli import projects_db as _pdb
-
-        registry = str(_pdb.projects_db_path())
-    except Exception:
-        registry = "this profile's projects.db"
-    asked_as = "--project" if source == "argument" else "the board's default project"
-    print(
-        f"warning: kanban: {asked_as} {project_id!r} is not in this profile's project registry "
-        f"({registry}); the card was filed WITHOUT the project link. Create the project in this "
-        f"profile (`hermes project create <name> --slug {project_id}`) or link by SLUG from the "
-        f"registry that owns it (`hermes project list`).",
-        file=sys.stderr,
-    )
-    _log.warning(
-        "kanban: unresolved project link %r (source=%s) - card filed unscoped", project_id, source,
-    )
-    return {
-        "project_link_unresolved": project_id,
-        "project_link_source": source,
-        "project_link_registry": registry,
-    }
+# The two project-link NOTES create_task writes -- the warn-on-a-dropped-link helper and the
+# contradicting-inferred-link gate -- live in ``kanban_db_project_link`` (a topical sibling:
+# the facade may only shrink, and this is new behaviour). Imported at the call site below.
 
 
 def _project_from_source_task(
@@ -1873,6 +1839,7 @@ def create_task(
     recorded on the card rather than refused.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
+    from hermes_cli.kanban_db_project_link import link_note, plan_project_link
     from hermes_cli.kanban_pr_acceptance import needs_repository_checks, validate_contract
     from hermes_cli.kanban_register import (
         OFF_BOARD_ASK_EVENT, apply_stamp, guard_new_ask_home, normalise_body,
@@ -1955,18 +1922,19 @@ def create_task(
     # names no board. One filing, one slug, so the metadata chain and the birth-priority chain
     # cannot disagree.
     dest_board = board or board_for_connection(conn) or get_current_board()
-    # A project-scoped board anchors every new task to its project's repo
-    # (deterministic worktree + branch) without each surface repeating it.
-    # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
-    # it must not be upgraded to a worktree in the board's repo (#106342).
-    project_source = "argument"
-    if project_id is None and workspace_kind != "scratch":
-        try:
-            project_id = (_board_meta_for(dest_board).get("project_id") or "").strip() or None
-        except Exception:
-            pass
-        if project_id:
-            project_source = "board"
+    # A project-scoped board anchors every new task to its project's repo (deterministic worktree +
+    # branch) without each surface repeating it; an explicit ``scratch`` (or ``project_id=""``) is a
+    # request for NO project and must not be upgraded (#106342). ONE phase in the sibling: the board
+    # default, the inherited source, and the contradiction gate that DROPS an inferred link the
+    # card's own text refutes -- and it runs BEFORE the link resolves, so a contradicted project
+    # never anchors a worktree in the wrong repo (card t_b407489b). Detection only: the report is
+    # printed below, once a card is really being created (a deduped call must not warn).
+    link = plan_project_link(
+        project_id=project_id, source_task_id=project_source_task_id, board=dest_board,
+        workspace_kind=workspace_kind, title=title, body=body)
+    project_id, project_source = link["project_id"], link["source"]
+    project_requested = link["requested"]
+    project_link_contradiction = link["contradiction"]
     if workspace_kind is None:
         workspace_kind = "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
@@ -1979,7 +1947,6 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
-    project_requested = project_id
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
@@ -2003,15 +1970,12 @@ def create_task(
         if row:
             return row["id"]
 
-    # An unresolvable project link is DROPPED either way (never a dangling reference, never a
-    # crash), but a silent drop is a silent failure: the caller believes the card is grouped
-    # and it is not. Warn on stderr AND carry the finding into the ``created`` event, so the
-    # filing CLI's caller learns it at the terminal and the card records it durably. Placed
-    # after the idempotency early-return: a deduped call creates no card to warn about.
-    project_unresolved = (
-        _warn_unresolved_project_link(project_requested, source=project_source)
-        if project_requested and project_id is None else {}
-    )
+    # THE LINK'S OWN RECORD (card t_b407489b): the ``created`` event says HOW the link happened --
+    # its source, or why it did not land -- so a wrong link is visible on the card instead of
+    # implicit. Reported AFTER the idempotency early-return: a deduped call files no card.
+    project_link_note = link_note(
+        project_id=project_id, requested=project_requested, source=project_source,
+        contradiction=project_link_contradiction)
 
     # THE BIRTH SEAM (REQUIRED 1, card t_2187558e). A board-scoped policy applied here cannot be
     # routed around: the tool verb, the CLI, a decomposer and another lane's agent all reach this
@@ -2130,7 +2094,7 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
-                        **project_unresolved,
+                        **project_link_note,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
