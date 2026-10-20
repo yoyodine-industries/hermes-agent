@@ -10,12 +10,17 @@ the entire value of these tests is exercising actual git verdicts):
 - patch-equivalent commits (rebase/squash-merge leak) → reap
 - live-locked tree                 → keep
 - kanban t_<hex> tree              → keep (owned by kanban gc)
+- kanban tree, card resolves       → judged by the card's STATUS (terminal → reap)
+- terminal card, deletions only, head on trunk → reap-archive
+- terminal card, ANY other dirt    → keep
+- kanban tree with no board row    → keep, flagged ATTENTION by the printer
 - branch GC: merged branch deleted, unique-commit branch kept,
   checked-out branch kept, protected names kept
 - reclaim operates ONLY on the frozen audit list (concurrent-session trap)
 """
 
 import os
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -86,6 +91,34 @@ def _verdict(records, name):
     match = [record for record in records if record.name == name]
     assert match, f"no record for {name}"
     return match[0]
+
+
+@pytest.fixture
+def board(tmp_path, monkeypatch):
+    """A throwaway kanban board root (``HERMES_KANBAN_HOME``) with a ``tasks`` table.
+
+    Card resolution goes through ``kanban_db.kanban_home()``, which honours
+    ``HERMES_KANBAN_HOME``, so this keeps the machine's real boards — and their
+    ~thousands of cards — out of every verdict exercised here. The returned
+    callable sets a card's status; an id never passed to it has NO board row.
+    """
+    home = tmp_path / "kanban-home"
+    home.mkdir()
+    db = home / "kanban.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+
+    def _set(task_id: str, status: str) -> None:
+        conn = sqlite3.connect(db)
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO tasks (id, status) VALUES (?, ?)",
+                         (task_id, status))
+        conn.close()
+
+    return _set
 
 
 class TestAuditVerdicts:
@@ -191,12 +224,14 @@ class TestAuditVerdicts:
         assert record.verdict == "keep"
         assert "in use" in record.reason
 
-    def test_kanban_tree_untouched(self, repo):
+    def test_kanban_tree_untouched(self, repo, board):
         _add_worktree(repo, "t_deadbeef", branch="kanban/t_deadbeef")
         records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
         record = _verdict(records, "t_deadbeef")
         assert record.verdict == "keep"
         assert "kanban" in record.reason
+        # No row on this board: kept AND flagged instead of silently "preserved".
+        assert record.attention == worktree_gc._ATTENTION_NO_BOARD_ROW
 
 
 class TestReclaim:
@@ -398,13 +433,137 @@ class TestExternalTrees:
         )
 
 
+class TestTerminalCardReclaim:
+    """A t_<hex> tree is judged by its card's STATUS, and a terminal card only
+    reclaims work the repo already has: deletions over a head that is on the
+    trunk. Everything else dirty stays put — a done card is not a licence to
+    throw away unmerged work."""
+
+    def _deleted(self, repo, name, branch):
+        tree, branch = _add_worktree(repo, name, branch=branch)
+        (tree / "README.md").unlink()
+        return tree, branch
+
+    def test_deletions_only_on_a_done_card_reaps_archive(self, repo, board):
+        tree, branch = self._deleted(repo, "t_abcdef", "kanban/t_abcdef")
+        board("t_abcdef", "done")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "t_abcdef")
+        assert record.verdict == "reap-archive", record.reason
+        assert "card done" in record.reason
+        assert "deletions" in record.reason
+        assert not record.attention
+
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("removed t_abcdef" in a for a in actions), actions
+        assert any("deletions" in a for a in actions), "the action line must name what it removed"
+        assert not tree.exists()
+        # reap-archive semantics: the branch is fully on the trunk, so it goes too.
+        assert _git(["branch", "--list", branch], repo).strip() == ""
+
+    def test_modification_on_a_done_card_stays(self, repo, board):
+        tree, _ = _add_worktree(repo, "t_abc123", branch="kanban/t_abc123")
+        (tree / "README.md").write_text("edited\n")
+        board("t_abc123", "done")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "t_abc123")
+        assert record.verdict == "keep"
+        assert "tracked" in record.reason
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert tree.exists()
+
+    def test_deletions_with_an_unpublished_head_stay(self, repo, board):
+        """Deleting a file loses nothing only when HEAD is already on the trunk."""
+        tree, _ = _add_worktree(repo, "t_abc456", branch="kanban/t_abc456")
+        (tree / "work.py").write_text("w = 1\n")
+        _git(["add", "."], tree)
+        _git(["commit", "-m", "unpublished work"], tree)
+        (tree / "README.md").unlink()
+        board("t_abc456", "done")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "t_abc456")
+        assert record.verdict == "keep", record.reason
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert tree.exists()
+
+    def test_deletion_plus_untracked_dirt_stays(self, repo, board):
+        """`??` is real work too: only a pure-D status qualifies."""
+        tree, _ = _add_worktree(repo, "t_abc789", branch="kanban/t_abc789")
+        (tree / "README.md").unlink()
+        (tree / "NOTES.md").write_text("scribbles\n")
+        board("t_abc789", "done")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        assert _verdict(records, "t_abc789").verdict == "keep"
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert tree.exists() and (tree / "NOTES.md").exists()
+
+    def test_renamed_file_is_real_work(self, repo, board):
+        tree, _ = _add_worktree(repo, "t_abc321", branch="kanban/t_abc321")
+        _git(["mv", "README.md", "RENAMED.md"], tree)
+        board("t_abc321", "done")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        assert _verdict(records, "t_abc321").verdict == "keep"
+
+    def test_deletions_only_parses_paths_with_spaces(self, repo):
+        """`-z` records are NUL-separated: a space in a path is not a field break."""
+        (repo / "two words.py").write_text("x = 1\n")
+        _git(["add", "."], repo)
+        _git(["commit", "-m", "add a spaced path"], repo)
+        tree, _ = _add_worktree(repo, "hermes-spaces")
+
+        assert worktree_gc._deletions_only(str(tree)) is False, "a clean tree is not deletions"
+        (tree / "two words.py").unlink()
+        (tree / "README.md").unlink()
+        assert worktree_gc._deletions_only(str(tree)) is True
+
+    def test_deletions_on_a_live_card_stay(self, repo, board):
+        tree, _ = self._deleted(repo, "t_11fe01", "kanban/t_11fe01")
+        board("t_11fe01", "running")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "t_11fe01")
+        assert record.verdict == "keep"
+        assert "running" in record.reason
+        assert tree.exists()
+
+
+class TestNoBoardRowAttention:
+    """D1: a card tree the board cannot resolve is REACHABLE — kept, and named
+    in its own ATTENTION section instead of vanishing into "preserved"."""
+
+    def test_no_board_row_tree_is_kept_and_flagged(self, repo, board):
+        tree, _ = _add_worktree(repo, "t_0badc0de", branch="hermes/t_0badc0de")
+        board("t_somethingelse", "done")  # a board exists; this card is not on it
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "t_0badc0de")
+        assert record.verdict == "keep"
+        assert "no board row" in record.reason
+        assert record.attention == worktree_gc._ATTENTION_NO_BOARD_ROW
+
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert tree.exists(), "an unresolvable card is never a licence to delete"
+
+    def test_resolved_card_carries_no_attention(self, repo, board):
+        _add_worktree(repo, "t_abc999", branch="kanban/t_abc999")
+        board("t_abc999", "done")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        assert _verdict(records, "t_abc999").attention == ""
+
+
 class TestCmdWorktreeJson:
     def _ns(self, repo, action, **kw):
         import argparse
 
         return argparse.Namespace(
             repo=str(repo), worktree_action=action,
-            json=True, older_than=kw.get("older_than"),
+            json=kw.get("json", True), older_than=kw.get("older_than"),
             dry_run=kw.get("dry_run", False),
             trees_only=kw.get("trees_only", False),
             branches_only=kw.get("branches_only", False),
@@ -441,3 +600,38 @@ class TestCmdWorktreeJson:
         from hermes_cli.worktree_cmd import cmd_worktree
 
         assert cmd_worktree(self._ns(repo, "prune", older_than=-1)) == 1
+
+    def test_prune_prints_an_attention_section_for_unresolvable_cards(self, repo, board, capsys):
+        """The 'no board row' class gets its own section — it is not 'preserved'
+        and it is not silent."""
+        from hermes_cli.worktree_cmd import cmd_worktree
+
+        _add_worktree(repo, "t_0badc0de", branch="hermes/t_0badc0de")
+        _add_worktree(repo, "hermes-plain")
+        board("t_unrelated", "done")
+
+        assert cmd_worktree(self._ns(repo, "prune", json=False, dry_run=True,
+                                     trees_only=True)) == 0
+        out = capsys.readouterr().out
+        attention_block = out.split("ATTENTION", 1)
+        assert len(attention_block) == 2, out
+        assert "1 tree(s)" in attention_block[1].splitlines()[0]
+        assert "t_0badc0de" in attention_block[1]
+        # Not folded into the preserved list, and not reaped.
+        preserved = out.split("Preserved", 1)[1].split("ATTENTION", 1)[0] if "Preserved" in out else ""
+        assert "t_0badc0de" not in preserved
+        assert (repo / ".worktrees" / "t_0badc0de").exists()
+
+    def test_prune_json_carries_attention(self, repo, board, capsys):
+        import json
+
+        from hermes_cli.worktree_cmd import cmd_worktree
+
+        _add_worktree(repo, "t_0badc0de", branch="hermes/t_0badc0de")
+        board("t_unrelated", "done")
+
+        assert cmd_worktree(self._ns(repo, "prune", dry_run=True)) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert [a["name"] for a in payload["attention"]] == ["t_0badc0de"]
+        assert payload["attention"][0]["attention"] == "no-board-row"
+        assert all(p["name"] != "t_0badc0de" for p in payload["preserved"])
