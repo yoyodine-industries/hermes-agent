@@ -1305,6 +1305,17 @@ def test_patch_assignee_to_a_dead_handle_answers_400_naming_the_invariant(client
     assert ok.status_code == 200, ok.text
     assert ok.json()["task"]["assignee"] == "real-lane"
 
+    # And the 409 for a CLAIMED card survives: "release the claim first" is a different
+    # remedy from "this handle cannot run", so the two must not collapse into one status.
+    conn = kbc.connect()
+    try:
+        conn.execute("UPDATE tasks SET status='running', claim_lock='probe' WHERE id=?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+    claimed = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"assignee": "real-lane"})
+    assert claimed.status_code == 409, claimed.text
+
 
 def test_reassign_endpoint_maps_the_refusal_instead_of_500ing(client, kanban_home):
     """POST /tasks/<id>/reassign had no mapping at all: the refusal escaped as a 500."""
