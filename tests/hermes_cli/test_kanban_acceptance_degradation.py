@@ -54,10 +54,11 @@ def board(tmp_path, monkeypatch):
 
 @pytest.fixture
 def forge(monkeypatch):
-    """The GitHub contract ``collect_acceptance`` reads, with the failures as knobs.
+    """Both forge doors, with the failures as knobs.
 
-    ``state["raise"]`` makes every endpoint fail (an unreachable or unauthenticated forge);
-    otherwise a repository with one required check named ``ci`` is reported.
+    ``state["raise"]`` makes every ``collect_acceptance`` endpoint fail (an unreachable or
+    unauthenticated forge); ``state["landing_state"]`` is what the landing-carrier clause's own
+    forge read answers (``merged`` means the landing is not owed).
     """
     state = {
         "raise": None,
@@ -65,6 +66,7 @@ def forge(monkeypatch):
         "conclusion": "success",
         "status": "completed",
         "pr_state": "OPEN",
+        "landing_state": "merged",
         "calls": 0,
     }
 
@@ -92,9 +94,14 @@ def forge(monkeypatch):
             return {"head": {"sha": SHA}, "base": {"ref": "main"}, "state": "open"}
         raise AssertionError(f"unexpected endpoint {endpoint}")
 
+    def fake_forge_state(repo, number, *, profile_home=None):
+        return state["landing_state"]
+
     live_acceptance = importlib.import_module("hermes_cli.kanban_pr_acceptance")
     live_store = importlib.import_module("hermes_cli.kanban_pr_acceptance_store")
+    live_carrier = importlib.import_module("hermes_cli.kanban_landing_carrier")
     monkeypatch.setattr(live_acceptance, "_api", fake_api)
+    monkeypatch.setattr(live_carrier, "forge_state", fake_forge_state)
     bound_globals = getattr(getattr(live_store, "collect_acceptance", None), "__globals__", None)
     if bound_globals is not None and bound_globals is not live_acceptance.__dict__:
         monkeypatch.setitem(bound_globals, "_api", fake_api)
@@ -133,7 +140,7 @@ def _carrier(conn, tid):
 def test_a_contract_no_retry_can_satisfy_is_repaired_at_load(board):
     """R4: a stored contract that is not a declaration is repaired, not left fatal.
 
-    Card ``t_c4a9d940`` held a bare space.  Every close was refused with "supply
+    Card ``t_c4a9d940`` held a column that read blank. Every close was refused with "supply
     metadata.published_pr matching the persisted completion contract" -- a contract that
     cannot be read and is never repaired, so the card was unclosable forever.
     """
@@ -149,18 +156,42 @@ def test_a_contract_no_retry_can_satisfy_is_repaired_at_load(board):
         assert repaired[0]["previous"] == " "
         assert repaired[0]["previous_repr"] == "' '"
         assert repaired[0]["repaired_to"] == "local-only"
+        assert "UNVERIFIED" in repaired[0]["warn"]        # the card's WARN row
         # The repair replaces the acceptance leg rather than skipping it silently: no
         # repository was ever judged, so no acceptance receipt is invented.
         assert _events(conn, tid, "pr_acceptance") == []
 
 
-def test_an_empty_contract_is_not_a_deadlock(board):
-    """A stored contract that is empty declares nothing, so nothing is enforced on it."""
+def test_an_empty_stored_contract_is_repaired_too(board):
+    """R4 names an EMPTY column: an empty value cannot be told apart from a truncated one."""
     with connect() as conn:
         tid = kb.create_task(conn, title="empty", completion_contract="local-only")
         _store_contract(conn, tid, "")
         assert kb.complete_task(conn, tid, result="done") is True
         assert kb.get_task(conn, tid).status == "done"
+        assert _contract(conn, tid) == "local-only"
+        repaired = _events(conn, tid, "completion_contract_repaired")[-1]
+        assert repaired["previous"] == ""
+        assert "EMPTY" in repaired["reason"]
+        assert "UNVERIFIED" in repaired["warn"]
+
+
+@pytest.mark.parametrize("published_pr", [None, 657, PR_URL],
+                         ids=["no-metadata", "bare-number", "full-url"])
+def test_the_filing_card_history_closes_in_every_shape(board, forge, published_pr):
+    """t_8805786a's exact history: blank stored contract + these three shapes, all closed.
+
+    On 2026-10-19 these were the three refusals -- ``missing``, ``infra`` and ``missing`` --
+    on a card whose land had demonstrably merged, and the merge sat on main while the log
+    said the landing was still owed.
+    """
+    with connect() as conn:
+        tid = kb.create_task(conn, title="the filing card", completion_contract="local-only")
+        _store_contract(conn, tid, " ")
+        metadata = {} if published_pr is None else {"published_pr": published_pr}
+        assert kb.complete_task(conn, tid, result="done", metadata=metadata) is True
+        assert kb.get_task(conn, tid).status == "done"
+        assert _events(conn, tid, "completion_contract_repaired")[-1]["previous"] == " "
 
 
 # ------------------------------------------------------------------ R1: degrade, not refuse
@@ -211,14 +242,13 @@ def test_an_identity_failure_still_refuses_and_names_the_fix(board, forge):
 def test_degrading_does_not_excuse_the_landing_leg(board, forge):
     """R1 is about a FORGE read, not a board fence: an unverified close still owes a carrier."""
     forge["raise"] = OSError("gh: command not found")
+    forge["landing_state"] = "open"          # the forge's own answer: the PR has not landed
     with connect() as conn:
         tid = kb.create_task(conn, title="unreadable forge", completion_contract="acme/repo")
         refusal = _refusal(kb.complete_task(conn, tid, result="done",
                                             metadata={"published_pr": PR_URL}))
-        # The unread forge did not buy the close: the LANDING fence refused it (its own verdict,
-        # `landing_state_unknown` or `landing_carrier_missing` depending on whether its own
-        # forge read works here), not acceptance -- an unverified PR still owes its landing leg.
-        assert refusal.cause.startswith("landing_")
+        # The unread forge did not buy the close: the LANDING fence refused it, not acceptance.
+        assert refusal.cause == "landing_carrier_missing"
         assert kb.get_task(conn, tid).status != "done"
         assert _events(conn, tid, "pr_acceptance_unverified") == []
 
