@@ -458,8 +458,11 @@ _SPECS = [
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
-        _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
-    ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
+        _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons. "
+                "MANDATORY when reopening a DONE card (the terminal reopen is never silent)."),
+        _arg("--reviewer", help="Reviewer lane that becomes the card's assignee when reopening a DONE card "
+                                "into review (required for done; refused if it is the card's own author)"),
+    ], help="Send one or more review tasks back for changes (review -> ready/todo; done -> review)"),
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),

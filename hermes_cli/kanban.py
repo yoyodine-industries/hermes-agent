@@ -1093,7 +1093,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                                        force=bool(getattr(args, "force", False)),
+                                        actor=_profile_author())
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
@@ -1372,18 +1373,43 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = str(kb.redact_review_value(reason.strip())).strip() or None
+    reviewer = getattr(args, "reviewer", None)
+    if reviewer is not None:
+        reviewer = str(reviewer).strip() or None
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
+        failures: dict[str, str] = {}
+
         def op(tid):
-            if not kb.reopen_review_task(conn, tid):
+            task = kb.get_task(conn, tid)
+            if task is not None and task.status == "done":
+                # done -> review is the TERMINAL-card repair door (t_eb5bf72d): it needs
+                # BOTH a recorded reason and a reviewer. A missing one is its own refusal
+                # text, never a silent False behind a misleading "not in review?".
+                if not reason:
+                    failures[tid] = (f"{tid} is done: reopening a terminal card into review "
+                                     f"requires a recorded --reason (why the review is still owed)")
+                    return False
+                if not reviewer:
+                    failures[tid] = (f"{tid} is done: reopening a terminal card into review "
+                                     f"requires --reviewer <lane> (a card sent to review needs a "
+                                     f"lane to review it)")
+                    return False
+                if not kb.reopen_review_task(conn, tid, reason=reason, reviewer=reviewer):
+                    failures[tid] = (
+                        f"cannot reopen {tid}: the reviewer must not be the card's own author "
+                        f"lane, and the card must still be done")
+                    return False
+                return True
+            if not kb.reopen_review_task(conn, tid, reason=reason):
                 return False
             if reason:
                 kb.add_comment(conn, tid, author or "operator", f"CHANGES REQUESTED: {reason}")
             return True
 
         return _bulk_apply(ids, op, lambda tid: f"Reopened {tid}{suffix}",
-                           lambda tid: f"cannot reopen {tid} (not in review?)")
+                           lambda tid: failures.get(tid) or f"cannot reopen {tid} (not in review?)")
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
