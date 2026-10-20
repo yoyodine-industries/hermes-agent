@@ -110,11 +110,13 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     if not completable:
         return False
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
-    # The declaration is IMMUTABLE: the published PR is recorded on the receipt and the audit
-    # event, never written back to the card. Rebinding froze a card to the first PR it ever
-    # published, so a superseded PR left it unsatisfiable forever with no verb to release it.
-    # A contract change is an OWNER act (``hermes kanban set-contract``), never a side effect
-    # of a completion -- ruling t_90767078, D2/D4.
+    # The declaration is IMMUTABLE once it is READABLE: the published PR is recorded on the
+    # receipt and the audit event, never written back to the card. Rebinding froze a card to
+    # the first PR it ever published, so a superseded PR left it unsatisfiable forever with no
+    # verb to release it. A contract change is an OWNER act (``hermes kanban set-contract``),
+    # never a side effect of a completion -- ruling t_90767078, D2/D4. (The one write above is
+    # not a rebind: it replaces a value this gate could not read at all, and records both the
+    # old value and the new one on the card's own event log.)
     # The assignee profile's gh login owns the repo: acceptance must not run as
     # the ambient login of whichever process completes the card (#122689).
     assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
