@@ -1236,7 +1236,7 @@ def _handle_record_landing_verdict(args: dict, **kw) -> str:
     result = args.get("result")
     result = _redact(result) if isinstance(result, str) and result.strip() else None
     board = args.get("board")
-    with _board(board) as (kb, conn):
+    with _board(board) as (_kb, conn):
         receipt = record_landing_verdict(
             conn, target, verdict, reason,
             caller_task_id=caller,
@@ -1564,17 +1564,29 @@ def _handle_unblock(args: dict, **kw) -> str:
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links/running
     children → ValueError). A worker linking its OWN running card proves ownership
-    with its run id so the dependency-block handoff still works."""
+    with its run id so the dependency-block handoff still works.
+
+    The receipt names the new dependency set's PROMOTION state: ``parents`` (per-edge
+    code/text/self_moves), ``standing`` (the ids that will not move on their own) and
+    ``warning`` — a link into a parent nobody will finish is a silent park otherwise.
+    """
     _reject_delegated_child_mutation("kanban_link")
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
+    from hermes_cli.profiles import list_profile_names
+
     with _board(args.get("board")) as (kb, conn):
-        gated = kb.link_tasks(
+        outcome = kb.link_tasks_reported(
             conn, parent_id=parent_id, child_id=child_id,
-            expected_child_run_id=_worker_run_id(str(child_id)))
-        return _ok(parent_id=parent_id, child_id=child_id, gated=gated,
-                   **({"gated_by": parent_id} if gated else {}))
+            expected_child_run_id=_worker_run_id(str(child_id)),
+            profiles=list_profile_names(), board=args.get("board"))
+        return _ok(parent_id=parent_id, child_id=child_id, gated=outcome.gated,
+                   **({"gated_by": parent_id} if outcome.gated else {}),
+                   parents=[{"id": p.id, "status": p.status, "code": p.code,
+                             "self_moves": p.self_moves} for p in outcome.parents],
+                   standing=outcome.standing, warning=outcome.warning,
+                   board_dispatch=outcome.board_dispatch)
 
 
 @_kanban_handler("kanban_close_sibling")
