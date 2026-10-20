@@ -89,10 +89,13 @@ check keep the card open. A refusal always quotes the persisted contract verbati
 worker is never sent to satisfy a declaration it cannot read. A stored contract that
 cannot be parsed as a declaration (empty, blank, truncated) is repaired at completion
 time, with a `completion_contract_repaired` event recording the value it replaced: to
-`local-only` when the close declares no publication, or to the exact PR URL the close
-declares (the same re-scope `kanban set-contract` performs by hand), so that the repair
-never contradicts the landing fence. `--force` overrides the live-claim
-guard only: it never bypasses acceptance, the landing carrier or the deploy proof.
+`local-only`, the value that claims nothing, which is all an unreadable contract says.
+The close is then recorded **unverified** (no acceptance leg is claimed), and the landing
+carrier still judges the declared PR — an empty and a `local-only` contract are the same
+thing to that clause, so the repair adds no refusal the card did not already face and
+never binds the card to a declaration only a merge can satisfy. `--force` overrides the
+live-claim guard only: it never bypasses acceptance, the landing carrier or the deploy
+proof.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
 store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery
