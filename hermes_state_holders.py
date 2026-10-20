@@ -11,7 +11,9 @@ import errno
 import functools
 import logging
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Set, Tuple
@@ -40,6 +42,21 @@ _PYTHON_SHORT_OPTIONS_WITH_OPERANDS = frozenset({"Q", "W", "X"})
 _PYTHON_LONG_OPTIONS_WITH_OPERANDS = frozenset(
     {"--check-hash-based-pycs", "--jit"}
 )
+
+# A scan that could not be completed says so with this pid. It is NOT a holder: a real holder
+# always carries a positive pid (an in-process one carries its own). Callers that fail closed treat
+# both alike, but anything that reports to a human must not name a holder it never saw.
+HOLDER_SCAN_FAILED_PID = -1
+
+
+def scan_failed(reason: str) -> tuple[int, str]:
+    """The holder entry that means "could not prove", never "someone holds it"."""
+    return (HOLDER_SCAN_FAILED_PID, reason)
+
+
+def is_holder_scan_failure(holder: tuple[int, str]) -> bool:
+    """True when *holder* records an incomplete scan rather than evidence of a holder."""
+    return holder[0] == HOLDER_SCAN_FAILED_PID
 
 
 def _read_proc_argv(pid: int) -> Optional[list[str]]:
@@ -144,6 +161,57 @@ def _looks_like_hermes(argv: Sequence[str]) -> bool:
 def canonical_sqlite_path(path: str) -> str:
     """Normalize a /proc fd target, stripping the Linux `` (deleted)`` suffix."""
     return os.path.normcase(os.path.abspath(path.removesuffix(" (deleted)")))
+
+
+_LSOF_CANDIDATES = ("/usr/sbin/lsof", "/usr/bin/lsof", "lsof")
+
+
+def _lsof_path() -> Optional[str]:
+    for candidate in _LSOF_CANDIDATES:
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+def _lsof_state_db_holders(db_path_str: str) -> Optional[list[tuple[int, str]]]:
+    """Who holds the DB or a WAL sidecar, asked of ``lsof`` — the kernel's own answer.
+
+    macOS has no /proc, so the alternative is psutil walking every open file of every process to
+    answer a question about ONE file: a full-host sweep that stats each stranger's path (including
+    the operator's real home — the gateway's kanban log, another profile's store) merely to decide
+    it is not ours. ``lsof`` filters on the paths we name and reports only those. ``None`` when
+    lsof is not installed, so the caller can fall back to the psutil sweep.
+    """
+    lsof = _lsof_path()
+    if lsof is None:
+        return None
+    watched_paths = _sqlite_family(db_path_str)
+    try:
+        completed = subprocess.run(
+            [lsof, "-n", "-P", "-F", "pn", *watched_paths],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [scan_failed(f"lsof scan failed: {exc}")]
+    if completed.returncode not in (0, 1):  # 1 == "no matching open files" on lsof
+        return [scan_failed(
+            f"lsof scan failed ({completed.returncode}): {completed.stderr.strip()[:120]}")]
+    # lsof exits 1 for a missing sidecar too, which proves nothing about the DB. Anything else it
+    # says about OUR paths (permission, bad descriptor) means the answer is unknown, not "quiet".
+    for line in completed.stderr.splitlines():
+        if "No such file" in line:
+            continue
+        if any(path in line for path in watched_paths):
+            return [scan_failed(f"lsof scan failed: {line.strip()[:120]}")]
+    holders: list[tuple[int, str]] = []
+    pid: Optional[int] = None
+    for line in completed.stdout.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:]) if line[1:].isdigit() else None
+        elif line.startswith("n") and pid is not None and pid != os.getpid():
+            holders.append((pid, line[1:]))
+    return holders
 
 
 _HOME_FLAGS = ("--hermes-home",)
@@ -425,9 +493,10 @@ def _windows_restart_manager_holders(db_path: Path) -> list[tuple[int, str]]:
 def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
     """Return foreign holders of the DB or one of its WAL sidecars.
 
-    A scan failure is represented as an unknown holder. Structural maintenance
-    must not assume quiescence when an old, unlinked SQLite generation may
-    still be open by another process.
+    An incomplete scan is represented by ``scan_failed(...)`` — an entry in the same shape, but
+    with ``HOLDER_SCAN_FAILED_PID`` and no claim about who holds what: see
+    ``is_holder_scan_failure``. Structural maintenance must not assume quiescence when an old,
+    unlinked SQLite generation may still be open by another process, so both kinds still defer it.
     """
     if _IS_WINDOWS:
         try:
@@ -437,7 +506,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                 "Could not prove state.db has no Windows holders; deferring structural maintenance: %s",
                 exc,
             )
-            return [(-1, f"Windows Restart Manager scan failed: {exc}")]
+            return [scan_failed(f"Windows Restart Manager scan failed: {exc}")]
 
     # realpath, not abspath: psutil/libproc report the kernel-resolved pathname, so a symlinked
     # HERMES_HOME would otherwise make every holder invisible and let maintenance proceed.
@@ -452,7 +521,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
         except OSError as exc:
             if exc.errno not in (errno.ENOENT, errno.ESRCH):
                 holders.append(
-                    (-1, f"watched-file stat failed: {candidate}: {exc}")
+                    scan_failed(f"watched-file stat failed: {candidate}: {exc}")
                 )
             continue
         watched_ids.add((stat_result.st_dev, stat_result.st_ino))
@@ -539,11 +608,25 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                 "deferring structural maintenance: %s",
                 exc,
             )
-            holders.append((-1, f"open-file scan failed: {exc}"))
+            holders.append(scan_failed(f"open-file scan failed: {exc}"))
         return holders
 
+    if not sys.platform.startswith("linux"):
+        # No /proc to filter on: ask lsof first (it matches the paths we name) and only fall back
+        # to the psutil sweep when lsof is not installed.
+        lsof_holders = _lsof_state_db_holders(db_path_str)
+        if lsof_holders is not None:
+            return lsof_holders
+
     if psutil is None:
-        return [(-1, "open-file scan unavailable")]
+        return [scan_failed("open-file scan unavailable")]
+    # Compare open files against the DB's own DIRECTORY first, textually. libproc/psutil report
+    # kernel-resolved paths, so a holder of ``db_path`` always names it inside
+    # ``realpath(db_path)``'s directory; every other open file on the machine is a stranger's file
+    # with a stranger's name, and resolving it would be I/O against whatever that process is using
+    # (on a live host: the operator's real home, e.g. another lane's kanban log). One such refusal
+    # used to come back as a failed scan and defer structural maintenance for a DB nobody held.
+    db_dir = os.path.normcase(os.path.dirname(db_path_str) + os.sep)
     try:
         for process in psutil.process_iter(["pid", "open_files"]):
             info = process.info
@@ -552,15 +635,20 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                 continue
             for opened in info.get("open_files") or ():
                 path = getattr(opened, "path", "")
-                if path and canonical_sqlite_path(os.path.realpath(path)) in watched:
-                    holders.append((pid, path))
+                if not path or not os.path.normcase(path).startswith(db_dir):
+                    continue
+                try:
+                    if canonical_sqlite_path(os.path.realpath(path)) in watched:
+                        holders.append((pid, path))
+                except OSError:
+                    continue
     except Exception as exc:
         logger.warning(
             "Could not prove state.db has no foreign holders; "
             "deferring structural maintenance: %s",
             exc,
         )
-        holders.append((-1, f"open-file scan failed: {exc}"))
+        holders.append(scan_failed(f"open-file scan failed: {exc}"))
     return holders
 
 
@@ -598,15 +686,24 @@ def held_store_refusal(db_path: Path, *, command: str, force_hint: Optional[str]
 
     by_pid: dict[int, set[str]] = {}
     unknown: list[str] = []
-    for pid, target in holders:
-        if pid <= 0 or target.startswith("uninspectable"):
+    for holder in holders:
+        pid, target = holder
+        if is_holder_scan_failure(holder) or target.startswith("uninspectable"):
             unknown.append(target)
         else:
             by_pid.setdefault(pid, set()).add(Path(target.removesuffix(" (deleted)")).name)
-    lines = [f"Refusing `hermes sessions {command}`: another process is using {db_path}."]
-    lines += [f"  {describe_holder_pid(pid)}: {', '.join(sorted(by_pid[pid]))}" for pid in sorted(by_pid)]
-    if unknown:
-        lines.append(f"  cannot prove the database is quiet (holder scan incomplete: {unknown[0][:120]})")
+    if by_pid:
+        lines = [f"Refusing `hermes sessions {command}`: another process is using {db_path}."]
+        lines += [f"  {describe_holder_pid(pid)}: {', '.join(sorted(by_pid[pid]))}" for pid in sorted(by_pid)]
+        if unknown:
+            lines.append(f"  cannot prove the database is quiet (holder scan incomplete: {unknown[0][:120]})")
+    else:
+        # Nothing was seen: only the scan itself failed. Naming a holder here would be the
+        # false-green mirror image — an operator sent hunting for a process that was never found.
+        lines = [
+            f"Refusing `hermes sessions {command}`: cannot prove {db_path} is quiet.",
+            f"  the holder scan could not be completed: {unknown[0][:120]}",
+        ]
     profile_arg = profile_cli_selector()
     lines += [
         "Rewriting the database under a live writer is how every agent ends up refusing turns with the "

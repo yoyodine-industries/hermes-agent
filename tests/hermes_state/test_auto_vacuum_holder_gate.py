@@ -6,8 +6,10 @@ sibling writer holds the store; the automatic producer must skip for the same re
 generation under a live holder is what leaves every agent refusing turns. It only ever skips.
 """
 
+import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -66,3 +68,24 @@ def test_auto_vacuum_skips_while_a_foreign_process_holds_the_store(tmp_path):
             holder.stdin.close()
             holder.wait(timeout=10)
         db.close()
+
+
+def test_host_activity_never_defers_maintenance_for_a_fixture_db(tmp_path):
+    """A host running the gateway always has SOMEONE holding files under the real home (its kanban
+    log, another profile's store). None of that is evidence about a fixture DB, and none of it may
+    be touched to find out: reading a stranger's path used to fail the scan and silently skip the
+    VACUUM below.
+
+    macOS only: this pins the lsof/psutil arms. /proc hosts prove identity by device+inode instead.
+    """
+    if not sys.platform.startswith("darwin"):
+        pytest.skip("pins the non-/proc arms")
+
+    db = _seeded_db(tmp_path)
+
+    result = _auto_maintenance(db)
+
+    assert result["pruned"] == 1
+    assert result["vacuumed"] is True
+    assert "vacuum_skipped_holders" not in result
+
