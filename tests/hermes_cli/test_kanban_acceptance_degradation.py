@@ -239,6 +239,30 @@ def test_a_repaired_contract_does_not_bind_the_card_to_the_declared_pr(board, fo
         assert task.last_failure_error is None
 
 
+def test_a_repaired_contract_invents_no_landing_refusal(board, forge):
+    """The repair never ADDS a refusal the board did not already have.
+
+    The same close with NO carrier: an EMPTY contract is refused ``landing_carrier_missing``
+    at base, and a repaired ``local-only`` is refused by the same cause with the same recorded
+    escapes -- because ``_contract_names_no_pr`` normalises for ``owner/repo#N`` and neither
+    value does. The contract therefore moves to the value that claims nothing and the close is
+    judged exactly where it was judged before; nothing about the repair makes the card harder to
+    close than the corrupt column did.
+    """
+    forge["pr_state"] = "OPEN"
+    forge["landing_state"] = "open"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="no carrier", completion_contract="local-only")
+        _store_contract(conn, tid, "")
+        refusal = _refusal(kb.complete_task(conn, tid, result="done",
+                                            metadata={"published_pr": PR_URL}))
+        assert refusal.cause == "landing_carrier_missing"
+        assert _contract(conn, tid) == "local-only"      # repaired before the fence judged it
+        assert "landing_card" in refusal.detail and "landing_deferred" in refusal.detail
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status != "done"
+
+
 # ------------------------------------------------------------------ R1: degrade, not refuse
 
 
