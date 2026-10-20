@@ -6,8 +6,11 @@ would swallow any test of the guard itself, which is exactly the case worth prov
 
 THE FLOOR IS ENFORCED, THE CEILING IS NOT - deliberately, and this is the decision record.
 
-``pyproject.toml`` declares ``nemo-relay>=0.10,<0.11`` for ``python_version >= '3.14'``. This
-module enforces only the lower bound, and the asymmetry is the point:
+``pyproject.toml`` declares ``nemo-relay>=0.10,<0.11`` on every platform arm of the project (the
+``python_version >= '3.14'`` clause that used to gate it is GONE: it declared the floor on the one
+interpreter that never installed the package and left it inert on the ones that run these tests,
+and 0.10.3 ships cp311-abi3 wheels with ``Requires-Python >=3.11``). This module enforces only the
+lower bound, and the asymmetry is the point:
 
 * BELOW the floor the environment cannot exercise the API these tests use. A *named skip* is
   the honest reading: nothing about the change under test is in question.
@@ -22,9 +25,10 @@ from __future__ import annotations
 import importlib.util
 import re
 
-#: The API the relay tests exercise: the lower bound pyproject.toml declares, except that
-#: pyproject gates it behind ``python_version >= '3.14'`` and this does not, because the tests
-#: need the API on whatever interpreter runs them.
+#: The API the relay tests exercise: the lower bound pyproject.toml declares, on every
+#: interpreter this project supports. (It used to be gated behind ``python_version >= '3.14'`` in
+#: pyproject, so on 3.11 nothing was declared and a 0.8.x wheel sat there happily - card
+#: t_473047e1. The gate is gone; this constant is now simply the declared floor.)
 RELAY_FLOOR: tuple[int, int] = (0, 10)
 
 #: The upper bound pyproject.toml declares. NOT enforced here (see the module docstring): above
@@ -32,11 +36,10 @@ RELAY_FLOOR: tuple[int, int] = (0, 10)
 RELAY_CEILING: tuple[int, int] = (0, 11)
 
 #: Why the module is skipped when the package is not installed at all. Named, not pytest's bare
-#: default: the one environment where the pyproject requirement is ACTIVE (python >= 3.14) was
-#: also the one with no wheel installed, so a silent skip there reads as "not needed".
+#: default, and it carries the install line so the reader's next act is a copy-paste.
 ABSENCE_REASON = (
-    "nemo-relay absent; pyproject declares >=0.10 on python>=3.14 "
-    "(provisioning is tracked separately)"
+    "nemo-relay is absent (not installed); the relay adapter's contract is >=0.10 "
+    "(install 'nemo-relay>=0.10,<0.11')"
 )
 
 
@@ -95,8 +98,9 @@ def skip_reason(available: bool | None = None, installed: str | None = None) -> 
         installed = installed_relay_version()
     if below_relay_floor(installed):
         floor = ".".join(str(n) for n in RELAY_FLOOR)
+        ceiling = ".".join(str(n) for n in RELAY_CEILING)
         return (
-            f"nemo-relay {installed or 'of unknown version'} is below the "
-            f">={floor} floor these tests exercise"
+            f"nemo-relay {installed or 'of unknown version'} is below the adapter's "
+            f"floor {floor} (install 'nemo-relay>={floor},<{ceiling}')"
         )
     return None

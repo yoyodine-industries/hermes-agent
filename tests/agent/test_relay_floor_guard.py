@@ -128,9 +128,10 @@ def test_the_installed_version_reader_never_raises() -> None:
 def test_absence_names_itself_and_the_requirement() -> None:
     """A missing package must not skip with pytest's bare default reason.
 
-    The one environment where the pyproject requirement is ACTIVE (python >= 3.14) was also the
-    one with no wheel installed, so a silent skip reads as "not needed" exactly where it is
-    needed. The reason has to say the package is absent and name the declared floor.
+    The floor is now declared on every interpreter, so the environment that runs these tests is
+    the one where the requirement is ACTIVE - a silent skip reads as "not needed" exactly where
+    it is needed. The reason has to say the package is absent, name the declared floor, and carry
+    the install line.
     """
     reason = skip_reason(available=False, installed="")
     assert reason == ABSENCE_REASON
