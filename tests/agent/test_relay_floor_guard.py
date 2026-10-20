@@ -136,6 +136,7 @@ def test_absence_names_itself_and_the_requirement() -> None:
     assert reason == ABSENCE_REASON
     assert "absent" in reason
     assert ">=0.10" in reason
+    assert "install" in reason, "the skip must say what to install, not just what is missing"
 
 
 def test_a_stale_version_names_the_version_and_the_floor() -> None:
@@ -143,6 +144,7 @@ def test_a_stale_version_names_the_version_and_the_floor() -> None:
     assert reason is not None
     assert "0.8.3" in reason
     assert "0.10" in reason
+    assert "install" in reason, "a stale environment must name the install that fixes it"
 
 
 def test_a_fresh_relay_is_not_skipped() -> None:

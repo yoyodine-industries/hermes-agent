@@ -33,10 +33,11 @@ RELAY_CEILING: tuple[int, int] = (0, 11)
 
 #: Why the module is skipped when the package is not installed at all. Named, not pytest's bare
 #: default: the one environment where the pyproject requirement is ACTIVE (python >= 3.14) was
-#: also the one with no wheel installed, so a silent skip there reads as "not needed".
+#: also the one with no wheel installed, so a silent skip there reads as "not needed" - and the
+#: reader then has no idea what to install.
 ABSENCE_REASON = (
     "nemo-relay absent; pyproject declares >=0.10 on python>=3.14 "
-    "(provisioning is tracked separately)"
+    "(install 'nemo-relay>=0.10,<0.11'; provisioning is tracked separately)"
 )
 
 
@@ -97,6 +98,6 @@ def skip_reason(available: bool | None = None, installed: str | None = None) -> 
         floor = ".".join(str(n) for n in RELAY_FLOOR)
         return (
             f"nemo-relay {installed or 'of unknown version'} is below the "
-            f">={floor} floor these tests exercise"
+            f"adapter's floor {floor} (install 'nemo-relay>=0.10,<0.11')"
         )
     return None
