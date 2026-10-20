@@ -60,19 +60,6 @@ def contract_is_readable(value: str | None) -> bool:
     return True
 
 
-def pr_url_contract(value) -> str | None:
-    """``value`` when it is already an exact PR URL -- i.e. an enforceable declaration.
-
-    Used by the repair path (R4, card ``t_c4a9d940``): a corrupt stored contract on a close
-    that ALSO declares ``metadata.published_pr`` cannot be repaired to ``local-only``, because
-    the landing carrier refuses that pairing as a contradiction ("do not re-declare it
-    'local-only': that is the claim its own record already refutes"). The PR the close itself
-    names is the one declaration that is both truthful and satisfiable -- the same re-scope
-    that clause's own remedy tells an operator to make by hand.
-    """
-    return value if isinstance(value, str) and _PR.fullmatch(value) else None
-
-
 def _declaration_mismatch(receipt: dict, contract: str, published_pr) -> dict:
     """R2 (card ``t_c4a9d940``): quote the declaration and the offer, never "the persisted
     contract".

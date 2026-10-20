@@ -184,17 +184,59 @@ def test_the_filing_card_history_closes_in_every_shape(board, forge, published_p
     On 2026-10-19 these were the three refusals -- ``missing``, ``infra`` and ``missing`` --
     on a card whose land had demonstrably merged, and the merge sat on main while the log
     said the landing was still owed.
+
+    The filing card's PR WAS MERGED (yan-hermes-skills#657 -> b8666eff), so every arm carries
+    ``pr_state="MERGED"``: a reproduction of that history has to reproduce the merge state, or
+    it proves only that an open PR on a check-green repository closes (comment 2255, DEFECT 2).
+    The unmerged shape is pinned on its own, below.
     """
+    forge["pr_state"] = "MERGED"
     with connect() as conn:
         tid = kb.create_task(conn, title="the filing card", completion_contract="local-only")
         _store_contract(conn, tid, " ")
         metadata = {} if published_pr is None else {"published_pr": published_pr}
         assert kb.complete_task(conn, tid, result="done", metadata=metadata) is True
         assert kb.get_task(conn, tid).status == "done"
+        assert _contract(conn, tid) == "local-only"
         assert _events(conn, tid, "completion_contract_repaired")[-1]["previous"] == " "
         # No duplicate obligation is left behind: no blocked-landing row, nothing that a later
         # seat would read as "the land is still owed".
         assert _events(conn, tid, "completion_blocked_landing_carrier") == []
+
+
+def test_a_repaired_contract_does_not_bind_the_card_to_the_declared_pr(board, forge):
+    """The DEFECT-1 regression guard: the fleet's ordinary ``[land]`` shape must still close.
+
+    ``empty contract + published_pr + landing_card + open PR`` -- and the repository declares
+    NO required checks, which is the normal shape fleet-wide (no yoyodine repo can declare
+    them). Measured at review (comment 2255): this CLOSED at base, and was REFUSED
+    ``acceptance_refusal / pending`` by the revision that repaired the contract to the declared
+    PR URL, leaving the card ``ready`` with its completion_contract bound to a declaration that
+    succeeds only once the PR is MERGED -- the card's own defect class, and undoable only by an
+    owner ``set-contract``.
+
+    The ruling pinned here: the repair target is ``local-only`` (R4's letter), so NO acceptance
+    leg is claimed and none is judged; the close is recorded unverified and the LANDING fence
+    judges the declared PR, which is carried. An open PR with a carrier therefore closes -- as
+    it did before the repair existed.
+    """
+    forge["pr_state"] = "OPEN"
+    forge["required"] = []                       # no repository-required checks: the fleet shape
+    with connect() as conn:
+        tid = kb.create_task(conn, title="carried open pr", completion_contract="local-only")
+        _store_contract(conn, tid, "")
+        assert kb.complete_task(conn, tid, result="done", metadata={
+            "published_pr": PR_URL, "landing_card": _carrier(conn, tid)}) is True
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "done"
+        # Repaired to the value that claims nothing -- never to the PR URL.
+        assert _contract(conn, tid) == "local-only"
+        repaired = _events(conn, tid, "completion_contract_repaired")[-1]
+        assert repaired["repaired_to"] == "local-only"
+        assert "UNVERIFIED" in repaired["warn"]
+        # Nothing is reported green: no acceptance leg ran, so no receipt is invented.
+        assert _events(conn, tid, "pr_acceptance") == []
+        assert task.last_failure_error is None
 
 
 # ------------------------------------------------------------------ R1: degrade, not refuse
