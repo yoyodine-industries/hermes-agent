@@ -230,6 +230,64 @@ def test_a_persisted_unsatisfiable_receipt_offers_the_merge_route_not_local_only
     assert "MERGED" in unpublished
 
 
+def _blocked_reasons(conn, tid: str) -> list[str]:
+    """The reason strings the ``blocked`` events carry — the card's own record of the park."""
+    return [json.loads(row[0]).get("reason") or "" for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'", (tid,))]
+
+
+def test_the_park_door_stamps_its_named_release_on_the_card(board):
+    """The lost sibling of the two above: the PARK door itself, driven directly.
+
+    ``collect_acceptance`` cannot produce an unsatisfiable receipt any more (t_9082c751), but
+    ``_park_unsatisfiable_contract`` stays live for receipts PERSISTED before that ruling, and it
+    had no test of its own — the generation that covered it also covered patches the live line no
+    longer carries. Driving the door rather than the classifier keeps this independent of the
+    forge: a contract no retry can satisfy parks the card ``blocked`` / ``capability``, the
+    ``blocked`` event's reason names the contract AND the release that EXISTS for that card (the
+    merge route once something is published, ``set-contract`` while nothing is), and the stamped
+    release really releases the card.
+    """
+    with connect() as conn:
+        tids = {name: kb.create_task(conn, title=f"parked, {name}",
+                                     completion_contract="local-only")
+                for name in ("published", "unpublished")}
+        for tid in tids.values():
+            # The declaration the park is about, without a create-time forge read.
+            assert kb.set_contract(conn, tid, "acme/repo", reason="fixture declaration") is True
+
+        assert kb._park_unsatisfiable_contract(
+            conn, tids["published"], "acme/repo",
+            receipt={"classification": "missing", "required": [], "pr_url": PR_URL}) is True
+        assert kb._park_unsatisfiable_contract(
+            conn, tids["unpublished"], "acme/repo",
+            receipt={"classification": "missing", "required": []}) is True
+
+        for name, tid in tids.items():
+            parked = kb.get_task(conn, tid)
+            assert parked.status == "blocked", name         # parked, not silently closed
+            assert parked.block_kind == "capability", name  # no human input owed
+            reasons = _blocked_reasons(conn, tid)
+            assert len(reasons) == 1, name
+            assert "acme/repo" in reasons[0], name          # names the contract it is about
+
+        # A card that published is never sent back to `local-only`: the reason offers the merge.
+        published_reason = _blocked_reasons(conn, tids["published"])[0]
+        assert "MERGED" in published_reason
+        assert "local-only" not in published_reason
+        # A card that published nothing may take the declaration release.
+        unpublished_reason = _blocked_reasons(conn, tids["unpublished"])[0]
+        assert "set-contract" in unpublished_reason
+
+        # The stamped door is REAL, not prose: the release it names is the release that works.
+        assert kb.unblock_task(conn, tids["published"]) is True
+        assert kb.set_contract(conn, tids["published"], "local-only",
+                               reason="repository declares no required checks") is True
+        released = kb.get_task(conn, tids["published"])
+        assert released.status != "blocked", released.status
+        assert released.completion_contract == "local-only"
+
+
 def test_retryable_missing_check_does_not_park(board, github):
     """A required check that has not reported yet stays retryable — no park, no terminal state."""
     github["runs"] = []
