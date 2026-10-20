@@ -46,6 +46,58 @@ def needs_repository_checks(value: str | None) -> bool:
     return validate_contract(value) not in ("local-only", "landed")
 
 
+def contract_is_readable(value: str | None) -> bool:
+    """True when the stored value is a declaration this gate can act on.
+
+    A board can hold a value ``create_task`` never validated -- an older row, a hand edit, a
+    truncated write. Card ``t_c4a9d940`` held a bare space and refused every close for it, so
+    the load path asks this BEFORE collecting anything (ruling R4).
+    """
+    try:
+        validate_contract(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _declaration_mismatch(receipt: dict, contract: str, published_pr) -> dict:
+    """R2 (card ``t_c4a9d940``): quote the declaration and the offer, never "the persisted
+    contract".
+
+    The old detail told the worker to supply ``metadata.published_pr`` "matching the persisted
+    completion contract" and never said what that contract WAS -- so a card refused against a
+    contract holding a space was unanswerable by reading the refusal. The remedy is named too:
+    supplying the right PR, or an owner re-scoping the declaration.
+    """
+    if published_pr is None:
+        detail = (
+            "metadata.published_pr is absent, so nothing names the PR the card's persisted "
+            f"completion contract {contract!r} requires."
+        )
+    elif not isinstance(published_pr, str):
+        detail = (
+            f"metadata.published_pr must be a GitHub PR URL string, got "
+            f"{type(published_pr).__name__} {published_pr!r} -- which cannot name the PR the "
+            f"card's persisted completion contract {contract!r} requires."
+        )
+    else:
+        detail = (
+            f"metadata.published_pr {published_pr!r} does not name the PR required by the "
+            f"card's persisted completion contract {contract!r}."
+        )
+    receipt.update(
+        classification="missing",
+        cause="declaration_mismatch",
+        detail=detail,
+        recovery=(
+            "Pass metadata.published_pr naming the PR this contract requires (a full "
+            "https://github.com/OWNER/REPO/pull/N URL in that repository), or have the card's "
+            "owner re-scope the declaration with `hermes kanban set-contract`."
+        ),
+    )
+    return receipt
+
+
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
          profile_home: str | None = None):
     command = ["gh", "api", endpoint, "--hostname", "github.com"]
@@ -131,11 +183,27 @@ def collect_acceptance(contract: str, published_pr: str | None,
     try:
         profile_home = _assignee_profile_home(assignee)
         declared = _PR.fullmatch(contract)
+        if declared is None and not _REPO.fullmatch(contract or ""):
+            # R4 (card t_c4a9d940): an unreadable declaration has no verdict to give. The
+            # load path repairs one before we get here; if a caller still reaches this line
+            # the receipt says WHY, so the close is degraded instead of refused forever.
+            receipt.update(
+                classification="missing",
+                cause="contract_unreadable",
+                detail=(f"The card's persisted completion contract {contract!r} is not a "
+                        "declaration this gate can read (local-only, landed, OWNER/REPO or an "
+                        "exact PR URL)."),
+            )
+            return receipt
+        if published_pr is not None and not isinstance(published_pr, str):
+            # A malformed publication is a DECLARATION error: the old code raised a TypeError
+            # inside the URL match and reported 'infra', sending the worker to check gh auth
+            # for a card that was simply mis-declared (t_c4a9d940, run 2).
+            return _declaration_mismatch(receipt, contract, published_pr)
         url = contract if declared else published_pr
         match = _PR.fullmatch(url or "")
         if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
-            receipt["detail"] = "Supply metadata.published_pr matching the persisted completion contract."
-            return receipt
+            return _declaration_mismatch(receipt, contract, published_pr)
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")

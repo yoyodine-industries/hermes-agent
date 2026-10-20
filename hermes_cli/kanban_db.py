@@ -4992,6 +4992,48 @@ class CompletionRefusal:
 # DB write (ruling t_90767078, D3/D4). A refusal that names it must never name a dead end.
 CONTRACT_RELEASE_VERB = "hermes kanban set-contract"
 
+# Classifications that mean NO VERDICT EXISTS on the PR because the transport failed: the
+# forge could not be READ. A verdict the forge actually returned (``pending``, ``failure``,
+# ``stale``, a ``missing`` required check) is NOT here -- those keep refusing.
+#
+# ``auth`` is deliberately NOT here (flagged to platform-stl, card t_c4a9d940): the ruling
+# named ``infra``, and ``auth`` is a DIFFERENT animal -- the assignee profile's login, which an
+# operator changes in a minute, and whose refusal already names that fix. Its door is also
+# pinned by its own tests (#122689: an assigned card's acceptance must never fall through to
+# the ambient login), so widening the degrade to it is a design ruling, not this card's
+# implementation detail.
+_UNVERIFIED_CLASSIFICATIONS = frozenset({"infra"})
+
+
+def _acceptance_unverified(receipt: Mapping[str, Any], contract: str) -> Optional[str]:
+    """The WARN text when the forge could not be READ -- else ``None`` (card ``t_c4a9d940``).
+
+    A close door that cannot accept evidence it can verify is as wrong as one that accepts
+    evidence it cannot. ``infra`` establishes nothing about the PR: ``gh`` is absent or the
+    network is down. Refusing on that forever turns a transient transport failure into a card
+    whose work IS landed with no way to say so (measured 2026-10-19: one card refused five
+    times and parked ``blocked``/``capability`` while its PR was merged).
+
+    So such a completion is ACCEPTED with the receipt recorded ``degraded`` and a WARN row on
+    the event log: recorded, unverified -- never reported green (the receipt keeps
+    ``ok: False``). This is "could not check never collapses into a pass", applied in the
+    direction that does not deadlock.
+    """
+    classification = receipt.get("classification")
+    if classification in _UNVERIFIED_CLASSIFICATIONS:
+        return (
+            f"PR acceptance could not be read ({classification}) for contract {contract!r}: "
+            f"this close is recorded as UNVERIFIED, not green. {receipt.get('detail', '')}"
+        ).strip()
+    if receipt.get("cause") == "contract_unreadable":
+        # The load path repairs these (``repair_unreadable_contract``); reaching here means a
+        # concurrent change slipped past it. Degrade rather than fail forever.
+        return (
+            f"The persisted completion contract {contract!r} is not a readable declaration, so "
+            "no acceptance verdict exists: this close is recorded as UNVERIFIED, not green."
+        )
+    return None
+
 
 def _contract_is_unsatisfiable(receipt: Mapping[str, Any]) -> bool:
     """True when NO retry can pass: a repository contract its repository cannot check.
@@ -5440,29 +5482,55 @@ def complete_task(
             f"{task_id} left a completable status while it was being closed",
         )
     if acceptance is not None and not acceptance[1].get("ok"):
-        # The acceptance receipt is not green. The DECLARATION is the fence, so nothing is
-        # traded away to make it pass: the refusal is reported, naming its own remedy, and an
-        # UNSATISFIABLE contract parks the card so no retry respawns against the same verdict.
-        # The receipt is persisted first -- in its own txn, because ``block_task`` takes one
-        # too -- so a refusal always stays auditable on the event log. Nothing else is written:
-        # the card is never completed and its declaration never moves (ruling t_90767078, D4).
-        with write_txn(conn):
-            record_acceptance(conn, task_id, acceptance)
+        # The acceptance receipt is not green. TWO outcomes, decided by whether a verdict
+        # EXISTS (R1, card t_c4a9d940):
+        #  * the forge answered and the answer is not acceptance -> refuse. The DECLARATION is
+        #    the fence, so nothing is traded away to make it pass: the refusal names its own
+        #    remedy, and an UNSATISFIABLE contract parks the card so no retry respawns against
+        #    the same verdict. The receipt is persisted first -- in its own txn, because
+        #    ``block_task`` takes one too -- so a refusal always stays auditable on the event
+        #    log. Nothing else is written: the card is never completed and its declaration
+        #    never moves (ruling t_90767078, D4).
+        #  * the forge could not be read (``infra``) -> degrade and fall through to the
+        #    completion below, recorded UNVERIFIED. A card whose work is landed must not be
+        #    unclosable because a subprocess failed.
         receipt = acceptance[1]
         contract = conn.execute(
             "SELECT completion_contract FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()[0]
-        detail = (
-            f"PR acceptance {receipt.get('classification')}: {receipt.get('detail', '')} "
-            f"{receipt.get('recovery', '')}"
-        ).strip()
-        if _contract_is_unsatisfiable(receipt):
-            _park_unsatisfiable_contract(
-                conn, task_id, contract, receipt=receipt,
-                expected_run_id=expected_run_id,
-            )
-            detail = f"{detail} {_unsatisfiable_contract_release(task_id, contract, receipt)}"
-        return CompletionRefusal("acceptance_refusal", detail)
+        warn = _acceptance_unverified(receipt, contract)
+        if warn is not None:
+            # R1 (card t_c4a9d940): no verdict exists on the PR, so this is DEGRADED, not
+            # refused -- the receipt still travels to the event log (``ok: False``, plus
+            # ``degraded``) and ``record_acceptance`` writes the WARN row under the terminal
+            # write txn. Falling through is deliberate: the fences AFTER acceptance (the
+            # landing carrier, the deploy proof inside it, the run-ownership guard) all still
+            # run, so an unread forge never buys a close over an unlanded PR's landing leg.
+            receipt["degraded"] = True
+            receipt["warn"] = warn
+            receipt["contract"] = contract
+        else:
+            with write_txn(conn):
+                record_acceptance(conn, task_id, acceptance)
+            detail = (
+                f"PR acceptance {receipt.get('classification')} of contract {contract!r}: "
+                f"{receipt.get('detail', '')} {receipt.get('recovery', '')}"
+            ).strip()
+            if _contract_is_unsatisfiable(receipt):
+                _park_unsatisfiable_contract(
+                    conn, task_id, contract, receipt=receipt,
+                    expected_run_id=expected_run_id,
+                )
+                detail = f"{detail} {_unsatisfiable_contract_release(task_id, contract, receipt)}"
+            if force:
+                # R3 (card t_c4a9d940): ``--force`` overrides the live-claim guard ONLY. It
+                # used to pass through silently and leave the operator guessing which half it
+                # had won, so a forced refusal now says which.
+                detail = (
+                    f"{detail} --force does not bypass PR acceptance: it overrides the "
+                    "live-claim guard only, and this card's contract still needs its evidence."
+                )
+            return CompletionRefusal("acceptance_refusal", detail)
     # The LANDING-CARRIER fence (t_88f6cb12, ruling t_9333ca24). A review close that DECLARES a
     # deliverable PR must name its landing leg: the landing is deliberately a SEPARATE card, and
     # nothing checked it was ever created, so approved work closed green and stranded. It runs
