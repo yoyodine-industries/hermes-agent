@@ -877,24 +877,10 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
-    # A worker linking its own running card (dependency-block handoff) proves
-    # ownership with its run id; linking a foreign task never needs one.
-    expected_child_run_id = (
-        _worker_run_id_for(args.child_id)
-        if args.child_id == os.environ.get("HERMES_KANBAN_TASK") else None)
-    with kbc.connect_closing() as conn:
-        gated = kb.link_tasks(conn, args.parent_id, args.child_id,
-                              expected_child_run_id=expected_child_run_id)
-    print(f"Linked {args.parent_id} -> {args.child_id}")
-    if gated:
-        print(
-            f"Note: {args.child_id} was ready and is now todo — parent "
-            f"{args.parent_id} is not done yet. The ready -> running claim "
-            f"re-checks parents, so the child only runs after the parent "
-            f"completes; use `hermes kanban unlink {args.parent_id} {args.child_id}` "
-            f"to run it now."
-        )
-    return 0
+    """Delegate to :mod:`hermes_cli.kanban_link_cmd` (behaviour lives in the sibling)."""
+    from hermes_cli.kanban_link_cmd import cmd_link
+
+    return cmd_link(args)
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:

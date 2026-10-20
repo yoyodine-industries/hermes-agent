@@ -1,0 +1,317 @@
+"""The link door names its parents' PROMOTION state: will anything make them finish?
+
+A link gates a child behind a parent, but a gated child only runs once the parent FINISHES.
+A parent parked in ``review``/``triage``/``blocked``, scheduled for a clock nobody owns, or
+assigned to a profile that no longer exists will never move by itself — so a link into it is
+a silent park. The classifier lives in ``hermes_cli.kanban_parent_state`` (pure, stdlib-only)
+and every link door (DB, ``kanban_link`` tool, ``hermes kanban link``) reports its verdict.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.kanban_parent_state import (
+    PARENT_STATE_CODES, ParentState, parent_promotion_state)
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_BOARD",
+                "HERMES_KANBAN_DB", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(var, raising=False)
+    kb.init_db()
+    return home
+
+
+def _parent(status, **extra):
+    row = {"status": status, "assignee": "lane", "block_kind": None,
+           "current_run_id": None, "due_at": None}
+    row.update(extra)
+    return row
+
+
+# --------------------------------------------------------------------------- #
+# The classifier
+# --------------------------------------------------------------------------- #
+
+def test_codes_are_the_frozen_ordered_tuple():
+    """The ordered tuple IS the contract a string-switching consumer dispatches off."""
+    assert PARENT_STATE_CODES == (
+        "running", "done", "blocked", "review", "triage", "scheduled",
+        "unassigned", "dead-assignee", "ready", "todo", "other")
+
+
+@pytest.mark.parametrize("status,code,self_moves", [
+    ("running", "running", True),
+    ("done", "done", True),
+    ("blocked", "blocked", False),
+    ("review", "review", False),
+    ("triage", "triage", False),
+    ("scheduled", "scheduled", False),
+    ("ready", "ready", False),
+    ("todo", "todo", False),
+])
+def test_each_known_status_maps_to_its_code(status, code, self_moves):
+    state = parent_promotion_state(_parent(status), profiles=["lane"])
+    assert state.code == code
+    assert state.self_moves is self_moves
+    assert isinstance(state, ParentState)
+
+
+def test_only_a_moving_or_moved_parent_self_moves():
+    """The whole point: everything but ``running``/``done`` is somebody's to unblock."""
+    for code in PARENT_STATE_CODES:
+        status = {"other": "no-such-status"}.get(code, code)
+        row = _parent(status, assignee="" if code == "unassigned" else "lane")
+        state = parent_promotion_state(row, profiles=["lane"])
+        assert state.self_moves is (code in ("running", "done")), code
+
+
+def test_running_reports_the_run_and_blocked_the_kind():
+    running = parent_promotion_state(_parent("running", current_run_id=41), profiles=["lane"])
+    assert running.text == "is RUNNING (run 41)"
+    blocked = parent_promotion_state(_parent("blocked", block_kind="dependency"),
+                                     profiles=["lane"])
+    assert "is BLOCKED (block_kind=dependency)" in blocked.text
+    # (e) without a block_kind the sentence must not leak the empty parenthesis.
+    bare = parent_promotion_state(_parent("blocked"), profiles=["lane"])
+    assert bare.code == "blocked"
+    assert bare.text.startswith("is BLOCKED:")
+    # (g) a running parent with no run id still names the run.
+    assert parent_promotion_state(_parent("running"), profiles=["lane"]).text == "is RUNNING"
+
+
+def test_scheduled_carries_the_clock_in_one_format_for_epoch_and_iso():
+    """``due_at`` is a stored epoch, but the classifier takes the clock as DATA."""
+    epoch = parent_promotion_state(_parent("scheduled", due_at=1792540800),
+                                   profiles=["lane"])
+    iso = parent_promotion_state(_parent("scheduled", due_at="2026-10-21T00:00:00Z"),
+                                 profiles=["lane"])
+    assert epoch.code == iso.code == "scheduled"
+    assert epoch.text == iso.text
+
+
+def test_scheduled_clock_text_is_iso_utc():
+    state = parent_promotion_state(_parent("scheduled", due_at=1792540800), profiles=["lane"])
+    assert " until " in state.text
+    token = state.text.split(" until ")[1].split(" ")[0].rstrip(":")
+    assert token.startswith("2026-10-") and token.endswith("+0000"), state.text
+    # A scheduled parent with no clock still names the wait rather than crashing on None.
+    clockless = parent_promotion_state(_parent("scheduled"), profiles=["lane"])
+    assert " until " not in clockless.text
+
+
+def test_unassigned_beats_a_dead_assignee():
+    state = parent_promotion_state(_parent("ready", assignee="   "), profiles=["lane"])
+    assert state.code == "unassigned"
+
+
+def test_dead_assignee_is_probed_only_when_profiles_are_injected():
+    """None means 'not injected' — the classifier does not guess a fleet from disk."""
+    row = _parent("ready", assignee="ghost-lane")
+    assert parent_promotion_state(row, profiles=["lane"]).code == "dead-assignee"
+    assert parent_promotion_state(row, profiles=None).code == "ready"
+    assert parent_promotion_state(row).code == "ready"
+
+
+def test_unknown_status_is_other_and_never_guessed_into_a_known_code():
+    state = parent_promotion_state(_parent("quarantined"), profiles=["lane"])
+    assert state.code == "other"
+    assert state.self_moves is False
+    assert "quarantined" in state.text
+
+
+def test_no_text_carries_an_identity_but_the_parent_it_describes():
+    """A notice consumer renders one sentence per parent id: no edge id may appear in it."""
+    ids = ("t_aaaa1111", "t_bbbb2222")
+    statuses = [{"status": s} for s in
+                ("running", "done", "blocked", "review", "triage", "scheduled",
+                 "ready", "todo", "quarantined")]
+    statuses += [{"status": "ready", "assignee": ""},
+                 {"status": "ready", "assignee": "ghost-lane"}]
+    for base in statuses:
+        row = {"assignee": "lane", "current_run_id": 7, "block_kind": "needs_input",
+               "due_at": 1792540800}
+        row.update(base)
+        row["id"] = ids[0]
+        state = parent_promotion_state(row, profiles=["lane"])
+        for other in ids:
+            assert other not in state.text, (state.code, state.text)
+
+
+# --------------------------------------------------------------------------- #
+# The link door
+# --------------------------------------------------------------------------- #
+
+def _link(parent_status, *, profiles=("lane",), board=None):
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="upstream", assignee="lane")
+        child = kb.create_task(conn, title="downstream", assignee="lane")
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (parent_status, parent))
+        conn.commit()
+        outcome = kb.link_tasks_reported(conn, parent, child,
+                                         profiles=list(profiles), board=board)
+    return parent, child, outcome
+
+
+def test_link_reports_a_standing_parent_in_from_the_child_side(kanban_home):
+    parent, _child, outcome = _link("ready")
+    assert outcome.gated is True
+    assert [e.id for e in outcome.parents] == [parent]
+    assert outcome.parents[0].code == "ready"
+    assert outcome.parents[0].status == "ready"
+    assert outcome.standing == [parent]
+    assert outcome.warning is not None
+    assert parent in outcome.warning
+    assert "NOT MOVING ON ITS OWN" in outcome.warning
+    assert "is READY and nothing has claimed it" in outcome.warning
+
+
+def test_link_behind_a_running_parent_gates_but_warns_nothing(kanban_home):
+    """The demotion is not the warning: a running parent is going to finish."""
+    _parent_id, _child, outcome = _link("running")
+    assert outcome.gated is True
+    assert outcome.parents[0].code == "running"
+    assert outcome.standing == []
+    assert outcome.warning is None
+
+
+def test_link_behind_a_done_parent_neither_gates_nor_warns(kanban_home):
+    _parent_id, _child, outcome = _link("done")
+    assert outcome.gated is False
+    assert outcome.standing == []
+    assert outcome.warning is None
+
+
+def test_link_reads_every_parent_edge_not_just_the_new_one(kanban_home):
+    with kbc.connect() as conn:
+        done_parent = kb.create_task(conn, title="finished")
+        kb.complete_task(conn, done_parent, result="ok")
+        parked = kb.create_task(conn, title="parked in review")
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (parked,))
+        child = kb.create_task(conn, title="child")
+        conn.commit()
+        first = kb.link_tasks_reported(conn, done_parent, child, profiles=["lane"])
+        assert first.standing == []
+        second = kb.link_tasks_reported(conn, parked, child, profiles=["lane"])
+    assert {e.id for e in second.parents} == {done_parent, parked}
+    assert second.standing == [parked]
+
+
+def test_link_tasks_stays_the_boolean_face_of_one_write_path(kanban_home):
+    """`link_tasks(...) is link_tasks_reported(...).gated` — same inputs, same verdict."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="upstream")
+        child = kb.create_task(conn, title="downstream")
+        other_parent = kb.create_task(conn, title="other upstream")
+        other_child = kb.create_task(conn, title="other downstream")
+        # two independent edges, one per door, so each verdict comes from a fresh write
+        reported = kb.link_tasks_reported(conn, parent, child)
+        boolean = kb.link_tasks(conn, other_parent, other_child)
+        done_parent = kb.create_task(conn, title="finished")
+        kb.complete_task(conn, done_parent, result="ok")
+        third_child = kb.create_task(conn, title="third child")
+        unreported_false = kb.link_tasks(conn, done_parent, third_child)
+        reported_false = kb.link_tasks_reported(conn, done_parent, third_child)
+    assert boolean is True and reported.gated is True
+    assert unreported_false is False and reported_false.gated is False
+
+
+def test_a_non_dispatching_board_earns_its_own_warning_line(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "board_dispatch_enabled", lambda board=None: False)
+    _parent_id, _child, outcome = _link("running", board="default")
+    assert outcome.board_dispatch == {"default": False}
+    assert outcome.warning is not None
+    assert "does not dispatch" in outcome.warning
+
+
+def test_the_board_is_never_inferred_when_the_caller_names_none(kanban_home):
+    _parent_id, _child, outcome = _link("ready")
+    assert outcome.board_dispatch == {}
+
+
+# --------------------------------------------------------------------------- #
+# The reporting doors
+# --------------------------------------------------------------------------- #
+
+def test_kanban_link_tool_reports_parents_standing_and_warning(kanban_home):
+    from tools import kanban_tools as kt
+
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="waiting in review", assignee="lane")
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (parent,))
+        child = kb.create_task(conn, title="gated child", assignee="lane")
+        conn.commit()
+    out = json.loads(kt._handle_link({"parent_id": parent, "child_id": child}))
+    assert out.get("ok"), out
+    assert out["gated"] is True
+    assert out["parents"] == [{"id": parent, "status": "review", "code": "review",
+                               "self_moves": False}]
+    assert out["standing"] == [parent]
+    assert "NOT MOVING ON ITS OWN" in out["warning"]
+    assert "board_dispatch" in out
+
+
+def test_kanban_link_tool_reads_a_status_the_classifier_calls_other(kanban_home):
+    from tools import kanban_tools as kt
+
+    # A LIVE assignee ("default" is always a profile) keeps the row out of the
+    # dead-assignee branch, so the unknown STATUS is what the classifier reports.
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="odd parent", assignee="default")
+        conn.execute("UPDATE tasks SET status = 'quarantined' WHERE id = ?", (parent,))
+        child = kb.create_task(conn, title="gated child", assignee="default")
+        conn.commit()
+    out = json.loads(kt._handle_link({"parent_id": parent, "child_id": child}))
+    assert out.get("ok"), out
+    assert out["parents"][0]["code"] == "other"
+    assert out["standing"] == [parent]
+
+
+def test_cli_link_prints_the_promotion_receipt_to_stderr(kanban_home, capsys):
+    from hermes_cli import kanban as kc
+
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="unclaimed parent", assignee="default")
+        child = kb.create_task(conn, title="gated child", assignee="default")
+        conn.commit()
+    rc = kc._cmd_link(argparse.Namespace(parent_id=parent, child_id=child))
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert f"Linked {parent} -> {child}" in captured.out
+    assert "Parent state (1 edge(s)):" in captured.err
+    assert parent in captured.err
+    assert "ready" in captured.err
+    assert "NOT MOVING ON ITS OWN" in captured.err
+
+
+def test_the_real_parser_and_dispatch_reach_the_link_receipt(kanban_home, capsys):
+    """The subprocess boundary is the only thing a worker cannot cross (provenance fence);
+    parser -> dispatch -> verb must still land the receipt, so exercise it for real."""
+    from hermes_cli import kanban as kc
+    from hermes_cli.kanban_parser import build_parser
+
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent waiting in review", assignee="default")
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (parent,))
+        child = kb.create_task(conn, title="gated child", assignee="default")
+        conn.commit()
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(["kanban", "link", parent, child])
+    rc = kc.kanban_command(args)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert f"Linked {parent} -> {child}" in captured.out
+    assert f"  {parent}  review  " in captured.err
+    assert "NOT MOVING ON ITS OWN" in captured.err
