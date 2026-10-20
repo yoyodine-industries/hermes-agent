@@ -60,16 +60,26 @@ def _prune(worktree_gc, repo_root: str, args) -> int:
     older_than = getattr(args, "older_than", None)
     actions: list = []
     kept: list = []
+    attention: list = []
     if not getattr(args, "branches_only", False):
         actions += worktree_gc.prune_missing_registrations(repo_root, dry_run=dry_run)
         tree_records = worktree_gc.audit_worktrees(repo_root, with_sizes=False, older_than_days=older_than)
         actions += worktree_gc.reclaim_worktrees(repo_root, dry_run=dry_run, records=tree_records)
+        attention = [r for r in tree_records if r.attention]
         kept = [r for r in tree_records if r.verdict == "keep"
-                and "kanban" not in r.reason and "in use" not in r.reason]
+                and not r.attention and "kanban" not in r.reason and "in use" not in r.reason]
         if kept and not as_json:
             print(f"Preserved {len(kept)} tree(s) with real work:")
             for r in kept:
                 print(f"  {r.name}: {r.reason}")
+        if attention and not as_json:
+            # Never fold these into "preserved": the sweep kept them only because it
+            # cannot resolve their card, and a human has to decide what they are.
+            print(f"ATTENTION — {len(attention)} tree(s) kept only because no board row "
+                  f"resolves for their card:")
+            for r in attention:
+                print(f"  {r.name} [{r.branch or 'detached'}]: {r.path}")
+            print("  Resolve the card, or reclaim these trees by hand.")
     if not getattr(args, "trees_only", False):
         actions += worktree_gc.reclaim_branches(repo_root, dry_run=dry_run)
 
@@ -79,6 +89,7 @@ def _prune(worktree_gc, repo_root: str, args) -> int:
             "dry_run": dry_run,
             "actions": actions,
             "preserved": [asdict(r) for r in kept],
+            "attention": [asdict(r) for r in attention],
         }, indent=2))
         return 0
     if actions:

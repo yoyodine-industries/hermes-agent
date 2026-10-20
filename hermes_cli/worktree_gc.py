@@ -39,9 +39,13 @@ class TreeRecord:
     branch: str
     age_days: float
     size_mb: Optional[int]
-    verdict: str          # reap | reap-archive | keep
+    verdict: str          # reap | reap-archive | reap-keep-branch | keep
     reason: str
     untracked: list[str] = field(default_factory=list)
+    # A keep the sweep cannot justify on its own: the record needs a human
+    # decision, so every printer must show it instead of folding it into
+    # "preserved" (see ``_ATTENTION_NO_BOARD_ROW``).
+    attention: str = ""
 
 
 @dataclass
@@ -132,6 +136,62 @@ def _dirty_split(path: str) -> tuple[bool, list[str]]:
         return True, []
 
 
+def _deletions_only(path: str) -> bool:
+    """True when EVERY local change in *path* is a tracked DELETION (porcelain ``D`` only).
+
+    A deletion removes content that still exists on the trunk, so it is the one
+    kind of tracked dirt a tree can be reclaimed over without losing work. Any
+    modification, addition, rename, copy or untracked path is real work. Parsed
+    exactly like :func:`_dirty_split` (``-z``, ``core.quotePath=false``) so a path
+    holding a space cannot be misread, and it fails SAFE toward False: an
+    unreadable status is never a licence to delete a tree.
+    """
+    try:
+        result = _git(["-c", "core.quotePath=false", "status", "--porcelain", "-z"],
+                      cwd=path, timeout=10)
+        if result.returncode != 0:
+            return False
+        fields = result.stdout.split("\0")
+        seen = False
+        index = 0
+        while index < len(fields):
+            record = fields[index]
+            index += 1
+            if not record:
+                continue
+            code = record[:2]
+            if "R" in code or "C" in code:
+                index += 1  # the rename/copy source follows as its own field
+            if "D" not in code or not set(code) <= {"D", " "}:
+                return False  # M / A / R / C / ?? — real work
+            seen = True
+        return seen
+    except Exception:
+        return False
+
+
+def _head_on_trunk(_ops, path: str, timeout: int = 10) -> Optional[str]:
+    """The ref whose tip already CONTAINS HEAD, or None when HEAD is unpublished.
+
+    The other half of the deletions-only gate: a deletion loses nothing only if
+    the tree's commits are already on the trunk. Judged against the same ref
+    merged work is judged against (``_worktree_merge_base_ref``) and by ancestry,
+    so a branch carrying even one commit the trunk lacks is not eligible. No
+    comparable ref -> None (fail safe: nothing is reaped).
+    """
+    try:
+        trunk = _ops._worktree_merge_base_ref(path, timeout=5)
+    except Exception:
+        return None
+    if not trunk:
+        return None
+    try:
+        result = _git(["merge-base", "--is-ancestor", "HEAD", trunk], cwd=path, timeout=timeout)
+    except Exception:
+        return None
+    return trunk if result.returncode == 0 else None
+
+
 def _archive_untracked(tree: Path, untracked: list[str]) -> Optional[Path]:
     """Copy untracked files out of a doomed tree; None on any failure (caller must then keep).
 
@@ -163,6 +223,12 @@ def _archive_untracked(tree: Path, untracked: list[str]) -> Optional[Path]:
 
 
 _TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled", "failed"})
+
+# A t_<hex> tree the board cannot resolve: kept (the card may live on a board
+# this sweep cannot see — deleting on a missing row destroys real work), but
+# flagged so no printer can fold it into "preserved" and lose it again.
+_ATTENTION_NO_BOARD_ROW = "no-board-row"
+_NO_BOARD_ROW_REASON = "kanban task tree; no board row for this card"
 
 
 def _card_status_for_tree(task_id: str) -> Optional[str]:
@@ -229,17 +295,21 @@ def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads)
     A ``t_<hex>`` tree belongs to a card, and the board's STATUS for that card
     — not the existence of a row — decides whether it may be reclaimed. A
     terminal card's tree is judged by the ordinary dirty/pushed rules below,
-    with one extra guard: its branch is kept, because the card's PR or its
-    landing door may still need it.
+    with two refinements: a clean tree keeps its branch (the card's PR or its
+    landing door may still need it), while a tree whose only local change is a
+    DELETION over a head already on the trunk is ``reap-archive``. A tree whose
+    card resolves to NO row is kept and flagged for attention: the row may
+    simply be on a board this sweep cannot see, so a human decides.
     """
     kanban_status: Optional[str] = None
     if _KANBAN_RE.match(entry.name):
         kanban_status = _card_status_for_tree(entry.name)
         if kanban_status is None:
-            return "keep", "kanban task tree; no board row for this card", []
+            return "keep", _NO_BOARD_ROW_REASON, []
         if kanban_status not in _TERMINAL_CARD_STATUSES:
             return "keep", f"kanban task tree; card is {kanban_status}", []
-    verdict, reason, untracked = _classify_reapable(_ops, repo_root, entry, merge_cache, remote_heads)
+    verdict, reason, untracked = _classify_reapable(
+        _ops, repo_root, entry, merge_cache, remote_heads, card_status=kanban_status)
     if kanban_status is not None:
         reason = f"card {kanban_status}; {reason}"
         if verdict == "reap":
@@ -247,13 +317,29 @@ def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads)
     return verdict, reason, untracked
 
 
-def _classify_reapable(_ops, repo_root: str, entry: Path, merge_cache, remote_heads) -> tuple[str, str, list[str]]:
-    """Reapability of one tree, ignoring card ownership."""
+def _classify_reapable(_ops, repo_root: str, entry: Path, merge_cache, remote_heads,
+                       *, card_status: Optional[str] = None) -> tuple[str, str, list[str]]:
+    """Reapability of one tree, ignoring card ownership.
+
+    ``card_status`` (a TERMINAL card's status) unlocks one extra verdict: a tree
+    whose only local change is a tracked DELETION and whose head is already on
+    the trunk. Such a tree carries no work the repo does not already have — the
+    deleted content is still on the trunk, and nothing is unpublished — so it is
+    ``reap-archive``: untracked files archived first (there are none, by the
+    rule's own shape), then the tree and its fully-merged branch go.
+    Anything else dirty stays ``keep`` at any card status.
+    """
     path = str(entry)
     if _ops._worktree_lock_is_live(repo_root, path, timeout=5) == "live":
         return "keep", "in use by a running hermes session", []
     tracked_dirty, untracked = _dirty_split(path)
     if tracked_dirty:
+        if card_status is not None and not untracked and _deletions_only(path):
+            trunk = _head_on_trunk(_ops, path)
+            if trunk:
+                return ("reap-archive",
+                        f"only local change is deletions and the head is already on {trunk}",
+                        [])
         return "keep", "uncommitted tracked changes (real work)", []
     archive_note = f"{len(untracked)} untracked file(s) will be archived"
     if _ops._worktree_has_unpushed_commits(path, timeout=5) and not _ops._worktree_commits_all_merged_upstream(
@@ -387,7 +473,8 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
         records.append(TreeRecord(
             name=entry.name, path=str(entry), branch=branch,
             age_days=age_days, size_mb=_tree_size_mb(entry) if with_sizes else None,
-            verdict=verdict, reason=reason, untracked=untracked))
+            verdict=verdict, reason=reason, untracked=untracked,
+            attention=_ATTENTION_NO_BOARD_ROW if reason == _NO_BOARD_ROW_REASON else ""))
 
     if len(merge_cache) != cache_size_before:
         _ops._save_worktree_merge_cache(merge_cache)
@@ -429,11 +516,11 @@ def reclaim_worktrees(
                 actions.append(f"failed to remove {record.name}: {remove_result.stderr.strip()}")
                 continue
             if record.verdict == "reap-keep-branch":
-                actions.append(f"removed {record.name} (branch {record.branch} kept — pushed open-PR lane)")
+                actions.append(f"removed {record.name} (branch {record.branch} kept — {record.reason})")
                 continue
             if record.branch and record.branch not in _PROTECTED_BRANCHES:
                 _git(["branch", "-D", record.branch], cwd=repo_root, timeout=10)
-            actions.append(f"removed {record.name}")
+            actions.append(f"removed {record.name} ({record.reason})")
         except Exception as exc:
             actions.append(f"failed to remove {record.name}: {exc}")
 
