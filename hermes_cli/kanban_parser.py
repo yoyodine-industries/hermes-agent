@@ -445,6 +445,20 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("reopen", [
+        _TASK_ID,
+        _arg("--reason",
+             help="Why the finished card is work again — recorded on the card and its event "
+                  "stream. Quote multi-word reasons."),
+        _arg("--to", dest="to", choices=("ready", "blocked"), default="ready",
+             help="Landing for the reopened card: 'ready' (default; re-gates to todo while a "
+                  "parent is unfinished) or 'blocked' (PARKED — the work is done and must not "
+                  "go back in front of a worker)"),
+        _arg("--block-kind", dest="block_kind", default=None,
+             help="Why a blocked landing is parked (default: external)"),
+        _arg("--dry-run", action="store_true",
+             help="Validate the reopen without mutating state"),
+    ], help="Reopen finished (done/archived) tasks — the operator door back to a live status"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

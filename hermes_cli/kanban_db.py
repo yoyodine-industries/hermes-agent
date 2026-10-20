@@ -6825,6 +6825,144 @@ def promote_task(
     return True, None
 
 
+#: The statuses the operator's REOPEN door owns. A finished card is the ONLY state this verb
+#: is for: ``blocked``/``scheduled`` resume through :func:`unblock_task`, ``review`` through
+#: :func:`reopen_review_task`, and a live card needs no door at all. Anything else is refused
+#: BY NAME with the verb that owns its state, so a caller is routed rather than guessed at.
+_REOPENABLE_STATUSES = frozenset({"done", "archived"})
+
+#: The landings a reopen may target. ``ready`` is the ordinary one (and re-gates to ``todo``
+#: while a parent is unfinished); ``blocked`` is the PARKED landing a caller uses when the
+#: card's WORK IS DONE and it must not go back in front of a worker -- the flow's repair of a
+#: hand-closed card. ``recompute_ready`` never promotes a blocked card, so the park is sticky.
+_REOPEN_DESTINATIONS = frozenset({"ready", "blocked"})
+
+
+def reopen_task(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: str = "",
+    dest_status: str = "ready", block_kind: Optional[str] = None,
+    dry_run: bool = False,
+) -> tuple[bool, Optional[str], dict]:
+    """Operator REOPEN: a ``done``/``archived`` card -> a LIVE status, in one audited act.
+
+    THE door out of a finished card. Before it existed the only writers that could undo a
+    completion were the dashboard's private ``_set_status_direct`` and forbidden raw SQL, so
+    every other actor -- the scheduled SDLC ``sync`` repair above all -- held a card it could
+    DETECT and not move.
+
+    ONE transaction does the whole act; NOTHING is written on a refusal:
+
+      1. the status is re-read INSIDE the write transaction and must still be
+         ``done``/``archived`` -- a card that moved in between is refused by name, never
+         flipped from a stale verdict;
+      2. a leaked run is reclaimed, keeping the ``current_run_id IS NULL <=> run terminal``
+         invariant every other status flip keeps;
+      3. ``completed_at``/``result``/the block counters/the failure breaker are cleared and
+         the card is landed per ``dest_status``: ``ready`` (``todo`` while a parent is
+         unfinished -- the same re-gate ``unblock`` uses) or ``blocked``;
+      4. every ``ready``/``review``/``running``/``done`` DESCENDANT is retracted to ``todo``
+         and re-gated by :func:`invalidate_descendants_for_parent_reopen` -- a reopened
+         ancestor means its descendants' completions no longer rest on it;
+      5. a ``reopened`` audit event, the legacy ``status`` event the live feed and the sweeps
+         read, and a comment carry the actor and the reason.
+
+    ``dest_status="blocked"`` is the PARKED landing, and it is deliberate: a caller that
+    reopens a card whose WORK IS DONE (the flow's repair of a hand-closed card) must not put
+    it back in front of a worker. ``blocked`` is also sticky -- ``recompute_ready`` never
+    promotes a blocked card -- so the park survives every dispatch tick. ``block_kind`` names
+    why the card is parked (``external`` for a repair the flow owns).
+
+    ``reason`` is recorded verbatim; the CLI door requires it (``--reason``), while a
+    programmatic caller (the flow) may omit it. ``dry_run`` validates and writes NOTHING --
+    not even an event. Returns ``(ok, why-not, info)`` where ``info`` is
+    ``{"from_status", "to_status"}`` on success and ``{}`` otherwise.
+    """
+    reason = (reason or "").strip()
+    actor = (actor or "").strip() or "operator"
+    dest_status = (dest_status or "ready").strip().lower()
+
+    status = _task_status(conn, task_id)
+    if status is None:
+        return False, f"task {task_id} not found", {}
+    if dest_status not in _REOPEN_DESTINATIONS:
+        return False, (
+            f"dest_status {dest_status!r} is not a reopen landing (one of "
+            f"{'/'.join(sorted(_REOPEN_DESTINATIONS))})"), {}
+    if status not in _REOPENABLE_STATUSES:
+        return False, (
+            f"task {task_id} is {status!r}; reopen only applies to a finished card "
+            f"('done'/'archived'). A 'blocked'/'scheduled' card resumes with `unblock`, a "
+            f"'review' card with `reopen-review`; a live card needs no door"), {}
+    if dry_run:
+        return True, None, {
+            "from_status": status,
+            "to_status": "blocked" if dest_status == "blocked"
+            else _landing_status_after_parents(conn, task_id),
+        }
+
+    terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    with write_txn(conn):
+        # The verdict is re-read INSIDE the write txn: a card that moved between the check
+        # above and here is refused by name rather than flipped from a stale read.
+        now = int(time.time())
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found", {}
+        if row["status"] not in _REOPENABLE_STATUSES:
+            return False, f"task {task_id} moved to {row['status']!r} during reopen", {}
+        prior = row["status"]
+        _reclaim_dangling_run(
+            conn, task_id, statuses=tuple(_REOPENABLE_STATUSES), now=now,
+            note="invariant recovery on reopen",
+        )
+        new_status = ("blocked" if dest_status == "blocked"
+                      else _landing_status_after_parents(conn, task_id))
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, completed_at = NULL, result = NULL, "
+            "block_kind = ?, block_recurrences = 0, consecutive_failures = 0, "
+            "last_failure_error = NULL, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL, current_run_id = NULL, "
+            "due_at = NULL, due_window_policy = NULL "
+            "WHERE id = ? AND status IN ('done', 'archived')",
+            (new_status, (block_kind or "external") if new_status == "blocked" else None,
+             task_id),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed during reopen", {}
+        # Composed under THIS txn (`allow_nested`), so the flip and the retractions commit
+        # together; the worker kills are drained after commit (audit trail before death).
+        drain = invalidate_descendants_for_parent_reopen(conn, task_id, author=actor)
+        terminations = list(drain["terminations"])
+        _append_event(conn, task_id, "reopened", {
+            "actor": actor, "reason": reason, "prior_status": prior,
+            "status": new_status,
+        })
+        # The legacy event every live-feed consumer and sweep already reads.
+        _append_event(conn, task_id, "status", {
+            "status": new_status, "reason": "reopened",
+            "previous_status": prior,
+        })
+        if new_status == "blocked":
+            # The SAME event shape `block_task` writes: `_has_sticky_block` reads the newest
+            # 'blocked' event, so this is what makes the parked landing survive
+            # `recompute_ready` (a bare status write would be promoted back to ready in the
+            # same tick and the repair would re-dispatch a worker onto finished work).
+            _append_event(conn, task_id, "blocked", {
+                "kind": block_kind or "external",
+                "reason": reason or "reopened and parked by the flow",
+                "source": "reopen",
+            })
+        _insert_comment(
+            conn, task_id, actor,
+            f"REOPENED from '{prior}' to '{new_status}' by {actor}"
+            + (f": {reason}" if reason else ""), now,
+        )
+    for pid, claim_lock, started_at in terminations:
+        _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+    return True, None, {"from_status": prior, "to_status": new_status}
+
+
 def _reclaim_dangling_run(
     conn: sqlite3.Connection, task_id: str, *, statuses, now: int, note: str,
 ) -> None:

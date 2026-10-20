@@ -230,7 +230,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     # it. It was already an ESTATE write (tree_identity.ESTATE_MUTATING_ACTIONS); this closes the
     # delegated fence over it too. (Card t_36adf9a5)
     "set-contract",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "reopen", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1330,6 +1330,44 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_reopen(args: argparse.Namespace) -> int:
+    """THE operator REOPEN door: a finished card back to a live status, in one audited act.
+
+    ``done``/``archived`` only -- every other state has its own door (``unblock``,
+    ``reopen-review``) and the kernel refuses BY NAME rather than guessing. ``--to blocked``
+    is the parked landing: a card whose work is DONE must not go back in front of a worker.
+
+    The parser makes ``--reason`` mandatory for the shell surface; this handler still
+    tolerates an absent reason for PROGRAMMATIC callers (the SDLC repair), which pass their
+    own fixed reason or none and must not be turned away by a CLI-only requirement.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban reopen is orchestrator-only; a worker must hand off its assigned "
+                    "task instead of reopening a finished card")
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        return _err("kanban reopen requires a task id", 2)
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    author = _profile_author()
+    dry_run = bool(getattr(args, "dry_run", False))
+    with kbc.connect_closing() as conn:
+        try:
+            ok, err, info = kb.reopen_task(
+                conn, task_id, actor=author, reason=reason or "",
+                dest_status=getattr(args, "to", None) or "ready",
+                block_kind=getattr(args, "block_kind", None), dry_run=dry_run)
+        except (ValueError, RuntimeError) as exc:
+            return _err(f"cannot reopen {task_id}: {exc}")
+    if not ok:
+        return _err(f"cannot reopen {task_id}: {err or 'refused'}")
+    if getattr(args, "json", False):
+        print(json.dumps({"id": task_id, **info}, sort_keys=True))
+    else:
+        print(f"{'Would reopen' if dry_run else 'Reopened'} {task_id}: "
+              f"{info.get('from_status')} -> {info.get('to_status')}")
+    return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1848,7 +1886,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "set-contract": _cmd_set_contract, "retarget": _cmd_retarget,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "reopen": _cmd_reopen,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
