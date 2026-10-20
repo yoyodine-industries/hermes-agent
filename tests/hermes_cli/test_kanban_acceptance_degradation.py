@@ -192,6 +192,9 @@ def test_the_filing_card_history_closes_in_every_shape(board, forge, published_p
         assert kb.complete_task(conn, tid, result="done", metadata=metadata) is True
         assert kb.get_task(conn, tid).status == "done"
         assert _events(conn, tid, "completion_contract_repaired")[-1]["previous"] == " "
+        # No duplicate obligation is left behind: no blocked-landing row, nothing that a later
+        # seat would read as "the land is still owed".
+        assert _events(conn, tid, "completion_blocked_landing_carrier") == []
 
 
 # ------------------------------------------------------------------ R1: degrade, not refuse
