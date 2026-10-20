@@ -87,9 +87,11 @@ and the landing carrier and deploy proof still judge the close. Every answer the
 did get still refuses: `pending`, `failure`, `stale`, `auth` and a missing required
 check keep the card open. A refusal always quotes the persisted contract verbatim, so a
 worker is never sent to satisfy a declaration it cannot read. A stored contract that
-cannot be parsed as a declaration is repaired to `local-only` at completion time, with a
-`completion_contract_repaired` event recording the value it replaced, instead of
-refusing every close for a state no retry can fix. `--force` overrides the live-claim
+cannot be parsed as a declaration (empty, blank, truncated) is repaired at completion
+time, with a `completion_contract_repaired` event recording the value it replaced: to
+`local-only` when the close declares no publication, or to the exact PR URL the close
+declares (the same re-scope `kanban set-contract` performs by hand), so that the repair
+never contradicts the landing fence. `--force` overrides the live-claim
 guard only: it never bypasses acceptance, the landing carrier or the deploy proof.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
