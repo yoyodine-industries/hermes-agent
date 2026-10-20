@@ -1335,11 +1335,14 @@ def _cmd_reopen(args: argparse.Namespace) -> int:
 
     ``done``/``archived`` only -- every other state has its own door (``unblock``,
     ``reopen-review``) and the kernel refuses BY NAME rather than guessing. ``--to blocked``
-    is the parked landing: a card whose work is DONE must not go back in front of a worker.
+    is the parked landing: a card whose work is DONE must not go back in front of a worker;
+    ``--to todo`` restores a card without making it dispatchable; ``--to ready`` (the
+    default) re-gates to ``todo`` on its own while a parent is unfinished.
 
-    The parser makes ``--reason`` mandatory for the shell surface; this handler still
-    tolerates an absent reason for PROGRAMMATIC callers (the SDLC repair), which pass their
-    own fixed reason or none and must not be turned away by a CLI-only requirement.
+    ``--reason`` is RECORDED but NOT required: the kernel does not demand it, and the
+    shell surface does not add a requirement the kernel does not have. The SDLC repair always
+    passes one (``REPAIR_REASON``), and a bare ``reopen <id>`` is a legal operator act whose
+    comment simply carries no reason.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return _err("kanban reopen is orchestrator-only; a worker must hand off its assigned "

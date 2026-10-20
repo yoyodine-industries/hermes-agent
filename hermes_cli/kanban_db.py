@@ -6832,10 +6832,13 @@ def promote_task(
 _REOPENABLE_STATUSES = frozenset({"done", "archived"})
 
 #: The landings a reopen may target. ``ready`` is the ordinary one (and re-gates to ``todo``
-#: while a parent is unfinished); ``blocked`` is the PARKED landing a caller uses when the
-#: card's WORK IS DONE and it must not go back in front of a worker -- the flow's repair of a
-#: hand-closed card. ``recompute_ready`` never promotes a blocked card, so the park is sticky.
-_REOPEN_DESTINATIONS = frozenset({"ready", "blocked"})
+#: while a parent is unfinished); ``todo`` is the same landing asked for EXPLICITLY - the card
+#: must not be dispatchable yet regardless of its parent graph (the caller is parking work it
+#: knows is not ready to be picked up, e.g. a card whose parents are all closed but whose item
+#: has not been verified); ``blocked`` is the PARKED landing a caller uses when the card's WORK
+#: IS DONE and it must not go back in front of a worker -- the flow's repair of a hand-closed
+#: card. ``recompute_ready`` never promotes a blocked card, so the park is sticky.
+_REOPEN_DESTINATIONS = frozenset({"ready", "todo", "blocked"})
 
 
 def reopen_task(
@@ -6859,7 +6862,8 @@ def reopen_task(
          invariant every other status flip keeps;
       3. ``completed_at``/``result``/the block counters/the failure breaker are cleared and
          the card is landed per ``dest_status``: ``ready`` (``todo`` while a parent is
-         unfinished -- the same re-gate ``unblock`` uses) or ``blocked``;
+         unfinished -- the same re-gate ``unblock`` uses), ``todo`` (landed as asked: it must
+         not be dispatchable yet) or ``blocked``;
       4. every ``ready``/``review``/``running``/``done`` DESCENDANT is retracted to ``todo``
          and re-gated by :func:`invalidate_descendants_for_parent_reopen` -- a reopened
          ancestor means its descendants' completions no longer rest on it;
@@ -6872,9 +6876,10 @@ def reopen_task(
     promotes a blocked card -- so the park survives every dispatch tick. ``block_kind`` names
     why the card is parked (``external`` for a repair the flow owns).
 
-    ``reason`` is recorded verbatim; the CLI door requires it (``--reason``), while a
-    programmatic caller (the flow) may omit it. ``dry_run`` validates and writes NOTHING --
-    not even an event. Returns ``(ok, why-not, info)`` where ``info`` is
+    ``reason`` is recorded verbatim and is NOT required by the kernel: the CLI collects it
+    when given, and the SDLC repair always passes one, but a bare ``reopen <id>`` is legal and
+    the comment then carries no reason. ``dry_run`` validates and writes NOTHING -- not even
+    an event. Returns ``(ok, why-not, info)`` where ``info`` is
     ``{"from_status", "to_status"}`` on success and ``{}`` otherwise.
     """
     reason = (reason or "").strip()
@@ -6896,8 +6901,7 @@ def reopen_task(
     if dry_run:
         return True, None, {
             "from_status": status,
-            "to_status": "blocked" if dest_status == "blocked"
-            else _landing_status_after_parents(conn, task_id),
+            "to_status": _reopen_landing(conn, task_id, dest_status),
         }
 
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
@@ -6916,8 +6920,7 @@ def reopen_task(
             conn, task_id, statuses=tuple(_REOPENABLE_STATUSES), now=now,
             note="invariant recovery on reopen",
         )
-        new_status = ("blocked" if dest_status == "blocked"
-                      else _landing_status_after_parents(conn, task_id))
+        new_status = _reopen_landing(conn, task_id, dest_status)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, completed_at = NULL, result = NULL, "
             "block_kind = ?, block_recurrences = 0, consecutive_failures = 0, "
@@ -6985,6 +6988,18 @@ def _reclaim_dangling_run(
             """,
             (note, now, int(stale["current_run_id"])),
         )
+
+
+def _reopen_landing(conn: sqlite3.Connection, task_id: str, dest_status: str) -> str:
+    """The status a reopen lands on: the requested one, or the parent re-gate.
+
+    ``blocked`` and ``todo`` are landed AS ASKED (both are non-dispatchable, so neither can be
+    promoted back into a worker's queue by ``recompute_ready``); ``ready`` is re-gated to
+    ``todo`` while a parent is unfinished, exactly as ``unblock`` does.
+    """
+    if dest_status in ("blocked", "todo"):
+        return dest_status
+    return _landing_status_after_parents(conn, task_id)
 
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
