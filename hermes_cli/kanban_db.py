@@ -1774,8 +1774,8 @@ def _refuse_unloadable_skills(skills: Any, assignee: Optional[str], *,
     and therefore still a ``ValueError``), not a bare ``ValueError``: every seam that tells "a
     gate refused this" from "something broke here" keys on that family, so the pair must arrive
     as the family or each seam re-decides it by whatever catch it happens to have. ``where``
-    names the door for the refusal's ``facts`` and defaults to the assign door, which is the one
-    with the most callers.
+    names the door for the refusal's ``facts``; every door passes its own name — there is no
+    default, because a guessed door would mislabel the refusal for whoever reads ``facts``.
     """
     names = _task_skill_names(skills)
     if not names:

@@ -1411,7 +1411,7 @@ def test_bulk_apply_one_records_a_gate_refusal_and_the_sweep_continues(client, m
             mod._bulk_apply_one(conn, applied_id, payload, None, bug_entry)
     finally:
         conn.close()
-    assert bug_entry == {"id": applied_id, "ok": True}
+    assert bug_entry == {"id": applied_id, "ok": True}, bug_entry
 
 
 # ---------------------------------------------------------------------------
