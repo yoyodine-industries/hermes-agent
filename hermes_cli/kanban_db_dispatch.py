@@ -4682,9 +4682,15 @@ def _apply_default_assignee(
     the one with no operator in the loop to read a refusal — it is logged.
     """
     row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    # The catch is the NAMED verdict (``SkillsRefused``), not ``ValueError``: this try wraps
+    # exactly one check, so a plain ValueError out of it is a bug in the check and must not be
+    # logged as a refusal and skipped -- the same narrowed-catch rule as the bulk sweep's.
+    from hermes_cli.kanban_gate_invariants import SkillsRefused
+
     try:
-        _kb._refuse_unloadable_skills(row["skills"] if row is not None else None, assignee)
-    except ValueError as exc:
+        _kb._refuse_unloadable_skills(row["skills"] if row is not None else None, assignee,
+                                      where="default_assignee", task_id=task_id)
+    except SkillsRefused as exc:
         _kb._log.warning(
             "kanban dispatch: not applying default_assignee=%r to task %s: %s",
             assignee, task_id, exc,

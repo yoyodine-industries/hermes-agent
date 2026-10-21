@@ -10,6 +10,12 @@ seam that can produce it, and (c) repaired, where the repair is deterministic, b
 ``evidence``   (Invariant A) a completion must declare the evidence behind it.
 ``creator``    (Invariant D) a card may not be ATTRIBUTED to a retired fleet identity.
 
+``skills`` is the fifth refusal and it rides the ``assignee`` family: a card whose stored skill
+names the assignee's worker cannot load exits on ``Unknown skill(s)`` before the agent starts, so
+it strands exactly like a handle that resolves nowhere — the failure is the same class, and only
+the evidence differs (the name list, not the profile). It is not a separate MEASUREMENT: the
+violation is a pair (assignee, skills), and the doors below judge it while the pair is known.
+
 The four rules that shape every choice here:
 
 1. **The disk is truth, never a name list.** Whether a handle can run is answered by the
@@ -44,7 +50,8 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 __all__ = [
-    "AssigneeRefused", "CreatorRefused", "DependencyRefused", "EvidenceRefused",
+    "AssigneeRefused", "CreatorRefused", "DependencyRefused", "EvidenceRefused", "GateRefused",
+    "SkillsRefused",
     "assignee_violations", "creator_violations", "dependency_violations", "evidence_violations",
     "gate_assignee", "gate_created_by", "gate_dependency", "gate_completion_evidence",
     "report", "reconcile", "terminal_lanes", "resolve_assignee", "retired_identities",
@@ -106,7 +113,7 @@ OPEN_STATUSES = ("ready", "todo", "running", "review", "blocked", "triage")
 
 # --- refusals -----------------------------------------------------------------------------
 #
-# All three are ``ValueError`` subclasses on purpose: the CLI funnels ValueError as a
+# All of them are ``ValueError`` subclasses on purpose: the CLI funnels ValueError as a
 # VALIDATION refusal (`kanban: <message>`) rather than an internal error, and the same text
 # reaches the kanban_* tools. The precedent is ``CreatedBlockedRefused``.
 
@@ -126,6 +133,31 @@ class AssigneeRefused(GateRefused):
     """Invariant B: the assignee resolves to nothing that can run."""
 
     invariant = "assignee"
+
+
+class SkillsRefused(GateRefused):
+    """The assignee's worker cannot load the SKILLS stored on the card.
+
+    The other half of "can a worker actually run this card": ``AssigneeRefused`` answers a
+    handle that resolves nowhere, this answers a handle that resolves but would exit on
+    ``Unknown skill(s)`` before its first turn. Both strand the card, both are refused where
+    the pair (assignee, skills) is first known — at create, and again at every door that
+    ATTACHES an assignee — and both are per-row refusals at the bulk sweep rather than bugs.
+
+    It is a ``GateRefused`` for one practical reason: the seams that already tell "refused on
+    purpose" from "something broke here" (the dashboard's ``_gate_errors_400``, the sweep's
+    recording catch) are keyed on that family, so a bare ``ValueError`` leaves every seam to
+    decide by whichever catch it happens to carry. Both got it wrong in opposite directions:
+    the bulk sweep recorded this verdict only for as long as its assign arm caught
+    ``ValueError`` — and that same catch laundered a genuine bug into an ``ok=False`` row —
+    while the dashboard answered bare prose where every other gate names its invariant.
+
+    ``facts`` carries ``where`` (the seam), ``assignee``, ``skills`` (the offending names) and
+    ``problems`` (the per-name error/closest-name records the message is built from), so a
+    caller can act on the refusal without parsing prose.
+    """
+
+    invariant = "skills"
 
 
 class DependencyRefused(GateRefused):

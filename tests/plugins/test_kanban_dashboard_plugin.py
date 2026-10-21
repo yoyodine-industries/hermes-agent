@@ -1411,4 +1411,92 @@ def test_bulk_apply_one_records_a_gate_refusal_and_the_sweep_continues(client, m
             mod._bulk_apply_one(conn, applied_id, payload, None, bug_entry)
     finally:
         conn.close()
-    assert bug_entry == {"id": applied_id, "ok": True}, bug_entry
+    assert bug_entry == {"id": applied_id, "ok": True}
+
+
+# ---------------------------------------------------------------------------
+# …and the SKILLS verdict at the same doors
+#
+# ``SkillsRefused`` is the assignee family's other half (a handle that resolves but whose
+# worker exits on ``Unknown skill(s)`` before its first turn), and it is raised as a named
+# ``GateRefused`` for exactly these two seams: the dashboard can answer ``invariant=skills``
+# instead of bare prose, and the sweep can RECORD the row instead of letting the refusal
+# escape. Both arms are two-sided.
+# ---------------------------------------------------------------------------
+
+def _write_skill(home: Path, lane: str, name: str) -> None:
+    """Give ``lane`` a loadable skill, so the other half of the pair can be exercised."""
+    skill_dir = home / "profiles" / lane / "skills" / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: test skill\n---\n\n# {name}\n", encoding="utf-8")
+
+
+def test_patch_assignee_onto_unloadable_skills_answers_400_naming_the_skills_family(
+    client, kanban_home,
+):
+    """PATCH /tasks/<id> handing a card to a profile that cannot load its skills: 400
+    carrying ``invariant=skills`` and the offending name — not bare prose, and not a 500."""
+    _arm_roster(kanban_home, "skills-lane")
+    tid = client.post("/api/plugins/kanban/tasks",
+                      json={"title": "judge the pair", "skills": ["ghost-skill"]}
+                      ).json()["task"]["id"]
+
+    refused = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"assignee": "skills-lane"})
+    assert refused.status_code == 400, refused.text
+    detail = refused.json()["detail"]
+    assert "invariant=skills" in detail
+    assert "ghost-skill" in detail, "the refusal must name the skill the worker cannot load"
+    assert "skills list" in detail, "the remedy travels with the refusal"
+    assert client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]["assignee"] is None
+
+    # Two-sided: the same door, the same lane, a skill that lane CAN load — it assigns.
+    _write_skill(kanban_home, "skills-lane", "ok-skill")
+    ok_tid = client.post("/api/plugins/kanban/tasks",
+                         json={"title": "loadable pair", "skills": ["ok-skill"]}
+                         ).json()["task"]["id"]
+    ok = client.patch(f"/api/plugins/kanban/tasks/{ok_tid}", json={"assignee": "skills-lane"})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["task"]["assignee"] == "skills-lane"
+
+
+def test_bulk_apply_one_records_a_skills_refusal_and_the_row_continues(client, kanban_home):
+    """A refused SKILLS pair is RECORDED per row and the rest of that row's patch still runs.
+
+    The sweep carries ONE assignee for every id, so the pair is loadable for one row and not
+    the other: the refused row must come back ``ok=False`` naming the skill (it used to raise
+    straight out of ``_bulk_apply_one``, which is what the route's blanket catch then turned
+    into an opaque per-row error) and must still take the same patch's ``priority`` — the
+    "records refusals … without aborting the remaining ops" contract, measured on a real
+    kernel refusal rather than a stubbed one.
+    """
+    _arm_roster(kanban_home, "skills-lane")
+    _write_skill(kanban_home, "skills-lane", "ok-skill")
+    refused_id = client.post("/api/plugins/kanban/tasks",
+                             json={"title": "bad pair", "skills": ["ghost-skill"]}
+                             ).json()["task"]["id"]
+    applied_id = client.post("/api/plugins/kanban/tasks",
+                             json={"title": "good pair", "skills": ["ok-skill"]}
+                             ).json()["task"]["id"]
+
+    mod = _load_plugin_module()
+    payload = mod.BulkTaskBody(ids=[refused_id, applied_id], assignee="skills-lane", priority=7)
+    results = []
+    conn = kbc.connect()
+    try:
+        for tid in (refused_id, applied_id):
+            entry: dict = {"id": tid, "ok": True}
+            mod._bulk_apply_one(conn, tid, payload, None, entry)  # must not raise
+            results.append(entry)
+    finally:
+        conn.close()
+
+    refused_entry, applied_entry = results
+    assert refused_entry["ok"] is False
+    assert "ghost-skill" in refused_entry["error"], refused_entry
+    assert applied_entry["ok"] is True
+    assert client.get(f"/api/plugins/kanban/tasks/{applied_id}").json()["task"]["assignee"] == (
+        "skills-lane")
+    assert client.get(f"/api/plugins/kanban/tasks/{refused_id}").json()["task"]["assignee"] is None
+    # The row continued past the refusal: the same patch's priority landed on it.
+    assert client.get(f"/api/plugins/kanban/tasks/{refused_id}").json()["task"]["priority"] == 7

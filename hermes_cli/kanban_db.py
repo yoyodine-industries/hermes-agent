@@ -1758,8 +1758,10 @@ def _task_skill_names(skills: Any) -> list[str]:
     return [str(name) for name in parsed if name] if isinstance(parsed, list) else []
 
 
-def _refuse_unloadable_skills(skills: Any, assignee: Optional[str]) -> None:
-    """Raise :class:`ValueError` for stored skill names *assignee*'s worker cannot load.
+def _refuse_unloadable_skills(skills: Any, assignee: Optional[str], *,
+                              where: str,
+                              task_id: Optional[str] = None) -> None:
+    """Raise :class:`SkillsRefused` for stored skill names *assignee*'s worker cannot load.
 
     ``create_task`` asks this where the card is created; every site that ATTACHES an
     assignee afterwards asks it again (``assign_task``, ``request_review``, the
@@ -1767,13 +1769,31 @@ def _refuse_unloadable_skills(skills: Any, assignee: Optional[str]) -> None:
     judged once the profile is known. A card created with no assignee therefore
     reaches a worker with its names unjudged and spends its attempts on
     ``Unknown skill(s)`` — the failure the create-time check exists to prevent.
+
+    The verdict is a NAMED refusal (``kanban_gate_invariants.SkillsRefused``, a ``GateRefused``
+    and therefore still a ``ValueError``), not a bare ``ValueError``: every seam that tells "a
+    gate refused this" from "something broke here" keys on that family, so the pair must arrive
+    as the family or each seam re-decides it by whatever catch it happens to have. ``where``
+    names the door for the refusal's ``facts`` and defaults to the assign door, which is the one
+    with the most callers.
     """
     names = _task_skill_names(skills)
     if not names:
         return
     problems = _unloadable_task_skills(names, assignee)
     if problems:
-        raise ValueError(_unloadable_skills_message(problems, assignee))
+        from hermes_cli.kanban_gate_invariants import SkillsRefused
+
+        raise SkillsRefused(
+            _unloadable_skills_message(problems, assignee),
+            task_id=task_id,
+            facts={
+                "where": where,
+                "assignee": assignee,
+                "skills": [str(problem.get("identifier")) for problem in problems],
+                "problems": problems,
+            },
+        )
 
 
 def _resolve_operator_ask(conn: sqlite3.Connection, *, board: Optional[str] = None,
@@ -1988,9 +2008,7 @@ def create_task(
     if skills_list:
         # Refuse a name no worker for this assignee can load, rather than letting the
         # card spend an attempt and auto-block on a failure only the worker log shows.
-        unloadable = _unloadable_task_skills(skills_list, assignee)
-        if unloadable:
-            raise ValueError(_unloadable_skills_message(unloadable, assignee))
+        _refuse_unloadable_skills(skills_list, assignee, where="kanban_create")
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -2713,7 +2731,8 @@ def list_tasks(
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim,
-    and ValueError when a worker for *profile* could not load the task's skills —
+    and :class:`SkillsRefused` (a ``ValueError`` subclass, so the CLI still reads it as a
+    validation refusal) when a worker for *profile* could not load the task's skills —
     except on a card in a terminal status (``done``/``archived``), which no worker
     will run again and can therefore be assigned for attribution.
     """
@@ -2748,7 +2767,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         # cannot fail on ``Unknown skill(s)``. Judging it there would only make a
         # finished (or archived) card un-attributable.
         if row["status"] not in TERMINAL_STATUSES:
-            _refuse_unloadable_skills(row["skills"], profile)
+            _refuse_unloadable_skills(row["skills"], profile, where="kanban_assign",
+                                      task_id=task_id)
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
@@ -6631,10 +6651,16 @@ def request_review(
                 # The reviewer takes the card over, so the skill pair is judged here
                 # exactly as assign_task judges it: refusing keeps the card in the
                 # implementer's hands instead of handing the reviewer a session that
-                # aborts on "Unknown skill(s)".
+                # aborts on "Unknown skill(s)". The catch is the NAMED verdict, not
+                # ``ValueError``: the try wraps one call that can only refuse this way, so a
+                # plain ValueError out of it is a bug in the check and must not be returned
+                # to the caller as a tidy "no" (that is how the family stayed invisible).
+                from hermes_cli.kanban_gate_invariants import SkillsRefused
+
                 try:
-                    _refuse_unloadable_skills(trow["skills"], reviewer)
-                except ValueError as exc:
+                    _refuse_unloadable_skills(trow["skills"], reviewer,
+                                              where="kanban_request_review", task_id=task_id)
+                except SkillsRefused as exc:
                     return _ret(False, str(exc))
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
