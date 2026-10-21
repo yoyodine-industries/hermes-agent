@@ -23,6 +23,7 @@ increments ``reoffer_count`` instead, so contention never consumes an attempt.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -445,6 +446,16 @@ def validate_delivery_id(delivery_id: Any) -> str:
 
 def delivery_root(home: str | os.PathLike[str]) -> Path:
     return Path(home).resolve() / "runtime" / DELIVERY_DIR_NAME
+
+
+def has_spool(home: str | os.PathLike[str]) -> bool:
+    """Whether this home ALREADY has a delivery spool (never creates one).
+
+    The drainer walks every profile home on the install, most of which never
+    carried a delivery; asking first keeps a sweep from planting an empty spool --
+    and chmod'ing it -- in a profile that does not use Bot Mode.
+    """
+    return delivery_root(home).is_dir()
 
 
 def _fsync_dir(path: Path) -> None:
@@ -991,16 +1002,25 @@ def read_record(
 
 
 def cleanup_bot_delivery_queue(max_age_hours: float | None = None) -> int:
-    """Hourly housekeeping hook (spec 3.1 trigger 4): sweep THIS home's queue.
+    """Hourly housekeeping hook (spec 3.1 trigger 4): sweep EVERY lane's queue.
 
     ``max_age_hours`` exists only for signature parity with the other
     ``cleanup_*`` chores; the queue's own TTL governs expiry.
+
+    A peer delivery is admitted into its TARGET lane's own home
+    (``profiles/<lane>/runtime/bot_delivery``), so sweeping only the default home
+    left a named lane's backlog with no expiry and no orphan-claim recovery at all
+    (card t_8a7a47d7).
     """
     del max_age_hours
     try:
-        from tools.bot_mode_probe import _default_home
+        from tools.bot_mode_probe import _default_home, _delivery_homes, _hermes_root
 
-        return sweep_delivery_queue(Path(_default_home()))
+        root = _hermes_root(Path(_default_home()))
+        return sum(
+            sweep_delivery_queue(profile_home)
+            for _name, profile_home in _delivery_homes(root)
+        )
     except Exception:  # pragma: no cover - housekeeping must not raise
         logger.debug("bot_delivery sweep failed", exc_info=True)
         return 0
@@ -1011,8 +1031,10 @@ def sweep_delivery_queue(
     *,
     now_ns: int | None = None,
     slot_held_fn: Any = None,
+    expire: bool = True,
+    on_expired: Any = None,
 ) -> int:
-    """Recover orphaned claims, then expire over-age records.
+    """Recover orphaned claims, then (``expire=True``) expire over-age records.
 
     Runs hourly and on every 30s drainer tick (VERIFICATION D1 trigger 4).
     Returns the number of records it acted on.
@@ -1021,11 +1043,23 @@ def sweep_delivery_queue(
     target mid-turn (a desktop session can hold the slot for a whole lease wait)
     must not have its inbound delivery expire underneath it: the slot holder is
     exactly the turn that will drain it next.
+
+    ``expire=False`` runs the orphaned-claim recovery ONLY. The drainer takes that
+    form before its drain and the full form after it (card t_8a7a47d7): a record
+    that was never offered to a turn (``attempts == 0``) must get its first -- and
+    on that tick, only -- chance to run before TTL can dead-letter it, or the
+    backlog is reaped the same tick the drainer finally reaches the lane.
+
+    ``on_expired`` is called once per expired record AFTER this home's lock is
+    released, so a callback may write into another home (the sender's failure
+    notice) without deadlocking this one. A callback that raises is logged and
+    never aborts the sweep.
     """
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     ttl = queue_ttl_seconds()
     held = slot_held if slot_held_fn is None else slot_held_fn
     actions = 0
+    expired: list[dict[str, Any]] = []
     with _locked(home) as root:
         # 1. a claim renamed the file but crashed before rewriting it
         for record in _list(root, CLAIMED_DIR):
@@ -1040,7 +1074,7 @@ def sweep_delivery_queue(
             actions += 1
 
         # 2. expire records that waited past the TTL
-        if ttl > 0:
+        if expire and ttl > 0:
             for record in _list(root, QUEUE_DIR):
                 if record.get("status") != STATUS_QUEUED:
                     continue
@@ -1059,8 +1093,15 @@ def sweep_delivery_queue(
                 os.replace(path, root / SETTLED_DIR / f"{updated['delivery_id']}.json")
                 _write(root / SETTLED_DIR / f"{updated['delivery_id']}.json", updated)
                 _log("expired", updated, reason=REASON_QUEUED_EXPIRED)
+                expired.append(updated)
                 actions += 1
-    _log("swept", None, actions=actions, ttl_seconds=ttl)
+    if on_expired is not None:
+        for record in expired:
+            try:
+                on_expired(record)
+            except Exception:  # a notice must never abort the sweep
+                logger.exception("bot_delivery expired-notice failed: %s", record.get("delivery_id"))
+    _log("swept", None, actions=actions, ttl_seconds=ttl, expired=len(expired))
     return actions
 
 
@@ -1249,6 +1290,95 @@ def queue_depth(home: str | os.PathLike[str], target_profile: str | None = None)
     """Number of not-yet-terminal records (optionally for one profile)."""
     with _locked(home) as root:
         return _pending(root, target_profile=target_profile)
+
+
+# --------------------------------------------------------------------------
+# sender-visible FAILURE for a record that expired unread (card t_8a7a47d7 b)
+# --------------------------------------------------------------------------
+#: Producer origin of an undelivered notice. Not a profile: no reply is routed
+#: to it, and the drainer never files a notice about a notice.
+EXPIRED_NOTICE_SENDER = "bot-delivery-drainer"
+
+#: Why the notice itself was queued -- it is a fresh delivery, not a backlog one.
+STATUS_DETAIL_UNDELIVERED_NOTICE = (
+    "undelivered: the peer delivery this notice reports expired before any turn read it"
+)
+
+
+def expired_notice_key(delivery_id: str) -> str:
+    """The idempotency key of the ONE failure notice owed for ``delivery_id``."""
+    return f"expired-notice:{delivery_id}"
+
+
+def _profile_home(profile: str) -> Path | None:
+    """The home of ``profile`` on this install, or None when it is not a profile."""
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        return Path(get_profile_dir(profile))
+    except Exception:  # an unknown sender is not a sweep failure
+        return None
+
+
+def notice_expired_to_sender(
+    record: dict[str, Any],
+    *,
+    home: str | os.PathLike[str] | None = None,
+    now_ns: int | None = None,
+) -> dict[str, Any] | None:
+    """File a FAILURE notice in the SENDER's own spool for an expired record.
+
+    Card t_8a7a47d7 (b): a sender's receipt said "queued -- the receiver re-offers
+    it". When the record expires unread that promise was false and the sender had
+    no way to learn it; the receipt is long gone, so the text sat invisible until a
+    human read the queue by hand. File ONE delivery into the sender's own lane so
+    the failure is READ by that lane's turn -- deterministically, with no LLM in
+    the loop -- which is the sender's cue to escalate.
+
+    ``home`` is the sender's own home. Resolve it by profile only when omitted, and
+    only from outside any lane's runtime scope (``get_profile_dir`` resolves against
+    the ambient default home). Idempotent on the expired record: one notice per
+    delivery. Returns the admitted record, or None when no notice is owed -- no
+    sender, a notice about a notice, an unknown profile, or a full sender queue.
+    """
+    delivery_id = str(record.get("delivery_id") or "")
+    sender = str(record.get("sender_profile") or "")
+    target = str(record.get("target_profile") or "")
+    if not delivery_id or not sender or sender == EXPIRED_NOTICE_SENDER:
+        return None
+    if home is None:
+        home = _profile_home(sender)
+        if home is None:
+            _log("expired_notice_skipped", record, reason="unknown_sender_profile")
+            return None
+    waited = int(queued_seconds(record, now_ns=now_ns))
+    message = (
+        f"[peer-delivery FAILED] your delivery {delivery_id} to {target} was NEVER read: "
+        f"it waited {waited}s queued and expired without being offered to a turn. "
+        f"The earlier 'queued' receipt is NOT a pending promise. Escalate (the escalate "
+        f"tool) or resend if this still matters."
+    )
+    key = expired_notice_key(delivery_id)
+    # A deterministic id keeps the notice single-writer: a re-run of the sweep
+    # re-admits nothing.
+    notice_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    try:
+        admitted = admit(
+            home,
+            sender_profile=EXPIRED_NOTICE_SENDER,
+            target_profile=sender,
+            target_session_id=None,
+            idempotency_key=key,
+            fingerprint=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            delivery_id=notice_id,
+            message=message,
+            status_detail=STATUS_DETAIL_UNDELIVERED_NOTICE,
+        )
+    except QueueFullError:
+        _log("expired_notice_refused", record, reason=STATUS_DETAIL_QUEUE_FULL, target=sender)
+        return None
+    _log("expired_notice", record, notice_id=admitted.get("delivery_id"), target=sender)
+    return admitted
 
 
 # --------------------------------------------------------------------------
