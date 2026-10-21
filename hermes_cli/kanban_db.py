@@ -268,6 +268,77 @@ def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
 
 
+def _main_db_file_of(conn: sqlite3.Connection) -> Optional[str]:
+    """``conn``'s main database file, or ``None`` when it cannot be told (in-memory / closed).
+
+    The ONE subject a fence may judge is the store the write LANDS on, and ``write_txn``
+    already fences exactly this file (``kanban_db_connect._main_db_file``). Read here rather
+    than imported because that module imports this one.
+    """
+    try:
+        for _seq, name, file in conn.execute("PRAGMA database_list") or ():
+            if name == "main" and file:
+                return str(file)
+    except Exception:
+        return None
+    return None
+
+
+def _write_fence_target_store(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+) -> Optional[Path]:
+    """The board store a mutation on *conn* LANDS ON - the only subject a fence verdict may judge.
+
+    A caller may NAME a board (``board=``) for the row it writes, but the write lands on the
+    store ``conn`` is open against. ``kanban_db_path(board=<name>)`` answers the ENV-PINNED store
+    whenever a worker's pin is authoritative (:func:`_explicit_board_intent_pinned`), so a fence
+    judged against it can speak about a board that is neither the write's board nor a board the
+    invocation named: it over-refuses a write that lands OUTSIDE the fence and it MASKS the honest
+    board error - the same masking class the CLI fast-fail was cured of (ruling of platform-stl on
+    t_ecd51c9c; card t_57e33100).
+
+    ``board`` is kept only as the FALLBACK for the one case the connection cannot answer (no file
+    at all), and a name that resolves to NO board is then no board for a fence verdict either.
+    Never raises: a guard that cannot resolve a subject must not become the caller's failure.
+    """
+    path = _main_db_file_of(conn)
+    if path:
+        return Path(path)
+    if not board:
+        return None
+    try:
+        normed = _normalize_board_slug(board)
+    except Exception:
+        return None
+    if not normed or (normed != DEFAULT_BOARD and not board_exists(normed)):
+        return None
+    try:
+        return kanban_db_path(board=board)
+    except Exception:
+        return None
+
+
+def _assert_not_delegated_child_write(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+) -> None:
+    """Refuse a delegated-child / worker-descendant write to the store *conn* LANDS on.
+
+    :func:`_assert_not_delegated_child_mutation` carries every arm of the fence - the
+    cooperatively-clearable ContextVar and marker inside ``kanban_path_is_fenced``, plus the
+    PROVENANCE arm a worker's shell cannot clear with ``env -u``. This is the same verdict with
+    the SUBJECT read off the connection instead of the named/pinned board: the designation door
+    is an ESTATE move (it re-ranks a card into the board's reserved tranche), so what it must be
+    judged by is the store its own rows land in.
+
+    ``None`` target (no store to be told, no board named) is NO VERDICT, never a blanket
+    refusal: a fence that cannot see must not refuse.
+    """
+    target = _write_fence_target_store(conn, board=board)
+    if target is None:
+        return
+    _assert_not_delegated_child_mutation(target)
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Best-effort lifecycle hook. Call AFTER the write txn commits (plugins never
     run under the SQLite write lock, always see durable state); failures are
@@ -3879,7 +3950,7 @@ def designate_priority(conn: sqlite3.Connection, task_id: str, *, reason: str,
     no post-commit side effect can fire while an outer txn can still roll back.
     """
     policy = _designation_policy()
-    _assert_not_delegated_child_mutation(kanban_db_path(board=board))
+    _assert_not_delegated_child_write(conn, board=board)
     reason = (reason or "").strip()
     if not reason:
         raise ValueError("a designation needs a reason (it is the audit answer)")
