@@ -729,8 +729,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
-    with kbc.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.assign_task(conn, args.task_id, profile)
+    # ``ValueError`` is the assignee invariant's refusal (a handle that cannot run) and
+    # ``RuntimeError`` is a claimed card: both are validation refusals with a named remedy, so
+    # they print as ``kanban: <message>`` with rc 2 — never a traceback.
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
     return _ok_or_err(ok, f"no such task: {args.task_id}",
                       f"Assigned {args.task_id} to {profile or '(unassigned)'}")
 
@@ -765,8 +771,13 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     reclaim = bool(getattr(args, "reclaim", False))
-    with kbc.connect_closing() as conn:
-        ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+    # Same two refusal families as _cmd_assign: a handle that cannot run (ValueError, the
+    # assignee invariant) and a claimed card (RuntimeError). Both are rc 2 with a message.
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
     return _ok_or_err(
         ok,
         f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",

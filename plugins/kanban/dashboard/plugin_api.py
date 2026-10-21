@@ -36,6 +36,7 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_gate_invariants import GateRefused
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
 
 log = logging.getLogger(__name__)
@@ -156,6 +157,27 @@ def _map_errors(status: int, *types: type[BaseException]) -> Iterator[None]:
 
 
 _value_error_400 = partial(_map_errors, 400, ValueError)  # domain-layer validation refusals
+
+
+@contextmanager
+def _gate_errors_400() -> Iterator[None]:
+    """Map a write-door gate refusal to 400, NAMING the invariant that refused it.
+
+    ``kanban_gate_invariants.GateRefused`` is a ``ValueError`` on purpose (it is a validation
+    refusal, not an internal error), so it would otherwise reach the client as bare prose that
+    happens to be a 400. The dashboard needs the family too: ``invariant=assignee`` tells the UI
+    the write was refused because the handle cannot run (invariant B) rather than because the
+    evidence was missing (A) or the payload was malformed — three different remedies behind one
+    status code. Any other ``ValueError`` keeps the plain-text 400 it always had.
+    """
+    from hermes_cli.kanban_gate_invariants import GateRefused
+
+    try:
+        yield
+    except GateRefused as exc:
+        raise HTTPException(status_code=400, detail=f"invariant={exc.invariant}: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @contextmanager
@@ -705,7 +727,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
         if payload.assignee is not None and not review_assignee_deferred:
-            with _map_errors(409, RuntimeError):
+            # A running card is still a 409 (release the claim first); a handle that cannot run
+            # is a 400 naming ``invariant=assignee`` — the two are different remedies.
+            with _map_errors(409, RuntimeError), _gate_errors_400():
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
@@ -850,7 +874,15 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
                   else kanban_db.assign_task(conn, tid, payload.assignee or None))
             if not ok:
                 entry.update(ok=False, error="assign refused")
-        except RuntimeError as e:
+        # ``GateRefused`` is the gate's own refusal family (Invariant B at this door: a handle
+        # that cannot run): a ValueError subclass raised ON PURPOSE as a per-row validation
+        # refusal, so it is RECORDED here like any other per-row refusal — letting it escape
+        # made the family invisible to the sweep's own contract ("records refusals ...
+        # without aborting the remaining ops"). The catch is narrowed to that family plus
+        # ``RuntimeError`` so a plain ValueError — the shape of a genuine bug in this door,
+        # not a refusal — still propagates to the caller instead of being laundered into an
+        # ``ok=False`` row nobody investigates.
+        except (GateRefused, RuntimeError) as e:
             entry.update(ok=False, error=str(e))
     if payload.priority is not None:
         _set_priority(conn, tid, payload.priority, board)
@@ -1048,7 +1080,7 @@ class ReassignBody(BaseModel):
 def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[str] = Query(None)):
     """Reassign to another profile, optionally reclaiming first
     (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
-    with _board_conn(board) as (board, conn):
+    with _board_conn(board) as (board, conn), _gate_errors_400():
         ok = kanban_db.reassign_task(
             conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
         if not ok:
