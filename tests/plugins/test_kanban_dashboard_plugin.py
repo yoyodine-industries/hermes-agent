@@ -1355,6 +1355,11 @@ def test_bulk_apply_one_records_a_gate_refusal_and_the_sweep_continues(client, m
     The bulk patch carries ONE handle for every row, so a real dead handle refuses every row
     and cannot show "continues past the refused one"; the kernel's own refusal is raised for
     the first row and the real ``assign_task`` runs for the second.
+
+    Two-sided by construction: the catch is the gate FAMILY (``GateRefused``), not the whole
+    of ``ValueError``, so the second half pins the other arm — a plain ``ValueError`` is a
+    bug in this door, not a refusal, and must still propagate instead of being laundered
+    into an ``ok=False`` row.
     """
     from hermes_cli import kanban_gate_invariants as gates
 
@@ -1390,3 +1395,20 @@ def test_bulk_apply_one_records_a_gate_refusal_and_the_sweep_continues(client, m
     assert applied_entry["ok"] is True
     assert client.get(f"/api/plugins/kanban/tasks/{applied_id}").json()["task"]["assignee"] == "gone-lane"
     assert client.get(f"/api/plugins/kanban/tasks/{refused_id}").json()["task"]["assignee"] is None
+
+    # The other arm of the same catch: a PLAIN ``ValueError`` out of the same call belongs to
+    # no invariant and carries no remedy, so it is NOT a per-row refusal — it must leave the
+    # function (the route's blanket catch reports it) with the entry untouched, or the sweep
+    # turns a bug into a tidy-looking ``ok=False`` nobody investigates.
+    def _buggy_assign(conn, task_id, profile):
+        raise ValueError("assign_task: unexpected shape")
+
+    monkeypatch.setattr(kb, "assign_task", _buggy_assign)
+    bug_entry: dict = {"id": applied_id, "ok": True}
+    conn = kbc.connect()
+    try:
+        with pytest.raises(ValueError, match="unexpected shape"):
+            mod._bulk_apply_one(conn, applied_id, payload, None, bug_entry)
+    finally:
+        conn.close()
+    assert bug_entry == {"id": applied_id, "ok": True}, bug_entry

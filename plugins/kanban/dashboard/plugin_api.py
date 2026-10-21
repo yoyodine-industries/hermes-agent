@@ -36,6 +36,7 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_gate_invariants import GateRefused
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
 
 log = logging.getLogger(__name__)
@@ -873,11 +874,15 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
                   else kanban_db.assign_task(conn, tid, payload.assignee or None))
             if not ok:
                 entry.update(ok=False, error="assign refused")
-        # ``ValueError`` is the gate's own refusal class (a handle that cannot run), so it has to
-        # be RECORDED here like any other per-row refusal: letting it escape past this function
-        # relied on the caller's blanket catch and made the family invisible to the sweep's own
-        # contract ("records refusals ... without aborting the remaining ops").
-        except (ValueError, RuntimeError) as e:
+        # ``GateRefused`` is the gate's own refusal family (Invariant B at this door: a handle
+        # that cannot run): a ValueError subclass raised ON PURPOSE as a per-row validation
+        # refusal, so it is RECORDED here like any other per-row refusal — letting it escape
+        # made the family invisible to the sweep's own contract ("records refusals ...
+        # without aborting the remaining ops"). The catch is narrowed to that family plus
+        # ``RuntimeError`` so a plain ValueError — the shape of a genuine bug in this door,
+        # not a refusal — still propagates to the caller instead of being laundered into an
+        # ``ok=False`` row nobody investigates.
+        except (GateRefused, RuntimeError) as e:
             entry.update(ok=False, error=str(e))
     if payload.priority is not None:
         _set_priority(conn, tid, payload.priority, board)
