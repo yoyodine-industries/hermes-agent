@@ -149,8 +149,36 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
         if resolved in seen:
             continue
         seen.add(resolved)
+        if not _db_has_tasks_table(resolved):
+            # A stub board (``boards/default`` and ``boards/_archived`` in the
+            # live home carry only metadata tables) answers "no such table:
+            # tasks", which the caller reads as an unreadable sibling and
+            # therefore defers EVERY cleanup on EVERY board. A board with no
+            # task table cannot be using this workspace: skip it.
+            _kb._log.debug("Ignoring tasks-less board db %s", resolved)
+            continue
         found.append(resolved)
     return found
+
+
+def _db_has_tasks_table(db_file: Path) -> bool:
+    """Whether *db_file* is a board store at all (it has a ``tasks`` table).
+
+    Unknown answers True so an unreadable board still makes the caller fail
+    closed; only a readable database that provably has no task table is skipped.
+    """
+    try:
+        other = sqlite3.connect(db_file.as_uri() + "?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = other.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1"
+            ).fetchone()
+            return row is not None
+        finally:
+            other.close()
+    except sqlite3.Error as exc:
+        _kb._log.warning("Cannot inspect board db %s: %s", db_file, exc)
+        return True
 
 
 def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
@@ -423,6 +451,58 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+def _archive_untracked_and_clear(task_id: str, wp: Path) -> bool:
+    """Archive a dirty worktree's UNTRACKED files, then clear them from the tree.
+
+    Returns True only when the tree holds no tracked change and every untracked
+    path was copied to ``<hermes home>/archive/worktree-prune/<task>-<stamp>``
+    and deleted. A tracked modification (anything but ``??``) is real work:
+    return False and let the caller preserve the tree in place.
+
+    Clearing rather than ``worktree remove --force`` keeps git's own dirty guard
+    as the last line of defence — a file written between the archive and the
+    removal makes the removal fail and the tree is preserved (TOCTOU safe).
+    """
+    try:
+        from hermes_cli.worktree_gc import _archive_untracked, _dirty_split
+    except Exception:
+        return False
+    tracked_dirty, untracked = _dirty_split(str(wp))
+    if tracked_dirty:
+        _kb._log.info(
+            "Preserving worktree for task %s: uncommitted tracked changes at %s",
+            task_id, wp,
+        )
+        return False
+    if not untracked:
+        return False
+    dest = _archive_untracked(wp, untracked)
+    if dest is None:
+        _kb._log.warning(
+            "Preserving worktree for task %s: could not archive untracked files at %s",
+            task_id, wp,
+        )
+        return False
+    for rel in untracked:
+        target = wp / rel
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target, ignore_errors=True)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+        except OSError as exc:
+            _kb._log.warning(
+                "Preserving worktree for task %s: cannot clear %s after archiving: %s",
+                task_id, target, exc,
+            )
+            return False
+    _kb._log.info(
+        "Archived untracked files for task %s to %s and cleared them from %s",
+        task_id, dest, wp,
+    )
+    return True
+
+
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
@@ -446,12 +526,15 @@ def _cleanup_worktree_workspace(
         repo_root = common.parent
         if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
             return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
+        if _worktree_has_unpushed_commits(str(wp)):
             _kb._log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
+                "Preserving worktree for task %s: unpushed commits at %s",
                 task_id, wp,
             )
             return
+        if _worktree_is_dirty(str(wp), str(repo_root)):
+            if not _archive_untracked_and_clear(task_id, wp):
+                return
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own
         # linked worktree, so move this process back to the main checkout
