@@ -64,14 +64,56 @@ def _admission_gate_enabled() -> bool:
         return True
 
 
+def _record_admission_fault(subject: str, detail: str, corpus: str = "") -> None:
+    """Record a judge FAULT — the admission that happened because the gate could not judge.
+
+    Fail-open is the pen's deliberate choice (a policy bug must not stop every lane from
+    learning), so the refusal itself cannot report it. Without this row the ledger of a broken
+    gate is indistinguishable from the ledger of a gate that found nothing to refuse, which is
+    the silent failure the ledger exists to rule out.
+    """
+    try:
+        from tools.skill_usage import record_admission_fault
+        record_admission_fault(subject, detail=detail, corpus=corpus)
+    except Exception:
+        logger.warning("admission fault could not be recorded for %s: %s", subject, detail,
+                       exc_info=True)
+
+
+#: Whether this process has already written the corpus-degradation fault.
+_CORPUS_FALLBACK_RECORDED = False
+
+
 def _admission_corpus_roots() -> list[Path]:
-    """The skills the agent can see — the corpus a new skill must be material against."""
+    """The skills the agent can see — the corpus a new skill must be material against.
+
+    The multi-root lookup can fail, and then this degrades to ONE root (``_skills_dir()``).
+    That is a NARROWER corpus and therefore a WEAKER gate — it can only let more through, never
+    less — so the degradation is logged at WARNING naming the root it fell back to, and written
+    to the ledger once per process. A silent fallback would make every judgement it feeds look
+    like a gate that judged against the whole corpus.
+    """
+    global _CORPUS_FALLBACK_RECORDED
+    roots: list[Path] = []
     try:
         from agent.skill_utils import get_all_skills_dirs
-        return [Path(d) for d in get_all_skills_dirs()]
-    except Exception:
-        logger.debug("admission corpus roots unavailable; using the active skills dir", exc_info=True)
-        return [_skills_dir()]
+        roots = [Path(d) for d in get_all_skills_dirs()]
+        if roots:
+            _CORPUS_FALLBACK_RECORDED = False
+            return roots
+        fault = "get_all_skills_dirs() named no skills dir"
+    except Exception as e:
+        fault = f"{type(e).__name__}: {e}"
+    fallback = _skills_dir()
+    logger.warning("admission corpus roots unavailable (%s); judging against %s only",
+                   fault, fallback)
+    if not _CORPUS_FALLBACK_RECORDED:
+        _CORPUS_FALLBACK_RECORDED = True
+        _record_admission_fault(
+            "admission-corpus",
+            f"corpus roots unavailable ({fault}); judged against {fallback} only — a narrower "
+            f"corpus is a weaker gate", corpus=str(fallback))
+    return [fallback]
 
 
 def _admission_references_hint(verdict: dict[str, Any], name: str) -> str:
@@ -105,18 +147,22 @@ def _admission_refusal(name: str, content: str) -> Optional[dict[str, Any]]:
     refusal names the existing skill, its path, the `references/` file to extend instead, and
     the rule that fired, then records itself in the ledger.
 
-    An internal fault in the judge fails OPEN (logged), not closed: this is a policy gate, and
-    a bug in it must not stop every lane from learning. That is the opposite of the door's
-    choice, where an unreadable corpus must not admit anything — there the corpus is a
-    deployment artifact, here it is the live tree.
+    An internal fault in the judge fails OPEN (logged and recorded as a fault row), not closed:
+    this is a policy gate, and a bug in it must not stop every lane from learning. That is the
+    opposite of the door's choice, where an unreadable corpus must not admit anything — there
+    the corpus is a deployment artifact, here it is the live tree.
     """
     if not _admission_gate_enabled():
         return None
+    roots: list[Path] = []
     try:
         from tools.skill_admission import refusal_message, verdict_for_content
-        verdict = verdict_for_content(name, content, _admission_corpus_roots())
-    except Exception:
+        roots = _admission_corpus_roots()
+        verdict = verdict_for_content(name, content, roots)
+    except Exception as e:
         logger.warning("skill admission gate could not judge %r; admitting it", name, exc_info=True)
+        _record_admission_fault(name, "judge fault, admitted: %s: %s" % (type(e).__name__, e),
+                                corpus=", ".join(str(r) for r in roots))
         return None
     if verdict.get("disposition") not in ("fold", "reject"):
         return None
@@ -700,13 +746,17 @@ def _support_file_admission_refusal(name: str, skill_dir: Path, file_path: str,
     """
     if not _admission_gate_enabled():
         return None
+    roots: list[Path] = []
     try:
         from tools.skill_admission import refusal_message, verdict_for_support_file
-        verdict = verdict_for_support_file(name, file_content, _admission_corpus_roots(),
-                                           exclude=[skill_dir])
-    except Exception:
+        roots = _admission_corpus_roots()
+        verdict = verdict_for_support_file(name, file_content, roots, exclude=[skill_dir])
+    except Exception as e:
         logger.warning("support-file admission gate could not judge %r; writing it", file_path,
                        exc_info=True)
+        _record_admission_fault(f"{name}/{file_path}",
+                                "judge fault, admitted: %s: %s" % (type(e).__name__, e),
+                                corpus=", ".join(str(r) for r in roots))
         return None
     if verdict.get("disposition") != "fold":
         return None
