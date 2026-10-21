@@ -327,20 +327,46 @@ def _park(conn, status: str, title: str = "parent") -> str:
     return parent
 
 
+def test_create_behind_a_ready_parent_names_the_parent(kanban_home):
+    """The common shape: `kanban_create(parents=[...])` on an unclaimed ready parent."""
+    with kbc.connect() as conn:
+        ready = _park(conn, "ready", "parent waiting in the queue")
+        conn.commit()
+        child, outcome = kb.create_task_reported(
+            conn, title="child", assignee="default", parents=(ready,), profiles=["default"])
+    assert outcome.gated is True
+    assert [edge.id for edge in outcome.parents] == [ready]
+    assert outcome.standing == [ready]
+    assert ready in outcome.warning and "NOT MOVING ON ITS OWN" in outcome.warning
+    assert kb.receipt_fields(outcome)["gated_by"] == ready
+    # The receipt names the CALLER's board, never the ambient one.
+    assert outcome.board_dispatch == {}
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, child).status == "todo"
+
+
 def test_create_reports_a_parent_that_will_never_move(kanban_home):
     with kbc.connect() as conn:
         parked = _park(conn, "review", "parent waiting in review")
         conn.commit()
-        child, outcome = kb.create_task_reported(
+        _child, outcome = kb.create_task_reported(
             conn, title="child", assignee="default", parents=(parked,), profiles=["default"])
-    assert outcome.gated is True
-    assert [edge.id for edge in outcome.parents] == [parked]
     assert outcome.parents[0].code == "review"
     assert outcome.standing == [parked]
     assert "NOT MOVING ON ITS OWN" in outcome.warning
-    assert kb.receipt_fields(outcome)["gated_by"] == parked
+
+
+def test_create_behind_a_dead_assignee_names_the_assignee(kanban_home):
+    """A parent assigned to a lane that is not live: the warning names WHO, not just 'gated'."""
     with kbc.connect() as conn:
-        assert kb.get_task(conn, child).status == "todo"
+        ghost = _park(conn, "ready", "parent of a retired lane")
+        conn.execute("UPDATE tasks SET assignee = 'ghost-lane' WHERE id = ?", (ghost,))
+        conn.commit()
+        _child, outcome = kb.create_task_reported(
+            conn, title="child", assignee="default", parents=(ghost,), profiles=["default"])
+    assert outcome.parents[0].code == "dead-assignee"
+    assert outcome.standing == [ghost]
+    assert "ghost-lane" in outcome.warning
 
 
 def test_create_behind_a_running_parent_gates_but_warns_nothing(kanban_home):
@@ -353,6 +379,8 @@ def test_create_behind_a_running_parent_gates_but_warns_nothing(kanban_home):
     assert outcome.gated is True
     assert outcome.standing == []
     assert outcome.warning is None
+    # gated_by still names it (that is today's contract) - the point is that no WARNING does.
+    assert kb.receipt_fields(outcome)["gated_by"] == running
 
 
 def test_create_behind_a_done_parent_is_ready_and_reports_nothing(kanban_home):
@@ -369,6 +397,16 @@ def test_create_behind_a_done_parent_is_ready_and_reports_nothing(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_create_without_parents_answers_exactly_what_it_always_did(kanban_home):
+    """No edge, no receipt: the keys are the ones the door shipped before this change."""
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({"title": "solo", "assignee": "default"}))
+    assert out.get("ok"), out
+    assert set(out) == {"ok", "task_id", "gated", "subscribed"} | set(kt._CREATED_FIELDS)
+    assert out["gated"] is False
+
+
 def test_create_reads_the_existing_card_when_an_idempotency_key_dedupes(kanban_home):
     with kbc.connect() as conn:
         parked = _park(conn, "review")
@@ -383,24 +421,22 @@ def test_create_reads_the_existing_card_when_an_idempotency_key_dedupes(kanban_h
     assert outcome.standing == [parked]
 
 
-def test_create_task_stays_the_id_shaped_face_of_the_same_write_path(kanban_home):
+def test_create_task_still_returns_the_id_the_reported_door_returns(kanban_home):
+    """`create_task` and `create_task_reported` are two faces of ONE write path."""
     with kbc.connect() as conn:
         parked = _park(conn, "review")
         conn.commit()
-        child = kb.create_task(conn, title="child", assignee="default", parents=(parked,))
+        child = kb.create_task(conn, title="child", assignee="default", parents=(parked,),
+                               idempotency_key="t-shared")
+        reported, outcome = kb.create_task_reported(
+            conn, title="child", assignee="default", idempotency_key="t-shared",
+            profiles=["default"])
+    assert child == reported
     assert isinstance(child, str) and child.startswith("t_")
+    assert outcome.standing == [parked]
     with kbc.connect() as conn:
         assert kb.parent_ids(conn, child) == [parked]
         assert kb.get_task(conn, child).status == "todo"
-
-
-def test_create_never_infers_the_ambient_board_for_its_receipt(kanban_home):
-    with kbc.connect() as conn:
-        parked = _park(conn, "ready")
-        conn.commit()
-        _child, outcome = kb.create_task_reported(
-            conn, title="child", assignee="default", parents=(parked,))
-    assert outcome.board_dispatch == {}
 
 
 def test_kanban_create_tool_reports_the_parent_receipt(kanban_home):
@@ -414,7 +450,8 @@ def test_kanban_create_tool_reports_the_parent_receipt(kanban_home):
     assert out.get("ok"), out
     assert out["gated"] is True and out["gated_by"] == parked
     assert out["standing"] == [parked]
-    assert out["parents"][0]["code"] == "review"
+    assert out["parents_state"][0]["id"] == parked
+    assert out["parents_state"][0]["code"] == "review"
     assert "NOT MOVING ON ITS OWN" in out["warning"]
 
 
@@ -427,6 +464,7 @@ def _create_args(**overrides) -> argparse.Namespace:
 
 
 def test_cli_create_prints_the_parent_receipt_to_stderr(kanban_home, capsys):
+    """The same lines `hermes kanban link` prints, on the create door too."""
     from hermes_cli import kanban as kc
 
     with kbc.connect() as conn:
@@ -441,6 +479,21 @@ def test_cli_create_prints_the_parent_receipt_to_stderr(kanban_home, capsys):
     assert "NOT MOVING ON ITS OWN" in captured.err
 
 
+def test_cli_create_behind_a_running_parent_prints_the_state_but_no_warning(kanban_home, capsys):
+    """A parent that IS moving needs no alarm - the state line alone says so."""
+    from hermes_cli import kanban as kc
+
+    with kbc.connect() as conn:
+        running = _park(conn, "running", "parent mid-run")
+        conn.commit()
+    rc = kc._cmd_create(_create_args(parent=[running]))
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Parent state (1 edge(s)):" in captured.err
+    assert f"  {running}  running  " in captured.err
+    assert "NOT MOVING ON ITS OWN" not in captured.err
+
+
 def test_cli_create_json_carries_the_receipt(kanban_home, capsys):
     from hermes_cli import kanban as kc
 
@@ -452,5 +505,5 @@ def test_cli_create_json_carries_the_receipt(kanban_home, capsys):
     assert rc == 0
     assert payload["gated"] is True and payload["gated_by"] == parked
     assert payload["standing"] == [parked]
-    assert payload["parents"][0]["id"] == parked
+    assert payload["parents_state"][0]["id"] == parked
     assert "NOT MOVING ON ITS OWN" in payload["warning"]

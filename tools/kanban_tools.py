@@ -1441,8 +1441,9 @@ def _handle_create(args: dict, **kw) -> str:
             # door (this process knows them) rather than guessed inside the kernel.
             profiles=list_profile_names())
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        # gated/gated_by keep their shape; parents/standing/warning/board_dispatch are the
-        # SAME receipt the link door reports, so a card filed behind a parent that will
+        # gated/gated_by keep their shape, and a create with no parents answers exactly what
+        # it always did; with parents, parents_state/standing/warning/board_dispatch come from
+        # the SAME receipt the link door reports, so a card filed behind a parent that will
         # never move is visible in the answer that created it, not after a second lookup.
         return _ok(task_id=new_tid, **landed, **kb.receipt_fields(outcome),
                    subscribed=_maybe_auto_subscribe(conn, new_tid))

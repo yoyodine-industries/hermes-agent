@@ -158,15 +158,19 @@ def created_outcome(
 def receipt_fields(outcome: LinkOutcome) -> dict:
     """The door payload for one receipt: the same keys on every surface that reports one.
 
-    ``gated_by`` names the parent that parked the card - the first edge, in id order, that
-    has not finished - so an agent reads WHY its new card sits in ``todo`` from the call
-    that created it, instead of a second round trip through the event log.
+    A create that carried NO parents answers exactly what it always did — ``gated: False``
+    and nothing else — because there is no edge to describe; the receipt appears only when
+    there is a dependency set to report. ``gated_by`` names the parent that parked the card
+    (the first edge, in id order, that has not finished), so an agent reads WHY its new card
+    sits in ``todo`` from the call that created it instead of a second round trip.
     """
+    if not outcome.parents:
+        return {"gated": False}
     open_edges = [e for e in outcome.parents if e.status not in TERMINAL_PARENT_STATUSES]
     payload = {
         "gated": outcome.gated,
-        "parents": [{"id": e.id, "status": e.status, "code": e.code, "self_moves": e.self_moves}
-                    for e in outcome.parents],
+        "parents_state": [{"id": e.id, "status": e.status, "code": e.code,
+                           "self_moves": e.self_moves} for e in outcome.parents],
         "standing": outcome.standing,
         "warning": outcome.warning,
         "board_dispatch": outcome.board_dispatch,
