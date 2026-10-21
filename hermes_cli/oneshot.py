@@ -88,11 +88,29 @@ def _auxiliary_report(report: dict, by_task: dict[str, dict]) -> None:
 # Exit code for a turn stopped by an interrupt (SIGINT convention, same as ``chat -Q``).
 _INTERRUPTED_EXIT_CODE = 130
 
+# Turn exits the loop deliberately keeps ADVISORY: the descriptor fields are stamped for
+# Desktop/TUI, but ``failed``/``completed`` stay as the loop chose so an interactive surface
+# advises and cron stays silent (see ``agent/turn_failure_copy.py::_EXIT_REASON_FAILURES``).
+# A headless caller has no human to notice the advisory, so ``-z`` turns these into exit 2.
+_ADVISORY_FAILURE_EXIT_REASONS = ("empty_response_exhausted", "reasoning_budget_exhausted")
+
+
+def _advisory_failure_class(result: dict) -> Optional[str]:
+    """Failure class for a turn the loop left advisory (``None`` when the exit is not one)."""
+    reason = result.get("turn_exit_reason")
+    if not isinstance(reason, str):
+        return None
+    for prefix in _ADVISORY_FAILURE_EXIT_REASONS:
+        if reason.startswith(prefix):
+            return str(result.get("failure_reason") or "empty_response")
+    return None
+
 
 def _oneshot_exit_code(response: Optional[str], result: dict) -> int:
     """Map a finished ``-z`` turn onto its exit code: ``0`` only when the turn completed;
     ``130`` interrupted; ``2`` failed or stopped partway (``partial``, ``completed: False`` such
-    as the iteration budget); ``1`` a completed turn that produced no text at all.
+    as the iteration budget, or an exit the loop left advisory); ``1`` a completed turn that
+    produced no text at all.
 
     The outcome is judged from the result, not from whether text was printed: a partial or
     failed turn usually leaves an explanation on stdout, and exiting 0 for it made scripts treat
@@ -101,6 +119,8 @@ def _oneshot_exit_code(response: Optional[str], result: dict) -> int:
     if result.get("interrupted"):
         return _INTERRUPTED_EXIT_CODE
     if result.get("failed") or result.get("partial") or result.get("completed") is False:
+        return 2
+    if _advisory_failure_class(result) is not None:
         return 2
     if not (response or "").strip():
         return 1
@@ -222,12 +242,17 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         return
     try:
         report = {key: result.get(key) for key in _USAGE_KEYS}
-        report["failed"] = bool(result.get("failed")) or failure is not None
+        advisory = _advisory_failure_class(result)
+        report["failed"] = bool(result.get("failed")) or failure is not None or advisory is not None
         report["service_tier"] = result.get("service_tier")
         if isinstance(result.get("auxiliary_usage"), dict):
             _auxiliary_report(report, result["auxiliary_usage"])
-        if failure is not None:
-            report["failure"] = failure
+        # Say WHY, so a caller's record is not a bare ``failed: true`` — and say it as the
+        # machine-readable failure CLASS when the turn has one. The exception/error text is the
+        # fallback for a run that died before it could classify itself.
+        failure_class = result.get("failure_reason") or advisory or failure
+        if failure_class:
+            report["failure"] = str(failure_class)
         out = Path(path).expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

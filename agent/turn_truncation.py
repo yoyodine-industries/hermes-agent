@@ -1,10 +1,11 @@
 """Truncation recovery (``finish_reason == "length"``) for the conversation turn loop.
 
 Handles thinking-budget exhaustion, repetition-dominated truncation, content-filter stream
-stalls escalated to the fallback chain, text continuation nudges (up to 4, with the ceiling
-exit that drops the fragment trail), truncated tool-call retries with max_tokens boosts, and
-the final roll-back. Nothing here imports ``agent.conversation_loop`` at module level
-(cycle); loop-internal helpers are imported lazily so tests patching them keep working.
+stalls escalated to the fallback chain, text continuation nudges (up to 4 — one for a
+reasoning-only truncation, where four more cannot produce text — with the ceiling exit that
+drops the fragment trail), truncated tool-call retries with max_tokens boosts, and the final
+roll-back. Nothing here imports ``agent.conversation_loop`` at module level (cycle);
+loop-internal helpers are imported lazily so tests patching them keep working.
 """
 
 from __future__ import annotations
@@ -216,6 +217,9 @@ class _Trunc(TruncationVerdict):
     action: str = "fallthrough"
     result: Optional[dict[str, Any]] = None
     window_filled: Optional[tuple[int, int]] = None  # (prompt_tokens, context_length)
+    # No visible text, and the budget went to a separate reasoning channel: one
+    # reasoning-off continuation may still recover, four cannot.
+    reasoning_only: bool = False
 
     def done(self, action: str, result: Optional[dict[str, Any]] = None) -> TruncationVerdict:
         self.action, self.result = action, result
@@ -260,6 +264,45 @@ def _abort_reason(agent: Any, content: Any, has_tool_calls: bool) -> Optional[tu
     if visible and is_repetition_dominated(visible):
         return _REPETITION_DOMINATED
     return None
+
+
+def _reasoning_token_count(agent: Any, response: Any) -> int:
+    """``reasoning_tokens`` from this response's usage (0 when the provider reports none)."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return 0
+    try:
+        canonical = normalize_usage(usage, provider=agent.provider, api_mode=agent.api_mode)
+    except Exception:  # a malformed usage body must never change the truncation verdict
+        logger.debug("unreadable usage on a truncated response", exc_info=True)
+        return 0
+    return int(getattr(canonical, "reasoning_tokens", 0) or 0)
+
+
+def _reasoning_only_truncation(agent: Any, response: Any, interim: Any) -> bool:
+    """``True`` when a length-truncated response has NO visible text because the output
+    budget went to a separate reasoning channel (the API arm of a thinking model).
+
+    Detected from evidence, never from ``<think>`` tags: that arm returns
+    ``content=""`` with the reasoning in its own field, so a tag search matches nothing
+    and the response is otherwise indistinguishable from an ordinary cap truncation.
+    Evidence is a non-zero ``reasoning_tokens`` in the usage, or a non-empty reasoning
+    field on the normalised message. A ``content`` that does carry visible text is an
+    ordinary partial answer, and a stream stub is a dropped connection, not a cap hit.
+    """
+    if interim is None or getattr(interim, "tool_calls", None):
+        return False
+    content = getattr(interim, "content", None)
+    if isinstance(content, str) and agent._strip_think_blocks(content).strip():
+        return False
+    try:
+        reasoning = agent._extract_reasoning(interim) or ""
+    except Exception:  # never let evidence-gathering decide the verdict
+        logger.debug("unreadable reasoning field on a truncated response", exc_info=True)
+        reasoning = ""
+    if isinstance(reasoning, str) and reasoning.strip():
+        return True
+    return _reasoning_token_count(agent, response) > 0
 
 
 def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[TruncationVerdict]:
@@ -324,7 +367,11 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         st.truncated_response_parts.append((_interim_content, st.is_stub))
 
     filled = st.window_filled
-    if n < 4 and filled is None:
+    # One reasoning-off continuation is a real recovery for the reasoning-only shape; three
+    # more would be three re-billed full prompts that cannot produce text when the cap and the
+    # thinking length are the same order.
+    continue_limit = 2 if st.reasoning_only else 4
+    if n < continue_limit and filled is None:
         _dropped_tools = getattr(st.response, "_dropped_tool_names", None)
         if st.is_stub and _dropped_tools:
             agent._vprint(
@@ -364,9 +411,18 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
             f"{partial_response}\n\n{notice}" if partial_response else notice,
             f"Prompt used {filled[0]} of {filled[1]} context tokens; no room to answer",
         )
+    if st.reasoning_only and not partial_response:
+        # The banner stays as user copy; the VERDICT is a failure, so a headless caller
+        # cannot take it as the answer (a pipeline has no human to notice).
+        return st.end_turn(
+            _CEILING_NO_TEXT,
+            "No visible answer: the response was reasoning-only and the output cap cut it",
+            failed=True,
+            failure=("empty_response", False),
+        )
     return st.end_turn(
         partial_response or _CEILING_NO_TEXT,
-        "Response remained truncated after 4 continuation attempts",
+        f"Response remained truncated after {n} continuation attempts",
     )
 
 
@@ -521,6 +577,16 @@ def recover_from_truncation(
         line, user_response, error = abort
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
         return st.end_turn(user_response, error)
+
+    # A separate-reasoning-field thinking model answers with content="" — indistinguishable
+    # from an ordinary cap truncation by content alone, so classify it from the evidence.
+    st.reasoning_only = not st.is_stub and _reasoning_only_truncation(agent, response, _trunc_msg)
+    if st.reasoning_only:
+        agent._vprint(
+            f"{agent.log_prefix}💭 No visible text — the output budget went to the reasoning "
+            "channel; allowing one reasoning-off continuation.",
+            diagnostic=True,
+        )
 
     if agent.api_mode in _CONTINUABLE_MODES:
         cf = _content_filter_fallback(st, _retry)
