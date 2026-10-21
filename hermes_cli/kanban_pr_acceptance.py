@@ -23,9 +23,27 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
         return "local-only"
+    # ``landed`` is the deploy-proof contract (hermes_cli/kanban_proof_gate.py): the card
+    # carries a deployed unit and may only close on a run/probe dated AFTER its landing.
+    if isinstance(value, str) and value.strip().lower() == "landed":
+        return "landed"
     if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
-        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+        raise ValueError(
+            "completion_contract must be local-only, landed, OWNER/REPO, or an exact GitHub PR URL")
     return value
+
+
+def needs_repository_checks(value: str | None) -> bool:
+    """True when the contract is a repository claim rather than the local run.
+
+    A repository that declares no required checks cannot be WAITED on, but it can
+    still be CLOSED: ``collect_acceptance`` treats the PR's MERGED state as the
+    evidence (ruling of 2026-10-18, card ``t_9082c751``), so such a contract is
+    satisfiable and never parks the card. ``landed`` is NOT a repository check: its
+    fence is the deploy-proof gate, so routing it into the GitHub path would park
+    every proof-contract card as unsatisfiable.
+    """
+    return validate_contract(value) not in ("local-only", "landed")
 
 
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
@@ -107,7 +125,7 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
 def collect_acceptance(contract: str, published_pr: str | None,
                        assignee: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
-               "pr_url": published_pr, "checks": [],
+               "pr_url": published_pr, "published_pr": published_pr, "checks": [],
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
@@ -121,7 +139,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
+        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state mergeCommit{{oid}}\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
         if repository is None:
             # A private repo the login cannot read resolves to null, not an error.
@@ -142,7 +160,25 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+            # A repository that declares no required checks cannot be WAITED on, and refusing
+            # its PR contract outright left a published card with no legal contract at all:
+            # `local-only` contradicts its own publication, and the PR contract was refused
+            # here (ruling of 2026-10-18, card ``t_9082c751``). MERGE STATE is the evidence.
+            if pr["state"] == "MERGED":
+                receipt["classification"] = "success"
+                receipt["ok"] = True
+                merge_sha = (pr.get("mergeCommit") or {}).get("oid")
+                if merge_sha:
+                    receipt["merge_sha"] = merge_sha
+                receipt["detail"] = (
+                    f"{repo}#{number} is MERGED (head {sha}); the repository declares no required "
+                    "checks, so merge state is this contract's acceptance evidence.")
+                return receipt
+            receipt["classification"] = "pending"
+            receipt["detail"] = (
+                f"{repo}#{number} is OPEN at {sha} and the repository declares no required checks, "
+                f"so the PR's MERGED state is this contract's acceptance evidence: merge the PR, "
+                f"then retry completion. Nothing is missing from the card.")
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
