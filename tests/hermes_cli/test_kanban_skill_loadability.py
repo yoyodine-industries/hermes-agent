@@ -22,6 +22,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_gate_invariants as gates
 
 
 @pytest.fixture
@@ -76,7 +77,7 @@ def _task(conn, tid):
 def test_create_task_refuses_skill_the_assignee_profile_cannot_load(kanban_home, profile_skills):
     """A name no worker for that profile can load is refused, with the closest name."""
     with kbc.connect_closing() as conn:
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(gates.SkillsRefused) as excinfo:
             kb.create_task(conn, title="typo", assignee="demo", skills=["demo-skil"])
         message = str(excinfo.value)
         assert "demo-skil" in message
@@ -88,7 +89,7 @@ def test_create_task_refuses_skill_the_assignee_profile_cannot_load(kanban_home,
 def test_create_task_skill_check_is_scoped_to_the_assignee_profile(kanban_home, profile_skills):
     """``other-skill`` is registered — but for another profile, so `demo`'s worker can't load it."""
     with kbc.connect_closing() as conn:
-        with pytest.raises(ValueError):
+        with pytest.raises(gates.SkillsRefused):
             kb.create_task(conn, title="wrong profile", assignee="demo", skills=["other-skill"])
         tid = kb.create_task(conn, title="right profile", assignee="other", skills=["other-skill"])
         task = kb.get_task(conn, tid)
@@ -101,7 +102,7 @@ def test_create_task_refuses_disabled_skill(kanban_home, profile_skills):
     (profile_skills["demo"] / "config.yaml").write_text(
         "skills:\n  disabled: [demo-skill]\n", encoding="utf-8")
     with kbc.connect_closing() as conn:
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(gates.SkillsRefused) as excinfo:
             kb.create_task(conn, title="disabled", assignee="demo", skills=["demo-skill"])
     assert "disabled" in str(excinfo.value).lower()
 
@@ -123,7 +124,7 @@ def test_create_task_skill_check_skips_when_no_profile_is_resolvable(kanban_home
         unassigned = kb.get_task(conn, kb.create_task(conn, title="unassigned", skills=["nope"]))
         assert unassigned is not None
         assert unassigned.skills == ["nope"]
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(gates.AssigneeRefused) as excinfo:
             kb.assign_task(conn, unassigned.id, "ghost")
         assert getattr(excinfo.value, "invariant", None) == "assignee", (
             "an unresolvable assignee is the ASSIGNEE verdict, never a skill verdict")
@@ -150,7 +151,7 @@ def test_assign_task_refuses_skill_the_target_profile_cannot_load(kanban_home, p
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="typo", skills=["demo-skil"])
         before = _task(conn, tid)
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(gates.SkillsRefused) as excinfo:
             kb.assign_task(conn, tid, "demo")
         message = str(excinfo.value)
         assert "demo-skil" in message
@@ -167,7 +168,7 @@ def test_assign_task_judges_skills_against_the_profile_being_attached(kanban_hom
     the card to a worker that cannot load it, so that reassign is refused too."""
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="cross profile", assignee="other", skills=["other-skill"])
-        with pytest.raises(ValueError):
+        with pytest.raises(gates.SkillsRefused):
             kb.assign_task(conn, tid, "demo")
         assert _task(conn, tid).assignee == "other", "the refused reassign keeps the owner"
         assert kb.assign_task(conn, tid, "other") is True
@@ -220,7 +221,7 @@ def test_assign_task_refuses_a_non_terminal_card_with_the_same_pair(kanban_home,
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="open", skills=["other-skill"])
         assert _task(conn, tid).status == "ready"
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(gates.SkillsRefused) as excinfo:
             kb.assign_task(conn, tid, "demo")
         assert "other-skill" in str(excinfo.value)
         assert _task(conn, tid).assignee is None
@@ -287,3 +288,101 @@ def test_default_assignee_applies_when_the_default_can_load_the_skills(kanban_ho
         assert kbd._apply_default_assignee(conn, plain, "demo", dry_run=False) is True
         assert _task(conn, loadable).assignee == "demo"
         assert _task(conn, plain).assignee == "demo"
+
+
+# ---------------------------------------------------------------------------
+# The verdict is a NAME: ``SkillsRefused``, not a bare ``ValueError``
+#
+# The pair (assignee, skills) is the same hazard the assignee invariant exists for — a card
+# handed to a worker that exits on ``Unknown skill(s)`` before its first turn strands exactly
+# like one handed to a handle that resolves nowhere — so it is refused by the same FAMILY. It
+# was not: the raise was a plain ``ValueError``, which made each seam guess. The bulk sweep's
+# assign arm recorded it only for as long as it happened to catch ``ValueError``, and that
+# same catch laundered a genuine bug into an ``ok=False`` row; the dashboard answered bare
+# prose where every other gate names its invariant. Naming the class is the whole fix: the
+# message is unchanged, the status codes are unchanged, and the seams can now tell "a gate
+# refused this row" from "something broke here" without owning a private copy of the rule.
+# ---------------------------------------------------------------------------
+
+
+def test_create_refusal_is_a_named_gate_verdict(kanban_home, profile_skills):
+    """The create door raises ``SkillsRefused``: a ``GateRefused``, still a ``ValueError``."""
+    with kbc.connect_closing() as conn:
+        with pytest.raises(gates.SkillsRefused) as excinfo:
+            kb.create_task(conn, title="typo", assignee="demo", skills=["demo-skil"])
+    exc = excinfo.value
+    assert type(exc) is gates.SkillsRefused, (
+        "the door must raise the family, not a bare ValueError the seams have to re-guess")
+    assert isinstance(exc, gates.GateRefused) and isinstance(exc, ValueError), (
+        "still a ValueError: the CLI funnels ValueError as a validation refusal (rc 2)")
+    assert exc.invariant == "skills"
+    assert exc.task_id is None, "a refused create wrote no card, so there is no id to name"
+    assert exc.facts["where"] == "kanban_create"
+    assert exc.facts["assignee"] == "demo"
+    assert exc.facts["skills"] == ["demo-skil"]
+    assert exc.facts["problems"], "the per-name records travel with the refusal"
+
+
+def test_assign_refusal_is_a_named_gate_verdict_carrying_the_card(kanban_home, profile_skills):
+    """The assign door names the card it refused, and the seam it was judged at."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="typo", skills=["demo-skil"])
+        with pytest.raises(gates.SkillsRefused) as excinfo:
+            kb.assign_task(conn, tid, "demo")
+    exc = excinfo.value
+    assert exc.invariant == "skills"
+    assert exc.task_id == tid, "the assign door names the card it refused"
+    assert exc.facts["where"] == "kanban_assign"
+    assert exc.facts["assignee"] == "demo"
+    assert exc.facts["skills"] == ["demo-skil"]
+
+
+def test_the_refusal_message_is_unchanged_by_the_name(kanban_home, profile_skills):
+    """Naming the class must not change a byte of the prose.
+
+    The message is the operator's remedy (``hermes -p <profile> skills list``, the closest
+    registered name): consumers, docs and humans point at that text, so the class is the only
+    new information here.
+    """
+    with kbc.connect_closing() as conn:
+        with pytest.raises(gates.SkillsRefused) as excinfo:
+            kb.create_task(conn, title="typo", assignee="demo",
+                           skills=["demo-skil", "nope-at-all"])
+    problems = kb._unloadable_task_skills(["demo-skil", "nope-at-all"], "demo")
+    assert str(excinfo.value) == kb._unloadable_skills_message(problems, "demo")
+
+
+def test_request_review_does_not_launder_a_plain_valueerror(
+    kanban_home, profile_skills, monkeypatch,
+):
+    """The reviewer check's catch is the NAMED verdict, not ``ValueError``.
+
+    A plain ``ValueError`` out of that one call is a bug in the check, not a refusal, so it
+    has to reach the caller instead of being returned as a tidy ``(False, reason)`` — the
+    same laundering the bulk sweep's narrowed catch exists to prevent.
+    """
+    def _broken(skills, assignee, **kwargs):
+        raise ValueError("the skill check itself is broken")
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="reviewer bug", assignee="demo", skills=["demo-skill"])
+        kb.claim_task(conn, tid)
+        run_id = _task(conn, tid).current_run_id
+        assert run_id is not None
+        monkeypatch.setattr(kb, "_refuse_unloadable_skills", _broken)
+        with pytest.raises(ValueError, match="the skill check itself is broken"):
+            kb.request_review(conn, tid, reviewer="other", expected_run_id=run_id)
+
+
+def test_default_assignee_does_not_launder_a_plain_valueerror(
+    kanban_home, profile_skills, monkeypatch,
+):
+    """Same rule at the dispatcher fallback: it logs a REFUSAL, it does not swallow a bug."""
+    def _broken(skills, assignee, **kwargs):
+        raise ValueError("the skill check itself is broken")
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="dispatch bug", skills=["demo-skil"])
+        monkeypatch.setattr(kb, "_refuse_unloadable_skills", _broken)
+        with pytest.raises(ValueError, match="the skill check itself is broken"):
+            kbd._apply_default_assignee(conn, tid, "demo", dry_run=False)
