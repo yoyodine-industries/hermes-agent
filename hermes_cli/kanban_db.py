@@ -1848,6 +1848,8 @@ def create_task(
     completion_contract: Optional[str] = None,
     serves: Optional[str] = None,
     allow_off_board_ask: bool = False,
+    from_inbox: Optional[str] = None,
+    from_inbox_item: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1871,7 +1873,34 @@ def create_task(
     that order. ``allow_off_board_ask``: the deliberate escape hatch for a NEW
     ask filed off its register's board (the ASK-HOME rule) — admitted and
     recorded on the card rather than refused.
+    ``from_inbox``/``from_inbox_item``: the seat (``<domain>/<profile>``) whose inbox the
+    card is filed FROM, and the item's own words as that seat holds them. The
+    ``## Inbox item`` block is composed into the body HERE — the one moment every filing
+    surface reaches — and the filing is REFUSED (``kanban_inbox.InboxRefusal``, a
+    ``ValueError``) before any write when the seat file does not exist or no longer holds
+    the item. One gate, two doors: the CLI's ``--from-inbox`` and the ``kanban_create``
+    tool both land on this seam, so neither can launder provenance the other checks.
     """
+    # THE INBOX-PROVENANCE SEAM (DESIGN section 4 of the seat-directory convention; card
+    # t_2081f599 block 4). It runs FIRST, before every other seam that reads the body (the
+    # priority policy, the operator-ask stamp) and long before the INSERT, so a filing that
+    # cannot prove the seat holds the item leaves the board untouched — the drop is caught
+    # one step earlier than the nightly audit that would otherwise find it days later.
+    if from_inbox or from_inbox_item:
+        from hermes_cli.kanban_inbox import InboxRefusal, with_inbox_provenance
+
+        if not from_inbox:
+            raise InboxRefusal(
+                "from_inbox_item needs from_inbox: provenance names the SEAT that holds the "
+                "item (--from-inbox <domain>/<profile>)"
+            )
+        if not from_inbox_item:
+            raise InboxRefusal(
+                "from_inbox needs from_inbox_item: the item's own words are the proof the "
+                "seat holds it (--from-inbox-item \"<the item as the seat writes it>\")"
+            )
+        body = with_inbox_provenance(body, from_inbox, from_inbox_item)
+
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import needs_repository_checks, validate_contract
     from hermes_cli.kanban_register import (

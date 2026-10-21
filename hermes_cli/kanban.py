@@ -448,33 +448,45 @@ def _cmd_create(args: argparse.Namespace) -> int:
         source_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                         if is_dispatcher_owned_worker_context() else None))
     from hermes_cli.profiles import list_profile_names
-    with kbc.connect_closing(board=fired_board) as conn:
-        task_id, outcome = kb.create_task_reported(
-            conn, title=args.title, body=body, assignee=args.assignee,
-            # The card's OWN board, not the ambient one: the priority policy, the
-            # board floor and every board-scoped read below must see the board the
-            # card actually lands on (a policy run against the ambient board computed
-            # a value the destination board's floor then refused).
-            board=fired_board,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
-            project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
-            parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries, model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            completion_contract=getattr(args, "completion_contract", None),
-            initial_status=getattr(args, "initial_status", "running"),
-            serves=getattr(args, "serves", None),
-            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
-                             if is_dispatcher_owned_worker_context() else None),
-            # The receipt's dead-assignee probe reads THIS process's live profiles.
-            profiles=list_profile_names(),
-        )
-        task = kb.get_task(conn, task_id)
+    from hermes_cli.kanban_inbox import InboxRefusal
+    try:
+        with kbc.connect_closing(board=fired_board) as conn:
+            task_id, outcome = kb.create_task_reported(
+                conn, title=args.title, body=body, assignee=args.assignee,
+                # The card's OWN board, not the ambient one: the priority policy, the
+                # board floor and every board-scoped read below must see the board the
+                # card actually lands on (a policy run against the ambient board computed
+                # a value the destination board's floor then refused).
+                board=fired_board,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+                project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+                parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries, model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                completion_contract=getattr(args, "completion_contract", None),
+                initial_status=getattr(args, "initial_status", "running"),
+                serves=getattr(args, "serves", None),
+                # Provenance is GATED in the kernel, not composed here: `create_task` is the
+                # one moment every filing surface reaches, so the CLI and the kanban_create
+                # tool cannot disagree about what counts as proof that the seat holds the
+                # item. A refusal arrives as InboxRefusal before any row exists.
+                from_inbox=getattr(args, "from_inbox", None),
+                from_inbox_item=getattr(args, "from_inbox_item", None),
+                creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                 if is_dispatcher_owned_worker_context() else None),
+                # The receipt's dead-assignee probe reads THIS process's live profiles.
+                profiles=list_profile_names(),
+            )
+            task = kb.get_task(conn, task_id)
+    except InboxRefusal as exc:
+        # A usage refusal, not a board fault: rc 2 so a shell can tell "the provenance could
+        # not be proved" from "the card said no", and nothing was written.
+        return _err(f"kanban: --from-inbox: {exc}", 2)
     if getattr(args, "json", False):
         _print_json({**_task_to_dict(task), **kb.receipt_fields(outcome)})
     else:

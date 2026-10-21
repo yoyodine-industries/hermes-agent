@@ -236,6 +236,14 @@ _SPECS = [
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
                   "SIGKILLs) the worker and re-queues the task."),
         _arg("--created-by", default="user", help="Author name recorded on the task (default: user)"),
+        _arg("--from-inbox", metavar="<domain>/<profile>",
+             help="File this card FROM a seat's inbox: writes the `## Inbox item` block "
+                  "(the seat and the item's own words) into the body, so the item->card "
+                  "linkage stays checkable after the item is struck. REFUSES when the "
+                  "seat's TASKS.md does not exist or does not hold the item. Needs "
+                  "--from-inbox-item."),
+        _arg("--from-inbox-item", metavar="TEXT",
+             help="The inbox item's own words, verbatim as filed (required with --from-inbox)."),
         _arg("--skill", action="append", default=[], dest="skills",
              help="Skill to force-load into the worker (repeatable). The kanban "
                   "lifecycle is already injected automatically. Example: --skill "
