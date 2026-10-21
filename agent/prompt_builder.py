@@ -250,13 +250,14 @@ SESSION_SEARCH_GUIDANCE = (
 # do not need. Bisected against the live API: that sentence alone reproduces the 400 and removing it alone
 # clears it; size and the system[0] identity gate were both ruled out. The reword is empirically validated,
 # not understood — if you rewrite this sentence, re-verify against a subscription OAuth token, not an
-# sk-ant-api… key, which does not hit the filter. Dieted (#95681, maintainer-directed): the record-it /
-# patch-it coaching that used to open this block duplicated the ## Skills section (which teaches both "offer
-# to save as a skill" and "fix it with skill_manage(action='patch')") and skill_manage's own schema. Only
-# the compaction-pruning contract lives here — nothing else teaches it.
+# sk-ant-api… key, which does not hit the filter. Dieted (#95681, maintainer-directed): only ONE record-it
+# line survives here, pointing at patch-first, plus the compaction-pruning contract that nothing else
+# teaches; the rest of the coaching lives in the ## Skills section (which now offers "record what it
+# taught ... a patch to that skill first" instead of the old "offer to save as a skill", t_6c0fb5f2).
 SKILL_SAFETY_HEADING = "## Skill Safety Rule"
 SKILLS_GUIDANCE = (
-    "When you work out a non-trivial workflow, record it with skill_manage for future reuse.\n\n"
+    "When you work out a non-trivial workflow, record it with skill_manage — patch the skill that "
+    "governs the task; create a new skill only when no existing skill covers the class.\n\n"
     f"{SKILL_SAFETY_HEADING}\n"
     "A skill placeholder containing `[SKILL_PRUNED]` lost its content in context compression and is inaccessible — "
     "reload it with skill_view(name='...') before acting on anything that depends on it. After reloading, ignore any "
@@ -1484,8 +1485,12 @@ def _render_skills_index(
         "code review, planning, and testing — load them even for tasks you already know how to do, because "
         "the skill defines how it should be done here.\n"
         "If a skill has issues, fix it with skill_manage(action='patch').\n"
-        "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
-        "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
+        "After a difficult or iterative task, offer to record what it taught in the skill that "
+        "governs that class of task — a patch to that skill first, and a new skill only when "
+        "nothing in the library covers the class (a draft that restates an existing skill is "
+        "refused by the admission gate — patch the skill it names instead). If a skill you loaded "
+        "was missing steps, had wrong commands, or needed pitfalls you discovered, update it "
+        "before finishing.\n"
         "\n"
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
