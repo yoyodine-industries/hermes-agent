@@ -1236,7 +1236,7 @@ def _handle_record_landing_verdict(args: dict, **kw) -> str:
     result = args.get("result")
     result = _redact(result) if isinstance(result, str) and result.strip() else None
     board = args.get("board")
-    with _board(board) as (kb, conn):
+    with _board(board) as (_kb, conn):
         receipt = record_landing_verdict(
             conn, target, verdict, reason,
             caller_task_id=caller,
@@ -1388,6 +1388,7 @@ def _handle_create(args: dict, **kw) -> str:
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     from hermes_cli import kanban_db as _kb_board
+    from hermes_cli.profiles import list_profile_names
     self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                 if _is_dispatcher_owned_worker() else None)
     # A card fired from another card lands on the SAME board as the card that fired
@@ -1412,7 +1413,7 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
-        new_tid = kb.create_task(
+        new_tid, outcome = kb.create_task_reported(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
@@ -1435,11 +1436,16 @@ def _handle_create(args: dict, **kw) -> str:
             # Escape hatch for the ASK-HOME rule: a NEW ask filed off its register's board
             # is refused unless the caller opts in deliberately (see kanban_register).
             allow_off_board_ask=bool(args.get("allow_off_board_ask")),
-            created_by=_persisted_identity(), session_id=session_id)
+            created_by=_persisted_identity(), session_id=session_id,
+            # The receipt's dead-assignee probe needs the live profiles; injected at the
+            # door (this process knows them) rather than guessed inside the kernel.
+            profiles=list_profile_names())
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
-        gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
-        return _ok(task_id=new_tid, **landed, **gate,
+        # gated/gated_by keep their shape, and a create with no parents answers exactly what
+        # it always did; with parents, parents_state/standing/warning/board_dispatch come from
+        # the SAME receipt the link door reports, so a card filed behind a parent that will
+        # never move is visible in the answer that created it, not after a second lookup.
+        return _ok(task_id=new_tid, **landed, **kb.receipt_fields(outcome),
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 
@@ -1564,17 +1570,29 @@ def _handle_unblock(args: dict, **kw) -> str:
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links/running
     children → ValueError). A worker linking its OWN running card proves ownership
-    with its run id so the dependency-block handoff still works."""
+    with its run id so the dependency-block handoff still works.
+
+    The receipt names the new dependency set's PROMOTION state: ``parents`` (per-edge
+    code/text/self_moves), ``standing`` (the ids that will not move on their own) and
+    ``warning`` — a link into a parent nobody will finish is a silent park otherwise.
+    """
     _reject_delegated_child_mutation("kanban_link")
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
+    from hermes_cli.profiles import list_profile_names
+
     with _board(args.get("board")) as (kb, conn):
-        gated = kb.link_tasks(
+        outcome = kb.link_tasks_reported(
             conn, parent_id=parent_id, child_id=child_id,
-            expected_child_run_id=_worker_run_id(str(child_id)))
-        return _ok(parent_id=parent_id, child_id=child_id, gated=gated,
-                   **({"gated_by": parent_id} if gated else {}))
+            expected_child_run_id=_worker_run_id(str(child_id)),
+            profiles=list_profile_names(), board=args.get("board"))
+        return _ok(parent_id=parent_id, child_id=child_id, gated=outcome.gated,
+                   **({"gated_by": parent_id} if outcome.gated else {}),
+                   parents=[{"id": p.id, "status": p.status, "code": p.code,
+                             "self_moves": p.self_moves} for p in outcome.parents],
+                   standing=outcome.standing, warning=outcome.warning,
+                   board_dispatch=outcome.board_dispatch)
 
 
 @_kanban_handler("kanban_close_sibling")

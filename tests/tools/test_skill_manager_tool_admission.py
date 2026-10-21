@@ -190,6 +190,69 @@ def test_a_bug_in_the_judge_fails_open_rather_than_stopping_all_learning(tmp_pat
         assert result["success"] is True, result
 
 
+# --- A fault is admitted, but never silently ---------------------------------------------
+#
+# Fail-open is the choice; an UNRECORDED fail-open is the defect. These pin the second half:
+# an admission the gate never judged must leave a row that says so, or the ledger of a broken
+# gate is byte-identical in meaning to the ledger of a gate that found nothing to refuse.
+
+def _faults_since(before):
+    return [e for e in _ledger()[before:] if e.get("disposition") == "fault"]
+
+
+def test_a_judge_fault_leaves_a_fault_row_naming_what_could_not_be_judged(tmp_path):
+    with _skills_root(tmp_path) as root:
+        _seed(root, "kanban-transitions", KANBAN)
+        before = len(_ledger())
+        # A healthy judge still REFUSES this draft: the fault path launders nothing.
+        refused = _create_skill("card-movement", RESTATEMENT)
+        assert refused["success"] is False
+        assert refused["refused_by"] == "admission"
+        with patch("tools.skill_admission.verdict_for_content", side_effect=RuntimeError("boom")):
+            result = _create_skill("card-movement", RESTATEMENT)
+        assert result["success"] is True, result
+        faults = _faults_since(before)
+        assert len(faults) == 1, faults
+        assert faults[0]["skill"] == "card-movement"
+        assert "RuntimeError" in faults[0]["reason"] and "boom" in faults[0]["reason"]
+        # A fault is not a refusal: it names no fold target, so no reader can fold into it.
+        assert faults[0]["existing_skill"] == ""
+        # ... and the refusal that a healthy judge wrote is still its own row, in the same ledger.
+        assert [e["disposition"] for e in _ledger()[before:]] == ["fold", "fault"]
+
+
+def test_a_support_file_judge_fault_leaves_a_fault_row_too(tmp_path):
+    with _skills_root(tmp_path) as root:
+        _seed(root, "kanban-transitions", KANBAN)
+        own = _seed(root, "delivery-windows", DELIVERY)
+        before = len(_ledger())
+        with patch("tools.skill_admission.verdict_for_support_file",
+                   side_effect=RuntimeError("boom")):
+            result = _write_file("delivery-windows", "references/broadcast.md",
+                                 "# Broadcast legs\n\nEach leg is announced once, and a failed leg "
+                                 "leaves the window armed so the next pass resumes it.\n")
+        assert result["success"] is True, result
+        assert (own / "references" / "broadcast.md").exists()
+        faults = _faults_since(before)
+        assert [f["skill"] for f in faults] == ["delivery-windows/references/broadcast.md"]
+
+
+def test_a_corpus_fallback_names_the_root_it_used_and_records_one_fault(tmp_path):
+    from tools.skill_manager_tool import _admission_corpus_roots
+
+    with _skills_root(tmp_path) as root:
+        before = len(_ledger())
+        with patch("agent.skill_utils.get_all_skills_dirs", side_effect=OSError("no roots")), \
+             patch("tools.skill_manager_tool._CORPUS_FALLBACK_RECORDED", False):
+            first = _admission_corpus_roots()
+            second = _admission_corpus_roots()
+        assert first == [root] and second == [root]
+        faults = [f for f in _faults_since(before) if f["skill"] == "admission-corpus"]
+        assert len(faults) == 1, faults
+        assert str(root) in faults[0]["reason"]
+        assert faults[0]["corpus"] == str(root)
+
+
 # --- New support files ------------------------------------------------------------------
 
 def test_a_new_reference_file_that_restates_another_skill_is_refused(tmp_path):
@@ -246,6 +309,20 @@ def test_a_genuinely_new_hub_bundle_installs(tmp_path):
         _seed(root, "kanban-transitions", KANBAN)
         bundle = _bundle(tmp_path, "delivery-windows", DELIVERY)
         _check_admission(root / "platform" / "delivery-windows", "delivery-windows", bundle)
+
+
+def test_a_hub_bundle_judge_fault_installs_and_leaves_a_fault_row(tmp_path):
+    from tools.skills_hub_install import _check_admission
+
+    with _skills_root(tmp_path) as root:
+        _seed(root, "kanban-transitions", KANBAN)
+        bundle = _bundle(tmp_path, "card-movement", RESTATEMENT)
+        before = len(_ledger())
+        with patch("tools.skill_admission.verdict_for_content", side_effect=RuntimeError("boom")):
+            _check_admission(root / "platform" / "card-movement", "card-movement", bundle)
+        faults = _faults_since(before)
+        assert [f["skill"] for f in faults] == ["card-movement"]
+        assert "RuntimeError" in faults[0]["reason"]
 
 
 def test_an_update_of_an_installed_skill_is_not_a_collision(tmp_path):

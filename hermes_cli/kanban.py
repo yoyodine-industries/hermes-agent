@@ -230,7 +230,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     # it. It was already an ESTATE write (tree_identity.ESTATE_MUTATING_ACTIONS); this closes the
     # delegated fence over it too. (Card t_36adf9a5)
     "set-contract",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "reopen", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -447,8 +447,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
         getattr(args, "board", None),
         source_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                         if is_dispatcher_owned_worker_context() else None))
+    from hermes_cli.profiles import list_profile_names
     with kbc.connect_closing(board=fired_board) as conn:
-        task_id = kb.create_task(
+        task_id, outcome = kb.create_task_reported(
             conn, title=args.title, body=body, assignee=args.assignee,
             # The card's OWN board, not the ambient one: the priority policy, the
             # board floor and every board-scoped read below must see the board the
@@ -470,12 +471,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
             serves=getattr(args, "serves", None),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
+            # The receipt's dead-assignee probe reads THIS process's live profiles.
+            profiles=list_profile_names(),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
-        _print_json(_task_to_dict(task))
+        _print_json({**_task_to_dict(task), **kb.receipt_fields(outcome)})
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        # Same words as `hermes kanban link`: a card FILED behind a parent nobody will finish
+        # is the same silent park, and stderr keeps `Created <id>` parsable on stdout.
+        if outcome.parents:
+            print(f"Parent state ({len(outcome.parents)} edge(s)):", file=sys.stderr)
+            for edge in outcome.parents:
+                print(f"  {edge.id}  {edge.code}  {edge.text}", file=sys.stderr)
+        if outcome.warning:
+            print(outcome.warning, file=sys.stderr)
         # One-line authoring advisory (card t_36adf9a5): a card born on a repo/PR/landed contract
         # is the one that can strand, and the door out of that declaration is `set-contract`.
         # Named HERE, at the moment the declaration is authored, so the operator never has to
@@ -888,24 +899,10 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
-    # A worker linking its own running card (dependency-block handoff) proves
-    # ownership with its run id; linking a foreign task never needs one.
-    expected_child_run_id = (
-        _worker_run_id_for(args.child_id)
-        if args.child_id == os.environ.get("HERMES_KANBAN_TASK") else None)
-    with kbc.connect_closing() as conn:
-        gated = kb.link_tasks(conn, args.parent_id, args.child_id,
-                              expected_child_run_id=expected_child_run_id)
-    print(f"Linked {args.parent_id} -> {args.child_id}")
-    if gated:
-        print(
-            f"Note: {args.child_id} was ready and is now todo — parent "
-            f"{args.parent_id} is not done yet. The ready -> running claim "
-            f"re-checks parents, so the child only runs after the parent "
-            f"completes; use `hermes kanban unlink {args.parent_id} {args.child_id}` "
-            f"to run it now."
-        )
-    return 0
+    """Delegate to :mod:`hermes_cli.kanban_link_cmd` (behaviour lives in the sibling)."""
+    from hermes_cli.kanban_link_cmd import cmd_link
+
+    return cmd_link(args)
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
@@ -1339,6 +1336,47 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+
+
+def _cmd_reopen(args: argparse.Namespace) -> int:
+    """THE operator REOPEN door: a finished card back to a live status, in one audited act.
+
+    ``done``/``archived`` only -- every other state has its own door (``unblock``,
+    ``reopen-review``) and the kernel refuses BY NAME rather than guessing. ``--to blocked``
+    is the parked landing: a card whose work is DONE must not go back in front of a worker;
+    ``--to todo`` restores a card without making it dispatchable; ``--to ready`` (the
+    default) re-gates to ``todo`` on its own while a parent is unfinished.
+
+    ``--reason`` is RECORDED but NOT required: the kernel does not demand it, and the
+    shell surface does not add a requirement the kernel does not have. The SDLC repair always
+    passes one (``REPAIR_REASON``), and a bare ``reopen <id>`` is a legal operator act whose
+    comment simply carries no reason.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban reopen is orchestrator-only; a worker must hand off its assigned "
+                    "task instead of reopening a finished card")
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        return _err("kanban reopen requires a task id", 2)
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    author = _profile_author()
+    dry_run = bool(getattr(args, "dry_run", False))
+    with kbc.connect_closing() as conn:
+        try:
+            ok, err, info = kb.reopen_task(
+                conn, task_id, actor=author, reason=reason or "",
+                dest_status=getattr(args, "to", None) or "ready",
+                block_kind=getattr(args, "block_kind", None), dry_run=dry_run)
+        except (ValueError, RuntimeError) as exc:
+            return _err(f"cannot reopen {task_id}: {exc}")
+    if not ok:
+        return _err(f"cannot reopen {task_id}: {err or 'refused'}")
+    if getattr(args, "json", False):
+        print(json.dumps({"id": task_id, **info}, sort_keys=True))
+    else:
+        print(f"{'Would reopen' if dry_run else 'Reopened'} {task_id}: "
+              f"{info.get('from_status')} -> {info.get('to_status')}")
+    return 0
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1859,7 +1897,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "set-contract": _cmd_set_contract, "retarget": _cmd_retarget,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "reopen": _cmd_reopen,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

@@ -144,6 +144,20 @@ class AdmissionRefused(ValueError):
     """A bundle the admission gate refused: refused for WHAT IT SAYS, not for a bad bundle."""
 
 
+def _record_admission_fault(subject: str, detail: str, corpus: str = "") -> None:
+    """Record a judge FAULT — an install that reached disk without being judged.
+
+    Best-effort like the refusal row, but loud when it fails: a fault that cannot be written is
+    exactly the silent failure the ledger exists to rule out.
+    """
+    try:
+        from tools.skill_usage import record_admission_fault
+        record_admission_fault(subject, detail=detail, corpus=corpus)
+    except Exception:
+        logger.warning("admission fault could not be recorded for %s: %s", subject, detail,
+                       exc_info=True)
+
+
 def _check_admission(install_dir: Path, skill_name: str, quarantine_path: Path) -> None:
     """Raise ValueError when the bundle restates a skill the agent already has.
 
@@ -156,11 +170,20 @@ def _check_admission(install_dir: Path, skill_name: str, quarantine_path: Path) 
 
     A bundle that restates ITSELF (an update of an already-installed skill) is not a
     collision: the corpus excludes the target directory, and same-name docs are skipped.
+
+    A fault in the judge fails OPEN here as it does at the pen — a hub install is the same
+    policy question, and a broken judge must not wall off the door — but it is written to the
+    admission ledger as a ``fault`` row, so an install that was never judged cannot be read as
+    an install that was judged and passed.
     """
     try:
         from tools.skill_admission import refusal_message, verdict_for_content
         from agent.skill_utils import get_all_skills_dirs
-    except Exception:
+    except Exception as e:
+        logger.warning("admission judge unavailable for hub bundle %r; installing it", skill_name,
+                       exc_info=True)
+        _record_admission_fault(skill_name, "judge import fault, installed: %s: %s"
+                                % (type(e).__name__, e))
         return
     skill_md = Path(quarantine_path) / "SKILL.md"
     try:
@@ -170,9 +193,12 @@ def _check_admission(install_dir: Path, skill_name: str, quarantine_path: Path) 
     roots = [Path(d) for d in get_all_skills_dirs()]
     try:
         verdict = verdict_for_content(skill_name, content, roots, exclude=[install_dir])
-    except Exception:
+    except Exception as e:
         logger.warning("admission gate could not judge hub bundle %r; installing it", skill_name,
                        exc_info=True)
+        _record_admission_fault(skill_name, "judge fault, installed: %s: %s"
+                                % (type(e).__name__, e),
+                                corpus=", ".join(str(r) for r in roots))
         return
     if verdict.get("disposition") not in ("fold", "reject"):
         return

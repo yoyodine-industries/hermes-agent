@@ -2191,6 +2191,21 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
+def create_task_reported(
+    conn: sqlite3.Connection, *, profiles: Optional[Iterable[str]] = None, **kwargs,
+) -> tuple[str, LinkOutcome]:
+    """Create a task through :func:`create_task`; return it with its dependency receipt.
+
+    The same single write path, so ``create_task`` keeps its id-shaped contract for callers
+    that only need one, and this door answers the question a FILER has — will this card run
+    by itself? ``profiles`` is the caller's live-profile list for the receipt's dead-assignee
+    probe (``None`` = not injected: skipped, never guessed); the board is the caller's own
+    ``board=``, never the ambient one.
+    """
+    task_id = create_task(conn, **kwargs)
+    return task_id, created_outcome(conn, task_id, profiles=profiles, board=kwargs.get("board"))
+
+
 def _board_meta_for(board: Optional[str]) -> dict:
     return read_board_metadata(board if board else get_current_board())
 
@@ -2829,81 +2844,13 @@ def link_tasks(
     rather than record a dependency that did not constrain the active run. The
     owning worker may link its own active run for a subsequent dependency-block
     handoff by supplying its trusted ``expected_child_run_id``.
+
+    The write lives in :mod:`hermes_cli.kanban_db_links` (``link_tasks_reported``, bound at
+    the tail import), the one path the receipt doors share; this wrapper keeps the boolean
+    contract.
     """
-    if parent_id == child_id:
-        raise ValueError("a task cannot depend on itself")
-    gated = False
-    with write_txn(conn):
-        missing = _missing_task_ids(conn, [parent_id, child_id])
-        if missing:
-            raise ValueError(f"unknown task(s): {', '.join(missing)}")
-        child = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?", (child_id,),
-        ).fetchone()
-        if child["status"] == "running" and (
-            expected_child_run_id is None
-            or child["current_run_id"] != expected_child_run_id
-        ):
-            raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
-        if _would_cycle(conn, parent_id, child_id):
-            raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
-        _link(conn, parent_id, child_id)
-        # If child was ready but parent is not yet terminal, demote child to todo
-        # (archived counts as terminal, matching _parents_satisfied/recompute_ready).
-        if _task_status(conn, parent_id) not in ("done", "archived"):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
-            )
-            gated = cur.rowcount == 1
-            if gated:
-                _append_event(
-                    conn,
-                    child_id,
-                    "dependency_wait",
-                    {"reason": "parent_not_done", "demoted": True, "parent": parent_id},
-                )
-        _append_event(
-            conn,
-            child_id,
-            "linked",
-            {"parent": parent_id, "child": child_id},
-        )
-        _inherit_notify_subs(conn, child_id, (parent_id,))
-    return gated
-
-
-def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
-    """True iff ``parent_id`` is already a descendant of ``child_id``."""
-    seen = set()
-    stack = [child_id]
-    while stack:
-        node = stack.pop()
-        if node == parent_id:
-            return True
-        if node in seen:
-            continue
-        seen.add(node)
-        rows = conn.execute(
-            "SELECT child_id FROM task_links WHERE parent_id = ?", (node,)
-        ).fetchall()
-        stack.extend(r["child_id"] for r in rows)
-    return False
-
-
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
-        )
-        removed = cur.rowcount > 0
-        if removed:
-            _append_event(conn, child_id, "unlinked", {"parent": parent_id, "child": child_id})
-    if removed:
-        # Re-gate the child now (as complete_task/unblock_task do) instead of
-        # leaving it in todo until the next tick.
-        recompute_ready(conn)
-    return removed
+    return link_tasks_reported(
+        conn, parent_id, child_id, expected_child_run_id=expected_child_run_id).gated
 
 
 def _linked_ids(conn: sqlite3.Connection, want: str, where: str, task_id: str) -> list[str]:
@@ -2913,9 +2860,6 @@ def _linked_ids(conn: sqlite3.Connection, want: str, where: str, task_id: str) -
     return [r[want] for r in rows]
 
 
-# Dependency edge removed — re-evaluate promotion eligibility for the child immediately. Matches the
-# contract of complete_task and unblock_task; without this the child stays stuck in todo until the next
-# dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return _linked_ids(conn, "parent_id", "child_id", task_id)
 
@@ -6854,6 +6798,147 @@ def promote_task(
     return True, None
 
 
+#: The statuses the operator's REOPEN door owns. A finished card is the ONLY state this verb
+#: is for: ``blocked``/``scheduled`` resume through :func:`unblock_task`, ``review`` through
+#: :func:`reopen_review_task`, and a live card needs no door at all. Anything else is refused
+#: BY NAME with the verb that owns its state, so a caller is routed rather than guessed at.
+_REOPENABLE_STATUSES = frozenset({"done", "archived"})
+
+#: The landings a reopen may target. ``ready`` is the ordinary one (and re-gates to ``todo``
+#: while a parent is unfinished); ``todo`` is the same landing asked for EXPLICITLY - the card
+#: must not be dispatchable yet regardless of its parent graph (the caller is parking work it
+#: knows is not ready to be picked up, e.g. a card whose parents are all closed but whose item
+#: has not been verified); ``blocked`` is the PARKED landing a caller uses when the card's WORK
+#: IS DONE and it must not go back in front of a worker -- the flow's repair of a hand-closed
+#: card. ``recompute_ready`` never promotes a blocked card, so the park is sticky.
+_REOPEN_DESTINATIONS = frozenset({"ready", "todo", "blocked"})
+
+
+def reopen_task(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: str = "",
+    dest_status: str = "ready", block_kind: Optional[str] = None,
+    dry_run: bool = False,
+) -> tuple[bool, Optional[str], dict]:
+    """Operator REOPEN: a ``done``/``archived`` card -> a LIVE status, in one audited act.
+
+    THE door out of a finished card. Before it existed the only writers that could undo a
+    completion were the dashboard's private ``_set_status_direct`` and forbidden raw SQL, so
+    every other actor -- the scheduled SDLC ``sync`` repair above all -- held a card it could
+    DETECT and not move.
+
+    ONE transaction does the whole act; NOTHING is written on a refusal:
+
+      1. the status is re-read INSIDE the write transaction and must still be
+         ``done``/``archived`` -- a card that moved in between is refused by name, never
+         flipped from a stale verdict;
+      2. a leaked run is reclaimed, keeping the ``current_run_id IS NULL <=> run terminal``
+         invariant every other status flip keeps;
+      3. ``completed_at``/``result``/the block counters/the failure breaker are cleared and
+         the card is landed per ``dest_status``: ``ready`` (``todo`` while a parent is
+         unfinished -- the same re-gate ``unblock`` uses), ``todo`` (landed as asked: it must
+         not be dispatchable yet) or ``blocked``;
+      4. every ``ready``/``review``/``running``/``done`` DESCENDANT is retracted to ``todo``
+         and re-gated by :func:`invalidate_descendants_for_parent_reopen` -- a reopened
+         ancestor means its descendants' completions no longer rest on it;
+      5. a ``reopened`` audit event, the legacy ``status`` event the live feed and the sweeps
+         read, and a comment carry the actor and the reason.
+
+    ``dest_status="blocked"`` is the PARKED landing, and it is deliberate: a caller that
+    reopens a card whose WORK IS DONE (the flow's repair of a hand-closed card) must not put
+    it back in front of a worker. ``blocked`` is also sticky -- ``recompute_ready`` never
+    promotes a blocked card -- so the park survives every dispatch tick. ``block_kind`` names
+    why the card is parked (``external`` for a repair the flow owns).
+
+    ``reason`` is recorded verbatim and is NOT required by the kernel: the CLI collects it
+    when given, and the SDLC repair always passes one, but a bare ``reopen <id>`` is legal and
+    the comment then carries no reason. ``dry_run`` validates and writes NOTHING -- not even
+    an event. Returns ``(ok, why-not, info)`` where ``info`` is
+    ``{"from_status", "to_status"}`` on success and ``{}`` otherwise.
+    """
+    reason = (reason or "").strip()
+    actor = (actor or "").strip() or "operator"
+    dest_status = (dest_status or "ready").strip().lower()
+
+    status = _task_status(conn, task_id)
+    if status is None:
+        return False, f"task {task_id} not found", {}
+    if dest_status not in _REOPEN_DESTINATIONS:
+        return False, (
+            f"dest_status {dest_status!r} is not a reopen landing (one of "
+            f"{'/'.join(sorted(_REOPEN_DESTINATIONS))})"), {}
+    if status not in _REOPENABLE_STATUSES:
+        return False, (
+            f"task {task_id} is {status!r}; reopen only applies to a finished card "
+            f"('done'/'archived'). A 'blocked'/'scheduled' card resumes with `unblock`, a "
+            f"'review' card with `reopen-review`; a live card needs no door"), {}
+    if dry_run:
+        return True, None, {
+            "from_status": status,
+            "to_status": _reopen_landing(conn, task_id, dest_status),
+        }
+
+    terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    with write_txn(conn):
+        # The verdict is re-read INSIDE the write txn: a card that moved between the check
+        # above and here is refused by name rather than flipped from a stale read.
+        now = int(time.time())
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found", {}
+        if row["status"] not in _REOPENABLE_STATUSES:
+            return False, f"task {task_id} moved to {row['status']!r} during reopen", {}
+        prior = row["status"]
+        _reclaim_dangling_run(
+            conn, task_id, statuses=tuple(_REOPENABLE_STATUSES), now=now,
+            note="invariant recovery on reopen",
+        )
+        new_status = _reopen_landing(conn, task_id, dest_status)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, completed_at = NULL, result = NULL, "
+            "block_kind = ?, block_recurrences = 0, consecutive_failures = 0, "
+            "last_failure_error = NULL, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL, current_run_id = NULL, "
+            "due_at = NULL, due_window_policy = NULL "
+            "WHERE id = ? AND status IN ('done', 'archived')",
+            (new_status, (block_kind or "external") if new_status == "blocked" else None,
+             task_id),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed during reopen", {}
+        # Composed under THIS txn (`allow_nested`), so the flip and the retractions commit
+        # together; the worker kills are drained after commit (audit trail before death).
+        drain = invalidate_descendants_for_parent_reopen(conn, task_id, author=actor)
+        terminations = list(drain["terminations"])
+        _append_event(conn, task_id, "reopened", {
+            "actor": actor, "reason": reason, "prior_status": prior,
+            "status": new_status,
+        })
+        # The legacy event every live-feed consumer and sweep already reads.
+        _append_event(conn, task_id, "status", {
+            "status": new_status, "reason": "reopened",
+            "previous_status": prior,
+        })
+        if new_status == "blocked":
+            # The SAME event shape `block_task` writes: `_has_sticky_block` reads the newest
+            # 'blocked' event, so this is what makes the parked landing survive
+            # `recompute_ready` (a bare status write would be promoted back to ready in the
+            # same tick and the repair would re-dispatch a worker onto finished work).
+            _append_event(conn, task_id, "blocked", {
+                "kind": block_kind or "external",
+                "reason": reason or "reopened and parked by the flow",
+                "source": "reopen",
+            })
+        _insert_comment(
+            conn, task_id, actor,
+            f"REOPENED from '{prior}' to '{new_status}' by {actor}"
+            + (f": {reason}" if reason else ""), now,
+        )
+    for pid, claim_lock, started_at in terminations:
+        _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+    return True, None, {"from_status": prior, "to_status": new_status}
+
+
 def _reclaim_dangling_run(
     conn: sqlite3.Connection, task_id: str, *, statuses, now: int, note: str,
 ) -> None:
@@ -6876,6 +6961,18 @@ def _reclaim_dangling_run(
             """,
             (note, now, int(stale["current_run_id"])),
         )
+
+
+def _reopen_landing(conn: sqlite3.Connection, task_id: str, dest_status: str) -> str:
+    """The status a reopen lands on: the requested one, or the parent re-gate.
+
+    ``blocked`` and ``todo`` are landed AS ASKED (both are non-dispatchable, so neither can be
+    promoted back into a worker's queue by ``recompute_ready``); ``ready`` is re-gated to
+    ``todo`` while a parent is unfinished, exactly as ``unblock`` does.
+    """
+    if dest_status in ("blocked", "todo"):
+        return dest_status
+    return _landing_status_after_parents(conn, task_id)
 
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
@@ -7961,6 +8058,15 @@ from hermes_cli.kanban_db_boards import (
     read_board_metadata,
     remove_board,
     write_board_metadata,
+)
+from hermes_cli.kanban_db_links import (
+    LinkOutcome,
+    ParentEdgeState,
+    _would_cycle,
+    created_outcome,
+    link_tasks_reported,
+    receipt_fields,
+    unlink_tasks,
 )
 from hermes_cli.kanban_db_connect import (
     _INITIALIZED_PATHS,
