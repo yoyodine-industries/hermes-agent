@@ -29,8 +29,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, ContextManager, Dict, Iterator, Optional, Tuple, cast
 
 from tools import bot_delivery_queue as delivery_queue
 from tools import bot_delivery_strand_alert as strand_alert
@@ -93,6 +94,44 @@ def _finalize_reply(payload: Any) -> str:
         return str(payload.get("final_response", "") or "")
 
 
+@contextmanager
+def target_profile_scope(adapter: Any, record: dict[str, Any]) -> Iterator[None]:
+    """Run a DRAINED turn inside its target lane's own runtime scope.
+
+    A drained record has no live request behind it, so nothing has scoped the
+    turn: ``_api_request_profile`` is unset, and the ``_profile_scope(None)`` that
+    ``_run_agent`` applies for an unset profile enters the DEFAULT profile's scope
+    whenever multiplexing is active. The lane's own session id would then be
+    applied against the DEFAULT home's ``state.db``: the record still settles
+    ``delivered``, the lane's Bot Chat never sees the message, and the sender's
+    text is echoed into a fresh session in the default home (card t_8a7a47d7).
+
+    Set the request profile to the record's target lane for the turn -- and enter
+    that lane's scope, so every home-relative read in between (the session history
+    included) resolves to the lane that owns the record -- then restore both. The
+    target profile is the lane the record was admitted into, so scope and ``home``
+    agree by construction; ``"default"`` resolves back to the default home, so a
+    default-lane record is scoped exactly as before.
+    """
+    from gateway.platforms.api_server import _api_request_profile
+
+    profile = str(record.get("target_profile") or "")
+    enter_scope = getattr(adapter, "_profile_scope", None)
+    # An adapter without a scope (a test seam, a non-multiplex adapter) simply
+    # runs unscoped -- exactly what it did before this change.
+    scope: ContextManager[None] = (
+        cast(ContextManager[None], enter_scope(profile))
+        if callable(enter_scope)
+        else nullcontext()
+    )
+    token = _api_request_profile.set(profile)
+    try:
+        with scope:
+            yield
+    finally:
+        _api_request_profile.reset(token)
+
+
 async def run_record(
     adapter: Any,
     home: Path,
@@ -114,18 +153,24 @@ async def run_record(
     session_id = str(record.get("target_session_id") or "")
     if ctx is None:
         kwargs = delivery_run_kwargs(record)
+        # A drained record has no request behind it, so nothing scoped the turn to
+        # the lane that owns it (card t_8a7a47d7).
+        scope = target_profile_scope(adapter, record)
     else:
         kwargs = dict(ctx.get("run_kwargs") or {})
         kwargs["session_id"] = session_id
-    history = await adapter._conversation_history_for_session(session_id)
+        # The caller's own request already set the profile it was routed to.
+        scope = nullcontext()
     started = time.monotonic()
     log_delivery_event("turn_start", record, drained=ctx is None)
     try:
-        result, _usage = await adapter._run_agent(
-            conversation_history=history,
-            lease_wait_seconds=delivery_queue.lease_probe_seconds(),
-            **kwargs,
-        )
+        with scope:
+            history = await adapter._conversation_history_for_session(session_id)
+            result, _usage = await adapter._run_agent(
+                conversation_history=history,
+                lease_wait_seconds=delivery_queue.lease_probe_seconds(),
+                **kwargs,
+            )
     except Exception as exc:  # noqa: BLE001 - any turn failure settles the record
         logger.exception("[api_server] peer delivery turn failed: %s", delivery_id)
         error = str(exc) or exc.__class__.__name__
@@ -225,13 +270,19 @@ async def drain_under_lock(
 async def drain_once(
     adapter: Any, home: Path, *, budget_seconds: Optional[float] = None
 ) -> int:
-    """Run queued deliveries for every profile in ``home`` whose slot is free.
+    """Run queued deliveries for EVERY lane whose slot is free.
 
     Returns the number of turns actually run. A slot held by any other turn (a
     desktop session, a card worker) is skipped, never fought for -- the holder
     drains the queue when it releases.
+
+    ``home`` only locates the root: the drainer enumerates every lane's own home,
+    because a peer delivery is admitted into its TARGET lane
+    (``profiles/<lane>/runtime/bot_delivery``), never the default home. Draining
+    only ``home`` is what left 20 records sitting three days with ``attempts=0``
+    while this sweep logged ``actions=0`` (card t_8a7a47d7).
     """
-    from tools.bot_mode_probe import _hermes_root
+    from tools.bot_mode_probe import _delivery_homes, _hermes_root
     from tools.bot_relay import TurnBusyError, acquire_turn_lock
 
     root = _hermes_root(home)
@@ -254,24 +305,79 @@ async def drain_once(
         except Exception:  # noqa: BLE001 - an unreadable gate must not stop the drainer
             return True
 
-    for profile in delivery_queue.queued_target_profiles(home):
-        while time.monotonic() < deadline:
-            if not _gate_has_room():
-                log_delivery_event("drain_deferred", None, target=profile, reason="agent_cap")
-                return drained
-            try:
-                with acquire_turn_lock(root, profile, timeout_seconds=0):
-                    record = delivery_queue.claim_next(
-                        home, target_profile=profile, lease_ok=True
-                    )
-                    if record is None:
-                        break
-                    settled, _reply = await run_record(adapter, home, record)
-                    drained += 1
-                    log_delivery_event("drained", settled, drained=drained)
-            except TurnBusyError:
-                log_delivery_event("drain_deferred", None, target=profile, reason="slot_held")
-                break
+    for _lane, lane_home in _delivery_homes(root):
+        # Asking a home that never carried a delivery would CREATE its spool and
+        # chmod it; a drain must never leave queue state behind in a profile that
+        # does not use Bot Mode.
+        if not delivery_queue.has_spool(lane_home):
+            continue
+        for profile in delivery_queue.queued_target_profiles(lane_home):
+            while time.monotonic() < deadline:
+                if not _gate_has_room():
+                    log_delivery_event("drain_deferred", None, target=profile, reason="agent_cap")
+                    return drained
+                try:
+                    with acquire_turn_lock(root, profile, timeout_seconds=0):
+                        record = delivery_queue.claim_next(
+                            lane_home, target_profile=profile, lease_ok=True
+                        )
+                        if record is None:
+                            # A lane that still has queued records but yielded no
+                            # claim is the exact state that used to vanish without
+                            # a trace -- name the lane and its depth.
+                            log_delivery_event(
+                                "drain_nothing_claimable",
+                                None,
+                                target=profile,
+                                home=str(lane_home),
+                                queued=delivery_queue.queue_depth(lane_home, profile),
+                            )
+                            break
+                        settled, _reply = await run_record(adapter, lane_home, record)
+                        drained += 1
+                        log_delivery_event("drained", settled, drained=drained)
+                except TurnBusyError:
+                    log_delivery_event("drain_deferred", None, target=profile, reason="slot_held")
+                    break
+    return drained
+
+
+def _spooled_lanes(home: Path) -> list[tuple[str, Path]]:
+    """Every lane home that already carries a delivery spool (never creates one)."""
+    from tools.bot_mode_probe import _delivery_homes, _hermes_root
+
+    return [
+        (name, lane_home)
+        for name, lane_home in _delivery_homes(_hermes_root(home))
+        if delivery_queue.has_spool(lane_home)
+    ]
+
+
+async def sweep_once(adapter: Any, home: Path) -> int:
+    """One sweep tick: recover every lane, drain, then expire + notify (t_8a7a47d7).
+
+    Three passes on purpose, and the order is the fix:
+
+    1. orphaned-claim recovery in EVERY lane home (``expire=False``) -- a claim
+       that crashed must be visible to the drain in the same tick;
+    2. the drain itself, which reaches every lane that has queued work;
+    3. TTL expiry, only for what is STILL queued after the drain -- so a record
+       that was never offered to a turn gets its one chance to run before expiry
+       can dead-letter it, and every record that does expire files a
+       sender-visible FAILURE notice in its sender's lane.
+
+    Expiry runs outside the drain so a lane whose slot is held keeps its backlog:
+    ``sweep_delivery_queue`` already refuses to expire while the slot is held, and
+    the holder is exactly the turn that will drain it next.
+    """
+    lanes = _spooled_lanes(Path(home))
+    for _name, lane_home in lanes:
+        delivery_queue.sweep_delivery_queue(lane_home, expire=False)
+    drained = await drain_once(adapter, Path(home))
+    for _name, lane_home in lanes:
+        delivery_queue.sweep_delivery_queue(
+            lane_home, on_expired=delivery_queue.notice_expired_to_sender
+        )
     return drained
 
 
@@ -284,10 +390,9 @@ async def sweep_loop(adapter: Any) -> None:
     while True:
         await asyncio.sleep(delivery_queue.sweep_seconds())
         try:
-            # Recover orphaned claims / expire over-age records first, so the
-            # drain below sees the real queue (and never expires a busy target's).
-            delivery_queue.sweep_delivery_queue(home)
-            drained = await drain_once(adapter, home)
+            # Recover orphaned claims, expire over-age records and drain the free
+            # slots of EVERY lane, not just this process's own default home.
+            drained = await sweep_once(adapter, home)
             if drained:
                 log_delivery_event("sweep_drained", None, drained=drained)
             # Trigger 5, the recurrence guard (DoD 4 of the peer-delivery project):
