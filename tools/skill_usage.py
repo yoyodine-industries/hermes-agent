@@ -520,17 +520,41 @@ def bump_patch(skill_name: str, *, action: str = "patch", task_id: Optional[str]
 
 
 def _admission_refusal_file() -> Path:
-    """The admission-refusal ledger: append-only, bounded, beside `.usage.json`.
+    """The admission ledger: append-only, bounded, beside `.usage.json`.
 
     It lives in the skills dir (not inside `.usage.json`) on purpose: a refused draft is not a
     skill, and a record in the usage map would make a phantom name show up wherever the ledger
     is enumerated. This is the audit trail the acceptance criterion asks for — every refusal,
     with what it collided with — and it is bounded so a leaking pen cannot grow it forever.
+
+    It carries TWO dispositions, not one: a refusal (`fold`/`reject`) and a FAULT
+    (:data:`ADMISSION_FAULT`) — the gate admitting because it could not judge at all. Keeping
+    the fault in the same file is what stops a broken gate from reading as a tidy ledger.
     """
     return _skills_dir() / ".admission_refusals.jsonl"
 
 
 JOURNAL_MAX_LINES = 500
+
+#: The disposition a FAULT row carries. A refusal is `fold`/`reject`; a fault is the gate
+#: admitting a draft it never judged, so the ledger separates "nothing collided" from "the
+#: gate was broken".
+ADMISSION_FAULT = "fault"
+
+
+def _append_admission_entry(entry: dict[str, Any]) -> bool:
+    """Append one bounded line to the admission ledger; True when it landed."""
+    path = _admission_refusal_file()
+    try:
+        with skill_file_lock(path.with_suffix(".jsonl.lock")):
+            lines = _read_lines(path, "Failed to read %s: %s")
+            lines.append(json.dumps(entry, sort_keys=True, ensure_ascii=False))
+            atomic_write_text(path, "\n".join(lines[-JOURNAL_MAX_LINES:]) + "\n",
+                             tmp_prefix=".admission_")
+        return True
+    except Exception as e:
+        logger.debug("Failed to append to the admission ledger for %s: %s", entry.get("skill"), e)
+        return False
 
 
 def record_admission_refusal(skill_name: str, *, disposition: str, existing_skill: str = "",
@@ -543,16 +567,30 @@ def record_admission_refusal(skill_name: str, *, disposition: str, existing_skil
     """
     entry = {"at": _now_iso(), "skill": skill_name, "disposition": disposition,
              "existing_skill": existing_skill, "reason": reason}
-    path = _admission_refusal_file()
-    try:
-        with skill_file_lock(path.with_suffix(".jsonl.lock")):
-            lines = _read_lines(path, "Failed to read %s: %s")
-            lines.append(json.dumps(entry, sort_keys=True, ensure_ascii=False))
-            atomic_write_text(path, "\n".join(lines[-JOURNAL_MAX_LINES:]) + "\n",
-                             tmp_prefix=".admission_")
-    except Exception as e:
-        logger.debug("Failed to record admission refusal for %s: %s", skill_name, e)
+    _append_admission_entry(entry)
     _emit_skill_lifecycle(skill_name, "create_refused", record={"created_by": None})
+
+
+def record_admission_fault(subject: str, *, detail: str, corpus: str = "") -> None:
+    """Record a FAULT: the gate could not judge, so it admitted the draft (fail open).
+
+    The fail-open is deliberate — a bug in a policy gate must not stop every lane from
+    learning — but an UNRECORDED fail-open makes the ledger read exactly like a gate that
+    judged everything and refused nothing. That is the silent failure this exists to stop: an
+    empty ledger is supposed to mean "no draft collided", and it can only mean that while
+    every admission the gate skipped is a row of its own.
+
+    ``subject`` is the skill (or ``name/file`` for a support file) the gate could not judge;
+    ``detail`` is the fault itself, carried into the row verbatim. Loud on failure by contract:
+    a fault row that cannot be written is the thing this function exists to prevent, so its
+    write error is a WARNING here where a refusal's is a DEBUG.
+    """
+    entry = {"at": _now_iso(), "skill": subject, "disposition": ADMISSION_FAULT,
+             "existing_skill": "", "reason": detail}
+    if corpus:
+        entry["corpus"] = corpus
+    if not _append_admission_entry(entry):
+        logger.warning("admission FAULT could not be recorded for %s: %s", subject, detail)
 
 
 def record_created(skill_name: str, *, agent_created: bool, task_id: Optional[str] = None,

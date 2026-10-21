@@ -24,8 +24,12 @@ reviewable rather than accidental:
   admitting blind is worse than refusing. The pen compares against the skills tree the agent
   can actually see; an EMPTY corpus there is not a wiring fault, it is a fresh install with
   nothing to duplicate, so the draft is admitted with that stated in its reason. Nothing is
-  ever refused on a corpus that could not be enumerated, and nothing is ever admitted on a
-  verdict that could not be computed.
+  ever refused on a corpus that could not be enumerated — and a verdict that could not be
+  computed ADMITS: the pen fails OPEN, because a bug in a policy gate must not stop every lane
+  from learning. That fail-open is not silent, which is the part that matters — the caller
+  writes it to the admission ledger as a `fault` row
+  (`tools.skill_usage.record_admission_fault`), naming what could not be judged and why, so a
+  broken gate can never read to an audit as a gate that found nothing to refuse.
 * **The unit.** The door judges `<skill>/SKILL.md` blobs. The pen also judges a NEW
   `references/<topic>.md` support file, because "add a file under another skill" is the other
   cheap way to grow the corpus; a support file has no frontmatter, so its intent surface is
