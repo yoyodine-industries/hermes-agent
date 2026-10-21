@@ -1,10 +1,13 @@
-"""The link door's RECEIPT: what a new parent edge can do on its own.
+"""The dependency RECEIPT: what a new parent edge can do on its own.
 
 A link gates a child behind a parent, but a gate is not a promise — the child only runs once
 the parent FINISHES, and a parent parked in ``review``/``triage``/``blocked``, or assigned to
-a profile that no longer exists, will never move by itself. This sibling owns the write path
-(:func:`link_tasks_reported`), the per-edge classification it attaches to every parent of the
-child, and the warning the doors report.
+a profile that no longer exists, will never move by itself. This sibling owns the write paths
+(:func:`link_tasks_reported`, :func:`unlink_tasks`), the per-edge classification every parent
+of the child gets, the warning the doors report, and the one payload (:func:`receipt_fields`)
+each door renders — the link door and the create door report the same receipt in the same
+words, because a card filed behind a standing parent is the same silent park as one linked
+into it.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached late-bound via
 ``_kb`` (import-cycle breaking) so monkeypatching ``kanban_db.<name>`` keeps working.
@@ -17,6 +20,10 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
 from hermes_cli.kanban_parent_state import ParentState, parent_promotion_state
+
+#: A parent in one of these has finished: the kernel promotes a child past it
+#: (``_parents_satisfied``/``recompute_ready``), so such an edge is no gate at all.
+TERMINAL_PARENT_STATUSES = ("done", "archived")
 
 
 @dataclass(frozen=True)
@@ -100,6 +107,95 @@ def link_warning(edges: list, board_dispatch: Mapping[str, bool]) -> Optional[st
     return "\n".join(lines) if lines else None
 
 
+def _receipt(edges: list, *, gated: bool, board: Optional[str] = None) -> LinkOutcome:
+    """Build one receipt off already-classified edges — the ONLY place one is constructed."""
+    dispatch = {} if board is None else {board: _kb.board_dispatch_enabled(board)}
+    return LinkOutcome(
+        gated=gated,
+        parents=edges,
+        standing=[edge.id for edge in edges if not edge.self_moves],
+        warning=link_warning(edges, dispatch),
+        board_dispatch=dispatch,
+    )
+
+
+def dependency_outcome(
+    conn: sqlite3.Connection,
+    child_id: str,
+    *,
+    gated: bool,
+    profiles=None,
+    board: Optional[str] = None,
+) -> LinkOutcome:
+    """The receipt for ``child_id``'s dependency set, as it stands.
+
+    ``gated`` is the caller's own demotion fact - the link door's ready->todo flip, the
+    create door's birth behind a parent that has not finished - and is passed in rather
+    than inferred: the two doors mean different things by it, and each already reports it
+    on its own surface. The edges, the standing set and the warning are built HERE, once,
+    so no door can report a dependency set in wording another door would not.
+    """
+    return _receipt(parent_edges(conn, child_id, profiles), gated=gated, board=board)
+
+
+def created_outcome(
+    conn: sqlite3.Connection, child_id: str, *, profiles=None, board: Optional[str] = None,
+) -> LinkOutcome:
+    """The receipt for a card FILED with parents: what its new dependency set can do alone.
+
+    A create door that answers only the new id leaves the filer to discover the park later,
+    and the ``dependency_wait`` event it writes is not the answer: a ``running`` parent still
+    finishes, while one parked in ``review`` or behind a dead assignee never moves. ``gated``
+    is true iff the card is parked in ``todo`` behind a parent that has not finished -
+    ``done``/``archived`` are terminal, the kernel's own promotion rule.
+    """
+    edges = parent_edges(conn, child_id, profiles)
+    gated = _kb._task_status(conn, child_id) == "todo" and any(
+        edge.status not in TERMINAL_PARENT_STATUSES for edge in edges)
+    return _receipt(edges, gated=gated, board=board)
+
+
+def receipt_fields(outcome: LinkOutcome) -> dict:
+    """The door payload for one receipt: the same keys on every surface that reports one.
+
+    ``gated_by`` names the parent that parked the card - the first edge, in id order, that
+    has not finished - so an agent reads WHY its new card sits in ``todo`` from the call
+    that created it, instead of a second round trip through the event log.
+    """
+    open_edges = [e for e in outcome.parents if e.status not in TERMINAL_PARENT_STATUSES]
+    payload = {
+        "gated": outcome.gated,
+        "parents": [{"id": e.id, "status": e.status, "code": e.code, "self_moves": e.self_moves}
+                    for e in outcome.parents],
+        "standing": outcome.standing,
+        "warning": outcome.warning,
+        "board_dispatch": outcome.board_dispatch,
+    }
+    if outcome.gated and open_edges:
+        payload["gated_by"] = open_edges[0].id
+    return payload
+
+
+def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    """Remove one ``parent_id -> child_id`` edge; returns whether one was removed.
+
+    The inverse door of :func:`link_tasks_reported`, and it re-gates the child at once, the
+    way ``complete_task``/``unblock_task`` do: without it the child stays stuck in ``todo``
+    until the next dispatcher tick or a manual ``hermes kanban recompute`` (issue #22459).
+    """
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
+        )
+        removed = cur.rowcount > 0
+        if removed:
+            _kb._append_event(conn, child_id, "unlinked",
+                              {"parent": parent_id, "child": child_id})
+    if removed:
+        _kb.recompute_ready(conn)
+    return removed
+
+
 def link_tasks_reported(
     conn: sqlite3.Connection,
     parent_id: str,
@@ -161,15 +257,7 @@ def link_tasks_reported(
             {"parent": parent_id, "child": child_id},
         )
         _kb._inherit_notify_subs(conn, child_id, (parent_id,))
-    edges = parent_edges(conn, child_id, profiles)
-    dispatch = {} if board is None else {board: _kb.board_dispatch_enabled(board)}
-    return LinkOutcome(
-        gated=gated,
-        parents=edges,
-        standing=[edge.id for edge in edges if not edge.self_moves],
-        warning=link_warning(edges, dispatch),
-        board_dispatch=dispatch,
-    )
+    return dependency_outcome(conn, child_id, gated=gated, profiles=profiles, board=board)
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

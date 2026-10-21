@@ -2191,6 +2191,21 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
+def create_task_reported(
+    conn: sqlite3.Connection, *, profiles: Optional[Iterable[str]] = None, **kwargs,
+) -> tuple[str, LinkOutcome]:
+    """Create a task through :func:`create_task`; return it with its dependency receipt.
+
+    The same single write path, so ``create_task`` keeps its id-shaped contract for callers
+    that only need one, and this door answers the question a FILER has — will this card run
+    by itself? ``profiles`` is the caller's live-profile list for the receipt's dead-assignee
+    probe (``None`` = not injected: skipped, never guessed); the board is the caller's own
+    ``board=``, never the ambient one.
+    """
+    task_id = create_task(conn, **kwargs)
+    return task_id, created_outcome(conn, task_id, profiles=profiles, board=kwargs.get("board"))
+
+
 def _board_meta_for(board: Optional[str]) -> dict:
     return read_board_metadata(board if board else get_current_board())
 
@@ -2827,21 +2842,6 @@ def link_tasks(
         conn, parent_id, child_id, expected_child_run_id=expected_child_run_id).gated
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
-        )
-        removed = cur.rowcount > 0
-        if removed:
-            _append_event(conn, child_id, "unlinked", {"parent": parent_id, "child": child_id})
-    if removed:
-        # Re-gate the child now (as complete_task/unblock_task do) instead of
-        # leaving it in todo until the next tick.
-        recompute_ready(conn)
-    return removed
-
-
 def _linked_ids(conn: sqlite3.Connection, want: str, where: str, task_id: str) -> list[str]:
     rows = conn.execute(
         f"SELECT {want} FROM task_links WHERE {where} = ? ORDER BY {want}", (task_id,)
@@ -2849,9 +2849,6 @@ def _linked_ids(conn: sqlite3.Connection, want: str, where: str, task_id: str) -
     return [r[want] for r in rows]
 
 
-# Dependency edge removed — re-evaluate promotion eligibility for the child immediately. Matches the
-# contract of complete_task and unblock_task; without this the child stays stuck in todo until the next
-# dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return _linked_ids(conn, "parent_id", "child_id", task_id)
 
@@ -8037,7 +8034,10 @@ from hermes_cli.kanban_db_links import (
     LinkOutcome,
     ParentEdgeState,
     _would_cycle,
+    created_outcome,
     link_tasks_reported,
+    receipt_fields,
+    unlink_tasks,
 )
 from hermes_cli.kanban_db_connect import (
     _INITIALIZED_PATHS,

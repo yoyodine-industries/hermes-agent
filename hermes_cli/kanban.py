@@ -447,8 +447,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
         getattr(args, "board", None),
         source_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                         if is_dispatcher_owned_worker_context() else None))
+    from hermes_cli.profiles import list_profile_names
     with kbc.connect_closing(board=fired_board) as conn:
-        task_id = kb.create_task(
+        task_id, outcome = kb.create_task_reported(
             conn, title=args.title, body=body, assignee=args.assignee,
             # The card's OWN board, not the ambient one: the priority policy, the
             # board floor and every board-scoped read below must see the board the
@@ -470,12 +471,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
             serves=getattr(args, "serves", None),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
+            # The receipt's dead-assignee probe reads THIS process's live profiles.
+            profiles=list_profile_names(),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
-        _print_json(_task_to_dict(task))
+        _print_json({**_task_to_dict(task), **kb.receipt_fields(outcome)})
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        # Same words as `hermes kanban link`: a card FILED behind a parent nobody will finish
+        # is the same silent park, and stderr keeps `Created <id>` parsable on stdout.
+        if outcome.parents:
+            print(f"Parent state ({len(outcome.parents)} edge(s)):", file=sys.stderr)
+            for edge in outcome.parents:
+                print(f"  {edge.id}  {edge.code}  {edge.text}", file=sys.stderr)
+        if outcome.warning:
+            print(outcome.warning, file=sys.stderr)
         # One-line authoring advisory (card t_36adf9a5): a card born on a repo/PR/landed contract
         # is the one that can strand, and the door out of that declaration is `set-contract`.
         # Named HERE, at the moment the declaration is authored, so the operator never has to

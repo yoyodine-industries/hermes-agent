@@ -1388,6 +1388,7 @@ def _handle_create(args: dict, **kw) -> str:
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     from hermes_cli import kanban_db as _kb_board
+    from hermes_cli.profiles import list_profile_names
     self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                 if _is_dispatcher_owned_worker() else None)
     # A card fired from another card lands on the SAME board as the card that fired
@@ -1412,7 +1413,7 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
-        new_tid = kb.create_task(
+        new_tid, outcome = kb.create_task_reported(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
@@ -1435,11 +1436,15 @@ def _handle_create(args: dict, **kw) -> str:
             # Escape hatch for the ASK-HOME rule: a NEW ask filed off its register's board
             # is refused unless the caller opts in deliberately (see kanban_register).
             allow_off_board_ask=bool(args.get("allow_off_board_ask")),
-            created_by=_persisted_identity(), session_id=session_id)
+            created_by=_persisted_identity(), session_id=session_id,
+            # The receipt's dead-assignee probe needs the live profiles; injected at the
+            # door (this process knows them) rather than guessed inside the kernel.
+            profiles=list_profile_names())
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
-        gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
-        return _ok(task_id=new_tid, **landed, **gate,
+        # gated/gated_by keep their shape; parents/standing/warning/board_dispatch are the
+        # SAME receipt the link door reports, so a card filed behind a parent that will
+        # never move is visible in the answer that created it, not after a second lookup.
+        return _ok(task_id=new_tid, **landed, **kb.receipt_fields(outcome),
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 
