@@ -204,6 +204,10 @@ def test_a_judge_fault_leaves_a_fault_row_naming_what_could_not_be_judged(tmp_pa
     with _skills_root(tmp_path) as root:
         _seed(root, "kanban-transitions", KANBAN)
         before = len(_ledger())
+        # A healthy judge still REFUSES this draft: the fault path launders nothing.
+        refused = _create_skill("card-movement", RESTATEMENT)
+        assert refused["success"] is False
+        assert refused["refused_by"] == "admission"
         with patch("tools.skill_admission.verdict_for_content", side_effect=RuntimeError("boom")):
             result = _create_skill("card-movement", RESTATEMENT)
         assert result["success"] is True, result
@@ -213,6 +217,8 @@ def test_a_judge_fault_leaves_a_fault_row_naming_what_could_not_be_judged(tmp_pa
         assert "RuntimeError" in faults[0]["reason"] and "boom" in faults[0]["reason"]
         # A fault is not a refusal: it names no fold target, so no reader can fold into it.
         assert faults[0]["existing_skill"] == ""
+        # ... and the refusal that a healthy judge wrote is still its own row, in the same ledger.
+        assert [e["disposition"] for e in _ledger()[before:]] == ["fold", "fault"]
 
 
 def test_a_support_file_judge_fault_leaves_a_fault_row_too(tmp_path):
