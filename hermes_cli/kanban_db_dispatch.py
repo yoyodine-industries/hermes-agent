@@ -2696,9 +2696,21 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """The profile owner executes; this subprocess only waits for its receipt."""
+    """The profile owner executes; this subprocess only waits for its receipt.
+
+    ``-P`` (the interpreter's safe-path flag) keeps the child's *working
+    directory* off ``sys.path``. The child runs with ``cwd`` set to the task's
+    workspace, and a workspace that is a git worktree of THIS repository —
+    every card that changes Hermes — carries its own ``hermes_cli/`` and
+    ``pm/``. With cwd first on ``sys.path`` the child imported the worktree's
+    copy, resolved its project root to the worktree, found no committed
+    dependency environment under that install key and exited 1 at boot, on
+    every retry, leaving the card ``ready`` and looking unattended. Nothing is
+    lost: the running install's root is pinned on the child's ``PYTHONPATH``
+    (``_worker_env`` -> ``pin_hermes_tree_on_pythonpath``).
+    """
     import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    return [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
