@@ -233,6 +233,42 @@ def test_comment_on_an_unregistered_board_still_refuses(monkeypatch, tmp_path):
     assert "no board by that name is registered" in err, err
 
 
+def test_comment_schema_publishes_the_cross_board_door_and_no_other_tool_does():
+    """The remedy must be readable BEFORE the call: a lane consults the rendered
+    ``board`` description, so a description that still says "refused, full stop" makes
+    the door undiscoverable and the next reviewer takes the detour again (t_2521d35f
+    review round 1). Exactly one tool carries the authority-scoped rule; the shared
+    text stays true of every other tool, which really does refuse unconditionally."""
+    from tools import kanban_tools_schemas as kts
+
+    def board_desc(schema):
+        return schema["parameters"]["properties"]["board"]["description"]
+
+    comment = board_desc(kts.KANBAN_COMMENT_SCHEMA)
+    assert "assignee or creator" in comment, comment
+    assert "ADMITTED" in comment and "cross-board" in comment, comment
+    # ...and it must not still promise the unconditional refusal the others carry.
+    assert "the call is refused (ValueError) rather than silently served" not in comment
+
+    others = []
+    for attr, schema in vars(kts).items():
+        if not (attr.startswith("KANBAN_") and attr.endswith("_SCHEMA")):
+            continue
+        if schema["name"] == "kanban_comment":
+            continue
+        prop = schema["parameters"]["properties"].get("board")
+        if prop is None:  # a tool that publishes no board parameter at all
+            continue
+        others.append(schema["name"])
+        desc = prop["description"]
+        assert "assignee or creator" not in desc, (
+            schema["name"], "the door text leaked into a tool that still refuses")
+        assert "the call is refused (ValueError) rather than silently served" in desc, (
+            schema["name"], "a still-unconditional tool lost its published rule")
+    assert "kanban_complete" in others, others
+    assert len(others) >= 15, others
+
+
 def test_show_bare_call_outside_worker_returns_orientation_not_error(monkeypatch, worker_env):
     """#91431: chat profiles with the kanban toolset call kanban_show bare to orient
     themselves; with no dispatcher task in scope there is nothing to show, so the
