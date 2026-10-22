@@ -10,7 +10,20 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("nemo_relay")
+# The module below exercises the nemo-relay 0.10 API, but pyproject.toml declares that floor
+# only for `python_version >= '3.14'`: on an older interpreter the requirement is inactive, so a
+# venv can import a 0.8.x wheel happily and every test here then fails for a reason that is not
+# the code's (card t_473047e1 - three reds a currency gate blamed on an innocent PR).
+#
+# BOTH ways of not having the API skip, and each names itself: an absent package says it is
+# absent (pytest's bare importorskip reason reads as "not needed" in the one environment where
+# the requirement is active), a stale one names the version and the floor. Above the ceiling
+# nothing skips - the pin has drifted and the tests should run to say so.
+from tests.agent._relay_floor import skip_reason
+
+_SKIP_REASON = skip_reason()
+if _SKIP_REASON:
+    pytest.skip(_SKIP_REASON, allow_module_level=True)
 
 from agent import relay_llm, relay_runtime
 
