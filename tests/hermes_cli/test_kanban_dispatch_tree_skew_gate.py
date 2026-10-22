@@ -796,3 +796,162 @@ def test_the_steady_state_check_does_not_reread_file_bytes(board, tree, monkeypa
     _edit(tree)
     tf.content_fingerprint()
     assert len(reads) == 2, "a moved file must force exactly one re-digest"
+
+
+# ---------------------------------------------------------------------------------------------
+# (f) the guard card's OWN contract (card t_4dbee32e): born ready, in the TOP band, closed by
+#     the tick that clears it, and escalated -- not duplicated -- when a reload does not help
+# ---------------------------------------------------------------------------------------------
+
+#: The fleet's own ladder. The guard card must be placed by the REAL policy, not by a stub that
+#: restates it; when the fleet tree is not on this host the assertion degrades to the mechanism
+#: (the declaration line the ladder reads) instead of asserting nothing.
+FLEET_BANDS = (
+    "/opt/hermes_prod/yaan-platform/scripts/kanban_priority_bands.py",
+    "/opt/hermes_sandbox/yaan-platform/scripts/kanban_priority_bands.py",
+)
+
+
+def _fleet_band_module():
+    import importlib.util
+
+    for candidate in FLEET_BANDS:
+        if not os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("fleet_kanban_priority_bands", candidate)
+        if spec is None or spec.loader is None:  # pragma: no cover - a broken path is a skip
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if hasattr(module, "band_birth"):
+            return module
+    return None
+
+
+def _point_ops_board_at_fleet_policy(module_path: str) -> None:
+    """Give the SCRATCH ops board the fleet's ladder, so the filing is judged by the real one."""
+    import pathlib
+
+    board_json = pathlib.Path(os.environ["HERMES_KANBAN_HOME"]) / "kanban" / "boards" / OPS_BOARD / "board.json"
+    doc = json.loads(board_json.read_text(encoding="utf-8"))
+    doc["priority_policy"] = {"module": module_path, "function": "band_birth"}
+    board_json.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _file_a_guard_card(board, tree) -> None:
+    tf.record_boot()
+    _edit(tree)
+    for _ in range(THRESHOLD):
+        _tick(board)
+    assert len(_actor_rows()) == 1, "the third refusal must file exactly one guard card"
+
+
+def test_guard_card_is_ready_and_top_band(board, tree):
+    """The card that CARRIES the deadline is ready, and the ladder puts it in the top band.
+
+    Measured before this: 116 guard cards across six boards, 42 of them in ``scheduled`` (a
+    deadline nobody is dispatched against) and every one of them at 790000 -- the tier's REST band
+    -- because the filing never declared anything for the ladder to read.
+    """
+    conn = board
+    bands = _fleet_band_module()
+    if bands is not None:
+        _point_ops_board_at_fleet_policy(FLEET_BANDS[0] if os.path.exists(FLEET_BANDS[0]) else FLEET_BANDS[1])
+    _file_a_guard_card(conn, tree)
+
+    row = _actor_rows()[0]
+    assert row["status"] == "ready", f"a guard card is born READY, got {row['status']!r}"
+    assert row["body"].startswith(kbd.TICK_YIELD_ACTOR_DECLARATION), (
+        "the card must declare its blast radius FIRST: the ladder reads that line and nothing else"
+    )
+    if bands is None:  # pragma: no cover - the fleet tree is not on this host
+        return
+    verdict = bands.band_birth(
+        0, kbd.TICK_YIELD_ACTOR_ASSIGNEE, OPS_BOARD, kbd.TICK_YIELD_ACTOR_TITLE, row["body"],
+    )
+    assert verdict["qualified"] is True, verdict
+    assert "gateway" in verdict["qualification"], verdict
+    assert verdict["applied"] == 800000, verdict
+    assert row["priority"] == verdict["applied"], (
+        f"the filing must keep the ladder's answer: row={row['priority']} ladder={verdict['applied']}"
+    )
+
+
+def test_a_normal_tick_closes_the_guard_card_it_cleared(board, tree):
+    """Auto-close is proof-driven: a SERVED tick after the frozen process is done, nothing less."""
+    conn = board
+    _file_a_guard_card(conn, tree)
+    card = _actor_rows()[0]
+    assert card["status"] == "ready"
+
+    # A REFUSED tick (skew still there) must leave the card exactly where it is.
+    _tick(conn)
+    assert _actor_rows()[0]["status"] == "ready", "a yielding tick is not a proof of anything"
+
+    # The reload landed: the tree now matches what this process imported, so the tick SERVES.
+    _edit(tree, body="VALUE = 1\n")
+    result = _tick(conn)
+    assert result.tick_yielded == "", result.tick_yielded
+
+    assert _actor_rows()[0]["status"] == "done", (
+        "a verified normal tick is the evidence the card's own 'What closes it' names"
+    )
+    ops = kbc.connect(board=OPS_BOARD)
+    try:
+        evidence = ops.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (card["id"],)
+        ).fetchone()
+    finally:
+        ops.close()
+    assert evidence is not None, "the close must land as a run with its proof recorded"
+    payload = json.loads(evidence["metadata"] or "{}")
+    assert "tree_skew_cleared" in payload, payload
+    assert payload["tree_skew_cleared"]["observed_by_pid"] == os.getpid()
+
+
+def test_a_skew_that_survives_a_reload_escalates_instead_of_refiling(board, tree, monkeypatch):
+    """A second frozen process, same disk content: the reload door is broken -> ONE escalation.
+
+    This is the 116-card pile in one test. A reload DID happen (a different pid), the skew came
+    back on the SAME checkout, and repeating "reload it" is not a plan -- the design authority has
+    to say whether the fingerprint or the reload is wrong.
+    """
+    conn = board
+    _file_a_guard_card(conn, tree)
+    first = _actor_rows()[0]
+    assert first["idempotency_key"].startswith(kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX)
+
+    # The reload: a NEW process now serves, and the OLD pid is proven dead.
+    frozen_pid = os.getpid()
+    tf.boot_record()["pid"] = frozen_pid + 1
+    real_liveness = kbd._pid_liveness
+    monkeypatch.setattr(
+        kbd, "_pid_liveness",
+        lambda pid: kbd.WORKER_DEAD if int(pid) == frozen_pid else real_liveness(pid),
+    )
+
+    for _ in range(THRESHOLD):
+        _tick(conn)
+
+    ops = kbc.connect(board=OPS_BOARD)
+    try:
+        cards = ops.execute(
+            "SELECT id, title, assignee, status, idempotency_key FROM tasks "
+            "WHERE idempotency_key LIKE ? ORDER BY rowid",
+            (f"{kbd.TICK_YIELD_ESCALATION_KEY_PREFIX}%",),
+        ).fetchall()
+    finally:
+        ops.close()
+    assert len(cards) == 1, f"exactly ONE escalation for this disk content, got {len(cards)}"
+    escalation = cards[0]
+    assert escalation["assignee"] == kbd.TICK_YIELD_ESCALATION_ASSIGNEE == "platform-stl"
+    assert escalation["status"] == "ready"
+    assert escalation["title"].startswith("[escalation]")
+    ops = kbc.connect(board=OPS_BOARD)
+    try:
+        guard_cards = ops.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ?", ("tree-skew:%",),
+        ).fetchone()[0]
+    finally:
+        ops.close()
+    assert guard_cards == 1, f"no 117th guard card: {guard_cards} guard cards on the board"
