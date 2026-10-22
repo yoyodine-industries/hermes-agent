@@ -1931,7 +1931,7 @@ def create_task(
     # INVARIANT D at its earliest door (operator ruling 2026-10-05, card t_5bbf4e80): the
     # card's ATTRIBUTION (`created_by`) must name a LIVE fleet identity. A card filed under a
     # DELETED profile is MISATTRIBUTED -- its provenance points at nothing and no lane can be
-    # asked to own it. A DENYLIST -- a non-profile producer origin (pr-evergreen, deploy-train,
+    # asked to own it. A DENYLIST -- a non-profile producer origin (hermes_pr_update, deploy-train,
     # sdlc, ...) is not a profile and passes.
     _gates.gate_created_by(created_by, board=board, where="kanban_create")
     if not title or not title.strip():

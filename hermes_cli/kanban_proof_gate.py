@@ -183,6 +183,44 @@ It is never silent either: the facts carry ``run_store_state: "unavailable"``, t
 error and ``degraded: True`` into the ``proof_gate_admitted`` audit event, and the pass text
 says the store was unreadable. One corrupted SQLite file can no longer make every landed card
 on every board unclosable at once.
+
+A FAN-OUT PHANTOM IS CLOSED AS NOT-WORK (card t_e7f27489). The changed-unit fan-out derives
+one ``landed`` item — and one card — PER UNIT a merge appears to have touched. When that
+derivation over-files (a side branch's paths read as the merge's), the card for the untouched
+unit has no artifact, no run and no probe, and never will: nothing was shipped to it. It used
+to be unclosable except by ARCHIVING it, which records no reason at all — the residue then
+reads as silently-dropped work and is re-measured by whoever finds it next. The class is now
+expressible, and it is PROVEN, not asserted:
+
+  * the proof declares ``{"mechanism": "fan-out-phantom", "unit": "<projects.conf key>",
+    "merge": "<sha>", "paths": ["<repo-relative path>", ...]}``;
+  * ``unit`` is resolved in the control plane's ``projects.conf`` (the same four columns and
+    the same parser semantics the train reads: key, canonical checkout, live dest, manifest).
+    An unknown unit, a registry-only row, or an unreadable control root is
+    ``phantom_unverifiable`` — fail closed, never a pass by absence;
+  * ``merge`` must resolve in that unit's OWN canonical checkout, and the gate MEASURES its
+    first-parent diff (``git diff --no-renames --name-only <merge>^1 <merge>``): a root commit
+    or an unresolvable sha is ``phantom_merge_unresolved``, and a declared ``paths`` list that
+    is not exactly the measured set is ``phantom_diff_mismatch`` (the measured set is printed,
+    so the retry is a copy, never a guess);
+  * the unit's SHIP SET is read from ITS OWN manifest — the ``include <git-pathspec>
+    [-> <live-path>]`` lines of the ``projects.conf`` row's manifest column, expanded with git
+    against both the checkout's HEAD and the merge commit (a union, so a path added by the
+    merge counts). ``preserve``/``reap`` lines are NOT ship lines: the repo does not own those
+    paths;
+  * if ANY measured path is in that ship set the claim is FALSE and the refusal says so —
+    ``phantom_paths_shipped``: the card is real work for that unit and owes the ordinary landed
+    proof. That is the direction that matters: the arm exists to close cards that carry no
+    work, never to talk a worker out of one that does;
+  * only when the intersection is empty is the card admitted, and the facts say what it was
+    closed AS: ``closure: "not-work"``, never a discharge. The audit event then reads
+    ``proof_gate_admitted`` with the unit, the merge, the measured paths, the dest, the manifest
+    it was judged against and its sha256 — a later reader sees WHY it closed, and on what
+    evidence.
+
+The live dest is RECORDED, never used as the test: dests nest (``platform-workflows`` lives
+inside ``/opt/hermes_prod``), so "the path exists under my dest" does not mean my unit ships it.
+Ownership is the manifest's question, and only the manifest's.
 """
 
 from __future__ import annotations
@@ -194,7 +232,7 @@ import re
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Iterable, Optional
 
 LANDED_CONTRACT = "landed"
@@ -207,6 +245,41 @@ DEFAULT_RUN_STORE = "/opt/hermes_prod/run_details/yoyoflow-state.db"
 DEFAULT_OVERRIDES = os.path.join(os.path.expanduser("~"), ".hermes", "yoyoflow",
                                  "untracked-overrides")
 DEFAULT_PREROLL = os.path.join(os.path.expanduser("~"), ".hermes", "yoyoflow", "r5-preroll")
+
+#: The deploy CONTROL PLANE: `projects.conf` (the ONE map from a unit to its canonical
+#: checkout, live dest and manifest) plus the manifests, read by the same grammar
+#: `scripts/deploy_train_nodes.py::projects` reads. Resolved lazily so a test drives it from
+#: a temp tree and never reads the live estate. Only the fan-out-phantom arm reads it (see
+#: the module docstring): the ordinary landed clauses answer from the ledger and the run store.
+DEFAULT_CONTROL_ROOT = "/opt/hermes_sandbox/yaan-repo-control"
+
+#: The one mechanism this gate accepts INSTEAD of ``run{store,id}``: a unit the changed-unit
+#: fan-out over-filed, proven to ship none of the merge's paths. Aliases are normalised to the
+#: canonical spelling in ``facts["mechanism"]``.
+_PHANTOM_MECHANISM = "fan-out-phantom"
+_PHANTOM_ALIASES = frozenset({
+    "fan-out-phantom", "fan_out_phantom", "fanout-phantom", "fanout_phantom",
+    "fan-out phantom", "phantom",
+})
+
+#: The clauses the phantom arm can fail on. They never coexist with the landed clauses: the arm
+#: returns before the artifact/landing/run evaluation runs, so a refusal here names only things
+#: a phantom claimant must fix.
+_PHANTOM_CAUSES = frozenset({
+    "phantom_unverifiable",
+    "phantom_unit_unknown",
+    "phantom_merge_unresolved",
+    "phantom_diff_mismatch",
+    "phantom_paths_shipped",
+})
+
+_PHANTOM_SHAPE = (
+    'metadata={"proof": {"mechanism": "fan-out-phantom", "unit": "<projects.conf key>", '
+    '"merge": "<sha>", "paths": ["<repo-relative path>", ...]}}'
+)
+
+#: How many measured paths a refusal message prints before it elides the rest.
+_PATH_LIST_CAP = 12
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _CARD_TOKEN = re.compile(r"t_[0-9a-f]{4,}")
@@ -259,6 +332,14 @@ _CAUSES = (
     "proof_predates_landing",
     "run_not_green",
     "live_tree_unproven",
+    # The fan-out-phantom arm's clauses (card t_e7f27489). They are an ALTERNATIVE door, not a
+    # landed clause: a phantom verdict returns before any artifact/landing/run judgment, so
+    # these can never be reported beside the clauses above.
+    "phantom_unverifiable",
+    "phantom_unit_unknown",
+    "phantom_merge_unresolved",
+    "phantom_diff_mismatch",
+    "phantom_paths_shipped",
 )
 
 # Named first when several clauses fail at once. The identity clauses are last: their
@@ -291,6 +372,13 @@ _CAUSE_PRECEDENCE = (
     "artifact_blob_unresolved",
     "artifact_unpinned",
     "artifact_hash_mismatch",
+    # The phantom arm's clauses are an alternative door (see ``_PHANTOM_CAUSES``): named first
+    # WITHIN a phantom refusal, but they never appear beside a landed clause.
+    "phantom_unverifiable",
+    "phantom_unit_unknown",
+    "phantom_merge_unresolved",
+    "phantom_diff_mismatch",
+    "phantom_paths_shipped",
 )
 
 _LEDGER_LINE_CAP = 200_000
@@ -324,7 +412,14 @@ PROOF_SHAPE = (
     'refused on a landed card) '
     '(if the run store itself cannot be READ the gate stands on the run log receipt '
     '(<run_details>/<run id>/run.log) and records the resolution as DEGRADED; with no receipt '
-    'it refuses "run_store_unavailable" -- a store outage is never reported as a missing run)'
+    'it refuses "run_store_unavailable" -- a store outage is never reported as a missing run) '
+    '(A FAN-OUT PHANTOM — a unit the changed-unit fan-out over-filed, which ships none of the '
+    'merge\'s paths — closes as NOT-WORK instead of landing: '
+    '{"mechanism": "fan-out-phantom", "unit": "<projects.conf key>", "merge": "<sha>", '
+    '"paths": ["<repo-relative path>", ...]} where paths is that merge\'s FIRST-PARENT diff as '
+    '`git diff --no-renames --name-only <merge>^1 <merge>` measures it; the gate re-measures '
+    'the diff and reads the unit\'s own manifest, and refuses "phantom_paths_shipped" if the '
+    'unit ships ANY of those paths — that card is real work)'
 )
 
 
@@ -351,7 +446,7 @@ class Verdict:
         """Record a failed clause. ``ok``/``cause`` are settled by :meth:`settle`."""
         self.failures.append({"clause": clause, "detail": detail})
 
-    def settle(self) -> "Verdict":
+    def settle(self) -> Verdict:
         if not self.failures:
             self.ok = True
             self.cause = None
@@ -384,7 +479,7 @@ class Verdict:
 def _iso(epoch: Optional[float]) -> Optional[str]:
     if epoch is None:
         return None
-    return datetime.fromtimestamp(float(epoch), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(float(epoch), tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def parse_ts(value: Any) -> Optional[float]:
@@ -406,7 +501,7 @@ def parse_ts(value: Any) -> Optional[float]:
     except ValueError:
         return None
     if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
+        stamp = stamp.replace(tzinfo=UTC)
     return stamp.timestamp()
 
 
@@ -1478,6 +1573,257 @@ def witness(payload: Any, conn: Optional[sqlite3.Connection] = None, *,
 # -- the gate -----------------------------------------------------------------
 
 
+# -- the fan-out phantom arm (card t_e7f27489) ------------------------------------------
+#
+# WHY THIS IS A SECOND DOOR AND NOT A WAIVER. A ``landed`` card owes deployed bytes, a landing
+# and a run after it. A card the changed-unit fan-out over-filed owes none of those and never
+# will, so every clause of the landed door is unsatisfiable by construction — and the only door
+# left was ``archived``, which records no reason. The alternative is not a weaker contract, it is
+# a DIFFERENT claim ("this unit ships none of the merge's paths"), and it is judged on facts the
+# gate measures itself: the control plane's own unit row, the merge's measured first-parent
+# diff, and the unit's own manifest expanded by git. Nothing here is taken from the card's prose.
+
+
+def _control_root(override: Optional[str] = None) -> str:
+    return (override or os.environ.get("YAAN_PROOF_CONTROL_ROOT")
+            or os.environ.get("YAAN_CONTROL_ROOT") or DEFAULT_CONTROL_ROOT)
+
+
+def _phantom_mechanism(proof: dict) -> Optional[str]:
+    """The canonical mechanism name when *proof* takes the phantom door, else ``None``."""
+    raw = proof.get("mechanism")
+    if not isinstance(raw, str):
+        return None
+    text = " ".join(raw.strip().lower().replace("_", "-").split())
+    if text in _PHANTOM_ALIASES or text.replace(" ", "-") in _PHANTOM_ALIASES:
+        return _PHANTOM_MECHANISM
+    return None
+
+
+def _git_out(*args: str) -> tuple:
+    """One git invocation -> ``(returncode, stdout, stderr)``; never raises, never blocks long."""
+    try:
+        proc = subprocess.run(("git",) + args, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, "", str(exc)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _projects_rows(control_root: str) -> dict:
+    """``projects.conf`` -> ``{unit: {checkout, dest, manifest}}``.
+
+    The grammar is the TRAIN's own (``scripts/deploy_train_nodes.py::projects``), deliberately
+    not a second opinion: a trailing `` #`` comment, blank and ``#`` lines skipped,
+    whitespace-separated columns, column 3 derived as ``<live root>/<basename of the checkout>``
+    when absent, column 4 the manifest path relative to the control root. A row whose dest is
+    the literal ``-`` is REGISTRY-ONLY and declares no live dest.
+    """
+    rows: dict = {}
+    with open(os.path.join(control_root, "projects.conf"), "r", encoding="utf-8",
+              errors="replace") as handle:
+        for raw in handle:
+            line = raw.split(" #", 1)[0].strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            checkout = parts[1]
+            dest = parts[2] if len(parts) > 2 else os.path.join(
+                os.environ.get("YAAN_LIVE_ROOT", "/opt/hermes_prod"),
+                os.path.basename(checkout.rstrip("/")))
+            rows[parts[0]] = {
+                "checkout": checkout,
+                "dest": dest,
+                "manifest": parts[3] if len(parts) > 3 else None,
+            }
+    return rows
+
+
+def _manifest_includes(manifest_path: str) -> list:
+    """The ``include`` pathspecs of a deploy manifest — the paths the unit SHIPS.
+
+    ``include <git-pathspec> [-> <live-path>]``: only the SOURCE side can match a merged path
+    (the live side is where it lands). ``preserve`` and ``reap`` say the OPPOSITE — the repo does
+    not own those paths — so they are never ship lines. Arguments are read verbatim, exactly as
+    ``deploy.sh`` reads them: a ``#`` in that file is a whole-line comment or it is not a comment.
+    """
+    specs: list = []
+    with open(manifest_path, "r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#") or not line.startswith("include "):
+                continue
+            source = line[len("include "):].strip().split("->", 1)[0].strip()
+            if source:
+                specs.append(source)
+    return specs
+
+
+def _shipped_files(checkout: str, specs: list, revs: tuple) -> tuple:
+    """``(files, per-rev facts)`` the unit's manifest ships at *revs*, unioned.
+
+    git does the pathspec matching, so a directory or a glob in the manifest expands exactly as
+    the deploy expands it and the gate never re-implements pathspec semantics.
+    """
+    files: set = set()
+    facts: dict = {}
+    for label, rev in revs:
+        code, out, err = _git_out("-C", checkout, "ls-tree", "-r", "--name-only", rev,
+                                  "--", *specs)
+        entry: dict = {"rev": rev, "rc": code}
+        if code != 0:
+            lines = (err or "").strip().splitlines()
+            entry["error"] = lines[-1] if lines else "git ls-tree failed"
+        else:
+            names = [name for name in out.splitlines() if name]
+            entry["files"] = len(names)
+            files.update(names)
+        facts[label] = entry
+    return files, facts
+
+
+def _brief(paths: list) -> str:
+    shown = list(paths)[:_PATH_LIST_CAP]
+    text = ", ".join(shown) if shown else "<none>"
+    extra = len(paths) - len(shown)
+    return text + (f" (+{extra} more)" if extra > 0 else "")
+
+
+def _phantom_verdict(proof: dict, *, control_root: Optional[str] = None) -> Verdict:
+    """Judge a ``mechanism: fan-out-phantom`` claim: does this unit ship ANY of the merge's paths?
+
+    Every input is resolved from the estate, never from the payload: the unit row, the
+    canonical checkout and the manifest come from ``projects.conf``; the path list is MEASURED
+    from the merge; the ship set is expanded from the manifest by git. On admission the facts
+    record what the card was closed AS (``closure: not-work``), which is the fact a later reader
+    needs — a phantom is never a discharge.
+    """
+    facts: dict = {"closure": "not-work", "mechanism": _PHANTOM_MECHANISM}
+    verdict = Verdict(True, None, "", facts)
+
+    unit = str(proof.get("unit") or "").strip()
+    merge = str(proof.get("merge") or "").strip()
+    declared = proof.get("paths")
+    if not unit or not merge or not isinstance(declared, list):
+        return Verdict(False, "malformed_proof", (
+            f"the fan-out-phantom arm needs a unit, a merge and a paths list; {_PHANTOM_SHAPE}"))
+    declared_paths = sorted({str(path).strip().lstrip("./")
+                             for path in declared if str(path).strip()})
+    facts["unit"] = unit
+    facts["merge"] = merge
+    facts["declared_paths"] = declared_paths
+
+    root = _control_root(control_root)
+    facts["control_root"] = root
+    try:
+        rows = _projects_rows(root)
+    except OSError as exc:
+        verdict.fail("phantom_unverifiable", (
+            f"the control plane's projects.conf cannot be read at {root} ({exc}), so the unit "
+            f"{unit!r} cannot be resolved and nothing about this claim was judged"))
+        return verdict.settle()
+
+    row = rows.get(unit)
+    if row is None:
+        verdict.fail("phantom_unit_unknown", (
+            f"{unit!r} is not a unit in {os.path.join(root, 'projects.conf')}: this arm binds a "
+            "card to a DEPLOYED unit, so the name must be the projects.conf key (for example "
+            "platform-workflows, prod-majordomo, yaan-main-2slot-occupancy)"))
+        return verdict.settle()
+
+    checkout, dest, manifest = row["checkout"], row["dest"], row["manifest"]
+    facts.update({"checkout": checkout, "dest": dest})
+    if not dest or dest == "-" or not manifest:
+        verdict.fail("phantom_unverifiable", (
+            f"the projects.conf row for {unit!r} declares "
+            f"{'no live dest (a registry-only row)' if (not dest or dest == '-') else 'no manifest'}, "
+            "so the paths it ships cannot be enumerated; a row with no ship set cannot host a "
+            "fan-out card"))
+        return verdict.settle()
+    manifest_path = manifest if os.path.isabs(manifest) else os.path.join(root, manifest)
+    facts["manifest"] = manifest_path
+
+    code, out, err = _git_out("-C", checkout, "rev-parse", "--verify", f"{merge}^{{commit}}")
+    if code != 0:
+        lines = (err or "").strip().splitlines()
+        verdict.fail("phantom_merge_unresolved", (
+            f"the merge {merge} does not resolve in {unit}'s canonical checkout {checkout} "
+            f"({lines[-1] if lines else 'git rev-parse failed'}); the fan-out's merge must be in "
+            "the unit's OWN repo"))
+        return verdict.settle()
+    sha = out.strip()
+    facts["merge"] = sha
+
+    code, out, _err = _git_out("-C", checkout, "rev-list", "--parents", "-n", "1", sha)
+    parents = out.split()[1:] if code == 0 else []
+    if not parents:
+        verdict.fail("phantom_merge_unresolved", (
+            f"{sha[:12]} has no first parent, so it has no first-parent diff to measure; the arm "
+            "judges MERGES (or any commit with a parent), never a root commit"))
+        return verdict.settle()
+    first_parent = parents[0]
+    facts["first_parent"] = first_parent
+
+    code, out, err = _git_out("-C", checkout, "diff", "--no-renames", "--name-only",
+                              first_parent, sha)
+    if code != 0:
+        lines = (err or "").strip().splitlines()
+        verdict.fail("phantom_merge_unresolved", (
+            f"the first-parent diff {first_parent[:12]}..{sha[:12]} could not be measured "
+            f"({lines[-1] if lines else 'git diff failed'})"))
+        return verdict.settle()
+    measured = sorted({name for name in out.splitlines() if name})
+    facts["paths"] = measured
+    facts["path_count"] = len(measured)
+    if measured != declared_paths:
+        verdict.fail("phantom_diff_mismatch", (
+            f"the declared paths are not {sha[:12]}'s FIRST-PARENT diff. MEASURED with "
+            f"`git diff --no-renames --name-only {first_parent[:12]} {sha[:12]}`: "
+            f"{_brief(measured)}. Copy that list verbatim into proof.paths"))
+        return verdict.settle()
+
+    try:
+        specs = _manifest_includes(manifest_path)
+    except OSError as exc:
+        verdict.fail("phantom_unverifiable", (
+            f"{unit}'s manifest {manifest_path} cannot be read ({exc}), so its ship set is "
+            "unknown and this claim is unproven"))
+        return verdict.settle()
+    if not specs:
+        verdict.fail("phantom_unverifiable", (
+            f"{unit}'s manifest {manifest_path} declares no `include` line, so there is no ship "
+            "set to weigh the merge against"))
+        return verdict.settle()
+    facts["manifest_sha256"] = _hash_file(manifest_path)
+    facts["include_count"] = len(specs)
+
+    shipped, rev_facts = _shipped_files(checkout, specs, (("head", "HEAD"), ("merge", sha)))
+    facts["ship_set_revs"] = rev_facts
+    facts["ship_set_size"] = len(shipped)
+    if not shipped:
+        verdict.fail("phantom_unverifiable", (
+            f"{unit}'s manifest names {len(specs)} include path(s), but NONE of them resolves to a "
+            f"file at {checkout}'s HEAD or at {sha[:12]}; a ship set of nothing proves nothing"))
+        return verdict.settle()
+
+    contested = [name for name in measured if name in shipped]
+    if contested:
+        verdict.fail("phantom_paths_shipped", (
+            f"{unit} SHIPS {len(contested)} of the merge's {len(measured)} first-parent paths "
+            f"({_brief(contested)}), so this card is REAL WORK for that unit, not a phantom: land "
+            "it on the train and complete it with the ordinary landed proof"))
+        return verdict.settle()
+
+    facts["dest_exists"] = os.path.isdir(dest)
+    facts["measured_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    verdict.detail = (
+        f"closed as NOT-WORK (fan-out phantom, not a discharge): {unit} ships none of "
+        f"{sha[:12]}'s {len(measured)} first-parent path(s) — measured {_brief(measured)} — "
+        f"judged against its own manifest {manifest} ({len(shipped)} file(s) shipped, dest {dest})")
+    return verdict.settle()
+
+
 def evaluate(
     proof: Any,
     conn: Optional[sqlite3.Connection] = None,
@@ -1486,6 +1832,7 @@ def evaluate(
     run_store_path: Optional[str] = None,
     overrides_root: Optional[str] = None,
     preroll_root: Optional[str] = None,
+    control_root: Optional[str] = None,
 ) -> Verdict:
     """Judge a ``landed`` card's proof block against the stores, never against its prose.
 
@@ -1498,6 +1845,12 @@ def evaluate(
             f"artifact, its landing, and a run or probe dated after it. Pass {PROOF_SHAPE}"))
     if not isinstance(proof, dict):
         return Verdict(False, "malformed_proof", f"proof must be an object; {PROOF_SHAPE}")
+    mechanism = _phantom_mechanism(proof)
+    if mechanism:
+        # The phantom door is judged INSTEAD of the landed clauses, before anything expects
+        # artifacts: a card the fan-out over-filed has none and never will (see the module
+        # docstring). Its verdict carries ``facts["closure"] == "not-work"``, never a discharge.
+        return _phantom_verdict(proof, control_root=control_root)
     entries = _artifacts(proof)
     if not entries:
         return Verdict(False, "malformed_proof", (
@@ -1593,6 +1946,20 @@ def render(task_id: str, verdict: Verdict) -> str:
         parts.append(
             "Also failing, and not fixed by the first clause (every one of these has to "
             "clear): " + "; ".join(f"[{f['clause']}] {f['detail']}" for f in others) + ".")
+    if verdict.cause in _PHANTOM_CAUSES:
+        if verdict.cause == "phantom_paths_shipped":
+            parts.append(
+                "This card is NOT a phantom, so there is nothing to waive and nothing to "
+                "archive: it is real work for a unit that ships the merge's paths. Close it "
+                "with the ordinary landed proof — the deployed artifact, its landing, and a "
+                "run dated after it.")
+            return " ".join(parts)
+        parts.append(
+            "The fan-out-phantom door owes nothing to the landed contract and gives it "
+            "nothing: " + _PHANTOM_SHAPE + ". The unit must be a projects.conf key, the merge "
+            "must resolve in that unit's OWN canonical checkout, and paths must be the "
+            "FIRST-PARENT diff measured above (copy the list the refusal printed).")
+        return " ".join(parts)
     if verdict.cause == "run_store_unavailable":
         parts.append(
             "This refusal is about the INSTRUMENT, not the claim: the run store could not be "

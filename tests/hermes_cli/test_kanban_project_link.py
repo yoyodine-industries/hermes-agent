@@ -10,6 +10,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import projects_db as pdb
 
 
@@ -135,3 +136,57 @@ def test_derived_branch_name_falls_back_when_the_title_yields_nothing(kanban_con
 
     assert task.branch_name == f"{proj.slug}/{tid}"
     assert _git_accepts(task.branch_name)
+
+
+# --- t_2500d9fb: the sanitizer's STATED contract, not just its production output
+#
+# Both production entry points were already safe, but the docstring claimed three
+# properties it did not have, and a future direct caller would read the docstring:
+#
+#   * not idempotent — stripping a leading '-' AFTER the component rules exposed a
+#     leading '.' or '/', which the next pass then stripped again;
+#   * not "always a ref git accepts" — the exposed leading '.'/'/' is exactly a ref
+#     git refuses;
+#   * not byte-identical for a valid name — git forbids a dot only at the END of
+#     the ref, while the code applied rstrip('.') per component.
+#
+# These pin the contract itself. Assertions go through git's own
+# `check-ref-format`, never a hard-coded string.
+
+_LEADING_DASH_COUNTEREXAMPLES = ["-.@", "-.a", "-/a", "-/.lock", "\x00..a"]
+
+
+@pytest.mark.parametrize("raw", _LEADING_DASH_COUNTEREXAMPLES)
+def test_sanitizer_output_is_a_fixpoint_git_accepts(raw):
+    once = pdb.sanitize_branch_name(raw, fallback="wt/t_dddd0001")
+
+    assert _git_accepts(once), once
+    assert pdb.sanitize_branch_name(once, fallback="wt/t_dddd0001") == once
+
+
+@pytest.mark.parametrize("raw", ["9./zb@1.0", "a./b", "0{./}z9"])
+def test_sanitizer_leaves_a_git_valid_name_byte_identical(raw):
+    # A non-final component ending in '.' is legal: only the ref's END may not be '.'.
+    assert _git_accepts(raw), raw
+    assert pdb.sanitize_branch_name(raw, fallback="wt/t_dddd0002") == raw
+
+
+@pytest.mark.parametrize("raw", _LEADING_DASH_COUNTEREXAMPLES)
+def test_dispatch_seam_repairs_each_counterexample_to_an_accepted_ref(raw):
+    repaired = kbw.safe_branch_name(raw, task_id="t_dddd0003")
+
+    assert _git_accepts(repaired), repaired
+
+
+def test_dispatch_seam_fails_closed_when_git_cannot_verify_the_name():
+    """A NUL byte cannot be passed to execve, so the probe RAISES.
+
+    The old bare ``except`` returned True for that, so the unverified name went
+    straight to ``git worktree add`` — the name is now repaired instead.
+    """
+    nul = "wt/t_dddd0004\x00tail"
+
+    assert kbw._git_ref_accepted(nul) is False
+    repaired = kbw.safe_branch_name(nul, task_id="t_dddd0004")
+    assert repaired != nul
+    assert _git_accepts(repaired), repaired
