@@ -2133,6 +2133,43 @@ def current_profile_name(default: str | None = None) -> str | None:
         return default
 
 
+def resolve_acting_profile_name(default: str | None = None) -> str:
+    """The name to RECORD as the author of a board write made by this process.
+
+    A gateway-served session carries no ``HERMES_PROFILE`` in ``os.environ`` and its
+    ``HERMES_HOME`` is the DEFAULT root, so the home-derived answer is ``"default"`` and
+    every comment it wrote was authored by nobody. Resolution order:
+
+        HERMES_PROFILE_NAME -> HERMES_PROFILE -> HERMES_SESSION_PROFILE (the bound
+        gateway session's mirror) -> the profile id derived from HERMES_HOME -> *default*
+
+    A bound ``HERMES_HOME`` override is authoritative on its own (a routed turn or a
+    multiplexed cron tick runs FOR its profile); reading the env pins there would
+    re-label that profile's writes with the launching host's identity, which is why
+    ``current_profile_name`` skips them too. Never raises: an author is a label, and a
+    board write must not fail over one.
+    """
+    fallback = default or "default"
+    from hermes_constants import get_hermes_home_override
+    try:
+        if get_hermes_home_override() is not None:
+            return get_active_profile_name() or fallback
+        for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+            value = (os.environ.get(env_name) or "").strip()
+            if value:
+                return value
+        try:
+            from gateway.session_context import get_session_env
+            session_profile = (get_session_env("HERMES_SESSION_PROFILE") or "").strip()
+        except Exception:
+            session_profile = ""
+        if session_profile:
+            return session_profile
+        return get_active_profile_name() or fallback
+    except Exception:
+        return fallback
+
+
 # Export / Import
 
 def _inside_git_checkout(path: Path) -> bool:
