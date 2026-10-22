@@ -188,7 +188,7 @@ def test_an_unresolvable_project_warns_and_is_recorded_on_the_created_event(home
 
     payload = _created_payload(tid)
     assert payload["project_link_unresolved"] == "p_deadbeef"
-    assert payload["project_link_source"] == "argument"
+    assert payload["project_link_source"] == "explicit"  # the caller's own argument (t_b407489b)
 
 
 def test_the_cli_create_surfaces_the_warning_on_the_terminal(home, capsys):
