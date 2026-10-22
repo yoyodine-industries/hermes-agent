@@ -47,6 +47,93 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
+def _admission_gate_enabled() -> bool:
+    """``skills.admission_gate`` (default True): the PEN-side admission gate.
+
+    Whether a NEW skill may exist at all is the same question the skills publish door answers
+    (`tools/skill_admission.py`, the port of `skills_publish_nodes.py::admission`). The door
+    answers it at publish time, when the file is already on disk and loadable; this is the
+    same judgement applied before `mkdir`/write, which is where proliferation is actually
+    decided. Set it false only to bootstrap a corpus, where every create would legitimately
+    restate a skill that has not been written yet.
+    """
+    try:
+        from hermes_cli.config import load_config
+        return is_truthy_value(cfg_get(load_config(), "skills", "admission_gate"), default=True)
+    except Exception:
+        return True
+
+
+def _admission_corpus_roots() -> list[Path]:
+    """The skills the agent can see — the corpus a new skill must be material against."""
+    try:
+        from agent.skill_utils import get_all_skills_dirs
+        return [Path(d) for d in get_all_skills_dirs()]
+    except Exception:
+        logger.debug("admission corpus roots unavailable; using the active skills dir", exc_info=True)
+        return [_skills_dir()]
+
+
+def _admission_references_hint(verdict: dict[str, Any], name: str) -> str:
+    """The `references/` file the refused draft should have been written as instead."""
+    fold_path = str(verdict.get("fold_path") or "")
+    if not fold_path:
+        return ""
+    skill_dir = Path(fold_path).parent
+    existing = skill_dir / "references" / f"{name}.md"
+    if existing.exists():
+        return f"{existing} (the file exists — extend it)"
+    return str(existing)
+
+
+def _record_admission_refusal(name: str, verdict: dict[str, Any]) -> None:
+    """Append the refusal to the skills ledger; best-effort, never blocks the refusal itself."""
+    try:
+        from tools.skill_usage import record_admission_refusal
+        record_admission_refusal(name, disposition=str(verdict.get("disposition") or ""),
+                                 existing_skill=str(verdict.get("fold_target") or ""),
+                                 reason=str(verdict.get("reason") or ""))
+    except Exception:
+        logger.debug("admission refusal ledger write failed for %s", name, exc_info=True)
+
+
+def _admission_refusal(name: str, content: str) -> Optional[dict[str, Any]]:
+    """Refuse a NEW skill that restates an existing one; None when the draft is material.
+
+    The judgement is `tools/skill_admission.py` — one rule shared with the publish door, so a
+    draft the door would fold or reject cannot be minted at the pen and laundered later. A
+    refusal names the existing skill, its path, the `references/` file to extend instead, and
+    the rule that fired, then records itself in the ledger.
+
+    An internal fault in the judge fails OPEN (logged), not closed: this is a policy gate, and
+    a bug in it must not stop every lane from learning. That is the opposite of the door's
+    choice, where an unreadable corpus must not admit anything — there the corpus is a
+    deployment artifact, here it is the live tree.
+    """
+    if not _admission_gate_enabled():
+        return None
+    try:
+        from tools.skill_admission import refusal_message, verdict_for_content
+        verdict = verdict_for_content(name, content, _admission_corpus_roots())
+    except Exception:
+        logger.warning("skill admission gate could not judge %r; admitting it", name, exc_info=True)
+        return None
+    if verdict.get("disposition") not in ("fold", "reject"):
+        return None
+    _record_admission_refusal(name, verdict)
+    message = refusal_message(verdict, references_hint=_admission_references_hint(verdict, name))
+    return _err(message, refused_by="admission", admission={
+        "disposition": verdict.get("disposition"),
+        "fold_target": verdict.get("fold_target") or "",
+        "fold_path": verdict.get("fold_path") or "",
+        "novelty": verdict.get("novelty"),
+        "context_tokens": verdict.get("context_tokens"),
+        "matches": verdict.get("matches") or [],
+        "reason": verdict.get("reason") or "",
+        "corpus_size": verdict.get("corpus_size"),
+    })
+
+
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     """Post-write scan (opt-in); error string if blocked, else None. An "ask" verdict
     (dangerous findings) is surfaced as an error so the agent can retry without them."""
@@ -456,6 +543,10 @@ def _create_skill(name: str, content: str, category: str | None = None) -> dict[
         return _err(err)
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
+    # The pen-side admission gate: BEFORE mkdir, so a restatement of an existing skill never
+    # reaches disk. Same judgement as the publish door (tools/skill_admission.py).
+    if refusal := _admission_refusal(name, content):
+        return refusal
     skill_dir = _resolve_skill_dir(name, category)
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(skill_dir.parent)
@@ -601,6 +692,43 @@ def _rmdir_if_empty(parent: Path, stop: Path) -> None:
         parent.rmdir()
 
 
+def _support_file_admission_refusal(name: str, skill_dir: Path, file_path: str,
+                                    file_content: str) -> Optional[dict[str, Any]]:
+    """Refuse a NEW `references/` file that restates an ENTIRE other skill.
+
+    Adding a support file is the other cheap way to grow the corpus, so a new topical file
+    gets the same judgement as a new skill — from the side that matters: a file that restates
+    a whole other skill is that skill's content, filed in the wrong place. Only the FOLD line
+    applies (a reference file legitimately has no standalone description and can be short).
+    """
+    if not _admission_gate_enabled():
+        return None
+    try:
+        from tools.skill_admission import refusal_message, verdict_for_support_file
+        verdict = verdict_for_support_file(name, file_content, _admission_corpus_roots(),
+                                           exclude=[skill_dir])
+    except Exception:
+        logger.warning("support-file admission gate could not judge %r; writing it", file_path,
+                       exc_info=True)
+        return None
+    if verdict.get("disposition") != "fold":
+        return None
+    _record_admission_refusal(f"{name}/{file_path}", verdict)
+    target = str(verdict.get("fold_target") or "")
+    hint = str(Path(str(verdict.get("fold_path") or "")).parent / "references" /
+               Path(file_path).name) if verdict.get("fold_path") else ""
+    message = refusal_message(verdict, references_hint=hint,
+                              subject="the new support file '%s' under '%s'" % (file_path, name))
+    return _err(message, refused_by="admission", admission={
+        "disposition": verdict.get("disposition"),
+        "fold_target": target,
+        "fold_path": verdict.get("fold_path") or "",
+        "novelty": verdict.get("novelty"),
+        "matches": verdict.get("matches") or [],
+        "reason": verdict.get("reason") or "",
+    })
+
+
 def _write_file(name: str, file_path: str, file_content: str) -> dict[str, Any]:
     """Add or overwrite a supporting file within any skill directory."""
     if err := _validate_file_path(file_path):
@@ -616,7 +744,13 @@ def _write_file(name: str, file_path: str, file_content: str) -> dict[str, Any]:
     if guard:
         return guard
     target, err = _resolve_supporting_file(skill_dir, file_path)
-    if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
+    if err:
+        return err
+    # A NEW references/ file carries new knowledge into the corpus: judge it before the write.
+    if file_path.startswith("references/") and not target.exists():
+        if refusal := _support_file_admission_refusal(name, skill_dir, file_path, file_content):
+            return refusal
+    if guard := _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
         return guard
     result = {"success": True, "message": f"File '{file_path}' written to skill '{name}'.", "path": str(target)}
     # references/ is where per-session hoarding shows up; surface the sprawl finding on the write

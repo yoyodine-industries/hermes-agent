@@ -830,7 +830,7 @@ def _install_skill(identifier: str, category: str, force: bool, c: Console, skip
     attempt = attempt if attempt is not None else {}
     attempt["registry"] = "none"
     from tools.skills_hub import HubLockFile, ensure_hub_dirs, skills_hub_http_session
-    from tools.skills_hub_install import install_from_quarantine, quarantine_bundle
+    from tools.skills_hub_install import AdmissionRefused, install_from_quarantine, quarantine_bundle
     from tools.skills_guard import should_allow_install
     ensure_hub_dirs()
     from tools.skills_sync_bundled_ops import bundled_skill_for_install
@@ -915,6 +915,13 @@ def _install_skill(identifier: str, category: str, force: bool, c: Console, skip
 
     try:
         install_dir = install_from_quarantine(q_path, bundle.name, category, bundle, result)
+    except AdmissionRefused as exc:
+        # Refused for what the bundle SAYS, not for a malformed bundle: say so, and name the
+        # skill it collided with (the refusal text carries the fold target and the fix).
+        c.print(Panel(str(exc), title="Not installed: admission refused", border_style="yellow"))
+        shutil.rmtree(q_path, ignore_errors=True)
+        attempt["failure_class"] = "admission_refused"
+        return bundle, failed, False
     except ValueError as exc:
         _invalid_path(c, bundle, exc, q_path)
         attempt["failure_class"] = "invalid_bundle"
