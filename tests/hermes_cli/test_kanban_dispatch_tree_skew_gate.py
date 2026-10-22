@@ -28,13 +28,29 @@ status on a surface a human reads. The check is O(tick), never O(cards).
   every refusal, so the board carried NO card until a human bounced the gateway;
 * the card is filed on the OPS board, at the rung the board's own priority ladder returns (DEC-3).
 
+**DEC-1..DEC-3 -- the per-episode identity, the freeze-proof door, and retirement** (cards
+``t_a54c8157`` design / ``t_ad5dc5d5`` implementation):
+
+* identity is the EPISODE, not the process: the signature is the imported CONTENT alone and the
+  window is ``<sig>:<first_tick>``, so two pids on the same content are ONE stall with ONE streak and
+  ONE card, while a stall that cleared and came back is a new window and gets a new card (DEC-1);
+* the door that survives a frozen dispatcher is the escalation REGISTRY -- one durable row plus the
+  DM it sends -- attempted ONCE per episode and bounded by the status record's ``delivery`` block,
+  with the card as the RECORD and the ops-seat peer nudge as the fallback leg (DEC-2);
+* the first tick that serves normally again retires the cleared episode's actor cards through the
+  kernel's own doors -- ``unblock_task`` then ``complete_task`` -- while a card filed by a still-live
+  FOREIGN process is left alone (DEC-3).
+
 The cases are named A1..A10 after the acceptance plan in
-``/opt/hermes_sandbox/platform/work/platform-stl/t_0b2118cb-tree-skew-streak/acceptance/TESTPLAN.md``.
+``/opt/hermes_sandbox/platform/work/platform-stl/t_0b2118cb-tree-skew-streak/acceptance/TESTPLAN.md``;
+the ``dod_*`` cases carry this card's own DoD (i)/(ii)/(iii).
 
 Everything here runs on a SCRATCH surface: the ticking board and the ops board are both throwaway
-DBs under ``tmp_path``, ``TICK_YIELD_ACTOR_BOARD`` is pointed at the scratch ops board, and the
-repo's hermetic fixture (``tests/conftest.py::_hermetic_environment``) strips the dispatcher's
-``HERMES_KANBAN_*`` pins -- so the fleet's ``migrations`` board is unreachable from this module.
+DBs under ``tmp_path``, ``TICK_YIELD_ACTOR_BOARD`` is pointed at the scratch ops board, the
+escalation registry is a FAKE module injected by path (never the live ``escalations.db``), the peer
+leg is recorded instead of spawned, and the repo's hermetic fixture
+(``tests/conftest.py::_hermetic_environment``) strips the dispatcher's ``HERMES_KANBAN_*`` pins --
+so the fleet's ``migrations`` board is unreachable from this module.
 """
 
 from __future__ import annotations
@@ -62,6 +78,47 @@ OPS_BOARD = "scratch-ops"
 #: test. Reading it tolerantly keeps every failure below behavioural.
 THRESHOLD = getattr(kbd, "TICK_YIELD_ACTOR_THRESHOLD", 3)
 
+#: The fake registry module. Written to ``tmp_path`` and loaded by the SHIPPED loader
+#: (``importlib`` by path), so the delivery path exercised is the real one; it appends every call to
+#: a JSONL file the assertions read back. ``__CALLS__`` is substituted with the file's path.
+FAKE_LEDGER_TEMPLATE = '''
+import json
+
+CALLS = __CALLS__
+
+
+def _read():
+    try:
+        with open(CALLS, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+    except OSError:
+        return []
+
+
+def _record(kind, payload):
+    with open(CALLS, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"kind": kind, **payload}) + "\\n")
+
+
+def register(**kwargs):
+    rows = [call for call in _read() if call["kind"] == "register"]
+    ref = "ESC-%05d" % (len(rows) + 1)
+    payload = {key: value for key, value in kwargs.items() if key != "submission"}
+    payload["ref"] = ref
+    _record("register", payload)
+    return {"ref": ref, "created": True}
+
+
+def notify(ref, owner_lane, line, **kwargs):
+    _record("notify", {"ref": ref, "owner_lane": owner_lane, "line": line})
+    return {"ref": ref, "notify_state": "sent"}
+'''
+
+#: A registry candidate that raises on IMPORT -- DEC-2.1's named-failure arm.
+BROKEN_LEDGER_TEMPLATE = '''
+raise RuntimeError("simulated: the ledger module is half-landed")
+'''
+
 
 # ---------------------------------------------------------------------------------------------
 # fixtures
@@ -82,6 +139,30 @@ def _isolate_boot_state(monkeypatch):
     yield
     tf.reset_boot()
     tf._content_memo.clear()
+
+
+@pytest.fixture(autouse=True)
+def _escalation_door(tmp_path, monkeypatch):
+    """Point DEC-2's door at a FAKE registry by path, and make leg 2 inert-but-recorded.
+
+    Nothing in this module may reach the live estate: the real ``escalations.db`` (a durable
+    escalation row per test) or a ``hermes peer run`` child (a DM per test). The fake is injected
+    through the SAME env-var first hop the shipped loader reads, so the loader, the call shape and
+    the bounded-retry logic are all the real ones.
+    """
+    calls = tmp_path / "escalation-calls.jsonl"
+    module = tmp_path / "fake_escalation_ledger.py"
+    module.write_text(
+        FAKE_LEDGER_TEMPLATE.replace("__CALLS__", repr(str(calls))), encoding="utf-8")
+    monkeypatch.setenv(kbd.TICK_YIELD_ESCALATION_ENV, str(module))
+    peer_calls: list = []
+
+    def _peer(line, episode):
+        peer_calls.append({"line": line, "episode": episode})
+        return "sent", None
+
+    monkeypatch.setattr(kbd, "_peer_run_tree_skew", _peer)
+    yield {"calls": calls, "peer": peer_calls, "module": module, "tmp_path": tmp_path}
 
 
 @pytest.fixture
@@ -159,19 +240,87 @@ def _ticking_rows(conn):
     return _rows(conn)
 
 
-def _close_card(task_id: str) -> None:
-    """Close a carrier the way a worker does -- it leaves the LIVE set."""
+def _status_record():
+    path = kbd.tick_yield_status_path()
+    return path, (json.loads(path.read_text(encoding="utf-8")) if path.exists() else None)
+
+
+def _ledger_calls(door, kind=None):
+    """Every call the fake registry recorded (``register`` / ``notify``), oldest first."""
+    path = door["calls"]
+    if not path.exists():
+        return []
+    rows = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    return [row for row in rows if kind is None or row.get("kind") == kind]
+
+
+#: Monotonic counter so each :func:`_clear_the_episode` call edits DIFFERENT content.
+_EPISODE_SEQ = [0]
+
+
+def _clear_the_episode(conn, tree):
+    """One refusal (marker written, no card yet), then a rewind: the next tick SERVES.
+
+    The serving tick is DEC-3's trigger -- it retires the marker, and the episode with it. The
+    edited body is unique per call so a SECOND call in one test is a second, genuinely different
+    skew rather than a no-op write.
+    """
+    _EPISODE_SEQ[0] += 1
+    tf.reset_boot()
+    tf.record_boot()
+    _edit(tree, body=f"VALUE = 2\n# episode {_EPISODE_SEQ[0]}\n")
+    _tick(conn)
+    tf.reset_boot()
+    tf.record_boot()
+    return _tick(conn)
+
+
+def _seed_legacy_actor(*, pid, ordinal=1, status="scheduled", sig=None):
+    """A carrier in the LEGACY key shape, ``tree-skew:<sig>:<pid>:<ord>``.
+
+    78 of those are live on the fleet's ops board, and DEC-3 must drain them by the pid they carry.
+    The signature is deliberately foreign, so the seeded card can never absorb (or be absorbed by)
+    the episode under test.
+    """
+    sig = sig or ("tree-content:" + "a" * 64)
     conn = kbc.connect(board=OPS_BOARD)
     try:
+        task_id = kb.create_task(
+            conn,
+            title=kbd.TICK_YIELD_ACTOR_TITLE,
+            body="legacy carrier (pre-DEC-1 key shape)",
+            assignee=kbd.TICK_YIELD_ACTOR_ASSIGNEE,
+            created_by="kanban-dispatcher",
+            idempotency_key=f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{sig}:{pid}:{ordinal}",
+        )
         with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        return task_id
     finally:
         conn.close()
 
 
-def _status_record():
-    path = kbd.tick_yield_status_path()
-    return path, (json.loads(path.read_text(encoding="utf-8")) if path.exists() else None)
+def _actor_status(task_id):
+    conn = kbc.connect(board=OPS_BOARD)
+    try:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return row["status"] if row is not None else None
+    finally:
+        conn.close()
+
+
+def _actor_event_kinds(task_id):
+    conn = kbc.connect(board=OPS_BOARD)
+    try:
+        return [
+            row["kind"] for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -272,9 +421,13 @@ def test_a_byte_identical_rewrite_reads_clean(board, tree):
 # ---------------------------------------------------------------------------------------------
 
 
-def test_a1_one_refused_tick_records_the_streak_and_files_nothing(board, tree):
+def test_a1_one_refused_tick_records_the_streak_and_files_nothing(board, tree, _escalation_door):
     """A1. One refusal is churn, not a stall: the record carries the streak, the board carries
-    no card."""
+    no card.
+
+    DEC-1.1/1.3: the signature is the imported CONTENT (no pid), and the episode is that content
+    plus the window's start. The pid is still written, as evidence.
+    """
     conn = board
     tf.record_boot()
     _edit(tree)
@@ -287,8 +440,13 @@ def test_a1_one_refused_tick_records_the_streak_and_files_nothing(board, tree):
     assert record["version"] == 2, "the record must carry the streak fields (version 2)"
     assert record["streak"] == 1
     assert record["first_tick"] == record["last_tick"], "one tick is its own window"
-    assert record["sig"] == f"{record['boot_fingerprint']}:{record['pid']}"
+    assert record["sig"] == record["boot_fingerprint"], "identity is the imported content, no pid"
+    assert f":{record['pid']}" not in record["sig"], "the pid is NOT identity (DEC-1.1)"
+    assert record["pid"] == tf.boot_record()["pid"], "the pid is still EVIDENCE"
+    assert record["episode"] == f"{record['sig']}:{record['first_tick']}"
     assert record["threshold"] == THRESHOLD
+    assert record["delivery"] is None, "below the threshold the door is not knocked on"
+    assert _escalation_door["peer"] == []
     assert _actor_rows() == [], "the FIRST refusal must not file a card"
     assert _ticking_rows(conn) == []
 
@@ -313,9 +471,11 @@ def test_a2_two_refused_ticks_climb_the_streak_and_still_file_nothing(board, tre
 # ---------------------------------------------------------------------------------------------
 
 
-def test_a3_the_third_refused_tick_files_exactly_one_actor_on_the_ops_board(board, tree):
+def test_a3_the_third_refused_tick_files_exactly_one_actor_on_the_ops_board(
+    board, tree, _escalation_door,
+):
     """A3. The act fires AT the threshold, on the OPS board, addressed to the ops seat, keyed
-    ``tree-skew:<signature>:1``.
+    ``tree-skew:<signature>:<window_start>`` (DEC-1.4).
 
     ``priority`` is asked of the board's own ladder. This scratch board carries no
     ``priority_policy``, so the ladder answers ``None`` and the card keeps the kernel default --
@@ -335,14 +495,19 @@ def test_a3_the_third_refused_tick_files_exactly_one_actor_on_the_ops_board(boar
     rows = _actor_rows()
     assert len(rows) == 1, f"the third refusal files exactly ONE card, got {len(rows)}"
     row = rows[0]
+    record = _status_record()[1]
+    assert record["streak"] == 3
     assert row["assignee"] == kbd.TICK_YIELD_ACTOR_ASSIGNEE == "default"
     assert row["idempotency_key"] == (
-        f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{boot['fingerprint']}:{boot['pid']}:1"
-    )
+        f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{boot['fingerprint']}:{record['first_tick']}"
+    ), "the key is the CONTENT plus the WINDOW -- no pid, no ordinal"
     assert row["priority"] == 0, "no policy on the board: the kernel default, not an invented band"
     assert "no priority policy on board" in row["body"], row["body"]
     assert _ticking_rows(conn) == [], "the card must NOT land on the board that ticked"
-    assert _status_record()[1]["streak"] == 3
+    # DEC-2.4: the card quotes the escalation the door raised.
+    regs = _ledger_calls(_escalation_door, "register")
+    assert len(regs) == 1
+    assert f"- escalation: `{regs[0]['ref']}`" in row["body"], row["body"]
 
 
 def test_a3_the_priority_is_asked_of_the_ladder_and_used(board, tree, monkeypatch):
@@ -386,84 +551,129 @@ def test_a4_n_more_ticks_keep_exactly_one_card_and_the_streak_climbing(board, tr
         assert len(_actor_rows()) == 1, "one stall is one card, however long it runs"
         assert _status_record()[1]["streak"] == expected, "the streak keeps climbing"
 
-    assert _actor_rows()[0]["idempotency_key"].endswith(":1")
+    assert _actor_rows()[0]["idempotency_key"].endswith(
+        f":{_status_record()[1]['first_tick']}"
+    ), "a window key, not an ordinal"
 
 
 # ---------------------------------------------------------------------------------------------
-# A5 -- the re-open leg: a DONE carrier never absorbs a new occurrence
+# A5 -- the WINDOW: a cleared episode never absorbs the next one
 # ---------------------------------------------------------------------------------------------
 
 
-def test_a5_a_closed_carrier_is_re_opened_at_the_next_ordinal(board, tree):
-    """A5. THE defect this card exists for.
+class _Clock:
+    """A forward-only clock shim for :mod:`hermes_cli.kanban_db_dispatch`.
+
+    Windows are second-granular, and a test drives several windows inside one second. Real episodes
+    are minutes apart (a reload plus a re-skew), so the shim moves the clock, never the code.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.offset = 0
+
+    def time(self):
+        return self._real.time() + self.offset
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_a5_a_cleared_episode_never_absorbs_the_next_window(
+    board, tree, monkeypatch, _escalation_door,
+):
+    """A5. THE defect this card exists for, in its DEC-1.4 form.
 
     On 2026-10-11 three guard cards were closed on a correct measurement, the stall continued under
     the same gateway pid, and the closed carrier's key swallowed every refusal -- the board carried
-    NO card until a human bounced the gateway at 04:45. A closed carrier must therefore never
-    absorb the recurrence: the next streak files a NEW card at the next ordinal.
+    NO card until a human bounced the gateway at 04:45. One stall is one card, but a CLEARED stall is
+    a different episode: its carrier is terminal, and the next window mints a new key from its own
+    ``first_tick``.
     """
+    import time as real_time
+
+    clock = _Clock(real_time)
+    monkeypatch.setattr(kbd, "time", clock)
     conn = board
     tf.record_boot()
     _edit(tree)
+    skewed = dict(tf.boot_record())
 
     for _ in range(THRESHOLD):
         _tick(conn)
     first = _actor_rows()
-    assert len(first) == 1, f"the first streak files one card, got {len(first)}"
-    _close_card(first[0]["id"])
+    assert len(first) == 1, f"the first window files one card, got {len(first)}"
+    first_key = first[0]["idempotency_key"]
+    first_window = _status_record()[1]["first_tick"]
 
+    # The episode CLEARS: rewind to the recorded content. The SERVING tick retires the carrier
+    # (DEC-3), which is also what makes the old key terminal.
+    tf.reset_boot()
+    tf.record_boot()
+    _tick(conn)
+    assert _actor_rows()[0]["status"] == "done", "a cleared episode retires its carrier"
+    assert _status_record()[1] is None
+
+    # The SAME imported content skews again: same signature, NEW window.
+    clock.offset += 60
+    monkeypatch.setattr(tf, "_boot_record", skewed)
     for _ in range(THRESHOLD):
         _tick(conn)
 
     rows = _actor_rows()
-    assert len(rows) == 2, f"the recurrence must file a SECOND card, got {len(rows)}: {rows}"
-    assert rows[0]["id"] != rows[1]["id"], "a new occurrence is a new card, not a comment"
-    closed = [r for r in rows if r["status"] == "done"]
-    live = [r for r in rows if r["status"] not in ("done", "archived")]
-    assert len(closed) == 1 and closed[0]["idempotency_key"].endswith(":1"), rows
-    assert len(live) == 1, f"exactly one carrier must be live, got {rows}"
-    assert live[0]["idempotency_key"].endswith(":2"), live[0]["idempotency_key"]
+    assert len(rows) == 2, f"the next window must file a SECOND card, got {rows}"
+    record = _status_record()[1]
+    assert record["first_tick"] > first_window
+    assert rows[1]["idempotency_key"] == (
+        f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{skewed['fingerprint']}:{record['first_tick']}"
+    ), "the new window keys from its OWN first tick"
+    assert rows[1]["idempotency_key"] != first_key
+    assert rows[1]["status"] not in ("done", "archived"), "the new carrier is live"
 
-    # ...and THAT carrier is live again, so a further refusal is absorbed once more.
+    # ...and THAT carrier is live, so a further refusal inside the window is absorbed again.
     _tick(conn)
     assert len(_actor_rows()) == 2
+    # DEC-2.4: one delivery attempt per episode -- two windows, two rows, two nudges, no more.
+    assert len(_ledger_calls(_escalation_door, "register")) == 2
+    assert len(_ledger_calls(_escalation_door, "notify")) == 2
 
 
 # ---------------------------------------------------------------------------------------------
-# A6 -- the signature is the frozen process, and each process runs its own streak
+# A6 -- the identity is the EPISODE, not the process
 # ---------------------------------------------------------------------------------------------
 
 
-def test_a6_each_frozen_process_runs_its_own_streak(board, tree, monkeypatch):
-    """A6/DEC-1. ``boot_fingerprint:boot_pid`` is the identity: a process that boots AFTER a reload
-    and is AGAIN skewed is a genuinely new stall, with its own streak and its own card."""
+def test_a6_two_pids_on_the_same_content_are_one_streak_and_one_card(board, tree, monkeypatch):
+    """A6/DEC-1.1/1.2. ``boot_fingerprint`` alone is the identity: a respawned dispatcher on the
+    same imported content continues the SAME window -- same streak, same ``first_tick``, and the
+    SAME card -- instead of starting a second stall nobody asked for."""
     conn = board
     tf.record_boot()
     _edit(tree)
     boot = tf.boot_record()
 
-    for _ in range(THRESHOLD):
-        _tick(conn)
-    assert len(_actor_rows()) == 1
+    _tick(conn)
+    _tick(conn)
+    first_window = _status_record()[1]["first_tick"]
 
+    # The dispatcher respawns (a launchd bounce, a crash) on the SAME imported content.
     monkeypatch.setattr(tf, "_boot_record", {**boot, "pid": int(boot["pid"]) + 1})
-
     _tick(conn)
-    assert len(_actor_rows()) == 1, "the new process is only on its FIRST refusal"
+
+    rows = _actor_rows()
+    assert len(rows) == 1, f"one stalled revision is ONE card, got {rows}"
     record = _status_record()[1]
-    assert record["streak"] == 1, "a new signature starts its own streak"
-    assert record["pid"] == int(boot["pid"]) + 1
+    assert record["streak"] == 3, "the streak CONTINUES across pids (DEC-1.2)"
+    assert record["first_tick"] == first_window, "the window did NOT restart"
+    assert record["pid"] == int(boot["pid"]) + 1, "the pid is still recorded, as evidence"
+    assert rows[0]["idempotency_key"] == (
+        f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{boot['fingerprint']}:{first_window}"
+    ), "one window, one key -- no pid in it"
+
+    # A further refusal from the second pid is still absorbed.
     _tick(conn)
     assert len(_actor_rows()) == 1
-
-    _tick(conn)
-    rows = _actor_rows()
-    assert len(rows) == 2, "its OWN third refusal files its own card"
-    prefix = kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX
-    assert {r["idempotency_key"] for r in rows} == {
-        f"{prefix}{boot['fingerprint']}:{boot['pid']}:1",
-        f"{prefix}{boot['fingerprint']}:{int(boot['pid']) + 1}:1",
-    }, "each frozen process keys its OWN stall, from its own first ordinal"
+    assert _status_record()[1]["streak"] == 4
 
 
 # ---------------------------------------------------------------------------------------------
@@ -494,7 +704,7 @@ def test_a7_a_healthy_tick_retires_the_marker_and_the_streak_restarts(board, tre
     _tick(conn)
     record = _status_record()[1]
     assert record is not None and record["streak"] == 1, "consecutive, never cumulative"
-    assert record["sig"] == f"{skewed['fingerprint']}:{skewed['pid']}"
+    assert record["sig"] == skewed["fingerprint"], "the signature is the content, no pid"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -655,21 +865,326 @@ def test_n_ticks_on_a_skewed_tree_file_exactly_one_actor_card(board, tree):
     assert rows[0]["idempotency_key"].startswith(f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}")
 
 
-def test_a_different_frozen_process_may_file_its_own_card(board, tree, monkeypatch):
-    """The PID is what separates two stalls: the same tree skewing under a NEW process is a new
-    stall, and each must run its own streak to the threshold."""
+def test_a_different_frozen_process_on_the_same_content_absorbs_into_the_existing_card(
+    board, tree, monkeypatch,
+):
+    """DEC-1.1: the PID does NOT separate two stalls. A respawned dispatcher on the same imported
+    content is the same stalled revision, so its third refusal is the SAME window's third refusal --
+    one card, not one per process."""
     conn = board
     tf.record_boot()
     _edit(tree)
     boot = tf.boot_record()
     for _ in range(THRESHOLD):
         _tick(conn)
+    assert len(_actor_rows()) == 1
 
     monkeypatch.setattr(tf, "_boot_record", {**boot, "pid": int(boot["pid"]) + 1})
     for _ in range(THRESHOLD):
         _tick(conn)
 
-    assert len(_actor_rows()) == 2
+    rows = _actor_rows()
+    assert len(rows) == 1, f"ONE OPEN actor per imported content, got {rows}"
+    assert _status_record()[1]["streak"] == THRESHOLD * 2, "the streak carried across the respawn"
+
+
+# ---------------------------------------------------------------------------------------------
+# this card's own DoD (i)-(iv)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_dod_i_two_pids_on_one_content_are_one_streak_one_card_one_row_one_nudge(
+    board, tree, monkeypatch, _escalation_door,
+):
+    """DoD (i). Two pids, one refused content: ONE card, ONE streak, ONE window, ONE escalation
+    row, ONE nudge. The double row was the post-fix killer -- a door knocked on per process."""
+    conn = board
+    tf.record_boot()
+    _edit(tree)
+    boot = tf.boot_record()
+
+    for _ in range(THRESHOLD + 2):
+        _tick(conn)
+    first_window = _status_record()[1]["first_tick"]
+
+    monkeypatch.setattr(tf, "_boot_record", {**boot, "pid": int(boot["pid"]) + 1})
+    for _ in range(THRESHOLD + 2):
+        _tick(conn)
+
+    rows = _actor_rows()
+    record = _status_record()[1]
+    assert len(rows) == 1, f"one card, got {rows}"
+    assert record["streak"] == 2 * (THRESHOLD + 2), "one streak"
+    assert record["first_tick"] == first_window, "one window"
+    assert record["episode"] == f"{boot['fingerprint']}:{first_window}"
+    assert rows[0]["idempotency_key"].endswith(f":{first_window}")
+
+    regs = _ledger_calls(_escalation_door, "register")
+    notifies = _ledger_calls(_escalation_door, "notify")
+    assert len(regs) == 1, f"ONE escalation row for the episode, got {regs}"
+    assert len(notifies) == 1, f"ONE nudge for the episode, got {notifies}"
+    assert regs[0]["source_id"] == record["episode"], "keyed by the EPISODE"
+    assert regs[0]["board"] == OPS_BOARD
+    assert regs[0]["owner_lane"] == "default", "explicit owner_lane, never a live resolver read"
+    assert regs[0]["raised_by"] == "kanban-dispatcher"
+    assert boot["fingerprint"] in regs[0]["reason"]
+    assert notifies[0]["ref"] == regs[0]["ref"]
+    assert notifies[0]["owner_lane"] == "default"
+    assert record["delivery"]["ref"] == regs[0]["ref"]
+    assert record["delivery"]["leg"] == "ledger"
+    assert record["delivery"]["state"] == "sent"
+    assert record["delivery"]["error"] is None
+    assert _escalation_door["peer"] == [], "leg 2 must not run when leg 1 carried the door"
+
+
+def test_dod_iii_the_delivery_is_attempted_once_per_episode(board, tree, _escalation_door):
+    """DoD (iii). N more refused ticks after the attempt add NO second row and NO second nudge --
+    the status record's ``delivery`` block is the bound, and it survives every rewrite."""
+    conn = board
+    tf.record_boot()
+    _edit(tree)
+
+    for _ in range(THRESHOLD):
+        _tick(conn)
+    first_attempt = dict(_status_record()[1]["delivery"])
+    assert first_attempt["state"] == "sent"
+
+    for _ in range(5):
+        _tick(conn)
+
+    record = _status_record()[1]
+    assert record["streak"] == THRESHOLD + 5, "the streak keeps climbing"
+    assert record["delivery"] == first_attempt, "the attempt is not repeated, not overwritten"
+    assert len(_ledger_calls(_escalation_door, "register")) == 1
+    assert len(_ledger_calls(_escalation_door, "notify")) == 1
+    assert len(_actor_rows()) == 1
+
+
+def test_dod_ii_a_cleared_episode_retires_its_card_including_a_scheduled_one(board, tree):
+    """DoD (ii). The first tick that serves normally again retires the card the episode filed --
+    and it does so through ``unblock_task`` first, because a ``scheduled`` card is exactly the live
+    shape that ``complete_task`` refuses (42 of the 51 stale cards were ``scheduled``)."""
+    conn = board
+    tf.record_boot()
+    _edit(tree)
+    for _ in range(THRESHOLD):
+        _tick(conn)
+    rows = _actor_rows()
+    assert len(rows) == 1
+    task_id = rows[0]["id"]
+
+    # The live shape: scheduled, not ready.
+    conn2 = kbc.connect(board=OPS_BOARD)
+    try:
+        with kb.write_txn(conn2):
+            conn2.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (task_id,))
+    finally:
+        conn2.close()
+    assert _actor_status(task_id) == "scheduled"
+
+    # The episode clears.
+    tf.reset_boot()
+    tf.record_boot()
+    result = _tick(conn)
+
+    assert result.tick_yielded == "", "the tick served"
+    assert _actor_status(task_id) == "done", "the cleared episode's card is retired"
+    assert kbd.TICK_YIELD_RETIRED_EVENT in _actor_event_kinds(task_id)
+    assert _status_record()[1] is None, "the marker was retired by the same tick"
+
+    # A retirement writes its own evidence: who retired it, whose card it was, and the key.
+    conn3 = kbc.connect(board=OPS_BOARD)
+    try:
+        row = conn3.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC "
+            "LIMIT 1", (task_id, kbd.TICK_YIELD_RETIRED_EVENT),
+        ).fetchone()
+        payload = json.loads(row["payload"])
+        task = conn3.execute("SELECT status, result FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    finally:
+        conn3.close()
+    assert payload["reason"] == "gate-clear"
+    assert payload["retired_by_pid"] == os.getpid()
+    assert payload["key"] == rows[0]["idempotency_key"]
+    assert task["status"] == "done"
+    assert "[retired] episode cleared at" in task["result"]
+
+
+def test_dod_ii_a_card_whose_filing_pid_is_a_LIVE_foreign_process_is_left_alone(
+    board, tree, monkeypatch,
+):
+    """DEC-3.3. A frozen peer still holds that episode: retiring its card on OUR clean tick would
+    read green over a frozen gateway -- the exact false green this block exists to prevent."""
+    conn = board
+    _clear_the_episode(conn, tree)
+    foreign_pid = os.getpid() + 1
+    task_id = _seed_legacy_actor(pid=foreign_pid)
+    monkeypatch.setattr(kbd, "_pid_liveness", lambda pid: kbd.WORKER_ALIVE)
+
+    _clear_the_episode(conn, tree)
+
+    assert _actor_status(task_id) == "scheduled", "a LIVE foreign filing pid is not retired"
+    assert kbd.TICK_YIELD_RETIRED_EVENT not in _actor_event_kinds(task_id)
+
+
+def test_dod_ii_a_card_whose_filing_pid_is_PROVEN_dead_is_retired(board, tree, monkeypatch):
+    """The other arm of the fence: a DEAD filing pid's card is history, and history is retirable."""
+    conn = board
+    _clear_the_episode(conn, tree)
+    task_id = _seed_legacy_actor(pid=os.getpid() + 1)
+    monkeypatch.setattr(kbd, "_pid_liveness", lambda pid: kbd.WORKER_DEAD)
+
+    _clear_the_episode(conn, tree)
+
+    assert _actor_status(task_id) == "done"
+    assert kbd.TICK_YIELD_RETIRED_EVENT in _actor_event_kinds(task_id)
+
+
+def test_dod_ii_a_card_from_our_own_pid_is_retired_without_a_liveness_probe(board, tree):
+    """DEC-3.5: our own pid is alive by definition, so no probe is needed or wanted."""
+    conn = board
+    _clear_the_episode(conn, tree)
+    task_id = _seed_legacy_actor(pid=os.getpid())
+
+    _clear_the_episode(conn, tree)
+
+    assert _actor_status(task_id) == "done"
+
+
+def test_dod_ii_a_RUNNING_card_is_never_retired(board, tree):
+    """DEC-3.6: a card under a live claim is somebody's work, gate-clear or not."""
+    conn = board
+    _clear_the_episode(conn, tree)
+    task_id = _seed_legacy_actor(pid=os.getpid(), status="running")
+
+    _clear_the_episode(conn, tree)
+
+    assert _actor_status(task_id) == "running"
+    assert kbd.TICK_YIELD_RETIRED_EVENT not in _actor_event_kinds(task_id)
+
+
+def test_dod_ii_a_window_key_is_never_mistaken_for_a_legacy_pid():
+    """The key parse must not read a 10-digit epoch as a pid (DEC-3.3)."""
+    prefix = kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX
+    sig = "tree-content:" + "b" * 64
+    assert kbd._tree_skew_actor_pid_from_key(f"{prefix}{sig}:1770000000") is None
+    assert kbd._tree_skew_actor_pid_from_key(f"{prefix}{sig}:4321:2") == 4321
+    assert kbd._tree_skew_actor_pid_from_key("") is None
+    assert kbd._tree_skew_actor_pid_from_key("tree-skew:") is None
+
+
+def test_dod_iv_the_signature_and_the_streak_are_invariant_under_a_pid_change():
+    """DoD (iv), as a unit: the same content under two pids yields ONE signature, ONE episode, and
+    ONE key -- the pid is evidence, never identity."""
+    yielded_a = kbd.DispatcherTickYielded("tree-content:aaa", "tree-content:bbb", boot_pid=111)
+    yielded_b = kbd.DispatcherTickYielded("tree-content:aaa", "tree-content:bbb", boot_pid=222)
+    assert kbd._yield_signature(yielded_a) == kbd._yield_signature(yielded_b) == "tree-content:aaa"
+    assert kbd._episode_identity(kbd._yield_signature(yielded_a), 1770000000) == (
+        kbd._episode_identity(kbd._yield_signature(yielded_b), 1770000000)
+    )
+    assert yielded_a.boot_pid != yielded_b.boot_pid, "the pid is still carried, as evidence"
+
+
+# ---------------------------------------------------------------------------------------------
+# DEC-2 -- the door's two legs and its boundaries
+# ---------------------------------------------------------------------------------------------
+
+
+def test_the_escalation_source_prefers_env_then_config_then_the_estate_default(
+    monkeypatch, tmp_path,
+):
+    """DEC-2.1: the module path is resolved ENV first, then ``kanban.escalation_ledger``, then the
+    estate default -- and the default is what keeps the door armed on a tree declaring nothing."""
+    monkeypatch.setenv(kbd.TICK_YIELD_ESCALATION_ENV, str(tmp_path / "env_module.py"))
+    assert kbd._escalation_ledger_source() == str(tmp_path / "env_module.py")
+
+    monkeypatch.delenv(kbd.TICK_YIELD_ESCALATION_ENV)
+    holder = {"cfg": {"kanban": {"escalation_ledger": str(tmp_path / "cfg_module.py")}}}
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: holder["cfg"])
+    assert kbd._escalation_ledger_source() == str(tmp_path / "cfg_module.py")
+
+    holder["cfg"] = {"kanban": {}}
+    assert kbd._escalation_ledger_source() == kbd.TICK_YIELD_ESCALATION_DEFAULT
+
+
+def test_a_disabled_registry_falls_through_to_the_peer_leg(
+    board, tree, monkeypatch, _escalation_door,
+):
+    """DEC-2.1: ``none``/``off`` is a kill switch, never a silent no-op -- leg 2 carries the door
+    and the card says no ref was filed instead of quoting one that does not exist."""
+    monkeypatch.setenv(kbd.TICK_YIELD_ESCALATION_ENV, "none")
+    conn = board
+    tf.record_boot()
+    _edit(tree)
+
+    for _ in range(THRESHOLD):
+        _tick(conn)
+
+    record = _status_record()[1]
+    delivery = record["delivery"]
+    assert delivery["leg"] == "peer"
+    assert delivery["state"] == "sent"
+    assert delivery["ref"] is None
+    assert "disabled" in (delivery["error"] or ""), delivery
+    assert _ledger_calls(_escalation_door, "register") == []
+    assert len(_escalation_door["peer"]) == 1
+    assert record["episode"] in _escalation_door["peer"][0]["episode"]
+    assert record["episode"] in _escalation_door["peer"][0]["line"]
+    rows = _actor_rows()
+    assert len(rows) == 1, "the RECORD still files"
+    assert "- escalation: `(none filed" in rows[0]["body"], rows[0]["body"]
+
+
+def test_a_registry_that_cannot_import_is_a_NAMED_failure_and_leg_2_still_runs(
+    board, tree, monkeypatch, _escalation_door, tmp_path,
+):
+    """DEC-2.1: a half-landed ledger must degrade to a named failure, never an exception in the
+    tick -- and the fallback leg must still knock."""
+    broken = tmp_path / "broken_ledger.py"
+    broken.write_text(BROKEN_LEDGER_TEMPLATE, encoding="utf-8")
+    monkeypatch.setenv(kbd.TICK_YIELD_ESCALATION_ENV, str(broken))
+    conn = board
+    tf.record_boot()
+    _edit(tree)
+
+    for _ in range(THRESHOLD):
+        _tick(conn)
+
+    delivery = _status_record()[1]["delivery"]
+    assert delivery["leg"] == "peer", "leg 1 could not load, so leg 2 carried it"
+    assert delivery["state"] == "sent"
+    assert "RuntimeError" in delivery["error"] and "half-landed" in delivery["error"]
+    assert len(_escalation_door["peer"]) == 1
+    assert len(_actor_rows()) == 1
+
+
+def test_when_BOTH_legs_fail_the_record_names_it_and_the_card_still_files(
+    board, tree, monkeypatch, _escalation_door, tmp_path,
+):
+    """DEC-2's no-silent-failure arm: an undeliverable door is RECORDED as failed, with both
+    reasons, and the card is still filed -- a failed DM must never cost the record."""
+    broken = tmp_path / "broken_ledger.py"
+    broken.write_text(BROKEN_LEDGER_TEMPLATE, encoding="utf-8")
+    monkeypatch.setenv(kbd.TICK_YIELD_ESCALATION_ENV, str(broken))
+    monkeypatch.setattr(
+        kbd, "_peer_run_tree_skew",
+        lambda line, episode: ("failed", "gateway unreachable (simulated)"),
+    )
+    conn = board
+    tf.record_boot()
+    _edit(tree)
+
+    for _ in range(THRESHOLD):
+        _tick(conn)
+
+    delivery = _status_record()[1]["delivery"]
+    assert delivery["state"] == "failed"
+    assert delivery["leg"] == "peer"
+    assert "RuntimeError" in delivery["error"], "leg 1's named failure is kept"
+    assert "gateway unreachable (simulated)" in delivery["error"], "leg 2's reason is kept too"
+    rows = _actor_rows()
+    assert len(rows) == 1
+    assert "- escalation: `(none filed" in rows[0]["body"]
 
 
 # ---------------------------------------------------------------------------------------------
