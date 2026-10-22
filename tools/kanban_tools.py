@@ -1021,6 +1021,12 @@ def _handle_complete(args: dict, **kw) -> str:
             if isinstance(ok, kb.CompletionRefusal) and ok.cause in (
                     "landing_carrier_missing", "landing_state_unknown"):
                 raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
+            # The SDLC review-route fence carries its own remedy inline too (t_eb5bf72d): the
+            # item, its stage, the fact that no other lane has run on this card, and the act
+            # owed (``request-review``). The WORKER is the door this fence refuses, so a
+            # run-ownership sentence here would be a fence the refused worker cannot read.
+            if isinstance(ok, kb.CompletionRefusal) and ok.cause == "sdlc_review_required":
+                raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
             # A reopened or never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.
             blockers = kb.unsatisfied_parents(conn, tid)

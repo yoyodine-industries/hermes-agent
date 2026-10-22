@@ -4958,6 +4958,10 @@ COMPLETION_REFUSAL_CAUSES = (
     # is the fail-closed channel when the forge cannot answer AND nothing is declared.
     "landing_carrier_missing",     # declared PR is unmerged with no carrier/exemption on any board
     "landing_state_unknown",       # the landing state of the declared PR cannot be judged
+    # The SDLC review-route clause (t_eb5bf72d): closing an SDLC card whose item is at or
+    # above ``approved`` and below ``accepted``, as the item's author lane, with no review
+    # run on the card -- the completion that strands the item and blocks the landing.
+    "sdlc_review_required",
 )
 
 
@@ -5361,6 +5365,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
     deferred_children: Optional[Mapping[str, Any]] = None,
+    actor: Optional[str] = None,
 ) -> bool | CompletionRefusal:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -5472,6 +5477,15 @@ def complete_task(
     landing_refusal = _gate_landing_carrier(conn, task_id, metadata)
     if landing_refusal is not None:
         return landing_refusal
+    # The SDLC REVIEW-ROUTE fence (t_eb5bf72d): a close by an SDLC item's author lane that
+    # would leave the item with no review run is the completion that strands it -- the item
+    # can then never reach ``accepted`` and its PR can never land, with no door left to put
+    # a reviewer on a done card. Runs last in the gate family, still before the write txn.
+    sdlc_refusal = _gate_sdlc_review_route(
+        conn, task_id, actor=actor, expected_run_id=expected_run_id,
+    )
+    if sdlc_refusal is not None:
+        return sdlc_refusal
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
@@ -5752,6 +5766,58 @@ def _gate_landing_carrier(
     with write_txn(conn):
         _append_event(
             conn, task_id, "completion_blocked_landing_carrier",
+            {"cause": verdict.cause, "detail": verdict.detail, "facts": verdict.facts},
+        )
+    return CompletionRefusal(verdict.cause, verdict.detail)
+
+
+def _gate_sdlc_review_route(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> Optional[CompletionRefusal]:
+    """Refuse a close that would STRAND an SDLC item by closing its card without review.
+
+    Card ``t_eb5bf72d`` (design authority platform-stl; the measured deadlock is on
+    ``t_4ae7ebdf`` / PR #1624). ``sdlc_nodes.require_acceptance`` reads the acceptance
+    verdict from the item's OWN card -- successful runs by a lane other than the author --
+    but the kernel let that card reach ``done`` with no review, after which NO sanctioned
+    door puts a reviewer's run on it (``request-review`` needs running/ready,
+    ``reopen-review`` needs review, ``edit`` cannot set status). The item then cannot
+    reach ``accepted``, ``land.sh`` refuses the landing for want of that stage, and the
+    only repair was minting a duplicate card plus a duplicate item per PR.
+
+    The clause is ``hermes_cli/kanban_sdlc_review_route.py`` (comment contracts only,
+    never prose, never a title): a card whose newest ``SDLC stage=...`` contract comment
+    names a stage at or above ``approved`` and below ``accepted``, closed by the item's
+    author lane, with no completed run by any other lane, is refused
+    ``sdlc_review_required`` and told the act it owes: ``request-review``.
+
+    It runs AFTER ``_gate_landing_carrier`` and still BEFORE the completion write txn --
+    so a close already refused by an earlier clause is answered by that clause, and a
+    refusal here leaves the card byte-untouched, records ONE auditable event
+    (``completion_blocked_sdlc_review``), and returns a falsy :class:`CompletionRefusal`
+    so every existing ``if not complete_task(...)`` caller keeps its meaning.
+
+    NOT bypassable by ``force``: ``force`` is the operator's claim-release door, not a
+    declaration that a review is owed nowhere. A close out of ``review`` is exempt by
+    construction (that close IS the verdict), and so is an unprovable closer -- refusing
+    an actor the kernel cannot name would be inference, not a fence.
+    """
+    try:
+        from hermes_cli import kanban_sdlc_review_route as clause
+    except Exception:  # an absent clause is an install defect, not a card's fault
+        return None
+    verdict = clause.evaluate(
+        conn=conn, task_id=task_id, actor=actor, expected_run_id=expected_run_id,
+    )
+    if verdict is None or not verdict.refused:
+        return None
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, clause.EVENT,
             {"cause": verdict.cause, "detail": verdict.detail, "facts": verdict.facts},
         )
     return CompletionRefusal(verdict.cause, verdict.detail)
@@ -7134,11 +7200,34 @@ def set_contract(
     return True
 
 
-def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def reopen_review_task(
+    conn: sqlite3.Connection, task_id: str, *,
+    reason: Optional[str] = None, reviewer: Optional[str] = None,
+) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
-    not a block; only :func:`complete_task` clears them)."""
+    not a block; only :func:`complete_task` clears them).
+
+    ``done`` -> ``review`` (card ``t_eb5bf72d``): the REPAIR door for a card that was
+    closed TERMINAL and must still be routed through review. Until this existed a done
+    card was a dead end -- ``request-review`` needs running/ready, ``edit`` cannot set
+    status -- so an SDLC item whose acceptance verdict was owed could never get one and
+    its PR could never land (measured on ``t_4ae7ebdf`` / PR #1624; the only repair was a
+    duplicate card plus a duplicate submission item per PR). This path REQUIRES a
+    non-blank ``reason`` (recorded on the event and as the reopen note: a terminal
+    reopen is never silent) and a ``reviewer`` that becomes the card's assignee, because
+    a card sent to review needs a lane to review it. The ``reason`` is mandatory for
+    exactly the case it exists for; and the transition is refused when the reviewer is
+    the card's own author, since a self-review cannot produce the verdict it is sent for.
+    """
+    if not isinstance(task_id, str) or not task_id.strip():
+        return False
+    row = conn.execute("SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return False
+    if row["status"] == "done":
+        return _reopen_done_for_review(conn, task_id, reason=reason, reviewer=reviewer)
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
@@ -7164,8 +7253,54 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer
+        if isinstance(reason, str) and reason.strip():
+            payload["reason"] = reason.strip()
         _append_event(
             conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
+        )
+        return True
+
+
+def _reopen_done_for_review(
+    conn: sqlite3.Connection, task_id: str, *,
+    reason: Optional[str], reviewer: Optional[str],
+) -> bool:
+    """The terminal-card half of :func:`reopen_review_task` (``done`` -> ``review``).
+
+    Refuses (``False``, card untouched) unless a non-blank ``reason`` and a ``reviewer``
+    are given AND the reviewer is not the card's author lane. Everything is validated
+    before the transaction, so a refusal writes nothing; success records ONE
+    ``review_reopened`` event carrying the prior status, the reason and the reviewer, so a
+    terminal reopen is always auditable.
+    """
+    reason = reason.strip() if isinstance(reason, str) and reason.strip() else ""
+    reviewer = reviewer.strip() if isinstance(reviewer, str) and reviewer.strip() else ""
+    if not reason or not reviewer:
+        return False
+    author = review_implementer(conn, task_id)
+    if not author:
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        author = _nonblank_str(row["assignee"]) if row is not None else None
+    if author and reviewer == author:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'review', assignee = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "worker_started_at = NULL, completed_at = NULL WHERE id = ? AND status = 'done'",
+            (reviewer, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "review_reopened",
+            {"status": "review", "from_status": "done", "reason": reason,
+             "reviewer": reviewer, "implementer": author},
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, reviewer, f"REOPENED FROM DONE: {reason}", now),
         )
         return True
 
