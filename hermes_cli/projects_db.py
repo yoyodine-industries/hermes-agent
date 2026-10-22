@@ -482,6 +482,31 @@ def project_for_path(conn: sqlite3.Connection, path: str, *, include_archived: b
     return get_project(conn, max(owners, key=lambda r: len(r["folder"]))["pid"]) if owners else None
 
 
+_GIT_REF_SANITIZE_MAX_PASSES = 8
+
+
+def _sanitize_ref_once(name: str) -> str:
+    """One normalisation pass of a ref name; ``sanitize_branch_name`` repeats it to a fixpoint."""
+    s = _GIT_REF_ILLEGAL_RE.sub("-", name.strip())
+    s = s.replace("@{", "-")
+    # A ref may not BEGIN with '-'. Strip it BEFORE the component rules: removing
+    # the dash can expose a leading '.' or '/', and doing it afterwards (as the
+    # join-level lstrip did) left refs git refuses.
+    s = s.lstrip("-")
+    components: list[str] = []
+    for raw in s.split("/"):
+        comp = raw.lstrip(".")  # a component may not BEGIN with '.'
+        comp = _GIT_REF_DOT_RUN_RE.sub(".", comp)  # '..' is never allowed
+        if comp.endswith(_GIT_REF_LOCK_SUFFIX):  # 'x.lock' is reserved by git
+            comp = comp[: -len(_GIT_REF_LOCK_SUFFIX)] + "-lock"
+        if comp:
+            components.append(comp)
+    # git forbids a dot only at the END of the REF — a non-final component ending
+    # in '.' ('9./zb@1.0') is a name git accepts, so this is not a per-component
+    # rule, and applying it per component rewrote valid names.
+    return "/".join(components).rstrip(".")
+
+
 def sanitize_branch_name(name: str, *, fallback: str = "") -> str:
     """Rewrite *name* into a ref ``git check-ref-format --branch`` accepts.
 
@@ -490,33 +515,37 @@ def sanitize_branch_name(name: str, *, fallback: str = "") -> str:
     (``... package.``), an embedded ``..``, a component ending in ``.lock``, a
     ``@{``, or a 40-char cut that lands right before a ``.``. git rejects the
     WHOLE ref, so ``git worktree add`` fails and the dispatch dies before any
-    checkout exists. Derivation therefore goes through here.
+    checkout exists. Derivation therefore goes through here, and so does the
+    dispatch seam for a name stored before that fix.
 
-    The rules are git's, measured against ``check-ref-format``:
+    The rules are git's own, measured against ``check-ref-format``:
 
     * control characters, space and ``~ ^ : ? * [ \\`` are not allowed;
     * ``@{`` is not allowed;
-    * no component may begin with ``.``, end with ``.`` or end in ``.lock``;
+    * no component may begin with ``.`` or end in ``.lock``;
     * ``..`` may not appear anywhere;
-    * components are non-empty (no ``//``), and the ref may not begin with ``-``.
+    * components are non-empty (no ``//``), and the ref may not begin with
+      ``-`` or end with ``.`` (a NON-final component ending in ``.`` is legal,
+      and is returned as it came in).
 
-    Substitutions are deterministic and idempotent (``sanitize(sanitize(x)) ==
-    sanitize(x)``), and an already-valid name comes back byte-identical, so no
-    existing branch name moves. An unrecoverable name becomes *fallback*, which
-    the caller supplies when it knows the task.
+    Substitutions are deterministic, every name it derives (never the caller's
+    *fallback*) is a ref git accepts, and the result is a fixpoint:
+    ``sanitize(sanitize(x)) == sanitize(x)``, so a repaired name never moves on
+    the next dispatch. A name git already accepts comes back byte-identical, so
+    no existing branch name is rewritten. Getting there takes more than one pass
+    because one rule can revive another (a ref-level trailing dot hides a
+    ``.lock`` component end), so the pass is repeated until it stops changing —
+    two passes are enough for today's rule set, and the bound is a guard against
+    a future pair that oscillates rather than a limit reached in practice. An
+    unrecoverable name becomes *fallback*, which the caller supplies when it
+    knows the task and is the caller's to keep valid.
     """
-    s = _GIT_REF_ILLEGAL_RE.sub("-", str(name or "").strip())
-    s = s.replace("@{", "-")
-    components: list[str] = []
-    for raw in s.split("/"):
-        comp = raw.lstrip(".")  # a component may not BEGIN with '.'
-        comp = _GIT_REF_DOT_RUN_RE.sub(".", comp)  # '..' is never allowed
-        comp = comp.rstrip(".")  # a component may not END with '.'
-        if comp.endswith(_GIT_REF_LOCK_SUFFIX):  # 'x.lock' is reserved by git
-            comp = comp[: -len(_GIT_REF_LOCK_SUFFIX)] + "-lock"
-        if comp:
-            components.append(comp)
-    s = "/".join(components).lstrip("-")  # a ref may not begin with '-'
+    s = str(name or "")
+    for _ in range(_GIT_REF_SANITIZE_MAX_PASSES):
+        nxt = _sanitize_ref_once(s)
+        if nxt == s:
+            break
+        s = nxt
     return s or fallback
 
 
