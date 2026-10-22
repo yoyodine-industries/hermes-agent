@@ -157,6 +157,42 @@ def test_refresh_tick_sqlite_lock_keeps_the_turn():
     lease.join_threads()
 
 
+def test_a_contention_burst_does_not_kill_a_turn_holding_a_long_tool_call():
+    """The measured failure, replayed in wall-clock time: the lock clears a few seconds in, the
+    turn has less authority left than one refresh interval, and it must still survive.
+
+    At the production 60 s refresh interval a single locked tick used to consume the turn: the
+    next attempt was a whole interval away, which could not land before expiry, so the refresher
+    gave up. The 2 s retry cadence renews at the first free moment instead.
+    """
+    import time as _time
+
+    db = _Db()
+    unlocked_at = _time.time() + 6.0
+
+    def locked_then_free(session_id, holder, **kwargs):
+        if _time.time() < unlocked_at:
+            raise sqlite3.OperationalError("database is locked")
+        return True
+
+    db.refresh_session_turn_lease = locked_then_free
+    lease, calls = _active_lease(db)
+    # 20 s of authority left — far less than one refresh interval, more than the burst.
+    lease._authority_deadline = _time.time() + 20.0
+
+    assert lease.refresh_tick() is False          # the burst: locked, chain handed to the retry
+    assert lease.stop.is_set() is False
+    deadline = _time.time() + 15.0
+    while _time.time() < deadline and lease._lock_retry_chain:
+        _time.sleep(0.2)
+    lease.join_threads()
+
+    assert lease.interrupt_message is None, "a contention burst killed the turn"
+    assert lease.stop.is_set() is False
+    assert calls == [], "the turn was interrupted instead of renewing"
+    assert lease._lock_retry_chain is False, "the normal interval cadence was never restored"
+
+
 def test_lock_retry_with_no_room_left_before_expiry_stops_the_turn():
     """When even the short retry cannot land before the row expires, the turn stops — the
     safety property is untouched; only the cadence changed."""

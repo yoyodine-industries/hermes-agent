@@ -73,7 +73,7 @@ class DurableTurnLease:
         """
         from agent.periodic_scheduler import schedule
 
-        self.timer_handles = [h for h in self.timer_handles if not h.cancelled()]
+        self.timer_handles = [h for h in self.timer_handles if not getattr(h, "cancelled", False)]
         self.timer_handles.append(schedule(self.refresh_tick, interval))
 
     def _current_session_id(self) -> str:
