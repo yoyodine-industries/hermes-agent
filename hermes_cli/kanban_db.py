@@ -690,6 +690,16 @@ class BoardResolutionError(ValueError):
     """
 
 
+class BoardPinRefused(ValueError):
+    """An explicit ``board=`` names a different board than the process's DB pin.
+
+    Subclasses ``ValueError`` so every existing caller and test that treats a
+    resolution failure as a usage error keeps working, while a door that is allowed to
+    cross the pin can catch this ONE condition without matching on message text (a
+    string test drifts the moment the message is reworded — card t_2521d35f).
+    """
+
+
 def unregistered_board_refusal(slug: str) -> str:
     """THE refusal text for a caller-named board nobody registered.
 
@@ -820,7 +830,7 @@ def assert_board_matches_pin(board: Optional[str]) -> None:
     if natural.resolve() != pinned.resolve():
         pinned_name = _pinned_board_slug(pinned, ("kanban.db",), "kanban.db")
         pinned_label = f"board {pinned_name!r}" if pinned_name else str(pinned)
-        raise ValueError(
+        raise BoardPinRefused(
             f"refusing to target board {slug!r}: this process is pinned to "
             f"{pinned_label} (HERMES_KANBAN_DB)"
         )

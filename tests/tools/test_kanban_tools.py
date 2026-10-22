@@ -128,6 +128,147 @@ def test_board_accepts_pinned_slug(monkeypatch, tmp_path):
         assert conn is not None
 
 
+def _stage_two_boards(monkeypatch, tmp_path, *, assignee, created_by, profile):
+    """``pinned`` and ``other`` registered; one card on ``other``; the process pinned to ``pinned``.
+
+    The shape every cross-board comment test needs: an explicit ``board=`` that the
+    ``HERMES_KANBAN_DB`` pin refuses, and a card whose owner is decided by the caller.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
+                "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(var, raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    kb._INITIALIZED_PATHS.clear()
+    kb.create_board("pinned")
+    kb.create_board("other")
+    with kbc.connect_closing(board="other") as conn:
+        tid = kb.create_task(conn, title="re-cut carrier", assignee=assignee,
+                             created_by=created_by)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="pinned")))
+    return tid
+
+
+def _comments_on(board: str, tid: str) -> list:
+    """The comment thread read back from ``board``'s OWN store (never the pin)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_register as kbr
+    conn = kbr.open_board_ro(board)
+    assert conn is not None, f"board {board!r} has no readable store"
+    try:
+        return kb.list_comments(conn, tid)
+    finally:
+        conn.close()
+
+
+def test_comment_crosses_the_pin_for_the_cards_assignee(monkeypatch, tmp_path):
+    """Card t_2521d35f: the pin fences work, not the handoff. A re-cut sha can only reach
+    the record as a comment on the card that names it, which may sit on another board - so
+    kanban_comment admits the caller when it IS the target card's assignee."""
+    tid = _stage_two_boards(monkeypatch, tmp_path, assignee="platform-stl",
+                            created_by="someone-else", profile="platform-stl")
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_comment({
+        "task_id": tid, "board": "other",
+        "body": "reviewed commit cff7cece27934b87737044ec10862cee1865f92c",
+    }))
+    assert out.get("ok"), out
+    assert out["task_id"] == tid
+    thread = _comments_on("other", tid)
+    assert [c.body for c in thread] == [
+        "reviewed commit cff7cece27934b87737044ec10862cee1865f92c"]
+    assert thread[0].author == "platform-stl", "the author is the runtime identity"
+    # ...and the pinned board was NOT the store written: no such card there.
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as pinned_conn:
+        assert kb.get_task(pinned_conn, tid) is None
+
+
+def test_comment_crosses_the_pin_for_the_cards_creator(monkeypatch, tmp_path):
+    """The door admits the card's CREATOR too - the lane that filed the work is accountable
+    for it even when another lane holds the assignee seat."""
+    tid = _stage_two_boards(monkeypatch, tmp_path, assignee="platform-stl",
+                            created_by="platform-coder", profile="platform-coder")
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_comment({
+        "task_id": tid, "board": "other", "body": "carrying the re-cut sha"}))
+    assert out.get("ok"), out
+    assert [c.body for c in _comments_on("other", tid)] == ["carrying the re-cut sha"]
+
+
+def test_comment_cross_board_refused_for_a_profile_that_does_not_own_the_card(
+        monkeypatch, tmp_path):
+    """The door is authority-scoped, not a drive-by channel: any other profile keeps today's
+    pin refusal, extended to say why and which profile was checked. Nothing is written."""
+    tid = _stage_two_boards(monkeypatch, tmp_path, assignee="platform-stl",
+                            created_by="platform-stl", profile="platform-coder")
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_comment({
+        "task_id": tid, "board": "other", "body": "a notice nobody asked for"}))
+    err = out.get("error") or ""
+    assert out.get("ok") is None, out
+    assert "refusing to target board 'other'" in err, err
+    assert "assignee or creator" in err, err
+    assert "platform-coder" in err, err
+    assert _comments_on("other", tid) == [], "a refused comment wrote to the foreign board"
+
+
+def test_comment_on_an_unregistered_board_still_refuses(monkeypatch, tmp_path):
+    """The door does not outrun registration: a slug nobody registered is refused by the
+    registration guard even when the caller would own a card there (there is none)."""
+    tid = _stage_two_boards(monkeypatch, tmp_path, assignee="platform-stl",
+                            created_by="platform-stl", profile="platform-stl")
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_comment({
+        "task_id": tid, "board": "no-such-board", "body": "x"}))
+    err = out.get("error") or ""
+    assert "no board by that name is registered" in err, err
+
+
+def test_comment_schema_publishes_the_cross_board_door_and_no_other_tool_does():
+    """The remedy must be readable BEFORE the call: a lane consults the rendered
+    ``board`` description, so a description that still says "refused, full stop" makes
+    the door undiscoverable and the next reviewer takes the detour again (t_2521d35f
+    review round 1). Exactly one tool carries the authority-scoped rule; the shared
+    text stays true of every other tool, which really does refuse unconditionally."""
+    from tools import kanban_tools_schemas as kts
+
+    def board_desc(schema):
+        return schema["parameters"]["properties"]["board"]["description"]
+
+    comment = board_desc(kts.KANBAN_COMMENT_SCHEMA)
+    assert "assignee or creator" in comment, comment
+    assert "ADMITTED" in comment and "cross-board" in comment, comment
+    # ...and it must not still promise the unconditional refusal the others carry.
+    assert "the call is refused (ValueError) rather than silently served" not in comment
+
+    others = []
+    for attr, schema in vars(kts).items():
+        if not (attr.startswith("KANBAN_") and attr.endswith("_SCHEMA")):
+            continue
+        if schema["name"] == "kanban_comment":
+            continue
+        prop = schema["parameters"]["properties"].get("board")
+        if prop is None:  # a tool that publishes no board parameter at all
+            continue
+        others.append(schema["name"])
+        desc = prop["description"]
+        assert "assignee or creator" not in desc, (
+            schema["name"], "the door text leaked into a tool that still refuses")
+        assert "the call is refused (ValueError) rather than silently served" in desc, (
+            schema["name"], "a still-unconditional tool lost its published rule")
+    assert "kanban_complete" in others, others
+    assert len(others) >= 15, others
+
+
 def test_show_bare_call_outside_worker_returns_orientation_not_error(monkeypatch, worker_env):
     """#91431: chat profiles with the kanban toolset call kanban_show bare to orient
     themselves; with no dispatcher task in scope there is nothing to show, so the

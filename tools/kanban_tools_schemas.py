@@ -22,24 +22,62 @@ _DESC_BOARD = (
     "the pin."
 )
 
+# ``kanban_comment`` is the ONE tool that does not refuse a foreign board
+# unconditionally: it admits the lane that OWNS the card. The shared
+# ``_DESC_BOARD`` above is still true for every other tool, so the override is
+# per-tool and this text must not be folded back into it (card t_2521d35f).
+_DESC_BOARD_COMMENT = (
+    "Kanban board slug to target. When omitted, the call resolves the "
+    "active board the usual way: HERMES_KANBAN_DB env → "
+    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
+    "home → 'default'. An explicit slug targets that board. Unlike the "
+    "other kanban tools, kanban_comment is an authority-scoped cross-board "
+    "door: a slug that resolves to a different board than the pinned DB "
+    "(HERMES_KANBAN_DB) is ADMITTED when your own profile is the target "
+    "card's assignee or creator — the lane accountable for the card "
+    "may comment on its own card from any board (that is how a re-cut sha, "
+    "which the PR card's immutable body can never carry, reaches the "
+    "record). Any other profile is refused (ValueError) with that reason "
+    "and the profile that was checked — this is not a drive-by comment "
+    "channel. Pass board= explicitly for a task_id on another board: "
+    "without it the id is resolved on the pinned board."
+)
+
 
 def _prop(type_: str, description: str) -> dict[str, str]:
     return {"type": type_, "description": description}
 
 
-def _board_schema_prop() -> dict[str, str]:
-    """Schema fragment for the optional ``board`` parameter (one place to tweak)."""
-    return _prop("string", _DESC_BOARD)
+def _board_schema_prop(description: str = _DESC_BOARD) -> dict[str, str]:
+    """Schema fragment for the optional ``board`` parameter (one place to tweak).
+
+    ``description`` is the per-tool override; it defaults to the shared text,
+    which is the unconditional-refusal rule every kanban tool but
+    ``kanban_comment`` follows.
+    """
+    return _prop("string", description)
 
 
-def _schema(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    """Build a tool schema; every kanban tool takes an optional trailing ``board``."""
+def _schema(
+    name: str,
+    description: str,
+    properties: dict[str, Any],
+    required: list[str],
+    *,
+    board_desc: str = _DESC_BOARD,
+) -> dict[str, Any]:
+    """Build a tool schema; every kanban tool takes an optional trailing ``board``.
+
+    ``board_desc`` overrides the shared ``board`` description for the one tool
+    whose cross-board rule differs (``kanban_comment``); everything else keeps
+    ``_DESC_BOARD``, which must stay true of the other tools.
+    """
     return {
         "name": name,
         "description": description,
         "parameters": {
             "type": "object",
-            "properties": {**properties, "board": _board_schema_prop()},
+            "properties": {**properties, "board": _board_schema_prop(board_desc)},
             "required": required,
         },
     }
@@ -471,6 +509,7 @@ KANBAN_COMMENT_SCHEMA = _schema(
         "body": _prop("string", "Markdown-supported comment body."),
     },
     ["task_id", "body"],
+    board_desc=_DESC_BOARD_COMMENT,
 )
 
 KANBAN_ATTACH_SCHEMA = _schema(

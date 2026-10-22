@@ -394,6 +394,87 @@ def _board(board: Optional[str], *, quiet_close: bool = False):
                 raise
 
 
+def _foreign_board_owned_by_caller(slug: str, tid: str, profile: str) -> bool:
+    """Whether ``profile`` is ``tid``'s assignee or creator on board ``slug``.
+
+    READ-ONLY, and it never creates: the board's own store is opened through
+    :func:`kanban_register.open_board_ro` (which resolves ``board_store_path``, the slug's
+    own file, never the process pin), so the probe can neither initialize, migrate nor
+    repair another lane's board. A board with no store, no such card, or an unreadable one
+    answers False - the pin refusal then stands unchanged.
+    """
+    import sqlite3
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_register as kbr
+
+    who = str(profile or "").strip()
+    if not who:
+        return False
+    conn = kbr.open_board_ro(slug)
+    if conn is None:
+        return False
+    try:
+        task = kb.get_task(conn, tid)
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    if task is None:
+        return False
+    return who in {str(task.assignee or "").strip(), str(task.created_by or "").strip()}
+
+
+@contextmanager
+def _foreign_board_store(slug: str):
+    """Open ``slug``'s OWN store read-write - never the env pin - for the one cross-board door.
+
+    ``connect(db_path=...)`` is the pin-free seam: the pin is a property of the CALLING
+    PROCESS, so ``connect(board=slug)`` would answer the pinned file for every slug.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect(db_path=kb.board_store_path(slug))
+    try:
+        yield kb, conn
+    finally:
+        conn.close()
+
+
+def _comment_board(board: Optional[str], tid: str, author: str):
+    """Board handle for ``kanban_comment``: the pinned board, or - for the ONE documented
+    cross-board door - the named board's own store when ``author`` OWNS the card.
+
+    The pin (``HERMES_KANBAN_DB``) fences a worker to its own board, and that is right for
+    every tool that hands work out or retires it. A comment is not that: it is the fleet's
+    handoff channel, and a RE-CUT sha can never appear in the PR card's immutable body, so
+    the only place it can reach the record is a comment on the card that names it - which
+    may live on another board (card t_2521d35f; measured on t_84bc5d53, whose board
+    ``defcon`` refused the reviewer's comment while the pin held ``migrations``).
+
+    So exactly ONE door opens, authority-scoped: the caller's own profile must BE the
+    target card's assignee or creator - the lane accountable for that card, writing on its
+    own card. Everything else keeps today's refusal, extended to say why and which profile
+    was checked, so it is not a drive-by comment channel.
+    """
+    from hermes_cli import kanban_db as kb
+
+    try:
+        kb.assert_board_matches_pin(board)
+    except kb.BoardPinRefused as refusal:
+        slug = kb.assert_board_registered(board) or ""
+        if not _foreign_board_owned_by_caller(slug, tid, author):
+            raise kb.BoardPinRefused(
+                f"{refusal}. kanban_comment reaches another board only for the card's own"
+                f" lane: this profile ({author!r}) must be {tid}'s assignee or creator, and"
+                f" it is neither. Any other cross-board notice is a routing question - send"
+                f" it to the lane that owns the card, or comment on a card of your own."
+            ) from None
+        return _foreign_board_store(slug)
+    return _board(board)
+
+
 def _existing_task(kb, conn, tid: str):
     task = kb.get_task(conn, tid)
     _check(task is not None, f"task {tid} not found")
@@ -1215,7 +1296,7 @@ def _handle_comment(args: dict, **kw) -> str:
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
     # with what reads as a system directive. See #19713.
     author = _persisted_identity()
-    with _board(args.get("board")) as (kb, conn):
+    with _comment_board(args.get("board"), str(tid), author) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
         return _ok(task_id=tid, comment_id=cid)
 
