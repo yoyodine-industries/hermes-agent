@@ -9,6 +9,8 @@ Direct-SQL setup is used to construct that state deterministically.
 from __future__ import annotations
 
 import argparse
+import json
+import time
 from pathlib import Path
 
 import pytest
@@ -109,5 +111,124 @@ def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
     with kbc.connect() as conn:
         for c in children:
             assert kb.get_task(conn, c).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# `scheduled` — the third PARKED status (card t_7fb19093).
+#
+# A card parked in `scheduled` with NO clock fence is a HUMAN hold ("released by
+# hand only"), and it used to have no promote door at all: `promote` answered the
+# tautology "task is 'scheduled'; promote only applies to 'todo' or 'blocked'".
+# The release condition is now judged by the two gates the board can read — the
+# parent edges and the clock fence — and a refusal names the gate still standing.
+# ---------------------------------------------------------------------------
+
+
+def _scheduled_child(conn, *, parent_status="done", due_at=None, window_policy=None):
+    """A card parked in `scheduled` (optionally clock-fenced) under one parent."""
+    parent = kb.create_task(conn, title="parent", assignee="setup")
+    child = kb.create_task(conn, title="child", parents=[parent], assignee="setup")
+    conn.execute("UPDATE tasks SET status=? WHERE id=?", (parent_status, parent))
+    ok = kb.schedule_task(conn, child, reason="waiting on the r1 pull", due_at=due_at,
+                          window_policy=window_policy)
+    assert ok
+    assert kb.get_task(conn, child).status == "scheduled"
+    return child, parent
+
+
+def test_promote_releases_a_scheduled_card_with_no_clock(conn):
+    child, _ = _scheduled_child(conn)
+    ok, err = kb.promote_task(conn, child, actor="platform-stl",
+                              reason="its blocker discharged 2026-10-04")
+    assert ok, err
+    task = kb.get_task(conn, child)
+    assert task.status == "ready"
+    # The gate is discharged, so no stale fence may ride along: a passed/absent
+    # `due_at` left behind would re-release (or falsely alarm about) a card that is
+    # already in the queue — the amnesia `unblock_task` refuses.
+    row = conn.execute("SELECT due_at, due_window_policy FROM tasks WHERE id=?",
+                       (child,)).fetchone()
+    assert row["due_at"] is None and row["due_window_policy"] is None
+
+
+def test_promote_records_the_scheduled_release_on_the_event_stream(conn):
+    child, _ = _scheduled_child(conn)
+    ok, err = kb.promote_task(conn, child, actor="platform-stl", reason="discharged")
+    assert ok, err
+    ev = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='promoted_manual' "
+        "ORDER BY id DESC LIMIT 1", (child,),
+    ).fetchone()
+    assert ev is not None
+    payload = json.loads(ev["payload"])
+    assert payload["from_status"] == "scheduled"
+    assert payload["actor"] == "platform-stl"
+    assert payload["cleared_due_at"] is None
+
+
+def test_promote_refuses_a_scheduled_card_whose_parent_is_still_running(conn):
+    child, parent = _scheduled_child(conn, parent_status="running")
+    ok, err = kb.promote_task(conn, child, actor="platform-stl")
+    assert not ok
+    # The refusal names the LIVE GATE, with its status — never the bare tautology.
+    assert err and parent in err
+    assert "running" in err
+    assert kb.get_task(conn, child).status == "scheduled"
+
+
+def test_promote_refuses_a_scheduled_card_whose_clock_has_not_fired(conn):
+    due_at = int(time.time()) + 3600
+    child, _ = _scheduled_child(conn, due_at=due_at)
+    ok, err = kb.promote_task(conn, child, actor="platform-stl")
+    assert not ok
+    # The refusal names the fire time and the ONE override, so the caller is routed
+    # rather than left to guess at another verb.
+    assert err and time.strftime("%Y-%m-%d %H:%M", time.localtime(due_at)) in err
+    assert "unblock" in err
+    assert kb.get_task(conn, child).status == "scheduled"
+
+
+def test_promote_dry_run_validates_a_scheduled_release_without_writing(conn):
+    child, _ = _scheduled_child(conn)
+    ok, err = kb.promote_task(conn, child, actor="platform-stl", dry_run=True)
+    assert ok and err is None
+    assert kb.get_task(conn, child).status == "scheduled"
+    assert not conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='promoted_manual'", (child,)
+    ).fetchone()
+
+
+def test_promote_releases_a_scheduled_card_whose_clock_has_fired(conn):
+    due_at = int(time.time()) - 60
+    child, _ = _scheduled_child(conn, due_at=due_at, window_policy="defer")
+    ok, err = kb.promote_task(conn, child, actor="platform-stl")
+    assert ok, err
+    assert kb.get_task(conn, child).status == "ready"
+    row = conn.execute("SELECT due_at, due_window_policy FROM tasks WHERE id=?",
+                       (child,)).fetchone()
+    assert row["due_at"] is None and row["due_window_policy"] is None
+
+
+def test_promote_still_refuses_a_running_card_and_names_its_own_exit(conn):
+    card = kb.create_task(conn, title="live", assignee="setup")
+    conn.execute("UPDATE tasks SET status='running' WHERE id=?", (card,))
+    ok, err = kb.promote_task(conn, card, actor="platform-stl")
+    assert not ok
+    assert err and "running" in err and "exit verb" in err
+
+
+def test_worker_scope_still_refuses_the_promote_door(kanban_home, monkeypatch):
+    """The new door is an OPERATOR door: nothing here widens worker scope.
+
+    `promote` stays in the delegated-child denied vocabulary, and no new
+    worker-facing verb was introduced to carry the release (the card expressly
+    refuses widening `kanban_schedule` for this).
+    """
+    assert "promote" in kb_cli._DELEGATED_CHILD_DENIED_ACTIONS
+    assert "release" not in kb_cli._HANDLERS
+    # ... and the fence really fires for it, judged against the board it targets.
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(kanban_home))
+    args = argparse.Namespace(kanban_action="promote", board=None)
+    assert kb_cli._is_delegated_child_cli_mutation(args) is True
 
 

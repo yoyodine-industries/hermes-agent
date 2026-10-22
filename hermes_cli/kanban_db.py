@@ -6782,18 +6782,62 @@ def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    """Operator promotion ``todo``/``blocked``/``scheduled`` -> ``ready`` with an
+    audit event. Refused while a parent is unfinished, and -- for a ``scheduled``
+    card -- while its clock fence is still armed; ``dry_run`` only validates.
+    Returns ``(ok, reason)``.
+
+    ``scheduled`` is the third PARKED status and it used to have no promote door at
+    all: this function answered ``"task is 'scheduled'; promote only applies to
+    'todo' or 'blocked'"`` -- a tautology that named no gate -- so a human-hold park
+    whose declared blocker was discharged sat in the queue until somebody guessed at
+    a different verb (card t_7fb19093; measured 2026-10-22 on the platform board:
+    2,457 cards in ``scheduled``, 2,456 of them carrying NO clock at all). The
+    release condition of a ``scheduled`` card is judged HERE, by the two gates the
+    board can actually read:
+
+      * its parent edges -- every one must be ``done``/``archived``;
+      * its clock fence -- absent (a human hold: "released by hand only") or already
+        fired. An ARMED fence is a live gate and is refused BY ITS FIRE TIME, with
+        the override named (``unblock``), never as a bare status refusal.
+
+    Nothing here reads the park's prose reason for a dated promise: a parser that
+    guesses at English could only ever ADD a refusal, and a wrong guess would keep a
+    discharged card parked forever -- the exact defect this door exists to end.
+    """
+    now = int(time.time())
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "blocked", "scheduled"):
         return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"task {task_id} is {cur_status!r}; promote applies to 'todo', 'blocked' "
+            f"or 'scheduled' -- a running/review/done card has its own exit verb"
         )
+
+    # A `scheduled` card's SECOND gate: the clock fence. Read the columns the board
+    # actually carries -- a board that predates the fence columns cannot hold one,
+    # so its cards are fence-free by definition.
+    due_at = 0
+    window_policy: Optional[str] = None
+    if cur_status == "scheduled":
+        columns = _fence_guard(conn, UNSET)
+        row = conn.execute(
+            f"SELECT {_present_columns(columns, ('id', 'due_at', 'due_window_policy'))} "
+            f"FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        due_at = int(_row_get(row, "due_at") or 0)
+        window_policy = _row_get(row, "due_window_policy")
+        if due_at > now:
+            remaining = due_at - now
+            fires = time.strftime("%Y-%m-%d %H:%M", time.localtime(due_at))
+            return False, (
+                f"task {task_id} is clock-fenced until {fires} (in {remaining // 60}m): "
+                f"the fence has not fired, so its release condition is not met. Wait for "
+                f"the due-fence releaser, or override the clock now with "
+                f"`hermes kanban unblock {task_id}`"
+            )
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
@@ -6805,8 +6849,12 @@ def promote_task(
     ).fetchall()
     unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
     if unsatisfied:
+        named = ", ".join(
+            f"{p['id']} is {p['status']}" for p in parents
+            if p["status"] not in ("done", "archived")
+        )
         return False, (
-            f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
+            f"unsatisfied parent dependencies: {named} "
             f"(the ready -> running claim re-checks parents, so promotion cannot "
             f"bypass them; complete the parents or drop the link with "
             f"`hermes kanban unlink <parent_id> {task_id}`)"
@@ -6816,13 +6864,30 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        sets = ["status = 'ready'"]
+        if cur_status == "scheduled":
+            # The fence is discharged: leaving a passed `due_at` behind would
+            # re-release (or falsely alarm about) a card already in the queue --
+            # the same amnesia `unblock_task` refuses.
+            columns = _tasks_columns(conn)
+            if "due_at" in columns:
+                sets.append("due_at = NULL")
+            if "due_window_policy" in columns:
+                sets.append("due_window_policy = NULL")
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            f"UPDATE tasks SET {', '.join(sets)} "
+            f"WHERE id = ? AND status IN ('todo', 'blocked', 'scheduled')", (task_id,),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        payload: dict[str, Any] = {"actor": actor, "reason": reason}
+        if cur_status == "scheduled":
+            payload.update({
+                "from_status": "scheduled",
+                "cleared_due_at": due_at or None,
+                "overridden_window_policy": window_policy or None,
+            })
+        _append_event(conn, task_id, "promoted_manual", payload)
 
     return True, None
 
