@@ -138,12 +138,43 @@ def test_refresh_tick_sqlite_lock_keeps_the_turn():
 
     db.refresh_session_turn_lease = locked
     lease, calls = _active_lease(db)
+    before = len(lease.timer_handles)
 
-    # False would cancel the refresher; a lock is a missed tick, not a lost lease.
-    assert lease.refresh_tick() is None
+    # False stops the interval chain (a short one-shot retry takes it over); the lock itself is a
+    # missed tick, never a lost lease.
+    assert lease.refresh_tick() is False
     assert calls == []
     assert lease.interrupt_message is None
     assert lease.stop.is_set() is False
+    # The retry is armed on the SHORT cadence, not one refresh interval out: waiting a whole
+    # interval per lock error is what spent the 300 s authority and killed live turns.
+    from agent.turn_facade_lease import _REFRESH_LOCK_RETRY_S
+
+    armed = lease.timer_handles[before:]
+    assert len(armed) == 1
+    assert abs(armed[0]._interval - _REFRESH_LOCK_RETRY_S) < 1e-6
+    assert lease._lock_retry_chain is True
+    lease.join_threads()
+
+
+def test_lock_retry_with_no_room_left_before_expiry_stops_the_turn():
+    """When even the short retry cannot land before the row expires, the turn stops — the
+    safety property is untouched; only the cadence changed."""
+    import time as _time
+
+    db = _Db()
+
+    def locked(session_id, holder, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    db.refresh_session_turn_lease = locked
+    lease, calls = _active_lease(db)
+    # Patience still positive (so a renewal IS attempted) but a 2 s retry plus the margin would
+    # land past expiry.
+    lease._authority_deadline = _time.time() + 3.0
+    assert lease.refresh_tick() is False
+    assert calls and calls[0].startswith("Session turn lease could not be refreshed")
+    lease.join_threads()
 
 
 class _MovingClock:
