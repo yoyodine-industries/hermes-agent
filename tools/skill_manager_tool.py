@@ -131,9 +131,10 @@ def _admission_references_hint(verdict: dict[str, Any], name: str) -> str:
 def _record_admission_refusal(name: str, verdict: dict[str, Any]) -> None:
     """Append the refusal to the skills ledger; best-effort, never blocks the refusal itself."""
     try:
+        from tools.skill_admission import named_skill
         from tools.skill_usage import record_admission_refusal
         record_admission_refusal(name, disposition=str(verdict.get("disposition") or ""),
-                                 existing_skill=str(verdict.get("fold_target") or ""),
+                                 existing_skill=named_skill(verdict)[0],
                                  reason=str(verdict.get("reason") or ""))
     except Exception:
         logger.debug("admission refusal ledger write failed for %s", name, exc_info=True)
@@ -156,7 +157,7 @@ def _admission_refusal(name: str, content: str) -> Optional[dict[str, Any]]:
         return None
     roots: list[Path] = []
     try:
-        from tools.skill_admission import refusal_message, verdict_for_content
+        from tools.skill_admission import named_skill, refusal_message, verdict_for_content
         roots = _admission_corpus_roots()
         verdict = verdict_for_content(name, content, roots)
     except Exception as e:
@@ -168,10 +169,15 @@ def _admission_refusal(name: str, content: str) -> Optional[dict[str, Any]]:
         return None
     _record_admission_refusal(name, verdict)
     message = refusal_message(verdict, references_hint=_admission_references_hint(verdict, name))
+    # The refusal's target is resolved ONCE (skill_admission.named_skill), and both the prose
+    # above and this payload are built from it: a `reject` names the nearest skill just as a
+    # `fold` names the skill to extend, so a consumer reading the field is told the same skill
+    # the message tells the author.
+    target, target_path = named_skill(verdict)
     return _err(message, refused_by="admission", admission={
         "disposition": verdict.get("disposition"),
-        "fold_target": verdict.get("fold_target") or "",
-        "fold_path": verdict.get("fold_path") or "",
+        "fold_target": target,
+        "fold_path": target_path,
         "novelty": verdict.get("novelty"),
         "context_tokens": verdict.get("context_tokens"),
         "matches": verdict.get("matches") or [],
@@ -748,7 +754,7 @@ def _support_file_admission_refusal(name: str, skill_dir: Path, file_path: str,
         return None
     roots: list[Path] = []
     try:
-        from tools.skill_admission import refusal_message, verdict_for_support_file
+        from tools.skill_admission import named_skill, refusal_message, verdict_for_support_file
         roots = _admission_corpus_roots()
         verdict = verdict_for_support_file(name, file_content, roots, exclude=[skill_dir])
     except Exception as e:
@@ -761,15 +767,15 @@ def _support_file_admission_refusal(name: str, skill_dir: Path, file_path: str,
     if verdict.get("disposition") != "fold":
         return None
     _record_admission_refusal(f"{name}/{file_path}", verdict)
-    target = str(verdict.get("fold_target") or "")
-    hint = str(Path(str(verdict.get("fold_path") or "")).parent / "references" /
-               Path(file_path).name) if verdict.get("fold_path") else ""
+    target, target_path = named_skill(verdict)
+    hint = str(Path(target_path).parent / "references" /
+               Path(file_path).name) if target_path else ""
     message = refusal_message(verdict, references_hint=hint,
                               subject="the new support file '%s' under '%s'" % (file_path, name))
     return _err(message, refused_by="admission", admission={
         "disposition": verdict.get("disposition"),
         "fold_target": target,
-        "fold_path": verdict.get("fold_path") or "",
+        "fold_path": target_path,
         "novelty": verdict.get("novelty"),
         "matches": verdict.get("matches") or [],
         "reason": verdict.get("reason") or "",
