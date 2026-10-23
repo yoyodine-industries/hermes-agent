@@ -2107,7 +2107,21 @@ def create_task(
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
                     if project_repo and not workspace_path:
-                        workspace_path = os.path.join(project_repo, ".worktrees", task_id)
+                        from hermes_cli import kanban_db_workspace as _wsm
+
+                        # A project repo that sits inside a guard-protected tree
+                        # would put the card's OWN workspace out of the lane's
+                        # reach: ask the guard's declaration and anchor the card
+                        # outside it, or refuse the birth by name (t_81c03c9a).
+                        workspace_path = str(
+                            _wsm.project_worktree_path(
+                                project_repo,
+                                task_id,
+                                assignee=assignee,
+                                board_anchor=_board_meta_for(dest_board).get("default_workdir"),
+                                project_label=project_obj.slug or project_obj.id,
+                            )
+                        )
                     if not branch_name:
                         branch_name = _project_branch_name(project_obj, task_id, title)
 
@@ -6317,7 +6331,15 @@ def retarget_task(
                     project_id=project_obj.id,
                     project_slug=project_obj.slug,
                 )
-                new_path = os.path.join(str(project_obj.primary_path), ".worktrees", task_id)
+                new_path = str(
+                    _wsm.project_worktree_path(
+                        str(project_obj.primary_path),
+                        task_id,
+                        assignee=task.assignee,
+                        board_anchor=_board_meta_for(None).get("default_workdir"),
+                        project_label=project_obj.slug or project_obj.id,
+                    )
+                )
             elif project_obj is None and task.workspace_kind == "worktree" and task.workspace_path:
                 new_path = task.workspace_path
             else:

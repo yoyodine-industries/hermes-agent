@@ -1185,6 +1185,195 @@ def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) ->
     _set_task_column(conn, task_id, "branch_name", str(branch_name))
 
 
+# --- the guarded-tree seam (card t_81c03c9a) -------------------------------
+#
+# A card's workspace must never be BORN inside a tree the shared-trees guard
+# protects: the guard then refuses the lane's first write and the card cannot
+# run at all. Two subsystems were each right on their own (the guard protects
+# live trees; the dispatcher anchors project worktrees under the project repo)
+# and together they produced an unwritable card. The seam that CHOSE the path
+# is the one that yields, and it asks the GUARD's own declaration rather than
+# re-implementing the rule: two copies of a security rule drift, and the copy
+# in the dispatcher is the one nobody re-reads.
+
+_GUARD_DECLARATION_ENV = "HERMES_SHARED_TREES_GUARD"
+_DEFAULT_GUARD_PATH = "/opt/hermes_prod/yaan-majordomo/ops-checks/guard-shared-trees.py"
+_SANDBOX_ROOT_ENV = "HERMES_SANDBOX_ROOT"
+_DEFAULT_SANDBOX_ROOT = "/opt/hermes_sandbox"
+_LANE_DOMAINS_CONF = "/opt/hermes_sandbox/yaan-repo-control/lane-domains.conf"
+_GUARD_ROOT_ATTRS = ("_SHARED_SOURCE_ROOTS", "_LIVE_ROOTS", "_REPAIR_ROOTS")
+# The ONE component that turns "inside a protected root" into "a lane's own tree"
+# (the guard's own exemption, spelled once here so the two cannot drift).
+_LANE_WORK_DIRNAME = "work"
+_GUARD_ROOTS_CACHE: dict[str, tuple[int, int, list[str]]] = {}
+
+
+class GuardDeclarationUnavailable(RuntimeError):
+    """A guard EXISTS but its declaration could not be read.
+
+    Deliberately NOT the same thing as "no guard is installed". Absence means
+    nothing on this host is protected, so today's path is already safe;
+    unreadability means we do not know, and a card born on a guess is exactly
+    the defect this seam exists to stop.
+    """
+
+
+class WorkspaceInsideGuardedTree(RuntimeError):
+    """The project worktree would land inside a protected root, with no way out."""
+
+    def __init__(self, *, project, attempted, protected_root, task_id=None):
+        self.project = project
+        self.attempted = str(attempted)
+        self.protected_root = str(protected_root)
+        self.task_id = task_id
+        super().__init__(
+            f"project {project!r} would put task {task_id or '?'} at {self.attempted}, "
+            f"which is inside the guard-protected root {self.protected_root}; no "
+            f"bare-mirror sibling and no lane work area is available to anchor it "
+            f"instead, so the dispatch is refused rather than landed inside the tree"
+        )
+
+
+def _guard_declared_roots() -> Optional[list[str]]:
+    """The protected roots, read from the guard's OWN declaration.
+
+    ``None`` means no guard is installed on this host (nothing is protected --
+    the honest reading of absence). A guard file that exists but cannot be read
+    raises ``GuardDeclarationUnavailable``: unreadable is not released.
+    """
+    path = os.environ.get(_GUARD_DECLARATION_ENV) or _DEFAULT_GUARD_PATH
+    guard = Path(path)
+    if not guard.exists():
+        return None
+    try:
+        st = guard.stat()
+    except OSError as exc:  # exists() said yes, stat said no: unreadable
+        raise GuardDeclarationUnavailable(f"cannot stat guard {path}: {exc}") from exc
+    cached = _GUARD_ROOTS_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return list(cached[2])
+    import importlib.util
+
+    try:
+        spec = importlib.util.spec_from_file_location("_hermes_shared_trees_guard", guard)
+        if spec is None or spec.loader is None:
+            raise ImportError("no loader for the guard module")
+        module = importlib.util.module_from_spec(spec)
+        # The guard is a SCRIPT: its module-level code is declarations, and its
+        # main() runs only under __main__, so importing it executes nothing.
+        spec.loader.exec_module(module)
+        roots: list[str] = []
+        for attr in _GUARD_ROOT_ATTRS:
+            values = getattr(module, attr, None)
+            if not isinstance(values, (list, tuple)):
+                raise AttributeError(f"guard declares no {attr}")
+            roots.extend(str(v) for v in values)
+    except Exception as exc:  # noqa: BLE001 - every failure is the same refusal
+        raise GuardDeclarationUnavailable(f"cannot read guard {path}: {exc}") from exc
+    if not roots:
+        raise GuardDeclarationUnavailable(f"guard {path} declares no roots at all")
+    _GUARD_ROOTS_CACHE[path] = (st.st_mtime_ns, st.st_size, roots)
+    return list(roots)
+
+
+def protected_root_for(path: Path | str) -> Optional[str]:
+    """The guard-protected root *path* sits inside, or ``None``.
+
+    A lane's own ``<root>/work/<profile>/`` tree is NOT protected: the guard
+    itself exempts that component, and the exemption is read from the guard's
+    declaration of it rather than spelled again here.
+    """
+    roots = _guard_declared_roots()
+    if not roots:
+        return None
+    target = _path_key(Path(path))
+    for root in roots:
+        base = _path_key(Path(root)).rstrip(os.sep)
+        if not base:
+            continue
+        if target == base:
+            return root
+        if target.startswith(base + os.sep):
+            rel = target[len(base) + 1:].split(os.sep)
+            if len(rel) >= 2 and rel[0] == _LANE_WORK_DIRNAME:
+                return None  # a lane's own work area inside a shared root
+            return root
+    return None
+
+
+def _lane_domain(assignee: str) -> Optional[str]:
+    """The lane's domain: the name rule, corrected by lane-domains.conf."""
+    try:
+        conf = Path(_LANE_DOMAINS_CONF).read_text(encoding="utf-8")
+    except OSError:
+        conf = ""
+    for line in conf.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "->" not in line:
+            continue
+        left, _, right = line.partition("->")
+        if left.strip() == assignee:
+            domain = right.strip()
+            if domain:
+                return domain
+    if "-" in assignee:
+        head = assignee.split("-", 1)[0]
+        if head:
+            return head
+    return None
+
+
+def lane_work_area(assignee: str, task_id: str, *, sandbox_root: Optional[str] = None) -> Optional[Path]:
+    """``<sandbox>/<domain>/work/<assignee>/<task_id>`` -- the out-of-tree anchor."""
+    if not assignee:
+        return None
+    domain = _lane_domain(assignee)
+    if not domain:
+        return None
+    root = Path(sandbox_root or os.environ.get(_SANDBOX_ROOT_ENV) or _DEFAULT_SANDBOX_ROOT)
+    return root / domain / "work" / assignee / task_id
+
+
+def project_worktree_path(
+    project_repo: Path | str,
+    task_id: str,
+    *,
+    assignee: Optional[str] = None,
+    board_anchor: Optional[Path | str] = None,
+    project_label: Optional[str] = None,
+) -> Path:
+    """Where a project-linked worktree card's workspace may live.
+
+    Unprotected project repo: today's ``<repo>/.worktrees/<id>``, byte for byte.
+    Protected: the anchor's mirror-sibling form when the board's anchor is a bare
+    canonical mirror, else the assignee lane's own work area, else a NAMED refusal.
+    """
+    candidate = Path(project_repo) / ".worktrees" / task_id
+    root = protected_root_for(candidate)
+    if root is None:
+        return candidate
+
+    for anchor in (board_anchor, project_repo):
+        if not anchor:
+            continue
+        anchor_path = Path(anchor)
+        if _git_is_bare_repo(anchor_path):
+            sibling = Path(_path_key(anchor_path) + ".worktrees") / task_id
+            if protected_root_for(sibling) is None:
+                return sibling
+
+    lane = lane_work_area(assignee, task_id) if assignee else None
+    if lane is not None and protected_root_for(lane) is None:
+        return lane
+
+    raise WorkspaceInsideGuardedTree(
+        project=project_label or str(project_repo),
+        attempted=candidate,
+        protected_root=root,
+        task_id=task_id,
+    )
+
+
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
