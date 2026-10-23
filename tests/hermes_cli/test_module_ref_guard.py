@@ -225,6 +225,38 @@ def test_checking_a_tree_does_not_import_the_cluster():
 # --- the command ---------------------------------------------------------------------------------
 
 
+def test_runtime_mode_asserts_hasattr_on_the_imported_members():
+    """``--runtime`` is the design's own assertion: nothing dangling, so nothing to report."""
+    out = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.module_ref_guard", "--tree", ".", "--runtime"],
+        cwd=str(REPO), capture_output=True, text=True, timeout=180)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "+ hasattr" in out.stdout, out.stdout
+
+
+def test_runtime_mode_keeps_the_static_miss_and_promotes_an_open_namespace(tmp_path):
+    """A pair the static scan declined to judge is still checked once the module is imported."""
+    root = _write_cluster(
+        tmp_path,
+        kanban_gate_invariants=(
+            "from hermes_cli.kanban_db import *\n"          # open namespace: not judged statically
+            "\n__all__ = ['present']\n"
+        ),
+        kanban_db="def present():\n    return 1\n",
+        kanban_swarm=(
+            "from hermes_cli import kanban_gate_invariants as gates\n"
+            "\n\ndef f():\n    return gates.absent_at_runtime()\n"
+        ),
+    )
+    _, misses, unresolved = guard.check_tree(root)
+    assert not misses and [m.symbol for m in unresolved] == ["absent_at_runtime"]
+
+    (tmp_path / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    runtime = guard.runtime_misses(guard.check_tree(root)[0], root)
+    assert [(m.form, m.symbol) for m in runtime] == [("runtime", "absent_at_runtime")]
+    assert "hasattr" in runtime[0].hint
+
+
 def test_the_command_exits_zero_on_a_whole_tree():
     out = subprocess.run([sys.executable, "-m", "hermes_cli.module_ref_guard", "--tree", "."],
                          cwd=str(REPO), capture_output=True, text=True, timeout=180)

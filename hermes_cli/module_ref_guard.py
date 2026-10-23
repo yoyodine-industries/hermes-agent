@@ -16,10 +16,13 @@ live a second time. A human read the two files and missed it twice.
 This module closes the class statically. Declare the module set (``CROSS_MODULE_SET``, extended
 by one constant), parse each member's source -- no imports: the check must stay cheap enough to
 run on any tree, and importing the cluster is exactly what breaks -- and report every reference
-made through another member's name whose target is not defined there.
+made through another member's name whose target is not defined there. ``--runtime`` opts into
+the ``hasattr`` assertion against the imported members for a gate that wants that belt too; the
+default pass reads sources only.
 
     python -m hermes_cli.module_ref_guard --tree <checkout>     # 0 clean, 1 misses
     python -m hermes_cli.module_ref_guard --tree . --json       # machine-readable
+    python -m hermes_cli.module_ref_guard --tree . --runtime    # + hasattr on the real modules
 
 Reference forms resolved:
 
@@ -39,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib
 import json
 import sys
 from dataclasses import asdict, dataclass
@@ -106,14 +110,18 @@ class ModuleNamespace:
 
 @dataclass
 class ModuleScan:
-    """One referencing module: its aliases, its misses and how many references were judged."""
+    """One referencing module: its aliases, every judgement it made, and what failed."""
 
     name: str
     path: Path
     aliases: dict
-    references: int
+    judged: list
     misses: list
     unresolved: list
+
+    @property
+    def references(self) -> int:
+        return len(self.judged)
 
 
 def _bound_names(target: ast.expr) -> Iterable[str]:
@@ -271,13 +279,14 @@ def _resolve_references(
 
     def judge(provider: str, symbol: str, node: ast.AST, expression: str,
               form: str) -> None:
-        scanner.references += 1
+        line = getattr(node, "lineno", 0)
+        scanner.judged.append((provider, symbol, line, form, expression))
         namespace = namespaces.get(provider)
         if namespace is None or namespace.defines(symbol):
             return
         miss = ModuleRefMiss(
             file=str(scanner.path),
-            line=getattr(node, "lineno", 0),
+            line=line,
             column=getattr(node, "col_offset", 0) + 1,
             form=form,
             expression=expression,
@@ -307,15 +316,15 @@ def _resolve_references(
                     and isinstance(symbol_node.value, str)):
                 judge(targets[base.id], symbol_node.value, node,
                       f'{base.id} getattr "{symbol_node.value}"', "getattr")
-        else:
-            provider = (_symbol_import_provider(node, members, package)
-                        if isinstance(node, ast.ImportFrom) else None)
+        elif isinstance(node, ast.ImportFrom):
+            provider = _symbol_import_provider(node, members, package)
             if provider is None:
                 continue
             for alias in node.names:
                 if alias.name == "*":
                     continue
-                scanner.references += 1
+                scanner.judged.append((provider, alias.name, node.lineno, "import",
+                                       f"from {node.module} import {alias.name}"))
                 namespace = namespaces.get(provider)
                 if namespace is None or namespace.defines(alias.name):
                     continue
@@ -373,7 +382,7 @@ def check_tree(tree_root, modules: Optional[Iterable[str]] = None,
             name=name,
             path=namespace.path,
             aliases={k: v for k, v in targets.items() if k not in ambiguous},
-            references=0,
+            judged=[],
             misses=[],
             unresolved=[],
         )
@@ -387,6 +396,47 @@ def check_tree(tree_root, modules: Optional[Iterable[str]] = None,
     return scans, misses, unresolved
 
 
+def runtime_misses(scans: Iterable[ModuleScan], tree_root,
+                   package: str = PACKAGE) -> list:
+    """The design's own assertion -- ``hasattr`` against the IMPORTED members.
+
+    Off by default because the static scan is the cheap, side-effect-free pass; a gate that wants
+    the runtime truth as well asks for it. Importing the cluster costs ~0.14s, so the tree under
+    test goes first on ``sys.path``, each member is imported once, and every reference the scan
+    judged is ``hasattr``-ed. A pair the static scan already reported is not repeated, but a pair
+    it declined to judge (an open namespace) IS promoted here when the import says it is missing.
+    """
+    root = str(Path(tree_root).resolve())
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+    already = {(m.provider, m.symbol) for scan in scans for m in scan.misses}
+    imported = {}
+    misses = []
+    for scan in scans:
+        for provider, symbol, line, form, expression in scan.judged:
+            if (provider, symbol) in already:
+                continue
+            if provider not in imported:
+                try:
+                    imported[provider] = importlib.import_module(f"{package}.{provider}")
+                except Exception as exc:  # the import failure IS the finding
+                    imported[provider] = None
+                    misses.append(ModuleRefMiss(
+                        file=str(scan.path), line=line, column=1, form="runtime",
+                        expression=f"import {package}.{provider}", provider=provider,
+                        symbol="<module import>",
+                        hint=f"the member does not import: {exc}"))
+            module = imported.get(provider)
+            if module is None or hasattr(module, symbol):
+                continue
+            misses.append(ModuleRefMiss(
+                file=str(scan.path), line=line, column=1, form="runtime",
+                expression=expression, provider=provider, symbol=symbol,
+                hint=f"hasattr({package}.{provider}, '{symbol}') is False at runtime"))
+    return misses
+
+
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m hermes_cli.module_ref_guard",
@@ -397,6 +447,8 @@ def main(argv: Optional[list] = None) -> int:
                         help=f"member to scan (repeatable; default: {' '.join(CROSS_MODULE_SET)})")
     parser.add_argument("--json", action="store_true", help="machine-readable report")
     parser.add_argument("--quiet", action="store_true", help="only the verdict line")
+    parser.add_argument("--runtime", action="store_true",
+                        help="also assert hasattr() against the imported members (imports them)")
     args = parser.parse_args(argv)
 
     try:
@@ -409,12 +461,16 @@ def main(argv: Optional[list] = None) -> int:
               file=sys.stderr)
         return 2
 
+    if args.runtime:
+        misses = misses + runtime_misses(scans, args.tree)
+
     references = sum(s.references for s in scans)
     if args.json:
         print(json.dumps({
             "tree": str(Path(args.tree).resolve()),
             "modules": [s.name for s in scans],
             "references": references,
+            "runtime": bool(args.runtime),
             "misses": [asdict(m) for m in misses],
             "unresolved": [asdict(m) for m in unresolved],
             "ok": not misses,
@@ -429,8 +485,9 @@ def main(argv: Optional[list] = None) -> int:
                 print()
         verdict = "OK" if not misses else "FAIL"
         scanner_lines = ", ".join(f"{s.name} {s.references}" for s in scans)
+        mode = " + hasattr" if args.runtime else ""
         print(f"{verdict}: {references} cross-module references across {len(scans)} modules "
-              f"({scanner_lines}); {len(misses)} dangling, {len(unresolved)} unresolved")
+              f"({scanner_lines}){mode}; {len(misses)} dangling, {len(unresolved)} unresolved")
         if misses:
             print("each MISS names a caller whose callee this tree does not carry: add the "
                   "callee to its module, or stop calling it.")
