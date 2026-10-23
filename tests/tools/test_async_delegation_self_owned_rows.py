@@ -20,6 +20,7 @@ import pytest
 
 from gateway import status
 from tools import async_delegation as ad
+from tools.process_registry import process_registry
 
 SELF_PID = os.getpid()
 
@@ -27,9 +28,15 @@ SELF_PID = os.getpid()
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch, tmp_path):
     ad._reset_for_tests()
+    # Isolate the process-wide completion queue: a dispatched delegation publishes onto it, and a
+    # leftover copy would be drained by whichever test runs next.
+    isolated = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
     yield
     ad._reset_for_tests()
+    while not isolated.empty():
+        isolated.get_nowait()
 
 
 def _self_fingerprint() -> int:
