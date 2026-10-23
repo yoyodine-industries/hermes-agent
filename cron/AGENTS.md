@@ -20,6 +20,13 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   session is hard-interrupted so it cannot monopolise the scheduler, while a long-but-active job
   is never cut off. Attached scripts (pre-run or `no_agent`) are bounded separately by the script
   timeout (`_DEFAULT_SCRIPT_TIMEOUT`, 3600s).
+- **A delivery turn never holds the run open, and a bounded turn still delivers.**
+  `cron.bot_chat_delivery_timeout_seconds` (default 180) bounds one bot-chat delivery turn; a
+  `no_agent` job's delivery is queued and the background drain posts it, so the execution row and
+  fire claim close at the script's exit (t_e9d06d80: a 600s turn kept a finished job's row
+  `running` for ten minutes, which the host lull gate read as cron work in flight). On timeout the
+  OUTPUT is queued — trimmed head+tail, naming `hermes cron runs` — never a notice that the alert
+  failed.
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
 - Every recurring occurrence is accounted for: `tick()` advances `next_run_at` BEFORE dispatch
   (at-most-once across a mid-run crash) and stamps `pending_slot` in the same save; a scan that

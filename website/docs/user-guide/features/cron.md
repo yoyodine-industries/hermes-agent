@@ -901,7 +901,7 @@ Or set the `HERMES_CRON_MEDIA_SEND_TIMEOUT` environment variable. The resolution
 
 ## Bot Chat delivery timeout
 
-A `bot-chat` delivery runs a full agent turn in the target bot's chat, so its bound is minutes, not seconds — 600s by default:
+A `bot-chat` delivery runs a full agent turn in the target bot's chat, so its bound is minutes, not seconds — 180s by default:
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -909,7 +909,9 @@ cron:
   bot_chat_delivery_timeout_seconds: 900
 ```
 
-A timed-out delivery is recorded in `last_delivery_error`; the bot's turn may still complete on its own.
+A timed-out delivery is recorded in `last_delivery_error` **and its output is still posted**: the text is queued to the deferred lane trimmed to its head and tail (naming `hermes cron runs` for the untrimmed copy) and the drain is kicked immediately, so a bounded turn never costs the alert. The bot's turn may still complete on its own.
+
+A script job's (`no_agent`) bot-chat delivery is queued from the start rather than run inline: the run closes at the script's exit and the background drain posts the result, so a delivery turn never holds the run's ledger row open.
 
 The cap bounds the bot's **turn** only. When that turn messages a teammate (`message_agent`), the delivery process stays alive afterwards — bounded by `terminal.oneshot_completion_wait_seconds` — so the teammate's reply can land in the Bot Chat; that wait is not part of the delivery and is never counted against, or cut short by, this cap.
 
