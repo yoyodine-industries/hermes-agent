@@ -134,8 +134,9 @@ def start_loop_liveness_watchdog(
                 logger.debug("Loop liveness faulthandler dump failed", exc_info=True)
             if stop_event.is_set():
                 return
-            _mark_exited_quietly(exit_code, "loop_liveness_watchdog")
-            _hard_exit(exit_code)
+            # Same exit door as the shutdown backstop: the forensic dump and the ledger/runtime
+            # stamps must never sit on the exit path of a watchdog (#t_0dc4f0d4).
+            ShutdownExitDoor.build(exit_code=exit_code).fire("loop_liveness_watchdog")
     thread = threading.Thread(target=_watchdog, daemon=True, name="gateway-loop-liveness-watchdog")
     try:
         thread.start()
@@ -236,42 +237,214 @@ def resolve_shutdown_watchdog_delay(
     return _coerce_float(drain_timeout, 0.0) + grace
 
 
+DEFAULT_EXIT_DOOR_JOIN_BUDGET_S = 2.0
+DEFAULT_BOUNDED_STEP_TIMEOUT_S = 5.0
+
+
+def get_exit_diag_path(home: Optional[Path] = None) -> Path:
+    """``<HERMES_HOME>/logs/gateway-exit-diag.log`` — the file a reader checks to ask "which exit
+    path ran?". The normal paths stamp it from ``hermes_cli.gateway``; the post-deadline exit door
+    stamps it too, because ``os._exit`` skips ``atexit`` and would otherwise leave the record that
+    matters most (a watchdog-forced exit) unwritten."""
+    return _home(home) / "logs" / "gateway-exit-diag.log"
+
+
+def _open_append_fd(path: Path) -> Optional[int]:
+    """Pre-open an append fd. Called ONLY before the deadline: after it, no filesystem work happens."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return os.open(os.fspath(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    except Exception:
+        logger.debug("Could not pre-open %s for the exit door", path, exc_info=True)
+        return None
+
+
+def _write_fd(fd: Optional[int], data: str) -> None:
+    """``os.write`` on an already-open fd; never raises, never opens anything."""
+    if fd is None:
+        return
+    with contextlib.suppress(Exception):
+        os.write(fd, data.encode("utf-8", "replace"))
+
+
+def run_bounded_step(name: str, fn: Callable[[], Any],
+                     *, timeout_s: float = DEFAULT_BOUNDED_STEP_TIMEOUT_S) -> bool:
+    """Run one teardown step on a daemon thread and join it for at most ``timeout_s``.
+
+    A teardown that blocks in ordinary file I/O must not become a process that cannot exit: the
+    caller keeps going, and a wedged step is reported WITH ITS OWN NAME (so the next incident is
+    one line, not five minutes of guessing). Returns ``True`` when the step completed."""
+    budget = _coerce_float(timeout_s, DEFAULT_BOUNDED_STEP_TIMEOUT_S)
+    done = threading.Event()
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # a step raising must not take the exit path down
+            box["error"] = exc
+        finally:
+            done.set()
+
+    try:
+        thread = threading.Thread(target=_run, daemon=True, name=f"gateway-teardown-{name}")
+        thread.start()
+    except Exception:
+        logger.warning("Shutdown step %r could not be started", name, exc_info=True)
+        return False
+    if not done.wait(timeout=budget):
+        logger.warning(
+            "Shutdown step %r did not complete within %.1fs — continuing teardown (the exit door "
+            "bounds the process, not this step)", name, budget)
+        return False
+    if box.get("error") is not None:
+        logger.warning("Shutdown step %r raised %r — continuing teardown",
+                       name, box["error"], exc_info=box["error"])
+        return False
+    return True
+
+
+class ShutdownExitDoor:
+    """The ONE exit door (I5): reached before any potentially blocking I/O, I/O-free after the deadline.
+
+    Built at the top of teardown, when the filesystem still works, so its dump and exit-diag fds are
+    already open when the deadline arrives. ``fire()`` may then block for at most
+    ``join_budget_s`` — total, not per step: the forensic dump, the ledger/runtime-status stamp and
+    the log drain all run on one daemon thread behind a hard join, and ``os._exit`` happens whether
+    or not any of them landed (I2). A watchdog that must do filesystem work to fire is not a
+    watchdog: on 2026-10-22 the old backstop did its mkdir+open+write first and never reached
+    ``os._exit`` at all.
+    """
+
+    def __init__(
+        self,
+        *,
+        exit_code: int = 1,
+        dump_fd: Optional[int] = None,
+        diag_fd: Optional[int] = None,
+        snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None,
+        join_budget_s: float = DEFAULT_EXIT_DOOR_JOIN_BUDGET_S,
+    ) -> None:
+        self.exit_code = int(exit_code)
+        self.dump_fd = dump_fd
+        self.diag_fd = diag_fd
+        self.snapshot_fn = snapshot_fn
+        self.join_budget_s = _coerce_float(join_budget_s, DEFAULT_EXIT_DOOR_JOIN_BUDGET_S)
+        self.armed_at = time.monotonic()
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        exit_code: int = 1,
+        dump_path: Optional[Path] = None,
+        diag_path: Optional[Path] = None,
+        snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None,
+        home: Optional[Path] = None,
+        join_budget_s: float = DEFAULT_EXIT_DOOR_JOIN_BUDGET_S,
+    ) -> ShutdownExitDoor:
+        """Open the forensic + exit-diag fds NOW (I/O allowed: we are before the deadline)."""
+        return cls(
+            exit_code=exit_code,
+            dump_fd=_open_append_fd(dump_path if dump_path is not None else get_shutdown_watchdog_dump_path(home)),
+            diag_fd=_open_append_fd(diag_path if diag_path is not None else get_exit_diag_path(home)),
+            snapshot_fn=snapshot_fn,
+            join_budget_s=join_budget_s,
+        )
+
+    def _write_forensic_dump(self, *, delay_s: float, snapshot: Optional[dict[str, Any]],
+                             reason: str) -> None:
+        """Header + faulthandler dump on the PRE-OPENED fd (overridden by tests to simulate a wedge)."""
+        header = {"event": "shutdown_watchdog_fired", "pid": os.getpid(), "delay_s": delay_s,
+                  "fired_at": datetime.now(UTC).isoformat(), "reason": reason,
+                  "snapshot": snapshot or {}}
+        _write_fd(self.dump_fd, json.dumps(header, default=str)
+                  + "\n--- faulthandler dump (all threads) ---\n")
+        if self.dump_fd is None:
+            with contextlib.suppress(Exception):
+                faulthandler.dump_traceback(all_threads=True)
+            return
+        with contextlib.suppress(Exception), os.fdopen(os.dup(self.dump_fd), "w",
+                                                       encoding="utf-8", closefd=True) as fh:
+            faulthandler.dump_traceback(file=fh, all_threads=True)
+            fh.write("--- end dump ---\n")
+            fh.flush()
+
+    def _stamp_exit_path(self, reason: str) -> None:
+        """One JSON line in ``logs/gateway-exit-diag.log`` naming the exit path.
+
+        Without it a watchdog-forced exit is indistinguishable from a SIGKILL after the fact — the
+        Oct 22 corpse had no ``exit_clean``/``exit_nonzero``/watchdog record at all."""
+        _write_fd(self.diag_fd, json.dumps({
+            "tag": "gateway.exit_watchdog", "path": "watchdog", "reason": reason,
+            "pid": os.getpid(), "at": datetime.now(UTC).isoformat(),
+        }, default=str) + "\n")
+
+    def _forensic_and_stamp(self, reason: str, delay_s: float) -> None:
+        """Everything the exit door WOULD like to record. Runs off the exit path, bounded by join."""
+        self._stamp_exit_path(reason)
+        try:
+            snapshot = self.snapshot_fn() if self.snapshot_fn is not None else None
+        except Exception as exc:  # a double's counters are not worth the exit
+            snapshot = {"snapshot_error": repr(exc)}
+        self._write_forensic_dump(delay_s=delay_s, snapshot=snapshot, reason=reason)
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
+        # Release the identity handles and drain the log queue BEFORE the hard exit: locks must
+        # never be stranded, and os._exit bypasses atexit. Both bounded by the join below.
+        with contextlib.suppress(Exception):
+            from gateway.status import remove_pid_file, release_gateway_runtime_lock
+            remove_pid_file()
+            release_gateway_runtime_lock()
+        with contextlib.suppress(Exception):
+            from hermes_logging import drain_log_queue
+            drain_log_queue(timeout=0.5)
+        _mark_exited_quietly(self.exit_code, reason)
+
+    def fire(self, reason: str, *, delay_s: float = 0.0) -> None:
+        """Exit the process. Blocks at most ``join_budget_s``; nothing after the deadline may block."""
+        try:
+            worker = threading.Thread(target=self._forensic_and_stamp, args=(reason, delay_s),
+                                      daemon=True, name="gateway-exit-door-forensics")
+            worker.start()
+            worker.join(timeout=self.join_budget_s)
+            if worker.is_alive():
+                with contextlib.suppress(Exception):
+                    sys.stderr.write(
+                        f"Gateway exit door: forensic thread still wedged after "
+                        f"{self.join_budget_s:.1f}s (reason={reason}); exiting anyway.\n")
+                    sys.stderr.flush()
+        except Exception:
+            logger.debug("Exit door forensics could not start", exc_info=True)
+        _hard_exit(self.exit_code)
+
+
 def _write_watchdog_dump(dump_path: Path, *, delay_s: float,
                          snapshot: Optional[dict[str, Any]]) -> None:
-    """Best-effort faulthandler + metadata dump before hard-exit."""
-    try:
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return
-    header = {"event": "shutdown_watchdog_fired", "pid": os.getpid(), "delay_s": delay_s,
-              "fired_at": datetime.now(UTC).isoformat(), "snapshot": snapshot or {}}
-    with contextlib.suppress(Exception), open(dump_path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(header, default=str) + "\n--- faulthandler dump (all threads) ---\n")
-        fh.flush()
-        try:
-            faulthandler.dump_traceback(file=fh, all_threads=True)
-        except Exception:
-            fh.write("(faulthandler.dump_traceback failed)\n")
-        fh.write("--- end dump ---\n")
-        fh.flush()
-    with contextlib.suppress(Exception):  # stderr too: journald/launchd get it if disk is wedged
-        sys.stderr.write(f"Gateway shutdown watchdog fired after {delay_s:.0f}s "
-                         f"(pid={os.getpid()}); dumping all thread stacks.\n")
-        sys.stderr.flush()
-        faulthandler.dump_traceback(all_threads=True)
+    """Best-effort faulthandler + metadata dump (kept for direct callers; the exit door writes on
+    a pre-opened fd instead, because this opens the file AFTER the deadline)."""
+    door = ShutdownExitDoor(exit_code=1, dump_fd=_open_append_fd(dump_path))
+    door._write_forensic_dump(delay_s=delay_s, snapshot=snapshot, reason="shutdown_watchdog")
 
 
 def arm_shutdown_watchdog(
     delay_s: float, *, done_event: Optional[threading.Event] = None,
     snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None, exit_code: int = 1,
-    dump_path: Optional[Path] = None, name: str = "gateway-shutdown-watchdog") -> threading.Event:
+    dump_path: Optional[Path] = None, name: str = "gateway-shutdown-watchdog",
+    door: Optional[ShutdownExitDoor] = None) -> threading.Event:
     """Arm a daemon-thread hard-exit backstop for a wedged shutdown path: exits quietly if
-    ``done_event`` is set within ``delay_s``, else dumps diagnostics and ``os._exit(exit_code)``.
-    Never raises; returns ``done_event`` for disarming."""
+    ``done_event`` is set within ``delay_s``, else fires the exit door (dump + exit-diag stamp,
+    then ``os._exit``). Never raises; returns ``done_event`` for disarming."""
     done = done_event if done_event is not None else threading.Event()
     delay = _coerce_float(delay_s, DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S)
     if delay <= 0:
         return done
+    exit_door = door if door is not None else ShutdownExitDoor.build(
+        exit_code=exit_code,
+        dump_path=dump_path if dump_path is not None else get_shutdown_watchdog_dump_path(),
+        snapshot_fn=snapshot_fn,
+    )
 
     def _watchdog() -> None:
         deadline = time.monotonic() + delay  # chunked wait so a late disarm is observed within ~1s
@@ -280,32 +453,11 @@ def arm_shutdown_watchdog(
                 return
         if done.is_set():
             return
-        try:
-            snapshot = snapshot_fn() if snapshot_fn is not None else None
-        except Exception as exc:
-            snapshot = {"snapshot_error": repr(exc)}
-        target = dump_path if dump_path is not None else get_shutdown_watchdog_dump_path()
-        _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot)
         with contextlib.suppress(Exception):
             logger.critical("Shutdown watchdog fired after %.0fs — forcing process exit "
-                            "(asyncio drain path appears wedged; see %s)", delay, target)
-        for stream in (sys.stdout, sys.stderr):
-            with contextlib.suppress(Exception):
-                stream.flush()
-        # Mirror _exit_after_graceful_shutdown: release PID file + runtime lock BEFORE the log drain
-        # (never strand locks), then drain the log queue so logger.critical lands before os._exit.
-        with contextlib.suppress(Exception):
-            # Mirror _exit_after_graceful_shutdown: release PID file + runtime lock BEFORE the log drain
-            # (locks must never be stranded), then drain the async log queue so the logger.critical above
-            # actually reaches the file before os._exit bypasses atexit. (#66892)
-            from gateway.status import remove_pid_file, release_gateway_runtime_lock
-            remove_pid_file()
-            release_gateway_runtime_lock()
-        with contextlib.suppress(Exception):
-            from hermes_logging import drain_log_queue
-            drain_log_queue(timeout=1.0)
-        _mark_exited_quietly(exit_code, "shutdown_watchdog")
-        _hard_exit(exit_code)
+                            "(asyncio drain path appears wedged; exit door writes the dump and "
+                            "logs/gateway-exit-diag.log)", delay)
+        exit_door.fire("shutdown_watchdog", delay_s=delay)
     try:
         threading.Thread(target=_watchdog, daemon=True, name=name).start()
     except Exception:
