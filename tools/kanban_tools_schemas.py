@@ -647,6 +647,18 @@ KANBAN_CREATE_SCHEMA = _schema(
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
+        "from_inbox": _prop("string", (
+            "File this card FROM a seat's inbox (<domain>/<profile>), e.g. 'platform/platform-coder'. "
+            "The card's body gains a '## Inbox item' block naming the seat and quoting from_inbox_item, "
+            "so the item->card linkage stays checkable after the item is struck from the seat file. "
+            "REFUSED (nothing created) when the seat's TASKS.md does not exist or no longer holds the item. "
+            "Requires from_inbox_item; use it whenever the work came from an inbox item."
+        )),
+        "from_inbox_item": _prop("string", (
+            "The inbox item's own words, verbatim as the seat's TASKS.md writes them (required with "
+            "from_inbox). Whitespace and markdown noise are ignored when matching, but the block quotes "
+            "exactly what you pass."
+        )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
                 "continuation turns the worker may take before the task "

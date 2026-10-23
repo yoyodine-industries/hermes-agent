@@ -1630,16 +1630,15 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     that shift as a recycled PID (#124570). A platform whose start is already boot-relative records
     ``0``. ``None`` when a half is unreadable — including "the platform has no boot witness", whose only
     honest reading is inability to certify identity, never a difference.
+
+    The definition lives in ``hermes_cli.code_skew_content`` (card t_4dbee32e): a persisted boot
+    record carries this identity so a carrier in ANOTHER process can tell "the same frozen process"
+    from "a recycled pid", and the liveness contract here must agree with it byte for byte. One
+    definition, two readers.
     """
-    from gateway.status import get_process_uptime_fingerprint, host_boot_witness
-    witness = host_boot_witness()
-    if not witness:
-        return None
-    fingerprint = get_process_uptime_fingerprint(int(pid))
-    if fingerprint is None:
-        return None
-    reference, start = fingerprint
-    return f"{witness}|{reference}|{start}"
+    from hermes_cli.code_skew_content import process_identity
+
+    return process_identity(int(pid))
 
 
 # ---------------------------------------------------------------------------
@@ -3905,6 +3904,23 @@ TICK_YIELD_ACTOR_EVENT = "tree_skew_actor_filed"
 TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX = "tree-skew:"
 TICK_YIELD_ACTOR_TITLE = "[guard] dispatcher is serving a mixed revision; refusing to spawn"
 
+#: The ladder reads a card's OWN declaration line for its blast radius
+#: (``kanban_priority_bands.declared_substrate``). A guard card gates every lane on this host and
+#: its remedy is the gateway's reload, so it declares exactly that --- which is what places it in
+#: the platform tier's TOP sub-band instead of its rest (measured: the same cards were filed at
+#: 790000, the rest band, because no declaration was ever written into the body).
+TICK_YIELD_ACTOR_DECLARATION = (
+    "- Blast radius: gateway runtime + kanban dispatcher (every lane on this host owns the reload)"
+)
+
+#: ...and the escalation leg: a skew that SURVIVES a reload is not a reload problem any more.
+TICK_YIELD_ESCALATION_ASSIGNEE = "platform-stl"
+TICK_YIELD_ESCALATION_TITLE = (
+    "[escalation] a gateway reload does not clear the tree skew --- the reload door itself is broken"
+)
+TICK_YIELD_ESCALATION_KEY_PREFIX = "tree-skew-escalation:"
+TICK_YIELD_ESCALATION_EVENT = "tree_skew_escalated"
+
 #: Consecutive refused ticks for ONE skew signature before the guard ACTS. One refusal is normal
 #: churn (a tree moves under a daemon mid-write); three in a row is a stall. Ruling t_eaadb60e
 #: (2026-10-11): ~3 minutes at the dispatcher's one-refusal-per-minute cadence.
@@ -3981,25 +3997,33 @@ def _short_tree_fingerprint(fingerprint: Optional[str]) -> str:
 def _consumer_tree_skew() -> Optional[tuple[str, str, int]]:
     """``(boot_fingerprint, disk_fingerprint, boot_pid)`` when THIS process is skewed, else None.
 
+    The DECISION is ``hermes_cli.code_skew_content.content_skew`` — the fleet's one staleness
+    comparison (card ``t_4dbee32e``). This gate and the carrier's content trigger ask the same
+    unit, so they cannot disagree about what "skewed" means; the only difference between them is
+    WHO is asking, which is exactly what makes the pair work: this check lives inside the frozen
+    process it judges, and the carrier's lives in a fresh one.
+
     CONTENT first, and load-bearing: the working tree is what moved in the incident this closes.
-    The git-ref check is consulted only when the content half reports nothing, so a pure HEAD move
-    whose files are byte-identical is still caught -- the ref path can ADD detection but never
+    The git-ref check is consulted only when the content half reports UNKNOWN, so a pure HEAD move
+    whose files are byte-identical is still caught — the ref path can ADD detection but never
     replace it.
 
     Every uncertain read returns ``None`` (no boot record, unreadable tree, unchanged tree): the
     gate fails OPEN, exactly like the ref-only guard it backstops. A guard that refused on an
-    unreadable read would stop the fleet on a transient IO error.
+    unreadable read would stop the fleet on a transient IO error. (An unknown read is NOT a claim
+    of health — the carrier's trigger is what turns it into a loud state, and ``None`` never
+    reaches a card as "clear".)
     """
     try:
-        from hermes_cli import tree_fingerprint
+        from hermes_cli import code_skew_content, tree_fingerprint
 
-        content = tree_fingerprint.detect_skew()
         record = tree_fingerprint.boot_record() or {}
+        measured = code_skew_content.measure(os.getpid(), record.get("tree"))
     except Exception:
-        content, record = None, {}
+        measured, record = {}, {}
     boot_pid = int(record.get("pid") or os.getpid())
-    if content is not None:
-        return str(content[0]), str(content[1]), boot_pid
+    if measured.get("skew") is True:
+        return str(measured["boot"]), str(measured["disk"]), boot_pid
 
     try:
         from gateway import code_skew
@@ -4281,6 +4305,8 @@ def _tick_yield_actor_body(
     )
 
     lines = [
+        TICK_YIELD_ACTOR_DECLARATION,
+        "",
         "## Observed",
         "",
         f"`{TICK_YIELD_PREFIX}` the kanban dispatcher is refusing to spawn: the tree it IMPORTED",
@@ -4347,21 +4373,27 @@ def _tick_yield_actor_body(
     return "\n".join(lines)
 
 
-def _tick_yield_actor_priority(*, title: str, body: str, board: str) -> tuple[int, str]:
+def _tick_yield_actor_priority(
+    *, title: str, body: str, board: str, assignee: Optional[str] = None,
+) -> tuple[int, str]:
     """(priority, note) asked of the LADDER, never typed.
 
     Resolved through the board's OWN priority policy (`board.json:priority_policy`), loaded the
     same way the create door loads it, with GATE_ASK (0): the card is born where the ladder places
     it. An unavailable ladder is RECORDED, never invented away -- the card is still filed, at the
     kernel default, and the note rides into the card body.
+
+    The BODY is passed in full because the ladder's qualification axis is the card's own
+    declaration line (``declared_substrate``): handing it ``body=""`` files the card in the tier's
+    rest band however load-bearing the card is.
     """
     try:
         from hermes_cli import kanban_priority_policy as _pol
 
         meta = _kb._board_meta_for(board) or {}
         verdict = _pol.priority_for_create(
-            0, assignee=TICK_YIELD_ACTOR_ASSIGNEE, board=board, title=title, body=body,
-            spec=meta.get("priority_policy"),
+            0, assignee=assignee or TICK_YIELD_ACTOR_ASSIGNEE, board=board, title=title,
+            body=body, spec=meta.get("priority_policy"),
         )
         if verdict is None:
             return 0, (f"(no priority policy on board {board}: filed at the kernel default; "
@@ -4428,6 +4460,19 @@ def _file_tick_yield_actor(
     prefix = f"{TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{sig}"
     filed_on_conn, filed_on, close_it = _ops_board_connection(conn)
     try:
+        # A skew that SURVIVED a reload is not a reload problem: file ONE escalation and stop
+        # minting duplicates of the same demand (card t_4dbee32e; the 116-card pile). Asked
+        # BEFORE the absorb, deliberately: DEC-1.4's key is per EPISODE, so a guard card filed by
+        # the process that has since been reloaded absorbs every later tick -- an absorb-first
+        # order would make this branch dead code and keep re-filing a demand a reload is already
+        # known not to clear. The escalation is idempotent per disk fingerprint, so every later
+        # refusal of the same surviving skew returns the same card.
+        survived = _skew_survived_a_reload(filed_on_conn, yielded)
+        if survived is not None:
+            return _file_tick_yield_escalation(
+                filed_on_conn, yielded, board=board, filed_on=filed_on,
+                status_path=status_path, streak=streak, prior_card=survived,
+            )
         placeholders = ",".join("?" for _ in TICK_YIELD_ACTOR_ABSORB_SKIP_STATUSES)
         existing = filed_on_conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key LIKE ? || ':%' "
@@ -4437,17 +4482,24 @@ def _file_tick_yield_actor(
         if existing is not None:
             return existing["id"]
         key = f"{prefix}:{int(window_start)}"
-        priority, ladder_note = _tick_yield_actor_priority(
-            title=TICK_YIELD_ACTOR_TITLE, body="", board=filed_on or board or "",
-        )
+
         body = _tick_yield_actor_body(
             yielded, board=board, status_path=status_path, streak=streak,
             first_tick=first_tick, last_tick=last_tick, filed_on=filed_on,
             episode=_episode_identity(sig, window_start or first_tick),
             escalation_ref=escalation_ref,
         )
+        # The ladder reads the card's OWN declaration line, so the body is built FIRST: asking it
+        # about an empty body is how these cards were born in the tier's rest band (790000) while
+        # declaring nothing at all.
+        priority, ladder_note = _tick_yield_actor_priority(
+            title=TICK_YIELD_ACTOR_TITLE, body=body, board=filed_on or board or "",
+        )
         if ladder_note:
             body += f"\n\n_priority note: {ladder_note}_"
+        # BORN READY, never `scheduled`: the kernel resolves a parentless, non-triage create to
+        # `ready` (kanban_db_graph.initial_task_state) -- the state a deadline carrier must be in
+        # for a seat to be dispatched against it. Pinned by test_guard_card_is_ready_and_top_band.
         actor_id = _kb.create_task(
             filed_on_conn,
             title=TICK_YIELD_ACTOR_TITLE,
@@ -4821,6 +4873,292 @@ def _retire_tree_skew_actors(conn: sqlite3.Connection, *, board: Optional[str] =
     return retired
 
 
+def _event_payload(raw) -> dict:
+    """A ``task_events.payload`` blob as a dict (tolerant: a relic is ``{}``, never a raise)."""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        doc = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else {}
+    except (TypeError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _skew_survived_a_reload(
+    conn: sqlite3.Connection, yielded: DispatcherTickYielded, *, limit: int = 50,
+) -> Optional[str]:
+    """The id of a prior guard card PROVING that a reload landed and did NOT clear the skew.
+
+    All of the evidence is already on the board: a guard card names the frozen process
+    (``boot_pid``) and the disk content it measured (``disk_fingerprint``). A card for the SAME
+    disk fingerprint naming a DIFFERENT process that is now PROVEN DEAD is a reload onto exactly
+    this checkout --- and this process is AGAIN skewed. That is no longer "reload it again"; it is
+    "the reload door does not clear the condition", which is a design question for the domain's
+    design authority, not a 116th copy of the same demand.
+
+    "Proven dead" is the liveness contract's verdict, never the negation of an unreadable probe:
+    an unknown process is not evidence that a reload happened.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT t.id AS id, e.payload AS payload FROM task_events e "
+            "JOIN tasks t ON t.id = e.task_id WHERE e.kind = ? ORDER BY e.id DESC LIMIT ?",
+            (TICK_YIELD_ACTOR_EVENT, int(limit)),
+        ).fetchall()
+    except Exception:  # pragma: no cover - a board without the event table has no history
+        return None
+    for row in rows:
+        payload = _event_payload(row["payload"])
+        if str(payload.get("disk_fingerprint") or "") != yielded.disk_fingerprint:
+            continue
+        try:
+            pid = int(payload.get("boot_pid"))
+        except (TypeError, ValueError):
+            continue
+        if pid == yielded.boot_pid:
+            # The SAME frozen process: that repeat is the existing carrier's to absorb.
+            continue
+        if _pid_liveness(pid) == WORKER_DEAD:
+            return str(row["id"])
+    return None
+
+
+def _tick_yield_escalation_body(
+    yielded: DispatcherTickYielded,
+    *,
+    prior_card: str,
+    board: Optional[str],
+    filed_on: Optional[str],
+    status_path: str,
+    streak: int,
+) -> str:
+    """The escalation card's body: deterministic, and it asks the ONE question that is left."""
+    return "\n".join([
+        TICK_YIELD_ACTOR_DECLARATION,
+        "",
+        "## What was measured",
+        "",
+        f"- this frozen process: pid {yielded.boot_pid}, imported content "
+        f"`{yielded.boot_fingerprint}` (label `{yielded.boot_label}`)",
+        f"- the checkout on disk: `{yielded.disk_fingerprint}` (label `{yielded.disk_label}`)",
+        f"- board refused: `{board or 'unknown'}`; card filed on: `{filed_on or board or 'unknown'}`",
+        f"- consecutive refused ticks under THIS process: **{streak}**",
+        f"- non-green status record: `{status_path}`",
+        "",
+        "## Why this is an escalation and not another guard card",
+        "",
+        f"`{prior_card}` carried the SAME on-disk content and named a DIFFERENT process, which is",
+        "now PROVEN DEAD: a reload DID happen, onto exactly this checkout, and the skew survived",
+        "it. Repeating the reload demand would be a duplicate -- the fleet already measured",
+        "116 such cards (measured 2026-10-21: 116 `[guard] dispatcher is serving a mixed revision`",
+        "rows across six boards), which is how a real stall becomes background noise.",
+        "",
+        "## The question this card exists to get answered",
+        "",
+        "The reload door does not clear the condition, so one of these is true and only a design",
+        "decision can say which:",
+        "",
+        "1. the fingerprint is measuring something a reload cannot change (a path that is not the",
+        "   imported one, a stale pyc the tree keeps regenerating, an interpreter loading a",
+        "   DIFFERENT tree than the one fingerprinted), or",
+        "2. the reload does not actually land on the disk bytes it reports (the launchd job",
+        "   restarting onto a pinned tree, a second process serving the same port).",
+        "",
+        "Answer with the branch that holds and the card moves to the code lane that owns it. Until",
+        "then NO further guard card is filed for this disk content -- this one card carries it.",
+    ])
+
+
+def _file_tick_yield_escalation(
+    conn: sqlite3.Connection,
+    yielded: DispatcherTickYielded,
+    *,
+    board: Optional[str] = None,
+    filed_on: Optional[str] = None,
+    status_path: str = "",
+    streak: int = 0,
+    prior_card: str = "",
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """File the ONE escalation card for a skew a reload did not clear (idempotent per disk)."""
+    key = f"{TICK_YIELD_ESCALATION_KEY_PREFIX}{yielded.disk_fingerprint}"
+    try:
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status NOT IN ('done', 'archived') ORDER BY created_at DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            return existing["id"]
+        body = _tick_yield_escalation_body(
+            yielded, prior_card=prior_card, board=board, filed_on=filed_on,
+            status_path=status_path, streak=streak,
+        )
+        priority, ladder_note = _tick_yield_actor_priority(
+            title=TICK_YIELD_ESCALATION_TITLE, body=body, board=filed_on or board or "",
+            assignee=TICK_YIELD_ESCALATION_ASSIGNEE,
+        )
+        if ladder_note:
+            body += f"\n\n_priority note: {ladder_note}_"
+        escalation_id = _kb.create_task(
+            conn,
+            title=TICK_YIELD_ESCALATION_TITLE,
+            body=body,
+            assignee=TICK_YIELD_ESCALATION_ASSIGNEE,
+            created_by="kanban-dispatcher",
+            priority=priority,
+            idempotency_key=key,
+        )
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, escalation_id, TICK_YIELD_ESCALATION_EVENT,
+                {
+                    "boot_fingerprint": yielded.boot_fingerprint,
+                    "disk_fingerprint": yielded.disk_fingerprint,
+                    "boot_pid": yielded.boot_pid,
+                    "prior_card": prior_card,
+                    "streak": int(streak),
+                    "filed_on": filed_on,
+                    "board": board,
+                    "at": int(now if now is not None else time.time()),
+                },
+            )
+        _kb._log.error(
+            "kanban dispatcher: the tree skew SURVIVED a reload (disk %s); filed escalation %s "
+            "to %s instead of another guard card",
+            yielded.disk_label, escalation_id, TICK_YIELD_ESCALATION_ASSIGNEE,
+        )
+        return escalation_id
+    except Exception as exc:
+        _kb._log.warning(
+            "kanban dispatcher: could not file the tree-skew ESCALATION (disk=%s, prior=%s): %s",
+            yielded.disk_fingerprint, prior_card, exc,
+        )
+        return None
+
+
+def _tick_served(result: Optional[object]) -> bool:
+    """True only for a tick that actually SERVED: not a refusal, not a lock skip, not an error."""
+    if result is None:
+        return False
+    try:
+        if getattr(result, "tick_yielded", None) or getattr(result, "error", None):
+            return False
+        return not (
+            getattr(result, "skipped_locked", False)
+            or getattr(result, "skipped_board_disabled", False)
+        )
+    except Exception:  # pragma: no cover - a duck-typed result must not stop a tick
+        return False
+
+
+def _close_cleared_tick_yield_cards(
+    result: Optional[object], conn: sqlite3.Connection,
+) -> list:
+    """Close the guard card(s) whose stall is OVER, on the proof of a verified NORMAL tick.
+
+    "Cleared" is never inferred from the ABSENCE of refusals -- the dispatcher that would refuse
+    is precisely the one that is gone. Two facts are required, both deterministic:
+
+      * THIS tick served (``_tick_served``): the evidence the card's own "What closes it" section
+        names ("the gate clears itself on the first tick that serves normally"); and
+      * the frozen process the card names is PROVEN DEAD (or is this very process, which has just
+        served), so a second live dispatcher on another board can never close a live gateway's
+        card.
+
+    A card a seat is working RIGHT NOW is protected by the kernel's live-claim fence: a
+    ``complete_task`` without run ownership is refused, which is why this door is safe to call on
+    every healthy tick. Every refusal is logged and the card is left exactly as it was.
+
+    The cards live on the OPS board (the one they were filed on), never on the board that merely
+    ticked -- the same rule the filing half follows.
+    """
+    if not _tick_served(result):
+        return []
+    ops_conn, _ops_board, close_it = _ops_board_connection(conn)
+    try:
+        return _close_cleared_cards_on(ops_conn)
+    finally:
+        if close_it:
+            try:
+                ops_conn.close()
+            except Exception:  # pragma: no cover - closing a scratch connection never matters
+                pass
+
+
+def _close_cleared_cards_on(conn: sqlite3.Connection) -> list:
+    """The body of :func:`_close_cleared_tick_yield_cards` against the board the cards ride."""
+    try:
+        rows = conn.execute(
+            "SELECT t.id AS id FROM tasks t JOIN task_events e ON e.task_id = t.id "
+            "WHERE e.kind = ? AND t.status NOT IN ('done', 'archived') GROUP BY t.id",
+            (TICK_YIELD_ACTOR_EVENT,),
+        ).fetchall()
+    except Exception:  # pragma: no cover - no board history, nothing to close
+        return []
+    closed = []
+    for row in rows:
+        card_id = row["id"]
+        try:
+            payload_row = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (card_id, TICK_YIELD_ACTOR_EVENT),
+            ).fetchone()
+        except Exception:  # pragma: no cover
+            continue
+        payload = _event_payload(payload_row["payload"] if payload_row is not None else None)
+        try:
+            frozen_pid = int(payload.get("boot_pid"))
+        except (TypeError, ValueError):
+            continue
+        if frozen_pid != os.getpid() and _pid_liveness(frozen_pid) != WORKER_DEAD:
+            continue
+        try:
+            outcome = _kb.complete_task(
+                conn, card_id,
+                summary=(
+                    "Closed by the dispatcher's OWN tick: the tree-skew stall this card carried is"
+                    " over. A dispatcher process served a normal tick after the frozen process it"
+                    f" named (pid {frozen_pid}) went away, so the reload landed and the gate is"
+                    " clear -- no lane action is owed on this card."
+                ),
+                metadata={
+                    "evidence": {
+                        "class": "none",
+                        "why": (
+                            "board repair with no run behind it: the proof is a verified normal "
+                            "dispatcher tick after the frozen pid (proven dead) stopped serving"
+                        ),
+                    },
+                    "tree_skew_cleared": {
+                        "frozen_pid": frozen_pid,
+                        "disk_fingerprint": payload.get("disk_fingerprint"),
+                        "boot_fingerprint": payload.get("boot_fingerprint"),
+                        "observed_by_pid": os.getpid(),
+                        "at": int(time.time()),
+                    },
+                },
+            )
+        except Exception as exc:
+            _kb._log.warning(
+                "kanban dispatcher: could not close the cleared tree-skew guard %s: %s", card_id, exc,
+            )
+            continue
+        if not outcome:
+            _kb._log.warning(
+                "kanban dispatcher: the cleared tree-skew guard %s was not closed (%s); it is a "
+                "live claim and stays with its worker", card_id, outcome,
+            )
+            continue
+        closed.append(card_id)
+        _kb._log.info(
+            "kanban dispatcher: closed tree-skew guard %s -- a normal tick after pid %s cleared it",
+            card_id, frozen_pid,
+        )
+    return closed
+
+
 def _tick_refused_for_tree_skew(
     conn: sqlite3.Connection,
     yielded: DispatcherTickYielded,
@@ -4961,12 +5299,26 @@ def dispatch_once(
     # 51-card live backlog long outlived). ``running`` cards are never touched (DEC-3.6) and a card
     # whose filing pid is a LIVE foreign process is skipped (a frozen peer still holds that
     # episode). A retirement fault is logged and never takes the tick down.
+    #
+    # The guard card the marker carried is closed on the SAME proof (card t_4dbee32e): a verified
+    # normal tick plus the frozen process the card names being dead is what "the reload landed"
+    # looks like from the board's side. This door runs FIRST because it is the NARROWER one -- it
+    # can only land on a card the kernel's own completion accepts -- so the retirement door below
+    # still owns every shape it cannot close (a `scheduled` legacy carrier, a `running` claim).
+    # Each door keeps its own fault isolation: neither may take a tick down.
     if not dry_run:
         cleared = _clear_tick_yield_status()
+        try:
+            _close_cleared_tick_yield_cards(result, conn)
+        except Exception as exc:  # a close is never allowed to break a tick
+            logger.warning(
+                "kanban dispatcher: tree-skew guard close failed on %s: %s",
+                resolved_board, exc,
+            )
         if resolved_board == TICK_YIELD_ACTOR_BOARD or cleared:
             try:
                 _retire_tree_skew_actors(conn, board=resolved_board)
-            except Exception as exc:  # noqa: BLE001 - retirement is never allowed to break a tick
+            except Exception as exc:  # retirement is never allowed to break a tick
                 logger.warning(
                     "kanban dispatcher: tree-skew actor retirement failed on %s: %s",
                     resolved_board, exc,

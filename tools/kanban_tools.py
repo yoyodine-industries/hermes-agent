@@ -1433,6 +1433,12 @@ def _handle_create(args: dict, **kw) -> str:
             # inherits it from this card's own session (the dispatcher exports it), from the
             # body, or from the parents - so an agent never has to remember the register.
             serves=args.get("serves"),
+            # Provenance for a card filed FROM a seat's inbox. The gate is in create_task, so
+            # this door and the CLI share ONE refusal (an InboxRefusal, i.e. a ValueError,
+            # which the handler envelope already reports without a traceback) and neither
+            # can create the row when the seat file does not hold the item.
+            from_inbox=args.get("from_inbox"),
+            from_inbox_item=args.get("from_inbox_item"),
             # Escape hatch for the ASK-HOME rule: a NEW ask filed off its register's board
             # is refused unless the caller opts in deliberately (see kanban_register).
             allow_off_board_ask=bool(args.get("allow_off_board_ask")),
