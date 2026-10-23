@@ -389,6 +389,27 @@ def top_matches(verdict, limit=ADMISSION_MATCHES):
         for m in (verdict.get("matches") or [])[:limit]]
 
 
+def named_skill(verdict):
+    """The existing skill a refusal points the author at: ``(name, path)``, or ``("", "")``.
+
+    A refusal names a skill on TWO dispositions and the message says so in both: ``fold``
+    refuses INTO one specific skill, and ``reject`` refuses because no single skill owns the
+    content and names the nearest one as where the rule belongs. The prose is not the only
+    reader of that fact — the structured refusal carries the same target in ``fold_target`` /
+    ``fold_path``, and a consumer that acts on the field instead of parsing a sentence must be
+    told the same skill. Resolving it in ONE place is what keeps the two from drifting apart:
+    `refusal_message` and every admission payload are built from this function.
+    """
+    disposition = str(verdict.get("disposition") or "")
+    if disposition == "fold" and verdict.get("fold_target"):
+        return str(verdict["fold_target"]), str(verdict.get("fold_path") or "")
+    if disposition == "reject":
+        nearest = next((m for m in (verdict.get("matches") or []) if m.get("name")), None)
+        if nearest:
+            return str(nearest["name"]), str(nearest.get("path") or "")
+    return "", ""
+
+
 def refusal_message(verdict, references_hint="", subject=""):
     """The author-facing refusal: WHAT collided, WHERE the knowledge goes, and WHY.
 
@@ -400,8 +421,7 @@ def refusal_message(verdict, references_hint="", subject=""):
     subject = subject or ("'%s'" % name)
     disposition = str(verdict.get("disposition") or "")
     if disposition == "fold":
-        target = verdict.get("fold_target") or ""
-        target_path = verdict.get("fold_path") or ""
+        target, target_path = named_skill(verdict)
         fold_match = next((m for m in verdict.get("matches") or [] if m["name"] == target),
                           (verdict.get("matches") or [{}])[0])
         lines = [
@@ -425,12 +445,14 @@ def refusal_message(verdict, references_hint="", subject=""):
         ]
         return "\n".join(lines)
     if disposition == "reject":
-        nearest = (verdict.get("matches") or [{}])[0]
+        target, target_path = named_skill(verdict)
+        nearest = next((m for m in verdict.get("matches") or [] if m.get("name") == target),
+                       (verdict.get("matches") or [{}])[0])
         lines = [
             "Refused: '%s' adds nothing to the corpus — %s." % (name, verdict.get("reason") or ""),
             "Nearest skill: %s (%s) at %s" % (
-                nearest.get("name", "-"), nearest.get("tier", "unknown"),
-                nearest.get("path", "-")),
+                target or "-", nearest.get("tier", "unknown"),
+                target_path or "-"),
             "Rule: a draft with under %d%% new intent and no single skill that owns its content "
             "is a spread restatement, and a stub below %d bytes is not a skill."
             % (round(ADMISSION_MIN_NOVELTY * 100), ADMISSION_STUB_BYTES),

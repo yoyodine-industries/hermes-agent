@@ -306,6 +306,42 @@ def test_the_reject_refusal_names_the_nearest_skill_and_the_rule(tmp_path):
     assert "15%" in message
 
 
+def test_every_refusal_that_names_a_skill_resolves_it_through_one_place(tmp_path):
+    """Prose and structured refusal come from ONE resolution, on every naming disposition.
+
+    `fold` names the skill the knowledge folds into; `reject` names the nearest skill, which is
+    where the rule belongs instead. Both messages name a skill, so `named_skill` — what the
+    message AND the tool's admission payload are built from — has to return it in both cases: a
+    consumer that reads the field rather than parsing a sentence is told nothing otherwise.
+    """
+    corpus = _corpus(tmp_path, {
+        "kanban-transitions": ("Claim and finish kanban cards.", KANBAN_BODY),
+        "postgres-migration": ("Write and verify postgres migrations.", POSTGRES_BODY),
+        "delivery-windows": ("Declare and close delivery windows.", DELIVERY_BODY)})
+
+    folded = adm.verdict_for_content(
+        "card-movement", _skill("card-movement", "Claim and finish kanban cards.", KANBAN_BODY),
+        [corpus])
+    assert folded["disposition"] == "fold"
+    assert adm.named_skill(folded) == (
+        "kanban-transitions", str(corpus / "kanban-transitions" / "SKILL.md"))
+    assert "Existing skill: kanban-transitions " in adm.refusal_message(folded)
+
+    rejected = adm.verdict_for_content(
+        "everything", _skill("everything", "Cards, migrations and windows.", SPREAD_BODY), [corpus])
+    assert rejected["disposition"] == "reject"
+    name, path = adm.named_skill(rejected)
+    assert (name, path) == (rejected["matches"][0]["name"], rejected["matches"][0]["path"])
+    assert f"Nearest skill: {name} " in adm.refusal_message(rejected)
+
+
+def test_a_refusal_that_names_no_skill_resolves_to_nothing():
+    """Nothing to point at: an empty corpus, or a disposition that refuses on its own merits."""
+    assert adm.named_skill({"disposition": "new", "matches": []}) == ("", "")
+    assert adm.named_skill({"disposition": "reject", "matches": []}) == ("", "")
+    assert adm.named_skill({}) == ("", "")
+
+
 def test_the_verdict_is_json_serialisable_for_the_tool_result(tmp_path):
     corpus = _corpus(tmp_path, {"kanban-transitions": ("Claim and finish kanban cards.", KANBAN_BODY)})
     verdict = adm.verdict_for_content(

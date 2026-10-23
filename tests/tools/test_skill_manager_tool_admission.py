@@ -7,9 +7,12 @@ function. The Hub door is covered here too, because it is the other way a copy a
 """
 
 import json
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from tools.skill_manager_tool import _create_skill, _write_file, skill_manage
 
@@ -74,6 +77,34 @@ Claim before writing, and heartbeat on long runs.
 ## Endings
 
 Complete, request review, block with a reason, or request changes.
+"""
+
+# Below the stub line: refused on size, with no single skill owning it.
+STUB = """\
+---
+name: tiny-note
+description: Tiny.
+---
+
+# Tiny
+
+One line about board cards.
+"""
+
+# Every sentence exists in one of two skills, neither owns 60% of it: a spread restatement.
+SPREAD = """\
+---
+name: cards-and-windows
+description: Cards, pauses and window closings.
+---
+
+# Cards and windows
+
+A card moves ready -> running -> done; the claim fence refuses a second worker and the review
+column owns the verdict. Terminal states are done, blocked and archived.
+
+Declare the window, arm the pause, broadcast each leg, then close the window and release the
+pause. Scheduled jobs defer into a reserved band and resume after the window closes.
 """
 
 
@@ -146,6 +177,50 @@ def test_the_refusal_is_recorded_in_the_ledger(tmp_path):
         assert entries[-1]["disposition"] == "fold"
         assert entries[-1]["existing_skill"] == "kanban-transitions"
         assert entries[-1]["reason"]
+
+
+def test_the_ledger_records_the_skill_a_reject_names(tmp_path):
+    """The record and the payload carry the same fact, or the ledger points nowhere."""
+    with _skills_root(tmp_path) as root:
+        _seed(root, "kanban-transitions", KANBAN)
+        _seed(root, "delivery-windows", DELIVERY)
+        result = _create_skill("tiny-note", STUB)
+        entries = [e for e in _ledger() if e["skill"] == "tiny-note"]
+    assert result["admission"]["disposition"] == "reject"
+    assert entries and entries[-1]["existing_skill"] == result["admission"]["fold_target"]
+    assert entries[-1]["existing_skill"]
+
+
+_NAMED = re.compile(r"(?:Existing skill|Nearest skill): (\S+) \(")
+
+
+@pytest.mark.parametrize("name,content,disposition", [
+    ("card-movement", RESTATEMENT, "fold"),
+    ("tiny-note", STUB, "reject"),
+    ("cards-and-windows", SPREAD, "reject"),
+])
+def test_the_structured_refusal_carries_the_skill_the_message_names(
+        tmp_path, name, content, disposition):
+    """Prose and field must name the same skill — on EVERY disposition that names one.
+
+    The message is what an agent reads; `admission.fold_target` is what automation reads. A
+    refusal that names the skill only inside a sentence is a dead end for a consumer whose
+    whole job on a refusal is "extend the skill you were told about", so the two are compared
+    here rather than trusted to stay in step.
+    """
+    with _skills_root(tmp_path) as root:
+        _seed(root, "kanban-transitions", KANBAN)
+        _seed(root, "delivery-windows", DELIVERY)
+        result = _create_skill(name, content)
+        assert not (root / "platform" / name).exists()
+        assert not (root / name).exists()
+    assert result["success"] is False, result
+    assert result["refused_by"] == "admission"
+    assert result["admission"]["disposition"] == disposition
+    named = _NAMED.search(result["error"])
+    assert named, f"the message names no skill:\n{result['error']}"
+    assert result["admission"]["fold_target"] == named.group(1)
+    assert Path(result["admission"]["fold_path"]).is_file()
 
 
 def test_the_curator_or_review_fork_cannot_bypass_the_gate(tmp_path):
