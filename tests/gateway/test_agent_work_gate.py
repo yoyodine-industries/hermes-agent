@@ -21,9 +21,11 @@ never on source text.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -99,6 +101,10 @@ def adapter(home, monkeypatch):
 
     a._conversation_history_for_session = _history
     a._run_agent = _run_agent
+    # Lane scoping, not the gate: the real ``_profile_scope`` imports ``gateway.run``, whose
+    # bootstrap reads the INSTALL's manifest.json -- forbidden for a test that must stay
+    # inside its tmp HERMES_HOME (and irrelevant to every assertion in this file).
+    a._profile_scope = lambda profile=None: nullcontext()
     monkeypatch.setattr(q, "receipt_after_seconds", lambda: 0.05)
     monkeypatch.setattr(q, "probe_delay", lambda n, **kw: 0.01)
     yield a
@@ -318,3 +324,286 @@ def test_saturation_warns_once_per_episode_and_recovery_is_logged(adapter, caplo
     assert len(saturated) == 1, "one WARNING per episode, not one per refusal"
     assert len(recovered) == 1
     assert "count=1" in saturated[0] and "limit=1" in saturated[0]
+
+
+# ── t_21572e62: the counter, MEASURED through the REAL _run_agent ───────────────
+#
+# The tests above drive a STUBBED ``adapter._run_agent`` (it appends to ``adapter.calls``
+# and returns), so they pin the arithmetic on the ADMISSION side and say nothing about the
+# TURN side. The t_376b3fbd probe measured the post-turn counter at 2 against a cap of 1
+# and could not say which increment leaked, because nothing observed the turn itself.
+#
+# Everything below runs the production turn path instead: the real
+# ``APIServerAdapter._run_agent`` (real ``_api_runs._submit_api_worker`` executor
+# submission, real ``_activate_admitted_request``, real ``_finish_turn_result``, real
+# ``finally`` release) reached through the real ``api_server_bot_delivery.run_record``, and
+# samples the adapter's OWN ``_agent_work_terms()`` / ``_agent_gate_snapshot()`` from
+# INSIDE the turn (``run_conversation``) and after it has returned. The only stubs are the
+# agent object the turn drives and the routing plumbing around it (lane scope, session
+# binding, metrics) -- neither is the counter under test.
+
+TURN_GATE_CAP = 1
+LANE = "default"
+
+
+class _GatedTurnAgent:
+    """The minimum a real ``_run_agent`` turn needs; ``run_conversation`` IS the turn."""
+
+    def __init__(self, on_turn):
+        self._on_turn = on_turn
+        self.session_id = "sess-gate"
+        self.session_prompt_tokens = 3
+        self.session_completion_tokens = 4
+        self.session_total_tokens = 7
+
+    def run_conversation(self, **kwargs):
+        # Sampled here, in the worker thread, while the turn is genuinely in flight: this
+        # is the moment the probe could not see.
+        self._on_turn(kwargs.get("user_message") or "")
+        return {"final_response": "pong"}
+
+
+def _gate_terms(adapter):
+    """The adapter's own three counted terms, measured now."""
+    return adapter._agent_work_terms()
+
+
+def _leaks(adapter, label):
+    """Findings for work the gate is STILL counting after a turn has returned.
+
+    Reads the adapter's own arithmetic (``_agent_work_terms`` and the snapshot's derived
+    count / attribution) -- never a flag this test sets -- so a failure names the turn that
+    leaked, the term that leaked and whoever holds it.
+    """
+    terms = _gate_terms(adapter)
+    snapshot = adapter._agent_gate_snapshot()
+    holders = [
+        "{term}@{route} profile={profile} session={session}".format(
+            term=holder.get("term") or "?",
+            route=holder.get("route") or "?",
+            profile=holder.get("profile") or "?",
+            session=holder.get("session_id") or "?",
+        )
+        for holder in snapshot["holders"]
+    ]
+    findings = []
+    for term in ("pending_requests", "inflight_turns", "live_runs"):
+        if terms[term]:
+            findings.append(
+                f"{label}: {term}={terms[term]} still counted after the turn returned "
+                f"(count={snapshot['count']} limit={snapshot['limit']}); "
+                f"holders={holders or 'none'}"
+            )
+    if sum(terms.values()) != snapshot["count"]:
+        findings.append(
+            f"{label}: the three terms ({terms}) do not add up to the published count "
+            f"({snapshot['count']})"
+        )
+    if snapshot["unattributed"]:
+        findings.append(
+            f"{label}: {snapshot['unattributed']} counted unit(s) with no live holder -- "
+            "the exact shape of a latch (the number a printed count must never show)"
+        )
+    return findings
+
+
+@pytest.fixture()
+def turn_adapter(home, monkeypatch):
+    """A real adapter whose ``_run_agent`` is the PRODUCTION one (not stubbed)."""
+    monkeypatch.setattr(api, "web", _FakeWeb)
+    a = api.APIServerAdapter.__new__(api.APIServerAdapter)
+    a._max_concurrent_runs = TURN_GATE_CAP
+    a._inflight_agent_runs = 0
+    a._pending_agent_requests = 0
+    a._active_run_tasks = {}
+    a._active_run_agents = {}
+    a._run_statuses = {}
+    a._run_owners = {}
+    a._agent_gate_holders = {}
+    a._gate_saturation_since = None
+    a._shutdown_interruptible_agents = {}
+    a._memory_sessions = SimpleNamespace(checkin=lambda agent: None)
+    # Routing plumbing, not the unit under test: the lane scope and the session binding
+    # ``_run_agent`` applies AROUND its counter.
+    a._profile_scope = lambda profile=None: nullcontext()
+    a._bind_api_server_session = lambda **kwargs: []
+    a._record_api_metrics = lambda usage, latency_seconds: None
+
+    async def _history(session_id):
+        return []
+
+    a._conversation_history_for_session = _history
+    a.settled = []
+    a._bot_send_record_status = (
+        lambda delivery_id, record, **kw: a.settled.append(
+            (delivery_id, record.get("status"), kw.get("result")))
+    )
+    a.samples = []
+
+    def _on_turn(message):
+        snapshot = a._agent_gate_snapshot()
+        a.samples.append({
+            "message": message,
+            "terms": _gate_terms(a),
+            "count": snapshot["count"],
+            "limit": snapshot["limit"],
+            "saturated": snapshot["saturated"],
+            "has_room": a._agent_gate_has_room(),
+            "count_of_work": a.active_agent_work_count(),
+            "holders": [holder.get("term") for holder in snapshot["holders"]],
+            "unattributed": snapshot["unattributed"],
+        })
+
+    a._create_agent = lambda **kwargs: _GatedTurnAgent(_on_turn)
+    return a
+
+
+def _admit_delivery(home, key, *, message="ping"):
+    """Admit one delivery into the queue (status ``queued``), exactly as a sender does."""
+    delivery_id = hashlib.sha256(key.encode()).hexdigest()[:32]
+    record = q.admit(
+        home,
+        sender_profile="sender",
+        target_profile=LANE,
+        target_session_id="sess-gate",
+        idempotency_key=q.validate_idempotency_key(key),
+        fingerprint="fp-" + delivery_id[:8],
+        delivery_id=delivery_id,
+        message=message,
+    )
+    assert record["status"] == q.STATUS_QUEUED
+    return record
+
+
+def _claimed_delivery(home, key, *, message="ping"):
+    """Admit one delivery and CLAIM it, exactly as the drainer hands a record to a turn."""
+    record = _admit_delivery(home, key, message=message)
+    claimed = q.claim_next(home, target_profile=LANE, lease_ok=True)
+    assert claimed is not None and claimed["delivery_id"] == record["delivery_id"]
+    return claimed
+
+
+def test_a_drained_turn_leaves_the_gate_empty_and_the_cap_still_admits(
+        turn_adapter, home):
+    """The turn term is INCREMENTED for the turn and RELEASED when it ends.
+
+    Three consecutive turns through the real path: each one must be counted exactly once
+    while it runs (count == cap == 1, attributed to ``inflight_turns``) and must leave the
+    gate at zero afterwards -- so the cap keeps admitting instead of latching shut.
+    """
+    a = turn_adapter
+    for index in range(3):
+        record = _claimed_delivery(home, f"auto:gate:drained:{index}")
+        assert sum(_gate_terms(a).values()) == 0, "the gate starts each turn empty"
+        settled, reply = asyncio.run(drain.run_record(a, home, record))
+        assert settled["status"] == q.STATUS_DELIVERED
+        assert reply == "pong"
+        # The named instrument, not a bare count: if this turn leaked a term the failure
+        # says WHICH term of WHICH turn, and who holds it.
+        assert _leaks(a, f"drained turn #{index + 1}") == []
+
+    # While each turn was in flight the gate counted EXACTLY that turn: one unit, the
+    # inflight term, nothing stacked on top of it, and the cap therefore readable.
+    assert len(a.samples) == 3
+    for sample in a.samples:
+        assert sample["terms"]["inflight_turns"] == 1
+        assert sample["terms"]["pending_requests"] == 0
+        assert sample["terms"]["live_runs"] == 0
+        assert sample["count_of_work"] == 1, "active_agent_work_count() == 1 inside the turn"
+        assert sample["count"] == TURN_GATE_CAP == sample["limit"], (
+            "one running turn against a cap of 1 is 1/1, never 2/1"
+        )
+        assert sample["saturated"] is True, "a turn holding the whole cap IS saturation"
+        assert sample["has_room"] is False
+        assert "inflight_turns" in sample["holders"]
+        assert sample["unattributed"] == 0
+    # After the turn: the gate is empty again -- no countable term, no holder, no latch.
+    assert _gate_terms(a) == {"pending_requests": 0, "inflight_turns": 0, "live_runs": 0}
+    assert a._agent_gate_holders == {}
+    assert a.active_agent_work_count() == 0
+    assert a._agent_gate_has_room() is True, "the cap admits again once the turn is over"
+    assert [entry[1] for entry in a.settled] == [q.STATUS_DELIVERED] * 3
+
+
+def test_an_in_call_turn_reads_1_of_1_not_2_with_a_foreign_head(
+        turn_adapter, home, monkeypatch):
+    """The caller's drain reservation becomes the turn's count -- one unit, not two.
+
+    A request admitted by ``_admit_api_agent_request`` holds one ``pending_requests`` slot
+    and a ContextVar reservation. When its handler drains the queue it runs the FOREIGN
+    head first and then its own record in-call; ``_activate_admitted_request`` must RELEASE
+    the caller's reservation as the turn takes its own unit, or the very same turn reads
+    ``pending_requests 1`` + ``inflight_turns 1`` = 2 against a cap of 1 and refuses work
+    nothing is running. This is the shape the probe saw as "2/1".
+    """
+    a = turn_adapter
+    monkeypatch.setattr(q, "receipt_after_seconds", lambda: 0.05)
+    # Both records are QUEUED (the drainer claims them itself): the foreign head first.
+    foreign = _admit_delivery(home, "auto:gate:foreign-head", message="head payload")
+    ours = _admit_delivery(home, "auto:gate:in-call", message="in call")
+    observed = {}
+
+    async def _admitted_request_runs_its_turn():
+        reservation = {"active": True}
+        token = api._api_agent_request_reservation.set(reservation)
+        a._pending_agent_requests += 1
+        observed["at_admission"] = sum(_gate_terms(a).values())
+        assert observed["at_admission"] == 1, "the admission holds exactly one slot"
+        try:
+            return await drain.drain_under_lock(
+                a, home=home, target_profile=LANE, delivery_id=ours["delivery_id"],
+                ctx={"session_id": "sess-gate", "user_message": "in call",
+                     "run_kwargs": {"session_id": "sess-gate", "user_message": "in call"}},
+                waited=0.0,
+            )
+        finally:
+            api._api_agent_request_reservation.reset(token)
+            api._release_pending_api_work(a, reservation)
+
+    response = asyncio.run(_admitted_request_runs_its_turn())
+
+    # The foreign head ran first, then the caller's own record -- both from the same
+    # queue, one turn each.
+    assert [sample["message"] for sample in a.samples] == ["head payload", "in call"]
+    assert q.read_record(home, foreign["delivery_id"])["status"] == q.STATUS_DELIVERED
+    assert q.read_record(home, ours["delivery_id"])["status"] == q.STATUS_DELIVERED
+    envelope = json.loads(response.body)
+    assert envelope["delivery_id"] == ours["delivery_id"]
+    assert envelope["status"] == q.STATUS_DELIVERED
+
+    # The in-call turn: the caller's reservation is TRANSFERRED to it, so it is 1/1.
+    in_call = a.samples[-1]
+    assert in_call["terms"]["pending_requests"] == 0, (
+        "the reservation must be transferred to the turn, not left beside it"
+    )
+    assert in_call["terms"]["inflight_turns"] == 1
+    assert in_call["count"] == TURN_GATE_CAP == in_call["limit"], (
+        f"one in-call turn is 1 counted unit, got {in_call['count']}"
+    )
+    assert in_call["count_of_work"] == 1
+    assert in_call["saturated"] is True
+    assert _leaks(a, "in-call turn") == []
+    assert a._agent_gate_holders == {}
+    assert a._agent_gate_has_room() is True
+
+
+def test_the_leak_detector_acts_on_a_real_leak(turn_adapter):
+    """Control: the detector above is not vacuous.
+
+    The defect's exact shape -- one term left counted with nobody running -- must be
+    reported by name, and must shut the cap (that shut cap is the incident: every lane
+    refused while nothing was executing).
+    """
+    a = turn_adapter
+    assert _leaks(a, "clean") == []
+
+    a._inflight_agent_runs = 1                      # the leak, in isolation
+    findings = _leaks(a, "leaked turn")
+    assert findings, "a stuck term must be reported"
+    assert "leaked turn: inflight_turns=1" in findings[0]
+    assert "count=1 limit=1" in findings[0]
+    assert a._agent_gate_has_room() is False, "a leaked term shuts the cap -- the incident"
+
+    a._inflight_agent_runs = 0
+    assert _leaks(a, "repaired") == []
+    assert a._agent_gate_has_room() is True

@@ -5117,6 +5117,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
                     clear_session_vars(tokens)
         self._activate_admitted_request()
+        # This term covers EVERY _run_agent caller -- /v1/chat/completions, /v1/responses,
+        # /api/sessions/{id}/chat[/stream] AND the peer-delivery drain turns (run_record /
+        # drain_under_lock). Callers never count themselves: an admitted request's own
+        # pending_requests reservation was just transferred above, so one turn is exactly
+        # one counted unit (t_376b3fbd, pinned by t_21572e62).
         self._inflight_agent_runs += 1
         # Attribution for the gate (t_376b3fbd): an in-flight turn is the biggest single
         # consumer of the cap, so a saturated gate must be able to name it. The token is
