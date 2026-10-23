@@ -295,7 +295,7 @@ def test_the_gate_block_is_published_with_the_heartbeat(adapter, monkeypatch):
     adapter._metrics_latency_ms = []
     adapter._metrics_last_request_at = None
     adapter._host, adapter._port = "127.0.0.1", 8644
-    adapter._active_structured_run_count = lambda: 0
+    adapter._nonterminal_run_row_count = lambda: 0
     adapter._latency_p95_ms = lambda samples: None
 
     adapter._publish_runtime_status()
