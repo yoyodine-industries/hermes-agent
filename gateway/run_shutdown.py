@@ -29,7 +29,12 @@ from gateway.restart import (
 )
 from gateway.run_common import _UNSET
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
-from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
+from gateway.shutdown_watchdog import (
+    ShutdownExitDoor,
+    arm_shutdown_watchdog,
+    resolve_shutdown_watchdog_delay,
+    run_bounded_step,
+)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -1838,9 +1843,17 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         )
 
     async def _stop_begin_teardown(self, ctx: GatewayShutdownMixin._StopContext) -> None:
-        """Flag teardown, stop room worker/watchdog, notify sessions."""
+        """Flag teardown, RELEASE THE IDENTITY, stop room worker/watchdog, notify sessions."""
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
+        # I4 (t_0dc4f0d4): release the pid file and the runtime lock BEFORE the drain. A process
+        # whose teardown cannot finish must not keep looking `running` to read_runtime_status, and
+        # must not hold the runtime lock against its replacement — the Oct 22 corpse did both, and
+        # the two calls that did it were the first blocking I/O of the last teardown phase, which is
+        # exactly where it died. Each step is bounded and named so a wedge is one log line.
+        from gateway.status import release_gateway_runtime_lock, remove_pid_file
+        run_bounded_step("remove_pid_file", remove_pid_file)
+        run_bounded_step("release_gateway_runtime_lock", release_gateway_runtime_lock)
         self._running = False
         self._clear_plugin_message_injector()
         self._draining = True
@@ -2123,17 +2136,18 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         logger.info("Shutdown phase: SessionDB close done at +%.2fs", ctx.elapsed())
 
     async def _stop_persist_exit_state(self, ctx: GatewayShutdownMixin._StopContext) -> None:
-        """PID/lock release, clean-shutdown marker, restart markers, terminal runtime status."""
+        """Clean-shutdown marker, restart markers, terminal runtime status.
+
+        The pid file and the runtime lock are released at the START of teardown (I4,
+        ``_stop_begin_teardown``): releasing them here was the first blocking I/O of the last phase
+        and is where the Oct 22 teardown died. Every remaining step is bounded and named (I5).
+        """
         from gateway.run import _hermes_home, _planned_restart_notification_path, _shutdown_gateway_health_export
         from utils import atomic_json_write
-        from gateway.status import remove_pid_file, release_gateway_runtime_lock
-        remove_pid_file()
-        release_gateway_runtime_lock()
         # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
         # half-finished sessions, so no marker — the next startup recovers their turn markers.
         if not ctx.timed_out:
-            with suppress(Exception):
-                (_hermes_home / ".clean_shutdown").touch()
+            run_bounded_step("write_clean_shutdown_marker", lambda: (_hermes_home / ".clean_shutdown").touch())
         else:
             logger.info(
                 "Skipping .clean_shutdown marker — drain timed out with "
@@ -2143,8 +2157,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         if ctx.active_agents:
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
         if self._restart_requested and self._restart_command_source is None:
-            with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
-                atomic_json_write(
+            run_bounded_step(
+                "write_planned_restart_notification",
+                lambda: atomic_json_write(
                     _planned_restart_notification_path(),
                     {
                         "requested_at": time.time(),
@@ -2152,7 +2167,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                         "detached": bool(self._restart_detached),
                     },
                     indent=None,
-                )
+                ),
+            )
         if self._restart_requested and self._restart_via_service:
             # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.
             self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
@@ -2205,23 +2221,31 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
     async def _stop_impl(self) -> None:
         """Run every ``_stop_*`` phase under the thread-based shutdown watchdog."""
         from gateway.run import GatewayRunner
-        # Thread-based watchdog (asyncio timeouts cannot recover a frozen loop): dumps stacks and
-        # os._exit past drain+grace so the service manager revives us. Skipped under pytest.
-        # Arm a plain OS thread at the start of stop(); if teardown never finishes within drain+grace it
-        # dumps faulthandler stacks and os._exit so KeepAlive/systemd can revive. Skip under pytest so
-        # stop()-driving unit tests don't get a delayed hard-exit in the worker. See #66892.
+        # One thread-based backstop for the whole teardown: asyncio timeouts cannot recover a frozen
+        # loop, so a plain OS thread armed at stop() fires the exit door (pre-opened dump/exit-diag
+        # fds, then os._exit) once drain+grace elapses, and KeepAlive/systemd revives the process.
+        # Every exit path funnels through that ONE door (#t_0dc4f0d4, I5). Skipped under pytest so
+        # stop()-driving unit tests don't get a delayed hard-exit in the worker.
         _watchdog_done = threading.Event()
         self._shutdown_watchdog_done = _watchdog_done
         # Shutdown-path doubles may lack the deferred-worker counter.
         ctx = GatewayShutdownMixin._StopContext(
             deferred_count=getattr(self, "_active_deferred_agent_worker_count", lambda: 0)
         )
+        _door = None
         if not os.environ.get("PYTEST_CURRENT_TEST"):
-            arm_shutdown_watchdog(
-                _effective_watchdog_leash(self), done_event=_watchdog_done,
-                snapshot_fn=lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx), exit_code=1,
+            # Built BEFORE any teardown I/O: the deadline path may only write to fds opened here (I2).
+            _door = ShutdownExitDoor.build(
+                exit_code=1,
+                snapshot_fn=lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx),
             )
+            self._shutdown_exit_door = _door
+            arm_shutdown_watchdog(_effective_watchdog_leash(self), done_event=_watchdog_done,
+                                  door=_door)
+        _phase = "not-started"
+        _completed = False
         try:
+            _phase = "begin_teardown"
             await GatewayRunner._stop_begin_teardown(self, ctx)
             timeout = effective_stop_drain_timeout(self)
             if timeout < self._restart_drain_timeout:
@@ -2230,15 +2254,41 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     "timeout of %.0fs — launchd SIGKILLs past it",
                     timeout, self._restart_drain_timeout, self._launchd_exit_timeout_s,
                 )
+            _phase = "drain_active_work"
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
+                _phase = "interrupt_remaining_work"
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
+            _phase = "finalize_agents_and_adapters"
             await GatewayRunner._stop_finalize_agents_and_adapters(self, ctx)
+            _phase = "release_runtime_state"
             await GatewayRunner._stop_release_runtime_state(self, ctx)
+            _phase = "quiesce_and_close_session_dbs"
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
+            _phase = "persist_exit_state"
             await GatewayRunner._stop_persist_exit_state(self, ctx)
+            _completed = True
         finally:
-            _watchdog_done.set()
+            # I3 no silent disarm: disarm ONLY a completed teardown. An exception in a phase used to
+            # leave a live, unlistening, un-drained process with the backstop switched off — the same
+            # corpse the watchdog exists to prevent, reached by a different route. The abandoned path
+            # goes straight through the exit door, naming the phase it died in.
+            self._shutdown_failed_phase = None if _completed else _phase
+            if _completed or _door is None:
+                _watchdog_done.set()
+                if _door is not None:
+                    # Clean stop, door never fired: drop the eagerly-opened fds (and the empty dump
+                    # file, so "the dump exists" keeps meaning "the watchdog fired").
+                    _door.close()
+            else:
+                with suppress(Exception):
+                    logger.critical(
+                        "Shutdown teardown abandoned in phase %r at +%.2fs — forcing exit through "
+                        "the exit door (no silent disarm; the process must not survive a teardown "
+                        "it could not finish)", _phase,
+                        ctx.elapsed() if ctx.started_at is not None else -1.0)
+                _watchdog_done.set()
+                _door.fire(f"teardown_abandoned:{_phase}")
 
     async def stop(
         self, *, restart: bool = False, detached_restart: bool = False, service_restart: bool = False
