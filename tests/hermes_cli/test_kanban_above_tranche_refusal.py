@@ -111,7 +111,7 @@ def test_above_ceiling_filing_is_refused_before_any_write(kanban_home: Path) -> 
             kb.create_task(
                 conn, title="lane work claiming the operator's band",
                 assignee="platform-worker", created_by="platform-worker",
-                priority=1100000,
+                priority=1100000, idempotency_key="fixture-111"
             )
         # A ValueError, so every surface reports a validation refusal, not a crash.
         assert isinstance(excinfo.value, ValueError)
@@ -131,7 +131,7 @@ def test_the_refusal_carries_the_standard_and_the_three_moves(kanban_home: Path)
         with pytest.raises(kb.AboveTrancheRefused) as excinfo:
             kb.create_task(
                 conn, title="quiet over-claim", assignee="platform-worker",
-                created_by="platform-worker", priority=1000000,
+                created_by="platform-worker", priority=1000000, idempotency_key="fixture-132"
             )
         message = str(excinfo.value)
         assert "above the reserved top tranche" in message
@@ -154,7 +154,7 @@ def test_the_deviation_row_is_filed_against_the_filing_lane_by_name(kanban_home:
             kb.create_task(
                 conn, title="lane work claiming the operator's band",
                 assignee="platform-worker", created_by="platform-worker",
-                priority=1100000,
+                priority=1100000, idempotency_key="fixture-154"
             )
         deviation = excinfo.value.deviation_task_id
         assert deviation, excinfo.value.deviation_error
@@ -180,7 +180,7 @@ def test_a_repeat_attempt_collapses_onto_the_same_deviation_row(kanban_home: Pat
             with pytest.raises(kb.AboveTrancheRefused) as excinfo:
                 kb.create_task(
                     conn, title="repeated over-claim", assignee="platform-worker",
-                    created_by="platform-worker", priority=1100000,
+                    created_by="platform-worker", priority=1100000, idempotency_key="fixture-181"
                 )
             ids.append(excinfo.value.deviation_task_id)
         assert ids[0] == ids[1] and ids[0]
@@ -202,7 +202,7 @@ def test_an_ask_reference_admits_the_filing_into_the_tranche(kanban_home: Path) 
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="the operator's ask, filed hot", assignee="platform-worker",
-            created_by="platform-worker", priority=1100000, serves=ASK_REF,
+            created_by="platform-worker", priority=1100000, serves=ASK_REF, idempotency_key="fixture-203"
         )
         assert _priority_of(conn, "the operator's ask, filed hot") == CEILING
         record = _policy_record(conn, "the operator's ask, filed hot")
@@ -221,7 +221,7 @@ def test_the_register_stamp_admits_a_filing_with_no_reference(kanban_home: Path)
     with kbc.connect() as conn:
         kb.create_task(
             conn, title="stamped ask", body=STAMP, assignee="platform-worker",
-            created_by="platform-worker", priority=1100000,
+            created_by="platform-worker", priority=1100000, idempotency_key="fixture-222"
         )
         assert _priority_of(conn, "stamped ask") == CEILING
         assert _policy_record(conn, "stamped ask")["above_tranche"]["marker"] == \
@@ -236,7 +236,7 @@ def test_a_declared_sev1_admits_a_filing_and_a_bare_claim_does_not(kanban_home: 
         kb.create_task(
             conn, title="gateway down for every lane",
             body="Severity: SEV1 - production is down",
-            assignee="platform-worker", created_by="platform-worker", priority=1100000,
+            assignee="platform-worker", created_by="platform-worker", priority=1100000, idempotency_key="fixture-236"
         )
         assert _priority_of(conn, "gateway down for every lane") == CEILING
         assert _policy_record(conn, "gateway down for every lane")["above_tranche"]["marker"] \
@@ -246,7 +246,7 @@ def test_a_declared_sev1_admits_a_filing_and_a_bare_claim_does_not(kanban_home: 
         with pytest.raises(kb.AboveTrancheRefused):
             kb.create_task(
                 conn, title="this is a sev1, trust me", body="sev1 sev1 sev1",
-                assignee="platform-worker", created_by="platform-worker", priority=1100000,
+                assignee="platform-worker", created_by="platform-worker", priority=1100000, idempotency_key="fixture-247"
             )
 
 
@@ -276,7 +276,7 @@ def test_a_filing_at_the_tranche_floor_is_not_this_doors_business(kanban_home: P
     with kbc.connect() as conn:
         kb.create_task(
             conn, title="inside the tranche, unwired board", assignee="platform-worker",
-            created_by="platform-worker", priority=TRANCHE_FLOOR,
+            created_by="platform-worker", priority=TRANCHE_FLOOR, idempotency_key="fixture-277"
         )
         assert _priority_of(conn, "inside the tranche, unwired board") == TRANCHE_FLOOR
 
@@ -293,7 +293,7 @@ def test_a_hand_lift_above_the_ceiling_is_refused(kanban_home: Path) -> None:
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="lane work", assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture-294"
         )
         with pytest.raises(kb.AboveTrancheRefused):
             kb.edit_task(conn, tid, priority=1100000)
@@ -313,14 +313,14 @@ def test_a_marked_card_may_still_be_lifted_and_a_plain_one_may_be_lowered(
     with kbc.connect() as conn:
         ask = kb.create_task(
             conn, title="the ask", body=STAMP, assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture-314"
         )
         kb.edit_task(conn, ask, priority=1100000)          # marker: allowed
         assert _priority_of(conn, "the ask") == 1100000
 
         plain = kb.create_task(
             conn, title="plain", assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture-321"
         )
         kb.edit_task(conn, plain, priority=ORDINARY_MAX - 1)
         assert _priority_of(conn, "plain") == ORDINARY_MAX - 1
@@ -338,15 +338,15 @@ def test_the_repair_pass_lowers_each_class_into_its_ceiling(kanban_home: Path) -
     with kbc.connect() as conn:
         plain = kb.create_task(
             conn, title="plain lane work", assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture-339"
         )
         stamped = kb.create_task(
             conn, title="stamped ask", body=STAMP, assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture-343"
         )
         designated = kb.create_task(
             conn, title="designated", assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture-347"
         )
         # Simulate the legacy rows: the designation is real, then the hand-lift door of the day
         # moved the row above the ceiling (the live defcon history exactly: designation ledger at
@@ -391,7 +391,7 @@ def test_the_repair_pass_is_idempotent_and_inert_on_a_clean_board(kanban_home: P
     with kbc.connect() as conn:
         kb.create_task(
             conn, title="clean", assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture-392"
         )
         assert kb.demote_above_tranche(conn, board="defcon") == []
         assert _priority_of(conn, "clean") == ORDINARY_MAX
@@ -417,11 +417,11 @@ def test_the_lane_picks_the_ask_ahead_of_the_card_that_used_to_outrank_it(
     with kbc.connect() as conn:
         plain = kb.create_task(
             conn, title="plain lane work", assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture-418"
         )
         ask = kb.create_task(
             conn, title="the ask", body=STAMP, assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture-422"
         )
         # The legacy state: the plain card held the higher number and was picked first.
         with kb.write_txn(conn):
