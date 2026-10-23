@@ -257,9 +257,57 @@ def _owner_liveness() -> Optional[Callable[[Any, Any], bool]]:
     return alive
 
 
+def _owner_is_this_process(pid: Any, started: Any) -> bool:
+    """True when a row's stamped owner IS this process incarnation.
+
+    A row stamped to us passes every liveness probe by construction — the pid is alive because it is
+    us — so ``alive(pid, started)`` cannot say whether anything HERE still holds the row. Callers
+    pair this with an in-memory live set instead of the pid: ``_records`` for in-flight work,
+    ``_offered`` for a completion copy this process still has. Without it, a row whose owner thread
+    is gone latches for the whole life of the process: the same defect ``cron/delivery_queue.py``
+    closes with its ``_ACTIVE_DELIVERIES`` set.
+    """
+    if not pid:
+        return False
+    try:
+        if int(pid) != os.getpid():
+            return False
+    except (TypeError, ValueError):
+        return False
+    if started is None:
+        return True  # legacy row: a bare pid match is all the identity it carries
+    try:
+        from gateway.status import get_process_start_time, start_time_fingerprints_match
+        current = get_process_start_time(os.getpid())
+    except Exception:
+        return True  # cannot tell -> hold: never fabricate a recovery nor a duplicate offer
+    if current is None:
+        return True
+    return bool(start_time_fingerprints_match(started, current))
+
+
+def _holds_record(delegation_id: str) -> bool:
+    """True when this process still holds the delegation's registry record (any status).
+
+    Membership is the live set. Any status counts, not just the live ones: a record this process
+    finalized and failed to persist (``_persist_completion`` is best-effort) must not be
+    reclassified as abandoned by the process that already has its result — that would deliver a
+    fabricated ``unknown`` turn beside the real one. ``_records`` is populated before
+    ``_persist_dispatch`` writes the row, so a row this process just dispatched is never seen
+    unheld.
+    """
+    with _records_lock:
+        return delegation_id in _records
+
+
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown; children a multi-child unit had already
-    recorded (``record_unit_child``) are replayed with their real results."""
+    recorded (``record_unit_child``) are replayed with their real results.
+
+    A row stamped to THIS process is not live because its pid is: it is only live while ``_records``
+    still holds the work, so a row whose owner thread is gone is classified here instead of latching
+    until the process exits.
+    """
     alive = _owner_liveness()
     if alive is None:
         return 0
@@ -271,7 +319,11 @@ def recover_abandoned_delegations() -> int:
                FROM async_delegations WHERE state IN ('running','finalizing')""").fetchall()
         for row in rows:
             delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid, result_json, last_state = row
-            if alive(pid, started):
+            if _owner_is_this_process(pid, started):
+                # Our own pid proves nothing about the WORK: only this process's registry can.
+                if _holds_record(delegation_id):
+                    continue
+            elif alive(pid, started):
                 continue
             task = json.loads(task_json or "{}")
             error = "Delegation owner exited before recording a terminal result; outcome unknown."
@@ -366,11 +418,13 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
     started; this covers the rest while it runs. Abandoned in-flight rows are first classified by
     ``recover_abandoned_delegations``. A terminal row qualifies when it is pending with an event, idle
     past ``_ORPHAN_STALE_S``, not under a live delivery claim, and its owner fails the shared liveness
-    check. A row is offered once per live in-memory copy: a consumer that discards the copy with the row
-    still pending hands it back for the next sweep. The consumer's ``claim_completion_delivery`` stays
-    the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
-    the delivery budget or the replay age converge to ``dropped``. Reads the current profile's ledger:
-    callers bind the owning profile first."""
+    check — with one arm for rows owned by THIS process: the pid is alive because it is us, so the row
+    is held only while ``_offered`` still holds a copy, which is what makes
+    ``return_completion_offer``'s hand-back re-offerable. A row is offered once per live in-memory copy:
+    a consumer that discards the copy with the row still pending hands it back for the next sweep. The
+    consumer's ``claim_completion_delivery`` stays the atomic cross-process gate, so two processes
+    offering one row never both deliver it. Rows past the delivery budget or the replay age converge to
+    ``dropped``. Reads the current profile's ledger: callers bind the owning profile first."""
     alive = _owner_liveness()
     if alive is None or not _db_path().exists():
         return 0  # never create a ledger just to sweep it
@@ -389,7 +443,10 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
                ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
         orphans = []
         for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts in rows:
-            if delegation_id in offered or alive(pid, started):
+            # Held while a live copy is out (offered), or by another live process that will deliver
+            # it itself. A row stamped to US is held only by that copy: the pid proves nothing.
+            if delegation_id in offered or (
+                    alive(pid, started) and not _owner_is_this_process(pid, started)):
                 continue
             if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
                 # Its last claimant died holding the final attempt; converge like release_completion_delivery.
@@ -506,21 +563,27 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     spawning session ended at an explicit user boundary such as /new or reset).
     ``dropped`` — not ``delivered`` — keeps the ack honest; not ``pending`` keeps
     restart recovery from replaying it into a fail-closed drop forever."""
-    return _update_delivery("""UPDATE async_delegations SET delivery_state='dropped',
+    done = _update_delivery("""UPDATE async_delegations SET delivery_state='dropped',
                   updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
              AND delivery_claim=?""", (time.time(), delegation_id, claim_id))
+    if done:
+        _clear_offer(delegation_id)  # the live copy is spent; stop holding the row
+    return done
 
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
     now = time.time()
-    return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
+    done = _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
                   delivered_at=?, updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
              AND delivery_claim=?""", (now, now, delegation_id, claim_id))
+    if done:
+        _clear_offer(delegation_id)  # the live copy is spent; stop holding the row
+    return done
 
 
 def complete_event_delivery(evt: dict[str, Any], claim_id: str) -> None:
@@ -534,6 +597,27 @@ def release_event_delivery(evt: dict[str, Any], claim_id: str) -> None:
     return_completion_offer(evt)
 
 
+def _record_offer(delegation_id: str) -> None:
+    """Record that THIS process holds a live in-memory copy of the completion.
+
+    ``_offered`` is the live set the sweep tests a row stamped to us against: the owner pid is alive
+    because it is us, so only this set can say whether the copy is still here.
+    """
+    if not delegation_id:
+        return
+    with _orphan_lock:
+        _offered.add((hermes_home_key(get_hermes_home()), delegation_id))
+
+
+def _clear_offer(delegation_id: str) -> None:
+    """The live copy is gone (delivered, dropped or handed back): release the row to the sweep.
+    Delegation ids are unique across profiles, so this clears the offer in every home."""
+    if not delegation_id:
+        return
+    with _orphan_lock:
+        _offered.difference_update({key for key in _offered if key[1] == delegation_id})
+
+
 def return_completion_offer(evt: dict[str, Any]) -> None:
     """Hand an offered completion back to the orphan sweep after its in-memory copy was discarded while
     the durable row stays pending, e.g. a TUI session that cannot prove it owns the event drops it (every
@@ -542,8 +626,7 @@ def return_completion_offer(evt: dict[str, Any]) -> None:
     delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
     if not delegation_id or is_interim_delegation_event(evt):
         return
-    with _orphan_lock:
-        _offered.difference_update({key for key in _offered if key[1] == delegation_id})
+    _clear_offer(delegation_id)
 
 
 def _event_delivery(fn, evt: dict[str, Any], claim_id: str) -> None:
@@ -943,6 +1026,11 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
     except Exception as exc:  # pragma: no cover
         logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
                      "result lost: %s", record.get("delegation_id"), exc)
+        return
+    # The copy just queued is the live-set entry for this row: our own pid says nothing about it
+    # (``sweep_orphaned_completions``), so without this the sweep would inject a second copy, and
+    # with it a row we still owe a delivery for is held until the copy is delivered or handed back.
+    _record_offer(str(record.get("delegation_id") or ""))
 
 
 def push_task_failure_notice(delegation_id: str, entry: dict[str, Any], *, n_tasks: int) -> None:
