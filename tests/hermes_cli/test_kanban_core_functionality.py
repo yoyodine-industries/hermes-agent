@@ -1054,7 +1054,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
         parent_b = kb.create_task(conn, title="retry-corrected", assignee="alice")
         kb.claim_task(conn, parent_b)
         real = kb.create_task(
-            conn, title="real-child", assignee="x", created_by="alice",
+            conn, title="real-child", assignee="x", created_by="alice", idempotency_key="fixture:case-1056"
         )
 
         # First attempt: phantom in the list rejects, task stays running.

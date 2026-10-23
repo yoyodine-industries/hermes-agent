@@ -401,7 +401,8 @@ def test_create_without_parents_answers_exactly_what_it_always_did(kanban_home):
     """No edge, no receipt: the keys are the ones the door shipped before this change."""
     from tools import kanban_tools as kt
 
-    out = json.loads(kt._handle_create({"title": "solo", "assignee": "default"}))
+    out = json.loads(kt._handle_create({"title": "solo", "assignee": "default",
+                                        "idempotency_key": "fixture:solo"}))
     assert out.get("ok"), out
     assert set(out) == {"ok", "task_id", "gated", "subscribed"} | set(kt._CREATED_FIELDS)
     assert out["gated"] is False
