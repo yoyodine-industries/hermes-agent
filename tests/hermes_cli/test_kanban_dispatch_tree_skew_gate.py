@@ -1470,3 +1470,338 @@ def test_a_skew_that_survives_a_reload_escalates_instead_of_refiling(board, tree
     finally:
         ops.close()
     assert guard_cards == 1, f"no 117th guard card: {guard_cards} guard cards on the board"
+
+
+# ---------------------------------------------------------------------------------------------
+# R-1..R-4 (card t_5a54ca29) -- SURVIVAL is the IMPORTED content coming back, never the disk
+# ---------------------------------------------------------------------------------------------
+
+
+def _dead_pid(monkeypatch, pid):
+    """Make exactly ``pid`` answer the liveness contract's PROVEN-DEAD verdict."""
+    real = kbd._pid_liveness
+    monkeypatch.setattr(
+        kbd, "_pid_liveness",
+        lambda other: kbd.WORKER_DEAD if int(other) == int(pid) else real(other),
+    )
+
+
+def _escalation_rows():
+    conn = kbc.connect(board=OPS_BOARD)
+    try:
+        return conn.execute(
+            "SELECT id, assignee, status, body, idempotency_key FROM tasks "
+            "WHERE idempotency_key LIKE ? ORDER BY rowid",
+            (f"{kbd.TICK_YIELD_ESCALATION_KEY_PREFIX}%",),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _persist_prior_boot(pid, fingerprint, *, identity="boot-witness|1200|340000"):
+    """The filer's OWN persisted boot record -- what certifies that today's pid is that process."""
+    directory = tf.boot_records_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{int(pid)}.json").write_text(
+        json.dumps({
+            "fingerprint": fingerprint,
+            "pid": int(pid),
+            "tree": None,
+            "recorded_at": 1,
+            "identity": identity,
+        }),
+        encoding="utf-8",
+    )
+
+
+def _seed_prior_guard_event(
+    *, boot_fingerprint, disk_fingerprint, pid, status="ready", completed_at=None,
+    first_tick=None, persist_boot=True,
+):
+    """A prior guard card, plus the event the shipped door writes for it.
+
+    Seeded rather than driven so a test can pick the ONE field under test -- the imported content,
+    the pid's liveness verdict, the card's status and its clearance time -- without the other two
+    having to be produced by a whole episode first. ``persist_boot`` writes the filer's own boot
+    record, without which the pid is NOT certified as that process (R-2, recycled-pid guard).
+    """
+    first_tick = int(first_tick or 1)
+    if persist_boot:
+        _persist_prior_boot(pid, boot_fingerprint)
+    conn = kbc.connect(board=OPS_BOARD)
+    try:
+        card_id = kb.create_task(
+            conn,
+            title=kbd.TICK_YIELD_ACTOR_TITLE,
+            body="prior guard card (seeded by the R-1..R-4 tests)",
+            assignee=kbd.TICK_YIELD_ACTOR_ASSIGNEE,
+            created_by="kanban-dispatcher",
+            idempotency_key=(
+                f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{boot_fingerprint}:{first_tick}"
+            ),
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, card_id, kbd.TICK_YIELD_ACTOR_EVENT, {
+                "boot_fingerprint": boot_fingerprint,
+                "disk_fingerprint": disk_fingerprint,
+                "boot_pid": int(pid),
+                "sig": boot_fingerprint,
+                "streak": THRESHOLD,
+                "first_tick": first_tick,
+                "last_tick": first_tick,
+                "window_start": first_tick,
+                "status_record": "(seeded)",
+                "board": OPS_BOARD,
+                "filed_on": OPS_BOARD,
+                "escalation_ref": None,
+            })
+            conn.execute(
+                "UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?",
+                (status, int(completed_at) if completed_at is not None else None, card_id),
+            )
+        return card_id
+    finally:
+        conn.close()
+
+
+def _close_card(task_id, *, completed_at):
+    """A human closed the card -- the state R-3 must survive without swallowing the next episode."""
+    conn = kbc.connect(board=OPS_BOARD)
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(completed_at), task_id),
+            )
+    finally:
+        conn.close()
+
+
+def test_r1_the_incident_replay_is_not_a_surviving_skew(board, tree, monkeypatch):
+    """R-1. b1b9cb6 -> 47558cf inside five minutes: the SAME disk, a DIFFERENT imported content.
+
+    The disk fingerprint is the one thing a reload does NOT change, so a prior event that measured
+    this same checkout proves nothing about whether a reload landed. The prior card here is left
+    OPEN and filed by a pid that is proven dead, so R-2 cannot be what rejects it: the imported
+    content is the only difference, which is the whole point. The ordinary acting card is the right
+    object for a re-skew onto a revision the fleet had already left -- not a design escalation
+    citing a card from an earlier story.
+    """
+    conn = board
+    tf.record_boot()
+    imported = tf.boot_record()["fingerprint"]
+    _edit(tree)
+    _tick(conn)  # one refusal: this is the disk content the fleet is now serving
+    state = _status_record()[1]
+    disk = state["disk_fingerprint"]
+    assert disk != imported, "the fixture's edit must move the disk content"
+
+    dead = os.getpid() + 900001
+    prior = _seed_prior_guard_event(
+        boot_fingerprint="tree-content:" + "c" * 64,  # an EARLIER story's imported content
+        disk_fingerprint=disk,                        # the same checkout this tick measures
+        pid=dead,
+        status="ready",
+        first_tick=int(state["first_tick"]) - 900,
+    )
+    _dead_pid(monkeypatch, dead)
+
+    for _ in range(THRESHOLD):
+        _tick(conn)
+
+    assert _escalation_rows() == [], (
+        "a prior event on the same DISK content is not a surviving skew when the IMPORTED content "
+        "differs (R-1): this is the fleet leaving a revision and coming back to it"
+    )
+    actors = [row for row in _actor_rows() if row["id"] != prior]
+    assert len(actors) == 1, f"the ordinary acting card is the right object here, got {actors}"
+    assert actors[0]["idempotency_key"] == (
+        f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{imported}:{state['first_tick']}"
+    ), "the acting card is keyed on THIS episode's imported content and window"
+
+
+def test_r2_a_card_cleared_before_this_process_booted_is_not_survival(board, tree, monkeypatch):
+    """R-2. Same imported content, same proven-dead pid -- but that card was CLEARED before boot.
+
+    Without R-2 the match is indistinguishable from a broken reload door, and every re-entry cites
+    a card that was answered hours ago. The clearance time against this process's boot
+    ``recorded_at`` is what separates "the reload landed and the skew is back" (escalate) from
+    "this episode began after the last one was closed" (file the ordinary card).
+    """
+    conn = board
+    tf.record_boot()
+    imported = tf.boot_record()["fingerprint"]
+    booted_at = int(tf.boot_record()["recorded_at"])
+    _edit(tree)
+    _tick(conn)  # one refusal: the disk content the earlier episode had also measured
+    disk = _status_record()[1]["disk_fingerprint"]
+
+    dead = os.getpid() + 900002
+    prior = _seed_prior_guard_event(
+        boot_fingerprint=imported,
+        disk_fingerprint=disk,          # the SAME checkout: R-1 and R-2 both let it through
+        pid=dead,
+        status="done",
+        completed_at=booted_at - 600,   # cleared ten minutes BEFORE this process booted
+        first_tick=booted_at - 900,
+    )
+    _dead_pid(monkeypatch, dead)
+
+    for _ in range(THRESHOLD):
+        _tick(conn)
+
+    assert _escalation_rows() == [], (
+        "a card cleared BEFORE this process booted is a previous episode, not a surviving reload "
+        "(R-2): re-filing it as survival is how one card becomes 116"
+    )
+    actors = [row for row in _actor_rows() if row["id"] != prior]
+    assert len(actors) == 1, f"this episode gets its own acting card, got {actors}"
+
+
+def test_r2_an_uncorroborated_filer_is_not_proven_dead(board, tree, monkeypatch):
+    """R-2, fail closed. No persisted boot record for the filer: NOT certified as that process.
+
+    A pid NUMBER is only evidence while it still means the same process, so the prior card is
+    corroborated against its filer's own boot record. Without one, the board cannot tell a dead
+    filer from a recycled pid -- and an unreadable claim does not carry a design escalation.
+    """
+    conn = board
+    tf.record_boot()
+    imported = tf.boot_record()["fingerprint"]
+    _edit(tree)
+
+    dead = os.getpid() + 900005
+    prior = _seed_prior_guard_event(
+        boot_fingerprint=imported,
+        disk_fingerprint="tree-content:" + "e" * 64,
+        pid=dead,
+        status="ready",
+        first_tick=1,
+        persist_boot=False,             # nothing on disk says this pid ever booted
+    )
+    _dead_pid(monkeypatch, dead)
+    assert tf.recorded_boot(dead) is None
+
+    for _ in range(THRESHOLD):
+        _tick(conn)
+
+    assert _escalation_rows() == [], (
+        "an uncorroborated filer is not PROVEN DEAD, so it cannot carry an escalation (R-2)"
+    )
+    assert [row["id"] for row in _actor_rows()] == [prior], (
+        "the ordinary acting path carries it: the open guard card absorbs, no escalation"
+    )
+
+
+def test_r3_a_reload_onto_the_same_imported_content_escalates_once_per_episode(
+    board, tree, monkeypatch, _escalation_door,
+):
+    """R-3 + R-4. The GENUINE door failure: same imported content, dead filer, open card.
+
+    Exactly one escalation, keyed on the imported content and THIS window's first tick, and its
+    body quotes the three facts R-4 demands -- each printed beside the pid that measured it -- with
+    the disk half labelled as evidence. The 116-card sentence stays; the "carried the SAME on-disk
+    content" sentence, refuted by R-1, does not.
+    """
+    conn = board
+    tf.record_boot()
+    imported = tf.boot_record()["fingerprint"]
+    _edit(tree)
+    _tick(conn)
+    state = _status_record()[1]
+    first_tick = int(state["first_tick"])
+
+    dead = os.getpid() + 900003
+    prior = _seed_prior_guard_event(
+        boot_fingerprint=imported,                 # the SAME imported content
+        disk_fingerprint=state["disk_fingerprint"],
+        pid=dead,
+        status="ready",                            # not closed: R-2 cannot reject it
+        first_tick=first_tick - 30,
+    )
+    _dead_pid(monkeypatch, dead)
+
+    for _ in range(THRESHOLD - 1):
+        _tick(conn)
+
+    rows = _escalation_rows()
+    assert len(rows) == 1, f"exactly ONE escalation for this episode, got {rows}"
+    escalation = rows[0]
+    assert escalation["idempotency_key"] == (
+        f"{kbd.TICK_YIELD_ESCALATION_KEY_PREFIX}{imported}:{first_tick}"
+    ), "the key is the IMPORTED content plus THIS window's first tick (R-3)"
+    assert escalation["assignee"] == kbd.TICK_YIELD_ESCALATION_ASSIGNEE == "platform-stl"
+
+    body = escalation["body"]
+    assert prior in body, "the body must NAME the prior card it matched"
+    assert imported in body, "this process's imported content, verbatim"
+    assert state["disk_fingerprint"] in body, "the measured disk content, verbatim (as evidence)"
+    assert str(dead) in body, "the pid that filed the prior card, verbatim"
+    assert "status `ready`" in body and "(not closed)" in body
+    assert "take NO part in the identity" in body, "the disk half must be labelled EVIDENCE"
+    assert "carried the SAME on-disk content" not in body, "the claim R-1 refuted is gone"
+    assert "116" in body, "the pile this card exists to stop is still named"
+
+    assert len(_actor_rows()) == 1, "the escalation REPLACES the guard card, it does not sit beside it"
+
+    # A repeat refusal INSIDE the same episode returns the same card -- never a second one.
+    for _ in range(2):
+        _tick(conn)
+    assert [row["id"] for row in _escalation_rows()] == [escalation["id"]]
+
+
+def test_r3_a_closed_escalation_never_swallows_the_next_episode(board, tree, monkeypatch):
+    """R-3. The window is in the key, so a NEW episode mints a NEW key and a NEW card.
+
+    Keyed on the disk fingerprint alone, a closed escalation absorbed the next stall for as long as
+    that checkout stayed frozen -- and in the incident the cited card had been closed months
+    earlier. Closing this episode's card and letting the gate clear must not silence the next one.
+    """
+    import time as real_time
+
+    clock = _Clock(real_time)
+    monkeypatch.setattr(kbd, "time", clock)
+    conn = board
+    tf.record_boot()
+    imported = tf.boot_record()["fingerprint"]
+    _edit(tree)
+    _tick(conn)
+    first_window = int(_status_record()[1]["first_tick"])
+
+    dead = os.getpid() + 900004
+    _seed_prior_guard_event(
+        boot_fingerprint=imported,
+        disk_fingerprint=_status_record()[1]["disk_fingerprint"],
+        pid=dead,
+        status="ready",
+        first_tick=first_window - 30,
+    )
+    _dead_pid(monkeypatch, dead)
+    for _ in range(THRESHOLD - 1):
+        _tick(conn)
+    first = _escalation_rows()
+    assert len(first) == 1, first
+    _close_card(first[0]["id"], completed_at=first_window + 30)
+
+    # The episode CLEARS: the checkout is rewound to the imported content and the tick serves.
+    clock.offset += 60
+    _edit(tree, body="VALUE = 1\n")
+    assert _tick(conn).tick_yielded == "", "the rewind must let the tick serve"
+    assert _status_record()[1] is None, "a serving tick retires the refused-tick record"
+
+    # ...and the SAME imported content is skewed again: a NEW window, a NEW episode.
+    clock.offset += 60
+    _edit(tree, body="VALUE = 2\n# re-entry\n")
+    for _ in range(THRESHOLD):
+        _tick(conn)
+
+    rows = _escalation_rows()
+    assert len(rows) == 2, f"the next episode must file its OWN escalation, got {rows}"
+    second = rows[1]
+    assert second["id"] != first[0]["id"]
+    assert second["idempotency_key"] != first[0]["idempotency_key"]
+    assert second["idempotency_key"] == (
+        f"{kbd.TICK_YIELD_ESCALATION_KEY_PREFIX}{imported}:"
+        f"{_status_record()[1]['first_tick']}"
+    ), "the new card keys from ITS OWN first tick (R-3)"
+    assert second["status"] not in ("done", "archived"), "the new escalation is live"

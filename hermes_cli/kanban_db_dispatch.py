@@ -4465,13 +4465,21 @@ def _file_tick_yield_actor(
         # BEFORE the absorb, deliberately: DEC-1.4's key is per EPISODE, so a guard card filed by
         # the process that has since been reloaded absorbs every later tick -- an absorb-first
         # order would make this branch dead code and keep re-filing a demand a reload is already
-        # known not to clear. The escalation is idempotent per disk fingerprint, so every later
-        # refusal of the same surviving skew returns the same card.
+        # known not to clear.
+        #
+        # WHAT COUNTS AS SURVIVAL (card t_5a54ca29, R-1): the SAME IMPORTED CONTENT, filed by a
+        # process that is now proven dead, on a card that was not already cleared before this
+        # process booted. The disk fingerprint is evidence, never the identity: it is the one
+        # fingerprint a reload does not change, so matching it turned a re-skew onto a revision
+        # the fleet had already left (b1b9cb6 -> 47558cf, five minutes) into an "escalation" that
+        # cited a guard card closed long before. The escalation is idempotent per EPISODE, so
+        # every later refusal of the same surviving skew returns the same card.
         survived = _skew_survived_a_reload(filed_on_conn, yielded)
         if survived is not None:
             return _file_tick_yield_escalation(
                 filed_on_conn, yielded, board=board, filed_on=filed_on,
-                status_path=status_path, streak=streak, prior_card=survived,
+                status_path=status_path, streak=streak, prior=survived,
+                first_tick=first_tick,
             )
         placeholders = ",".join("?" for _ in TICK_YIELD_ACTOR_ABSORB_SKIP_STATUSES)
         existing = filed_on_conn.execute(
@@ -4884,24 +4892,120 @@ def _event_payload(raw) -> dict:
     return doc if isinstance(doc, dict) else {}
 
 
-def _skew_survived_a_reload(
-    conn: sqlite3.Connection, yielded: DispatcherTickYielded, *, limit: int = 50,
-) -> Optional[str]:
-    """The id of a prior guard card PROVING that a reload landed and did NOT clear the skew.
+@dataclass(frozen=True)
+class _PriorSkewEvent:
+    """A prior guard card that PROVES a reload landed on THIS SAME imported content.
 
-    All of the evidence is already on the board: a guard card names the frozen process
-    (``boot_pid``) and the disk content it measured (``disk_fingerprint``). A card for the SAME
-    disk fingerprint naming a DIFFERENT process that is now PROVEN DEAD is a reload onto exactly
-    this checkout --- and this process is AGAIN skewed. That is no longer "reload it again"; it is
-    "the reload door does not clear the condition", which is a design question for the domain's
-    design authority, not a 116th copy of the same demand.
+    The identity is ``boot_fingerprint`` -- the content a reload CHANGES (R-1).
+    ``disk_fingerprint`` rides along as EVIDENCE ONLY: what a reload leaves behind is the checkout,
+    so matching on it made an ordinary re-skew read as a broken door (card t_5a54ca29).
+    """
 
-    "Proven dead" is the liveness contract's verdict, never the negation of an unreadable probe:
-    an unknown process is not evidence that a reload happened.
+    card_id: str
+    boot_pid: int
+    boot_fingerprint: str
+    disk_fingerprint: str
+    status: str
+    completed_at: Optional[int]
+    event_at: int
+    boot_recorded_at: int
+
+
+def _this_process_booted_at(boot_pid: int) -> Optional[int]:
+    """When the process that imported this content recorded its boot, or ``None``.
+
+    Read from the LIVE process first: the gate runs INSIDE the process it judges, so the in-memory
+    record is the authoritative one. The persisted record is the fallback, accepted only when its
+    stored identity still names the same process -- a recycled pid's record dates somebody else's
+    boot, and dating the wrong boot is how a cleared episode would read as survival.
+
+    ``None`` means the caller must NOT escalate (R-2): an undateable boot is not evidence that a
+    prior card survived into it.
     """
     try:
+        from hermes_cli import tree_fingerprint
+
+        record = tree_fingerprint.boot_record() or {}
+        if int(record.get("pid") or 0) == int(boot_pid) and record.get("recorded_at") is not None:
+            return int(record["recorded_at"])
+        persisted = tree_fingerprint.recorded_boot(int(boot_pid)) or {}
+        if int(persisted.get("pid") or 0) != int(boot_pid):
+            return None
+        if persisted.get("recorded_at") is None:
+            return None
+        identity = persisted.get("identity")
+        if identity and _process_fingerprint(int(boot_pid)) != identity:
+            return None
+        return int(persisted["recorded_at"])
+    except Exception:  # health: allow BLE001 -- fail-open (t_5a54ca29): an unreadable boot record
+        # means this process's boot cannot be dated, and an undateable boot must NOT escalate
+        # (R-2) -- but it must never take the dispatch tick down either.
+        return None
+
+
+def _prior_filer_certified_dead(pid: int, boot_fingerprint: str) -> bool:
+    """``pid`` filed the prior card and is PROVEN DEAD -- anchored to its OWN boot record.
+
+    The liveness verdict is necessary but not sufficient (R-2, recycled-pid guard): a pid NUMBER is
+    only evidence while it still means the same process. So the filer's persisted boot record has
+    to exist, name that pid, and carry the same imported content the card claims; and where both
+    sides are readable, the identity at that pid has to be the recorded one -- which is exactly
+    what a recycled pid breaks, and an identity that now differs from the record is NOT a death.
+
+    A missing or mismatched record is NOT certified: the card then describes a process this board
+    can no longer corroborate, and an unreadable claim does not carry a design escalation.
+    """
+    try:
+        from hermes_cli import tree_fingerprint
+
+        record = tree_fingerprint.recorded_boot(int(pid)) or {}
+    except Exception:  # health: allow BLE001 -- fail-open (t_5a54ca29): an unreadable record
+        # cannot certify the filer, and an uncertified pid is simply not PROVEN DEAD (so it
+        # cannot carry a design escalation) -- never a reason to take the tick down.
+        return False
+    if int(record.get("pid") or 0) != int(pid):
+        return False
+    if str(record.get("fingerprint") or "") != str(boot_fingerprint):
+        return False
+    recorded_identity = record.get("identity")
+    if recorded_identity:
+        live_identity = _process_fingerprint(int(pid))
+        if live_identity is not None and live_identity != recorded_identity:
+            return False  # the pid now names a DIFFERENT process: recycled, not dead
+    return _pid_liveness(int(pid)) == WORKER_DEAD
+
+
+def _skew_survived_a_reload(
+    conn: sqlite3.Connection, yielded: DispatcherTickYielded, *, limit: int = 50,
+) -> Optional[_PriorSkewEvent]:
+    """The prior guard card PROVING a reload landed on THIS imported content and did not clear it.
+
+    THE IDENTITY IS THE IMPORTED CONTENT, NEVER THE DISK (R-1). What a reload changes is the
+    content a process imports; what a reload leaves behind is the checkout on disk. A prior card
+    whose ``disk_fingerprint`` equals this tick's is therefore NOT evidence of survival -- it is
+    the same skew measured by a DIFFERENT process, and 2026-10-21 is exactly that shape (b1b9cb6
+    back to 47558cf inside five minutes): a re-skew onto a revision the fleet had already left.
+    Matching on the disk made an ordinary re-entry read as a broken reload door.
+
+    All three must hold; any unreadable field means NOT survived (fail closed):
+
+      * R-1: the prior event imported the SAME content this process imported
+        (``boot_fingerprint``) -- the only thing a reload can change;
+      * it named a DIFFERENT process, and that process is PROVEN DEAD -- the liveness contract's
+        verdict, never the negation of an unreadable probe: an unknown process is not evidence
+        that a reload happened;
+      * R-2: that card was not already CLEARED before this process booted. A prior card still open,
+        or closed at/after this process's boot ``recorded_at``, is a reload that landed and came
+        back -- which is a design question. One closed before that is a previous episode, already
+        answered, and re-filing it as survival is how one card becomes 116.
+    """
+    boot_recorded_at = _this_process_booted_at(yielded.boot_pid)
+    if boot_recorded_at is None:
+        return None
+    try:
         rows = conn.execute(
-            "SELECT t.id AS id, e.payload AS payload FROM task_events e "
+            "SELECT t.id AS id, t.status AS status, t.completed_at AS completed_at, "
+            "e.payload AS payload FROM task_events e "
             "JOIN tasks t ON t.id = e.task_id WHERE e.kind = ? ORDER BY e.id DESC LIMIT ?",
             (TICK_YIELD_ACTOR_EVENT, int(limit)),
         ).fetchall()
@@ -4909,7 +5013,7 @@ def _skew_survived_a_reload(
         return None
     for row in rows:
         payload = _event_payload(row["payload"])
-        if str(payload.get("disk_fingerprint") or "") != yielded.disk_fingerprint:
+        if str(payload.get("boot_fingerprint") or "") != yielded.boot_fingerprint:
             continue
         try:
             pid = int(payload.get("boot_pid"))
@@ -4918,40 +5022,93 @@ def _skew_survived_a_reload(
         if pid == yielded.boot_pid:
             # The SAME frozen process: that repeat is the existing carrier's to absorb.
             continue
-        if _pid_liveness(pid) == WORKER_DEAD:
-            return str(row["id"])
+        boot_fingerprint = str(payload.get("boot_fingerprint") or "")
+        if not _prior_filer_certified_dead(pid, boot_fingerprint):
+            continue
+        status = str(row["status"] or "")
+        completed_at = row["completed_at"]
+        if status in TICK_YIELD_ACTOR_ABSORB_SKIP_STATUSES:
+            try:
+                closed_at = int(completed_at)
+            except (TypeError, ValueError):
+                # Closed with no usable time: a previous episode and this one cannot be told
+                # apart, and that is not proof the door failed (R-2, fail closed).
+                continue
+            if closed_at < boot_recorded_at:
+                continue
+        return _PriorSkewEvent(
+            card_id=str(row["id"]),
+            boot_pid=pid,
+            boot_fingerprint=str(payload.get("boot_fingerprint") or ""),
+            disk_fingerprint=str(payload.get("disk_fingerprint") or ""),
+            status=status,
+            completed_at=int(completed_at) if completed_at is not None else None,
+            event_at=int(payload.get("last_tick") or payload.get("first_tick") or 0),
+            boot_recorded_at=int(boot_recorded_at),
+        )
     return None
 
 
 def _tick_yield_escalation_body(
     yielded: DispatcherTickYielded,
     *,
-    prior_card: str,
+    prior: _PriorSkewEvent,
     board: Optional[str],
     filed_on: Optional[str],
     status_path: str,
     streak: int,
+    first_tick: int,
 ) -> str:
-    """The escalation card's body: deterministic, and it asks the ONE question that is left."""
+    """The escalation card's body: deterministic, MEASUREMENTS only, and the ONE question left.
+
+    Every fact is labelled and quoted verbatim (R-4), each fingerprint printed beside the pid of
+    the process that measured it, and the match the card rests on is the IMPORTED content. The
+    body is built ONLY for the case R-1..R-3 established, so the question section stays: this card
+    exists to get an answer, not to report a number.
+    """
+    import datetime
+
+    def _iso(epoch):
+        try:
+            return datetime.datetime.fromtimestamp(int(epoch)).isoformat(timespec="seconds")
+        except (TypeError, ValueError, OSError):
+            return "?"
+
+    closed_at = _iso(prior.completed_at) if prior.completed_at is not None else "(not closed)"
     return "\n".join([
         TICK_YIELD_ACTOR_DECLARATION,
         "",
-        "## What was measured",
+        "## What was measured (verbatim, no conclusion)",
         "",
-        f"- this frozen process: pid {yielded.boot_pid}, imported content "
-        f"`{yielded.boot_fingerprint}` (label `{yielded.boot_label}`)",
+        f"- THIS process: pid {yielded.boot_pid}, imported content "
+        f"`{yielded.boot_fingerprint}` (label `{yielded.boot_label}`), boot recorded at "
+        f"{_iso(prior.boot_recorded_at)} (epoch {int(prior.boot_recorded_at)})",
         f"- the checkout on disk: `{yielded.disk_fingerprint}` (label `{yielded.disk_label}`)",
         f"- board refused: `{board or 'unknown'}`; card filed on: `{filed_on or board or 'unknown'}`",
-        f"- consecutive refused ticks under THIS process: **{streak}**",
+        f"- consecutive refused ticks under THIS process: **{streak}**; episode "
+        f"`{yielded.boot_label}:{int(first_tick)}` (first tick {_iso(first_tick)})",
         f"- non-green status record: `{status_path}`",
+        "",
+        "## The prior event this matched (SAME imported content)",
+        "",
+        f"- prior guard card: `{prior.card_id}` -- status `{prior.status}`, closed at {closed_at}",
+        f"- filed by: pid {prior.boot_pid}, which imported content `{prior.boot_fingerprint}` "
+        f"and measured disk content `{prior.disk_fingerprint}`",
+        f"- that event was recorded at {_iso(prior.event_at)}, and that pid's liveness verdict is "
+        "PROVEN DEAD",
+        f"- this process booted at {_iso(prior.boot_recorded_at)}, so that card had not already "
+        "cleared this skew before this process started",
+        f"- match basis: the IMPORTED content `{yielded.boot_fingerprint}` is IDENTICAL in both. "
+        "The disk fingerprints are quoted as evidence only and take NO part in the identity (R-1)",
         "",
         "## Why this is an escalation and not another guard card",
         "",
-        f"`{prior_card}` carried the SAME on-disk content and named a DIFFERENT process, which is",
-        "now PROVEN DEAD: a reload DID happen, onto exactly this checkout, and the skew survived",
-        "it. Repeating the reload demand would be a duplicate -- the fleet already measured",
-        "116 such cards (measured 2026-10-21: 116 `[guard] dispatcher is serving a mixed revision`",
-        "rows across six boards), which is how a real stall becomes background noise.",
+        f"`{prior.card_id}` was filed by pid {prior.boot_pid}, which is now PROVEN DEAD, and this",
+        "process imported the SAME content: a reload DID land, the skew is back on the content it",
+        "imported, and the prior card had not been cleared before this process booted. Repeating",
+        "the reload demand would be a duplicate -- the fleet already measured 116 such cards",
+        "(measured 2026-10-21: 116 `[guard] dispatcher is serving a mixed revision` rows across",
+        "six boards), which is how a real stall becomes background noise.",
         "",
         "## The question this card exists to get answered",
         "",
@@ -4965,7 +5122,7 @@ def _tick_yield_escalation_body(
         "   restarting onto a pinned tree, a second process serving the same port).",
         "",
         "Answer with the branch that holds and the card moves to the code lane that owns it. Until",
-        "then NO further guard card is filed for this disk content -- this one card carries it.",
+        "then NO further guard card is filed for this episode -- this one card carries it.",
     ])
 
 
@@ -4973,15 +5130,23 @@ def _file_tick_yield_escalation(
     conn: sqlite3.Connection,
     yielded: DispatcherTickYielded,
     *,
+    prior: _PriorSkewEvent,
     board: Optional[str] = None,
     filed_on: Optional[str] = None,
     status_path: str = "",
     streak: int = 0,
-    prior_card: str = "",
+    first_tick: int = 0,
     now: Optional[int] = None,
 ) -> Optional[str]:
-    """File the ONE escalation card for a skew a reload did not clear (idempotent per disk)."""
-    key = f"{TICK_YIELD_ESCALATION_KEY_PREFIX}{yielded.disk_fingerprint}"
+    """File the ONE escalation card for a skew a reload did not clear (idempotent per EPISODE).
+
+    The key is ``tree-skew-escalation:<imported content>:<first_tick>`` (R-3). One card per
+    episode: a repeat refusal INSIDE the episode returns this same card, while an episode whose
+    card has been closed mints a new key from its OWN ``first_tick`` instead of being swallowed by
+    the old one -- the same window rule the guard card follows (DEC-1.4). Keying on the disk
+    fingerprint instead made the escalation outlive its episode and cited a card closed months ago.
+    """
+    key = f"{TICK_YIELD_ESCALATION_KEY_PREFIX}{yielded.boot_fingerprint}:{int(first_tick)}"
     try:
         existing = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -4991,8 +5156,8 @@ def _file_tick_yield_escalation(
         if existing is not None:
             return existing["id"]
         body = _tick_yield_escalation_body(
-            yielded, prior_card=prior_card, board=board, filed_on=filed_on,
-            status_path=status_path, streak=streak,
+            yielded, prior=prior, board=board, filed_on=filed_on,
+            status_path=status_path, streak=streak, first_tick=first_tick,
         )
         priority, ladder_note = _tick_yield_actor_priority(
             title=TICK_YIELD_ESCALATION_TITLE, body=body, board=filed_on or board or "",
@@ -5016,7 +5181,14 @@ def _file_tick_yield_escalation(
                     "boot_fingerprint": yielded.boot_fingerprint,
                     "disk_fingerprint": yielded.disk_fingerprint,
                     "boot_pid": yielded.boot_pid,
-                    "prior_card": prior_card,
+                    "episode": f"{yielded.boot_label}:{int(first_tick)}",
+                    "first_tick": int(first_tick),
+                    "prior_card": prior.card_id,
+                    "prior_boot_pid": prior.boot_pid,
+                    "prior_boot_fingerprint": prior.boot_fingerprint,
+                    "prior_disk_fingerprint": prior.disk_fingerprint,
+                    "prior_status": prior.status,
+                    "prior_completed_at": prior.completed_at,
                     "streak": int(streak),
                     "filed_on": filed_on,
                     "board": board,
@@ -5024,15 +5196,17 @@ def _file_tick_yield_escalation(
                 },
             )
         _kb._log.error(
-            "kanban dispatcher: the tree skew SURVIVED a reload (disk %s); filed escalation %s "
-            "to %s instead of another guard card",
-            yielded.disk_label, escalation_id, TICK_YIELD_ESCALATION_ASSIGNEE,
+            "kanban dispatcher: the tree skew SURVIVED a reload onto imported content %s "
+            "(episode %s:%s); filed escalation %s to %s instead of another guard card",
+            yielded.boot_label, yielded.boot_label, int(first_tick), escalation_id,
+            TICK_YIELD_ESCALATION_ASSIGNEE,
         )
         return escalation_id
     except Exception as exc:
         _kb._log.warning(
-            "kanban dispatcher: could not file the tree-skew ESCALATION (disk=%s, prior=%s): %s",
-            yielded.disk_fingerprint, prior_card, exc,
+            "kanban dispatcher: could not file the tree-skew ESCALATION (boot=%s, key=%s, "
+            "prior=%s): %s",
+            yielded.boot_fingerprint, key, prior.card_id, exc,
         )
         return None
 
