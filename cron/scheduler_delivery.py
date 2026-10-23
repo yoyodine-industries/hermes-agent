@@ -689,15 +689,47 @@ def _resolve_single_delivery_target(
     return _home_target(platform_name, chat_id, home_provenance) if chat_id else None
 
 
+# The delivery turn is bounded so the run never waits on it (t_e9d06d80). It is a full agent
+# turn on the target profile, so it stays in minutes — but 600 s meant one stalled turn held the
+# run's ledger row (and the host's lull gate) for ten minutes after the script had exited.
+DEFAULT_BOT_CHAT_DELIVERY_TIMEOUT_SECONDS = 180
+# What a timed-out turn still owes the operator: the output itself, head+tail. The diagnosis is
+# at the top and the exit line / card ids at the bottom, so a window keeps both and drops only
+# the middle — never the alert.
+_BOT_CHAT_TIMEOUT_TRIM_HEAD = 3000
+_BOT_CHAT_TIMEOUT_TRIM_TAIL = 1200
+
+
+def _trim_output_for_delivery(content: str, *, job_id: str) -> str:
+    """The output a timed-out turn still owes, bounded to one postable message.
+
+    A timeout used to replace the alert with a 280-char excerpt introduced by "the full output
+    could NOT be posted here" — so a job that failed lost its diagnosis exactly when the operator
+    needed it (measured 2026-10-23, job 50b61ee711ae). Keep the head and the tail, name where the
+    untrimmed text lives, and let the deferred lane post it.
+    """
+    text = content.strip()
+    window = _BOT_CHAT_TIMEOUT_TRIM_HEAD + _BOT_CHAT_TIMEOUT_TRIM_TAIL
+    if len(text) <= window:
+        return text
+    dropped = len(text) - window
+    return (
+        f"{text[:_BOT_CHAT_TIMEOUT_TRIM_HEAD]}\n"
+        f"… [{dropped} chars trimmed — full text: `hermes cron runs` (job '{job_id}')] …\n"
+        f"{text[-_BOT_CHAT_TIMEOUT_TRIM_TAIL:]}"
+    )
+
+
 def _get_bot_chat_delivery_timeout() -> int:
     """Timeout for one bot-chat delivery turn (a full agent turn — minutes, not seconds).
-    ``cron.bot_chat_delivery_timeout_seconds``; default 600."""
+    ``cron.bot_chat_delivery_timeout_seconds``; default 180."""
     try:
         cfg = _sched.load_config()
-        value = int(cfg.get("cron", {}).get("bot_chat_delivery_timeout_seconds", 600))
-        return value if value > 0 else 600
+        value = int(cfg.get("cron", {}).get(
+            "bot_chat_delivery_timeout_seconds", DEFAULT_BOT_CHAT_DELIVERY_TIMEOUT_SECONDS))
+        return value if value > 0 else DEFAULT_BOT_CHAT_DELIVERY_TIMEOUT_SECONDS
     except Exception:
-        return 600
+        return DEFAULT_BOT_CHAT_DELIVERY_TIMEOUT_SECONDS
 
 
 def _get_standalone_send_timeout() -> int:
@@ -776,9 +808,11 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
 
     None means completed; a queued/claimed receipt returns an explicit unverified status
     string so existing Optional[str] callers cannot misreport admission as delivery.
-    ``profile`` is ``""`` for the job's own profile. A ``for_failure`` notice whose target
-    profile hides warning notifications is recorded as ``suppressed`` (a durable
-    disposition, never a send) and flagged on the job.
+    A ``no_agent`` job's output is queue-only: it is handed to the durable deferred lane
+    (posted by the background drain) instead of running a delivery turn in the run's path,
+    so the run closes at the script's exit. ``profile`` is ``""`` for the job's own profile.
+    A ``for_failure`` notice whose target profile hides warning notifications is recorded as
+    ``suppressed`` (a durable disposition, never a send) and flagged on the job.
     """
     import hashlib
     import json
@@ -873,6 +907,34 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         # Discovery/admission uncertainty must never open a second-writer fallback.
         return f"bot-chat delivery to profile '{profile_label}' unverified: {exc}"
 
+    # A `no_agent` script's output needs no agent turn to post, and the run that produced it has
+    # already ended: queue the alert on the durable lane and return, so the execution row and the
+    # fire claim close at the script's exit instead of behind a turn that can run for minutes
+    # (t_e9d06d80 — measured: script exited 04:36:20, ledger row held to 04:46:20). The
+    # background drain posts it under the same bound as any deferred record, so a bounce no
+    # longer loses it either.
+    if deferred is None and job.get("no_agent"):
+        try:
+            from cron.bot_chat_delivery import defer as _defer_script_output
+            pending = _defer_script_output(key, dict(job), content, profile, home,
+                                          for_failure=for_failure)
+        except Exception as exc:
+            logger.warning(
+                "Job '%s': bot-chat delivery to profile '%s' could not be queued: %s",
+                job_id, profile_label, str(exc) or type(exc).__name__)
+            return (f"bot-chat delivery to profile '{profile_label}' could not be queued: {exc}. "
+                    "The result is saved; run `hermes cron runs` to see it")
+        target = f"bot-chat:{profile_label}"
+        # The queued receipt is what books the run: `_deliver_result` drops a bot-chat error
+        # string for a queued/claimed receipt, and `_record_delivery_verification` derives
+        # `last_delivery_queued` (and so `delivery_outcome=queued` / `last_status=delivery_queued`)
+        # from this dict, which is also what `hermes cron list` reports.
+        job.setdefault("_bot_chat_delivery_receipts", {})[target] = {
+            "status": pending["status"], "delivery_id": key}
+        logger.info("Job '%s': Bot Chat %s queued for delivery (script job) receipt=%s status=%s",
+                    job_id, profile_label, key, pending["status"])
+        return None
+
     # The running install first (same trust order as gateway.run._resolve_hermes_bin): the
     # scheduler lives in the long-running gateway, so a PATH-first lookup would hand delivery
     # to whatever `hermes` PATH names — another install, or a planted one — instead of this one.
@@ -948,35 +1010,35 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         logger.info("Job '%s': delivered to Bot Chat of profile '%s'", job_id, profile_label)
         return None
     except subprocess.TimeoutExpired:
-        # Replaying the full payload risks a duplicate (the killed turn may already have
-        # persisted it); staying silent loses the alert entirely (2026-09-19 docgen-deadman
-        # case). So queue a SHORT marker that points at the saved output, once per execution
-        # (stable key); the re-mark guard reads the record's ``degraded`` flag, never the text.
-        marker_queued = False
+        # The turn is bounded; when the bound expires the alert is still owed, so queue the
+        # OUTPUT — trimmed to one postable message — and start the drain, instead of queueing a
+        # notice about the delivery failing (t_e9d06d80). Once per execution, on a stable digest
+        # key: the re-queue guard reads the record's ``degraded`` flag, never its text, because a
+        # drained record that times out again must not spawn a copy chain.
+        queued = False
+        trimmed = ""
         if not (deferred or {}).get("degraded"):
-            marker = (
-                f"DELIVERY DEGRADED: this alert's bot-chat turn timed out after "
-                f"{timeout_s}s, so the full output could NOT be posted here. Read the "
-                f"complete saved output with `hermes cron runs` (job '{job_id}'). "
-                f"Excerpt: {content.strip()[:280]}"
-            )
+            trimmed = _trim_output_for_delivery(content, job_id=job_id)
             try:
-                from cron.bot_chat_delivery import defer as _defer_marker
+                from cron.bot_chat_delivery import defer as _defer_output, drain_in_background
                 # Deferred ids double as live-owner delivery ids, which must be 32-64 hex
-                # chars (tools.bot_live_delivery._delivery_id) — so the marker's id is a
+                # chars (tools.bot_live_delivery._delivery_id) — so the queued copy's id is a
                 # fresh digest derived from the execution key, not a suffixed one.
                 marker_key = hashlib.sha256(f"{key}:degraded".encode()).hexdigest()
-                _defer_marker(marker_key, dict(job), marker, profile, home,
+                _defer_output(marker_key, dict(job), trimmed, profile, home,
                               for_failure=for_failure, degraded=True)
-                marker_queued = True
+                queued = True
+                # Post it now: waiting for the next tick would make a bounded turn feel like a
+                # lost alert. The drain is backgrounded, so it does not delay this run.
+                drain_in_background()
             except Exception as defer_exc:
                 logger.warning(
-                    "Job '%s': degraded-delivery marker could not be queued: %s",
+                    "Job '%s': timed-out output could not be queued for Bot Chat: %s",
                     job_id, defer_exc)
         hint = (
-            "a short degraded-delivery notice was queued to Bot Chat — posted once the "
-            f"session frees; full output stays saved, run `hermes cron runs` for job '{job_id}'"
-            if marker_queued else
+            f"the output was queued ({len(trimmed)} chars, head and tail kept) and is posted "
+            "as soon as the session frees"
+            if queued else
             "the result is saved; run `hermes cron runs` to see it, or `hermes doctor` "
             "if this keeps happening")
         return _fail(

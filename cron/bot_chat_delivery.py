@@ -58,8 +58,9 @@ def _records(root: Path) -> list[tuple[Path, dict]]:
 
 def defer(key: str, job: dict, content: str, profile: str, home: Path, *,
           for_failure: bool = False, suppressed: bool = False, degraded: bool = False) -> dict:
-    """``degraded`` marks the short notice queued after a CLI-lane turn timed out; the record
-    carries it so the consumer recognizes the marker by the record, never by its text."""
+    """``degraded`` marks the output queued after a CLI-lane turn timed out (trimmed to its head
+    and tail); the record carries it so the consumer recognizes the retry by the record, never by
+    its text."""
     root = _root()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with _FileLock(root / ".lock"):
