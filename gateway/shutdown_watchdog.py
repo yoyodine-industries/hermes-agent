@@ -238,6 +238,7 @@ def resolve_shutdown_watchdog_delay(
 
 
 DEFAULT_EXIT_DOOR_JOIN_BUDGET_S = 2.0
+DEFAULT_EXIT_DOOR_OPEN_BUDGET_S = 1.0
 DEFAULT_BOUNDED_STEP_TIMEOUT_S = 5.0
 
 
@@ -257,6 +258,36 @@ def _open_append_fd(path: Path) -> Optional[int]:
     except Exception:
         logger.debug("Could not pre-open %s for the exit door", path, exc_info=True)
         return None
+
+
+def _open_exit_door_fds(paths: list[Path], *, budget_s: float) -> list[Optional[int]]:
+    """Open every door fd in ONE bounded step, off the caller's thread.
+
+    This runs at the top of teardown, on the event loop, BEFORE the backstop is armed — so it must
+    not be able to block either: a wedged mount hangs ``open(2)`` just as happily as ``write(2)``
+    (a FIFO with no reader blocks in ``open``), and a loop stuck here would never get as far as
+    arming the watchdog. Past the budget the door simply keeps ``None`` fds and falls back to
+    stderr: the exit is the guarantee, the dump is the courtesy.
+    """
+    result: list[Optional[int]] = [None] * len(paths)
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            for idx, path in enumerate(paths):
+                result[idx] = _open_append_fd(path)
+        finally:
+            done.set()
+
+    try:
+        threading.Thread(target=_run, daemon=True, name="gateway-exit-door-open").start()
+    except Exception:
+        logger.debug("Exit door fds could not be opened", exc_info=True)
+        return result
+    if not done.wait(timeout=max(0.05, budget_s)):
+        logger.warning("Exit door fds not opened within %.1fs — exiting without them (stderr fallback)",
+                       budget_s)
+    return result
 
 
 def _write_fd(fd: Optional[int], data: str) -> None:
@@ -324,13 +355,36 @@ class ShutdownExitDoor:
         diag_fd: Optional[int] = None,
         snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None,
         join_budget_s: float = DEFAULT_EXIT_DOOR_JOIN_BUDGET_S,
+        dump_path: Optional[Path] = None,
     ) -> None:
         self.exit_code = int(exit_code)
         self.dump_fd = dump_fd
         self.diag_fd = diag_fd
         self.snapshot_fn = snapshot_fn
         self.join_budget_s = _coerce_float(join_budget_s, DEFAULT_EXIT_DOOR_JOIN_BUDGET_S)
+        self.dump_path = dump_path
+        self.fired = False
         self.armed_at = time.monotonic()
+
+    def close(self) -> None:
+        """Release the pre-opened fds when the process is NOT exiting through the door.
+
+        The dump fd is opened eagerly (it must be open before the deadline), which creates an empty
+        dump file on every shutdown; a reader would then see a "watchdog fired" file after every
+        clean stop. An unfired door removes it again so presence still means it fired.
+        """
+        if self.fired:
+            return
+        for attr in ("dump_fd", "diag_fd"):
+            fd = getattr(self, attr)
+            if fd is not None:
+                with contextlib.suppress(Exception):
+                    os.close(fd)
+                setattr(self, attr, None)
+        if self.dump_path is not None:
+            with contextlib.suppress(Exception):
+                if self.dump_path.exists() and self.dump_path.stat().st_size == 0:
+                    self.dump_path.unlink()
 
     @classmethod
     def build(
@@ -343,13 +397,19 @@ class ShutdownExitDoor:
         home: Optional[Path] = None,
         join_budget_s: float = DEFAULT_EXIT_DOOR_JOIN_BUDGET_S,
     ) -> ShutdownExitDoor:
-        """Open the forensic + exit-diag fds NOW (I/O allowed: we are before the deadline)."""
+        """Open the forensic + exit-diag fds NOW (I/O allowed: we are before the deadline) — bounded,
+        because ``open`` blocks on a wedged mount too."""
+        dump_target = dump_path if dump_path is not None else get_shutdown_watchdog_dump_path(home)
+        diag_target = diag_path if diag_path is not None else get_exit_diag_path(home)
+        dump_fd, diag_fd = _open_exit_door_fds([dump_target, diag_target],
+                                              budget_s=DEFAULT_EXIT_DOOR_OPEN_BUDGET_S)
         return cls(
             exit_code=exit_code,
-            dump_fd=_open_append_fd(dump_path if dump_path is not None else get_shutdown_watchdog_dump_path(home)),
-            diag_fd=_open_append_fd(diag_path if diag_path is not None else get_exit_diag_path(home)),
+            dump_fd=dump_fd,
+            diag_fd=diag_fd,
             snapshot_fn=snapshot_fn,
             join_budget_s=join_budget_s,
+            dump_path=dump_target,
         )
 
     def _write_forensic_dump(self, *, delay_s: float, snapshot: Optional[dict[str, Any]],
@@ -404,6 +464,7 @@ class ShutdownExitDoor:
 
     def fire(self, reason: str, *, delay_s: float = 0.0) -> None:
         """Exit the process. Blocks at most ``join_budget_s``; nothing after the deadline may block."""
+        self.fired = True
         try:
             worker = threading.Thread(target=self._forensic_and_stamp, args=(reason, delay_s),
                                       daemon=True, name="gateway-exit-door-forensics")

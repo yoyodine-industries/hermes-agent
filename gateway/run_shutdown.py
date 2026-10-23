@@ -2277,6 +2277,10 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             self._shutdown_failed_phase = None if _completed else _phase
             if _completed or _door is None:
                 _watchdog_done.set()
+                if _door is not None:
+                    # Clean stop, door never fired: drop the eagerly-opened fds (and the empty dump
+                    # file, so "the dump exists" keeps meaning "the watchdog fired").
+                    _door.close()
             else:
                 with suppress(Exception):
                     logger.critical(

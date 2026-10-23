@@ -144,6 +144,39 @@ def test_armed_shutdown_watchdog_fires_through_the_exit_door(tmp_path, monkeypat
     assert get_exit_diag_path(tmp_path).name == "gateway-exit-diag.log"
 
 
+def test_build_does_not_block_when_open_wedges(tmp_path):
+    """``build`` runs on the event loop before the backstop is armed — a wedged ``open(2)`` there
+    would freeze the very loop it is protecting, so the opens are bounded too."""
+    from gateway.shutdown_watchdog import DEFAULT_EXIT_DOOR_OPEN_BUDGET_S
+
+    wedged = tmp_path / "logs" / "dump.log"
+    wedged.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(wedged)  # open(O_WRONLY) with no reader blocks in the kernel, not in Python
+
+    started = time.monotonic()
+    door = ShutdownExitDoor.build(exit_code=1, dump_path=wedged, diag_path=wedged)
+    elapsed = time.monotonic() - started
+
+    assert door.dump_fd is None and door.diag_fd is None
+    assert elapsed < DEFAULT_EXIT_DOOR_OPEN_BUDGET_S + 1.5, f"build blocked {elapsed:.1f}s"
+
+
+def test_door_close_removes_the_unfired_dump_but_keeps_a_fired_one(tmp_path, monkeypatch):
+    """An empty dump file from an innocent shutdown must not read as "the watchdog fired"."""
+    dump = tmp_path / "logs" / "dump.log"
+    diag = tmp_path / "logs" / "diag.log"
+    clean = ShutdownExitDoor.build(exit_code=1, dump_path=dump, diag_path=diag)
+    assert dump.exists(), "the fd is pre-opened eagerly (it must exist before the deadline)"
+    clean.close()
+    assert not dump.exists() and clean.dump_fd is None
+
+    monkeypatch.setattr(shutdown_watchdog_module.os, "_exit", lambda code: None)
+    fired = ShutdownExitDoor.build(exit_code=1, dump_path=dump, diag_path=diag)
+    fired.fire("test_fired")
+    fired.close()
+    assert dump.exists() and "shutdown_watchdog_fired" in dump.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------------------------
 # I1 — no-dark: a teardown that cannot finish still exits within the leash
 # ---------------------------------------------------------------------------------------------
@@ -319,6 +352,9 @@ def test_completed_teardown_disarms_without_firing_the_door(monkeypatch):
         def fire(self, reason, **kwargs):  # pragma: no cover - must not be reached
             fired.append(reason)
 
+        def close(self):
+            fired.append("closed")
+
     order = []
     _patch_phases(monkeypatch, raising_phase=None, order=order)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
@@ -332,7 +368,8 @@ def test_completed_teardown_disarms_without_firing_the_door(monkeypatch):
     double = _TeardownDouble()
     asyncio.run(double._stop_impl())
 
-    assert fired == []
+    assert [f for f in fired if f != "closed"] == [], "a completed teardown must not fire the door"
+    assert "closed" in fired, "a completed teardown releases the door's pre-opened fds"
     assert double._shutdown_watchdog_done is not None and double._shutdown_watchdog_done.is_set()
     assert order[:2] == ["begin", "drain"]
 
