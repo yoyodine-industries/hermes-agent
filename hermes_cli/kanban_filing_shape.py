@@ -38,12 +38,17 @@ WHY A REFUSAL AND NOT A WARNING: the invariants module beside this one learned t
 refusal names the exact key to add and the exact parent to link, so a caller has a cheap honest
 path.
 
-NOT ENFORCED, deliberately: the key's internal SHAPE. The ruling prescribes
-``<repo>#<n>:<condition>`` / ``<area>:<condition>``; measured on the same board, four live bot
-families key in OTHER shapes (deploy-train 162 of 177, hermes_pr_update 60, landcastle 53,
-workflow-currency 22 -- no colon), so a shape refusal would stop those surfaces' filing in one
-tick. That narrowing belongs to platform-stl, which migrates those families' keys first; this
-gate enforces the half that is safe today and that removes the measured duplicate mechanism.
+THE KEY'S SHAPE, and this half is a RATCHET rather than a switch (platform-stl decision
+ESC-ef2af6848e602c8b, 2026-10-22). An armed family's key must be ``<area>:<condition>``: at least
+one colon, both sides non-empty, and the right side must NAME A PREDICATE -- a bare counter is not
+a condition (``pr-approval-refusal-135`` is the 2,091-card shape this invariant exists to kill).
+Arming is PER FAMILY, because a global switch is an outage that teaches every owner to hate the
+invariant: ``pr-approval``, ``sdlc`` and ``tip-guard`` are armed now (the first migrates its keys
+under a pre-stamp bridge, the other two already key in that shape), five families are in WARN MODE
+until their date (the filing SUCCEEDS and is RECORDED -- a silent pass is what the decision
+refuses), and any family not named there is ARMED AT BIRTH, because a new surface has no legacy
+to bridge and the cost of compliance on day one is zero. Keys already written are NEVER re-judged
+and no card is ever re-keyed by this gate: the ratchet governs filings made after a family arms.
 
 NOT ENFORCED IN THE MEASURE-AND-REPAIR PASS either: a repair would have to INVENT the key or the
 parent a card was never filed with, and a guessed key is worse than the duplicate it papers over.
@@ -51,7 +56,9 @@ parent a card was never filed with, and a guessed key is worse than the duplicat
 
 from __future__ import annotations
 
+import datetime
 import os
+import re
 import sqlite3
 from typing import Iterable, Optional
 
@@ -61,6 +68,30 @@ HUMAN_CREATOR = "user"
 #: The env var a dispatcher-spawned worker carries. A filing made INSIDE a worker session is a
 #: bot filing even when the caller forgot ``created_by`` -- measured: 33 blank-stamp cards.
 BOT_SESSION_ENV = "HERMES_KANBAN_TASK"
+
+#: Families in WARN MODE until their shape clause arms (platform-stl, ESC-ef2af6848e602c8b).
+#: Measured base: deploy-train 162 of 177 keys had no colon, hermes_pr_update 60/60, landcastle
+#: 53/53, workflow-currency 22/22, sdlc-events 19/19 -- a shape refusal today would stop ~330
+#: filings a week across five live surfaces, so each is given its migration window and a counter.
+#: A family NOT listed here is armed at birth. ``pr-approval``, ``sdlc`` and ``tip-guard`` are
+#: therefore armed now, which is what the decision requires of them.
+WARN_UNTIL: dict[str, str] = {
+    "deploy-train": "2026-11-01",
+    "hermes_pr_update": "2026-11-01",
+    "landcastle": "2026-11-01",
+    "workflow-currency": "2026-11-01",
+    "sdlc-events": "2026-11-01",
+}
+
+#: Where a warn-mode filing is RECORDED. The decision requires the pass to COUNT: a shape rule
+#: that silently passes until it starts refusing is unfalsifiable, so every unshaped key a warn
+#: family files lands here and ``warn_report`` prints it beside the gate violations.
+WARN_TABLE = "filing_shape_warn"
+
+#: The shape a key must have once its family is armed.
+KEY_SHAPE = "<area>:<condition>"
+
+_BARE_COUNTER = re.compile(r"-?\d+")
 
 
 class FilingShapeRefused(ValueError):
@@ -94,10 +125,106 @@ def is_bot_filing(created_by: Optional[str]) -> bool:
     return bool(os.environ.get(BOT_SESSION_ENV))
 
 
+def filing_family(created_by: Optional[str]) -> str:
+    """The FILING FAMILY a stamp belongs to -- the unit the shape clause is armed per.
+
+    ``created_by`` already names the producer (``deploy-train``, ``landcastle``, ``pr-approval``,
+    a profile id), and the operator's measurement of who files what was taken by that column, so
+    the family is that stamp lowercased. An unattributed filing is its own family: it is armed,
+    because a nameless producer cannot be granted a migration window nobody would ever check.
+    """
+    return str(created_by or "").strip().lower() or "anonymous"
+
+
+def key_shape_problem(key: str) -> Optional[str]:
+    """Why this key is NOT ``<area>:<condition>``, or ``None`` when it is.
+
+    The right of the colon must name a PREDICATE. A bare counter is the shape this whole invariant
+    exists to kill -- ``pr-approval-refusal-135`` says which pass filed the card and says nothing
+    about what condition it is about, so the same condition can be filed again under the next
+    number. ``repo#1891:refusal`` is shaped; ``pr-approval:135`` is not.
+    """
+    text = str(key or "").strip()
+    if ":" not in text:
+        return "no colon -- there is no condition, only a label"
+    area, _, condition = text.rpartition(":")
+    if not area.strip():
+        return "the area left of the colon is empty"
+    if not condition.strip():
+        return "the condition right of the colon is empty"
+    if _BARE_COUNTER.fullmatch(condition.strip()):
+        return "the text right of the colon is a bare counter, not a condition"
+    return None
+
+
+def shape_armed(family: str, today: Optional[str] = None) -> bool:
+    """True when this family's shape clause is armed (refuses); False while it is in warn mode.
+
+    ``today`` is an ISO date; tests pass one so the ratchet is proven rather than waited for.
+    """
+    until = WARN_UNTIL.get(str(family or "").strip().lower())
+    if not until:
+        return True
+    now = str(today or "").strip() or datetime.date.today().isoformat()
+    return now >= until
+
+
+def _record_warn(conn: sqlite3.Connection, *, family: str, key: str, where: str,
+                 problem: str) -> None:
+    """Record an unshaped key filed by a warn-mode family. Never raises into the caller.
+
+    A warn mode that only prints is unfalsifiable, so the pass must COUNT. A bookkeeping failure
+    must not refuse a filing the decision says must SUCCEED, so this swallows its own errors.
+    """
+    try:
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {WARN_TABLE} ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, family TEXT NOT NULL, key TEXT NOT NULL, "
+            "problem TEXT NOT NULL, where_ TEXT, created_at TEXT NOT NULL DEFAULT "
+            "(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
+        )
+        conn.execute(
+            f"INSERT INTO {WARN_TABLE} (family, key, problem, where_) VALUES (?, ?, ?, ?)",
+            (family, key, problem, where),
+        )
+    except sqlite3.Error:
+        return
+
+
+def warn_report(conn: sqlite3.Connection) -> dict:
+    """Per-family count of unshaped keys filed while in warn mode -- the ratchet's evidence.
+
+    Read-only and empty when nothing has been recorded (or the table does not exist yet), so it is
+    safe to call from the gates report on every board.
+    """
+    try:
+        rows = conn.execute(
+            f"SELECT family, COUNT(*) AS n, MIN(created_at) AS first_at, MAX(created_at) AS last_at "
+            f"FROM {WARN_TABLE} GROUP BY family ORDER BY n DESC"
+        ).fetchall()
+        samples: dict[str, list[str]] = {}
+        for row in conn.execute(
+            f"SELECT family, key, problem FROM {WARN_TABLE} ORDER BY id DESC LIMIT 200"
+        ).fetchall():
+            bucket = samples.setdefault(row["family"], [])
+            if len(bucket) < 3 and row["key"] not in bucket:
+                bucket.append(row["key"])
+    except sqlite3.Error:
+        return {"families": [], "total": 0, "armed_at": dict(WARN_UNTIL)}
+    families = [
+        {"family": row["family"], "count": int(row["n"]), "first_at": row["first_at"],
+         "last_at": row["last_at"], "samples": samples.get(row["family"], [])}
+        for row in rows
+    ]
+    return {"families": families,
+            "total": sum(item["count"] for item in families),
+            "armed_at": dict(WARN_UNTIL)}
+
+
 def gate_filing_shape(conn: sqlite3.Connection, *, parents: Iterable[str] = (),
                       idempotency_key: Optional[str] = None, created_by: Optional[str] = None,
-                      where: str = "create") -> None:
-    """The write door: a BOT filing must be a CHILD or carry a KEY.
+                      where: str = "create", today: Optional[str] = None) -> None:
+    """The write door: a BOT filing must be a CHILD, or carry a KEY of the right SHAPE.
 
     ``parents`` is the filing's parent ids (a child), ``idempotency_key`` its key. A child is
     checked for existence and archived-ness; a top-level bot filing without a key is REFUSED by
@@ -139,16 +266,36 @@ def gate_filing_shape(conn: sqlite3.Connection, *, parents: Iterable[str] = (),
         return
     if not is_bot_filing(created_by):
         return
-    if str(idempotency_key or "").strip():
+    key = str(idempotency_key or "").strip()
+    if not key:
+        raise FilingShapeRefused(
+            f"{where}: an UNKEYED TOP-LEVEL filing by {created_by or 'a bot session'} is the "
+            "shape the board cannot recognise the second time -- nothing links it to a parent "
+            "and no key names its condition, so the same condition is filed again on every pass "
+            "(measured: 2,091 `pr-approval-refusal-*` cards over 1,206 distinct (repo, PR) "
+            "pairs). File it as a CHILD (`parents=[<the card this work serves>]`) or give it an "
+            "`idempotency_key` naming what it is about (`<repo>#<n>:<condition>`, "
+            "`<area>:<condition>`) -- a second filing of that key returns the first card and "
+            "creates nothing. Nothing was written.",
+            cause="unkeyed_top_level",
+            facts={"where": where, "created_by": created_by},
+        )
+    # A key is necessary, and once its family is ARMED it must also be SHAPED -- the right of the
+    # colon names the PREDICATE, so a re-run of the same condition lands on the same key instead
+    # of on the next counter.
+    problem = key_shape_problem(key)
+    if problem is None:
+        return
+    family = filing_family(created_by)
+    if not shape_armed(family, today):
+        _record_warn(conn, family=family, key=key, where=where, problem=problem)
         return
     raise FilingShapeRefused(
-        f"{where}: an UNKEYED TOP-LEVEL filing by {created_by or 'a bot session'} is the shape "
-        "the board cannot recognise the second time -- nothing links it to a parent and no key "
-        "names its condition, so the same condition is filed again on every pass (measured: "
-        "2,091 `pr-approval-refusal-*` cards over 1,206 distinct (repo, PR) pairs). File it as "
-        "a CHILD (`parents=[<the card this work serves>]`) or give it an `idempotency_key` "
-        "naming what it is about (`<repo>#<n>:<condition>`, `<area>:<condition>`) -- a second "
-        "filing of that key returns the first card and creates nothing. Nothing was written.",
-        cause="unkeyed_top_level",
-        facts={"where": where, "created_by": created_by},
+        f"{where}: family `{family}` filed key `{key}`, which is not the shape `{KEY_SHAPE}` -- "
+        f"{problem}. The right of the colon must name the CONDITION the card is about (e.g. "
+        "`repo#1891:refusal`, `board:migration-drift`), never a counter that a re-run can step "
+        "past. Rewrite the key. Nothing was written.",
+        cause="unshaped_key",
+        facts={"where": where, "created_by": created_by, "family": family, "key": key,
+               "shape": KEY_SHAPE, "problem": problem},
     )

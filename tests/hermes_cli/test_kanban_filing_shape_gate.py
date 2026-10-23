@@ -164,3 +164,65 @@ def test_the_refusal_is_a_validation_error_not_an_internal_one(conn):
         kb.create_task(conn, title="boom", created_by="tip-guard")
     assert not isinstance(excinfo.value, (SystemExit, AssertionError))
     assert "UNKEYED TOP-LEVEL" in str(excinfo.value)
+
+
+# ── the key's SHAPE: armed per family (platform-stl, ESC-ef2af6848e602c8b) ──
+#
+# The ruling's second clause is a RATCHET, not a switch: a family whose keys are already shaped
+# (or that migrates under a bridge) refuses an unshaped key NOW, a family with legacy keys is in
+# warn mode until its date, and a family nobody has seen before is armed at birth -- there is no
+# legacy to bridge, so the cost of compliance on day one is zero.
+
+def test_an_armed_family_filing_an_unshaped_key_is_refused_by_name(conn):
+    with _refusal("unshaped_key") as excinfo:
+        kb.create_task(conn, title="unshaped", created_by="pr-approval",
+                       idempotency_key="pr-approval-refusal-135")
+    message = str(excinfo.value)
+    # The decision requires the refusal to name the FAMILY, the offending KEY and the SHAPE it
+    # wanted -- so the remedy is a rewrite, not "disable the rule".
+    assert "pr-approval" in message
+    assert "pr-approval-refusal-135" in message
+    assert "<area>:<condition>" in message
+    assert "Nothing was written" in message
+    assert _rows(conn, "title = ?", ("unshaped",)) == []
+
+
+def test_a_bare_counter_is_not_a_condition(conn):
+    from hermes_cli import kanban_filing_shape as fs
+    assert fs.key_shape_problem("pr-approval-refusal-135") is not None
+    assert fs.key_shape_problem("pr-approval:135") is not None
+    assert fs.key_shape_problem(":condition") is not None
+    assert fs.key_shape_problem("area:") is not None
+    assert fs.key_shape_problem("yaan-platform#1891:refusal") is None
+    assert fs.key_shape_problem("board:migration-drift") is None
+
+
+def test_a_warn_mode_family_files_and_the_pass_being_counted(conn, monkeypatch):
+    """Warn mode SUCCEEDS the filing -- and records it, because a silent pass proves nothing."""
+    from hermes_cli import kanban_filing_shape as fs
+    monkeypatch.setitem(fs.WARN_UNTIL, "deploy-train", "2999-01-01")
+    tid = kb.create_task(conn, title="warned", created_by="deploy-train",
+                         idempotency_key="deploy-train-42")
+    assert tid.startswith("t_")
+    report = fs.warn_report(conn)
+    assert report["total"] == 1
+    assert report["families"][0]["family"] == "deploy-train"
+    assert "deploy-train-42" in report["families"][0]["samples"]
+
+
+def test_the_warn_mode_arms_on_its_date(conn):
+    """Before the date the key passes; on the date the same key is refused by name."""
+    from hermes_cli import kanban_filing_shape as fs
+    fs.gate_filing_shape(conn, idempotency_key="deploy-train-42", created_by="deploy-train",
+                         today="2026-10-31")
+    with pytest.raises(ValueError) as excinfo:
+        fs.gate_filing_shape(conn, idempotency_key="deploy-train-42", created_by="deploy-train",
+                             today="2026-11-01")
+    assert getattr(excinfo.value, "cause", None) == "unshaped_key"
+
+
+def test_a_family_nobody_has_seen_is_armed_at_birth(conn):
+    with _refusal("unshaped_key"):
+        kb.create_task(conn, title="new bot", created_by="brand-new-bot",
+                       idempotency_key="bare-label")
+    assert _rows(conn, "title = ?", ("new bot",)) == []

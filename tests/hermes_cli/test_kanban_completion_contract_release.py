@@ -304,7 +304,7 @@ def test_retryable_missing_check_does_not_park(board, github):
 def test_set_contract_requires_a_reason_and_refuses_a_terminal_card(board):
     with connect() as conn:
         tid = kb.create_task(conn, title="release", completion_contract="acme/repo",
-                             created_by="platform-coder", idempotency_key="fixture-306")
+                             created_by="platform-coder", idempotency_key="fixture:case-306")
         assert kb.set_contract(conn, tid, "local-only", reason="repo requires no checks",
                                actor="platform-coder")
         task = kb.get_task(conn, tid)
