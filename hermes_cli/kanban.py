@@ -1781,6 +1781,27 @@ def _gates_from_delegated_child() -> bool:
             or kanban_path_is_fenced(kb.kanban_db_path()))
 
 
+def _print_shape_warn(record: dict) -> None:
+    """Print the filing-shape ratchet's WARN-MODE counts beside the gate violations.
+
+    Invariant E arms its shape clause per family (platform-stl decision ESC-ef2af6848e602c8b):
+    a warn-mode family's unshaped filing still SUCCEEDS, so it is not a violation and must not
+    move the exit code -- but it is COUNTED, because a warn mode nobody can measure is a silent
+    pass, which is the thing the decision refuses.
+    """
+    warn = record.get("filing_shape_warn") or {}
+    total = int(warn.get("total") or 0)
+    if not total:
+        return
+    armed_at = warn.get("armed_at") or {}
+    print(f"filing shape (invariant E, warn mode): {total} unshaped key filing(s) recorded")
+    for row in warn.get("families") or []:
+        due = armed_at.get(row["family"], "armed")
+        samples = ", ".join(row.get("samples") or [])
+        print(f"  {row['family']}: {row['count']} (shape clause refuses from {due})"
+              + (f" -- e.g. {samples}" if samples else ""))
+
+
 def _cmd_gates(args: argparse.Namespace) -> int:
     """``hermes kanban gates report|reconcile`` — the relations the write seams enforce.
 
@@ -1798,6 +1819,7 @@ def _cmd_gates(args: argparse.Namespace) -> int:
     went dark with it, so the rank invariant could be neither measured nor reconciled.
     """
     from hermes_cli import kanban_gate_invariants as _gate_inv
+    from hermes_cli import kanban_filing_shape as _shape
     action = (getattr(args, "action", None) or "report").strip().lower()
     if action not in ("report", "reconcile"):
         return _err(f"kanban gates: unknown action {action!r}; use report or reconcile", 2)
@@ -1816,6 +1838,7 @@ def _cmd_gates(args: argparse.Namespace) -> int:
                 "families_total": families["violations_total"],
                 "open_total": families["open_total"],
                 "armed": families["armed"],
+                "filing_shape_warn": _shape.warn_report(conn),
             }
             remaining = record["violations_total"] + families["open_total"]
         else:
@@ -1842,6 +1865,7 @@ def _cmd_gates(args: argparse.Namespace) -> int:
         if open_total == 0:
             print(f"Gate invariants hold on board {record['board']!r}: no open violation in rank, "
                   "assignee, dependency or evidence.")
+            _print_shape_warn(record)
             return 0
         print(f"Gate invariants on board {record['board']!r}: {open_total} open violation(s) "
               f"(rank {len(rank_rows)}, assignee {len(families.get('assignee') or [])}, "
@@ -1866,6 +1890,7 @@ def _cmd_gates(args: argparse.Namespace) -> int:
                           f"{', '.join(row.get('named') or [])} with no edge{suffix}")
                 else:
                     print(f"  {row['task_id']} done with no evidence record")
+        _print_shape_warn(record)
         if record["violations_total"] == 0 and record["open_total"] == 0:
             return 0
         return 1

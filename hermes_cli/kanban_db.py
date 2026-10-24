@@ -2032,6 +2032,7 @@ def create_task(
         if row:
             return row["id"]
 
+
     # An unresolvable project link is DROPPED either way (never a dangling reference, never a
     # crash), but a silent drop is a silent failure: the caller believes the card is grouped
     # and it is not. Warn on stderr AND carry the finding into the ``created`` event, so the
@@ -2094,6 +2095,22 @@ def create_task(
         board_default = _board_meta_for(dest_board).get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    # INVARIANT E, the last refusal before the INSERT (operator ruling 2026-10-22, card
+    # t_add7b0e9): a BOT filing must be a CHILD or carry a KEY, because a top-level unkeyed card
+    # is a condition the store cannot recognise the second time (measured: 2,091
+    # `pr-approval-refusal-*` cards over 1,206 distinct (repo, PR) pairs; 258 unkeyed
+    # platform-stl filings in 7 days). Deliberately LAST among the refusal doors: every policy
+    # refusal above (attribution, assignee, ask-home, above-tranche) keeps its precedence and its
+    # message, and only a filing that would otherwise have been WRITTEN is shape-checked. It sits
+    # after the idempotency read too, so a repeat of a key is ANSWERED by the first card rather
+    # than refused because its parent has since finished.
+    from hermes_cli.kanban_filing_shape import gate_filing_shape
+
+    gate_filing_shape(
+        conn, parents=parents, idempotency_key=idempotency_key,
+        created_by=created_by, where="kanban_create",
+    )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):

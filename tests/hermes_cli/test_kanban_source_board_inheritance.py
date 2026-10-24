@@ -45,7 +45,7 @@ def _create_args(**over):
     ns = argparse.Namespace(
         title="a fired card", body=None, body_file=None, workspace=None, branch=None,
         max_runtime=None, max_retries=None, assignee="platform-coder", created_by=None,
-        tenant=None, priority=0, parent=[], triage=True, idempotency_key=None,
+        tenant=None, priority=0, parent=[], triage=True, idempotency_key="fixture:source-board",
         skills=None, model_override=None, provider_override=None, goal_mode=False,
         goal_max_turns=None, completion_contract=None, initial_status="running",
         serves=None, project=None, json=True, board=None,
@@ -116,7 +116,7 @@ def test_tool_create_from_a_card_lands_on_the_source_board(kanban_home, monkeypa
     monkeypatch.setenv("HERMES_KANBAN_TASK", source_id)
     payload = json.loads(kt._handle_create({
         "title": "fired by the tool", "assignee": "platform-coder",
-        "triage": True}))
+        "triage": True, "idempotency_key": "fixture:tool-source-board"}))
     assert payload.get("ok") is True, payload
     assert kb.source_board_for_task(payload["task_id"]) == SOURCE_BOARD
     assert _ids_on(WRONG_BOARD) == set()

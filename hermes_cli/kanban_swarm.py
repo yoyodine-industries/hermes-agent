@@ -16,6 +16,7 @@ notifier, slash command and dispatcher keep working without a new service.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
 import sqlite3
 import time
@@ -174,6 +175,15 @@ def _create_swarm_uncommitted(
     goal = _require_text(goal, "goal")
     verifier_assignee = _require_text(verifier_assignee, "verifier_assignee")
     synthesizer_assignee = _require_text(synthesizer_assignee, "synthesizer_assignee")
+    # The root is a TOP-LEVEL card filed by a bot, so it must carry the key its condition is
+    # recognised by (invariant E, operator ruling 2026-10-22, card t_add7b0e9): a swarm absent a
+    # key is a graph the board cannot tell from a second identical swarm. The goal IS the
+    # swarm's identity, so it derives the key when the caller does not name one -- and a repeat
+    # of the same goal then answers with the FIRST swarm's root (the topology is recovered from
+    # the blackboard below), instead of a duplicate graph.
+    if not idempotency_key:
+        digest = hashlib.sha256(goal.strip().encode("utf-8")).hexdigest()[:16]
+        idempotency_key = f"swarm:{digest}"
     worker_specs = list(workers)
     if not worker_specs:
         raise ValueError("at least one worker is required")

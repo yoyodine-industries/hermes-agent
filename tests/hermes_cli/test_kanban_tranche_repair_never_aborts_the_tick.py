@@ -82,11 +82,11 @@ def test_the_repair_pass_survives_the_armed_storage_guard(kanban_home: Path) -> 
         assert kb.arm_priority_tranche_guard("default") == list(kb.PRIORITY_TRANCHE_TRIGGERS)
         stamped = kb.create_task(
             conn, title="stamped ask", body=STAMP, assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture:case-83"
         )
         plain = kb.create_task(
             conn, title="plain lane work", assignee="platform-worker",
-            created_by="platform-worker", priority=ORDINARY_MAX,
+            created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture:case-87"
         )
         _lift_above_the_ceiling(conn, stamped)
         _lift_above_the_ceiling(conn, plain)
@@ -121,7 +121,7 @@ def test_the_repair_lands_an_inherited_marker_in_the_ordinary_domain(kanban_home
     with kbc.connect() as conn:
         assert kb.arm_priority_tranche_guard("default") == list(kb.PRIORITY_TRANCHE_TRIGGERS)
         parent = kb.create_task(conn, title="the ask", body=STAMP, assignee="platform-worker",
-                                created_by="platform-worker", priority=ORDINARY_MAX)
+                                created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture:case-123")
         child = kb.create_task(conn, title="work under the ask", assignee="platform-worker",
                                created_by="platform-worker", priority=ORDINARY_MAX,
                                parents=[parent])
@@ -160,8 +160,8 @@ def test_the_storage_guard_admits_every_marker_the_doors_admit(kanban_home: Path
         ("child", "operator asks are tracked elsewhere", False, False, True),
         ("child", "carries no Operator-ask reference", False, False, True),
         ("child", STAMP, False, True, False),
-        ("child", "\n%s\n" % STAMP, False, True, False),
-        ("child", "   \t%s   " % STAMP, False, True, False),
+        ("child", f"\n{STAMP}\n", False, True, False),
+        ("child", f"   \t{STAMP}   ", False, True, False),
         ("child", "notes\n\nOperator-ask: t_a1b2c3d4/e5f6a7b8", False, True, False),
         ("child", "Severity: SEV1", False, True, False),
         ("child", "    Severity: SEV1", False, True, False),   # measured live: indented
@@ -178,7 +178,8 @@ def test_the_storage_guard_admits_every_marker_the_doors_admit(kanban_home: Path
         assert kb.arm_priority_tranche_guard("default") == list(kb.PRIORITY_TRANCHE_TRIGGERS)
         for i, (title, body, designated, entitled, must_refuse) in enumerate(corpus):
             tid = kb.create_task(conn, title=title, body=body, assignee="platform-worker",
-                                 created_by="platform-worker", priority=ORDINARY_MAX)
+                                 created_by="platform-worker", priority=ORDINARY_MAX,
+                                 idempotency_key=f"fixture:tranche-case-{i}")
             if designated:
                 kb.designate_priority(conn, tid, reason="operator ask", authority="default")
             marker = kb.tranche_entitlement(conn, board="default", task_id=tid,
@@ -195,12 +196,12 @@ def test_the_storage_guard_admits_every_marker_the_doors_admit(kanban_home: Path
                 refused_with = str(exc)
             else:
                 refused_with = ""
-            case = "case %d %r / %r" % (i, title, (body or "")[:40])
+            case = f"case {i} {title!r} / {(body or '')[:40]!r}"
             if entitled:
-                assert admitted, "%s: the doors call this entitled but the guard refused (%s)" % (
-                    case, refused_with)
+                assert admitted, (
+                    f"{case}: the doors call this entitled but the guard refused ({refused_with})")
             if must_refuse:
-                assert not admitted, "%s: no evidence at all, and the guard admitted it" % case
+                assert not admitted, f"{case}: no evidence at all, and the guard admitted it"
             if admitted:
                 assert _priority(conn, tid) == CEILING
             elif must_refuse:
@@ -223,14 +224,14 @@ def test_the_create_seam_lands_a_marker_filing_in_the_tranche_on_an_armed_board(
         assert kb.arm_priority_tranche_guard("default") == list(kb.PRIORITY_TRANCHE_TRIGGERS)
         tid = kb.create_task(conn, title="the operator's ask", body=STAMP,
                              assignee="platform-worker", created_by="platform-worker",
-                             priority=1100000)
+                             priority=1100000, idempotency_key="fixture:case-224")
         assert _priority(conn, tid) == CEILING
         body = conn.execute("SELECT body FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
         assert "Operator-ask:" in body
         # ... and an unmarked filing over the ceiling is still REFUSED with its remedy.
         with pytest.raises(kb.AboveTrancheRefused):
             kb.create_task(conn, title="plain lane work", assignee="platform-worker",
-                           created_by="platform-worker", priority=1100000)
+                           created_by="platform-worker", priority=1100000, idempotency_key="fixture:case-232")
 
 
 def test_a_declared_sev1_lifted_above_the_ceiling_is_lowered_to_the_tranche_top(
@@ -240,7 +241,7 @@ def test_a_declared_sev1_lifted_above_the_ceiling_is_lowered_to_the_tranche_top(
     with kbc.connect() as conn:
         assert kb.arm_priority_tranche_guard("default") == list(kb.PRIORITY_TRANCHE_TRIGGERS)
         sev = kb.create_task(conn, title="SEV1 [deploy-train] run failed", body="Severity: SEV1",
-                             assignee="default", created_by="default", priority=ORDINARY_MAX)
+                             assignee="default", created_by="default", priority=ORDINARY_MAX, idempotency_key="fixture:case-242")
         _lift_above_the_ceiling(conn, sev, 1100000)
         ledger = {row["task_id"]: row for row in kb.demote_above_tranche(conn, board="default")}
         assert ledger[sev]["now"] == CEILING
@@ -270,7 +271,7 @@ def test_a_failing_repair_pass_does_not_take_the_tick_down(
         # the property that matters - a repair that raised before the spawn loop left 452 ready
         # cards unspawned.
         card = kb.create_task(conn, title="recoverable", assignee="platform-worker",
-                              created_by="platform-worker")
+                              created_by="platform-worker", idempotency_key="fixture:case-272")
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status='blocked', consecutive_failures=1 WHERE id=?", (card,))
@@ -296,7 +297,7 @@ def test_a_refused_row_is_reported_not_swallowed(kanban_home: Path) -> None:
     """
     with kbc.connect() as conn:
         row = kb.create_task(conn, title="no marker at all", assignee="platform-worker",
-                             created_by="platform-worker", priority=ORDINARY_MAX)
+                             created_by="platform-worker", priority=ORDINARY_MAX, idempotency_key="fixture:case-298")
         _lift_above_the_ceiling(conn, row)
         assert kb.arm_priority_tranche_guard("default") == list(kb.PRIORITY_TRANCHE_TRIGGERS)
 
