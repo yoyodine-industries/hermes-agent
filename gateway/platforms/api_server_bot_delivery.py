@@ -267,6 +267,23 @@ async def drain_under_lock(
     )
 
 
+def _adapter_cap_has_room(adapter: Any) -> bool:
+    """Whether the AGENT-WORK cap allows one more turn to start (t_376b3fbd).
+
+    A delivery accepted while the cap was full waits for a SLOT, so BOTH the drainer
+    and the expiry sweep ask the same gate the 429 does (t_43f11055 a). Without this an
+    accepted record would be run anyway and the cap would bound HTTP admission only,
+    which is not what it is for.
+    """
+    gate = getattr(adapter, "_agent_gate_has_room", None)
+    if not callable(gate):
+        return True
+    try:
+        return bool(gate())
+    except Exception:  # an unreadable gate must not stop the drainer
+        return True
+
+
 async def drain_once(
     adapter: Any, home: Path, *, budget_seconds: Optional[float] = None
 ) -> int:
@@ -291,19 +308,8 @@ async def drain_once(
     drained = 0
 
     def _gate_has_room() -> bool:
-        """Whether the AGENT-WORK cap allows one more turn to start (t_376b3fbd).
-
-        A delivery accepted while the cap was full waits for a SLOT, so the drainer asks the
-        same gate the 429 does. Without this an accepted record would be run anyway and the
-        cap would bound HTTP admission only, which is not what it is for.
-        """
-        gate = getattr(adapter, "_agent_gate_has_room", None)
-        if not callable(gate):
-            return True
-        try:
-            return bool(gate())
-        except Exception:  # noqa: BLE001 - an unreadable gate must not stop the drainer
-            return True
+        """The AGENT-WORK cap, through the ONE seam the expiry sweep also asks."""
+        return _adapter_cap_has_room(adapter)
 
     for _lane, lane_home in _delivery_homes(root):
         # Asking a home that never carried a delivery would CREATE its spool and
@@ -367,8 +373,9 @@ async def sweep_once(adapter: Any, home: Path) -> int:
        sender-visible FAILURE notice in its sender's lane.
 
     Expiry runs outside the drain so a lane whose slot is held keeps its backlog:
-    ``sweep_delivery_queue`` already refuses to expire while the slot is held, and
-    the holder is exactly the turn that will drain it next.
+    ``sweep_delivery_queue`` refuses to expire while the slot is held OR while the
+    AGENT-WORK cap has no room -- the same two deferrals this drain applies -- and the
+    holder / the cap's own wait is exactly what will drain it next (t_43f11055 a).
     """
     lanes = _spooled_lanes(Path(home))
     for _name, lane_home in lanes:
@@ -376,7 +383,9 @@ async def sweep_once(adapter: Any, home: Path) -> int:
     drained = await drain_once(adapter, Path(home))
     for _name, lane_home in lanes:
         delivery_queue.sweep_delivery_queue(
-            lane_home, on_expired=delivery_queue.notice_expired_to_sender
+            lane_home,
+            on_expired=delivery_queue.notice_expired_to_sender,
+            agent_cap_has_room_fn=lambda: _adapter_cap_has_room(adapter),
         )
     return drained
 
@@ -386,6 +395,10 @@ async def sweep_loop(adapter: Any) -> None:
     from tools.bot_mode_probe import _default_home
 
     home = Path(_default_home())
+    # This process owns the AGENT-WORK cap; registering it here is what makes the
+    # HOURLY chore (``cleanup_bot_delivery_queue``) expire against the same gate the
+    # drain defers on, not only the 30s sweep below (t_43f11055 a).
+    delivery_queue.register_agent_cap_probe(lambda: _adapter_cap_has_room(adapter))
     logger.info("[api_server] bot delivery drainer started (home=%s)", home)
     while True:
         await asyncio.sleep(delivery_queue.sweep_seconds())
