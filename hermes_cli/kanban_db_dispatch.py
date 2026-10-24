@@ -3956,6 +3956,16 @@ TICK_YIELD_RETIRE_BATCH = 100
 #: ``running`` is here for a reason (DEC-3.6): a card under a live claim is somebody's work.
 #: ``failed``/``cancelled`` are terminal for the same purpose as ``done``/``archived``.
 TICK_YIELD_RETIRE_SKIP_STATUSES = ("done", "archived", "failed", "cancelled", "running")
+
+#: Bounded retirement (card t_028ad743). A live guard that REFUSES the kernel's close used to be
+#: re-warned on every tick, forever: three immortal cards on the platform board produced a warning
+#: per tick and no action, which is a defect wearing a log line. Every refusal is recorded ON THE
+#: CARD, so the bound survives a respawned dispatcher; at the bound ONE ``..._retire_failed`` event
+#: names the last refusal (and the shape the kernel will not take) and the card leaves the sweep
+#: for good -- it is then an audit finding, not a per-tick siren.
+TICK_YIELD_RETIRE_MAX_ATTEMPTS = 3
+TICK_YIELD_RETIRE_REFUSED_EVENT = "tree_skew_actor_retire_refused"
+TICK_YIELD_RETIRE_FAILED_EVENT = "tree_skew_actor_retire_failed"
 #: The ABSORB half (DEC-1.4) is deliberately narrower than the retire half: ``running`` is a LIVE
 #: carrier and must absorb the repeat, or a long stall would file a second card beside the first.
 TICK_YIELD_ACTOR_ABSORB_SKIP_STATUSES = ("done", "archived", "failed", "cancelled")
@@ -4641,7 +4651,7 @@ def _peer_run_tree_skew(line: str, episode: str) -> tuple[str, Optional[str]]:
             encoding="utf-8", errors="replace",
             timeout=TICK_YIELD_ESCALATION_TIMEOUT_S, env=env,
         )
-    except Exception as exc:  # noqa: BLE001 - a nudge must never take a tick down
+    except Exception as exc:
         return "failed", f"{exc.__class__.__name__}: {exc}"
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[:400] or f"rc={proc.returncode}"
@@ -4687,12 +4697,12 @@ def _deliver_tree_skew_escalation(
                 submission=record or {"episode": episode},
             ) or {}
             ref = row.get("ref")
-        except Exception as exc:  # noqa: BLE001 - a registry fault must not lose the door
+        except Exception as exc:
             error = f"register: {exc.__class__.__name__}: {exc}"
         if ref:
             try:
                 module.notify(ref, TICK_YIELD_ACTOR_ASSIGNEE, line)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # The ROW exists (the durable half landed); only the nudge failed. Say so, and do
                 # not re-knock through leg 2: a second channel for one episode is noise.
                 failed = f"notify: {exc.__class__.__name__}: {exc}"
@@ -4717,168 +4727,7 @@ def _deliver_tree_skew_escalation(
     }
 
 
-def _tree_skew_actor_pid_from_key(key: str) -> Optional[int]:
-    """The filing pid a LEGACY key carries, else ``None``.
 
-    Legacy shape ``tree-skew:<sig>:<pid>:<ord>``. The content signature itself contains a colon
-    (``tree-content:<hex>``), so the key is parsed from the TAIL: the last two fields are the
-    ``pid``/``ord`` pair when BOTH are digits and the ordinal is small (an occurrence count, never
-    an epoch). A WINDOW key (``tree-skew:<sig>:<first_tick>``) ends in a 10-digit epoch, which is
-    not a plausible ordinal, so a window key never reads as legacy.
-    """
-    parts = str(key or "").split(":")
-    if len(parts) < 4:
-        return None
-    tail_pid, ordinal = parts[-2], parts[-1]
-    if not (tail_pid.isdigit() and ordinal.isdigit()):
-        return None
-    if int(ordinal) > 9999 or int(tail_pid) <= 0:
-        return None
-    return int(tail_pid)
-
-
-def _tree_skew_actor_provenance(conn: sqlite3.Connection, task_id: str, key: str) -> dict:
-    """``{"filing_pid", "escalation_ref"}`` for one actor card.
-
-    The pid comes from the legacy key's own field first (it is what the card was MINTED with), then
-    from the ``tree_skew_actor_filed`` event payload, else ``None`` -- which DEC-3.3 treats as
-    retire-eligible ONLY because the caller is a gate-CLEAR tick and ``running`` is excluded.
-    """
-    info: dict = {"filing_pid": _tree_skew_actor_pid_from_key(key), "escalation_ref": None}
-    payload: dict = {}
-    try:
-        row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-            "ORDER BY id DESC LIMIT 1", (task_id, TICK_YIELD_ACTOR_EVENT),
-        ).fetchone()
-    except Exception:
-        row = None
-    if row is not None:
-        try:
-            payload = json.loads(row["payload"] or "{}")
-        except (TypeError, ValueError):
-            payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    if info["filing_pid"] is None:
-        try:
-            info["filing_pid"] = int(str(payload.get("boot_pid")))
-        except (TypeError, ValueError):
-            info["filing_pid"] = None
-    ref = payload.get("escalation_ref")
-    info["escalation_ref"] = str(ref) if ref else None
-    return info
-
-
-def _retire_tree_skew_actors(conn: sqlite3.Connection, *, board: Optional[str] = None) -> int:
-    """Close every live actor card whose episode has CLEARED (DEC-3). Returns how many retired.
-
-    A tick that serves normally is PROOF the episode is over: this process compared the content it
-    imported against the checkout and found them equal. Its actors are therefore retired here,
-    deterministically and through the KERNEL's own doors -- ``unblock_task`` first (42 of the live
-    51 stale cards were ``scheduled``, and ``complete_task`` refuses that status), then
-    ``complete_task``. A ``CompletionRefusal`` is logged and COUNTED, never raised into the tick.
-
-    The LIVENESS FENCE is the same one :func:`_clear_tick_yield_status` applies: a card filed by a
-    FOREIGN pid that is still ALIVE belongs to a frozen peer's episode, and retiring it would read
-    green over a frozen gateway -- the exact false green this whole block exists to prevent.
-
-    Selection is bounded (``TICK_YIELD_RETIRE_BATCH``) and per tick, so a 51-card backlog drains
-    over a couple of ticks instead of walking the board in one.
-    """
-    actor_conn, filed_on, close_it = _ops_board_connection(conn)
-    if filed_on != TICK_YIELD_ACTOR_BOARD:
-        # The actor board could not be opened. Retiring on the board that merely ticked would be a
-        # different claim (those cards are not ours to close), so say so and serve the tick.
-        _kb._log.warning(
-            "kanban dispatcher: tree-skew actor retirement skipped -- the actor board %s is "
-            "unavailable (fell back to %s)", TICK_YIELD_ACTOR_BOARD, filed_on,
-        )
-        if close_it:
-            try:
-                actor_conn.close()
-            except Exception:
-                pass
-        return 0
-    retired = refused = skipped = 0
-    try:
-        placeholders = ",".join("?" for _ in TICK_YIELD_RETIRE_SKIP_STATUSES)
-        rows = actor_conn.execute(
-            "SELECT id, status, idempotency_key FROM tasks "
-            "WHERE created_by = 'kanban-dispatcher' AND title = ? "
-            "AND idempotency_key LIKE ? || '%' "
-            f"AND status NOT IN ({placeholders}) "
-            "ORDER BY rowid LIMIT ?",
-            (TICK_YIELD_ACTOR_TITLE, TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX,
-             *TICK_YIELD_RETIRE_SKIP_STATUSES, TICK_YIELD_RETIRE_BATCH),
-        ).fetchall()
-        import datetime
-
-        cleared_at = datetime.datetime.fromtimestamp(
-            int(time.time())).isoformat(timespec="seconds")
-        for row in rows:
-            task_id = row["id"]
-            key = row["idempotency_key"] or ""
-            provenance = _tree_skew_actor_provenance(actor_conn, task_id, key)
-            filing_pid = provenance["filing_pid"]
-            if (filing_pid is not None and filing_pid != os.getpid()
-                    and _pid_liveness(filing_pid) != WORKER_DEAD):
-                skipped += 1
-                continue
-            if row["status"] in ("blocked", "scheduled"):
-                try:
-                    _kb.unblock_task(actor_conn, task_id)
-                except Exception as exc:  # noqa: BLE001
-                    _kb._log.warning(
-                        "kanban dispatcher: could not unblock tree-skew actor %s (%s): %s",
-                        task_id, row["status"], exc)
-            result_line = (
-                f"[retired] episode cleared at {cleared_at}: the dispatcher ticked clean against "
-                f"the content it imported, so the stall this card records is over. "
-                f"retired_by_pid={os.getpid()} filing_pid={filing_pid} key={key}"
-            )
-            try:
-                verdict = _kb.complete_task(
-                    actor_conn, task_id, result=result_line, fire_lifecycle_hook=False)
-            except Exception as exc:  # noqa: BLE001
-                refused += 1
-                _kb._log.warning(
-                    "kanban dispatcher: could not retire tree-skew actor %s: %s", task_id, exc)
-                continue
-            if isinstance(verdict, _kb.CompletionRefusal) or not verdict:
-                refused += 1
-                detail = getattr(verdict, "detail", None) or getattr(verdict, "cause", "refused")
-                _kb._log.warning(
-                    "kanban dispatcher: could not retire tree-skew actor %s: %s", task_id, detail)
-                continue
-            try:
-                with _kb.write_txn(actor_conn):
-                    _kb._append_event(actor_conn, task_id, TICK_YIELD_RETIRED_EVENT, {
-                        "reason": "gate-clear",
-                        "retired_by_pid": os.getpid(),
-                        "filing_pid": filing_pid,
-                        "key": key,
-                        "escalation_ref": provenance["escalation_ref"],
-                    })
-            except Exception as exc:  # noqa: BLE001 - the close landed; the note is best-effort
-                _kb._log.warning(
-                    "kanban dispatcher: retired tree-skew actor %s but could not record the "
-                    "retirement event: %s", task_id, exc)
-            retired += 1
-    except Exception as exc:  # noqa: BLE001 - retirement must never take a tick down
-        _kb._log.warning("kanban dispatcher: tree-skew actor retirement failed: %s", exc)
-    finally:
-        if close_it:
-            try:
-                actor_conn.close()
-            except Exception:
-                pass
-    if retired or refused or skipped:
-        _kb._log.info(
-            "kanban dispatcher: tree-skew actor retirement on %s: retired=%d refused=%d "
-            "skipped_live=%d", filed_on, retired, refused, skipped,
-        )
-    return retired
 
 
 def _event_payload(raw) -> dict:
@@ -5211,128 +5060,6 @@ def _file_tick_yield_escalation(
         return None
 
 
-def _tick_served(result: Optional[object]) -> bool:
-    """True only for a tick that actually SERVED: not a refusal, not a lock skip, not an error."""
-    if result is None:
-        return False
-    try:
-        if getattr(result, "tick_yielded", None) or getattr(result, "error", None):
-            return False
-        return not (
-            getattr(result, "skipped_locked", False)
-            or getattr(result, "skipped_board_disabled", False)
-        )
-    except Exception:  # pragma: no cover - a duck-typed result must not stop a tick
-        return False
-
-
-def _close_cleared_tick_yield_cards(
-    result: Optional[object], conn: sqlite3.Connection,
-) -> list:
-    """Close the guard card(s) whose stall is OVER, on the proof of a verified NORMAL tick.
-
-    "Cleared" is never inferred from the ABSENCE of refusals -- the dispatcher that would refuse
-    is precisely the one that is gone. Two facts are required, both deterministic:
-
-      * THIS tick served (``_tick_served``): the evidence the card's own "What closes it" section
-        names ("the gate clears itself on the first tick that serves normally"); and
-      * the frozen process the card names is PROVEN DEAD (or is this very process, which has just
-        served), so a second live dispatcher on another board can never close a live gateway's
-        card.
-
-    A card a seat is working RIGHT NOW is protected by the kernel's live-claim fence: a
-    ``complete_task`` without run ownership is refused, which is why this door is safe to call on
-    every healthy tick. Every refusal is logged and the card is left exactly as it was.
-
-    The cards live on the OPS board (the one they were filed on), never on the board that merely
-    ticked -- the same rule the filing half follows.
-    """
-    if not _tick_served(result):
-        return []
-    ops_conn, _ops_board, close_it = _ops_board_connection(conn)
-    try:
-        return _close_cleared_cards_on(ops_conn)
-    finally:
-        if close_it:
-            try:
-                ops_conn.close()
-            except Exception:  # pragma: no cover - closing a scratch connection never matters
-                pass
-
-
-def _close_cleared_cards_on(conn: sqlite3.Connection) -> list:
-    """The body of :func:`_close_cleared_tick_yield_cards` against the board the cards ride."""
-    try:
-        rows = conn.execute(
-            "SELECT t.id AS id FROM tasks t JOIN task_events e ON e.task_id = t.id "
-            "WHERE e.kind = ? AND t.status NOT IN ('done', 'archived') GROUP BY t.id",
-            (TICK_YIELD_ACTOR_EVENT,),
-        ).fetchall()
-    except Exception:  # pragma: no cover - no board history, nothing to close
-        return []
-    closed = []
-    for row in rows:
-        card_id = row["id"]
-        try:
-            payload_row = conn.execute(
-                "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (card_id, TICK_YIELD_ACTOR_EVENT),
-            ).fetchone()
-        except Exception:  # pragma: no cover
-            continue
-        payload = _event_payload(payload_row["payload"] if payload_row is not None else None)
-        try:
-            frozen_pid = int(payload.get("boot_pid"))
-        except (TypeError, ValueError):
-            continue
-        if frozen_pid != os.getpid() and _pid_liveness(frozen_pid) != WORKER_DEAD:
-            continue
-        try:
-            outcome = _kb.complete_task(
-                conn, card_id,
-                summary=(
-                    "Closed by the dispatcher's OWN tick: the tree-skew stall this card carried is"
-                    " over. A dispatcher process served a normal tick after the frozen process it"
-                    f" named (pid {frozen_pid}) went away, so the reload landed and the gate is"
-                    " clear -- no lane action is owed on this card."
-                ),
-                metadata={
-                    "evidence": {
-                        "class": "none",
-                        "why": (
-                            "board repair with no run behind it: the proof is a verified normal "
-                            "dispatcher tick after the frozen pid (proven dead) stopped serving"
-                        ),
-                    },
-                    "tree_skew_cleared": {
-                        "frozen_pid": frozen_pid,
-                        "disk_fingerprint": payload.get("disk_fingerprint"),
-                        "boot_fingerprint": payload.get("boot_fingerprint"),
-                        "observed_by_pid": os.getpid(),
-                        "at": int(time.time()),
-                    },
-                },
-            )
-        except Exception as exc:
-            _kb._log.warning(
-                "kanban dispatcher: could not close the cleared tree-skew guard %s: %s", card_id, exc,
-            )
-            continue
-        if not outcome:
-            _kb._log.warning(
-                "kanban dispatcher: the cleared tree-skew guard %s was not closed (%s); it is a "
-                "live claim and stays with its worker", card_id, outcome,
-            )
-            continue
-        closed.append(card_id)
-        _kb._log.info(
-            "kanban dispatcher: closed tree-skew guard %s -- a normal tick after pid %s cleared it",
-            card_id, frozen_pid,
-        )
-    return closed
-
-
 def _tick_refused_for_tree_skew(
     conn: sqlite3.Connection,
     yielded: DispatcherTickYielded,
@@ -5461,42 +5188,20 @@ def dispatch_once(
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
+            # DEC-3 + card t_028ad743: retire the guards whose episode is OVER, BEFORE this tick
+            # claims or spawns anything. THE PROOF IS THE PLACEMENT -- a tick that reached here
+            # passed ``_raise_if_tree_skewed`` (the tree this process imported IS the checkout on
+            # disk) and holds the board's dispatch lock. It must run before the claim phase because
+            # the tick's own reconcile otherwise releases and CLAIMS a fallback-filed guard: the
+            # card came back ``running``, the kernel refused the close, and the duplicate was
+            # re-dispatched to its lane on every tick while never being retired.
+            #
+            # Both doors keep their own fault isolation: neither may take a tick down.
+            if not dry_run:
+                _retire_cleared_tree_skew_cards(conn, board=resolved_board)
             result = _locked_tick()
             # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
             _kbc._maybe_checkpoint_wal(conn, db_path)
-    # This tick served normally, so a non-green marker left by THIS process (or by a process that
-    # is now provably dead) is retired. A fresh process never clears a live gateway's marker.
-    #
-    # DEC-3: the SAME tick is the proof that the EPISODE cleared, so the actor cards filed for it
-    # are retired here too -- on the actor board, never on the board that merely ticked. Runs when
-    # this tick just retired a record, or whenever the tick IS the actor board (whose records the
-    # 51-card live backlog long outlived). ``running`` cards are never touched (DEC-3.6) and a card
-    # whose filing pid is a LIVE foreign process is skipped (a frozen peer still holds that
-    # episode). A retirement fault is logged and never takes the tick down.
-    #
-    # The guard card the marker carried is closed on the SAME proof (card t_4dbee32e): a verified
-    # normal tick plus the frozen process the card names being dead is what "the reload landed"
-    # looks like from the board's side. This door runs FIRST because it is the NARROWER one -- it
-    # can only land on a card the kernel's own completion accepts -- so the retirement door below
-    # still owns every shape it cannot close (a `scheduled` legacy carrier, a `running` claim).
-    # Each door keeps its own fault isolation: neither may take a tick down.
-    if not dry_run:
-        cleared = _clear_tick_yield_status()
-        try:
-            _close_cleared_tick_yield_cards(result, conn)
-        except Exception as exc:  # a close is never allowed to break a tick
-            logger.warning(
-                "kanban dispatcher: tree-skew guard close failed on %s: %s",
-                resolved_board, exc,
-            )
-        if resolved_board == TICK_YIELD_ACTOR_BOARD or cleared:
-            try:
-                _retire_tree_skew_actors(conn, board=resolved_board)
-            except Exception as exc:  # retirement is never allowed to break a tick
-                logger.warning(
-                    "kanban dispatcher: tree-skew actor retirement failed on %s: %s",
-                    resolved_board, exc,
-                )
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -7140,3 +6845,15 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
+
+# The tree-skew RETIREMENT doors (card t_028ad743) live in a topical sibling and are re-exported
+# here: ``dispatch_once`` calls them by name at tick time, and the tests patch this module. Imported
+# after ``_kb`` for the same reason -- the sibling reaches back into ``kanban_db`` at CALL time.
+from hermes_cli.kanban_db_dispatch_retire import (
+    _close_cleared_cards_on,
+    _close_cleared_tick_yield_cards,
+    _retire_cleared_tree_skew_cards,
+    _retire_tree_skew_actors,
+    _tree_skew_actor_pid_from_key,
+    _tree_skew_actor_provenance,
+)

@@ -1805,3 +1805,163 @@ def test_r3_a_closed_escalation_never_swallows_the_next_episode(board, tree, mon
         f"{_status_record()[1]['first_tick']}"
     ), "the new card keys from ITS OWN first tick (R-3)"
     assert second["status"] not in ("done", "archived"), "the new escalation is live"
+
+
+# ---------------------------------------------------------------------------------------------
+# card t_028ad743 -- the two shapes the retirement doors could not close
+# ---------------------------------------------------------------------------------------------
+
+
+def _card_kinds(conn, task_id):
+    return [
+        row["kind"] for row in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+    ]
+
+
+def _ops_card_kinds(task_id):
+    conn = kbc.connect(board=OPS_BOARD)
+    try:
+        return _card_kinds(conn, task_id)
+    finally:
+        conn.close()
+
+
+def test_a_guard_filed_on_the_FALLBACK_board_is_retired_by_a_served_tick(board, tree):
+    """Card t_028ad743: the fallback-filed duplicate (the fleet's t_35f10525).
+
+    A guard filed while the ops board was UNOPENABLE lands on the board that was merely TICKING --
+    with our own ``tree-skew:`` key, but with no ``tree_skew_actor_filed`` event and a title no seat
+    would recognise. The narrow door selects by that EVENT and the broad one by the EXACT TITLE on
+    the ACTOR board, so this card was invisible to both: immortal, and re-dispatched every tick.
+    Its own key says it is OURS, so a served tick must retire it wherever it was filed.
+    """
+    conn = board
+    task_id = kb.create_task(
+        conn,
+        title="[guard] mixed revision -- DUPLICATE, filed on the fallback board",
+        body="filed only because the ops board was unopenable",
+        assignee=kbd.TICK_YIELD_ACTOR_ASSIGNEE,
+        created_by="kanban-dispatcher",
+        idempotency_key=(
+            f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}tree-content:{'b' * 64}:1792800954"
+        ),
+    )
+    # ``blocked`` is the fleet's own shape for a fallback-filed guard (t_4a8ae67f, t_9ed0a953): not
+    # spawnable, and NOT completable -- so the narrow door's ``complete_task`` refused it with
+    # ``cause='not_running'`` on every tick and it stayed live forever.
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task_id,))
+    assert kbd.TICK_YIELD_ACTOR_EVENT not in _card_kinds(conn, task_id), (
+        "the defect is a card carrying the KEY but no filing EVENT"
+    )
+
+    # The tree on disk is the tree this process imported: the tick SERVES, and a served tick is
+    # the proof that the episode the card records is over.
+    tf.record_boot()
+    result = _tick(conn)
+    assert result.tick_yielded == "", result.tick_yielded
+
+    row = conn.execute("SELECT status, result FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row["status"] == "done", (
+        "a card carrying our own tree-skew key is ours to retire on whatever board it was filed"
+    )
+    assert "[retired] episode cleared at" in (row["result"] or ""), row["result"]
+    assert kbd.TICK_YIELD_RETIRED_EVENT in _card_kinds(conn, task_id)
+
+
+@pytest.mark.parametrize("status", ["ready", "scheduled", "blocked", "todo"])
+def test_a_cleared_guard_is_retired_from_EVERY_non_terminal_status(board, tree, status):
+    """Card t_028ad743 (class guardrail): ANY live status ends TERMINAL, not just running/done.
+
+    The retirement doors used to close only what the kernel already accepted: a ``scheduled`` or
+    ``blocked`` guard was refused with ``cause='not_running'`` and a ``ready`` one was claimed by the
+    tick before the close. Each status is taken to terminal through ITS OWN kernel door --
+    ``promote_task`` for ``todo``, ``unblock_task`` for ``blocked``/``scheduled``, ``complete_task``
+    for all of them -- never by writing ``status`` directly.
+    """
+    conn = board
+    ops = kbc.connect(board=OPS_BOARD)
+    try:
+        task_id = kb.create_task(
+            ops,
+            title="[guard] cleared episode, parked in a status the close used to refuse",
+            body="seeded by card t_028ad743's class guardrail",
+            assignee=kbd.TICK_YIELD_ACTOR_ASSIGNEE,
+            created_by="kanban-dispatcher",
+            idempotency_key=(
+                f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}tree-content:{status[0] * 64}:1792800954"
+            ),
+        )
+        with kb.write_txn(ops):
+            ops.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    finally:
+        ops.close()
+    assert _actor_status(task_id) == status
+
+    # The tree on disk is the tree this process imported: the tick is serving, so the episode the
+    # card records is over.
+    tf.record_boot()
+    result = _tick(conn)
+    assert result.tick_yielded == "", result.tick_yielded
+
+    assert _actor_status(task_id) == "done", f"a cleared guard in {status!r} must end terminal"
+    assert kbd.TICK_YIELD_RETIRED_EVENT in _ops_card_kinds(task_id)
+
+
+def test_a_guard_the_kernel_keeps_refusing_GIVES_UP_once_instead_of_warning_forever(board, tree):
+    """Card t_028ad743: bounded retries, then give up OUT LOUD and ONCE.
+
+    A guard the kernel will never close -- here a ``todo`` card whose PARENT is unfinished, so the
+    kernel's own ``promote_task`` refuses it -- used to be re-attempted and re-warned on EVERY tick,
+    forever. Now every refusal is a ``..._retire_refused`` event ON the card (so the bound survives
+    a respawned dispatcher), and at ``TICK_YIELD_RETIRE_MAX_ATTEMPTS`` ONE ``..._retire_failed``
+    event names the last refusal, after which the card leaves every sweep: no new events, and no
+    further warnings.
+    """
+    conn = board
+    ops = kbc.connect(board=OPS_BOARD)
+    try:
+        parent_id = kb.create_task(
+            ops,
+            title="[guard] an unfinished parent (keeps the guard out of ready)",
+            body="seeded by card t_028ad743's bound test",
+            created_by="kanban-dispatcher",
+        )
+        with kb.write_txn(ops):
+            ops.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (parent_id,))
+        task_id = kb.create_task(
+            ops,
+            title="[guard] a shape the kernel will not take",
+            body="seeded by card t_028ad743's bound test",
+            assignee=kbd.TICK_YIELD_ACTOR_ASSIGNEE,
+            created_by="kanban-dispatcher",
+            parents=(parent_id,),
+            idempotency_key=(
+                f"{kbd.TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}tree-content:{'c' * 64}:1792800954"
+            ),
+        )
+    finally:
+        ops.close()
+    assert _actor_status(task_id) == "todo", "an unfinished parent parks the guard in todo"
+
+    tf.record_boot()
+    for _ in range(kbd.TICK_YIELD_RETIRE_MAX_ATTEMPTS):
+        assert _tick(conn).tick_yielded == ""
+
+    kinds = _ops_card_kinds(task_id)
+    assert kinds.count(kbd.TICK_YIELD_RETIRE_FAILED_EVENT) == 1, (
+        f"the sweep must give up ONCE, in a durable event; got {kinds}"
+    )
+    assert kinds.count(kbd.TICK_YIELD_RETIRE_REFUSED_EVENT) <= (
+        kbd.TICK_YIELD_RETIRE_MAX_ATTEMPTS - 1
+    ), f"retries are BOUNDED; got {kinds}"
+
+    # ... and it stays quiet: a given-up card is an audit finding, not a per-tick siren.
+    before = kinds
+    assert _tick(conn).tick_yielded == ""
+    assert _ops_card_kinds(task_id) == before, (
+        "a card that gave up must not be re-attempted tick after tick"
+    )
+    assert _actor_status(task_id) == "todo", "a refused card keeps its status"
