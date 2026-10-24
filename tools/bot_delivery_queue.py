@@ -329,21 +329,27 @@ def busy_from_detail(record: dict[str, Any]) -> bool:
     return record.get("status_detail") in (STATUS_DETAIL_TARGET_BUSY, STATUS_DETAIL_LIVE_OWNER)
 
 
-def slot_held(home: str | os.PathLike[str], profile: str) -> bool:
-    """Whether ``profile``'s turn slot is currently held by another turn.
+def slot_held(home: str | os.PathLike[str], profile: str,
+              session: str | None = None) -> bool:
+    """Whether the ``(profile, session)`` turn slot is currently held by another turn.
 
     The lock is the durable relay lock, so this sees a holder that is not a
     queue consumer at all -- a desktop or card session mid-turn holds the same
     slot. Imported lazily because :mod:`tools.bot_relay` imports this module.
     Never raises: an unreadable lock reads as free (a probe failure must not
     expire a delivery, and it cannot authorise a claim either).
+
+    ``session`` is the transcript the delivery is bound for — a queued DM always
+    targets the profile's Bot Chat — so the probe asks about THAT transcript, not
+    the whole seat (``t_47082c1d``).
     """
     try:
         from tools.bot_mode_probe import _hermes_root
-        from tools.bot_relay import TurnBusyError, acquire_delivery_turn_lock
+        from tools.bot_relay import BOT_CHAT_SESSION_KEY, TurnBusyError, acquire_delivery_turn_lock
 
+        key = BOT_CHAT_SESSION_KEY if session is None else session
         try:
-            with acquire_delivery_turn_lock(_hermes_root(Path(home)), profile):
+            with acquire_delivery_turn_lock(_hermes_root(Path(home)), profile, key):
                 return False
         except TurnBusyError:
             return True
@@ -433,19 +439,22 @@ def claim_age_seconds(record: dict[str, Any], *, now_ns: int | None = None) -> f
     return max(0.0, (moments - started) / 1e9)
 
 
-def lease_holder(home: str | os.PathLike[str], profile: str) -> dict[str, Any] | None:
+def lease_holder(home: str | os.PathLike[str], profile: str,
+                 session: str | None = None) -> dict[str, Any] | None:
     """The holder record naming the process that took ``profile``'s turn, or ``None``.
 
     The SAME observation the re-offer path already makes (``bot_relay``
     ``read_turn_lock_holder``): the lockfile's own record, with its pid liveness
     PROBED, never trusted. Imported lazily because :mod:`tools.bot_relay` imports this
     module, and never raising: an unreadable lockfile is "nobody named", not an error.
+    ``session`` defaults to the Bot Chat transcript this queue delivers into (``t_47082c1d``).
     """
     try:
         from tools.bot_mode_probe import _hermes_root
-        from tools.bot_relay import read_turn_lock_holder
+        from tools.bot_relay import BOT_CHAT_SESSION_KEY, read_turn_lock_holder
 
-        return read_turn_lock_holder(_hermes_root(Path(home)), profile)
+        return read_turn_lock_holder(_hermes_root(Path(home)), profile,
+                                     BOT_CHAT_SESSION_KEY if session is None else session)
     except Exception:  # pragma: no cover - defensive
         return None
 

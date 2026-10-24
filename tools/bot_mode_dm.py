@@ -499,13 +499,16 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
     if stdin_file or len(argv) < 3 or cli not in ("hermes", "hermes.exe") or argv[1] != "-p":
         return contextlib.nullcontext()
     from tools.bot_mode_probe import _hermes_root
-    from tools.bot_relay import acquire_delivery_turn_lock
+    from tools.bot_relay import BOT_CHAT_SESSION_KEY, acquire_delivery_turn_lock
 
     # §2.5 step 1 / P10: the DELIVERY path probes the turn lock non-blockingly. The lock is a
     # mutual-exclusion primitive here, never a waiting room: a held lock raises TurnBusyError at
     # once, the delivery is retained by the receiver queue, and ``_delivery_main`` reports the
     # receipt (exit 0) rather than parking the sender or failing the delivery.
-    return acquire_delivery_turn_lock(_hermes_root(Path(_default_home())), argv[2])
+    # The key is the transcript this turn appends to — the profile's Bot Chat — never the profile
+    # itself, so a DM no longer queues behind a Desktop/room turn on the same seat (t_47082c1d).
+    return acquire_delivery_turn_lock(_hermes_root(Path(_default_home())), argv[2],
+                                      BOT_CHAT_SESSION_KEY)
 
 
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:
