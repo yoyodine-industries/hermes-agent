@@ -155,9 +155,14 @@ class HostedRoomService:
                 "This Group Chat is managed by another gateway.")
         return gateway_id, epoch
 
-    def _turn_lock(self, profile: str) -> contextlib.AbstractContextManager[Path]:
+    def _turn_lock(self, profile: str, session: str | None = None) -> contextlib.AbstractContextManager[Path]:
+        """The turn lock for ONE transcript of ``profile`` (``t_47082c1d``).
+
+        ``session`` is a transcript handle (``bot_relay.room_session_key(room_id)``), never the
+        profile: a Group Chat room's turn must not exclude the seat's DM/Desktop turns.
+        """
         from tools.bot_relay import acquire_turn_lock
-        return acquire_turn_lock(self.root, profile)
+        return acquire_turn_lock(self.root, profile, session=session)
 
     def start(self) -> None:
         self.runtime.start()

@@ -333,8 +333,12 @@ def test_turn_wait_seconds_reads_config(monkeypatch):
 # ── wiring: local teammate delivery (tools/bot_mode_dm.py) ──────────────────
 
 
-def test_run_delivery_holds_profile_lock_during_turn(root, tmp_path, monkeypatch):
-    """The local `hermes -p <profile>` turn runs UNDER the profile lock."""
+def test_run_delivery_holds_the_bot_chat_lock_during_turn(root, tmp_path, monkeypatch):
+    """The local `hermes -p <profile>` delivery turn runs UNDER the profile's BOT CHAT lock.
+
+    …and only under that one (``t_47082c1d``): while the turn runs, a second delivery into the same
+    Bot Chat must fail, while a turn on another transcript of the same seat must not.
+    """
     home = root / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -343,10 +347,15 @@ def test_run_delivery_holds_profile_lock_during_turn(root, tmp_path, monkeypatch
     observed = {}
 
     def _fake_run(argv, **kwargs):
-        # While the turn runs, a second acquire on the same profile must fail.
+        # While the turn runs, a second acquire on the same transcript must fail…
         with pytest.raises(TurnBusyError):
-            with acquire_turn_lock(home, "ops", timeout_seconds=0.15):
+            with acquire_turn_lock(home, "ops", timeout_seconds=0.15,
+                                   session=bot_relay.BOT_CHAT_SESSION_KEY):
                 pass  # pragma: no cover
+        # …and a different transcript of the same profile is free.
+        with acquire_turn_lock(home, "ops", timeout_seconds=0.15,
+                               session=bot_relay.room_session_key("other-room")):
+            pass
         observed["argv"] = argv
 
         class _P:
@@ -363,7 +372,8 @@ def test_run_delivery_holds_profile_lock_during_turn(root, tmp_path, monkeypatch
     assert rc == 0
     assert observed["argv"][:3] == ["hermes", "-p", "ops"]
     # …and after the turn, the lock is free again.
-    with acquire_turn_lock(home, "ops", timeout_seconds=0.5):
+    with acquire_turn_lock(home, "ops", timeout_seconds=0.5,
+                           session=bot_relay.BOT_CHAT_SESSION_KEY):
         pass
 
 
@@ -401,13 +411,15 @@ def test_delivery_turn_lock_probe_is_non_blocking(root, tmp_path, monkeypatch):
     monkeypatch.setattr(bot_relay, "turn_wait_seconds", lambda: 30)  # must be irrelevant
     held = threading.Event()
     release = threading.Event()
-    t = threading.Thread(target=_hold_flock, args=(turn_lock_path(home, "ops"), held, release))
+    t = threading.Thread(target=_hold_flock,
+                         args=(turn_lock_path(home, "ops", bot_relay.BOT_CHAT_SESSION_KEY),
+                               held, release))
     t.start()
     assert held.wait(timeout=5)
     try:
         started = time.monotonic()
         with pytest.raises(TurnBusyError):
-            with acquire_delivery_turn_lock(home, "ops"):
+            with acquire_delivery_turn_lock(home, "ops", bot_relay.BOT_CHAT_SESSION_KEY):
                 pass
         assert time.monotonic() - started < 1.0, "the delivery probe must never wait"
     finally:
@@ -433,7 +445,8 @@ def test_delivery_main_reports_target_busy_json(root, tmp_path, monkeypatch, cap
     held = threading.Event()
     release = threading.Event()
     t = threading.Thread(
-        target=_hold_flock, args=(turn_lock_path(home, "ops"), held, release)
+        target=_hold_flock,
+        args=(turn_lock_path(home, "ops", bot_relay.BOT_CHAT_SESSION_KEY), held, release)
     )
     t.start()
     assert held.wait(timeout=5)
@@ -476,7 +489,7 @@ def test_delivery_main_names_the_holder_in_the_retained_receipt(root, tmp_path, 
     release = threading.Event()
     t = threading.Thread(
         target=_hold_flock_with_holder,
-        args=(turn_lock_path(home, "ops"), "ops", held, release),
+        args=(turn_lock_path(home, "ops", bot_relay.BOT_CHAT_SESSION_KEY), "ops", held, release),
         kwargs={"started_at": time.time() - 90},
     )
     t.start()

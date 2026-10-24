@@ -1271,9 +1271,9 @@ def _observed_turn_lock_holder(home: Any, profile: str) -> Optional[dict]:
     """
     try:
         from tools.bot_mode_probe import _hermes_root
-        from tools.bot_relay import read_turn_lock_holder
+        from tools.bot_relay import BOT_CHAT_SESSION_KEY, read_turn_lock_holder
 
-        return read_turn_lock_holder(_hermes_root(Path(home)), profile)
+        return read_turn_lock_holder(_hermes_root(Path(home)), profile, BOT_CHAT_SESSION_KEY)
     except Exception:  # pragma: no cover - defensive
         return None
 
@@ -4102,7 +4102,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Curve 1: non-blocking turn-lock probes inside ``receipt_after_seconds``."""
         from tools import bot_delivery_queue as delivery_queue
         from tools.bot_mode_probe import _hermes_root
-        from tools.bot_relay import TurnBusyError, acquire_turn_lock
+        from tools.bot_relay import BOT_CHAT_SESSION_KEY, TurnBusyError, acquire_turn_lock
 
         budget = delivery_queue.receipt_after_seconds()
         if bot_send["wait_seconds"] > 0:
@@ -4114,7 +4114,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         n = 0
         while True:
             try:
-                with acquire_turn_lock(root, target_profile, timeout_seconds=0):
+                with acquire_turn_lock(root, target_profile, timeout_seconds=0,
+                                       session=BOT_CHAT_SESSION_KEY):
                     # Under the lock we hold, drain the queue HEAD-FIRST
                     # (VERIFICATION D1): a foreign head is RUN, never handed back.
                     # Handing it back is what left the live backlog ownerless -- the

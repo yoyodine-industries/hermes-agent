@@ -300,7 +300,7 @@ async def drain_once(
     while this sweep logged ``actions=0`` (card t_8a7a47d7).
     """
     from tools.bot_mode_probe import _delivery_homes, _hermes_root
-    from tools.bot_relay import TurnBusyError, acquire_turn_lock
+    from tools.bot_relay import BOT_CHAT_SESSION_KEY, TurnBusyError, acquire_turn_lock
 
     root = _hermes_root(home)
     budget = SWEEP_DRAIN_BUDGET_SECONDS if budget_seconds is None else budget_seconds
@@ -323,7 +323,8 @@ async def drain_once(
                     log_delivery_event("drain_deferred", None, target=profile, reason="agent_cap")
                     return drained
                 try:
-                    with acquire_turn_lock(root, profile, timeout_seconds=0):
+                    with acquire_turn_lock(root, profile, timeout_seconds=0,
+                                           session=BOT_CHAT_SESSION_KEY):
                         record = delivery_queue.claim_next(
                             lane_home, target_profile=profile, lease_ok=True
                         )

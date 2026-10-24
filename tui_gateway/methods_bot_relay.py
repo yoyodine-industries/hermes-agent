@@ -121,7 +121,7 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
         return _err(rid, 4090, "profile and message required")
     try:
         from tools.bot_mode_dm import MESSAGE_MAX_CHARS
-        from tools.bot_relay import acquire_turn_lock
+        from tools.bot_relay import BOT_CHAT_SESSION_KEY, acquire_turn_lock
         if len(message) > MESSAGE_MAX_CHARS + 200:  # + attribution headroom
             return _err(rid, 4091, "message too long")
         root = _root()
@@ -228,7 +228,7 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
             # Worst-case handler hold is lock wait (bot_mode.turn_wait_seconds, default 120s) + the 600s
             # turn timeout below — doubled when the retry policy grants one bounded re-run — so clients
             # calling bot_relay.deliver must tolerate ~1320s before assuming failure. See #93091.
-            with acquire_turn_lock(root, resolved):
+            with acquire_turn_lock(root, resolved, session=BOT_CHAT_SESSION_KEY):
                 proc = _run(resolved, tmp, turn_env)
                 if proc.returncode != 0:
                     # Retry policy: transient classes re-run the SAME session once; context_overflow
