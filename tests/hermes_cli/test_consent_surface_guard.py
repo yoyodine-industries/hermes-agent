@@ -133,7 +133,7 @@ def test_unrelated_scope_does_not_cover(home, approvals):
     tid = _card("Rotate the bloom filters", "refs: APR-0011")
     decision, message = g.surface_decision(CONFIG, _ctx(tid, approvals))
     assert decision == "deny"
-    assert "does not cover" in message
+    assert "do not cover this scope" in message
 
 
 def test_pending_row_is_not_consent(home, approvals):
@@ -192,6 +192,10 @@ def test_key_covers_agrees_with_approvals_core():
     ]
     for covering, token in pairs:
         assert g._key_covers(covering, token) == core._key_covers(covering, token), (covering, token)
+
+
+def test_reading_coverage_for_no_ids_is_not_a_query(home, approvals):
+    assert g._read_coverage_rows(Path(approvals), []) == {}
 
 
 # --- the refusal (D4) --------------------------------------------------------
@@ -286,6 +290,7 @@ def test_an_unreadable_approvals_store_refuses_the_surface(home, tmp_path):
     decision, message = g.surface_decision(CONFIG, _ctx(tid, str(missing)))
     assert decision == "deny"
     assert "approvals_store_unreadable" in message
+    assert "not read (store error)" in message
 
 
 def test_an_unreadable_board_store_fails_closed_for_surfaces(home, approvals, tmp_path):

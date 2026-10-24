@@ -315,6 +315,8 @@ def _covers(row: Mapping[str, Any], token: str, surface: str) -> bool:
 
 def _read_coverage_rows(path: Path, ids: list[int]) -> dict[int, dict]:
     """Read-only lookup of the coverage fields for the cited rows."""
+    if not ids:  # an empty IN () is a syntax error, and nothing to cover either way
+        return {}
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
     try:
         con.row_factory = sqlite3.Row
@@ -454,6 +456,7 @@ def refusal_message(hit: Any, verdict: SurfaceVerdict, ctx: Any = None) -> str:
         f"  owning card: {ctx.task_id or '(none)'}",
         f"  required scope token: {token}",
     ]
+    store_error = verdict.cause in ("approvals_store_unreadable", "board_store_unreadable")
     if verdict.refs:
         cited = "; ".join(
             f"{r.ref} -> {r.status or 'unresolved'}"
@@ -461,6 +464,8 @@ def refusal_message(hit: Any, verdict: SurfaceVerdict, ctx: Any = None) -> str:
             for r in verdict.refs
         )
         lines.append(f"  references on the card: {cited}")
+    elif store_error:
+        lines.append("  references on the card: not read (store error)")
     else:
         lines.append("  references on the card: none")
     if verdict.cause == "latched":
@@ -468,9 +473,9 @@ def refusal_message(hit: Any, verdict: SurfaceVerdict, ctx: Any = None) -> str:
                         "(one refusal per surface per run)")
     if verdict.cause == "scope_not_covered" and verdict.approved_refs:
         lines.append(
-            "  the approved reference does not cover this scope: an approval for "
-            f"{verdict.approved_refs[0].ref} covers a different surface or a broader "
-            "scope than this token.")
+            "  the approved reference(s) do not cover this scope: "
+            + ", ".join(r.ref for r in verdict.approved_refs)
+            + " declare a narrower or different scope than the required token.")
     if verdict.cause in ("approvals_store_unreadable", "board_store_unreadable"):
         lines.append(f"  store error ({verdict.cause}): {verdict.detail}")
     lines += [
