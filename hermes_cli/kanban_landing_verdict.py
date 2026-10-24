@@ -51,11 +51,13 @@ REFUSALS (each one is a silent no-op this door exists to prevent):
   * a target that does not exist, or that is ARCHIVED (the reconciler skips archived cards, so
     a verdict written there is invisible);
   * a target that DECLARES no deliverable PR at all -- a verdict on such a card discharges
-    nothing while looking like a discharge. "Declares" is read with the same key precedence
-    the clause uses (``published_pr`` then ``pr``/``pr_url``/``pr_number``, then an exact
-    PR-URL ``completion_contract``) plus the bare-number + repo-key shape the reconciler
-    resolves (``repo`` / ``repository`` / ``destination_repo`` / ``target_repo``), so the door
-    and the reconciler agree on what a declaration IS.
+    nothing while looking like a discharge. "Declares" is read with the clause's own key
+    precedence (``published_pr`` at tier 1; the fleet's ``pr``/``pr_url``/``pr_number``/
+    ``merge_pr``/``pull_request`` at tier 2 -- the reconciler's own key set, ruling
+    ``t_f1dc66dc``; then an exact PR-URL ``completion_contract`` at tier 3) plus the
+    bare-number + repo-key shape the reconciler resolves (``repo`` / ``repository`` /
+    ``destination_repo`` / ``target_repo``), so the door and the reconciler agree on what a
+    declaration IS.
 
 MERGE, NEVER REPLACE. The verdict is merged into the NEWEST run's metadata; every existing key
 on that run survives, and ``tasks.result`` is untouched unless the caller passes one. Writing
@@ -80,8 +82,9 @@ from typing import Optional
 __all__ = [
     "VERDICTS",
     "LandingVerdictRefused",
-    "record_landing_verdict",
+    "declaration",
     "declared_refs",
+    "record_landing_verdict",
     "validate_reason",
 ]
 
@@ -160,7 +163,7 @@ def _run_metadata(conn: sqlite3.Connection, task_id: str) -> list[dict]:
         return []
     out: list[dict] = []
     for row in rows:
-        raw = row["metadata"] if "metadata" in getattr(row, "keys", lambda: [])() else row[0]
+        raw = row["metadata"] if "metadata" in getattr(row, "keys", list)() else row[0]
         parsed = _as_dict(raw)
         if parsed:
             out.append(parsed)
@@ -178,24 +181,71 @@ def _effective(mds: list[dict], key: str) -> Optional[str]:
 
 def _bare_number_with_repo(md: dict) -> bool:
     """A ``pr_number``-style declaration whose repository the reconciler resolves by KEY."""
-    repo = ""
+    return bool(_bare_number_keys(md))
+
+
+def _repo_key(md: dict) -> str:
     for key in _REPO_KEYS:
         value = md.get(key)
         if isinstance(value, str) and value.strip():
-            repo = value.strip()
-            break
+            return key
+    return ""
+
+
+def _bare_number_keys(md: dict) -> list[str]:
+    """The keys that make a bare-number declaration resolvable, empty when it is not.
+
+    Returned so the receipt can say WHICH surface resolved a low-confidence declaration:
+    the number key alone resolves nothing (the repository is unknowable), so the pair is
+    the declaration.
+    """
+    repo_key = _repo_key(md)
+    if not repo_key:
+        return []
+    repo = md.get(repo_key)
+    repo = repo.strip() if isinstance(repo, str) else ""
     if not repo or "/" not in repo or repo.startswith(("http://", "https://")):
-        return False
+        return []
     owner, _, name = repo.partition("/")
     if not owner or not name or "/" in name:
-        return False
+        return []
     for key in _PR_KEYS:
         value = md.get(key)
         if value is None or isinstance(value, bool):
             continue
         if str(value).strip().isdigit():
-            return True
-    return False
+            return sorted([repo_key, key])
+    return []
+
+
+def declaration(
+    *, metadata: Optional[dict], runs_metadata: list[dict], contract: Optional[str] = None
+) -> tuple[int, list[str], list[str]]:
+    """-> ``(tier, refs, keys)``: what this card declares, and WHICH surface resolved it.
+
+    The tier is the clause's own (:func:`kanban_landing_carrier.declared_prs`): 1
+    ``published_pr``, 2 the fleet's looser keys (``pr`` / ``pr_url`` / ``pr_number`` /
+    ``merge_pr`` / ``pull_request``), 3 an exact PR-URL ``completion_contract``. Recording
+    the tier is what makes a verdict written off a looser key visibly lower-confidence
+    than one written off the kernel's own publication key (ruling ``t_f1dc66dc``).
+
+    Two shapes count, because both are live in the fleet and the reconciler resolves both:
+    a normalisable ref (PR URL or ``owner/repo#N``) found by the clause's own
+    ``declared_prs`` precedence, and a bare number carrying its repository in a sibling key
+    (``repo`` / ``repository`` / ``destination_repo`` / ``target_repo``) -- the same tier 2,
+    with the pair of keys that resolved it.
+    """
+    clause = _clause()
+    tier, refs, keys = clause.declared_prs(
+        metadata=metadata, runs_metadata=runs_metadata, contract=contract
+    )
+    if refs:
+        return tier, list(refs), list(keys)
+    for md in ([metadata] if isinstance(metadata, dict) else []) + list(runs_metadata):
+        bare_keys = _bare_number_keys(md)
+        if bare_keys:
+            return 2, ["<bare pr_number + repo key>"], bare_keys
+    return 0, [], []
 
 
 def declared_refs(
@@ -203,21 +253,12 @@ def declared_refs(
 ) -> list[str]:
     """The deliverable PRs this card declares; empty when it declares none.
 
-    Two shapes count, because both are live in the fleet and the reconciler resolves both:
-    a normalisable ref (PR URL or ``owner/repo#N``) found by the clause's own
-    ``declared_prs`` precedence, and a bare number carrying its repository in a sibling key
-    (``repo`` / ``repository`` / ``destination_repo`` / ``target_repo``).
+    The refs only -- :func:`declaration` is the same read that also names the tier and keys.
     """
-    clause = _clause()
-    _tier, refs, _keys = clause.declared_prs(
+    _tier, refs, _keys = declaration(
         metadata=metadata, runs_metadata=runs_metadata, contract=contract
     )
-    if refs:
-        return list(refs)
-    for md in ([metadata] if isinstance(metadata, dict) else []) + list(runs_metadata):
-        if _bare_number_with_repo(md):
-            return ["<bare pr_number + repo key>"]
-    return []
+    return refs
 
 
 def record_landing_verdict(
@@ -263,7 +304,7 @@ def record_landing_verdict(
         )
 
     mds = _run_metadata(conn, target)
-    refs = declared_refs(
+    tier, refs, keys = declaration(
         metadata=None,
         runs_metadata=list(reversed(mds)),  # newest-last, the clause's own order
         contract=getattr(task, "completion_contract", None),
@@ -271,18 +312,22 @@ def record_landing_verdict(
     if not refs:
         raise LandingVerdictRefused(
             f"{target} declares no deliverable PR, so a landing verdict on it discharges "
-            "nothing. Declarations are read from published_pr, pr/pr_url/pr_number (or a bare "
-            "pr_number with a repo/repository/destination_repo/target_repo field) and from a "
-            "PR-URL completion_contract. Nothing was written -- name the card whose own close "
+            "nothing. Declarations are read from the SAME surface the landing reconciler "
+            "reads: metadata published_pr (tier 1), then the fleet's pr / pr_url / pr_number "
+            "/ merge_pr / pull_request (tier 2), either as a PR URL or owner/repo#N (or a bare "
+            "number with a repo/repository/destination_repo/target_repo field), then a PR-URL "
+            "completion_contract. Nothing was written -- name the card whose own close "
             "declared the PR."
         )
 
     previous = _effective(mds, verdict)
     if previous == text and result is None:
-        _record_noop(conn, caller, caller_run_id, target, verdict, text, board=board)
+        _record_noop(conn, caller, caller_run_id, target, verdict, text, board=board,
+                     declared={"tier": tier, "keys": keys})
         return {
             "target": target, "verdict": verdict, "reason": text, "changed": False,
-            "prs": refs, "caller": caller, "note": "the effective verdict already equals this one",
+            "prs": refs, "tier": tier, "keys": keys, "caller": caller,
+            "note": "the effective verdict already equals this one",
         }
 
     run_id = _newest_run_id(conn, target)
@@ -311,19 +356,21 @@ def record_landing_verdict(
                 changed = False
         if result is not None:
             conn.execute("UPDATE tasks SET result = ? WHERE id = ?", (result, target))
+        declared = {"tier": tier, "keys": keys}
         _append_audit(
             conn, target, run_id, verdict, text, refs,
             caller=caller, board=board, then="recorded" if changed else "noop",
+            declared=declared,
         )
         if caller:
             _append_audit(
                 conn, caller, caller_run_id, verdict, text, refs,
                 caller=None, board=board, then="recorded" if changed else "noop",
-                target=target,
+                target=target, declared=declared,
             )
     return {
         "target": target, "verdict": verdict, "reason": text, "changed": changed,
-        "run_id": run_id, "prs": refs, "caller": caller,
+        "run_id": run_id, "prs": refs, "tier": tier, "keys": keys, "caller": caller,
     }
 
 
@@ -340,9 +387,14 @@ def _newest_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
 def _append_audit(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int], verdict: str, reason: str,
     refs: list[str], *, caller: Optional[str], board: Optional[str], then: str,
-    target: Optional[str] = None,
+    target: Optional[str] = None, declared: Optional[dict] = None,
 ) -> None:
-    """One event row per end of the act -- the target's history and the caller's."""
+    """One event row per end of the act -- the target's history and the caller's.
+
+    ``declared`` records WHICH declaration surface resolved (tier + keys), so a verdict
+    written off a looser fleet key is visibly lower-confidence in the audit than one taken
+    off ``published_pr`` (ruling ``t_f1dc66dc``).
+    """
     from hermes_cli import kanban_db as kb
 
     payload = {
@@ -352,6 +404,8 @@ def _append_audit(
         "actor": "kanban_record_landing_verdict",
         "outcome": then,
     }
+    if declared:
+        payload["declared_by"] = dict(declared)
     if board:
         payload["board"] = board
     if caller:
@@ -365,8 +419,14 @@ def _append_audit(
 def _record_noop(
     conn: sqlite3.Connection, caller: Optional[str], caller_run_id: Optional[int],
     target: str, verdict: str, reason: str, *, board: Optional[str],
+    declared: Optional[dict] = None,
 ) -> None:
-    """A repeat of an already-effective verdict: no target write, one recorded no-op."""
+    """A repeat of an already-effective verdict: no target write, one recorded no-op.
+
+    ``declared`` carries the same tier/keys the recorded path writes, so the ruling's
+    "the receipt/audit row records WHICH tier/keys resolved" holds on EVERY write, not
+    only the first one (review round 1, R2 on card ``t_f1dc66dc``).
+    """
     from hermes_cli import kanban_db as kb
 
     if not caller:
@@ -376,6 +436,7 @@ def _record_noop(
             conn, caller, "landing_verdict_noop",
             {"verdict": verdict, "reason": reason, "target_task_id": target,
              "actor": "kanban_record_landing_verdict", "outcome": "noop",
+             **({"declared_by": dict(declared)} if declared else {}),
              **({"board": board} if board else {})},
             run_id=caller_run_id,
         )

@@ -14,22 +14,27 @@ same landing leg the approval close owes. A close that declares NOTHING is still
 untouched BY CONSTRUCTION -- that property, not the transition, is what keeps
 design, research and local-only cards outside this clause.
 
-OBLIGATION COMES FROM AN EXPLICIT PUBLICATION DECLARATION, NEVER FROM A MENTION
-(ruling of 2026-10-18, card `t_9082c751`). The trigger is ``published_pr`` -- the
-kernel's own PR-acceptance key -- or an exact PR-URL ``completion_contract``. The
-fleet's looser keys (``pr`` / ``pr_url`` / ``pr_number``) are MENTIONS: they name
-the PR a card published as readily as one it investigated, cited, or was told NOT
-to ride, and only the writer knows which. Judging them produced refusals whose
-contradiction the record never made: ``t_ee64588b`` closed ``local-only`` with
-``pr`` pointing at the PR it had opened, was refused ``landing_carrier_missing``
-with "your contract says nothing published", and then found the clause's own
-advice -- re-scope to the PR URL -- refused by the acceptance door. A mention is
-recorded on the verdict's ``mentions`` fact and never creates a landing obligation
-here; the wider key set keeps its surveyor, the landing reconciler
-(``scripts/landing_reconcile_nodes.py`` reads ``published_pr`` / ``pr`` /
-``pr_url`` / ``pr_number`` / ``merge_pr`` / ``pull_request``), which files a
-carrier wherever one is genuinely owed -- so narrowing THIS door does not narrow
-the net.
+OBLIGATION COMES FROM A DECLARATION, IN TWO ORDERED TIERS (ruling of 2026-10-23,
+card `t_f1dc66dc`, which SUPERSEDES the 2026-10-18 ruling on card `t_9082c751`).
+Tier 1 is ``published_pr`` -- the kernel's own PR-acceptance key -- and it still
+wins whenever it resolves. Tier 2 is the fleet's looser key set (``pr`` /
+``pr_url`` / ``pr_number`` / ``merge_pr`` / ``pull_request``): byte-for-byte the
+surface the landing reconciler reads (``scripts/landing_reconcile_nodes.py``,
+``PR_KEYS``), so a carrier can never again be FILED from a declaration this clause
+-- or the verdict door built on it -- cannot DISCHARGE. That hole was measured:
+``t_45655ee5`` was review-closed with ``{"pr": "owner/repo#1944"}`` and contract
+``local-only``, the reconciler filed carrier ``t_f4349dba`` off ``metadata.pr``, and
+the ONE sanctioned way to discharge it refused because the 2026-10-18 rule read
+``pr`` as a mention. Tier 3 is an exact PR-URL ``completion_contract``.
+
+The looser keys are STILL recorded as mentions (:func:`mentioned_prs`, on the
+verdict's ``mentions`` fact): a card that CITES a PR without publishing it is worth
+keeping in the audit trail. Being a mention is simply no longer why a verdict is
+refused. The 2026-10-18 ruling narrowed this door because judging those keys had
+refused ``t_ee64588b`` (closed ``local-only`` with ``pr`` pointing at the PR it had
+opened); the 2026-10-23 ruling fixes that at the surface instead -- the door now
+reads exactly what the reconciler reads (ONE DECLARATION SURFACE), rather than
+buying the door's comfort by blinding the reconciler to real declarations.
 
 NO CONTRACT WORD IS A DEAD END (rewritten 2026-10-18, same card). This clause used
 to justify its shape with "a PR-bearing contract is unsatisfiable fleet-wide,
@@ -87,19 +92,21 @@ says "do NOT ride yaan-platform#1118"), so a prose-triggered guard would refuse
 legitimate closes. Precedence:
 
   1. ``metadata.published_pr`` on any run of the card (the kernel's own
-     PR-acceptance key) -- the ONLY metadata key that creates an obligation;
-  2. an exact PR-URL ``completion_contract``.
+     PR-acceptance key) -- tier 1, and it WINS over any tier-2 declaration;
+  2. ``metadata.pr`` / ``pr_url`` / ``pr_number`` / ``merge_pr`` / ``pull_request``
+     -- tier 2, the fleet's looser keys, the reconciler's ``PR_KEYS`` minus
+     ``published_pr`` (see :data:`TIER_KEYS`);
+  3. an exact PR-URL ``completion_contract`` -- tier 3.
 
-``metadata.pr`` / ``pr_url`` / ``pr_number`` are MENTIONS, not declarations: they
-are recorded on the verdict's ``mentions`` fact (with the card, the run and the
-raw value) so the reconciler and the audit trail keep them, and they never trigger
-a refusal (see OBLIGATION COMES FROM AN EXPLICIT PUBLICATION DECLARATION above).
-
-A declaration that normalises to no ``owner/repo#N`` (a bare ``pr_number`` with no
+A tier whose values normalise to no ``owner/repo#N`` (a bare ``pr_number`` with no
 repository, prose) is not a declaration: no repository can be derived from it
-without guesswork, and guessing is how a fence refuses an honest card. A card that
-declares nothing is untouched BY CONSTRUCTION -- a design, research or local-only
-card is outside this clause.
+without guesswork, and guessing is how a fence refuses an honest card -- so that
+tier falls THROUGH to the next rather than refusing, and the declaration is
+unusable, not damning. The tier-2 keys are ALSO recorded on the verdict's
+``mentions`` fact (key, raw value, normalised ref) -- that record is REPORTING, not
+judging, and it is no longer the reason a verdict is refused (see the ONE
+DECLARATION SURFACE paragraph above). A card that declares nothing is untouched BY
+CONSTRUCTION -- a design, research or local-only card is outside this clause.
 
 THE RULE. For each declared PR the close must satisfy ONE of:
 
@@ -142,14 +149,14 @@ from typing import Any, Callable, Iterable, Optional
 
 __all__ = [
     "CAUSE_CARRIER_MISSING",
-    "CAUSE_STATE_UNKNOWN",
-    "CAUSE_NOT_OWED_KEYS",
     "CAUSE_DEFERRED_KEYS",
-    "evaluate",
+    "CAUSE_NOT_OWED_KEYS",
+    "CAUSE_STATE_UNKNOWN",
     "declared_prs",
-    "normalize_ref",
+    "evaluate",
     "is_named_exemption",
     "landing_lane_hint",
+    "normalize_ref",
 ]
 
 CAUSE_CARRIER_MISSING = "landing_carrier_missing"
@@ -173,13 +180,26 @@ _PR_SHORT = re.compile(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)\b")
 _CARD_ID = re.compile(r"\bt_[0-9a-f]{6,}\b")
 _ANY_URL = re.compile(r"https?://\S+")
 
-# The ONLY metadata keys that create a landing obligation (ruling 2026-10-18, card
-# ``t_9082c751``): the kernel's own PR-acceptance key, written when a card
-# publishes its deliverable.
-TIER_KEYS = (("published_pr",),)
+# The metadata keys that create a landing obligation, in PRECEDENCE ORDER (ruling
+# 2026-10-23, card ``t_f1dc66dc`` -- ONE DECLARATION SURFACE). Tier 1 is the kernel's own
+# PR-acceptance key, written when a card publishes its deliverable, and it still wins.
+# Tier 2 is the fleet's looser key set -- the SAME set the landing reconciler reads
+# (``landing_reconcile_nodes.PR_KEYS``) -- so a carrier can no longer be CREATED from a
+# declaration this clause (and the verdict door built on it) can never DISCHARGE. Measured
+# on ``t_45655ee5``, whose only declaration is ``metadata.pr``.
+#
+# This supersedes the 2026-10-18 ruling (card ``t_9082c751``) that read these keys as
+# mentions only. Narrowing the reconciler instead was rejected: the fleet's closes really do
+# declare in ``pr``, so narrowing would stop carriers being filed for genuinely unlanded PRs
+# -- losing coverage to fix a door.
+TIER_KEYS = (
+    ("published_pr",),
+    ("pr", "pr_url", "pr_number", "merge_pr", "pull_request"),
+)
 
-# Recorded on the verdict's facts, never judged: the fleet's looser keys, which
-# name the PR a card published as readily as one it only cited or investigated.
+# Reported on the verdict's facts by :func:`mentioned_prs` as the audit trail of a value a
+# card cited. Since ``t_f1dc66dc`` these keys are ALSO tier-2 declarations (judged above), so
+# a mention is no longer why a verdict is refused -- the record is reporting, never judging.
 MENTION_KEYS = ("pr", "pr_url", "pr_number")
 
 
@@ -196,7 +216,7 @@ def normalize_ref(value: Any) -> Optional[str]:
     number is NOT normalisable -- the repository it belongs to is not derivable
     from a declaration, and inventing one is how a fence refuses an honest card.
     """
-    if isinstance(value, bool) or isinstance(value, int):
+    if isinstance(value, (bool, int)):
         return None
     if not isinstance(value, str):
         return None
@@ -252,12 +272,15 @@ def declared_prs(
 ) -> tuple[int, list[str], list[str]]:
     """-> ``(tier, refs, keys_seen)`` for the first declaration tier that resolves.
 
-    Tier 1 ``published_pr`` (the kernel's publication key) beats tier 2, an exact
-    PR-URL ``completion_contract``. A tier whose values carry no repository (a bare
-    number) falls THROUGH to the next tier rather than refusing: the declaration is
-    unusable, not damning. ``pr`` / ``pr_url`` / ``pr_number`` are MENTIONS
-    (:data:`MENTION_KEYS`) and are never read as a declaration -- see
-    :func:`mentioned_prs`.
+    Tier 1 ``published_pr`` (the kernel's publication key) beats tier 2, the fleet's
+    looser keys ``pr`` / ``pr_url`` / ``pr_number`` / ``merge_pr`` / ``pull_request``
+    (:data:`TIER_KEYS`, the reconciler's own key set), which in turn beats tier 3, an
+    exact PR-URL ``completion_contract``. A tier whose values carry no repository (a
+    bare number) falls THROUGH to the next tier rather than refusing: the declaration
+    is unusable, not damning. Widening tier 2 with the reconciler's keys is the
+    one-declaration-surface ruling (card ``t_f1dc66dc``): the verdict door can record
+    an escape for every declaration a carrier can be filed from. The looser keys are
+    still reported as MENTIONS by :func:`mentioned_prs` -- recording, not judging.
     """
     mds = _all_metadata(metadata, runs_metadata)
     for tier, keys in enumerate(TIER_KEYS, start=1):
@@ -285,13 +308,16 @@ def mentioned_prs(
     metadata: Optional[dict],
     runs_metadata: Iterable[dict] = (),
 ) -> list[dict]:
-    """PRs a card NAME without declaring them its own publication.
+    """PRs a card NAMES, kept as a record -- reporting, never judging.
 
     ``pr`` / ``pr_url`` / ``pr_number`` are the fleet's looser keys: they carry the
-    PR a card opened, and equally the PR it investigated, cited or was told not to
-    ride. They are recorded here (key, raw value, normalised ref) so the verdict's
-    facts and the landing reconciler keep them, and they are deliberately NOT read
-    as a landing obligation (ruling 2026-10-18, card ``t_9082c751``).
+    PR a card opened, and equally the PR it investigated, cited, or was told not to
+    ride. Since the ONE DECLARATION SURFACE ruling (2026-10-23, card ``t_f1dc66dc``,
+    which supersedes 2026-10-18 ``t_9082c751``) those same keys are ALSO tier-2
+    DECLARATIONS, judged by :func:`declared_prs`. This function keeps the mention
+    record (key, raw value, normalised ref) on the verdict's facts because a card
+    that CITES a PR is worth keeping in the trail; it is no longer the reason a
+    verdict is refused.
     """
     out: dict[tuple[str, str], dict] = {}
     for md in _all_metadata(metadata, runs_metadata):
