@@ -293,6 +293,14 @@ def test_an_unreadable_approvals_store_refuses_the_surface(home, tmp_path):
     assert "not read (store error)" in message
 
 
+def test_a_non_surface_write_is_never_refused(home, approvals):
+    """D5's other half: ordinary work is not this clause's business."""
+    tid = _card("Rotate the bloom filters", "no reference")
+    ctx = _ctx(tid, approvals)
+    assert g.surface_decision(object(), ctx) == ("allow", "")
+    assert g.surface_decision(Hit("", "", None), ctx) == ("allow", "")
+
+
 def test_an_unreadable_board_store_fails_closed_for_surfaces(home, approvals, tmp_path):
     junk = tmp_path / "not-a-db.db"
     junk.write_text("not sqlite at all")

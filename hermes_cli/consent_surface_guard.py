@@ -415,6 +415,12 @@ def _decide(hit: Any, ctx: GuardContext) -> tuple[str, str]:
     if not consent_gate_active(ctx):
         return "allow", ""
     surface, token, _ = _hit(hit)
+    if not surface:
+        # Not a classified surface, so not our clause: ordinary work is never refused
+        # here (D5). The doors only build a hit from the classifier, which always
+        # names a surface.
+        logger.debug("consent-surface guard: called without a surface; allowing")
+        return "allow", ""
     latched = _LATCH.get((_session_key(ctx), surface))
     if latched is not None:
         # One refusal per surface per run: the worker cannot re-route the same write
