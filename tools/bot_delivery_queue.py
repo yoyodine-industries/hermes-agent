@@ -160,6 +160,19 @@ DETAIL_HELD_LIVE = (
 STATUS_DETAIL_TARGET_BUSY = "target_busy: turn slot held by another turn; delivery queued"
 STATUS_DETAIL_LIVE_OWNER = "live_owner_present"
 STATUS_DETAIL_LEASE_CONTENDED = "lease_contended"
+#: A claim recovered as a LOST LEASE: the turn that took the claim
+#: never ended it, ``2 x`` the queue TTL has passed and no live process holds the seat,
+#: so the freeze the claim bought is void and the record goes back to ``queued``.
+STATUS_DETAIL_LEASE_LOST = (
+    "lease_lost: the claim outlived 2x the queue TTL with no live holder; re-offered"
+)
+#: The same lost lease, dead-lettered: re-offering it is not owed. One wording for
+#: both reasons (attempts exhausted, or the record's own delivery deadline already
+#: passed), so the detail never claims a cause that did not apply -- the log event
+#: carries which one it was.
+STATUS_DETAIL_LEASE_DEAD_LETTER = (
+    "lease_lost: the claim outlived 2x the queue TTL with no live holder; not delivered"
+)
 STATUS_DETAIL_QUEUE_FULL = "queue_full"
 #: A queued delivery whose target slot is FREE -- a different cause from
 #: TARGET_BUSY, and the one a receipt must not misreport (VERIFICATION D2).
@@ -180,6 +193,10 @@ LIMIT_PER_PROFILE = "per_profile"
 LIMIT_PER_SENDER = "per_sender"
 
 REASON_QUEUED_EXPIRED = "queued_expired"
+#: A claim whose lease ran out: the turn it was taken for never
+#: settled it and no live process holds the seat. Terminal form only -- a recovered
+#: claim that is re-offered carries no reason, it is QUEUED again.
+REASON_LEASE_LOST = "lease_lost"
 
 #: An over-age record whose expiry found it NEVER OFFERED to a turn (``attempts == 0``).
 #: t_43f11055 (b): such a record was dead-lettered by the expiry gate while the DRAIN
@@ -225,7 +242,7 @@ def _cfg(key: str, *, loader: str = "load_config_readonly") -> Any:
     try:  # pragma: no cover - exercised through the accessors
         import hermes_cli.config as _config
 
-        getter = getattr(_config, loader, None) or getattr(_config, "load_config")
+        getter = getattr(_config, loader, None) or _config.load_config
         cfg = getter() or {}
         value = (cfg.get("bot_mode") or {}).get(key)
     except Exception:
@@ -382,6 +399,92 @@ def agent_cap_has_room(probe: Any = None) -> bool:
         return bool(fn())
     except Exception:  # a probe failure is not an expiry verdict
         return True
+
+
+# --------------------------------------------------------------------------
+# the claim LEASE
+# --------------------------------------------------------------------------
+#: A claim is a lease with an EXPIRY: ``2 x`` the queue TTL. Past it, with no live
+#: holder naming the seat, the claim is unauthorised -- the freeze it bought is void
+#: (``queued_seconds``), the census counts it as ``claimed_stuck``, and the sweep
+#: recovers it (re-offer, then dead-letter). Not a config key: the ruling derives it
+#: from the TTL so the two can never drift apart.
+LEASE_TTL_MULTIPLIER = 2.0
+
+
+def lease_expiry_seconds() -> float:
+    """A claim's own expiry: ``LEASE_TTL_MULTIPLIER x`` the queue TTL (3600s at 1800s)."""
+    return LEASE_TTL_MULTIPLIER * queue_ttl_seconds()
+
+
+def claim_age_seconds(record: dict[str, Any], *, now_ns: int | None = None) -> float | None:
+    """Seconds since the claim was taken; ``None`` when the record carries no claim.
+
+    ``claimed_at`` is the written fact; an older/spooled record without it falls back
+    to the open attempt's ``started_at``, which is the same moment by construction.
+    """
+    moments = time.time_ns() if now_ns is None else int(now_ns)
+    claimed = record.get("claimed_at")
+    if not claimed:
+        entry = _open_attempt(record) or {}
+        claimed = entry.get("started_at")
+    try:
+        started = int(claimed or 0)
+    except (TypeError, ValueError):
+        return None
+    if started <= 0:
+        return None
+    return max(0.0, (moments - started) / 1e9)
+
+
+def lease_holder(home: str | os.PathLike[str], profile: str) -> dict[str, Any] | None:
+    """The holder record naming the process that took ``profile``'s turn, or ``None``.
+
+    The SAME observation the re-offer path already makes (``bot_relay``
+    ``read_turn_lock_holder``): the lockfile's own record, with its pid liveness
+    PROBED, never trusted. Imported lazily because :mod:`tools.bot_relay` imports this
+    module, and never raising: an unreadable lockfile is "nobody named", not an error.
+    """
+    try:
+        from tools.bot_mode_probe import _hermes_root
+        from tools.bot_relay import read_turn_lock_holder
+
+        return read_turn_lock_holder(_hermes_root(Path(home)), profile)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def lease_holder_alive(home: str | os.PathLike[str], profile: str) -> bool:
+    """Whether a LIVE process is named as the seat's turn holder.
+
+    Only an explicit ``alive: true`` counts. An absent, torn or pid-less record names
+    nobody, and an unprobeable pid is not evidence of a turn: none of them defends a
+    claim, so the lease rule treats all of them as "no live holder". That direction is
+    deliberate -- a stuck record is the defect this exists to end, while a genuinely
+    running turn publishes its own holder record.
+    """
+    holder = lease_holder(home, profile)
+    return bool(holder) and holder.get("alive") is True
+
+
+def lease_lost(record: dict[str, Any], *, home: str | os.PathLike[str],
+               now_ns: int | None = None) -> bool:
+    """Whether an open attempt is an UNAUTHORISED claim (a lost lease).
+
+    All three must hold: the record is not terminal, it carries an attempt with no
+    ``ended_at`` (a claim nobody closed), that claim is older than
+    :func:`lease_expiry_seconds`, and no live process holds the target's turn. A live
+    holder keeps the record exactly as it is, however old (ruling (c)); an attempt
+    under the expiry is never touched either.
+    """
+    if record.get("status") in TERMINAL_STATUSES:
+        return False
+    if _open_attempt(record) is None:
+        return False
+    age = claim_age_seconds(record, now_ns=now_ns)
+    if age is None or age <= lease_expiry_seconds():
+        return False
+    return not lease_holder_alive(home, record.get("target_profile") or "")
 
 
 # --------------------------------------------------------------------------
@@ -633,7 +736,16 @@ def _pending(root: Path, *, target_profile: str | None = None,
 # timestamps / derived fields
 # --------------------------------------------------------------------------
 def queued_seconds(record: dict[str, Any], *, now_ns: int | None = None) -> float:
-    """Seconds the record spent *waiting* (sum of its queued intervals)."""
+    """Seconds the record spent *waiting* (sum of its queued intervals).
+
+    An open attempt freezes the reading (a turn is running right now: no further
+    queued time accrues). That freeze is a CLAIM on the record's time, and a claim
+    cannot outlive its LEASE: past :func:`lease_expiry_seconds`
+    the frozen reading is void and the waiting accrues again. The holder is not
+    consulted here -- a claim that old is no evidence of a turn whichever process
+    names it -- while the destructive recovery (and the ``claimed_stuck`` counter)
+    still require that no live holder stands behind it (:func:`lease_lost`).
+    """
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     cursor = int(record.get("created_at") or 0)
     total = 0
@@ -645,7 +757,9 @@ def queued_seconds(record: dict[str, Any], *, now_ns: int | None = None) -> floa
             total += started - cursor
         ended = entry.get("ended_at")
         if ended is None:
-            # a turn is running right now: no further queued time accrues
+            if (claim_age_seconds(record, now_ns=now_ns) or 0.0) > lease_expiry_seconds():
+                total += max(0, now_ns - int(started or cursor))
+            # else: a turn is running within its lease -- no further queued time accrues
             return total / 1e9
         cursor = max(cursor, ended)
     if record.get("status") not in TERMINAL_STATUSES:
@@ -1086,7 +1200,7 @@ def cleanup_bot_delivery_queue(max_age_hours: float | None = None) -> int:
     A peer delivery is admitted into its TARGET lane's own home
     (``profiles/<lane>/runtime/bot_delivery``), so sweeping only the default home
     left a named lane's backlog with no expiry and no orphan-claim recovery at all
-    (card t_8a7a47d7).
+    (the drain-gate repair).
     """
     del max_age_hours
     try:
@@ -1102,6 +1216,66 @@ def cleanup_bot_delivery_queue(max_age_hours: float | None = None) -> int:
         return 0
 
 
+def _requeue_lost_lease(root: Path, record: dict[str, Any], *, now_ns: int) -> dict[str, Any]:
+    """Return a leaked claim to ``queue/`` in place (the caller holds the spool lock).
+
+    The turn was never paid for, so -- exactly like :func:`requeue_unstarted` -- the
+    claim's ``attempts += 1`` and its still-open ``attempts_log`` entry are rolled
+    back, and ``reoffer_count`` (not ``attempts``) records that this record was
+    offered and abandoned again.
+    """
+    updated = dict(record)
+    delivery_id = updated["delivery_id"]
+    updated["attempts"] = max(0, int(updated.get("attempts", 0)) - 1)
+    log = list(updated.get("attempts_log") or [])
+    if log and log[-1].get("ended_at") is None:
+        log.pop()
+    updated["attempts_log"] = log
+    updated["status"] = STATUS_QUEUED
+    updated["reoffer_count"] = int(updated.get("reoffer_count", 0)) + 1
+    updated["claimed_at"] = None
+    updated["status_detail"] = STATUS_DETAIL_LEASE_LOST
+    updated["updated_at"] = now_ns
+    updated["sequence"] = int(updated.get("sequence", 0))
+    queued_path = root / QUEUE_DIR / f"{delivery_id}.json"
+    os.replace(root / CLAIMED_DIR / f"{delivery_id}.json", queued_path)
+    updated["queue_position"] = _queue_position(root, updated) or 1
+    _write(queued_path, updated)
+    _fsync_dir(root / CLAIMED_DIR)
+    return dict(updated)
+
+
+def _settle_lost_lease(root: Path, record: dict[str, Any], *, now_ns: int) -> dict[str, Any]:
+    """Dead-letter a leaked claim as ``failed`` / ``lease_lost`` (caller holds the lock).
+
+    The open attempt is CLOSED with the same reason: an attempt left open is the thing
+    the census cannot see, so this recovery must not leave the very shape it repairs.
+    """
+    updated = dict(record)
+    delivery_id = updated["delivery_id"]
+    updated["status"] = STATUS_FAILED
+    updated["reason"] = REASON_LEASE_LOST
+    updated["status_detail"] = STATUS_DETAIL_LEASE_DEAD_LETTER
+    updated["updated_at"] = now_ns
+    updated["queue_position"] = None
+    entry = _open_attempt(updated)
+    if entry is not None:
+        entry["ended_at"] = now_ns
+        entry["status"] = STATUS_FAILED
+        entry["reason"] = REASON_LEASE_LOST
+    settled_path = root / SETTLED_DIR / f"{delivery_id}.json"
+    os.replace(root / CLAIMED_DIR / f"{delivery_id}.json", settled_path)
+    _write(settled_path, updated)
+    _fsync_dir(root / CLAIMED_DIR)
+    return dict(updated)
+
+
+#: Sentinel for ``on_lease_lost``: by default the sweep FILES the sender's notice. A
+#: delivery dead-lettered without a word to its sender is the silent failure this
+#: repair exists to kill, so silence is opt-in (tests), never the default.
+_NOTICE_BY_DEFAULT = object()
+
+
 def sweep_delivery_queue(
     home: str | os.PathLike[str],
     *,
@@ -1110,8 +1284,9 @@ def sweep_delivery_queue(
     agent_cap_has_room_fn: Any = None,
     expire: bool = True,
     on_expired: Any = None,
+    on_lease_lost: Any = _NOTICE_BY_DEFAULT,
 ) -> int:
-    """Recover orphaned claims, then (``expire=True``) expire over-age records.
+    """Recover orphaned claims and leaked leases, then (``expire=True``) expire over-age records.
 
     Runs hourly and on every 30s drainer tick (VERIFICATION D1 trigger 4).
     Returns the number of records it acted on.
@@ -1135,16 +1310,29 @@ def sweep_delivery_queue(
     turn (``attempts == 0``) expires as ``never_offered``, which is the fact the strand
     census counts and which files NO notice (t_43f11055 b/c).
 
-    ``expire=False`` runs the orphaned-claim recovery ONLY. The drainer takes that
-    form before its drain and the full form after it (card t_8a7a47d7): a record
-    that was never offered to a turn (``attempts == 0``) must get its first -- and
-    on that tick, only -- chance to run before TTL can dead-letter it, or the
-    backlog is reaped the same tick the drainer finally reaches the lane.
+    ``expire=False`` runs the recovery passes ONLY (orphaned claims + lost leases).
+    The drainer takes that form before its drain and the full form after it (card
+    the drain gate): a record that was never offered to a turn (``attempts == 0``) must
+    get its first -- and on that tick, only -- chance to run before TTL can
+    dead-letter it, or the backlog is reaped the same tick the drainer finally
+    reaches the lane.
 
-    ``on_expired`` is called once per expired record AFTER this home's lock is
-    released, so a callback may write into another home (the sender's failure
-    notice) without deadlocking this one. A callback that raises is logged and
-    never aborts the sweep.
+    A CLAIM IS A LEASE WITH AN EXPIRY: a record in ``claimed/``
+    whose attempt never ended, whose claim is older than
+    :func:`lease_expiry_seconds`, and whose seat has no LIVE holder is a lost lease.
+    It is re-offered (``reoffer_count`` bumped) while ``reoffer_count`` is under
+    ``max_turn_attempts`` AND the record is still inside its own delivery TTL --
+    a lost lease must not resurrect a delivery the deadline already condemned, and
+    pass 2 would reap it in the same tick with a notice saying it was never read.
+    Otherwise it is dead-lettered ``failed`` / ``lease_lost`` and its sender told.
+    A record with a live holder, or a young claim, is untouched: a turn that is
+    genuinely running keeps its record exactly as it is.
+
+    ``on_expired`` / ``on_lease_lost`` are called once per record AFTER this home's
+    lock is released, so a callback may write into another home (the sender's
+    failure notice) without deadlocking this one. A callback that raises is logged
+    and never aborts the sweep. ``on_lease_lost`` defaults to
+    :func:`notice_lease_lost_to_sender`; pass ``None`` to suppress it.
     """
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     ttl = queue_ttl_seconds()
@@ -1152,6 +1340,7 @@ def sweep_delivery_queue(
     cap_has_room = agent_cap_has_room(agent_cap_has_room_fn)
     actions = 0
     expired: list[dict[str, Any]] = []
+    lost: list[dict[str, Any]] = []
     with _locked(home) as root:
         # 1. a claim renamed the file but crashed before rewriting it
         for record in _list(root, CLAIMED_DIR):
@@ -1163,6 +1352,31 @@ def sweep_delivery_queue(
                 root / QUEUE_DIR / f"{delivery_id}.json",
             )
             _write(root / QUEUE_DIR / f"{delivery_id}.json", record)
+            actions += 1
+
+        # 1b. a claim whose LEASE ran out: no lived attempt, no live holder.
+        # Read AFTER pass 1, so a torn claim recovered above is never judged twice.
+        for record in _list(root, CLAIMED_DIR):
+            if not lease_lost(record, home=home, now_ns=now_ns):
+                continue
+            delivery_id = record["delivery_id"]
+            reoffer_count = int(record.get("reoffer_count", 0))
+            # A lost lease does not RESURRECT a record past its own delivery deadline:
+            # re-offering one would either deliver days-old work or be reaped by pass 2
+            # below with a notice that says it was never read. Both are wrong, so the
+            # deadline decides -- and past it the terminal reason is the truthful one.
+            over_deadline = ttl > 0 and queued_seconds(record, now_ns=now_ns) > ttl
+            if not over_deadline and reoffer_count < max_turn_attempts():
+                updated = _requeue_lost_lease(root, record, now_ns=now_ns)
+                _log("lease_lost", updated, action="requeued",
+                     reoffer_count=updated.get("reoffer_count"),
+                     claim_age_seconds=round(claim_age_seconds(record, now_ns=now_ns) or 0, 1))
+            else:
+                updated = _settle_lost_lease(root, record, now_ns=now_ns)
+                _log("lease_lost", updated, action="failed", reason=REASON_LEASE_LOST,
+                     reoffer_count=reoffer_count, over_deadline=over_deadline,
+                     claim_age_seconds=round(claim_age_seconds(record, now_ns=now_ns) or 0, 1))
+                lost.append(updated)
             actions += 1
 
         # 2. expire records that waited past the TTL
@@ -1200,7 +1414,16 @@ def sweep_delivery_queue(
                 on_expired(record)
             except Exception:  # a notice must never abort the sweep
                 logger.exception("bot_delivery expired-notice failed: %s", record.get("delivery_id"))
-    _log("swept", None, actions=actions, ttl_seconds=ttl, expired=len(expired))
+    notifier = notice_lease_lost_to_sender if on_lease_lost is _NOTICE_BY_DEFAULT else on_lease_lost
+    if notifier is not None:
+        for record in lost:
+            try:
+                notifier(record)
+            except Exception:  # a notice must never abort the sweep
+                logger.exception("bot_delivery lease-lost notice failed: %s",
+                                 record.get("delivery_id"))
+    _log("swept", None, actions=actions, ttl_seconds=ttl, expired=len(expired),
+         lease_lost=len(lost))
     return actions
 
 
@@ -1224,8 +1447,12 @@ def queued_target_profiles(home: str | os.PathLike[str]) -> list[str]:
 # --------------------------------------------------------------------------
 #: The census' own field set. ``stranded`` is the alarm's number; the rest is
 #: evidence a reader needs to act without any other tooling.
-_CENSUS_COUNT_KEYS = ("queued", "pending_over_ttl", "expired", "ambiguous", "failed",
-                      "delivered", "stranded")
+#: ``claimed_stuck`` is a first-class counter since the lost-lease repair: a claim whose
+#: lease ran out is a strand that ``pending_over_ttl`` structurally could not see
+#: (an open attempt froze its reading), so it is counted on its own -- never merely
+#: inferred from the over-TTL term.
+_CENSUS_COUNT_KEYS = ("queued", "pending_over_ttl", "claimed_stuck", "expired", "ambiguous",
+                      "failed", "delivered", "stranded")
 _CENSUS_AGE_KEYS = ("oldest_age_seconds", "oldest_delivery_id", "oldest_path")
 
 
@@ -1264,6 +1491,12 @@ def seat_strand_census(home: str | os.PathLike[str], *, now_ns: int | None = Non
 
         stranded = queued records that waited past the queue TTL
                  + settled ``expired`` records (accepted and never delivered)
+                 + CLAIMS WHOSE LEASE WAS LOST (``claimed_stuck``)
+
+    ``claimed_stuck`` is a claim recovered by :func:`lease_lost`: an attempt nobody
+    ended, older than ``2 x`` the TTL, with no live holder. It is counted there and
+    NOT in ``pending_over_ttl``, so the two terms never describe one record twice --
+    the stuck term is the one that can see a record the freeze hid.
 
     ``ambiguous`` -- the crash-mid-turn "outcome unknown", an HONEST unknown own
     terminal state, not a strand -- and ``failed`` are counted and REPORTED but
@@ -1281,12 +1514,14 @@ def seat_strand_census(home: str | os.PathLike[str], *, now_ns: int | None = Non
             if record.get("status") in TERMINAL_STATUSES:
                 continue
             seat["queued"] += 1
+            path = root / sub / f"{record.get('delivery_id')}.json"
+            if lease_lost(record, home=home, now_ns=now_ns):
+                seat["claimed_stuck"] += 1
+                _note_oldest(seat, record, path, now_ns=now_ns)
+                continue
             if queued_seconds(record, now_ns=now_ns) > ttl:
                 seat["pending_over_ttl"] += 1
-                _note_oldest(
-                    seat, record,
-                    root / sub / f"{record.get('delivery_id')}.json", now_ns=now_ns,
-                )
+                _note_oldest(seat, record, path, now_ns=now_ns)
     for record in _list(root, SETTLED_DIR):
         status = str(record.get("status") or "")
         if status in seat:
@@ -1296,7 +1531,9 @@ def seat_strand_census(home: str | os.PathLike[str], *, now_ns: int | None = Non
                 seat, record,
                 root / SETTLED_DIR / f"{record.get('delivery_id')}.json", now_ns=now_ns,
             )
-    seat["stranded"] = int(seat["pending_over_ttl"]) + int(seat["expired"])
+    seat["stranded"] = (
+        int(seat["pending_over_ttl"]) + int(seat["expired"]) + int(seat["claimed_stuck"])
+    )
     return seat
 
 
@@ -1553,6 +1790,69 @@ def notice_expired_to_sender(
         _log("expired_notice_refused", record, reason=STATUS_DETAIL_QUEUE_FULL, target=sender)
         return None
     _log("expired_notice", record, notice_id=admitted.get("delivery_id"), target=sender)
+    return admitted
+
+
+def lease_lost_notice_key(delivery_id: str) -> str:
+    """The idempotency key of the ONE failure notice owed for a lost lease."""
+    return f"lease-lost-notice:{delivery_id}"
+
+
+def notice_lease_lost_to_sender(
+    record: dict[str, Any],
+    *,
+    home: str | os.PathLike[str] | None = None,
+    now_ns: int | None = None,
+) -> dict[str, Any] | None:
+    """File a FAILURE notice in the SENDER's own spool for a dead-lettered claim.
+
+    A claim whose lease ran out is a delivery that was accepted and
+    never made -- eleven of them sat for up to 181h with nobody told. The receipt the
+    sender holds said "queued -- the receiver re-offers it", which stopped being true
+    when the lease was lost, and a ``settled/failed`` file nobody reads is a silent
+    failure. So the repair tells the SENDER, deterministically and with no LLM in the
+    loop, through the same door the expiry notice uses: ONE delivery into the sender's
+    own lane, read by that lane's next turn, which is the sender's cue to resend.
+
+    Idempotent on the delivery (one notice per lost lease). Returns the admitted
+    record, or ``None`` when no notice is owed -- no sender, a notice about a notice,
+    an unknown profile, or a full sender queue.
+    """
+    delivery_id = str(record.get("delivery_id") or "")
+    sender = str(record.get("sender_profile") or "")
+    target = str(record.get("target_profile") or "")
+    if not delivery_id or not sender or sender == EXPIRED_NOTICE_SENDER:
+        return None
+    if home is None:
+        home = _profile_home(sender)
+        if home is None:
+            _log("lease_lost_notice_skipped", record, reason="unknown_sender_profile")
+            return None
+    claimed = int(claim_age_seconds(record, now_ns=now_ns) or 0)
+    message = (
+        f"[peer-delivery FAILED] your delivery {delivery_id} to {target} was NEVER delivered: "
+        f"it was claimed for {claimed}s, the claim's lease was lost (no live holder) and the "
+        f"record was dead-lettered as lease_lost. The earlier 'queued' receipt is NOT a "
+        f"pending promise. Resend if this still matters."
+    )
+    key = lease_lost_notice_key(delivery_id)
+    notice_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    try:
+        admitted = admit(
+            home,
+            sender_profile=EXPIRED_NOTICE_SENDER,
+            target_profile=sender,
+            target_session_id=None,
+            idempotency_key=key,
+            fingerprint=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            delivery_id=notice_id,
+            message=message,
+            status_detail=STATUS_DETAIL_UNDELIVERED_NOTICE,
+        )
+    except QueueFullError:
+        _log("lease_lost_notice_refused", record, reason=STATUS_DETAIL_QUEUE_FULL, target=sender)
+        return None
+    _log("lease_lost_notice", record, notice_id=admitted.get("delivery_id"), target=sender)
     return admitted
 
 

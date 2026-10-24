@@ -20,6 +20,10 @@ QUEUED_EXPIRED = "queued_expired"
 #: deferred it, not the lane. A distinct code so a consumer can tell "your lane never
 #: got to it" from "we never even handed it to a turn" -- and so it is not auto-retried.
 NEVER_OFFERED = "never_offered"
+# A claim whose lease ran out: the turn never ended it and no live holder stands
+# behind it. The delivery was accepted and never made -- the sender is told, and
+# resending is a human act, so it is not auto-retryable.
+LEASE_LOST = "lease_lost"
 DELIVERY_TIMEOUT = "delivery_timeout"
 AGENT_BLOCKED = "agent_blocked"
 CANCELLED = "cancelled"
@@ -38,8 +42,8 @@ TARGET_SCOPE_UNRESOLVED = "target_scope_unresolved"
 UNKNOWN = "unknown"
 
 ALL_REASONS = frozenset({
-    RUNTIME_OFFLINE, QUEUED_EXPIRED, NEVER_OFFERED, DELIVERY_TIMEOUT, AGENT_BLOCKED,
-    CANCELLED, QUEUE_FULL,
+    RUNTIME_OFFLINE, QUEUED_EXPIRED, NEVER_OFFERED, LEASE_LOST, DELIVERY_TIMEOUT,
+    AGENT_BLOCKED, CANCELLED, QUEUE_FULL,
     PROVIDER_AUTH_OR_ACCESS, PROVIDER_QUOTA_LIMIT, PROVIDER_RATE_LIMIT,
     PROVIDER_SERVER_ERROR, CONTEXT_OVERFLOW, MISSING_CONFIG, MODEL_UNAVAILABLE,
     TARGET_SCOPE_UNRESOLVED, UNKNOWN,

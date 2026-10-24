@@ -228,14 +228,15 @@ def build_card_body(verdict: dict[str, Any], *, idempotency_key: str,
     oldest = totals.get("oldest_age_seconds")
     ttl = census.get("ttl_seconds")
     rows = [
-        "| seat | stranded | over-TTL queued | expired | ambiguous | failed | delivered | oldest |",
-        "|---|---|---|---|---|---|---|---|",
+        "| seat | stranded | over-TTL queued | claimed stuck | expired | ambiguous | failed | delivered | oldest |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for seat in sorted(seats):
         data = seats[seat]
         rows.append(
             f"| `{seat}` | {int(data.get('stranded') or 0)} "
-            f"| {int(data.get('pending_over_ttl') or 0)} | {int(data.get('expired') or 0)} "
+            f"| {int(data.get('pending_over_ttl') or 0)} "
+            f"| {int(data.get('claimed_stuck') or 0)} | {int(data.get('expired') or 0)} "
             f"| {int(data.get('ambiguous') or 0)} | {int(data.get('failed') or 0)} "
             f"| {int(data.get('delivered') or 0)} | {_age_text(data.get('oldest_age_seconds'))} |"
         )
@@ -249,7 +250,11 @@ def build_card_body(verdict: dict[str, Any], *, idempotency_key: str,
         "hand on 2026-10-14 (project `peer-delivery`).",
         "",
         f"- **stranded: {verdict['fleet_total']}** (was {verdict['previous_total']}) -- "
-        "the count is over-TTL queued records PLUS settled `expired` records",
+        "the count is over-TTL queued records PLUS settled `expired` records PLUS "
+        "claims whose lease was lost (`claimed_stuck`)",
+        f"- claimed stuck: {int(totals.get('claimed_stuck') or 0)} -- a claim older than "
+        "2x the TTL that no live holder stands behind: a delivery nobody is running and "
+        "nothing was counting",
         f"- grew on seat(s): {', '.join(f'`{s}`' for s in grown) or '(new backlog, no seat named)'}",
         f"- queue TTL: {ttl}s",
         f"- oldest stranded record: {_age_text(oldest)} old"
@@ -297,7 +302,7 @@ def _file_alert(verdict: dict[str, Any], *, board: str, assignee: str,
     try:
         return str(filer(title=STRAND_ALERT_TITLE, body=body, assignee=assignee,
                          priority=int(priority), board=board, idempotency_key=key) or "")
-    except Exception as exc:  # noqa: BLE001 - an alarm must report, never break the sweep
+    except Exception as exc:
         logger.warning("[bot_delivery] strand alert could not be filed: %s", exc, exc_info=True)
         return ""
 
@@ -348,6 +353,7 @@ def alert(root_home: str | os.PathLike[str], *,
         seats=delivery_queue.stranded_breakdown(verdict["census"]),
         expired=int(totals.get("expired") or 0),
         over_ttl=int(totals.get("pending_over_ttl") or 0),
+        claimed_stuck=int(totals.get("claimed_stuck") or 0),
         ambiguous=int(totals.get("ambiguous") or 0),
         generation=verdict["generation"],
         card=card_id or "-")
@@ -379,7 +385,7 @@ def evaluate_and_alert(home: str | os.PathLike[str], **kwargs: Any) -> Optional[
 
     try:
         return alert(_hermes_root(Path(home)), **kwargs)
-    except Exception:  # noqa: BLE001 - an alarm must never kill the drainer's sweep
+    except Exception:
         logger.warning("[bot_delivery] strand alert evaluation failed", exc_info=True)
         return None
 
@@ -400,6 +406,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         "root": census["root"],
         "ttl_seconds": census["ttl_seconds"],
         "stranded": census["totals"]["stranded"],
+        "claimed_stuck": census["totals"]["claimed_stuck"],
         "expired": census["totals"]["expired"],
         "pending_over_ttl": census["totals"]["pending_over_ttl"],
         "ambiguous": census["totals"]["ambiguous"],
@@ -409,6 +416,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         "oldest_path": census["totals"]["oldest_path"],
         "seats": {seat: {"stranded": data["stranded"], "expired": data["expired"],
                          "pending_over_ttl": data["pending_over_ttl"],
+                         "claimed_stuck": data["claimed_stuck"],
                          "ambiguous": data["ambiguous"], "failed": data["failed"],
                          "delivered": data["delivered"],
                          "oldest_age_seconds": data["oldest_age_seconds"]}
