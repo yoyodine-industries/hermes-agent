@@ -14,6 +14,7 @@ when the target is definitively offline (fail fast instead of queueing a DM nobo
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -690,15 +691,17 @@ def _pid_alive(pid: Any) -> Optional[bool]:
     return True
 
 
-def publish_turn_lock_holder(fd: int, profile: str) -> None:
-    """Publish this process as ``profile``'s turn holder, in place on the flocked fd.
+def publish_turn_lock_holder(fd: int, profile: str, session: str | None = None) -> None:
+    """Publish this process as ``profile``'s turn holder for ``session``, in place on the flocked fd.
 
     Written through the SAME fd that holds the lock — a rename would swap the inode out from under the
     flock and let the next waiter acquire a second, unrelated lock. Best-effort: an unwritable lockfile
-    costs the refusal its pid, never the turn its lock.
+    costs the refusal its pid, never the turn its lock. ``session`` is the granularity the lock was
+    taken at (``t_47082c1d``): a waiter names WHICH transcript is wedged, not just the seat.
     """
     record = {
         "pid": os.getpid(), "ppid": os.getppid(), "profile": str(profile or ""),
+        "session": str(session or ""),
         "started_at": time.time(), "host": socket.gethostname(),
     }
     payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")[:TURN_LOCK_HOLDER_MAX_BYTES]
@@ -718,8 +721,8 @@ def clear_turn_lock_holder(fd: int) -> None:
         os.fsync(fd)
 
 
-def read_turn_lock_holder(root: Path | str, profile: str) -> Optional[dict]:
-    """The holder a live turn published for ``profile``, or None when absent/unreadable.
+def read_turn_lock_holder(root: Path | str, profile: str, session: str | None = None) -> Optional[dict]:
+    """The holder a live turn published for ``profile``/``session``, or None when absent/unreadable.
 
     Never raises and never trusts the record: it is a claim written by another process, so a waiter uses
     it to NAME the holder, never to acquire the turn. ``alive`` is probed here rather than trusted from it.
@@ -727,7 +730,7 @@ def read_turn_lock_holder(root: Path | str, profile: str) -> Optional[dict]:
     only the documented keys, non-empty, so a stray field in a stale lockfile cannot reach a wire payload.
     """
     try:
-        raw = turn_lock_path(root, profile).read_text(encoding="utf-8", errors="replace").strip()
+        raw = turn_lock_path(root, profile, session).read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return None
     if not raw:
@@ -747,6 +750,7 @@ def read_turn_lock_holder(root: Path | str, profile: str) -> Optional[dict]:
         ("pid", pid),
         ("ppid", _int_or_none(record.get("ppid"))),
         ("profile", str(record.get("profile") or "").strip() or None),
+        ("session", str(record.get("session") or "").strip() or None),
         ("host", str(record.get("host") or "").strip() or None),
         ("started_at", started),
         ("age_seconds", (round(max(0.0, time.time() - started), 3) if started is not None else None)),
@@ -824,9 +828,13 @@ class TurnBusyError(RuntimeError):
     #: stamps, so a sender that greps for ``target_busy`` still finds it there, never as a reason.
     status_detail = STATUS_DETAIL_TARGET_BUSY
 
-    def __init__(self, profile: str, waited_seconds: float, holder: Optional[dict] = None):
+    def __init__(self, profile: str, waited_seconds: float, holder: Optional[dict] = None,
+                 *, session: str | None = None):
         self.profile, self.waited_seconds = profile, waited_seconds
         self.holder = holder or None
+        #: The transcript whose turn we were waiting on (``t_47082c1d``). ``None`` is the pre-granularity
+        #: profile-wide key. Attribution only — it never widens or narrows the lock at refusal time.
+        self.session = session
         fragment = holder_fragment(self.holder)
         super().__init__(f"target_busy: another delivery turn is already running for profile '{profile}' — "
                          f"queued behind it for ~{int(round(waited_seconds))}s. The delivery is durably "
@@ -849,7 +857,7 @@ class TurnBusyError(RuntimeError):
 
 
 
-def acquire_delivery_turn_lock(root: Path | str, profile: str) -> Iterator[Path]:
+def acquire_delivery_turn_lock(root: Path | str, profile: str, session: str | None = None) -> Iterator[Path]:
     """The DELIVERY path's turn lock: a NON-blocking probe (§2.5 step 1, P10).
 
     The lock is a mutual-exclusion primitive on this path, never a waiting room: a held
@@ -857,8 +865,12 @@ def acquire_delivery_turn_lock(root: Path | str, profile: str) -> Iterator[Path]
     parking the sender, and the caller hands the delivery to the receiver queue, which
     re-offers it when the turn slot frees. Callers that take the lock without a timeout
     of their own still get ``turn_wait_seconds`` as the budget.
+
+    ``session`` is the transcript the delivery will append to (``t_47082c1d``) — NOT the sender and NOT
+    the profile. A DM that names the Bot Chat session it is bound for no longer waits behind a Desktop
+    turn on the same seat; two DMs bound for that same Bot Chat still queue behind each other.
     """
-    return acquire_turn_lock(root, profile, timeout_seconds=0)
+    return acquire_turn_lock(root, profile, timeout_seconds=0, session=session)
 
 
 def turn_wait_seconds() -> float:
@@ -867,29 +879,72 @@ def turn_wait_seconds() -> float:
     return float(TURN_WAIT_SECONDS_FALLBACK) if val is None else max(0.0, float(val))
 
 
-def turn_lock_path(root: Path | str, profile: str) -> Path:
-    """Per-profile lockfile path (short — safe on macOS temp roots)."""
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", str(profile or ""))[:64] or "_"
-    return relay_root(root) / LOCKS_DIR / f"{safe}.lock"
+#: The transcript handle a DM is delivered into: a profile's ``Bot Chat`` is a SINGLETON transcript
+#: (``SessionDB.get_session_by_title("Bot Chat")``), and every delivery surface — ``hermes -p <p> chat``,
+#: ``bot_relay.deliver``, the queue drain, the API drain — appends to that one transcript. The turn lock
+#: is therefore keyed on this handle, NOT on the session row id: the handle is stable BEFORE the row
+#: exists, so two deliveries that would create it still serialize (``t_47082c1d``).
+BOT_CHAT_SESSION_KEY = "botchat"
+
+
+def room_session_key(room_id: str) -> str:
+    """Transcript handle for one Group Chat room's session.
+
+    A room's transcript is titled from ``room_id`` (``room_session_title``), so ``room_id`` — not the
+    session row id — is the stable handle: the lock can be taken before the session is resolved or
+    created, and two attempts for one room still exclude each other.
+    """
+    return f"room:{room_id}"
+
+
+def turn_lock_path(root: Path | str, profile: str, session: str | None = None) -> Path:
+    """Lockfile path for ``(profile, session)`` — short, and attributable from the filename alone.
+
+    GRANULARITY (``t_47082c1d``): the lock guards ONE transcript, not one seat. Keying it on the profile
+    alone made every surface that runs a turn as profile P — a Desktop session, a hosted room, a DM
+    delivery — serialize against each other although they touch different sessions; measured 2026-10-23,
+    a DM waited 1m59s / 34 re-offers behind a Desktop turn on the same profile while four other worker
+    sessions on that profile ran freely. Two deliveries into the SAME Bot Chat must still serialize, so
+    the session id is part of the key, never a fallback to "any turn of this profile".
+
+    ``session=None`` keeps the old profile-wide key. It survives only for callers that genuinely mean
+    "this whole seat" (and for tests of the pre-``t_47082c1d`` behaviour); every delivery and turn surface
+    passes a session key. The sanitised session carries a digest of the RAW value, so two distinct
+    sessions that sanitise to the same characters (``room:ops/1`` vs ``room:ops_1``) can never share a
+    lockfile — a collision would silently re-serialize unrelated turns, i.e. reintroduce the defect.
+    """
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", str(profile or ""))[:48] or "_"
+    if session is None:
+        return relay_root(root) / LOCKS_DIR / f"{safe}.lock"
+    raw_session = str(session)
+    safe_session = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_session)[:80] or "_"
+    digest = hashlib.sha256(raw_session.encode("utf-8", "replace")).hexdigest()[:10]
+    return relay_root(root) / LOCKS_DIR / f"{safe}__{safe_session}__{digest}.lock"
 
 
 @contextlib.contextmanager
-def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | None = None) -> Iterator[Path]:
-    """Hold ``profile``'s cross-process turn lock for the ``with`` body: non-blocking
+def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | None = None, *,
+                      session: str | None = None) -> Iterator[Path]:
+    """Hold the ``(profile, session)`` cross-process turn lock for the ``with`` body: non-blocking
     flock probe + short-sleep retry up to the budget (``bot_mode.turn_wait_seconds``
     unless ``timeout_seconds``); raises :class:`TurnBusyError` when exhausted — naming
     the holder and its age when the lockfile carries a holder record. No
     ordering among waiters, but every waiter is bounded. Without ``fcntl`` (Windows)
-    the lock is a no-op — those installs never had this race path."""
+    the lock is a no-op — those installs never had this race path.
+
+    ``session`` narrows the key from the seat to the TRANSCRIPT (``t_47082c1d``): the flock, the bounded
+    retry, the holder record and the refusal are all unchanged, but a turn on session A no longer blocks
+    a turn on session B of the same profile.
+    """
     try:
         import fcntl
     except ImportError:  # pragma: no cover — Windows
         logger.debug("bot turn lock disabled: fcntl unavailable on this platform")
-        yield turn_lock_path(root, profile)
+        yield turn_lock_path(root, profile, session)
         return
 
     budget = turn_wait_seconds() if timeout_seconds is None else max(0.0, float(timeout_seconds))
-    path = turn_lock_path(root, profile)
+    path = turn_lock_path(root, profile, session)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -902,16 +957,16 @@ def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | N
             except OSError:
                 now = time.monotonic()
                 if now >= deadline:
-                    holder = read_turn_lock_holder(root, profile)
+                    holder = read_turn_lock_holder(root, profile, session)
                     # One line per refusal: a seat held past the budget is the signal (t_9acf5894 item 3)
-                    # and it must name the holder, or nothing downstream can route around it.
-                    logger.warning("bot turn lock busy: profile=%s waited=%.0fs holder=%s",
-                                   profile, now - start,
+                    # and it must name the holder AND the session, or nothing downstream can route around it.
+                    logger.warning("bot turn lock busy: profile=%s session=%s waited=%.0fs holder=%s",
+                                   profile, session if session is not None else "-", now - start,
                                    (f"pid {holder['pid']} age={_format_holder_age(holder.get('age_seconds'))}"
                                     f" alive={holder.get('alive')}") if holder else "unknown")
-                    raise TurnBusyError(profile, now - start, holder)
+                    raise TurnBusyError(profile, now - start, holder, session=session)
                 time.sleep(min(0.1, max(0.005, deadline - now)))
-        publish_turn_lock_holder(fd, profile)
+        publish_turn_lock_holder(fd, profile, session)
         try:
             yield path
         finally:
