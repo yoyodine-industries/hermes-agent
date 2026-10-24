@@ -1296,6 +1296,7 @@ def sweep_delivery_queue(
     lease) and pass 2 would reap the record in this same tick anyway. So it is
     NEVER re-offered -- resurrecting it would deliver hours- or days-old peer work,
     and the truthful outcome is the terminal one.
+
     A record with a live holder, or a young claim, is untouched: a turn that is
     genuinely running keeps its record exactly as it is.
 
@@ -1330,7 +1331,6 @@ def sweep_delivery_queue(
         for record in _list(root, CLAIMED_DIR):
             if not lease_lost(record, home=home, now_ns=now_ns):
                 continue
-            delivery_id = record["delivery_id"]
             # A lost lease is PAST ITS OWN DEADLINE BY CONSTRUCTION (lease = 2 x TTL,
             # and the lease is only lost once the waiting has accrued past the TTL),
             # so resurrection is never on the table: delivering hours-old peer work,
