@@ -454,26 +454,72 @@ def test_local_only_contract_with_a_declaration_names_the_contradiction_first(co
     assert _status(conn, task_id) == "running"
 
 
-def test_a_mention_is_not_a_publication_declaration(conn, forge):
-    """The ``t_ee64588b`` shape: a local-only card whose metadata NAMES a PR closes.
+def test_a_fleet_looser_key_is_a_tier_two_declaration(conn, forge):
+    """The ``t_45655ee5`` shape: a card whose only declaration is ``pr`` is JUDGED.
 
-    ``pr`` / ``pr_url`` / ``pr_number`` are the fleet's looser keys: they carry the PR
-    the card opened as readily as one it cited or investigated, and only the writer knows
-    which. They are recorded on the verdict's ``mentions`` fact and never create a
-    landing obligation (ruling 2026-10-18, card ``t_9082c751``) -- so the close is the
-    clause's business no more than a card that declares nothing, and no forge read is
-    spent on it. The reconciler surveys the wider key set.
+    ``pr`` / ``pr_url`` / ``pr_number`` / ``merge_pr`` / ``pull_request`` are tier-2
+    DECLARATIONS (ruling 2026-10-23, card ``t_f1dc66dc`` -- ONE DECLARATION SURFACE),
+    aligned onto the key set the landing reconciler reads
+    (``landing_reconcile_nodes.PR_KEYS``). The defect this closes: the reconciler filed
+    carrier ``t_f4349dba`` from ``t_45655ee5``'s ``metadata.pr`` while the verdict door --
+    the one sanctioned way to discharge it -- refused the same card as declaring nothing,
+    leaving a prose comment or an endless carrier re-file.
+
+    This SUPERSEDES the 2026-10-18 ruling (card ``t_9082c751``) under which these keys were
+    mentions only and created no obligation: the close is now the clause's business, and the
+    recorded escapes (``landing_not_owed`` / ``landing_deferred``) are the way out. The keys
+    are still reported as ``mentions`` on the verdict's facts -- recording, not judging.
     """
-    task_id = _worker_card(conn, title="a local-only card that cited a PR",
+    task_id = _worker_card(conn, title="a card that declares in pr",
                            completion_contract="local-only")
 
-    assert kb.complete_task(
+    refusal = kb.complete_task(
         conn, task_id, summary="done",
-        metadata={"pr": PR_URL, "pr_url": PR_URL, "pr_number": 7},
-    ) is True
-    assert _status(conn, task_id) == "done"
-    assert forge["asked"] == []
-    assert _blocked_events(conn, task_id) == []
+        metadata={"pr": PR_URL},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
+    assert PR in refusal.detail
+    assert _status(conn, task_id) == "running"
+    facts = _blocked_events(conn, task_id)[0]["facts"]
+    assert facts["declaration_tier"] == 2, "the fleet's looser key resolves at tier 2"
+    assert facts["declaration_keys"] == ["pr"]
+    assert forge["asked"] == [("example-org/example-repo", "7")]
+
+
+@pytest.mark.parametrize("key", ["merge_pr", "pull_request"])
+def test_the_reconciler_s_other_keys_declare_too(conn, forge, key):
+    """The tier-2 surface is the reconciler's ``PR_KEYS``, not just the three most common."""
+    task_id = _review_card(conn)
+
+    refusal = kb.complete_task(conn, task_id, summary="approved", metadata={key: PR_URL})
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
+    assert _blocked_events(conn, task_id)[0]["facts"]["declaration_keys"] == [key]
+    assert forge["asked"] == [("example-org/example-repo", "7")]
+
+
+def test_the_tier_two_surface_is_the_reconciler_s_key_set():
+    """Pin tier 2 to the reconciler's key set AS MEASURED at yaan-platform @6091b5da.
+
+    ``landing_reconcile_nodes.PR_KEYS`` (yaan-platform ``origin/main`` @6091b5da) minus
+    ``published_pr`` -- which is this clause's tier 1 -- IS tier 2, so a carrier can no
+    longer be filed from a declaration the door cannot discharge (exactly the hole
+    ``t_45655ee5`` / ``t_f4349dba`` measured).
+
+    SCOPE OF THE GUARD (corrected in review round 1, R4): ``reconciler_pr_keys`` below is a
+    FROZEN LOCAL COPY, so this test catches drift on THIS side only. A key added to the
+    reconciler's ``PR_KEYS`` in yaan-platform does NOT fail this test -- the copy must be
+    updated by hand, and that manual step is the guard's known limit, not a claim it makes.
+    """
+    reconciler_pr_keys = (
+        "published_pr", "pr", "pr_url", "pr_number", "merge_pr", "pull_request",
+    )
+
+    assert klc.TIER_KEYS[0] == ("published_pr",), "tier 1 is the kernel's publication key"
+    assert klc.TIER_KEYS[1] == tuple(k for k in reconciler_pr_keys if k != "published_pr")
 
 
 def test_measured_mentions_are_recorded_on_the_verdict_facts(conn, forge):

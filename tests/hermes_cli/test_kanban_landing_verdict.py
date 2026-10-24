@@ -180,6 +180,8 @@ def test_bare_pr_number_with_a_repo_key_counts_as_a_declaration(board):
     receipt = _record(conn, target)
 
     assert receipt["changed"] is True
+    assert receipt["tier"] == 2, "the bare-number shape is the reconciler's, so tier 2"
+    assert receipt["keys"] == ["pr_number", "repo"], "the pair is what resolved it"
     assert _newest_metadata(kb, conn, target)["landing_not_owed"] == REASON
 
 
@@ -267,7 +269,7 @@ def test_an_archived_target_is_refused(board):
 
 
 def test_a_missing_target_is_refused(board):
-    kb, conn = board
+    _kb, conn = board
 
     with pytest.raises(ValueError, match="does not exist"):
         _record(conn, "t_deadbeef")
@@ -321,6 +323,12 @@ def test_a_repeat_is_idempotent_and_records_only_a_noop_on_the_caller(board):
     assert len(_events(conn, caller, "landing_verdict_noop")) == 1
     assert len(_events(conn, caller, "landing_verdict_recorded")) == 1
 
+    # R2 (review round 1, card t_f1dc66dc): the ruling promises the audit row records
+    # WHICH tier/keys resolved -- that promise must hold on a REPEAT too, not only on the
+    # first write, or a verdict's provenance disappears exactly where it is re-exercised.
+    noop_payload = json.loads(_events(conn, caller, "landing_verdict_noop")[0]["payload"])
+    assert noop_payload["declared_by"] == {"tier": 1, "keys": ["published_pr"]}
+
 
 # ---------------------------------------------------------------------------
 # The gate is unchanged: refused before, admitted after -- over the REAL door
@@ -352,3 +360,102 @@ def test_the_completion_gate_is_not_weakened(board, monkeypatch):
     assert admitted is True, f"the close was still refused: {admitted!r}"
     row = conn.execute("SELECT status FROM tasks WHERE id = ?", (target,)).fetchone()
     assert row["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# ONE DECLARATION SURFACE (ruling 2026-10-23, card t_f1dc66dc)
+#
+# The door must accept every declaration a carrier can be FILE from, because the
+# reconciler files carriers off the wider key set. Measured on t_45655ee5: carrier
+# t_f4349dba was filed from ``metadata.pr`` while this door refused the same card as
+# declaring nothing. The fleet's looser keys are tier 2; ``published_pr`` keeps tier 1.
+# ---------------------------------------------------------------------------
+
+FLEET_PR = "yoyodine-industries/yaan-platform#1944"
+
+
+def _declaring_in(kb, conn, metadata, title="declares in a fleet key"):
+    """A closed card declaring exactly ``metadata`` on its run -- the reconciler's shape."""
+    target = kb.create_task(conn, title=title, assignee="platform-coder")
+    kb._synthesize_ended_run(
+        conn, target, outcome="completed", summary="closed; this PR is the deliverable",
+        metadata=metadata,
+    )
+    return target
+
+
+def test_a_fleet_looser_key_declares_at_tier_two_and_the_receipt_says_so(board):
+    """AC1: the ONLY declaration is run metadata ``{"pr": ...}`` -- accepted, tier 2 / ``pr``."""
+    kb, conn = board
+    target = _declaring_in(kb, conn, {"pr": FLEET_PR})
+
+    receipt = _record(conn, target)
+
+    assert receipt["changed"] is True
+    assert receipt["tier"] == 2, "the fleet's looser key is a tier-2 declaration"
+    assert receipt["keys"] == ["pr"], "the receipt names WHICH key resolved"
+    assert receipt["prs"] == [FLEET_PR]
+    assert _newest_metadata(kb, conn, target)["landing_not_owed"] == REASON
+
+    # The audit row carries the same fact, so the record is not only in the caller's hand.
+    payload = json.loads(_events(conn, target, "landing_verdict_recorded")[0]["payload"])
+    assert payload["declared_by"] == {"tier": 2, "keys": ["pr"]}
+
+    # And the clause reads the escape the door wrote: the close is admitted.
+    from hermes_cli import kanban_landing_carrier as clause
+
+    verdict = clause.evaluate(
+        conn=conn, task_id=target, forge=lambda _repo, _num: "OPEN", candidates=[],
+    )
+    assert verdict is not None and verdict.refused is False
+    assert verdict.facts["declaration_tier"] == 2
+    assert verdict.facts["prs"][0]["state"] == "landing_not_owed"
+
+
+def test_published_pr_still_resolves_at_tier_one_over_a_conflicting_pr(board):
+    """AC2: precedence -- the kernel's own publication key wins, and the looser key is not read."""
+    kb, conn = board
+    target = _declaring_in(
+        kb, conn, {"published_pr": PR_URL, "pr": "other-org/other-repo#999"},
+        title="declares both keys",
+    )
+
+    receipt = _record(conn, target)
+
+    assert receipt["tier"] == 1
+    assert receipt["keys"] == ["published_pr"]
+    assert receipt["prs"] == ["yoyodine-industries/yaan-hermes-config#63"]
+    assert "other-org/other-repo#999" not in receipt["prs"]
+
+    from hermes_cli import kanban_landing_carrier as clause
+
+    verdict = clause.evaluate(
+        conn=conn, task_id=target, forge=lambda _repo, _num: "OPEN", candidates=[],
+    )
+    assert verdict is not None
+    assert verdict.facts["declaration_tier"] == 1
+    assert [entry["ref"] for entry in verdict.facts["prs"]] == [
+        "yoyodine-industries/yaan-hermes-config#63"
+    ]
+
+
+def test_the_refusal_names_the_surface_the_reconciler_reads(board):
+    """AC3: a card declaring nothing still refuses -- and the remedy names the ONE surface.
+
+    No stale "``pr`` is not a declaration" wording: anything the reconciler can file a
+    carrier from is named here, because anything it can file from is what this door must
+    be able to discharge.
+    """
+    kb, conn = board
+    target = _declaring_in(kb, conn, {}, title="local-only work")
+
+    with pytest.raises(ValueError) as refused:
+        _record(conn, target)
+
+    message = str(refused.value)
+    assert "declares no deliverable PR" in message
+    for key in ("published_pr", "pr_url", "pr_number", "merge_pr", "pull_request"):
+        assert key in message, f"the refusal must name the reconciler's key {key}: {message}"
+    assert "tier 2" in message and "tier 1" in message
+    assert "repo/repository/destination_repo/target_repo" in message
+    assert "Nothing was written" in message
