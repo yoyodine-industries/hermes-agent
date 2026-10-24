@@ -211,6 +211,46 @@ def _retired_result_line(key: str, provenance: dict) -> str:
     )
 
 
+def _retirement_close_kwargs(key: str, provenance: dict, payload: dict) -> dict:
+    """The ONE declaration every automatic close carries: ``result``, ``summary``, the evidence.
+
+    BOTH doors write it (card t_028ad743, review D1). The broad actor sweep used to pass
+    ``result`` alone, and with the board's evidence gate at its default ``refuse`` the kernel
+    answered ``CompletionRefusal(cause='no_evidence')`` -- so a card the sweep had CORRECTLY judged
+    cleared could never be closed, and every refusal spent one of the card's bounded attempts on a
+    defect of our own making. One helper, so the two doors cannot drift apart again.
+
+    ``class='none'`` is the honest class: this is board repair with no run behind it. The proof is
+    a verified normal dispatcher tick after the frozen pid stopped serving, and the kernel records
+    the declaration as an ``evidence_none`` event on the card.
+    """
+    return {
+        "result": _retired_result_line(key, provenance),
+        "summary": (
+            "Closed by the dispatcher's OWN tick: the tree-skew stall this card carried is"
+            " over. A dispatcher process served a normal tick after the frozen process it"
+            f" named (pid {provenance.get('filing_pid')}) went away, so the reload landed"
+            " and the gate is clear -- no lane action is owed on this card."
+        ),
+        "metadata": {
+            "evidence": {
+                "class": "none",
+                "why": (
+                    "board repair with no run behind it: the proof is a verified normal "
+                    "dispatcher tick after the frozen pid (proven dead) stopped serving"
+                ),
+            },
+            "tree_skew_cleared": {
+                "frozen_pid": provenance.get("filing_pid"),
+                "disk_fingerprint": payload.get("disk_fingerprint"),
+                "boot_fingerprint": payload.get("boot_fingerprint"),
+                "observed_by_pid": os.getpid(),
+                "at": int(time.time()),
+            },
+        },
+    }
+
+
 def _retire_one_tree_skew_actor(
     conn: sqlite3.Connection,
     task_id: str,
@@ -221,6 +261,7 @@ def _retire_one_tree_skew_actor(
     reason: str,
     close_kwargs: dict,
     log_what: str,
+    attempted: Optional[set] = None,
 ) -> str:
     """Close ONE actor card through the kernel's doors; bounded, and LOUD when it will not close.
 
@@ -233,12 +274,19 @@ def _retire_one_tree_skew_actor(
     THE BOUND: a refusal is recorded ON THE CARD, so it survives a respawned dispatcher. At
     ``TICK_YIELD_RETIRE_MAX_ATTEMPTS`` ONE ``tree_skew_actor_retire_failed`` event names the last
     refusal and the card leaves every sweep for good -- an audit finding instead of a per-tick
-    siren. Returns ``"retired"``, ``"refused"``, ``"failed"`` (gave up on this attempt) or
-    ``"gave_up"`` (a prior give-up owns it; nothing was attempted).
+    siren. It counts the KERNEL's refusals, not our plumbing (review D1): ``attempted`` is the set
+    the CALLER shares between both doors for one tick, so a card both doors can see (on a tick
+    whose board IS the actor board) is tried ONCE and a refusal is not counted twice. Returns
+    ``"retired"``, ``"refused"``, ``"failed"`` (gave up on this attempt), ``"gave_up"`` (a prior
+    give-up owns it) or ``"deduped"`` (the other door already tried it this tick).
     """
     f = _facade()
     if _retire_event_count(conn, task_id, f.TICK_YIELD_RETIRE_FAILED_EVENT):
         return "gave_up"
+    if attempted is not None:
+        if task_id in attempted:
+            return "deduped"
+        attempted.add(task_id)
     if status == "todo":
         # ``todo`` is not completable and not unblockable: the kernel's door for it is
         # ``promote_task`` (refused while a parent is unfinished -- which is then a REAL refusal and
@@ -309,7 +357,9 @@ def _retire_one_tree_skew_actor(
     return "retired"
 
 
-def _retire_tree_skew_actors(conn: sqlite3.Connection, *, board: Optional[str] = None) -> int:
+def _retire_tree_skew_actors(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, attempted: Optional[set] = None,
+) -> int:
     """Close every live actor card on the actor board whose episode has CLEARED (DEC-3).
 
     A tick that serves normally is PROOF the episode is over. Selection is bounded
@@ -319,6 +369,9 @@ def _retire_tree_skew_actors(conn: sqlite3.Connection, *, board: Optional[str] =
     Selection is by the KEY, not by the exact title it was filed with: a card a seat re-titled is
     still the record of our stall, and requiring ``title = TICK_YIELD_ACTOR_TITLE`` was one of the
     two reasons a disguised guard was immortal (card t_028ad743).
+
+    ``attempted`` is the per-tick set shared with the narrow door (review D1): the run that calls
+    both doors hands the same set in, so a card both of them can see is attempted once, not twice.
     """
     f = _facade()
     actor_conn, filed_on, close_it = f._ops_board_connection(conn)
@@ -335,7 +388,7 @@ def _retire_tree_skew_actors(conn: sqlite3.Connection, *, board: Optional[str] =
             except Exception as exc:  # health: allow BLE001 -- closing a scratch connection never matters to a tick
                 _db()._log.debug("kanban dispatcher: closing the actor board failed: %s", exc)
         return 0
-    counts = {"retired": 0, "refused": 0, "skipped": 0, "failed": 0, "gave_up": 0}
+    counts = {"retired": 0, "refused": 0, "skipped": 0, "failed": 0, "gave_up": 0, "deduped": 0}
     try:
         placeholders = ", ".join("?" for _ in f.TICK_YIELD_RETIRE_SKIP_STATUSES)
         rows = actor_conn.execute(
@@ -362,7 +415,8 @@ def _retire_tree_skew_actors(conn: sqlite3.Connection, *, board: Optional[str] =
                 provenance=provenance,
                 reason="gate-clear",
                 log_what="kanban dispatcher: tree-skew actor",
-                close_kwargs={"result": _retired_result_line(key, provenance)},
+                close_kwargs=_retirement_close_kwargs(key, provenance, payload),
+                attempted=attempted,
             )
             counts[outcome] = counts.get(outcome, 0) + 1
     except Exception as exc:  # health: allow BLE001 -- retirement must never take a tick down
@@ -376,14 +430,16 @@ def _retire_tree_skew_actors(conn: sqlite3.Connection, *, board: Optional[str] =
     if any(counts.values()):
         _db()._log.info(
             "kanban dispatcher: tree-skew actor retirement on %s: retired=%d refused=%d "
-            "skipped_live=%d gave_up_now=%d already_given_up=%d", filed_on,
+            "skipped_live=%d gave_up_now=%d already_given_up=%d deduped=%d", filed_on,
             counts["retired"], counts["refused"], counts["skipped"], counts["failed"],
-            counts["gave_up"],
+            counts["gave_up"], counts["deduped"],
         )
     return counts["retired"]
 
 
-def _close_cleared_tick_yield_cards(conn: sqlite3.Connection) -> list:
+def _close_cleared_tick_yield_cards(
+    conn: sqlite3.Connection, *, attempted: Optional[set] = None,
+) -> list:
     """Close every guard card whose stall is OVER, on the proof that THIS tick is serving.
 
     "Cleared" is never inferred from the ABSENCE of refusals -- the dispatcher that would refuse is
@@ -408,13 +464,16 @@ def _close_cleared_tick_yield_cards(conn: sqlite3.Connection) -> list:
     ``running`` cards are excluded from selection outright: a live claim is somebody's work, and
     ``complete_task`` would refuse it anyway (which must never be counted as a card's failed
     retirement attempt).
+
+    ``attempted`` is the per-tick set shared with the broad actor sweep (review D1), so both doors
+    together make at most ONE attempt per card per tick.
     """
     f = _facade()
     closed: list = []
     swept: set = set()
     ops_conn, ops_board, close_it = f._ops_board_connection(conn)
     try:
-        closed.extend(_close_cleared_cards_on(ops_conn))
+        closed.extend(_close_cleared_cards_on(ops_conn, attempted=attempted))
         if ops_board:
             swept.add(ops_board)
     finally:
@@ -432,11 +491,13 @@ def _close_cleared_tick_yield_cards(conn: sqlite3.Connection) -> list:
             "swept for cleared guards", exc, ops_board,
         )
     if ticking_board and ticking_board not in swept:
-        closed.extend(_close_cleared_cards_on(conn))
+        closed.extend(_close_cleared_cards_on(conn, attempted=attempted))
     return closed
 
 
-def _close_cleared_cards_on(conn: sqlite3.Connection) -> list:
+def _close_cleared_cards_on(
+    conn: sqlite3.Connection, *, attempted: Optional[set] = None,
+) -> list:
     """The body of :func:`_close_cleared_tick_yield_cards` against one board.
 
     Selection is the card's own KEY (``tree-skew:`` -- what ``_file_tick_yield_actor`` mints and
@@ -477,31 +538,8 @@ def _close_cleared_cards_on(conn: sqlite3.Connection) -> list:
             provenance=provenance,
             reason="gate-clear",
             log_what="kanban dispatcher: the cleared tree-skew guard",
-            close_kwargs={
-                "result": _retired_result_line(key, provenance),
-                "summary": (
-                    "Closed by the dispatcher's OWN tick: the tree-skew stall this card carried is"
-                    " over. A dispatcher process served a normal tick after the frozen process it"
-                    f" named (pid {provenance.get('filing_pid')}) went away, so the reload landed"
-                    " and the gate is clear -- no lane action is owed on this card."
-                ),
-                "metadata": {
-                    "evidence": {
-                        "class": "none",
-                        "why": (
-                            "board repair with no run behind it: the proof is a verified normal "
-                            "dispatcher tick after the frozen pid (proven dead) stopped serving"
-                        ),
-                    },
-                    "tree_skew_cleared": {
-                        "frozen_pid": provenance.get("filing_pid"),
-                        "disk_fingerprint": payload.get("disk_fingerprint"),
-                        "boot_fingerprint": payload.get("boot_fingerprint"),
-                        "observed_by_pid": os.getpid(),
-                        "at": int(time.time()),
-                    },
-                },
-            },
+            close_kwargs=_retirement_close_kwargs(key, provenance, payload),
+            attempted=attempted,
         )
         if outcome != "retired":
             continue
@@ -527,11 +565,16 @@ def _retire_cleared_tree_skew_cards(conn: sqlite3.Connection, *, board: Optional
     and holds the board's dispatch lock, and BEFORE the tick claims or spawns anything (card
     t_028ad743 -- after the claim phase a fallback-filed guard came back ``running`` and no door
     could ever close it).
+
+    ONE per-tick ``attempted`` set is shared by both doors (review D1): where the doors overlap --
+    a tick whose board IS the actor board -- a card gets ONE attempt, so ``..._retire_refused``
+    counts the kernel's refusals and the give-up bound is spent at the rate it names, not twice.
     """
     f = _facade()
+    attempted: set = set()
     cleared = f._clear_tick_yield_status()
     try:
-        closed = _close_cleared_tick_yield_cards(conn)
+        closed = _close_cleared_tick_yield_cards(conn, attempted=attempted)
     except Exception as exc:  # health: allow BLE001 -- a close is never allowed to break a tick
         _db()._log.warning(
             "kanban dispatcher: tree-skew guard close failed on %s: %s", board, exc, exc_info=True,
@@ -539,7 +582,7 @@ def _retire_cleared_tree_skew_cards(conn: sqlite3.Connection, *, board: Optional
         closed = []
     if board == f.TICK_YIELD_ACTOR_BOARD or cleared:
         try:
-            _retire_tree_skew_actors(conn, board=board)
+            _retire_tree_skew_actors(conn, board=board, attempted=attempted)
         except Exception as exc:  # health: allow BLE001 -- retirement never breaks a tick
             _db()._log.warning(
                 "kanban dispatcher: tree-skew actor retirement failed on %s: %s", board, exc,
