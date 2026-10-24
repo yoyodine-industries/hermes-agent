@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from typing import Callable
 
 import pytest
 
@@ -45,6 +46,28 @@ def _lane(home, name):
     return path
 
 
+class _LogCapture:
+    """The module logger, captured: the deferral events are the only trace there is."""
+
+    def __init__(self):
+        self.lines = []
+
+    def info(self, msg, *args, **kwargs):
+        self.lines.append(msg % args if args else str(msg))
+
+    def exception(self, msg, *args, **kwargs):  # pragma: no cover - failure path
+        self.lines.append("EXCEPTION " + (msg % args if args else str(msg)))
+
+    def debug(self, msg, *args, **kwargs):
+        self.lines.append("debug " + (msg % args if args else str(msg)))
+
+    def warning(self, msg, *args, **kwargs):
+        self.lines.append("warning " + (msg % args if args else str(msg)))
+
+    def __contains__(self, needle):
+        return any(needle in line for line in self.lines)
+
+
 def _did(n: int) -> str:
     return "%032x" % n
 
@@ -71,6 +94,8 @@ class _Adapter:
         self.calls = []
         self.scopes = []
         self.profile_during_turn = None
+        # The AGENT-WORK cap, as the drainer and the expiry sweep both ask it.
+        self._agent_gate_has_room: Callable[[], bool] = lambda: True
 
     async def _conversation_history_for_session(self, session_id):
         return []
@@ -150,11 +175,25 @@ def test_a_never_attempted_record_is_drained_before_it_can_expire(home):
 
 # ── (3) an expiry that DOES happen goes back to the sender as a FAILURE ───────
 
+def _offered(lane_home, target="platform-stl"):
+    """An OFFERED record: claimed by a turn, then handed back to the queue contended.
+
+    This is the ONLY shape that still files a failure notice -- a record a turn was
+    actually offered and left unread (t_43f11055 c).
+    """
+    record = q.claim_next(lane_home, target_profile=target, lease_ok=True)
+    assert record is not None and record["attempts"] == 1
+    requeued = q.requeue(lane_home, record["delivery_id"])
+    assert requeued["attempts"] == 1 and requeued["status"] == q.STATUS_QUEUED
+    return requeued
+
+
 def test_an_expired_record_files_one_sender_visible_failure(home):
     target = _lane(home, "platform-stl")
     sender = _lane(home, "platform-coder")
     age = q.queue_ttl_seconds() * 2 + 60
-    record = _admit(target, target="platform-stl", sender="platform-coder", age_seconds=age)
+    _admit(target, target="platform-stl", sender="platform-coder", age_seconds=age)
+    record = _offered(target)
 
     q.sweep_delivery_queue(target, on_expired=q.notice_expired_to_sender)
 
@@ -173,6 +212,7 @@ def test_the_failure_notice_is_idempotent(home):
     sender = _lane(home, "platform-coder")
     age = q.queue_ttl_seconds() * 2 + 60
     _admit(target, target="platform-stl", sender="platform-coder", age_seconds=age)
+    _offered(target)
 
     q.sweep_delivery_queue(target, on_expired=q.notice_expired_to_sender)
     q.sweep_delivery_queue(target, on_expired=q.notice_expired_to_sender)
@@ -187,6 +227,122 @@ def test_a_notice_about_a_notice_is_never_filed(home):
         "sender_profile": q.EXPIRED_NOTICE_SENDER,
         "target_profile": "platform-stl",
         "created_at": time.time_ns() - 10**12,
+        "attempts": 1,
         "attempts_log": [],
     }
     assert q.notice_expired_to_sender(record) is None
+
+
+# ── (4) the cap and the classification: t_43f11055 ────────────────────────────
+
+def test_a_full_agent_cap_expires_nothing(home, monkeypatch):
+    """(a) The cap is a FLEET-WIDE condition, not this record's outcome."""
+    lane = _lane(home, "platform-stl")
+    age = q.queue_ttl_seconds() * 2 + 60
+    record = _admit(lane, target="platform-stl", message="waiting on a free place",
+                    age_seconds=age)
+    calls = _LogCapture()
+    monkeypatch.setattr(q, "logger", calls)
+    adapter = _Adapter()
+    adapter._agent_gate_has_room = lambda: False
+
+    assert asyncio.run(drain.sweep_once(adapter, home)) == 0
+
+    settled = q.read_record(lane, record["delivery_id"])
+    assert settled is not None
+    assert settled["status"] == q.STATUS_QUEUED, (
+        "expiry dead-lettered a record the DRAIN was deferring on the cap")
+    assert settled["attempts"] == 0
+    assert "age_kept_agent_cap" in calls, "the deferral must be traceable"
+    assert "age_kept_slot_held" not in calls, "the slot was free; the cap was not"
+    assert adapter.calls == []
+
+
+def test_the_backlog_runs_once_the_cap_frees_a_place(home):
+    """The same record, one tick later: offered, attempted, delivered."""
+    lane = _lane(home, "platform-stl")
+    age = q.queue_ttl_seconds() * 2 + 60
+    record = _admit(lane, target="platform-stl", message="late but not lost",
+                    age_seconds=age)
+    state = {"room": False}
+    adapter = _Adapter()
+    adapter._agent_gate_has_room = lambda: state["room"]
+
+    asyncio.run(drain.sweep_once(adapter, home))
+    assert q.read_record(lane, record["delivery_id"])["status"] == q.STATUS_QUEUED
+
+    state["room"] = True
+    assert asyncio.run(drain.sweep_once(adapter, home)) == 1
+
+    settled = q.read_record(lane, record["delivery_id"])
+    assert settled["status"] == q.STATUS_DELIVERED
+    assert settled["attempts"] == 1, "an offered record records the attempt"
+    assert [call["user_message"] for call in adapter.calls] == ["late but not lost"]
+
+
+def test_an_unoffered_expiry_is_classified_and_files_no_notice(home):
+    """(b)+(c): reason ``never_offered``, and NO new queued record anywhere."""
+    target = _lane(home, "platform-stl")
+    sender = _lane(home, "platform-coder")
+    age = q.queue_ttl_seconds() * 2 + 60
+    record = _admit(target, target="platform-stl", sender="platform-coder",
+                    age_seconds=age)
+
+    q.sweep_delivery_queue(target, on_expired=q.notice_expired_to_sender)
+
+    settled = q.read_record(target, record["delivery_id"])
+    assert settled["status"] == q.STATUS_EXPIRED
+    assert settled["reason"] == q.REASON_NEVER_OFFERED
+    assert settled["reason"] != q.REASON_QUEUED_EXPIRED
+    assert "never offered" in settled["status_detail"]
+    assert q._list(q.delivery_root(sender), q.QUEUE_DIR) == [], (
+        "an unoffered expiry must not queue a fresh turn behind the same busy lane")
+    assert q._list(q.delivery_root(target), q.QUEUE_DIR) == []
+
+
+def test_the_failure_reaches_the_senders_live_context_when_it_has_one(home, monkeypatch):
+    """(c) first branch: into the sender's NEXT TURN CONTEXT, never a queued turn."""
+    from tools import bot_live_delivery as live
+
+    target = _lane(home, "platform-stl")
+    sender = _lane(home, "platform-coder")
+    owner = {"profile_home": str(sender), "session_id": "s", "lease_id": "l",
+             "live_session_id": "s"}
+    calls = []
+    monkeypatch.setattr(live, "find_canonical_live_owner", lambda _home: dict(owner))
+    monkeypatch.setattr(
+        live,
+        "deliver_to_live_owner",
+        lambda _home, _owner, message, **kwargs: calls.append((message, kwargs))
+        or {"delivery_id": kwargs.get("delivery_id")},
+    )
+    age = q.queue_ttl_seconds() * 2 + 60
+    _admit(target, target="platform-stl", sender="platform-coder", age_seconds=age)
+
+    q.sweep_delivery_queue(target, on_expired=q.notice_expired_to_sender)
+
+    assert len(calls) == 1, "the sender must still learn its delivery died"
+    message, kwargs = calls[0]
+    assert "NEVER read" in message and "never offered" in message
+    assert kwargs["notification_category"] == "diagnostic"
+    assert q._list(q.delivery_root(sender), q.QUEUE_DIR) == []
+    assert not (q.delivery_root(sender) / "settled").exists() or (
+        q._list(q.delivery_root(sender), q.SETTLED_DIR) == []
+    )
+
+
+def test_the_notice_loop_cannot_form(home):
+    """(c) end to end: repeated sweeps of both lanes create no second-order record."""
+    target = _lane(home, "platform-stl")
+    sender = _lane(home, "platform-coder")
+    age = q.queue_ttl_seconds() * 2 + 60
+    _admit(target, target="platform-stl", sender="platform-coder", age_seconds=age)
+
+    for _ in range(3):
+        q.sweep_delivery_queue(target, on_expired=q.notice_expired_to_sender)
+        q.sweep_delivery_queue(sender, on_expired=q.notice_expired_to_sender)
+
+    assert q._list(q.delivery_root(sender), q.QUEUE_DIR) == []
+    assert q._list(q.delivery_root(sender), q.SETTLED_DIR) == [], (
+        "a notice about a notice is how the loop used to feed itself")
+    assert len(q._list(q.delivery_root(target), q.SETTLED_DIR)) == 1

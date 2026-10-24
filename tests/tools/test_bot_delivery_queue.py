@@ -24,6 +24,28 @@ def _did(n: int) -> str:
     return "%032x" % n
 
 
+class _LogCapture:
+    """The module logger, captured: the deferral events are the only trace there is."""
+
+    def __init__(self):
+        self.lines = []
+
+    def info(self, msg, *args, **kwargs):
+        self.lines.append(msg % args if args else str(msg))
+
+    def exception(self, msg, *args, **kwargs):  # pragma: no cover - failure path
+        self.lines.append("EXCEPTION " + (msg % args if args else str(msg)))
+
+    def debug(self, msg, *args, **kwargs):
+        self.lines.append("debug " + (msg % args if args else str(msg)))
+
+    def warning(self, msg, *args, **kwargs):
+        self.lines.append("warning " + (msg % args if args else str(msg)))
+
+    def __contains__(self, needle):
+        return any(needle in line for line in self.lines)
+
+
 def _admit(home, n=1, *, sender="alpha", target="bravo", profile_hint=None, now_ns=None):
     return q.admit(
         home,
@@ -273,16 +295,65 @@ def test_settle_failed_carries_error_and_reason(tmp_path):
 
 
 # ---------------------------------------------------------------- expiry + sweep
-def test_sweep_expires_over_age_records(tmp_path):
+def test_sweep_expires_an_unoffered_record_as_never_offered(tmp_path):
+    """t_43f11055 (b): accepted, NEVER OFFERED to a turn, then dead-lettered."""
     old = time.time_ns() - int(2 * 3600 * 1e9)
     _admit(tmp_path, 1, now_ns=old)
     assert q.sweep_delivery_queue(tmp_path) == 1
     record = q.read_record(tmp_path, _did(1))
     assert record["status"] == "expired"
-    assert record["reason"] == q.REASON_QUEUED_EXPIRED
-    assert record["status_detail"] == "queued 1800s without a free turn slot; not delivered"
+    assert record["reason"] == q.REASON_NEVER_OFFERED
+    assert record["status_detail"] == q.never_offered_detail()
+    assert "never offered" in record["status_detail"]
     assert _settled_path(tmp_path, 1).exists()
     assert q.sweep_delivery_queue(tmp_path) == 0
+
+
+def test_sweep_expires_an_offered_record_as_queued_expired(tmp_path):
+    """The other classification: a turn WAS offered it and it still went unread."""
+    old = time.time_ns() - int(2 * 3600 * 1e9)
+    _admit(tmp_path, 1, now_ns=old)
+    claimed = q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
+    assert claimed["attempts"] == 1
+    # Offered, then handed back to the queue (a contended lease): attempts stays 1
+    q.requeue(tmp_path, _did(1))
+    assert q.sweep_delivery_queue(tmp_path) == 1
+    record = q.read_record(tmp_path, _did(1))
+    assert record["status"] == "expired"
+    assert record["reason"] == q.REASON_QUEUED_EXPIRED
+    assert record["status_detail"] == q.expired_detail()
+
+
+def test_sweep_expires_nothing_while_the_agent_cap_is_full(tmp_path, monkeypatch):
+    """t_43f11055 (a): the cap is a fleet-wide deferral, not an expiry verdict."""
+    old = time.time_ns() - int(2 * 3600 * 1e9)
+    _admit(tmp_path, 1, now_ns=old)
+    calls = _LogCapture()
+    monkeypatch.setattr(q, "logger", calls)
+
+    assert q.sweep_delivery_queue(tmp_path, agent_cap_has_room_fn=lambda: False) == 0
+
+    assert q.read_record(tmp_path, _did(1))["status"] == "queued"
+    assert "age_kept_agent_cap" in calls
+    assert "age_kept_slot_held" not in calls
+
+
+def test_the_registered_cap_probe_answers_expiry_with_no_caller_argument(tmp_path):
+    """The HOURLY chore passes no argument: the probe this process registered answers."""
+    old = time.time_ns() - int(2 * 3600 * 1e9)
+    _admit(tmp_path, 1, now_ns=old)
+    try:
+        q.register_agent_cap_probe(lambda: False)
+        assert q.agent_cap_has_room() is False
+        assert q.sweep_delivery_queue(tmp_path) == 0
+        assert q.read_record(tmp_path, _did(1))["status"] == "queued"
+        q.register_agent_cap_probe(lambda: True)
+        assert q.sweep_delivery_queue(tmp_path) == 1
+        assert q.read_record(tmp_path, _did(1))["status"] == "expired"
+    finally:
+        q.register_agent_cap_probe(None)
+    # with no probe, unknown is not full -- a CLI has no view of the cap
+    assert q.agent_cap_has_room() is True
 
 
 def test_sweep_leaves_fresh_records_alone(tmp_path):
@@ -400,6 +471,15 @@ def test_build_envelope_delivered(tmp_path):
     assert env["busy"] is False
 
 
+def test_never_offered_is_in_the_documented_failure_vocabulary():
+    """The reason we settle with must be a code consumers were told about (t_43f11055 b)."""
+    from tools import bot_failure_reasons as reasons
+
+    assert q.REASON_NEVER_OFFERED == reasons.NEVER_OFFERED
+    assert reasons.NEVER_OFFERED in reasons.ALL_REASONS
+    assert reasons.retry_action(reasons.NEVER_OFFERED) == reasons.RETRY_NONE
+
+
 def test_build_envelope_expired_and_unknown(tmp_path):
     old = time.time_ns() - int(2 * 3600 * 1e9)
     _admit(tmp_path, 1, now_ns=old)
@@ -407,8 +487,8 @@ def test_build_envelope_expired_and_unknown(tmp_path):
     env = q.build_envelope(q.read_record(tmp_path, _did(1)))
     assert env["result"] == "failed"
     assert env["status"] == "expired"
-    assert env["reason"] == q.REASON_QUEUED_EXPIRED
-    assert env["detail"] == "queued 1800s without a free turn slot; not delivered"
+    assert env["reason"] == q.REASON_NEVER_OFFERED
+    assert env["detail"] == q.never_offered_detail()
     assert env["retryable"] is False
 
 
