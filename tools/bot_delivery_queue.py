@@ -160,16 +160,10 @@ DETAIL_HELD_LIVE = (
 STATUS_DETAIL_TARGET_BUSY = "target_busy: turn slot held by another turn; delivery queued"
 STATUS_DETAIL_LIVE_OWNER = "live_owner_present"
 STATUS_DETAIL_LEASE_CONTENDED = "lease_contended"
-#: A claim recovered as a LOST LEASE: the turn that took the claim
-#: never ended it, ``2 x`` the queue TTL has passed and no live process holds the seat,
-#: so the freeze the claim bought is void and the record goes back to ``queued``.
-STATUS_DETAIL_LEASE_LOST = (
-    "lease_lost: the claim outlived 2x the queue TTL with no live holder; re-offered"
-)
-#: The same lost lease, dead-lettered: re-offering it is not owed. One wording for
-#: both reasons (attempts exhausted, or the record's own delivery deadline already
-#: passed), so the detail never claims a cause that did not apply -- the log event
-#: carries which one it was.
+#: A claim recovered as a LOST LEASE, dead-lettered: the turn that took the claim
+#: never ended it, ``2 x`` the queue TTL has passed with no live process holding the
+#: seat, and by then the record's own delivery deadline is gone too -- so it is
+#: settled ``failed`` and its sender told, never re-offered.
 STATUS_DETAIL_LEASE_DEAD_LETTER = (
     "lease_lost: the claim outlived 2x the queue TTL with no live holder; not delivered"
 )
@@ -194,8 +188,9 @@ LIMIT_PER_SENDER = "per_sender"
 
 REASON_QUEUED_EXPIRED = "queued_expired"
 #: A claim whose lease ran out: the turn it was taken for never
-#: settled it and no live process holds the seat. Terminal form only -- a recovered
-#: claim that is re-offered carries no reason, it is QUEUED again.
+#: settled it and no live process holds the seat. Terminal only -- a lost lease is
+#: past its delivery deadline by construction, so it is dead-lettered under this
+#: reason, never re-offered.
 REASON_LEASE_LOST = "lease_lost"
 
 #: An over-age record whose expiry found it NEVER OFFERED to a turn (``attempts == 0``).
@@ -407,8 +402,9 @@ def agent_cap_has_room(probe: Any = None) -> bool:
 #: A claim is a lease with an EXPIRY: ``2 x`` the queue TTL. Past it, with no live
 #: holder naming the seat, the claim is unauthorised -- the freeze it bought is void
 #: (``queued_seconds``), the census counts it as ``claimed_stuck``, and the sweep
-#: recovers it (re-offer, then dead-letter). Not a config key: the ruling derives it
-#: from the TTL so the two can never drift apart.
+#: recovers it: dead-lettered and its sender told (never re-offered, since a lost
+#: lease is past its delivery deadline by construction). Not a config key: the
+#: ruling derives it from the TTL so the two can never drift apart.
 LEASE_TTL_MULTIPLIER = 2.0
 
 
@@ -1200,7 +1196,7 @@ def cleanup_bot_delivery_queue(max_age_hours: float | None = None) -> int:
     A peer delivery is admitted into its TARGET lane's own home
     (``profiles/<lane>/runtime/bot_delivery``), so sweeping only the default home
     left a named lane's backlog with no expiry and no orphan-claim recovery at all
-    (the drain-gate repair).
+    (card t_8a7a47d7).
     """
     del max_age_hours
     try:
@@ -1214,35 +1210,6 @@ def cleanup_bot_delivery_queue(max_age_hours: float | None = None) -> int:
     except Exception:  # pragma: no cover - housekeeping must not raise
         logger.debug("bot_delivery sweep failed", exc_info=True)
         return 0
-
-
-def _requeue_lost_lease(root: Path, record: dict[str, Any], *, now_ns: int) -> dict[str, Any]:
-    """Return a leaked claim to ``queue/`` in place (the caller holds the spool lock).
-
-    The turn was never paid for, so -- exactly like :func:`requeue_unstarted` -- the
-    claim's ``attempts += 1`` and its still-open ``attempts_log`` entry are rolled
-    back, and ``reoffer_count`` (not ``attempts``) records that this record was
-    offered and abandoned again.
-    """
-    updated = dict(record)
-    delivery_id = updated["delivery_id"]
-    updated["attempts"] = max(0, int(updated.get("attempts", 0)) - 1)
-    log = list(updated.get("attempts_log") or [])
-    if log and log[-1].get("ended_at") is None:
-        log.pop()
-    updated["attempts_log"] = log
-    updated["status"] = STATUS_QUEUED
-    updated["reoffer_count"] = int(updated.get("reoffer_count", 0)) + 1
-    updated["claimed_at"] = None
-    updated["status_detail"] = STATUS_DETAIL_LEASE_LOST
-    updated["updated_at"] = now_ns
-    updated["sequence"] = int(updated.get("sequence", 0))
-    queued_path = root / QUEUE_DIR / f"{delivery_id}.json"
-    os.replace(root / CLAIMED_DIR / f"{delivery_id}.json", queued_path)
-    updated["queue_position"] = _queue_position(root, updated) or 1
-    _write(queued_path, updated)
-    _fsync_dir(root / CLAIMED_DIR)
-    return dict(updated)
 
 
 def _settle_lost_lease(root: Path, record: dict[str, Any], *, now_ns: int) -> dict[str, Any]:
@@ -1312,19 +1279,23 @@ def sweep_delivery_queue(
 
     ``expire=False`` runs the recovery passes ONLY (orphaned claims + lost leases).
     The drainer takes that form before its drain and the full form after it (card
-    the drain gate): a record that was never offered to a turn (``attempts == 0``) must
+    t_8a7a47d7): a record that was never offered to a turn (``attempts == 0``) must
     get its first -- and on that tick, only -- chance to run before TTL can
     dead-letter it, or the backlog is reaped the same tick the drainer finally
     reaches the lane.
 
     A CLAIM IS A LEASE WITH AN EXPIRY: a record in ``claimed/``
     whose attempt never ended, whose claim is older than
-    :func:`lease_expiry_seconds`, and whose seat has no LIVE holder is a lost lease.
-    It is re-offered (``reoffer_count`` bumped) while ``reoffer_count`` is under
-    ``max_turn_attempts`` AND the record is still inside its own delivery TTL --
-    a lost lease must not resurrect a delivery the deadline already condemned, and
-    pass 2 would reap it in the same tick with a notice saying it was never read.
-    Otherwise it is dead-lettered ``failed`` / ``lease_lost`` and its sender told.
+    :func:`lease_expiry_seconds` (= ``2 x`` the queue TTL), and whose seat has no
+    LIVE holder is a lost lease. It is dead-lettered ``failed`` / ``lease_lost``,
+    its open attempt is closed, and its sender is told.
+
+    A lost lease is PAST ITS OWN DELIVERY DEADLINE BY CONSTRUCTION: the lease is
+    only lost once the claim is older than ``2 x`` TTL, so the waiting has accrued
+    past the TTL (see :func:`queued_seconds`, which voids the freeze past the
+    lease) and pass 2 would reap the record in this same tick anyway. So it is
+    NEVER re-offered -- resurrecting it would deliver hours- or days-old peer work,
+    and the truthful outcome is the terminal one.
     A record with a live holder, or a young claim, is untouched: a turn that is
     genuinely running keeps its record exactly as it is.
 
@@ -1360,23 +1331,17 @@ def sweep_delivery_queue(
             if not lease_lost(record, home=home, now_ns=now_ns):
                 continue
             delivery_id = record["delivery_id"]
-            reoffer_count = int(record.get("reoffer_count", 0))
-            # A lost lease does not RESURRECT a record past its own delivery deadline:
-            # re-offering one would either deliver days-old work or be reaped by pass 2
-            # below with a notice that says it was never read. Both are wrong, so the
-            # deadline decides -- and past it the terminal reason is the truthful one.
-            over_deadline = ttl > 0 and queued_seconds(record, now_ns=now_ns) > ttl
-            if not over_deadline and reoffer_count < max_turn_attempts():
-                updated = _requeue_lost_lease(root, record, now_ns=now_ns)
-                _log("lease_lost", updated, action="requeued",
-                     reoffer_count=updated.get("reoffer_count"),
-                     claim_age_seconds=round(claim_age_seconds(record, now_ns=now_ns) or 0, 1))
-            else:
-                updated = _settle_lost_lease(root, record, now_ns=now_ns)
-                _log("lease_lost", updated, action="failed", reason=REASON_LEASE_LOST,
-                     reoffer_count=reoffer_count, over_deadline=over_deadline,
-                     claim_age_seconds=round(claim_age_seconds(record, now_ns=now_ns) or 0, 1))
-                lost.append(updated)
+            # A lost lease is PAST ITS OWN DEADLINE BY CONSTRUCTION (lease = 2 x TTL,
+            # and the lease is only lost once the waiting has accrued past the TTL),
+            # so resurrection is never on the table: delivering hours-old peer work,
+            # or re-offering it for pass 2 to reap in this same tick with a notice
+            # saying it was never read, are both wrong. Dead-letter it, and tell the
+            # sender -- the terminal reason is the truthful one.
+            updated = _settle_lost_lease(root, record, now_ns=now_ns)
+            _log("lease_lost", updated, action="failed", reason=REASON_LEASE_LOST,
+                 reoffer_count=int(record.get("reoffer_count", 0)),
+                 claim_age_seconds=round(claim_age_seconds(record, now_ns=now_ns) or 0, 1))
+            lost.append(updated)
             actions += 1
 
         # 2. expire records that waited past the TTL

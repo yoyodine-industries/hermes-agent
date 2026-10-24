@@ -88,12 +88,6 @@ def _settled(home, n=1) -> dict:
     )
 
 
-def _queued(home, n=1) -> dict:
-    return json.loads(
-        (_spool(home) / q.QUEUE_DIR / f"{_did(n)}.json").read_text(encoding="utf-8")
-    )
-
-
 # ---------------------------------------------------------------- the predicate
 def test_lease_is_twice_the_queue_ttl():
     assert q.lease_expiry_seconds() == 2 * q.queue_ttl_seconds()
@@ -125,22 +119,38 @@ def test_a_closed_attempt_is_never_a_lost_lease(tmp_path):
 
 
 # ---------------------------------------------------------------- (a) recovery
-def test_lost_lease_is_reoffered_while_its_deadline_stands(tmp_path, monkeypatch):
-    """(a) the re-offer branch: bump ``reoffer_count``, roll the attempt back."""
-    monkeypatch.setattr(q, "lease_expiry_seconds", lambda: 5.0)
-    home = _root(tmp_path / "hermes")
-    _record, claimed_path = _leaked_claim(home, 1, age_seconds=60)
+def test_lost_lease_is_dead_lettered_never_reoffered(tmp_path):
+    """The production shape: the YOUNGEST lost lease (claimed_at = 2 x TTL + 1s).
 
-    assert q.sweep_delivery_queue(home, on_lease_lost=None) == 1
+    At its own constants a lost lease has always passed its delivery deadline, so
+    the shipping outcome is the dead-letter arm -- ``failed`` / ``lease_lost`` with
+    the open attempt closed, ``reoffer_count`` untouched, exactly ONE sender
+    notice, and nothing put back in ``queue/``.
+    """
+    home = _root(tmp_path / "hermes")
+    # the youngest possible lost lease: one second past 2 x TTL, no live holder.
+    # (The boundary itself is not asserted -- a wall-clock age of exactly 2 x TTL
+    # turns into "older than" the moment the clock ticks; the ruling is strict.)
+    record, claimed_path = _leaked_claim(home, 1, age_seconds=LEASE + 1,
+                                         reoffer_count=2)
+    assert q.lease_lost(record, home=home) is True
+    notices = []
+
+    assert q.sweep_delivery_queue(home, on_lease_lost=notices.append) == 1
 
     assert not claimed_path.exists()
-    queued = _queued(home)
-    assert queued["status"] == q.STATUS_QUEUED
-    assert queued["reoffer_count"] == 1
-    assert queued["attempts"] == 0          # the turn was never paid for
-    assert queued["attempts_log"] == []     # the open attempt is gone with it
-    assert queued["claimed_at"] is None
-    assert queued["status_detail"] == q.STATUS_DETAIL_LEASE_LOST
+    settled = _settled(home)
+    assert settled["status"] == q.STATUS_FAILED
+    assert settled["reason"] == q.REASON_LEASE_LOST
+    assert settled["status_detail"] == q.STATUS_DETAIL_LEASE_DEAD_LETTER
+    assert settled["reoffer_count"] == 2          # unchanged: it was not re-offered
+    assert all(entry.get("ended_at") for entry in settled["attempts_log"])
+    assert [r["delivery_id"] for r in notices] == [_did(1)]   # exactly one notice
+    # zero requeues: nothing was returned to queue/
+    assert not (_spool(home) / q.QUEUE_DIR / f"{_did(1)}.json").exists()
+    # a second sweep is a no-op -- the record is terminal, not a backlog entry
+    assert q.sweep_delivery_queue(home, on_lease_lost=notices.append) == 0
+    assert len(notices) == 1
 
 
 def test_lost_lease_past_its_deadline_is_dead_lettered(tmp_path):
@@ -163,20 +173,6 @@ def test_lost_lease_past_its_deadline_is_dead_lettered(tmp_path):
     assert all(entry.get("ended_at") for entry in settled["attempts_log"])
     assert settled["attempts_log"][-1]["reason"] == q.REASON_LEASE_LOST
     assert settled["claimed_at"] == record["claimed_at"]
-
-
-def test_reoffered_branch_still_respects_the_delivery_deadline(tmp_path, monkeypatch):
-    """A lost lease does not resurrect a delivery the TTL already condemned."""
-    monkeypatch.setattr(q, "lease_expiry_seconds", lambda: 5.0)
-    home = _root(tmp_path / "hermes")
-    # claim leaked 40 minutes ago: past the lease (5s) AND past the 30min TTL
-    _leaked_claim(home, 1, age_seconds=TTL + 600, reoffer_count=0)
-
-    q.sweep_delivery_queue(home, on_lease_lost=None)
-
-    settled = _settled(home)
-    assert settled["status"] == q.STATUS_FAILED
-    assert settled["reason"] == q.REASON_LEASE_LOST
 
 
 def test_recovery_is_idempotent(tmp_path):
