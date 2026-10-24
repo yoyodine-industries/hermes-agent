@@ -181,6 +181,15 @@ LIMIT_PER_SENDER = "per_sender"
 
 REASON_QUEUED_EXPIRED = "queued_expired"
 
+#: An over-age record whose expiry found it NEVER OFFERED to a turn (``attempts == 0``).
+#: t_43f11055 (b): such a record was dead-lettered by the expiry gate while the DRAIN
+#: gate was deferring it -- 112 of the fleet's 116 expired records carry attempts=0.
+#: Calling that ``queued_expired`` blames the lane's queue for the drain's own
+#: deferral; this reason is the fact the strand census counts, and the one an expiry
+#: files no notice for (c), so an unoffered expiry can never feed a notice back into
+#: the same busy spool.
+REASON_NEVER_OFFERED = "never_offered"
+
 #: `retryable(envelope)` is derived from the *envelope reason* only. It is
 #: unrelated to ``retry_action()`` (agent auto-retry) -- never derive one from
 #: the other.
@@ -338,11 +347,72 @@ def observed_detail(home: str | os.PathLike[str], profile: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# the AGENT-WORK cap, as expiry must see it (t_43f11055 a)
+# --------------------------------------------------------------------------
+#: The drain defers on the agent-work cap (the same gate the 429 asks) and on a held
+#: slot; expiry used to ask ONLY the slot. So while the cap was full the drain offered
+#: nothing, queue age kept accruing, and the same tick's expiry dead-lettered records
+#: with ``attempts=0`` -- 112 live records, the fleet's whole expired set.
+#:
+#: The cap is process state (in-flight turns), so the process that owns it registers a
+#: probe here ONCE; every expiry caller -- the 30s gateway sweep AND the hourly chore --
+#: then asks the same gate the drain asks instead of a per-caller guess.
+_AGENT_CAP_PROBE: Any = None
+
+
+def register_agent_cap_probe(probe: Any) -> None:
+    """Register (or clear, with ``None``) this process's view of the agent-work cap."""
+    global _AGENT_CAP_PROBE
+    _AGENT_CAP_PROBE = probe
+
+
+def agent_cap_has_room(probe: Any = None) -> bool:
+    """Whether the AGENT-WORK cap allows one more turn to START.
+
+    ``None`` (no probe registered and none handed in) is UNKNOWN, and unknown is not
+    full: a CLI or a test has no view of the cap and must not be handed a fleet-wide
+    "full" it cannot measure. Only the process that owns the cap can answer, and it
+    registers :func:`register_agent_cap_probe`. Never raises -- an unreadable cap
+    must not dead-letter a record, exactly as an unreadable lock reads as free.
+    """
+    fn = _AGENT_CAP_PROBE if probe is None else probe
+    if not callable(fn):
+        return True
+    try:
+        return bool(fn())
+    except Exception:  # a probe failure is not an expiry verdict
+        return True
+
+
+# --------------------------------------------------------------------------
 # user-facing strings
 # --------------------------------------------------------------------------
 def expired_detail(ttl_seconds: float | None = None) -> str:
     ttl = queue_ttl_seconds() if ttl_seconds is None else ttl_seconds
     return f"queued {int(ttl)}s without a free turn slot; not delivered"
+
+
+def never_offered_detail(ttl_seconds: float | None = None) -> str:
+    """The honest detail for an expiry that found the record never offered to a turn."""
+    ttl = queue_ttl_seconds() if ttl_seconds is None else ttl_seconds
+    return (
+        f"queued {int(ttl)}s and expired without ever being offered to a turn; "
+        f"the drain never offered it"
+    )
+
+
+def expiry_classification(
+    record: dict[str, Any], ttl_seconds: float | None = None
+) -> tuple[str, str]:
+    """The ONE classifier for an over-age record: ``(reason, status_detail)``.
+
+    Both expiry paths ask this -- :func:`mark_expired` and the sweep -- so a record
+    that was accepted and never OFFERED to a turn (``attempts == 0``) is
+    ``never_offered`` on either path, never ``queued_expired`` (t_43f11055 b).
+    """
+    if int(record.get("attempts") or 0) <= 0:
+        return REASON_NEVER_OFFERED, never_offered_detail(ttl_seconds)
+    return REASON_QUEUED_EXPIRED, expired_detail(ttl_seconds)
 
 
 def queue_full_detail(
@@ -384,7 +454,9 @@ def build_notification_text(record: dict[str, Any]) -> str:
         return DETAIL_ADMISSION_CAP
     status = record.get("status")
     if status == STATUS_EXPIRED:
-        return expired_detail()
+        # An expiry prints the CLASSIFICATION it settled with -- ``never_offered`` for a
+        # record no turn was ever offered (t_43f11055 b) -- never a blanket "no free slot".
+        return record.get("status_detail") or expired_detail()
     if status == STATUS_AMBIGUOUS:
         return unknown_detail(record.get("idempotency_key"))
     if record.get("reason") == "queue_full":
@@ -900,7 +972,12 @@ def settle(
 def mark_expired(
     home: str | os.PathLike[str], delivery_id: str, *, now_ns: int | None = None
 ) -> dict[str, Any]:
-    """Settle an over-age ``queued`` record as ``expired``."""
+    """Settle an over-age ``queued`` record as ``expired``.
+
+    The classification comes from :func:`expiry_classification`, the same one the
+    sweep asks: a record this never offered to a turn expires as ``never_offered``
+    (t_43f11055 b).
+    """
     key_id = validate_delivery_id(delivery_id)
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     with _locked(home) as root:
@@ -913,8 +990,7 @@ def mark_expired(
             raise FileNotFoundError(f"no queued record for {key_id}")
         updated = dict(record)
         updated["status"] = STATUS_EXPIRED
-        updated["reason"] = REASON_QUEUED_EXPIRED
-        updated["status_detail"] = expired_detail()
+        updated["reason"], updated["status_detail"] = expiry_classification(record)
         updated["updated_at"] = now_ns
         updated["queue_position"] = None
         os.replace(queued_path, root / SETTLED_DIR / f"{key_id}.json")
@@ -1031,6 +1107,7 @@ def sweep_delivery_queue(
     *,
     now_ns: int | None = None,
     slot_held_fn: Any = None,
+    agent_cap_has_room_fn: Any = None,
     expire: bool = True,
     on_expired: Any = None,
 ) -> int:
@@ -1039,10 +1116,24 @@ def sweep_delivery_queue(
     Runs hourly and on every 30s drainer tick (VERIFICATION D1 trigger 4).
     Returns the number of records it acted on.
 
-    An over-age record is expired only while its target's turn slot is FREE. A
-    target mid-turn (a desktop session can hold the slot for a whole lease wait)
-    must not have its inbound delivery expire underneath it: the slot holder is
-    exactly the turn that will drain it next.
+    An over-age record is expired only while its target's turn slot is FREE **and**
+    the AGENT-WORK cap has room -- the SAME two deferrals the drain applies before it
+    will offer a record to a turn (t_43f11055 a). A target mid-turn (a desktop session
+    can hold the slot for a whole lease wait) must not have its inbound delivery expire
+    underneath it: the slot holder is exactly the turn that will drain it next. And a
+    full cap is a FLEET-WIDE condition, not this record's outcome: while the drain is
+    deferring on it, queue age must keep counting without dead-lettering what the drain
+    will offer the moment the cap frees a place -- ``age_kept_slot_held`` /
+    ``age_kept_agent_cap``.
+
+    ``agent_cap_has_room_fn`` is how a caller hands in its view of the cap; omitted, the
+    probe this process registered (:func:`register_agent_cap_probe`) answers, and a
+    process with neither answers "room" -- unknown is not full, exactly as the drain
+    treats an unreadable gate.
+
+    Expiry is classified by :func:`expiry_classification`: a record NEVER offered to a
+    turn (``attempts == 0``) expires as ``never_offered``, which is the fact the strand
+    census counts and which files NO notice (t_43f11055 b/c).
 
     ``expire=False`` runs the orphaned-claim recovery ONLY. The drainer takes that
     form before its drain and the full form after it (card t_8a7a47d7): a record
@@ -1058,6 +1149,7 @@ def sweep_delivery_queue(
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     ttl = queue_ttl_seconds()
     held = slot_held if slot_held_fn is None else slot_held_fn
+    cap_has_room = agent_cap_has_room(agent_cap_has_room_fn)
     actions = 0
     expired: list[dict[str, Any]] = []
     with _locked(home) as root:
@@ -1080,19 +1172,26 @@ def sweep_delivery_queue(
                     continue
                 if queued_seconds(record, now_ns=now_ns) <= ttl:
                     continue
+                if not cap_has_room:
+                    # The cap is fleet-wide: the drain is deferring this record for a
+                    # condition that is not the record's fault and will clear. Age
+                    # keeps counting; the expiry does not (t_43f11055 a).
+                    _log("age_kept_agent_cap", record)
+                    continue
                 if held(home, record.get("target_profile") or ""):
                     _log("age_kept_slot_held", record)
                     continue
                 updated = dict(record)
                 updated["status"] = STATUS_EXPIRED
-                updated["reason"] = REASON_QUEUED_EXPIRED
-                updated["status_detail"] = expired_detail(ttl)
+                updated["reason"], updated["status_detail"] = expiry_classification(
+                    record, ttl
+                )
                 updated["updated_at"] = now_ns
                 updated["queue_position"] = None
                 path = root / QUEUE_DIR / f"{updated['delivery_id']}.json"
                 os.replace(path, root / SETTLED_DIR / f"{updated['delivery_id']}.json")
                 _write(root / SETTLED_DIR / f"{updated['delivery_id']}.json", updated)
-                _log("expired", updated, reason=REASON_QUEUED_EXPIRED)
+                _log("expired", updated, reason=updated["reason"])
                 expired.append(updated)
                 actions += 1
     if on_expired is not None:
@@ -1320,6 +1419,51 @@ def _profile_home(profile: str) -> Path | None:
         return None
 
 
+def _never_offered_failure_message(
+    record: dict[str, Any], delivery_id: str, target: str, now_ns: int | None
+) -> str:
+    """What the sender is told when its delivery expired without ever being offered."""
+    waited = int(queued_seconds(record, now_ns=now_ns))
+    return (
+        f"[peer-delivery FAILED] your delivery {delivery_id} to {target} was NEVER read: "
+        f"it waited {waited}s queued and expired without ever being offered to a turn "
+        f"(the drain never offered it). The earlier 'queued' receipt is NOT a pending "
+        f"promise and nothing is still in flight. Escalate (the escalate tool) or resend "
+        f"if this still matters."
+    )
+
+
+def _deliver_into_live_context(
+    home: str | os.PathLike[str], message: str, *, record: dict[str, Any]
+) -> bool:
+    """Hand a failure notice to the sender's live session -- its next turn context.
+
+    Deliberately NOT a queued turn (t_43f11055 c): a live-mailbox delivery is claimed by
+    the session that is already running, so it can never grow the queue it reports on and
+    can never itself expire. Returns False -- never raises -- when the sender has no
+    advertised live consumer; the caller then keeps the failure in the log.
+    """
+    try:
+        from tools.bot_live_delivery import (
+            deliver_to_live_owner,
+            find_canonical_live_owner,
+        )
+
+        owner = find_canonical_live_owner(Path(home))
+        if owner is None:
+            return False
+        raw = str(record.get("delivery_id") or "")
+        notice_id = hashlib.sha256(f"{raw}:never-offered".encode()).hexdigest()
+        deliver_to_live_owner(
+            Path(home), owner, message, delivery_id=notice_id,
+            notification_category="diagnostic",
+        )
+        return True
+    except Exception:  # a notice must never break the sweep
+        logger.debug("bot_delivery never-offered live delivery failed", exc_info=True)
+        return False
+
+
 def notice_expired_to_sender(
     record: dict[str, Any],
     *,
@@ -1340,11 +1484,41 @@ def notice_expired_to_sender(
     the ambient default home). Idempotent on the expired record: one notice per
     delivery. Returns the admitted record, or None when no notice is owed -- no
     sender, a notice about a notice, an unknown profile, or a full sender queue.
+
+    An expiry of a record that was NEVER OFFERED to a turn files NO queued notice
+    (t_43f11055 c): that failure is the drain's, and queueing a fresh turn behind the
+    same busy lane is how a notice-of-a-notice loop forms -- 5 such notice records sat
+    in platform-stl's settled set. The failure is logged here with the sender, the
+    target and the delivery id, and the record itself settles as ``never_offered``,
+    which is the reason the strand census counts and escalates from the board. No new
+    queue record is ever created on that path, so the loop cannot form.
     """
     delivery_id = str(record.get("delivery_id") or "")
     sender = str(record.get("sender_profile") or "")
     target = str(record.get("target_profile") or "")
     if not delivery_id or not sender or sender == EXPIRED_NOTICE_SENDER:
+        return None
+    if int(record.get("attempts") or 0) <= 0 or record.get("reason") == REASON_NEVER_OFFERED:
+        # (c) An UNOFFERED expiry owes no queued turn: queueing one behind the same busy
+        # lane is how the notice-of-a-notice loop formed. The sender still learns the
+        # delivery died -- in its NEXT TURN CONTEXT if it has a live session, otherwise
+        # in the gateway log where the failure is searchable by sender and id. Either
+        # way nothing new can be queued, so nothing new can expire.
+        failure_home = Path(home) if home is not None else _profile_home(sender)
+        message = _never_offered_failure_message(record, delivery_id, target, now_ns)
+        delivered = (
+            failure_home is not None
+            and _deliver_into_live_context(failure_home, message, record=record)
+        )
+        _log(
+            "expired_never_offered_failure",
+            record,
+            sender=sender,
+            target=target,
+            waited_seconds=int(queued_seconds(record, now_ns=now_ns)),
+            delivered_to="live_context" if delivered else "log",
+            notice="none",
+        )
         return None
     if home is None:
         home = _profile_home(sender)
@@ -1354,7 +1528,8 @@ def notice_expired_to_sender(
     waited = int(queued_seconds(record, now_ns=now_ns))
     message = (
         f"[peer-delivery FAILED] your delivery {delivery_id} to {target} was NEVER read: "
-        f"it waited {waited}s queued and expired without being offered to a turn. "
+        f"it waited {waited}s queued and expired still unread after "
+        f"{int(record.get('attempts') or 0)} turn attempt(s). "
         f"The earlier 'queued' receipt is NOT a pending promise. Escalate (the escalate "
         f"tool) or resend if this still matters."
     )
@@ -1428,7 +1603,7 @@ def build_envelope(
     if record.get("status_detail") == STATUS_DETAIL_LIVE_OWNER:
         detail: str | None = DETAIL_HELD_LIVE
     elif status == STATUS_EXPIRED:
-        detail = expired_detail()
+        detail = record.get("status_detail") or expired_detail()
     elif status == STATUS_AMBIGUOUS:
         detail = unknown_detail(record.get("idempotency_key"))
     elif reason == "queue_full":
