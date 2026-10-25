@@ -5579,6 +5579,20 @@ def complete_task(
     landing_refusal = _gate_landing_carrier(conn, task_id, metadata)
     if landing_refusal is not None:
         return landing_refusal
+    # THE DISCHARGE GATE (design record platform-stl t_0608ce6d, card t_9a2aaaea). Both halves
+    # judge the ARGUMENT a completion closes on, at the seam, BEFORE the card is written:
+    #   E -- every ``t_<hex>`` id the handoff cites must exist on SOME board (a phantom ref is a
+    #        fabricated record; ``unknown`` never refuses, because a store that will not open is
+    #        a coverage gap and not a verdict);
+    #   F -- a completion that argues its premise is VOID must carry the measurement it is void
+    #        by, and the kernel evaluates every measurement itself.
+    # Placed exactly here, with the other completion gates: after the landing carrier (a close
+    # that already failed land is answered by that clause) and before the write txn, so a
+    # refusal leaves the card byte-untouched and hands the worker the cause that failed.
+    gate_completion_discharge(
+        conn, task_id, summary=summary, result=result, metadata=metadata,
+        verified_cards=verified_cards, force=force,
+    )
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
@@ -6083,19 +6097,17 @@ def _flag_phantom_prose_refs(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
     summary: Optional[str], result: Optional[str], verified_cards: list[str],
 ) -> None:
-    """Advisory post-commit scan of summary+result for unresolvable ``t_<hex>``
-    references; emits ``suspected_hallucinated_references`` in its own txn so
-    the completion is already durable. Never blocks."""
-    scan_text = " ".join(filter(None, [summary, result]))
-    if not scan_text:
-        return
-    phantom_refs = [p for p in _scan_prose_for_phantom_ids(conn, scan_text) if p not in set(verified_cards)]
-    if phantom_refs:
-        with write_txn(conn):
-            _append_event(
-                conn, task_id, "suspected_hallucinated_references",
-                {"phantom_refs": phantom_refs, "source": "completion_summary"}, run_id=run_id,
-            )
+    """Advisory post-commit scan of summary+result for ``t_<hex>`` references that NO
+    reachable board carries; emits ``suspected_hallucinated_references`` in its own txn so
+    the completion is already durable. Never blocks.
+
+    The RESOLVER is not here: ``hermes_cli/kanban_completion_refs.py`` owns the one tri-state
+    resolver the discharge gate also judges with (design record platform-stl t_0608ce6d), so
+    "phantom" means one thing on this host. Delegated rather than duplicated for exactly that
+    reason - two resolvers would drift, and the drift is invisible until a real card is called
+    a fabrication.
+    """
+    flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
 
 
 def _merge_completion_prose_artifacts(
@@ -8311,6 +8323,17 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+from hermes_cli.kanban_completion_refs import (
+    PhantomRefsRefused,
+    VoidClaimRefused,
+    VoidClaimUnmeasured,
+    discharge_gate_mode,
+    flag_phantom_prose_refs,
+    gate_completion_discharge,
+    gate_completion_refs,
+    gate_void_claim,
+    resolve_refs as resolve_completion_refs,
+)
 from hermes_cli.kanban_db_boards import (
     _default_board_display_name,
     board_dispatch_enabled,

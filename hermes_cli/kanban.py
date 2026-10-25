@@ -1129,6 +1129,12 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
+            except (kb.PhantomRefsRefused, kb.VoidClaimUnmeasured, kb.VoidClaimRefused) as ref_err:
+                # The DISCHARGE gate refused the ARGUMENT (design record platform-stl
+                # t_0608ce6d) and nothing was written. The kernel's message carries the cause and
+                # the remedy; render it rather than the generic "unknown id or terminal state".
+                fail_msg[tid] = str(ref_err)
+                return False
             if isinstance(done, kb.CompletionRefusal):
                 # A refusal is DATA (``complete_task``'s contract): the CLI must render the
                 # cause and its remedy, or the operator sees the generic "unknown id or
@@ -1787,13 +1793,34 @@ def _gates_from_delegated_child() -> bool:
             or kanban_path_is_fenced(kb.kanban_db_path()))
 
 
+def _print_discharge(discharge: dict) -> None:
+    """One line for the discharge gate's two families: ``phantom_refs`` and ``void_claims``.
+
+    Printed in BOTH the clean and the violated branch, because the gate's outcomes are telemetry
+    and not part of the exit code: a refusal a worker answered must be countable without turning
+    ``gates report`` red forever (design record platform-stl t_0608ce6d).
+    """
+    families = (discharge or {}).get("families") or {}
+    if not families:
+        return
+    parts = []
+    for name in ("phantom_refs", "void_claims"):
+        counts = families.get(name) or {}
+        shown = ", ".join(f"{key} {value}" for key, value in counts.items() if value)
+        parts.append(f"{name}: {shown or 'none'}")
+    print(f"Discharge gate (mode={discharge.get('mode', '?')}): " + "; ".join(parts))
+
+
 def _cmd_gates(args: argparse.Namespace) -> int:
     """``hermes kanban gates report|reconcile`` — the relations the write seams enforce.
 
     FOUR invariant families, one verb: ``rank`` (no card ranks below a card it gates),
     ``assignee`` (no row is assigned to a handle that cannot run), ``dependency`` (no block
     waits on a card in prose with no edge) and ``evidence`` (no completion carries no evidence
-    record). ``report`` is read-only and its EXIT CODE is the answer (0 = every invariant
+    record). Since the DISCHARGE gate (design record platform-stl t_0608ce6d) the record also
+    carries its two event families, ``phantom_refs`` and ``void_claims``, counted from
+    ``task_events`` - TELEMETRY, so they print and appear under ``--json`` but never move the
+    exit code. ``report`` is read-only and its EXIT CODE is the answer (0 = every invariant
     holds, 1 = at least one is violated), so a carrier can gate on it instead of parsing prose.
     ``reconcile`` is the deterministic pass: it repairs what has a deterministic repair, then
     RE-MEASURES, and a non-zero exit means the board is still out of order after the pass - a
@@ -1813,6 +1840,14 @@ def _cmd_gates(args: argparse.Namespace) -> int:
         if action == "report":
             violations = kb.gate_violations(conn)
             families = _gate_inv.report(conn)
+            # The DISCHARGE gate's event families (design record platform-stl t_0608ce6d). Read
+            # here rather than inside ``report()`` so the kernel's invariant report keeps its
+            # four-family contract, and so this telemetry can never leak into ``open_total`` /
+            # the exit code: a refusal a worker then answered is a gate WORKING, not an open
+            # violation, and counting it as one would pin the report red forever.
+            from hermes_cli.kanban_completion_refs import event_families
+
+            discharge = event_families(conn)
             record: dict = {
                 "board": kb.board_for_connection(conn) or "",
                 "violations": violations,
@@ -1821,7 +1856,8 @@ def _cmd_gates(args: argparse.Namespace) -> int:
                 "counts": families["counts"],
                 "families_total": families["violations_total"],
                 "open_total": families["open_total"],
-                "armed": families["armed"],
+                "armed": {**families["armed"], "discharge_gate": discharge["mode"]},
+                "discharge": discharge,
             }
             remaining = record["violations_total"] + families["open_total"]
         else:
@@ -1873,7 +1909,9 @@ def _cmd_gates(args: argparse.Namespace) -> int:
                 else:
                     print(f"  {row['task_id']} done with no evidence record")
         if record["violations_total"] == 0 and record["open_total"] == 0:
+            _print_discharge(record.get("discharge") or {})
             return 0
+        _print_discharge(record.get("discharge") or {})
         return 1
     print(f"Gate reconcile on board {record['board']!r}: {record['violations_before']} rank "
           f"edge(s) before, {record['lifts_total']} lift(s), {record['violations_after']} after; "
