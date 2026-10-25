@@ -1021,6 +1021,11 @@ def _handle_complete(args: dict, **kw) -> str:
             if isinstance(ok, kb.CompletionRefusal) and ok.cause in (
                     "landing_carrier_missing", "landing_state_unknown"):
                 raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
+            # The dirty-unit-checkout fence names the checkout, the paths and the remedy in
+            # ``detail`` (t_b151a247). A card that cannot see WHY it is refused is re-run
+            # blind, and a blind re-run dirties the same tree again.
+            if isinstance(ok, kb.CompletionRefusal) and ok.cause == "dirty_unit_checkout":
+                raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
             # A reopened or never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.
             blockers = kb.unsatisfied_parents(conn, tid)
