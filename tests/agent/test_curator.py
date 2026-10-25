@@ -1158,3 +1158,98 @@ def test_threaded_llm_pass_keeps_callers_profile_scope(curator_env, tmp_path, mo
     assert not (root / "skills" / ".curator_state").exists(), "thread wrote the ROOT home's state"
     state = json.loads((profile / "skills" / ".curator_state").read_text(encoding="utf-8-sig"))
     assert state["last_run_summary"].endswith("llm: stub")
+
+
+# ---------------------------------------------------------------------------
+# Git-tracked guard rides the dry run (card t_4c38630b)
+# ---------------------------------------------------------------------------
+
+def _git(repo: Path, *args: str) -> None:
+    import os
+    import subprocess
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"})
+
+
+def _git_tracked_skill(skills_dir: Path, name: str) -> Path:
+    """skills/<name> (flat) with a committed SKILL.md — tracked bytes, like the yoyodine corpus."""
+    d = _write_skill(skills_dir, name)
+    if not (skills_dir / ".git").exists():
+        _git(skills_dir, "init")
+    _git(skills_dir, "add", "-A", name)
+    _git(skills_dir, "commit", "-m", f"seed {name}")
+    return d
+
+
+def test_dry_run_counts_what_it_would_do_instead_of_reading_a_constant(curator_env, monkeypatch):
+    """The preview used to return `{marked_stale: 0, archived: 0}` from a literal — evidence for
+    nothing. It now walks the same rows as the real pass, so it counts what it WOULD do."""
+    c, u = curator_env["curator"], curator_env["usage"]
+    monkeypatch.setattr(u, "protect_git_tracked_enabled", lambda: True)
+    skills_dir = curator_env["home"] / "skills"
+    _write_skill(skills_dir, "loose-skill")
+    _backdate(u, "loose-skill", 200)
+
+    counts = c.apply_automatic_transitions(apply=False)
+
+    assert counts["checked"] == 1
+    assert counts["archived"] == 1                      # would-archive
+    assert (skills_dir / "loose-skill").is_dir()        # ...and did not
+    assert u.load_usage()["loose-skill"]["state"] == u.STATE_ACTIVE
+
+
+def test_dry_run_counts_blocked_git_tracked_and_the_real_pass_still_refuses(curator_env, monkeypatch):
+    """T2: the visible counter, in the preview AND the real run, and the tracked skill is never
+    moved by either. This is the regression: the corpus archive happened on a pass whose preview
+    said it would archive nothing."""
+    c, u = curator_env["curator"], curator_env["usage"]
+    monkeypatch.setattr(u, "protect_git_tracked_enabled", lambda: True)
+    skills_dir = curator_env["home"] / "skills"
+    tracked = _git_tracked_skill(skills_dir, "corpus-skill")
+    _write_skill(skills_dir, "loose-skill")
+    _backdate(u, "corpus-skill", 200)
+    _backdate(u, "loose-skill", 200)
+    usage_before = (skills_dir / ".usage.json").read_text()
+
+    preview = c.apply_automatic_transitions(apply=False)
+
+    assert preview["blocked_git_tracked"] == 1
+    assert preview["archived"] == 1                          # the loose one, counted not done
+    assert tracked.is_dir() and (skills_dir / "loose-skill").is_dir()
+    assert (skills_dir / ".usage.json").read_text() == usage_before
+    assert "1 blocked: git-tracked" in c._auto_summary_line(preview, dry_run=True)
+
+    real = c.apply_automatic_transitions()
+
+    assert real["blocked_git_tracked"] == 1
+    assert real["archived"] == 1
+    assert tracked.is_dir()                                  # still refused
+    assert not (skills_dir / "loose-skill").exists()          # the ordinary archive still works
+    assert u.load_usage()["corpus-skill"]["state"] == u.STATE_ACTIVE
+    assert "blocked: git-tracked 1 (curator.protect_git_tracked)" in c._auto_summary_line(real)
+
+
+def test_protect_git_tracked_off_lets_the_curator_archive_tracked_bytes(curator_env, monkeypatch):
+    """The escape hatch: with the flag off the pass behaves exactly as it did before the guard."""
+    c, u = curator_env["curator"], curator_env["usage"]
+    monkeypatch.setattr(u, "protect_git_tracked_enabled", lambda: False)
+    skills_dir = curator_env["home"] / "skills"
+    tracked = _git_tracked_skill(skills_dir, "corpus-skill")
+    _backdate(u, "corpus-skill", 200)
+
+    counts = c.apply_automatic_transitions()
+
+    assert counts["blocked_git_tracked"] == 0
+    assert counts["archived"] == 1
+    assert not tracked.exists()
+
+
+def test_curator_status_prints_the_guard_state(curator_env, capsys):
+    """`hermes curator status` must show the flag — a protection nobody can see is one nobody
+    can tell is off."""
+    from hermes_cli import curator as cli
+    c = curator_env["curator"]
+    cli._print_curator_config(c)
+    out = capsys.readouterr().out
+    assert "protect:" in out and "git-tracked" in out
