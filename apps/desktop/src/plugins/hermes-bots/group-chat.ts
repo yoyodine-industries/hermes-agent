@@ -54,7 +54,34 @@ const GROUP_CHAT_SYNC_MESSAGES = 16
 const GROUP_CHAT_SYNC_TEXT_CHARS = 1200
 const GROUP_CHAT_SYNC_TRUNCATION_MARK = '… [truncated]'
 const GROUP_CHAT_SYNC_IMAGE_CHARS = 24000
+// Ceiling on durable tombstones carried in one publish.
+const GROUP_CHAT_SYNC_TOMBSTONES = 64
 let groupChatSyncTimer: ReturnType<typeof setTimeout> | null = null
+
+/** The tombstones a publish may emit: `id:` keys only.
+ *
+ *  A `name:` tombstone is a permanent lie. Legacy (pre-roomId) rooms are keyed
+ *  by display name and carry no identity, so every reader applies the
+ *  tombstone to whatever now holds that name — and a recreated room starts at
+ *  syncRevision 0, so the tombstone always outranks it. Worse, each publish
+ *  writes the union of remote and local `deleted` maps back, so one name key
+ *  survives every mirror, forever: the name can never be reused, and a room
+ *  remade under it is deleted seconds after creation (2026-10-24 incident).
+ *
+ *  So the read path keeps honouring `name:` keys from older mirrors — that is
+ *  the only compat they are entitled to — and nothing republishes them. An
+ *  id-keyed tombstone needs none of that licence: it names one room, and a
+ *  recreate mints a fresh id, so it can never be misapplied. */
+function groupChatPublishableTombstones(
+  deleted: Record<string, number> = {}
+): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(deleted)
+      .filter(([key]) => key.startsWith('id:'))
+      .sort(([, left], [, right]) => Number(right || 0) - Number(left || 0))
+      .slice(0, GROUP_CHAT_SYNC_TOMBSTONES)
+  )
+}
 
 /** One room inside the bounded ui_meta projection: a compacted log plus the
  *  identity fields, without any of `GroupChat`'s runtime/orchestration state. */
@@ -295,11 +322,7 @@ export function groupChatSyncSnapshot(
 
   const rooms: Record<string, GroupChatSyncRoom> = {}
 
-  const boundedDeleted = Object.fromEntries(
-    Object.entries(deleted)
-      .sort(([, left], [, right]) => Number(right || 0) - Number(left || 0))
-      .slice(0, 64)
-  )
+  const boundedDeleted = groupChatPublishableTombstones(deleted)
 
   const envelope: GroupChatSyncSnapshot = {
     version: 3,
@@ -627,11 +650,7 @@ function groupChatSyncEnvelope(
   rooms: Record<string, GroupChatSyncRoom>,
   deleted: Record<string, number> = {}
 ): GroupChatSyncSnapshot {
-  const boundedDeleted = Object.fromEntries(
-    Object.entries(deleted)
-      .sort(([, left], [, right]) => Number(right || 0) - Number(left || 0))
-      .slice(0, 64)
-  )
+  const boundedDeleted = groupChatPublishableTombstones(deleted)
 
   const envelope: GroupChatSyncSnapshot = {
     version: 3,
@@ -874,9 +893,20 @@ export function mergeRemoteGroupChatSnapshotIntoRooms(
       // legitimate higher-revision recreation to protect.
       delete rooms[targetName]
     } else {
+      const target = rooms[targetName]
       const deletedRevision = Math.max(0, Number(deletedAt || 0))
 
-      if (deletedRevision >= Number(rooms[targetName]?.syncRevision || 0)) {
+      // A `name:` tombstone remembers a LEGACY room — one minted before room
+      // ids existed. A local room carrying a roomId is provably not that
+      // room (a recreate mints a fresh id), and its syncRevision restarts at
+      // 0, so the revision gate below can never outrank the tombstone. This
+      // is how one stale mirror's immortal name tombstone used to delete the
+      // room the user had just remade under the same name.
+      if (target?.roomId) {
+        continue
+      }
+
+      if (deletedRevision >= Number(target?.syncRevision || 0)) {
         delete rooms[targetName]
       }
     }
