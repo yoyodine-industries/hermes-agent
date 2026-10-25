@@ -229,6 +229,13 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
     ) = ({} for _ in range(7))
+    # run_id -> live-handle token: ONE registry for BOTH run families (t_5976163f R4). A
+    # /v1/runs row is held by its task in ``_active_run_tasks``; an inline bot/chat turn is
+    # held by its token, because ``_run_agent`` already counts that turn (it must NOT enter
+    # ``_active_run_tasks`` or the agent-work gate would double count it). Registered at
+    # ADMISSION, released in the turn's own ``finally`` — so every non-terminal row is
+    # attributable, and a row that no handle owns is orphaned work, never live work.
+    self._live_run_handles: dict[str, dict[str, Any]] = {}
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -392,26 +399,140 @@ def _owner_alive(owner_pid: int, owner_started: int) -> bool:
         return False
 
 
+def _live_run_handle_table(self) -> dict[str, dict[str, Any]]:
+    """The ``run_id -> handle`` table, created on demand.
+
+    An adapter built outside ``_initialize_run_state`` (a test double) still answers a status
+    read instead of raising from the fence; a missing table simply means "this process holds
+    nothing".
+    """
+    table = getattr(self, "_live_run_handles", None)
+    if table is None:
+        table = self._live_run_handles = {}
+    return table
+
+
+def _register_live_run_handle(self, run_id: str, *, family: str) -> None:
+    """Take *run_id*'s live handle at ADMISSION — in the same synchronous frame as its first
+    status row, so no reader and no sweep can observe a non-terminal row that no handle owns.
+
+    *family* names the holder: ``v1_runs`` (its asyncio task is attached right after creation)
+    or ``inline`` (a bot/chat turn whose task is deliberately kept out of
+    ``_active_run_tasks``).
+    """
+    _live_run_handle_table(self)[run_id] = {
+        "family": family, "task": None, "started_at": time.time()}
+
+
+def _attach_live_run_handle_task(self, run_id: str, task: Any) -> None:
+    """Bind the turn's task to its handle. A finished task makes the handle dead, so a task
+    that died before its turn started can never keep a dead row looking alive."""
+    entry = _live_run_handle_table(self).get(run_id)
+    if entry is not None:
+        entry["task"] = task
+
+
+def _release_live_run_handle(self, run_id: str) -> None:
+    """Drop the handle in the turn's own ``finally`` — the release is the fence's clock."""
+    _live_run_handle_table(self).pop(run_id, None)
+
+
+def _task_is_running(task: Any) -> bool:
+    """A task whose state cannot be read is NOT live (a terminated run leaves the fence)."""
+    try:
+        return not task.done()
+    except Exception:  # an unreadable task is not live work
+        return False
+
+
+def _run_has_live_handle(self, run_id: str) -> bool:
+    """Does THIS process still hold executable work for *run_id*? Both families, one answer.
+
+    /v1/runs liveness is the run's task in ``_active_run_tasks`` (that dict stays the gate's
+    task census); an inline bot/chat turn's liveness is its handle token. Both are consulted,
+    so every non-terminal row is attributable to either a task or a token and neither the gate
+    nor this fence has to guess which family wrote the row.
+    """
+    task = (getattr(self, "_active_run_tasks", None) or {}).get(run_id)
+    if task is not None and _task_is_running(task):
+        return True
+    entry = _live_run_handle_table(self).get(run_id)
+    if entry is None:
+        return False
+    held = entry.get("task")
+    return True if held is None else _task_is_running(held)
+
+
+def _row_is_run_work(status: dict[str, Any]) -> bool:
+    """Is this row's liveness a run handle's to prove?
+
+    A ``kind="bot_send"`` row is a delivery projection: it is live for as long as the delivery
+    queue says so and no run task ever holds it, so requiring a handle would fence every
+    in-flight delivery the moment it was polled.
+    """
+    return str(status.get("kind") or "") != "bot_send"
+
+
+def _fence_unheld_run_status(self, run_id: str, status: dict[str, Any]) -> dict[str, Any]:
+    """Fail a self-owned, non-terminal RUN row closed when nothing in this process holds it.
+
+    One fence for all three callers (memory read, store read, sweep) so they cannot disagree:
+    the row becomes ``interrupted``, it is mutated in place (so later reads of the same dict
+    agree) and the fence is persisted through the idempotency store, so a restart never
+    resurrects the row as live work.
+    """
+    if status.get("status") in TERMINAL_STATUSES or not _row_is_run_work(status):
+        return status
+    if _run_has_live_handle(self, run_id):
+        return status
+    status.update(
+        status="interrupted",
+        error="The run has no live worker in this gateway process; fenced closed.",
+        last_event="run.interrupted",
+        updated_at=time.time())
+    try:
+        self._run_idempotency_store.update_status(run_id, status)
+    except Exception:  # a fence that cannot persist still fenced this read
+        logger.debug("[api_server] failed to persist the fence for run %s", run_id, exc_info=True)
+    return status
+
+
 def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, Any] | None:
-    """Hydrate a scoped run status and fail stale owners closed."""
+    """Hydrate a scoped run status and fail stale OR ORPHANED rows closed.
+
+    Two arms, one question — is anything still holding this row? A row owned by another
+    process is that process's business (the dead-owner arm below covers the restart); a row
+    owned by THIS process must be held by a live handle, because the owner pid being alive
+    proves nothing when the owner is us (t_5976163f R4).
+    """
     status = self._run_statuses.get(run_id)
     if status is not None:
         if run_id in self._run_idempotency_ids:
             scope = self._run_idempotency_scope(request)
             self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
-        return status
+        # An in-memory row was written by this process, so it is self-owned by construction.
+        return _fence_unheld_run_status(self, run_id, status)
     scope = self._run_idempotency_scope(request)
     record = self._run_idempotency_store.status_for_run(
         scope, run_id, retention_until=_room_retention_until(request))
     if record is None:
         return None
     status = dict(record["status"])
-    if status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
-        int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
-        status.update(
-            status="interrupted", error="The gateway restarted before this run settled.",
-            last_event="run.interrupted", updated_at=time.time())
-        self._run_idempotency_store.update_status(run_id, status)
+    owner_pid = int(record.get("owner_pid") or 0)
+    owner_started = int(record.get("owner_started") or 0)
+    self_pid = int(getattr(self, "_run_owner_pid", 0) or 0)
+    self_started = int(getattr(self, "_run_owner_started", 0) or 0)
+    if status.get("status") not in TERMINAL_STATUSES:
+        if (_row_is_run_work(status) and self_pid and owner_pid == self_pid
+                and (not owner_started or not self_started or owner_started == self_started)):
+            # Same-process arm: this record is our own, read back through the store. The live
+            # handle is the only proof of work — the pid is alive because it IS us.
+            status = _fence_unheld_run_status(self, run_id, status)
+        elif not _owner_alive(owner_pid, owner_started):
+            status.update(
+                status="interrupted", error="The gateway restarted before this run settled.",
+                last_event="run.interrupted", updated_at=time.time())
+            self._run_idempotency_store.update_status(run_id, status)
     self._run_statuses[run_id] = status
     self._run_idempotency_ids.add(run_id)
     self._run_owners[run_id] = scope
@@ -521,9 +642,9 @@ def _forget_run(self, run_id: str, *tables) -> None:
 
 
 def _retire_live_run(self, run_id: str) -> None:
-    """Retire agent/task/approval control state once the executor-backed task is done."""
+    """Retire agent/task/approval/handle control state once the run's task is done."""
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
-                self._stopping_run_ids, self._shutdown_interrupted_run_ids)
+                self._stopping_run_ids, self._shutdown_interrupted_run_ids, _live_run_handle_table(self))
 
 
 def _drop_run_transport(self, run_id: str) -> None:
@@ -715,6 +836,9 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     q = self._run_streams[run_id] = _RunStream()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
+    # The handle goes in BEFORE the row: admission and ownership are one frame, so a
+    # concurrent status read (or the sweep) can never see this row without its handle.
+    _register_live_run_handle(self, run_id, family="v1_runs")
     initial_status = self._set_run_status(
         run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
     if idempotency_key:
@@ -725,7 +849,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         if outcome != "created":
             _forget_run(
                 self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
-                self._run_statuses, self._run_owners)
+                self._run_statuses, self._run_owners, _live_run_handle_table(self))
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
     launch = _RunLaunch(
@@ -749,6 +873,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
     else:
         task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+    _attach_live_run_handle_task(self, run_id, task)
     with suppress(TypeError):
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
@@ -1015,7 +1140,7 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
     """Drop the owner stamp only once nothing keyed by *run_id* survives: ownership must
     outlive every surface it protects (retired on different clocks); ownerless = fail-closed."""
     live = (self._run_statuses, self._active_run_agents, self._active_run_tasks, self._run_streams,
-            self._run_approval_sessions)
+            self._run_approval_sessions, _live_run_handle_table(self))
     if not any(run_id in table for table in live):
         self._run_owners.pop(run_id, None)
 
@@ -1300,3 +1425,12 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         if (status.get("status") in {"completed", "failed", "cancelled"}
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
             _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
+    # A non-terminal row that no handle in this process holds is orphaned work, whether or not
+    # anyone ever polls it (t_5976163f R4). Fence it HERE as well as on read: a row that only
+    # reading would fix is a latch for as long as nobody reads — which is exactly the case that
+    # made the census lie. Every row this process admitted lives in ``_run_statuses``, so this
+    # pass is complete for self-owned rows; rows from an earlier incarnation are fenced by the
+    # read path's dead-owner arm.
+    for run_id, status in list(self._run_statuses.items()):
+        if status.get("status") not in TERMINAL_STATUSES:
+            _fence_unheld_run_status(self, run_id, status)

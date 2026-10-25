@@ -107,6 +107,14 @@ def bind_module(module_globals: dict, server, *, skip=()) -> None:
         if isinstance(obj, types.FunctionType):
             if obj.__module__ == mod_name:
                 obj = rebind(obj, g, seen)
+                # The split module's OWN view stays in sync, the same way its dispatch
+                # tables are kept in sync below. The original body resolves its globals
+                # against the split module, where server-only names (_sessions, _emit,
+                # _load_cfg, ...) do not exist: it is NOT callable. Publishing the
+                # rebound copy means ``from tui_gateway.session_notifications import X``
+                # -- what a static reader (and tree preflight) expects from the module
+                # that defines X -- hands back the callable body (t_07408bf7).
+                module_globals[name] = obj
             elif name == obj.__name__:
                 continue  # plain import; server has its own (``_alias = other.fn`` publishes as-is)
         elif isinstance(obj, (dict, tuple, list)) and _has_own_fn(obj):

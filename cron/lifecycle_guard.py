@@ -9,6 +9,8 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 
 from __future__ import annotations
 
+import datetime
+import json
 import logging
 import os
 import re
@@ -483,6 +485,7 @@ class _LifecycleScanBudget:
         "paths_remaining",
         "refusal",
         "remote_reads_remaining",
+        "root_command",
     )
 
     def __init__(self) -> None:
@@ -492,6 +495,8 @@ class _LifecycleScanBudget:
         self.paths_remaining = _MAX_LIFECYCLE_SCAN_PATHS
         self.remote_reads_remaining = _MAX_LIFECYCLE_SCAN_REMOTE_READS
         self.refusal: Optional[str] = None
+        #: The command this walk answers for, so a refusal row can name it (t_1b4d6bac).
+        self.root_command: str = ""
 
     def charge_text(self, text: str) -> bool:
         """Charge *text* before tokenization; False when it does not fit."""
@@ -557,7 +562,46 @@ def _budget_exhausted(budget: _LifecycleScanBudget, what: str, depth: int) -> bo
         what, depth,
     )
     budget.refusal = f"the scan budget was exhausted ({what} at depth {depth})"
+    _record_refusal(budget, None, budget.refusal)
     return True
+
+
+# --- refusals leave a row (card t_1b4d6bac) ---------------------------------------------------
+#
+# A refusal emitted at the tool boundary used to leave NOTHING: the block reached the model as a
+# tool error and the run ledger never saw it, so from inside a DAG a refused command was
+# indistinguishable from a command that never ran. That is the no-silent-failure shape, and the
+# 34 MB deploy-ledger block is the proof of why it matters.
+_REFUSAL_LEDGER_ENV = "LIFECYCLE_GUARD_REFUSAL_LEDGER"
+_REFUSAL_LEDGER_DEFAULT = "/opt/hermes_prod/run_details/lifecycle-guard-refusals.jsonl"
+
+
+def refusal_ledger_path() -> Path:
+    """Where the guard appends its refusal rows (env-overridable, never a config surface)."""
+    return Path(os.environ.get(_REFUSAL_LEDGER_ENV) or _REFUSAL_LEDGER_DEFAULT)
+
+
+def _record_refusal(budget: _LifecycleScanBudget, path: Optional[Path], reason: str) -> None:
+    """Append ONE JSONL row naming *reason* for *path*. Best-effort by contract.
+
+    Never raises and never changes the verdict: a guard that cannot write its row must still
+    answer its question (#76762 - a guard crash breaks every terminal command).
+    """
+    row = {
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "kind": "lifecycle-guard-refusal",
+        "path": str(path) if path is not None else "",
+        "reason": reason,
+        "command": (budget.root_command or "")[:400],
+        "pid": os.getpid(),
+    }
+    try:
+        target = refusal_ledger_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:
+        logger.warning("lifecycle guard could not record its own refusal row", exc_info=True)
 
 
 def _unreadable_reason(path: Path) -> str:
@@ -579,7 +623,39 @@ def _unreadable_reason(path: Path) -> str:
 def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
     logger.warning("lifecycle guard cannot scan referenced script %s: %s; failing closed", path, reason)
     budget.refusal = reason
+    _record_refusal(budget, path, reason)
     return True
+
+
+# --- data is not code (card t_1b4d6bac) -------------------------------------------------------
+#
+# A path the walk reached by TEXT-SCANNING another script - or that a command names as an option
+# VALUE (``--ledger``, ``--review-ledger``, ``--state-dir``) - is DATA unless the file itself
+# proves otherwise. Measured 2026-10-25: ``python gate.py --admit-rev ...`` scanned gate.py, whose
+# body merely MENTIONS ``/opt/hermes_prod/deploy-ledger.jsonl`` (gate.py:147,
+# ``DEFAULT_LEDGER``), the candidate inherited the parent's "executed" flag at the recursion, and a
+# 34 MB append-only receipt log refused the whole landing door for every lane. Nothing executed
+# that ledger; nothing named it; and 34 MB of receipts is not something to tokenize per command.
+_SCRIPT_HEAD_PROBE_BYTES = 2
+
+
+def _proves_script(path: Path) -> bool:
+    """Is *path* PROVABLY a script, from a bounded head read (never a full scan)?
+
+    Two proofs, both cheap and both the file's own claim: the executable bit, or the ``#!``
+    magic of its first two bytes. Everything else is data: never scanned, never charged against
+    the walk budget, and never failing closed on size, however large it is.
+    """
+    try:
+        if os.access(path, os.X_OK):
+            return True
+    except OSError:
+        pass
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(_SCRIPT_HEAD_PROBE_BYTES) == b"#!"
+    except OSError:
+        return False
 
 
 # --- shell tokenization -----------------------------------------------------------------------
@@ -879,8 +955,22 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
             yield token[len(prefix):]
 
 
-def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
-    """Yield the scripts the token at *index* executes, if any."""
+def _tagged(name: str, cwd: Optional[str], strong: bool) -> Iterator[tuple[Path, bool]]:
+    """Yield ``(path, strong)`` for every resolution of *name*.
+
+    *strong* is True when the token NAMES the file in an execution slot (an interpreter's
+    argument, or ``source``/``.``), and False when it is only a bare command-word candidate --
+    which is also how a path in prose or an assignment value reaches the walk when the tokenizer
+    reads arbitrary source text. That distinction is what lets the walk tell a mention from an
+    execution (card t_1b4d6bac): a strong candidate answers for its size, a weak one must prove
+    itself a script.
+    """
+    for path in _resolved_or_nothing(name, cwd):
+        yield path, strong
+
+
+def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[tuple[Path, bool]]:
+    """Yield ``(script, strong)`` for the token at *index*, if it names one."""
     if index >= len(segment):
         return
     executable = segment[index]
@@ -888,7 +978,7 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
 
     if executable_name in {".", "source"}:
         if len(segment) > index + 1:
-            yield from _resolved_or_nothing(segment[index + 1], cwd)
+            yield from _tagged(segment[index + 1], cwd, True)
         return
 
     if executable_name in _SHELL_EXECUTABLES:
@@ -909,19 +999,20 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
                 continue
             break
         if arg_index < len(arguments) and arguments[arg_index] not in _SHELL_COMMAND_FLAGS:
-            yield from _resolved_or_nothing(arguments[arg_index], cwd)
+            yield from _tagged(arguments[arg_index], cwd, True)
         return
 
     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
-        yield from _resolved_or_nothing(executable, cwd)
+        yield from _tagged(executable, cwd, False)
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
-    original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
-    a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
+def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[tuple[Path, bool]]:
+    """Yield ``(script, strong)`` for scripts executed directly or through a POSIX shell. Each
+    segment is read at the original token AND at the peeled wrapper target — additive on purpose:
+    peeling must never REMOVE a reference (a local ``./timeout`` is a script, not the coreutils
+    wrapper)."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -1126,11 +1217,11 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
+    candidates = [(path, executed, strong) for path, strong in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
     if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+        candidates += [(path, False, strong) for path, strong in _iter_referenced_shell_scripts(command, cwd=cwd)]
 
-    for script_path, candidate_executed in candidates:
+    for script_path, candidate_executed, candidate_strong in candidates:
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
         if _on_cloud_path(script_path):
             if candidate_executed:
@@ -1142,6 +1233,15 @@ def _contains_unsafe_gateway_action(
             continue
         resolved = _resolve_lenient(script_path)
         if resolved in visited:
+            continue
+        # DATA IS NOT CODE (card t_1b4d6bac). At depth 0 the candidate came from the command the
+        # user typed. Deeper, the walk reached it by TEXT-SCANNING the script above: a WEAK hit (a
+        # bare command-word token - which is how a path in prose, a docstring, an assignment value
+        # or a `--ledger` option value arrives) is a MENTION and only counts if the file proves
+        # itself a script. A STRONG hit is an interpreter's argument (`bash x.sh`, `python x.py`)
+        # or a `source`; that IS an execution, whether or not the file carries a shebang, and it
+        # answers for its size exactly as it always did.
+        if depth >= 1 and not candidate_strong and not _proves_script(resolved):
             continue
         if not budget.charge_path():
             if candidate_executed:
@@ -1199,6 +1299,7 @@ def scan_gateway_lifecycle(
     verdict.
     """
     budget = _LifecycleScanBudget()
+    budget.root_command = command or ""
     try:
         unsafe = _contains_unsafe_gateway_action(
             command, cwd=cwd, depth=0, visited=set(), budget=budget,
@@ -1268,6 +1369,7 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
         # The direct command regex below still scans the full text, so a literal `hermes gateway restart`
         # embedded in a .py script is still blocked. See #77131, #78398.
         budget = _LifecycleScanBudget()
+        budget.root_command = combined or ""
         if not budget.charge_text(combined):
             unsafe = _budget_exhausted(budget, "text", 0)
             refusal = budget.refusal

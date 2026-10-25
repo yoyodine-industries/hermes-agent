@@ -217,9 +217,9 @@ def kanban_command(args: argparse.Namespace) -> int:
 # --- Handlers ---
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
-    from hermes_cli.profiles import current_profile_name
-    return current_profile_name("user") or "user"
+    """Best-effort author name for a board write from the CLI or a gateway-served turn."""
+    from hermes_cli.profiles import resolve_acting_profile_name
+    return resolve_acting_profile_name("user")
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({

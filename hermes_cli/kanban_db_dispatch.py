@@ -683,7 +683,7 @@ def _git_status_lines(tree: Path) -> list[str]:
     try:
         proc = subprocess.run(
             ["git", "-C", str(tree), "status", "--porcelain"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
     except (OSError, ValueError) as exc:
         return [f"(git unavailable: {exc})"]
@@ -3924,6 +3924,23 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
 # owns the bounce (``default``, the ops seat -- see the ruling's D4: the reload door is NOT this
 # worker's). The standalone daemon loop and the CLI ``dispatch`` entry reach the same gate because
 # it sits in :func:`dispatch_once`, the one entry all three share.
+#
+# DEC-1..DEC-3 (design t_a54c8157, implementation t_ad5dc5d5) shape what that means, and each
+# paragraph below is load-bearing:
+#
+# * DEC-1 -- IDENTITY IS THE EPISODE. The signature is the imported CONTENT alone (no pid) and the
+#   window is ``<sig>:<first_tick>``. Two processes on the same content are ONE stall -- one streak,
+#   one card -- and a stall that cleared and came back is a NEW window with its own card. The old
+#   ``<sig>:<pid>`` signature filed a card per respawn for one stalled revision, and the old
+#   ``:<ordinal>`` key swallowed a recurrence whose carrier had been closed.
+# * DEC-2 -- THE CARD IS THE RECORD; THE DOOR IS THE ESCALATION REGISTRY. While ``dispatch_once``
+#   refuses, nothing on this host is claimed, so a card on a board nobody is serving waits for a
+#   human to go looking. The durable row in ``escalations.db`` plus the DM it sends is the door that
+#   survives a frozen dispatcher. One attempt per EPISODE, bounded by the record's ``delivery``
+#   block, with ``hermes -p default peer run`` as the fallback leg and every failure NAMED.
+# * DEC-3 -- RETIREMENT IS AUTOMATIC. The first tick that serves normally again retires the cleared
+#   episode's cards through the kernel's own doors (``unblock_task`` then ``complete_task``), with a
+#   liveness fence that leaves a live FOREIGN pid's card alone.
 
 #: Greppable prefix of every refusal. A yielding ticker must be distinguishable from a healthy one
 #: at the status surface (the ``cron.scheduler.CronTickYielded`` precedent); this string is what a
@@ -3934,9 +3951,12 @@ TICK_YIELD_PREFIX = "tree-skew-yield:"
 #: like the board itself. Tick-scoped on purpose, and a different record from the boot identity
 #: (this one records WHY a tick served nothing; the boot record records what the process loaded).
 TICK_YIELD_STATUS_FILENAME = "dispatcher_tick_yield.json"
-#: Version 2 carries the refusal streak (`sig`/`streak`/`first_tick`/`last_tick`); version 1 held
-#: only the tick's own forensics. The reader is tolerant, so a v1 relic on disk reads as "no prior
-#: streak" and the next streak simply starts at 1.
+# Version 2 carries the refusal streak (`sig`/`streak`/`first_tick`/`last_tick`) plus, since
+# DEC-1..DEC-3 (card t_ad5dc5d5), the EPISODE (`episode`) and the door's single attempt
+# (`delivery`: `{at, leg, ref, state, error}`). Version 1 held only the tick's own forensics. The
+# reader is tolerant, so a v1 relic on disk reads as "no prior streak" and the next streak simply
+# starts at 1; a v2 record whose `sig` carries the retired `:<pid>` suffix likewise reads as a new
+# episode, which costs a deployed streak one restart.
 TICK_YIELD_STATUS_VERSION = 2
 
 #: Exactly ONE acting card, addressed to the seat that owns the bounce.
@@ -3972,6 +3992,44 @@ TICK_YIELD_ACTOR_THRESHOLD = 3
 #: single fleet-wide stall (different boards are different DBs, so the idempotency key cannot span
 #: them). Overridable so an acceptance surface can exercise the path without touching the fleet.
 TICK_YIELD_ACTOR_BOARD = os.environ.get("HERMES_KANBAN_TICK_YIELD_BOARD", "migrations")
+
+#: --- DEC-2: the freeze-proof DOOR, and DEC-3: retirement --------------------------------
+#: The actor card is the RECORD, not the door. ``dispatch_once`` is the one entry every dispatch
+#: path shares, so WHILE IT REFUSES NOTHING IS CLAIMED -- a card filed on a board nobody is serving
+#: waits for a human to go looking. The door that survives a frozen dispatcher is therefore the
+#: escalation REGISTRY (``escalation_ledger.py``: one durable row in ``escalations.db``) plus the DM
+#: it sends. The registry module is loaded BY PATH -- it lives in the platform estate, not on this
+#: package's import path -- and a candidate that fails to load is a NAMED failure, never an
+#: exception that reaches the tick.
+TICK_YIELD_ESCALATION_ENV = "HERMES_KANBAN_ESCALATION_LEDGER"
+TICK_YIELD_ESCALATION_CONFIG_KEY = "escalation_ledger"
+TICK_YIELD_ESCALATION_DEFAULT = "/opt/hermes_prod/yaan-platform/scripts/escalation_ledger.py"
+TICK_YIELD_ESCALATION_DISABLED = ("none", "off")
+TICK_YIELD_ESCALATION_SOURCE_KIND = "dispatcher_tree_skew"
+TICK_YIELD_ESCALATION_ISSUE_CLASS = "dispatcher-tree-skew"
+TICK_YIELD_ESCALATION_RAISED_BY = "kanban-dispatcher"
+TICK_YIELD_ESCALATION_TIMEOUT_S = 30
+
+#: Retirement (DEC-3): the event that records an automatic close, and the batch bound. The SELECT
+#: is capped so a tick never walks the board: the live backlog was 51 cards, the cap is 100.
+TICK_YIELD_RETIRED_EVENT = "tree_skew_actor_retired"
+TICK_YIELD_RETIRE_BATCH = 100
+#: ``running`` is here for a reason (DEC-3.6): a card under a live claim is somebody's work.
+#: ``failed``/``cancelled`` are terminal for the same purpose as ``done``/``archived``.
+TICK_YIELD_RETIRE_SKIP_STATUSES = ("done", "archived", "failed", "cancelled", "running")
+
+#: Bounded retirement (card t_028ad743). A live guard that REFUSES the kernel's close used to be
+#: re-warned on every tick, forever: three immortal cards on the platform board produced a warning
+#: per tick and no action, which is a defect wearing a log line. Every refusal is recorded ON THE
+#: CARD, so the bound survives a respawned dispatcher; at the bound ONE ``..._retire_failed`` event
+#: names the last refusal (and the shape the kernel will not take) and the card leaves the sweep
+#: for good -- it is then an audit finding, not a per-tick siren.
+TICK_YIELD_RETIRE_MAX_ATTEMPTS = 3
+TICK_YIELD_RETIRE_REFUSED_EVENT = "tree_skew_actor_retire_refused"
+TICK_YIELD_RETIRE_FAILED_EVENT = "tree_skew_actor_retire_failed"
+#: The ABSORB half (DEC-1.4) is deliberately narrower than the retire half: ``running`` is a LIVE
+#: carrier and must absorb the repeat, or a long stall would file a second card beside the first.
+TICK_YIELD_ACTOR_ABSORB_SKIP_STATUSES = ("done", "archived", "failed", "cancelled")
 
 
 class DispatcherTickYielded(RuntimeError):
@@ -4067,17 +4125,33 @@ def tick_yield_status_path(path: Any = None) -> Path:
 
 
 def _yield_signature(yielded: DispatcherTickYielded) -> str:
-    """The STALL's identity: the tree content this process IMPORTED, plus its pid.
+    """The EPISODE's content: the tree content this process IMPORTED, and nothing else.
 
-    The disk half is deliberately NOT in the signature. Bytes landing under a frozen process
-    change the disk side without ending the stall, so a disk-sensitive signature would reset the
-    streak on every landing and file a second card mid-stall. The disk fingerprint is EVIDENCE
-    (status record + card body), never identity.
+    DEC-1 (ruling ``t_a54c8157``, card ``t_ad5dc5d5``): identity is per-EPISODE, not per-process.
+    ``boot_pid`` is deliberately NOT here. Two processes refusing on the same imported content are
+    ONE stalled revision -- the reload that clears them is the same reload -- so a pid-sensitive
+    signature would start a fresh streak on every respawn and file a card per process for a single
+    stall. The pid stays EVIDENCE everywhere it already appears (the record's ``pid``, the card
+    body, the event payload); identity is the content, and the re-open door is the WINDOW
+    (:func:`_episode_identity`): a stall that cleared and came back is a new window and gets its
+    own card.
 
-    ``boot_pid`` stays IN: a process that boots AFTER a reload and is AGAIN skewed is a genuinely
-    new stall and may file its own card.
+    The disk half is not in the signature either. Bytes landing under a frozen process change the
+    disk side without ending the stall, so a disk-sensitive identity would reset the streak on
+    every landing and file a second card mid-stall. The disk fingerprint is EVIDENCE (status record
+    + card body), never identity.
     """
-    return f"{yielded.boot_fingerprint}:{yielded.boot_pid}"
+    return str(yielded.boot_fingerprint)
+
+
+def _episode_identity(signature: str, first_tick: int) -> str:
+    """The EPISODE's identity: the imported content plus the window's START.
+
+    ``first_tick`` is the streak's own first refusal (the record's ``first_tick``), so the identity
+    is stable for the whole window however many ticks -- and however many processes -- refuse
+    inside it, and changes the moment the window re-opens.
+    """
+    return f"{signature}:{int(first_tick)}"
 
 
 def _read_tick_yield_status(path) -> dict:
@@ -4091,34 +4165,60 @@ def _read_tick_yield_status(path) -> dict:
     return doc if isinstance(doc, dict) else {}
 
 
-def _record_tick_yield(yielded: DispatcherTickYielded, *, board: Optional[str] = None) -> str:
-    """Write the NON-GREEN status record, carrying the REFUSAL STREAK.
-
-    How many consecutive refused ticks this same frozen process has produced for the same
-    signature, and the window's first and last tick. Corroboration only -- the streak is the
-    dispatcher's OWN refusal count, never the reload state row's counter (whose ``consecutive: 10``
-    sat beside ``act: none, card: <closed>``).
+def _write_tick_yield_status(payload: dict, path=None) -> str:
+    """Write the status record verbatim and return its path (or the named reason it could not be).
 
     Best-effort by design -- an unwritable kanban home must not take the tick down -- but never
     silent: the refusal has already been logged loudly by the caller, and the return value is
     carried into the log line and the acting card so a reader can find the record even when it
     could not be written.
     """
+    target = tick_yield_status_path(path)
+    try:
+        from utils import atomic_json_write
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(target, payload, mode=0o600)
+        return str(target)
+    except Exception as exc:
+        _kb._log.warning(
+            "kanban dispatcher: could not write the tree-skew status record to %s: %s", target, exc,
+        )
+        return f"(status record unwritable: {exc})"
+
+
+def _record_tick_yield(
+    yielded: DispatcherTickYielded, *, board: Optional[str] = None,
+) -> tuple[str, dict]:
+    """Write the NON-GREEN status record, carrying the REFUSAL STREAK. ``(path, payload)``.
+
+    How many consecutive refused ticks have produced this same IMPORTED CONTENT, and the window's
+    first and last tick. Corroboration only -- the streak is the dispatcher's OWN refusal count,
+    never the reload state row's counter (whose ``consecutive: 10`` sat beside ``act: none, card:
+    <closed>``).
+
+    DEC-1.2: the streak continues across PROCESSES. ``same`` compares the signature only, so a
+    respawn -- or a second dispatcher process on the same frozen content -- continues the window
+    and keeps ``first_tick`` instead of starting its own. The pid is still written, as EVIDENCE.
+
+    DEC-2.4: the delivery attempt is PER EPISODE and BOUNDED -- once the record carries a
+    ``delivery`` for THIS episode it is carried forward untouched, so a fourth, fifth and fiftieth
+    refusal cannot re-register, re-notify or re-file. The streak is recomputed every tick; the
+    delivery is not.
+    """
     path = tick_yield_status_path()
     prior = _read_tick_yield_status(path)
     now = int(time.time())
     sig = _yield_signature(yielded)
-    same = (
-        bool(prior.get("yielded"))
-        and prior.get("sig") == sig
-        and int(prior.get("pid") or -1) == int(yielded.boot_pid)
-    )
+    same = bool(prior.get("yielded")) and prior.get("sig") == sig
     if same:
         streak = int(prior.get("streak") or 0) + 1
         first_tick = int(prior.get("first_tick") or now)
     else:
         streak = 1
         first_tick = now
+    episode = _episode_identity(sig, first_tick)
+    delivery = prior.get("delivery") if prior.get("episode") == episode else None
     payload = {
         "version": TICK_YIELD_STATUS_VERSION,
         "yielded": True,
@@ -4135,34 +4235,46 @@ def _record_tick_yield(yielded: DispatcherTickYielded, *, board: Optional[str] =
         "first_tick": first_tick,
         "last_tick": now,
         "threshold": TICK_YIELD_ACTOR_THRESHOLD,
+        # --- the episode half (DEC-1.3 / DEC-2.4) ---
+        "episode": episode,
+        "delivery": delivery,
         "recorded_at": now,
     }
-    try:
-        from utils import atomic_json_write
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json_write(path, payload, mode=0o600)
-        return str(path)
-    except Exception as exc:
-        _kb._log.warning(
-            "kanban dispatcher: could not write the tree-skew status record to %s: %s", path, exc,
-        )
-        return f"(status record unwritable: {exc})"
+    return _write_tick_yield_status(payload, path), payload
 
 
-def _clear_tick_yield_status() -> None:
-    """Retire a stale non-green marker once a tick serves normally again.
+def _merge_tick_yield_delivery(delivery: dict) -> str:
+    """Record a delivery attempt on the CURRENT episode's status record.
+
+    Deliberately NOT routed through :func:`_record_tick_yield`: this must not touch the streak (the
+    attempt happens inside one refusal, and a second write that re-derived the streak would count
+    the same tick twice). A record that vanished or names another episode is left alone and the
+    caller's return value says so.
+    """
+    path = tick_yield_status_path()
+    record = _read_tick_yield_status(path)
+    if not record.get("yielded"):
+        return "(no status record to carry the delivery)"
+    record["delivery"] = delivery
+    return _write_tick_yield_status(record, path)
+
+
+def _clear_tick_yield_status() -> bool:
+    """Retire a stale non-green marker once a tick serves normally again. ``True`` when retired.
 
     Cleared ONLY when this process wrote the record (it is the one that is now healthy), or when
     the recording process is PROVEN dead (its refusal is history, not a live condition). A fresh
     dispatcher process must never clear a live gateway's marker -- that would read green over a
     frozen gateway, which is the exact false green this record exists to prevent.
+
+    The return value is DEC-3's trigger: a tick that just retired a record is a tick whose episode
+    CLEARED, and that is the moment the actor cards filed for it are retired too.
     """
     path = tick_yield_status_path()
     try:
         raw = path.read_text(encoding="utf-8")
     except (OSError, ValueError):
-        return
+        return False
     try:
         record = json.loads(raw)
     except (ValueError, TypeError):
@@ -4175,11 +4287,12 @@ def _clear_tick_yield_status() -> None:
             recorded_pid = None
         if recorded_pid is not None and recorded_pid != os.getpid():
             if _pid_liveness(recorded_pid) != WORKER_DEAD:
-                return
+                return False
     try:
         path.unlink()
     except OSError:
         pass
+    return True
 
 
 def _last_spawned_line(board: Optional[str], *, limit_bytes: int = 2_000_000) -> str:
@@ -4243,6 +4356,8 @@ def _tick_yield_actor_body(
     last_tick: int = 0,
     tree: Optional[Path] = None,
     filed_on: Optional[str] = None,
+    episode: str = "",
+    escalation_ref: Optional[str] = None,
 ) -> str:
     """The acting card's body: deterministic evidence, no model, no prose to interpret."""
     tree = Path(tree) if tree is not None else _tree_skew_subject_root()
@@ -4253,6 +4368,12 @@ def _tick_yield_actor_body(
             return datetime.datetime.fromtimestamp(int(epoch)).isoformat(timespec="seconds")
         except (TypeError, ValueError, OSError):
             return "?"
+
+    escalation = (
+        f"`{escalation_ref}`" if escalation_ref
+        else "`(none filed -- the escalation registry was unavailable this tick; see the status "
+             "record's `delivery` block for the named failure)`"
+    )
 
     lines = [
         TICK_YIELD_ACTOR_DECLARATION,
@@ -4279,6 +4400,8 @@ def _tick_yield_actor_body(
         f"- tree: `{tree}`",
         f"- board refused: `{board or 'unknown'}`",
         f"- card filed on: `{filed_on or board or 'unknown'}`",
+        f"- episode: `{episode or 'unknown'}`",
+        f"- escalation: {escalation}",
         f"- non-green status record: `{status_path}`",
         f"- last successful spawn: `{_last_spawned_line(board)}`",
         "",
@@ -4295,15 +4418,24 @@ def _tick_yield_actor_body(
         "only on a reload) and it stops dispatch for every lane on this host. Take the reload within",
         "30 minutes of the last tick above, or comment why not.",
         "",
-        "## What closes it (the remedy)",
+        "## This card is the RECORD, not the remedy",
         "",
-        "Reload the gateway onto the current checkout: the sanctioned door is the ops seat's",
-        "`bounce_gateway` verb (`default` / `platform-stl`), with `force=true` and a note when the",
-        "lull gate cannot clear -- the card-worker hold is ADVISORY and must never gate a service",
-        "restore. The hand form is the canonical planned-stop marker for the pid plus ONE SIGTERM",
-        "(launchd KeepAlive respawns it); a hand reload must write its `bounces.jsonl` row through",
-        "the deploy seam or it is unattributable. The gate clears itself on the first tick that",
-        "serves normally.",
+        "The remedy is the RELOAD: the sanctioned door is the ops seat's `bounce_gateway` verb",
+        "(`default` / `platform-stl`), with `force=true` and a note when the lull gate cannot clear",
+        "-- the card-worker hold is ADVISORY and must never gate a service restore. The hand form is",
+        "the canonical planned-stop marker for the pid plus ONE SIGTERM (launchd KeepAlive respawns",
+        "it); a hand reload must write its `bounces.jsonl` row through the deploy seam or it is",
+        "unattributable.",
+        "",
+        f"The DOOR is the escalation row above ({escalation}) plus the DM it sends to the ops seat.",
+        "While `dispatch_once` refuses, NOTHING on this host is claimed, so a card on a board nobody",
+        "is serving is a record a human has to go looking for -- do NOT \"claim this card\" as the",
+        "remedy, and do not close it by hand: leaving it open is what keeps the stall readable.",
+        "",
+        "Retirement is AUTOMATIC (DEC-3): the first tick that serves normally again retires every",
+        "actor card of the cleared episode (`tree_skew_actor_retired`), because a serving tick is",
+        "proof the episode is over. A card whose filing pid is still a LIVE foreign process is left",
+        "alone -- a frozen peer still holds that episode.",
         "",
         "```",
         *_git_status_lines(tree),
@@ -4373,17 +4505,24 @@ def _file_tick_yield_actor(
     streak: int = 0,
     first_tick: int = 0,
     last_tick: int = 0,
+    window_start: int = 0,
+    escalation_ref: Optional[str] = None,
     now: Optional[int] = None,
 ) -> Optional[str]:
-    """File the ACTING card for this stall, idempotently and status-aware.
+    """File the ACTING card for this episode, idempotently and status-aware.
 
-    Key shape: ``tree-skew:<signature>:<occurrence>``  (signature = DEC-1).
+    Key shape: ``tree-skew:<signature>:<window_start>`` (DEC-1.4) -- the WINDOW replaces both the
+    pid and the old ``:<ordinal>``. Two processes on the same imported content therefore reach the
+    same key, and one stall is one card however often its dispatcher respawns.
 
-    * a LIVE carrier (status not in ('done','archived')) with this signature's prefix absorbs the
-      repeat -- a long stall files ONE card, never one per tick;
-    * a CLOSED last carrier is the RE-OPEN LEG: a new card is filed under a fresh ordinal, because
-      a fixed key would be handed straight back by the kernel's own idempotency door (the exact
-      defect that cost 1h38m: three closed guard cards absorbed every refusal of the recurrence).
+    * at most ONE OPEN actor per imported content: every task on the actor board whose key starts
+      ``tree-skew:<signature>:`` and whose status is not terminal absorbs the repeat, so the
+      cardinality holds EVEN when the status record could not be read or written (the lookup is on
+      the board, not on the record). LEGACY keys (``tree-skew:<sig>:<pid>:<ord>``, 78 of them live)
+      match the same prefix and absorb too;
+    * a CLEARED window is not absorbed: its carrier is ``done`` (terminal), and the next window
+      mints a NEW key from its own ``first_tick`` -- the fixed-key defect that cost 1h38m on
+      2026-10-11 is exactly what the window replaces.
 
     Best-effort: a board that refuses the write is logged with the key it could not file and never
     takes the tick down.
@@ -4392,28 +4531,42 @@ def _file_tick_yield_actor(
     prefix = f"{TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{sig}"
     filed_on_conn, filed_on, close_it = _ops_board_connection(conn)
     try:
-        existing = filed_on_conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key LIKE ? || ':%' "
-            "AND status NOT IN ('done', 'archived') ORDER BY created_at DESC LIMIT 1",
-            (prefix,),
-        ).fetchone()
-        if existing is not None:
-            return existing["id"]
         # A skew that SURVIVED a reload is not a reload problem: file ONE escalation and stop
-        # minting duplicates of the same demand (card t_4dbee32e; the 116-card pile).
+        # minting duplicates of the same demand (card t_4dbee32e; the 116-card pile). Asked
+        # BEFORE the absorb, deliberately: DEC-1.4's key is per EPISODE, so a guard card filed by
+        # the process that has since been reloaded absorbs every later tick -- an absorb-first
+        # order would make this branch dead code and keep re-filing a demand a reload is already
+        # known not to clear.
+        #
+        # WHAT COUNTS AS SURVIVAL (card t_5a54ca29, R-1): the SAME IMPORTED CONTENT, filed by a
+        # process that is now proven dead, on a card that was not already cleared before this
+        # process booted. The disk fingerprint is evidence, never the identity: it is the one
+        # fingerprint a reload does not change, so matching it turned a re-skew onto a revision
+        # the fleet had already left (b1b9cb6 -> 47558cf, five minutes) into an "escalation" that
+        # cited a guard card closed long before. The escalation is idempotent per EPISODE, so
+        # every later refusal of the same surviving skew returns the same card.
         survived = _skew_survived_a_reload(filed_on_conn, yielded)
         if survived is not None:
             return _file_tick_yield_escalation(
                 filed_on_conn, yielded, board=board, filed_on=filed_on,
-                status_path=status_path, streak=streak, prior_card=survived,
+                status_path=status_path, streak=streak, prior=survived,
+                first_tick=first_tick,
             )
-        used = filed_on_conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ? || ':%'", (prefix,),
-        ).fetchone()[0]
-        key = f"{prefix}:{int(used) + 1}"
+        placeholders = ",".join("?" for _ in TICK_YIELD_ACTOR_ABSORB_SKIP_STATUSES)
+        existing = filed_on_conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE ? || ':%' "
+            f"AND status NOT IN ({placeholders}) ORDER BY rowid LIMIT 1",
+            (prefix, *TICK_YIELD_ACTOR_ABSORB_SKIP_STATUSES),
+        ).fetchone()
+        if existing is not None:
+            return existing["id"]
+        key = f"{prefix}:{int(window_start)}"
+
         body = _tick_yield_actor_body(
             yielded, board=board, status_path=status_path, streak=streak,
             first_tick=first_tick, last_tick=last_tick, filed_on=filed_on,
+            episode=_episode_identity(sig, window_start or first_tick),
+            escalation_ref=escalation_ref,
         )
         # The ladder reads the card's OWN declaration line, so the body is built FIRST: asking it
         # about an empty body is how these cards were born in the tier's rest band (790000) while
@@ -4446,9 +4599,11 @@ def _file_tick_yield_actor(
                     "streak": int(streak),
                     "first_tick": int(first_tick),
                     "last_tick": int(last_tick or (time.time() if now is None else now)),
+                    "window_start": int(window_start or first_tick),
                     "status_record": status_path,
                     "board": board,
                     "filed_on": filed_on,
+                    "escalation_ref": escalation_ref,
                 },
             )
         return actor_id
@@ -4465,6 +4620,177 @@ def _file_tick_yield_actor(
                 pass
 
 
+def _escalation_ledger_source() -> str:
+    """Where the escalation registry module lives: ENV, then CONFIG, then the estate default.
+
+    ``HERMES_KANBAN_ESCALATION_LEDGER`` wins, so an acceptance surface (or an operator) can point
+    the door at a scratch ledger without touching the fleet's; ``kanban.escalation_ledger`` is the
+    durable spelling; the estate default keeps the door armed on a tree whose config declares
+    nothing. ``none``/``off`` DISABLES leg 1 and falls through to leg 2 -- a kill switch, never a
+    silent no-op.
+    """
+    env = (os.environ.get(TICK_YIELD_ESCALATION_ENV) or "").strip()
+    if env:
+        return env
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = (load_config_readonly() or {}).get("kanban") or {}
+    except Exception:
+        cfg = {}
+    if isinstance(cfg, dict):
+        value = cfg.get(TICK_YIELD_ESCALATION_CONFIG_KEY)
+        if value:
+            return str(value)
+    return TICK_YIELD_ESCALATION_DEFAULT
+
+
+def _load_escalation_ledger():
+    """``(module, None)`` when the registry loads, else ``(None, named-error)``.
+
+    BY PATH, always: ``escalation_ledger.py`` lives in the platform estate
+    (``/opt/hermes_prod/yaan-platform/scripts``), not on this package's import path, and pushing
+    that directory onto ``sys.path`` from a dispatcher tick would let the estate's module names
+    shadow this package's. A candidate that raises on import (a half-landed ledger) is a NAMED
+    failure and leg 2 still runs -- no exception from here ever reaches the tick.
+    """
+    import importlib.util
+
+    source = _escalation_ledger_source()
+    if source.strip().lower() in TICK_YIELD_ESCALATION_DISABLED:
+        return None, f"disabled by {TICK_YIELD_ESCALATION_ENV}={source!r}"
+    path = Path(source).expanduser()
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "hermes_tick_yield_escalation_ledger", path)
+        if spec is None or spec.loader is None:
+            return None, f"no loadable module at {path}"
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        return None, f"{exc.__class__.__name__}: {exc}"
+    return module, None
+
+
+def _tree_skew_escalation_line(
+    yielded: DispatcherTickYielded, *, episode: str, streak: int, status_path: str,
+) -> str:
+    """ONE deterministic line: the registry's ``reason``, the DM body, and the card's quote.
+
+    No model, no prose to interpret: gate, imported label, disk label, pid, streak, episode and the
+    status record's path -- the same facts the card carries, in one sentence a DM can be read from.
+    """
+    return (
+        f"{TICK_YIELD_PREFIX} kanban dispatcher refusing to serve: imported tree content "
+        f"{yielded.boot_label} (pid {yielded.boot_pid}) but the checkout is {yielded.disk_label}; "
+        f"streak {streak} of {TICK_YIELD_ACTOR_THRESHOLD}; episode {episode}; "
+        f"status record {status_path}"
+    )
+
+
+def _peer_run_tree_skew(line: str, episode: str) -> tuple[str, Optional[str]]:
+    """Leg 2 of the door: ONE ``hermes -p default peer run`` nudge. ``(state, error)``, never raises.
+
+    The verb is the ASYNC one (``peer run`` queues the turn and returns), and ``--idempotency-key``
+    is the EPISODE identity, so a re-fire of the same window cannot nudge twice even if the record
+    that was supposed to bound it was lost. ``escalation_ledger.notify()`` is the model for the env
+    scrubbing: a tick fires inside another process's tree, so its board/profile pins (and a
+    delegated child's context) must not leak into the child.
+    """
+    import subprocess
+
+    hermes = os.environ.get("HERMES_ESCALATION_HERMES") or "hermes"
+    cmd = [hermes, "-p", TICK_YIELD_ACTOR_ASSIGNEE, "peer", "run",
+           f"yoyodine/{TICK_YIELD_ACTOR_ASSIGNEE}", "--idempotency-key", episode]
+    env = dict(os.environ)
+    for var in list(env):
+        if var.startswith("HERMES_KANBAN_") or var == "HERMES_DELEGATED_CHILD_CONTEXT":
+            env.pop(var, None)
+    try:
+        proc = subprocess.run(
+            cmd, input=line, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=TICK_YIELD_ESCALATION_TIMEOUT_S, env=env,
+        )
+    except Exception as exc:
+        return "failed", f"{exc.__class__.__name__}: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:400] or f"rc={proc.returncode}"
+        return "failed", detail
+    return "sent", None
+
+
+def _deliver_tree_skew_escalation(
+    yielded: DispatcherTickYielded,
+    *,
+    episode: str,
+    status_path: str,
+    streak: int,
+    record: Optional[dict] = None,
+) -> dict:
+    """The DOOR, attempted ONCE per episode: the registry row (+ its nudge), else the peer nudge.
+
+    Returns ``{"at", "leg", "ref", "state", "error"}`` -- recorded on the status record so a later
+    refusal of the same window can see the door was already knocked on, and a reader of the record
+    can see WHICH leg carried it and what failed. Notes on the shape:
+
+    * ``owner_lane`` is passed EXPLICITLY: ``resolver_for_board`` reads the catalogue DB and fails
+      LOUD on an unreadable registry, and a delivery path that dies on a lookup is no door at all.
+    * the escalation is NEVER closed from here -- closing carries the resolver's write-back
+      (resolution, why-raisers-stuck, learning), which only the resolver can honestly write.
+    * ``state`` is ``sent`` / ``failed`` / ``unavailable``; nothing here raises.
+    """
+    at = int(time.time())
+    line = _tree_skew_escalation_line(
+        yielded, episode=episode, streak=streak, status_path=status_path)
+    module, error = _load_escalation_ledger()
+    ref: Optional[str] = None
+    if module is not None:
+        try:
+            row = module.register(
+                source_kind=TICK_YIELD_ESCALATION_SOURCE_KIND,
+                source_id=episode,
+                board=TICK_YIELD_ACTOR_BOARD,
+                owner_lane=TICK_YIELD_ACTOR_ASSIGNEE,
+                reason=line,
+                raised_by=TICK_YIELD_ESCALATION_RAISED_BY,
+                issue_class=TICK_YIELD_ESCALATION_ISSUE_CLASS,
+                submission=record or {"episode": episode},
+            ) or {}
+            ref = row.get("ref")
+        except Exception as exc:
+            error = f"register: {exc.__class__.__name__}: {exc}"
+        if ref:
+            try:
+                module.notify(ref, TICK_YIELD_ACTOR_ASSIGNEE, line)
+            except Exception as exc:
+                # The ROW exists (the durable half landed); only the nudge failed. Say so, and do
+                # not re-knock through leg 2: a second channel for one episode is noise.
+                failed = f"notify: {exc.__class__.__name__}: {exc}"
+                _kb._log.warning(
+                    "kanban dispatcher: escalation %s raised but its nudge failed: %s", ref, failed)
+                return {"at": at, "leg": "ledger", "ref": ref, "state": "failed",
+                        "error": failed}
+            return {"at": at, "leg": "ledger", "ref": ref, "state": "sent", "error": None}
+    state, peer_error = _peer_run_tree_skew(line, episode)
+    combined = "; ".join(part for part in (error, peer_error) if part) or None
+    if state != "sent":
+        _kb._log.warning(
+            "kanban dispatcher: the tree-skew door delivered NOTHING for episode %s "
+            "(leg 2 state=%s): %s", episode, state, combined,
+        )
+    return {
+        "at": at,
+        "leg": "peer",
+        "ref": ref,
+        "state": state,
+        "error": combined,
+    }
+
+
+
+
+
 def _event_payload(raw) -> dict:
     """A ``task_events.payload`` blob as a dict (tolerant: a relic is ``{}``, never a raise)."""
     if isinstance(raw, dict):
@@ -4476,24 +4802,120 @@ def _event_payload(raw) -> dict:
     return doc if isinstance(doc, dict) else {}
 
 
-def _skew_survived_a_reload(
-    conn: sqlite3.Connection, yielded: DispatcherTickYielded, *, limit: int = 50,
-) -> Optional[str]:
-    """The id of a prior guard card PROVING that a reload landed and did NOT clear the skew.
+@dataclass(frozen=True)
+class _PriorSkewEvent:
+    """A prior guard card that PROVES a reload landed on THIS SAME imported content.
 
-    All of the evidence is already on the board: a guard card names the frozen process
-    (``boot_pid``) and the disk content it measured (``disk_fingerprint``). A card for the SAME
-    disk fingerprint naming a DIFFERENT process that is now PROVEN DEAD is a reload onto exactly
-    this checkout --- and this process is AGAIN skewed. That is no longer "reload it again"; it is
-    "the reload door does not clear the condition", which is a design question for the domain's
-    design authority, not a 116th copy of the same demand.
+    The identity is ``boot_fingerprint`` -- the content a reload CHANGES (R-1).
+    ``disk_fingerprint`` rides along as EVIDENCE ONLY: what a reload leaves behind is the checkout,
+    so matching on it made an ordinary re-skew read as a broken door (card t_5a54ca29).
+    """
 
-    "Proven dead" is the liveness contract's verdict, never the negation of an unreadable probe:
-    an unknown process is not evidence that a reload happened.
+    card_id: str
+    boot_pid: int
+    boot_fingerprint: str
+    disk_fingerprint: str
+    status: str
+    completed_at: Optional[int]
+    event_at: int
+    boot_recorded_at: int
+
+
+def _this_process_booted_at(boot_pid: int) -> Optional[int]:
+    """When the process that imported this content recorded its boot, or ``None``.
+
+    Read from the LIVE process first: the gate runs INSIDE the process it judges, so the in-memory
+    record is the authoritative one. The persisted record is the fallback, accepted only when its
+    stored identity still names the same process -- a recycled pid's record dates somebody else's
+    boot, and dating the wrong boot is how a cleared episode would read as survival.
+
+    ``None`` means the caller must NOT escalate (R-2): an undateable boot is not evidence that a
+    prior card survived into it.
     """
     try:
+        from hermes_cli import tree_fingerprint
+
+        record = tree_fingerprint.boot_record() or {}
+        if int(record.get("pid") or 0) == int(boot_pid) and record.get("recorded_at") is not None:
+            return int(record["recorded_at"])
+        persisted = tree_fingerprint.recorded_boot(int(boot_pid)) or {}
+        if int(persisted.get("pid") or 0) != int(boot_pid):
+            return None
+        if persisted.get("recorded_at") is None:
+            return None
+        identity = persisted.get("identity")
+        if identity and _process_fingerprint(int(boot_pid)) != identity:
+            return None
+        return int(persisted["recorded_at"])
+    except Exception:  # health: allow BLE001 -- fail-open (t_5a54ca29): an unreadable boot record
+        # means this process's boot cannot be dated, and an undateable boot must NOT escalate
+        # (R-2) -- but it must never take the dispatch tick down either.
+        return None
+
+
+def _prior_filer_certified_dead(pid: int, boot_fingerprint: str) -> bool:
+    """``pid`` filed the prior card and is PROVEN DEAD -- anchored to its OWN boot record.
+
+    The liveness verdict is necessary but not sufficient (R-2, recycled-pid guard): a pid NUMBER is
+    only evidence while it still means the same process. So the filer's persisted boot record has
+    to exist, name that pid, and carry the same imported content the card claims; and where both
+    sides are readable, the identity at that pid has to be the recorded one -- which is exactly
+    what a recycled pid breaks, and an identity that now differs from the record is NOT a death.
+
+    A missing or mismatched record is NOT certified: the card then describes a process this board
+    can no longer corroborate, and an unreadable claim does not carry a design escalation.
+    """
+    try:
+        from hermes_cli import tree_fingerprint
+
+        record = tree_fingerprint.recorded_boot(int(pid)) or {}
+    except Exception:  # health: allow BLE001 -- fail-open (t_5a54ca29): an unreadable record
+        # cannot certify the filer, and an uncertified pid is simply not PROVEN DEAD (so it
+        # cannot carry a design escalation) -- never a reason to take the tick down.
+        return False
+    if int(record.get("pid") or 0) != int(pid):
+        return False
+    if str(record.get("fingerprint") or "") != str(boot_fingerprint):
+        return False
+    recorded_identity = record.get("identity")
+    if recorded_identity:
+        live_identity = _process_fingerprint(int(pid))
+        if live_identity is not None and live_identity != recorded_identity:
+            return False  # the pid now names a DIFFERENT process: recycled, not dead
+    return _pid_liveness(int(pid)) == WORKER_DEAD
+
+
+def _skew_survived_a_reload(
+    conn: sqlite3.Connection, yielded: DispatcherTickYielded, *, limit: int = 50,
+) -> Optional[_PriorSkewEvent]:
+    """The prior guard card PROVING a reload landed on THIS imported content and did not clear it.
+
+    THE IDENTITY IS THE IMPORTED CONTENT, NEVER THE DISK (R-1). What a reload changes is the
+    content a process imports; what a reload leaves behind is the checkout on disk. A prior card
+    whose ``disk_fingerprint`` equals this tick's is therefore NOT evidence of survival -- it is
+    the same skew measured by a DIFFERENT process, and 2026-10-21 is exactly that shape (b1b9cb6
+    back to 47558cf inside five minutes): a re-skew onto a revision the fleet had already left.
+    Matching on the disk made an ordinary re-entry read as a broken reload door.
+
+    All three must hold; any unreadable field means NOT survived (fail closed):
+
+      * R-1: the prior event imported the SAME content this process imported
+        (``boot_fingerprint``) -- the only thing a reload can change;
+      * it named a DIFFERENT process, and that process is PROVEN DEAD -- the liveness contract's
+        verdict, never the negation of an unreadable probe: an unknown process is not evidence
+        that a reload happened;
+      * R-2: that card was not already CLEARED before this process booted. A prior card still open,
+        or closed at/after this process's boot ``recorded_at``, is a reload that landed and came
+        back -- which is a design question. One closed before that is a previous episode, already
+        answered, and re-filing it as survival is how one card becomes 116.
+    """
+    boot_recorded_at = _this_process_booted_at(yielded.boot_pid)
+    if boot_recorded_at is None:
+        return None
+    try:
         rows = conn.execute(
-            "SELECT t.id AS id, e.payload AS payload FROM task_events e "
+            "SELECT t.id AS id, t.status AS status, t.completed_at AS completed_at, "
+            "e.payload AS payload FROM task_events e "
             "JOIN tasks t ON t.id = e.task_id WHERE e.kind = ? ORDER BY e.id DESC LIMIT ?",
             (TICK_YIELD_ACTOR_EVENT, int(limit)),
         ).fetchall()
@@ -4501,7 +4923,7 @@ def _skew_survived_a_reload(
         return None
     for row in rows:
         payload = _event_payload(row["payload"])
-        if str(payload.get("disk_fingerprint") or "") != yielded.disk_fingerprint:
+        if str(payload.get("boot_fingerprint") or "") != yielded.boot_fingerprint:
             continue
         try:
             pid = int(payload.get("boot_pid"))
@@ -4510,40 +4932,93 @@ def _skew_survived_a_reload(
         if pid == yielded.boot_pid:
             # The SAME frozen process: that repeat is the existing carrier's to absorb.
             continue
-        if _pid_liveness(pid) == WORKER_DEAD:
-            return str(row["id"])
+        boot_fingerprint = str(payload.get("boot_fingerprint") or "")
+        if not _prior_filer_certified_dead(pid, boot_fingerprint):
+            continue
+        status = str(row["status"] or "")
+        completed_at = row["completed_at"]
+        if status in TICK_YIELD_ACTOR_ABSORB_SKIP_STATUSES:
+            try:
+                closed_at = int(completed_at)
+            except (TypeError, ValueError):
+                # Closed with no usable time: a previous episode and this one cannot be told
+                # apart, and that is not proof the door failed (R-2, fail closed).
+                continue
+            if closed_at < boot_recorded_at:
+                continue
+        return _PriorSkewEvent(
+            card_id=str(row["id"]),
+            boot_pid=pid,
+            boot_fingerprint=str(payload.get("boot_fingerprint") or ""),
+            disk_fingerprint=str(payload.get("disk_fingerprint") or ""),
+            status=status,
+            completed_at=int(completed_at) if completed_at is not None else None,
+            event_at=int(payload.get("last_tick") or payload.get("first_tick") or 0),
+            boot_recorded_at=int(boot_recorded_at),
+        )
     return None
 
 
 def _tick_yield_escalation_body(
     yielded: DispatcherTickYielded,
     *,
-    prior_card: str,
+    prior: _PriorSkewEvent,
     board: Optional[str],
     filed_on: Optional[str],
     status_path: str,
     streak: int,
+    first_tick: int,
 ) -> str:
-    """The escalation card's body: deterministic, and it asks the ONE question that is left."""
+    """The escalation card's body: deterministic, MEASUREMENTS only, and the ONE question left.
+
+    Every fact is labelled and quoted verbatim (R-4), each fingerprint printed beside the pid of
+    the process that measured it, and the match the card rests on is the IMPORTED content. The
+    body is built ONLY for the case R-1..R-3 established, so the question section stays: this card
+    exists to get an answer, not to report a number.
+    """
+    import datetime
+
+    def _iso(epoch):
+        try:
+            return datetime.datetime.fromtimestamp(int(epoch)).isoformat(timespec="seconds")
+        except (TypeError, ValueError, OSError):
+            return "?"
+
+    closed_at = _iso(prior.completed_at) if prior.completed_at is not None else "(not closed)"
     return "\n".join([
         TICK_YIELD_ACTOR_DECLARATION,
         "",
-        "## What was measured",
+        "## What was measured (verbatim, no conclusion)",
         "",
-        f"- this frozen process: pid {yielded.boot_pid}, imported content "
-        f"`{yielded.boot_fingerprint}` (label `{yielded.boot_label}`)",
+        f"- THIS process: pid {yielded.boot_pid}, imported content "
+        f"`{yielded.boot_fingerprint}` (label `{yielded.boot_label}`), boot recorded at "
+        f"{_iso(prior.boot_recorded_at)} (epoch {int(prior.boot_recorded_at)})",
         f"- the checkout on disk: `{yielded.disk_fingerprint}` (label `{yielded.disk_label}`)",
         f"- board refused: `{board or 'unknown'}`; card filed on: `{filed_on or board or 'unknown'}`",
-        f"- consecutive refused ticks under THIS process: **{streak}**",
+        f"- consecutive refused ticks under THIS process: **{streak}**; episode "
+        f"`{yielded.boot_label}:{int(first_tick)}` (first tick {_iso(first_tick)})",
         f"- non-green status record: `{status_path}`",
+        "",
+        "## The prior event this matched (SAME imported content)",
+        "",
+        f"- prior guard card: `{prior.card_id}` -- status `{prior.status}`, closed at {closed_at}",
+        f"- filed by: pid {prior.boot_pid}, which imported content `{prior.boot_fingerprint}` "
+        f"and measured disk content `{prior.disk_fingerprint}`",
+        f"- that event was recorded at {_iso(prior.event_at)}, and that pid's liveness verdict is "
+        "PROVEN DEAD",
+        f"- this process booted at {_iso(prior.boot_recorded_at)}, so that card had not already "
+        "cleared this skew before this process started",
+        f"- match basis: the IMPORTED content `{yielded.boot_fingerprint}` is IDENTICAL in both. "
+        "The disk fingerprints are quoted as evidence only and take NO part in the identity (R-1)",
         "",
         "## Why this is an escalation and not another guard card",
         "",
-        f"`{prior_card}` carried the SAME on-disk content and named a DIFFERENT process, which is",
-        "now PROVEN DEAD: a reload DID happen, onto exactly this checkout, and the skew survived",
-        "it. Repeating the reload demand would be a duplicate -- the fleet already measured",
-        "116 such cards (measured 2026-10-21: 116 `[guard] dispatcher is serving a mixed revision`",
-        "rows across six boards), which is how a real stall becomes background noise.",
+        f"`{prior.card_id}` was filed by pid {prior.boot_pid}, which is now PROVEN DEAD, and this",
+        "process imported the SAME content: a reload DID land, the skew is back on the content it",
+        "imported, and the prior card had not been cleared before this process booted. Repeating",
+        "the reload demand would be a duplicate -- the fleet already measured 116 such cards",
+        "(measured 2026-10-21: 116 `[guard] dispatcher is serving a mixed revision` rows across",
+        "six boards), which is how a real stall becomes background noise.",
         "",
         "## The question this card exists to get answered",
         "",
@@ -4557,7 +5032,7 @@ def _tick_yield_escalation_body(
         "   restarting onto a pinned tree, a second process serving the same port).",
         "",
         "Answer with the branch that holds and the card moves to the code lane that owns it. Until",
-        "then NO further guard card is filed for this disk content -- this one card carries it.",
+        "then NO further guard card is filed for this episode -- this one card carries it.",
     ])
 
 
@@ -4565,15 +5040,23 @@ def _file_tick_yield_escalation(
     conn: sqlite3.Connection,
     yielded: DispatcherTickYielded,
     *,
+    prior: _PriorSkewEvent,
     board: Optional[str] = None,
     filed_on: Optional[str] = None,
     status_path: str = "",
     streak: int = 0,
-    prior_card: str = "",
+    first_tick: int = 0,
     now: Optional[int] = None,
 ) -> Optional[str]:
-    """File the ONE escalation card for a skew a reload did not clear (idempotent per disk)."""
-    key = f"{TICK_YIELD_ESCALATION_KEY_PREFIX}{yielded.disk_fingerprint}"
+    """File the ONE escalation card for a skew a reload did not clear (idempotent per EPISODE).
+
+    The key is ``tree-skew-escalation:<imported content>:<first_tick>`` (R-3). One card per
+    episode: a repeat refusal INSIDE the episode returns this same card, while an episode whose
+    card has been closed mints a new key from its OWN ``first_tick`` instead of being swallowed by
+    the old one -- the same window rule the guard card follows (DEC-1.4). Keying on the disk
+    fingerprint instead made the escalation outlive its episode and cited a card closed months ago.
+    """
+    key = f"{TICK_YIELD_ESCALATION_KEY_PREFIX}{yielded.boot_fingerprint}:{int(first_tick)}"
     try:
         existing = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -4583,8 +5066,8 @@ def _file_tick_yield_escalation(
         if existing is not None:
             return existing["id"]
         body = _tick_yield_escalation_body(
-            yielded, prior_card=prior_card, board=board, filed_on=filed_on,
-            status_path=status_path, streak=streak,
+            yielded, prior=prior, board=board, filed_on=filed_on,
+            status_path=status_path, streak=streak, first_tick=first_tick,
         )
         priority, ladder_note = _tick_yield_actor_priority(
             title=TICK_YIELD_ESCALATION_TITLE, body=body, board=filed_on or board or "",
@@ -4608,7 +5091,14 @@ def _file_tick_yield_escalation(
                     "boot_fingerprint": yielded.boot_fingerprint,
                     "disk_fingerprint": yielded.disk_fingerprint,
                     "boot_pid": yielded.boot_pid,
-                    "prior_card": prior_card,
+                    "episode": f"{yielded.boot_label}:{int(first_tick)}",
+                    "first_tick": int(first_tick),
+                    "prior_card": prior.card_id,
+                    "prior_boot_pid": prior.boot_pid,
+                    "prior_boot_fingerprint": prior.boot_fingerprint,
+                    "prior_disk_fingerprint": prior.disk_fingerprint,
+                    "prior_status": prior.status,
+                    "prior_completed_at": prior.completed_at,
                     "streak": int(streak),
                     "filed_on": filed_on,
                     "board": board,
@@ -4616,139 +5106,19 @@ def _file_tick_yield_escalation(
                 },
             )
         _kb._log.error(
-            "kanban dispatcher: the tree skew SURVIVED a reload (disk %s); filed escalation %s "
-            "to %s instead of another guard card",
-            yielded.disk_label, escalation_id, TICK_YIELD_ESCALATION_ASSIGNEE,
+            "kanban dispatcher: the tree skew SURVIVED a reload onto imported content %s "
+            "(episode %s:%s); filed escalation %s to %s instead of another guard card",
+            yielded.boot_label, yielded.boot_label, int(first_tick), escalation_id,
+            TICK_YIELD_ESCALATION_ASSIGNEE,
         )
         return escalation_id
     except Exception as exc:
         _kb._log.warning(
-            "kanban dispatcher: could not file the tree-skew ESCALATION (disk=%s, prior=%s): %s",
-            yielded.disk_fingerprint, prior_card, exc,
+            "kanban dispatcher: could not file the tree-skew ESCALATION (boot=%s, key=%s, "
+            "prior=%s): %s",
+            yielded.boot_fingerprint, key, prior.card_id, exc,
         )
         return None
-
-
-def _tick_served(result: Optional[object]) -> bool:
-    """True only for a tick that actually SERVED: not a refusal, not a lock skip, not an error."""
-    if result is None:
-        return False
-    try:
-        if getattr(result, "tick_yielded", None) or getattr(result, "error", None):
-            return False
-        return not (
-            getattr(result, "skipped_locked", False)
-            or getattr(result, "skipped_board_disabled", False)
-        )
-    except Exception:  # pragma: no cover - a duck-typed result must not stop a tick
-        return False
-
-
-def _close_cleared_tick_yield_cards(
-    result: Optional[object], conn: sqlite3.Connection,
-) -> list:
-    """Close the guard card(s) whose stall is OVER, on the proof of a verified NORMAL tick.
-
-    "Cleared" is never inferred from the ABSENCE of refusals -- the dispatcher that would refuse
-    is precisely the one that is gone. Two facts are required, both deterministic:
-
-      * THIS tick served (``_tick_served``): the evidence the card's own "What closes it" section
-        names ("the gate clears itself on the first tick that serves normally"); and
-      * the frozen process the card names is PROVEN DEAD (or is this very process, which has just
-        served), so a second live dispatcher on another board can never close a live gateway's
-        card.
-
-    A card a seat is working RIGHT NOW is protected by the kernel's live-claim fence: a
-    ``complete_task`` without run ownership is refused, which is why this door is safe to call on
-    every healthy tick. Every refusal is logged and the card is left exactly as it was.
-
-    The cards live on the OPS board (the one they were filed on), never on the board that merely
-    ticked -- the same rule the filing half follows.
-    """
-    if not _tick_served(result):
-        return []
-    ops_conn, _ops_board, close_it = _ops_board_connection(conn)
-    try:
-        return _close_cleared_cards_on(ops_conn)
-    finally:
-        if close_it:
-            try:
-                ops_conn.close()
-            except Exception:  # pragma: no cover - closing a scratch connection never matters
-                pass
-
-
-def _close_cleared_cards_on(conn: sqlite3.Connection) -> list:
-    """The body of :func:`_close_cleared_tick_yield_cards` against the board the cards ride."""
-    try:
-        rows = conn.execute(
-            "SELECT t.id AS id FROM tasks t JOIN task_events e ON e.task_id = t.id "
-            "WHERE e.kind = ? AND t.status NOT IN ('done', 'archived') GROUP BY t.id",
-            (TICK_YIELD_ACTOR_EVENT,),
-        ).fetchall()
-    except Exception:  # pragma: no cover - no board history, nothing to close
-        return []
-    closed = []
-    for row in rows:
-        card_id = row["id"]
-        try:
-            payload_row = conn.execute(
-                "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (card_id, TICK_YIELD_ACTOR_EVENT),
-            ).fetchone()
-        except Exception:  # pragma: no cover
-            continue
-        payload = _event_payload(payload_row["payload"] if payload_row is not None else None)
-        try:
-            frozen_pid = int(payload.get("boot_pid"))
-        except (TypeError, ValueError):
-            continue
-        if frozen_pid != os.getpid() and _pid_liveness(frozen_pid) != WORKER_DEAD:
-            continue
-        try:
-            outcome = _kb.complete_task(
-                conn, card_id,
-                summary=(
-                    "Closed by the dispatcher's OWN tick: the tree-skew stall this card carried is"
-                    " over. A dispatcher process served a normal tick after the frozen process it"
-                    f" named (pid {frozen_pid}) went away, so the reload landed and the gate is"
-                    " clear -- no lane action is owed on this card."
-                ),
-                metadata={
-                    "evidence": {
-                        "class": "none",
-                        "why": (
-                            "board repair with no run behind it: the proof is a verified normal "
-                            "dispatcher tick after the frozen pid (proven dead) stopped serving"
-                        ),
-                    },
-                    "tree_skew_cleared": {
-                        "frozen_pid": frozen_pid,
-                        "disk_fingerprint": payload.get("disk_fingerprint"),
-                        "boot_fingerprint": payload.get("boot_fingerprint"),
-                        "observed_by_pid": os.getpid(),
-                        "at": int(time.time()),
-                    },
-                },
-            )
-        except Exception as exc:
-            _kb._log.warning(
-                "kanban dispatcher: could not close the cleared tree-skew guard %s: %s", card_id, exc,
-            )
-            continue
-        if not outcome:
-            _kb._log.warning(
-                "kanban dispatcher: the cleared tree-skew guard %s was not closed (%s); it is a "
-                "live claim and stays with its worker", card_id, outcome,
-            )
-            continue
-        closed.append(card_id)
-        _kb._log.info(
-            "kanban dispatcher: closed tree-skew guard %s -- a normal tick after pid %s cleared it",
-            card_id, frozen_pid,
-        )
-    return closed
 
 
 def _tick_refused_for_tree_skew(
@@ -4759,17 +5129,35 @@ def _tick_refused_for_tree_skew(
     dry_run: bool = False,
 ) -> DispatchResult:
     """The whole non-green path for a refused tick: loud line, status record, and -- at the
-    THRESHOLD, not before -- ONE acting card on the ops board. Returns the non-green result."""
+    THRESHOLD, not before -- the DOOR (one delivery attempt per episode) and ONE acting card on the
+    ops board. Returns the non-green result.
+
+    Ordered on purpose: the door is knocked on BEFORE the card is written, so the card can quote the
+    escalation ref it produced. Both are bounded to one attempt/one card per EPISODE -- the status
+    record's ``delivery`` block is the bound for the door, the board's own absorb rule is the bound
+    for the card.
+    """
     status_path = "(dry run: nothing written)"
     if not dry_run:
-        status_path = _record_tick_yield(yielded, board=board)
-        state = _read_tick_yield_status(tick_yield_status_path())
+        status_path, state = _record_tick_yield(yielded, board=board)
         streak = int(state.get("streak") or 0)
         if streak >= TICK_YIELD_ACTOR_THRESHOLD:
+            sig = _yield_signature(yielded)
+            first_tick = int(state.get("first_tick") or state.get("recorded_at") or time.time())
+            episode = state.get("episode") or _episode_identity(sig, first_tick)
+            delivery = state.get("delivery") or {}
+            if not delivery.get("at"):
+                delivery = _deliver_tree_skew_escalation(
+                    yielded, episode=episode, status_path=status_path, streak=streak,
+                    record=state,
+                )
+                _merge_tick_yield_delivery(delivery)
             _file_tick_yield_actor(
                 conn, yielded, board=board, status_path=status_path, streak=streak,
-                first_tick=int(state.get("first_tick") or 0),
+                first_tick=first_tick,
                 last_tick=int(state.get("last_tick") or 0),
+                window_start=first_tick,
+                escalation_ref=delivery.get("ref"),
             )
     logger.error("kanban dispatcher: %s (status record: %s)", yielded, status_path)
     return DispatchResult(tick_yielded=str(yielded))
@@ -4861,16 +5249,20 @@ def dispatch_once(
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
+            # DEC-3 + card t_028ad743: retire the guards whose episode is OVER, BEFORE this tick
+            # claims or spawns anything. THE PROOF IS THE PLACEMENT -- a tick that reached here
+            # passed ``_raise_if_tree_skewed`` (the tree this process imported IS the checkout on
+            # disk) and holds the board's dispatch lock. It must run before the claim phase because
+            # the tick's own reconcile otherwise releases and CLAIMS a fallback-filed guard: the
+            # card came back ``running``, the kernel refused the close, and the duplicate was
+            # re-dispatched to its lane on every tick while never being retired.
+            #
+            # Both doors keep their own fault isolation: neither may take a tick down.
+            if not dry_run:
+                _retire_cleared_tree_skew_cards(conn, board=resolved_board)
             result = _locked_tick()
             # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
             _kbc._maybe_checkpoint_wal(conn, db_path)
-    # This tick served normally, so a non-green marker left by THIS process (or by a process that
-    # is now provably dead) is retired. A fresh process never clears a live gateway's marker.
-    if not dry_run:
-        _clear_tick_yield_status()
-        # ...and the guard card the marker carried is closed on the same proof (card t_4dbee32e):
-        # a verified normal tick is what "the reload landed" looks like from the board's side.
-        _close_cleared_tick_yield_cards(result, conn)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -6632,3 +7024,15 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
+
+# The tree-skew RETIREMENT doors (card t_028ad743) live in a topical sibling and are re-exported
+# here: ``dispatch_once`` calls them by name at tick time, and the tests patch this module. Imported
+# after ``_kb`` for the same reason -- the sibling reaches back into ``kanban_db`` at CALL time.
+from hermes_cli.kanban_db_dispatch_retire import (
+    _close_cleared_cards_on,
+    _close_cleared_tick_yield_cards,
+    _retire_cleared_tree_skew_cards,
+    _retire_tree_skew_actors,
+    _tree_skew_actor_pid_from_key,
+    _tree_skew_actor_provenance,
+)

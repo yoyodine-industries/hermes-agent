@@ -980,7 +980,17 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 
 
 def _git_ref_accepted(branch_name: str) -> bool:
-    """True when git itself accepts *branch_name* as a branch ref."""
+    """True only when git itself confirms *branch_name* as a branch ref.
+
+    Fails CLOSED. A probe that cannot run — no git on PATH, a timeout, or a name
+    carrying a NUL byte that ``execve`` refuses — is a name we could not verify,
+    and a name we could not verify is not a name we hand to ``git worktree add``.
+    Returning the unverified name unchanged is what let a NUL-carrying stored
+    name through; the caller now repairs it (``sanitize_branch_name`` maps NUL
+    into ``-`` as an illegal control character).
+    """
+    if not branch_name or "\x00" in branch_name:
+        return False
     try:
         probe = subprocess.run(
             ["git", "check-ref-format", "--branch", branch_name],
@@ -989,9 +999,12 @@ def _git_ref_accepted(branch_name: str) -> bool:
             timeout=30,
         )
     except Exception:
-        # No usable git: let ``git worktree add`` be the judge rather than
-        # rewriting a name we could not check.
-        return True
+        _log.warning(
+            "kanban workspace: could not verify branch name %r with git; treating it as "
+            "invalid and repairing it",
+            branch_name,
+        )
+        return False
     return probe.returncode == 0
 
 

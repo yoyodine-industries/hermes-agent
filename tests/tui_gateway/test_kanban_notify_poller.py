@@ -17,9 +17,11 @@ from unittest.mock import patch
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
-from tui_gateway.server import (
+from tui_gateway import server  # installs the split modules' bodies (method_ctx.bind_module)
+from tui_gateway.session_notifications import (
     _collect_kanban_notifications,
     _format_kanban_event_text,
+    _notification_poller_loop,
 )
 
 SESSION_KEY = "tui-session-key-1"
@@ -275,7 +277,7 @@ class TestNotificationPollerLoopKanbanWiring:
         )
         stop = threading.Event()
         thread = threading.Thread(
-            target=server._notification_poller_loop,
+            target=_notification_poller_loop,
             args=(stop, "sid-poller-test", session),
             daemon=True,
         )

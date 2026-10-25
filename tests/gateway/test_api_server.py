@@ -872,13 +872,21 @@ class TestHealthDetailedEndpoint:
         probe.assert_not_called()
 
 
-    def test_readiness_work_counts_include_stopping_runs(self, adapter):
-        """Regression: _handle_stop_run() sets status="stopping" and holds it
-        there — cooperatively, with no hard timeout — until the agent notices
-        the interrupt and the task actually exits. A run in that window is
-        still doing real executor-thread work and must count as active,
-        the same as "running"; excluding it undercounts active_api_runs for
-        the whole (now-unbounded) cooperative-stop duration."""
+    @pytest.mark.asyncio
+    async def test_readiness_work_counts_include_stopping_runs(self, adapter):
+        """A6 (t_5976163f): a cooperatively-stopping run IS active work — because its TASK is
+        alive, not because its row says "stopping".
+
+        _handle_stop_run() sets status="stopping" and holds it there — cooperatively, with no
+        hard timeout — until the agent notices the interrupt and the task actually exits. A run
+        in that window is still doing real executor-thread work and must count as active. The
+        same stopping ROW with no live task behind it must count as 0: a status string is a
+        report, not a handle, so readiness can no longer be fed by rows alone.
+        """
+
+        async def _never():
+            await asyncio.Event().wait()
+
         adapter._run_statuses = {
             "queued": {"status": "queued"},
             "running": {"status": "running"},
@@ -887,10 +895,68 @@ class TestHealthDetailedEndpoint:
             "done": {"status": "completed"},
             "cancelled": {"status": "cancelled"},
         }
+        adapter._inflight_agent_runs = 0
+        stopping_task = asyncio.create_task(_never())
+        adapter._active_run_tasks = {"stopping": stopping_task}
+        try:
+            with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=0), \
+                 patch("tools.async_delegation.active_count", return_value=0):
+                assert adapter._readiness_work_counts() == (1, 0, 0)
+        finally:
+            stopping_task.cancel()
+            await asyncio.gather(stopping_task, return_exceptions=True)
 
+        # The same rows, no live task: the stopping row no longer claims live work.
+        adapter._active_run_tasks = {}
         with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=0), \
              patch("tools.async_delegation.active_count", return_value=0):
-            assert adapter._readiness_work_counts() == (4, 0, 0)
+            assert adapter._readiness_work_counts() == (0, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_readiness_and_published_metrics_share_one_live_number(self, adapter):
+        """A5 (t_5976163f): readiness reports R1's live number, not the row census.
+
+        The /health/detailed ``active_api_runs`` field is fed by ``_readiness_work_counts()``;
+        the published metrics field is fed by ``_api_server_status_payload()``. They must be
+        the same number and must equal the gate's own terms — and a leaked row (census only,
+        no handle) must move neither.
+        """
+
+        async def _never():
+            await asyncio.Event().wait()
+
+        live_task = asyncio.create_task(_never())
+        try:
+            adapter._run_statuses = {
+                "leaked": {"status": "queued"},     # a row no handle owns: census only
+                "live": {"status": "running"},      # held by a live task
+                "done": {"status": "completed"},
+            }
+            adapter._active_run_tasks = {"live": live_task}
+            adapter._inflight_agent_runs = 1
+            with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=0), \
+                 patch("tools.async_delegation.active_count", return_value=0):
+                readiness_api_runs = adapter._readiness_work_counts()[0]
+            published = adapter._api_server_status_payload()
+            terms = adapter._agent_work_terms()
+        finally:
+            live_task.cancel()
+            await asyncio.gather(live_task, return_exceptions=True)
+
+        assert readiness_api_runs == published["active_runs"] == 2
+        assert published["active_rows"] == 2
+        assert published["active_runs"] == terms["live_runs"] + terms["inflight_turns"]
+
+        # The census is NOT a liveness source: dropping the leaked row moves active_rows and
+        # leaves both published live numbers alone.
+        adapter._run_statuses.pop("leaked")
+        adapter._active_run_tasks = {}
+        adapter._inflight_agent_runs = 0
+        with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=0), \
+             patch("tools.async_delegation.active_count", return_value=0):
+            assert adapter._readiness_work_counts()[0] == 0
+        assert adapter._api_server_status_payload()["active_runs"] == 0
+        assert adapter._api_server_status_payload()["active_rows"] == 1
 
 
 # ---------------------------------------------------------------------------
