@@ -64,7 +64,7 @@ def _dead_mount(tmp_path: Path, name: str = "vol") -> tuple[Path, Path]:
 
 def test_container_reachable_judges_only_symlink_prefixes(kanban_home, tmp_path):
     """A dangling SYMLINK is unreachable; an ordinary path that does not exist yet is fine."""
-    dead, dead_target = _dead_mount(tmp_path, "vol")
+    dead, _dead_target = _dead_mount(tmp_path, "vol")
     live_target = tmp_path / "live-volume"
     live_target.mkdir()
     live = tmp_path / "live"
