@@ -781,6 +781,79 @@ def no_repo_refusal(
     )
 
 
+#: Marker that LEADS the refusal text: ``_record_task_failure`` truncates the stored error at 500
+#: chars, and this string is also the dispatcher's event kind for the deferral.
+WORKSPACE_VOLUME_MARKER = "workspace_volume_unavailable: "
+
+
+def _unreachable_component(path: Path | str) -> Optional[Path]:
+    """The first SYMLINK prefix of ``path`` whose target is not an existing directory, else None.
+
+    A component that is NOT a link and does not exist is fine: materialising a workspace creates
+    its parents. Only an EXISTING symlink is judged, and only by whether its target is a directory
+    -- that is what "the volume is not mounted" looks like from here (``/opt/hermes_sandbox ->
+    /Volumes/yoyofs1/hermes_sandbox`` with the volume gone: the link is present, the target is not).
+    """
+    try:
+        candidate = Path(path).expanduser()
+    except (TypeError, ValueError):  # pragma: no cover - a non-path argument is the caller's bug
+        return None
+    for prefix in [*candidate.parents[::-1], candidate]:
+        if not prefix.is_symlink():
+            continue
+        if not Path(os.path.realpath(prefix)).is_dir():
+            return prefix
+    return None
+
+
+def container_reachable(path: Path | str) -> bool:
+    """True when every SYMLINK prefix of ``path`` resolves to a directory that exists.
+
+    The predicate a workspace materialiser MUST ask before it creates anything: ``mkdir`` through
+    a dangling link does not fail, it creates the missing directory INSIDE the resolved target, so
+    a card whose volume is unmounted silently gets a workspace on the wrong volume. Callers treat
+    False as :class:`WorkspaceVolumeUnavailable`.
+    """
+    return _unreachable_component(path) is None
+
+
+class WorkspaceVolumeUnavailable(RuntimeError):
+    """A workspace path component is a symlink whose target is gone: the volume is not mounted.
+
+    INFRASTRUCTURE and RETRYABLE, in one class so no caller prose-parses it: nothing of the card
+    ran, the repair is on the host (remount the volume), and the card must keep its retry budget
+    and stay claimable for the first tick after the volume returns. Also kept distinct from
+    :class:`WorktreeAnchorNotRepo`, which is the opposite verdict (the card's own wiring, blocked
+    on the first attempt) and would otherwise swallow this case: a gone volume makes every anchor
+    lookup answer "not a repo".
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        component: Path | str,
+        task_id: Optional[str] = None,
+    ) -> None:
+        self.path = str(path)
+        self.component = str(component)
+        self.task_id = task_id
+        super().__init__(
+            f"{WORKSPACE_VOLUME_MARKER}{path} cannot be used: the symlinked component "
+            f"{component} does not resolve to a directory, so its volume is not mounted. "
+            f"Nothing was created through the link. Remount the volume; the card retries on the "
+            f"next dispatcher tick"
+            + (f" (task {task_id})." if task_id else ".")
+        )
+
+
+def _refuse_unreachable(path: Path | str, *, task_id: Optional[str] = None) -> None:
+    """Raise :class:`WorkspaceVolumeUnavailable` when ``path`` sits behind a dangling symlink."""
+    component = _unreachable_component(path)
+    if component is not None:
+        raise WorkspaceVolumeUnavailable(path, component=component, task_id=task_id)
+
+
 class WorktreeAnchorNotRepo(ValueError):
     """A ``worktree`` card's anchor is not (inside) a git repository.
 
@@ -996,6 +1069,9 @@ def _board_anchor_repo(board: Optional[str]) -> Optional[Path]:
     anchor = Path(board_default).expanduser()
     if not anchor.is_absolute():
         return None
+    # A board anchor behind a dangling symlink is a HOST condition, not a missing repo: answer it
+    # with the volume verdict so the caller does not fall through to ``WorktreeAnchorNotRepo``.
+    _refuse_unreachable(anchor)
     return _repo_anchor_for(anchor)
 
 
@@ -1013,8 +1089,16 @@ def _mirror_anchored_worktree(
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    Both ends are checked for a mounted volume FIRST: a ``git worktree add`` through a dangling
+    symlink would create the tree inside whatever the link resolves to on the host, so the refusal
+    is :class:`WorkspaceVolumeUnavailable` (infrastructure, retryable) rather than a git error the
+    classifier would charge to the card.
+    """
     target = target.expanduser()
+    _refuse_unreachable(repo_root)
+    _refuse_unreachable(target)
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
         return
@@ -1067,6 +1151,10 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"board {board_slug!r} default_workdir {board_default!r} is not "
                 "absolute; use an absolute path to a git repo"
             )
+        # BEFORE the anchor is probed for a repo: with the volume gone every anchor answers
+        # "not a repo", which is the NON-RETRYABLE verdict and would block the card on a
+        # host condition. The volume verdict is asked first so the card stays retryable.
+        _refuse_unreachable(anchor, task_id=task.id)
         repo_root = _repo_anchor_for(anchor)
         if repo_root is None:
             raise WorktreeAnchorNotRepo(
@@ -1084,6 +1172,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"task {task.id} has non-absolute worktree path "
             f"{task.workspace_path!r}; use an absolute path"
         )
+    # Asked BEFORE ``resolve``/``exists``: resolving a dangling link rewrites the path into the
+    # missing target, and every probe after that answers "not a repo" -- the wrong verdict.
+    _refuse_unreachable(requested, task_id=task.id)
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
@@ -1168,6 +1259,10 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
             )
     else:
         raise ValueError(f"unknown workspace_kind: {kind}")
+    # THE gate the ruling names: never create a directory through a symlink whose volume is gone.
+    # ``mkdir`` would happily create ``<resolved-target>/<...>`` and put the card's workspace on
+    # whatever volume the link happens to fall back to, so the check has to precede the create.
+    _refuse_unreachable(p, task_id=task.id)
     p.mkdir(parents=True, exist_ok=True)
     return p
 

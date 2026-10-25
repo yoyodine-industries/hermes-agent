@@ -153,6 +153,12 @@ SPAWN_FAILURE_HOST_CAPACITY = "host_capacity"
 #: become a repo between tick N and tick N+1. The card is blocked on the FIRST such failure and
 #: annotated with ``spawn_failed: no repo at <path>`` plus the repair (card t_e5ff985b).
 SPAWN_FAILURE_WORKSPACE_NOT_REPO = "workspace_not_repo"
+#: A workspace path component is a symlink whose target is gone (``WorkspaceVolumeUnavailable``):
+#: the host's volume is not mounted. INFRASTRUCTURE and RETRYABLE -- nothing of the card ran, the
+#: repair is on the host, and the run is closed as a DEFERRAL so the card keeps its retry budget
+#: and is claimable again on the first tick after the volume returns (ruling t_f2c8b3fe §4).
+#: The value doubles as the event kind the deferral is recorded under.
+SPAWN_FAILURE_WORKSPACE_VOLUME = "workspace_volume_unavailable"
 
 #: ``substrate_import:<provider-relpath>:<symbol>`` -- the lane-level dedupe key (D6).
 SUBSTRATE_SIGNATURE_PREFIX = "substrate_import:"
@@ -473,6 +479,12 @@ def classify_spawn_failure(exc: BaseException, *, tree: Optional[Path] = None) -
       tree and its provider is source under the tree that does not supply the name. Nothing of
       the card ran, so the failure must not spend the card's retry budget, and it must be counted
       for the LANE actor instead of parking the card.
+    * ``workspace_volume_unavailable`` -- a workspace path component is a symlink whose target is
+      gone (``WorkspaceVolumeUnavailable``): the host's volume is not mounted. Nothing of the card
+      ran and no retry of the card can mount a volume, so this is infrastructure: the run closes as
+      a deferral and the card keeps its retry budget. It is checked BEFORE the no-repo verdict,
+      because with a volume gone every anchor also answers "not a repo" -- and that verdict blocks
+      the card on the first attempt.
     * ``workspace_not_repo`` -- the card's own worktree anchor is not a git repository
       (``WorktreeAnchorNotRepo``). The card's wiring is wrong and no retry can fix a folder, so
       this is the one card-class verdict that trips the breaker on the FIRST failure.
@@ -482,8 +494,10 @@ def classify_spawn_failure(exc: BaseException, *, tree: Optional[Path] = None) -
 
     Callers must not scatter ``isinstance`` checks beside this: one verdict per failure.
     """
-    from hermes_cli.kanban_db_workspace import WorktreeAnchorNotRepo
+    from hermes_cli.kanban_db_workspace import WorkspaceVolumeUnavailable, WorktreeAnchorNotRepo
 
+    if isinstance(exc, WorkspaceVolumeUnavailable):
+        return SPAWN_FAILURE_WORKSPACE_VOLUME
     if isinstance(exc, WorktreeAnchorNotRepo):
         return SPAWN_FAILURE_WORKSPACE_NOT_REPO
     try:
@@ -510,6 +524,13 @@ def _spawn_failure_report(
     """
     tree = Path(tree) if tree is not None else _dispatching_tree_root()
     kind = classify_spawn_failure(exc, tree=tree)
+    if kind == SPAWN_FAILURE_WORKSPACE_VOLUME:
+        # The refusal text already LEADS with the marker, and the component names the unmounted
+        # volume both on the run and on the event -- a deferral has to say WHICH mount to fix.
+        return str(exc), kind, {
+            "workspace_volume_unavailable": True,
+            "workspace_volume_component": getattr(exc, "component", None),
+        }
     if kind != SPAWN_FAILURE_SUBSTRATE_IMPORT:
         return str(exc), kind, None
     metadata_extra: dict[str, Any] = {"substrate_import": True}
@@ -798,7 +819,11 @@ def _record_spawn_failure(
     """
     tree = _dispatching_tree_root()
     error_text, kind, metadata_extra = _spawn_failure_report(exc, task_id, tree=tree)
-    infrastructure = kind in (SPAWN_FAILURE_SUBSTRATE_IMPORT, SPAWN_FAILURE_HOST_CAPACITY)
+    infrastructure = kind in (
+        SPAWN_FAILURE_SUBSTRATE_IMPORT,
+        SPAWN_FAILURE_HOST_CAPACITY,
+        SPAWN_FAILURE_WORKSPACE_VOLUME,
+    )
     # A non-repo anchor is not retryable: blocking on the FIRST failure is the difference
     # between a card that says "this is broken, here is the fix" and one that burns its
     # retry budget and returns to ``ready`` looking unattended (card t_e5ff985b).
@@ -807,6 +832,11 @@ def _record_spawn_failure(
         _kb._log.warning(
             "kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s",
             task_id, exc,
+        )
+    elif kind == SPAWN_FAILURE_WORKSPACE_VOLUME:
+        _kb._log.warning(
+            "kanban dispatcher: spawn of %s deferred, the workspace volume is not mounted: %s",
+            task_id, error_text,
         )
     elif kind == SPAWN_FAILURE_SUBSTRATE_IMPORT:
         _kb._log.warning(
@@ -818,8 +848,9 @@ def _record_spawn_failure(
             "kanban dispatcher: %s cannot spawn and no retry can fix it: %s", task_id, error_text,
         )
     # The naming line leads for a substrate failure; an ordinary failure keeps its caller's
-    # context label ("workspace: ..."). The no-repo refusal carries its own leading marker.
-    if kind == SPAWN_FAILURE_SUBSTRATE_IMPORT or non_retryable:
+    # context label ("workspace: ..."). The no-repo refusal carries its own leading marker, and
+    # so does the volume refusal (its marker is what the reviewer greps for on the card).
+    if kind in (SPAWN_FAILURE_SUBSTRATE_IMPORT, SPAWN_FAILURE_WORKSPACE_VOLUME) or non_retryable:
         text = error_text
     else:
         text = f"{prefix}{error_text}"
@@ -828,6 +859,23 @@ def _record_spawn_failure(
         outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
         infrastructure=infrastructure, metadata_extra=metadata_extra, force_trip=non_retryable,
     )
+    if kind == SPAWN_FAILURE_WORKSPACE_VOLUME:
+        # The DEFERRAL is recorded as itself, not only as a ``spawn_failed`` row: a lane that goes
+        # quiet because a volume went away has to say so where the board's own history is read.
+        try:
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, task_id, SPAWN_FAILURE_WORKSPACE_VOLUME,
+                    {
+                        "deferral": True,
+                        "error": error_text,
+                        "component": (metadata_extra or {}).get("workspace_volume_component"),
+                    },
+                )
+        except Exception:  # pragma: no cover - annotation is best-effort, the deferral is recorded
+            _kb._log.warning(
+                "kanban dispatcher: could not annotate %s with its volume deferral", task_id,
+            )
     if kind == SPAWN_FAILURE_SUBSTRATE_IMPORT:
         _maybe_file_substrate_actor(
             conn, (metadata_extra or {}).get("substrate_signature"), tree=tree, board=board,
