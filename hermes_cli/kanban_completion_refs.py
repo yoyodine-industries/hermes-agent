@@ -320,6 +320,19 @@ def resolve_refs(conn: sqlite3.Connection, tids: Iterable[str]) -> dict[str, Ref
             continue
         try:
             sibling.row_factory = sqlite3.Row
+            # A store that OPENS but carries no ``tasks`` table is not an outage: it is a store
+            # holding no cards, and such a store ANSWERS "not here" rather than "I could not be
+            # read". The distinction is load-bearing, not pedantic: ``boards/_archived/kanban.db``
+            # on this host is an initialised-but-empty husk with no ``tasks`` table, so counting a
+            # schema-less store as ``unknown`` made EVERY phantom ref ``unknown`` and turned Gate
+            # E's refusal arm into an advisory (measured live 2026-10-25 on card t_0608ce6d: with
+            # the husk counted, t_deadbeefdeadbeef was ADMITTED as unverified). An actual open or
+            # read failure still lands in ``unknown_boards`` below - the outage rule is untouched.
+            if sibling.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
+            ).fetchone() is None:
+                searched.append(slug)
+                continue
             still = list(kb._missing_task_ids(sibling, remaining))
             for tid in set(remaining) - set(still):
                 found[tid] = slug
