@@ -933,7 +933,13 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
                         f"lock={existing.claim_lock or '(none)'}")
-        workspace = kbw.resolve_workspace(task)
+        try:
+            workspace = kbw.resolve_workspace(task)
+        except kbw.WorkspaceVolumeUnavailable as exc:
+            # A HOST condition, not a bad command: name it and stop, instead of a traceback that
+            # reads like a broken CLI. The claim above stays until its TTL expires (unchanged
+            # behaviour for every resolve failure, and the dispatcher's own path defers instead).
+            return _err(f"cannot prepare the workspace for {task.id}: {exc}", 3)
         kbw.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
