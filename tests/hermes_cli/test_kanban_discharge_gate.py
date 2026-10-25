@@ -19,6 +19,7 @@ deleted outright six weeks later.
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -434,5 +435,63 @@ def test_gates_report_carries_the_two_families(fresh_home, monkeypatch, capsys):
     assert discharge["families"]["phantom_refs"]["refused"] == 1
     assert discharge["families"]["void_claims"]["refused"] == 0
     assert out["open_total"] == 0
+
+
+def test_a_schemaless_store_answers_not_here_and_a_phantom_still_refuses(fresh_home):
+    """An openable store with no ``tasks`` table holds no cards - it is not an outage.
+
+    Measured live 2026-10-25 on the card this gate answers: ``boards/_archived/kanban.db`` on this
+    host is an initialised-but-empty husk with no ``tasks`` table. Counting such a store as
+    ``unknown`` made EVERY phantom ref unverified - which is not a refusal - so Gate E's refusal
+    arm was advisory-only in production while its unit tests stayed green (they only ever had
+    stores the resolver could read). A store that holds no cards ANSWERS "not here": the ids stay
+    ABSENT, and the completion is refused.
+    """
+    _boards("alpha")
+    husk = kb.boards_root() / "husk" / "kanban.db"
+    husk.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(str(husk)).close()      # openable, zero tables - the live husk's exact shape
+    with kbc.connect(board="alpha") as conn:
+        card = kb.create_task(conn, title="husk on the host", assignee="platform-coder")
+        with pytest.raises(refs.PhantomRefsRefused) as excinfo:
+            _complete(conn, card, result="landed with t_deadbeefdeadbeef")
+        task = kb.get_task(conn, card)
+        assert task is not None and task.status != "done"
+        refused = _events(conn, card, "completion_blocked_phantom_refs")
+
+    assert len(refused) == 1
+    payload = refused[0].payload
+    assert payload["phantom_refs"] == ["t_deadbeefdeadbeef"]
+    assert payload["unknown_boards"] == [], "a schemaless store answered; nothing was unknown"
+    assert "husk" in payload["boards_searched"], "the husk is still named as searched"
+    assert "husk" in str(excinfo.value), "the refusal names the boards it searched"
+
+
+def test_a_store_that_cannot_be_read_still_never_refuses(fresh_home, monkeypatch):
+    """The outage rule the fix must not have eaten: a READ FAILURE is unknown, not absent.
+
+    Sibling of the schemaless case above, one line apart in the resolver and opposite in verdict.
+    """
+    _boards("alpha")
+    broken = kb.boards_root() / "broken" / "kanban.db"
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(str(broken)).close()
+
+    real_connect = sqlite3.connect
+
+    def _explode(*args, **kwargs):
+        if "broken" in str(args[0] if args else "") or "broken" in str(kwargs.get("database", "")):
+            raise sqlite3.OperationalError("database is locked")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(refs.sqlite3, "connect", _explode)
+    with kbc.connect(board="alpha") as conn:
+        card = kb.create_task(conn, title="outage on the host", assignee="platform-coder")
+        assert _complete(conn, card, result="landed with t_deadbeefdeadbeef") is True
+        unverified = _events(conn, card, "phantom_refs_unverified")
+
+    assert unverified, "an unreadable store must be recorded, not silently dropped"
+    assert len(unverified) == 1
+    assert "broken" in unverified[0].payload["unknown_boards"]
 
 
