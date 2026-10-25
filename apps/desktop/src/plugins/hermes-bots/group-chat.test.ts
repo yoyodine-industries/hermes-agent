@@ -618,11 +618,78 @@ describe('gateway mirror', () => {
   it('omits empty runtime rooms', async () => {
     const { chat } = await loadRoom()
 
+    // The disband path flags its runtime tombstone (`tombstone: true`,
+    // group-chat-view.tsx) — that flag, not the empty log, is what keeps it
+    // out of the mirror.
     const snapshot = chat.groupChatSyncSnapshot({
-      Disbanded: { log: [], members: [{ name: 'research' }] }
+      Disbanded: { log: [], members: [{ name: 'research' }], tombstone: true, running: false },
+      // A disband husk that lost its roster (the id-carrying record a late
+      // prompt harvest rewrites) must not publish either — it would come back
+      // as a normalized room on the next hydrate.
+      Husk: { log: [], roomId: 'rm-husk', stranded: { research: 0 } }
     } as unknown as Record<string, GroupChat>)
 
     expect(Object.keys(snapshot.rooms)).toEqual([])
+  })
+
+  it('publishes a freshly created room that has no messages yet', async () => {
+    const { chat } = await loadRoom()
+
+    const snapshot = chat.groupChatSyncSnapshot({
+      'New Room': {
+        log: [],
+        members: [{ name: 'research' }, { name: 'builder' }],
+        roomId: 'rm-new-room',
+        syncRevision: 0
+      }
+    } as unknown as Record<string, GroupChat>)
+
+    // A room the user just made used to be filtered out until someone spoke
+    // in it, so it never reached the mirror at all.
+    expect(Object.keys(snapshot.rooms)).toEqual(['id:rm-new-room'])
+    expect(snapshot.rooms['id:rm-new-room'].members?.map(member => member.name)).toEqual([
+      'research',
+      'builder'
+    ])
+  })
+
+  it('sheds log entries to fit the budget, never a room', async () => {
+    const { chat } = await loadRoom()
+
+    const entry = (index: number) => ({
+      at: index,
+      from: { kind: 'user' as const, name: 'You' },
+      text: `${index} ${'x'.repeat(1200)}`
+    })
+
+    const fat = (prefix: string) => ({
+      log: Array.from({ length: 16 }, (_, index) => entry(index)),
+      members: [{ name: 'research' }],
+      roomId: prefix
+    })
+
+    // ~4 × 20 KB of history in a 48 KB budget: the old fit trimmed each room
+    // to one entry and then deleted whatever still did not fit — and because
+    // the loop ran newest-room-last, that was always the room just created.
+    const snapshot = chat.groupChatSyncSnapshot({
+      Platform: fat('rm-platform'),
+      Alpha: fat('rm-alpha'),
+      Beta: fat('rm-beta'),
+      Gamma: fat('rm-gamma'),
+      Fresh: { log: [], members: [{ name: 'builder' }], roomId: 'rm-fresh' }
+    } as unknown as Record<string, GroupChat>)
+
+    expect(Object.keys(snapshot.rooms).sort()).toEqual([
+      'id:rm-alpha',
+      'id:rm-beta',
+      'id:rm-fresh',
+      'id:rm-gamma',
+      'id:rm-platform'
+    ])
+    expect(chat.groupChatGatewayJsonSize(snapshot)).toBeLessThanOrEqual(48000)
+    expect(snapshot.rooms['id:rm-platform'].log.length).toBeLessThan(16)
+    expect(snapshot.rooms['id:rm-platform'].omitted).toBe(16 - snapshot.rooms['id:rm-platform'].log.length)
+    expect(snapshot.rooms['id:rm-fresh'].log).toEqual([])
   })
 
   it('an empty hydrate cannot erase a shared room mirror', async () => {

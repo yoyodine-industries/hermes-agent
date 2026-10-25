@@ -312,7 +312,18 @@ export function groupChatSyncSnapshot(
   const ranked = Object.entries(all || {})
     // Empty runtime tombstones are used to stop an in-flight room after
     // disband. They are not real rooms and must never reappear on mobile.
-    .filter(([, room]) => room && Array.isArray(room.log) && room.log.length > 0)
+    // A room the user JUST made has an empty log too — publishing only rooms
+    // that already carry a message meant a new room never reached the mirror
+    // until someone spoke in it, so the room they had just created was simply
+    // not there (2026-10-24). A seated roster is what makes an empty room a
+    // real one; a husk left by a disband carries no members and stays out.
+    .filter(
+      ([, room]) =>
+        room &&
+        Array.isArray(room.log) &&
+        !room.tombstone &&
+        (room.log.length > 0 || (Array.isArray(room.members) && room.members.length > 0))
+    )
     .sort(([, left], [, right]) => {
       const leftAt = Number(left.log[left.log.length - 1]?.at || 0)
       const rightAt = Number(right.log[right.log.length - 1]?.at || 0)
@@ -321,6 +332,8 @@ export function groupChatSyncSnapshot(
     })
 
   const rooms: Record<string, GroupChatSyncRoom> = {}
+  // Pre-trim entry counts, so `omitted` stays truthful after the fit.
+  const totalEntries = new Map<string, number>()
 
   const boundedDeleted = groupChatPublishableTombstones(deleted)
 
@@ -416,23 +429,99 @@ export function groupChatSyncSnapshot(
 
     const key = groupChatRoomKey(name, room)
     rooms[key] = compact
-    noteGroupChatSyncOmitted(compact, room.log.length)
+    totalEntries.set(key, room.log.length)
+  }
 
-    while (compact.log.length > 1 && groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
-      compact.log.shift()
-      noteGroupChatSyncOmitted(compact, room.log.length)
+  groupChatFitSyncEnvelope(rooms, totalEntries, envelope)
+
+  return envelope
+}
+
+/** Fit the envelope into ONE budget, at the writer.
+ *
+ *  Shed log entries from every room, never the rooms themselves. The previous
+ *  fit deleted whole rooms: it trimmed each room to a single entry and then
+ *  removed whatever still did not fit — newest-room-last, so the room the user
+ *  had just created was the one deleted, on every publish (2026-10-24: rooms
+ *  vanished from every mirror seconds after creation while the payload sat at
+ *  46.7 KB of a 48 KB budget, almost all of it one room's history).
+ *
+ *  Order: images, then the longest log, entry by entry, down to zero; then
+ *  member rows on the oldest rooms. Dropping a room is the absolute last
+ *  resort and cannot be reached while the skeletons alone fit the budget —
+ *  and this ceiling sits below the gateway's own, so an over-budget write
+ *  would be dropped wholesale instead of losing one room. */
+function groupChatFitSyncEnvelope(
+  rooms: Record<string, GroupChatSyncRoom>,
+  totalEntries: Map<string, number>,
+  envelope: GroupChatSyncSnapshot
+) {
+  const size = () => groupChatGatewayJsonSize(envelope)
+  const fits = () => size() <= GROUP_CHAT_SYNC_MAX_BYTES
+
+  if (fits()) {
+    for (const [key, room] of Object.entries(rooms)) {
+      noteGroupChatSyncOmitted(room, totalEntries.get(key) || room.log.length)
     }
 
-    if (compact.image && groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
-      delete compact.image
+    return
+  }
+
+  for (const room of Object.values(rooms)) {
+    if (fits()) {
+      break
     }
 
-    if (groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
+    delete room.image
+  }
+
+  for (;;) {
+    if (fits()) {
+      break
+    }
+
+    let heaviest: GroupChatSyncRoom | null = null
+    let heaviestSize = -1
+
+    // Shed from the room that actually costs the bytes, not from whichever
+    // room happens to be first: a small room must not lose its history
+    // because another room is fat.
+    for (const room of Object.values(rooms)) {
+      if (room.log.length === 0) {
+        continue
+      }
+
+      const roomSize = groupChatGatewayJsonSize(room)
+
+      if (roomSize > heaviestSize) {
+        heaviest = room
+        heaviestSize = roomSize
+      }
+    }
+
+    if (!heaviest) {
+      break
+    }
+
+    heaviest.log.shift()
+  }
+
+  for (const room of Object.values(rooms)) {
+    if (fits()) {
+      break
+    }
+
+    delete room.members
+  }
+
+  for (const [key, room] of Object.entries(rooms)) {
+    noteGroupChatSyncOmitted(room, totalEntries.get(key) || room.log.length)
+
+    // Unreachable while the skeletons alone fit; see the note above.
+    if (!fits()) {
       delete rooms[key]
     }
   }
-
-  return envelope
 }
 
 function groupChatSyncEntryKey(entry: GroupMessage) {
