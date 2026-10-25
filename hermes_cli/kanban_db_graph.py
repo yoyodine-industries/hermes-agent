@@ -182,7 +182,10 @@ def _insert_decomposed_child(
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event, _apply_board_priority_policy,
-        board_for_connection,
+        board_for_connection, _resolve_operator_ask, operator_ask_event,
+    )
+    from hermes_cli.kanban_register import (
+        OFF_BOARD_ASK_EVENT, apply_stamp, guard_new_ask_home, normalise_body,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
@@ -196,7 +199,15 @@ def _insert_decomposed_child(
     else:
         child_ws_path = None
     new_id = _new_task_id()
-    body = child.get("body")
+    # ONE NORMALISATION (card t_35272553). The child body is decoded ONCE, and that single
+    # value is what every consumer of it reads: the board's priority policy, the ask
+    # resolver and the INSERT. Three readers of one input that each decoded - or declined
+    # to decode - it for themselves could disagree, and they did: for a bytes child body
+    # the policy read an empty string and the resolver saw None, while the INSERT dropped
+    # it to NULL, so the child was born body-less and silently. ``normalise_body`` is the
+    # register module's public lossy decoder - the SAME one the create seam's no-ask
+    # fallback uses - so the two writers agree about what a non-str body means.
+    body = normalise_body(child.get("body"))
     child_assignee = _canonical_assignee(child.get("assignee"))
     # THE SECOND WRITER (card t_0396c536; restored by t_2187558e). A decomposed child is born
     # here rather than through ``create_task``, so the board's bound has to be reached from
@@ -204,17 +215,37 @@ def _insert_decomposed_child(
     # band while the root's own card looked correctly banded. The board is resolved from
     # THIS connection - a caller holding another board's connection is not on the current
     # board, and reading the ambient one would bound the children by somebody else's table.
+    child_board = board_for_connection(conn)
     priority, policy_provenance = _apply_board_priority_policy(
-        0, assignee=child_assignee, board=board_for_connection(conn),
-        title=child["title"].strip(), body=body if isinstance(body, str) else None,
+        0, assignee=child_assignee, board=child_board,
+        title=child["title"].strip(), body=body,
     )
+    # THE OPERATOR-ASK SEAM at the second writer (the create seam's sibling, card
+    # t_8ca4b5a0; its ask-home door is t_abefe660). A decomposition is a card born outside
+    # ``create_task``, and the root's own lineage is the reference - a fan-out of a card in
+    # service of an ask serves that ask - while a child body carrying its own
+    # ``Operator-ask:`` stamp resolves through the resolver's BODY step. Same contract as
+    # the create seam: resolution never fails a filing, and a child that IS a new ask must
+    # land on its register's own board (refused before the INSERT, env hatch honoured) or
+    # its register's roll-up never sees it.
+    ask_ref = _resolve_operator_ask(
+        conn, board=child_board, parents=[root_id], body=body, serves=None,
+    )
+    ask_off_board = guard_new_ask_home(
+        ask_ref, board=child_board, title=child["title"].strip(), caller=author,
+    )
+    ask_pair = ask_ref.for_card(new_id) if ask_ref is not None else None
+    # The stamp rides the INSERT: no reader ever sees an in-service child without it. With
+    # no ask pair the body is the value decoded above - already normalised, so the row is
+    # text and the two seams store the same thing for the same input.
+    child_body = apply_stamp(body, *ask_pair) if ask_pair else body
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, priority, workspace_kind, "
         " workspace_path, tenant, created_at, created_by) "
         "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
-            new_id, child["title"].strip(), body if isinstance(body, str) else None,
+            new_id, child["title"].strip(), child_body,
             child_assignee, priority, child_ws_kind, child_ws_path,
             root_row["tenant"], now, (author or "decomposer"),
         ),
@@ -224,10 +255,15 @@ def _insert_decomposed_child(
         {
             "by": author or "decomposer",
             "from_decompose_of": root_id,
+            **(operator_ask_event(ask_ref, ask_pair)),
             # The policy's own record, verbatim, and only on a card it moved - the same rule
             # the create seam applies, so a fan-out is readable the same way a filing is.
             **({"priority_policy": policy_provenance} if policy_provenance else {}),
         },
     )
+    if ask_off_board is not None:
+        # The hatch's own record: the escape is on the record rather than silent, the same
+        # row the create seam writes for a deliberate cross-board filing.
+        _append_event(conn, new_id, OFF_BOARD_ASK_EVENT, ask_off_board)
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
     return new_id
