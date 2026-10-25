@@ -46,11 +46,19 @@ __all__ = [
 
 ANCHOR = "/opt/hermes_prod/deploy-ledger.jsonl"
 
-# deploy-ledger.20261025T031500Z.jsonl  (also accepts the plain .jsonl.<stamp> spelling, and a
-# "-2" collision suffix from two rotations inside one second)
+#: The integrity record written beside the anchor after a rotation - the SAME shape review.sh
+#: writes beside the review ledger (``{"ledger", "bytes", "lines", "sha256", "at", "sealed_by"}``),
+#: so both ledgers in /opt/hermes_prod read as one family. ``sha256`` is over the sealed segment's
+#: whole content.
+ANCHOR_SUFFIX = ".anchor.json"
+
+# deploy-ledger.jsonl.bak-20261025T031500Z - the house spelling, matching the review ledger's
+# rotated sibling. The bare ``deploy-ledger.20261025T031500Z.jsonl`` form is accepted too so a
+# segment written by an earlier build stays readable. The trailing "-2" is the collision suffix
+# for two rotations inside one second.
 _STAMP = r"\d{8}T\d{6}Z(?:-\d+)?"
 _SEGMENT_RE = re.compile(
-    r"^(?P<stem>.+?)\.(?P<stamp>%s)(?:\.jsonl)?$|^(?P<stem2>.+?)\.jsonl\.(?P<stamp2>%s)$" % (_STAMP, _STAMP)
+    r"^(?P<stem>.+?\.jsonl)\.bak-(?P<stamp>%s)$|^(?P<stem2>.+?)\.(?P<stamp2>%s)(?:\.jsonl)?$" % (_STAMP, _STAMP)
 )
 
 
@@ -61,10 +69,11 @@ def segment_stamp(now: Optional[datetime] = None) -> str:
 
 
 def _segment_name(anchor: Path, stamp: str) -> str:
-    base = anchor.name
-    if base.endswith(".jsonl"):
-        base = base[: -len(".jsonl")]
-    return "%s.%s.jsonl" % (base, stamp)
+    return "%s.bak-%s" % (anchor.name, stamp)
+
+
+def anchor_record_path(path: str = ANCHOR) -> Path:
+    return Path(path).with_name(Path(path).name + ANCHOR_SUFFIX)
 
 
 def segments(path: str = ANCHOR) -> List[str]:
@@ -93,7 +102,7 @@ def segments(path: str = ANCHOR) -> List[str]:
             continue
         name_stem = match.group("stem") or match.group("stem2") or ""
         stamp = match.group("stamp") or match.group("stamp2") or ""
-        if name_stem == stem:
+        if name_stem in (stem, base):
             found.append((stamp, entry.name))
 
     found.sort()
@@ -161,6 +170,26 @@ def rotate(path: str = ANCHOR, *, min_bytes: int = 0, now: Optional[datetime] = 
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+    except OSError:
+        pass
+
+    # The integrity record, same shape as the review ledger's: what was sealed, how big, how
+    # many rows, and the digest of its content - so "the segment set" is an auditable claim and
+    # not just a glob.
+    try:
+        import hashlib
+
+        payload = target.read_bytes()
+        record = {
+            "ledger": str(anchor),
+            "segment": target.name,
+            "bytes": len(payload),
+            "lines": sum(1 for line in payload.split(b"\n") if line.strip()),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "sealed_by": os.environ.get("HERMES_AGENT_IDENTITY") or os.environ.get("USER") or "unknown",
+        }
+        anchor_record_path(str(anchor)).write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
     except OSError:
         pass
     return target.name

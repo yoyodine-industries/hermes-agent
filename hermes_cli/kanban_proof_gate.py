@@ -525,21 +525,16 @@ def _run_store_path(override: Optional[str]) -> str:
 
 
 def _ledger_rows(path: str) -> Iterable[dict]:
-    try:
-        handle = open(path, "r", encoding="utf-8", errors="replace")
-    except OSError:
-        return
-    with handle:
-        for line in handle:
-            line = line.strip()
-            if not line or len(line) > _LEDGER_LINE_CAP:
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(row, dict):
-                yield row
+    """Every row of the ledger at *path*, resolving the SEGMENT SET (card t_1b4d6bac).
+
+    The ledger rotates; the anchor keeps the newest rows and the older ones live in stamped
+    siblings. Reading the anchor alone would silently lose every landed row a rotation has
+    moved - and those rows are the proof this gate exists to check - so the set is resolved
+    oldest-first here, in one place, and a rotation is invisible to every caller.
+    """
+    from hermes_cli.deploy_ledger import iter_rows as _ledger_iter_rows
+
+    return _ledger_iter_rows(path, line_cap=_LEDGER_LINE_CAP)
 
 
 # -- refs, rows, stamps -------------------------------------------------------

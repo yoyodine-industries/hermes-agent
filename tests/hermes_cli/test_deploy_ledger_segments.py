@@ -37,7 +37,7 @@ def test_segments_of_a_fresh_ledger_is_just_the_anchor(ledger):
 def test_rotation_renames_the_anchor_and_keeps_every_row(ledger):
     rotated = deploy_ledger.rotate(str(ledger), min_bytes=1, now=datetime(2026, 10, 25, 3, 15, tzinfo=timezone.utc))
 
-    assert rotated == "deploy-ledger.20261025T031500Z.jsonl"
+    assert rotated == "deploy-ledger.jsonl.bak-20261025T031500Z"
     assert not ledger.exists(), "the anchor is RENAMED, never copied-and-emptied"
     assert ledger.with_name(rotated).stat().st_size > 0, "rotation must not truncate"
     # the row is still readable, through the set, with the anchor absent
@@ -60,6 +60,17 @@ def test_two_rotations_inside_one_second_do_not_collide(ledger):
 
     assert first != second
     assert [row["sha"] for row in deploy_ledger.read_rows(str(ledger))] == ["aaa111", "ccc333"]
+
+
+def test_the_rotation_writes_an_anchor_record_beside_the_ledger(ledger):
+    """The house anchor shape, so both ledgers in /opt/hermes_prod are one auditable family."""
+    deploy_ledger.rotate(str(ledger), min_bytes=1, now=datetime(2026, 10, 25, 3, 15, tzinfo=timezone.utc))
+
+    record = json.loads(deploy_ledger.anchor_record_path(str(ledger)).read_text(encoding="utf-8"))
+    assert record["segment"] == "deploy-ledger.jsonl.bak-20261025T031500Z"
+    assert record["ledger"] == str(ledger)
+    assert record["lines"] == 1 and record["bytes"] > 0
+    assert len(record["sha256"]) == 64
 
 
 def test_rotation_respects_the_size_floor_and_never_touches_a_small_ledger(ledger):
