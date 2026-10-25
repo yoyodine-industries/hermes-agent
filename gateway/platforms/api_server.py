@@ -138,6 +138,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
+from gateway.platforms import api_server_rooms as _rooms
 from gateway.platforms import api_server_bot_delivery as _bot_delivery
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
@@ -1252,6 +1253,18 @@ def _room_grant_delegate(name: str):
     return _handler
 
 
+def _rooms_delegate(name: str):
+    """Adapter method forwarding to ``api_server_rooms.<name>`` (call-time lookup) for the
+    read-only room surface: ``GET /api/rooms`` and ``GET /api/rooms/{room_id}/log``.
+
+    aiohttp passes ONLY the request to a registered handler (API handlers here read path
+    parameters from ``request.match_info``), so the room id travels the same way."""
+    async def _handler(self, request):
+        return await getattr(_rooms, name)(self, request, _api_server=sys.modules[__name__])
+    _handler.__name__ = name
+    return _handler
+
+
 def _run_route_delegate(name: str):
     """Adapter method forwarding to ``api_server_runs.<name>`` (call-time lookup) with this
     module's namespace as ``_api_server``."""
@@ -2032,6 +2045,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
+        routes.extend(_rooms._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
@@ -5144,6 +5158,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return await _room_dispatch._normalize_room_dispatch(self, request, body, _api_server=sys.modules[__name__])
 
     _handle_room_member_invitation = _room_grant_delegate("_handle_room_member_invitation")
+    # Read-only room surface (GET /api/rooms, GET /api/rooms/{room_id}/log): a projection of the
+    # hosted-room STORE, never of the in-process worker, so it survives a generational handover.
+    _handle_rooms_listing = _rooms_delegate("_handle_rooms_listing")
+    _handle_room_log = _rooms_delegate("_handle_room_log")
     _handle_room_member_capabilities = _room_grant_delegate("_handle_room_member_capabilities")
     _handle_room_member_grant_refresh = _room_grant_delegate("_handle_room_member_grant_refresh")
     _handle_room_member_grant_revoke = _room_grant_delegate("_handle_room_member_grant_revoke")
