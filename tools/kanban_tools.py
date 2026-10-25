@@ -988,6 +988,23 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"kanban_complete blocked: {empty_err}. Your task is still in-flight (no state "
                 f"change). Retry kanban_complete with a non-empty summary or result describing "
                 f"what was done.")
+        except kb.PhantomRefsRefused as ref_err:
+            # The DISCHARGE gate's citing half (design record platform-stl t_0608ce6d): the
+            # handoff cites a card id no reachable board carries. The gate runs before the write
+            # txn, so nothing moved and the audit event is on the card. The remedy is IN the
+            # kernel's message; the retry is spelt out because a model reads an unqualified
+            # tool_error as terminal and would otherwise stall instead of correcting the handoff.
+            return tool_error(
+                f"kanban_complete blocked: {ref_err} Retry kanban_complete with the same "
+                f"handoff and the citation corrected: name the real card id (and the board it "
+                f"lives on, if it is not this one), or drop the id from the prose.")
+        except (kb.VoidClaimUnmeasured, kb.VoidClaimRefused) as void_err:
+            # The DISCHARGE gate's void-claim half: the completion argues its premise is void and
+            # the declared measurement is missing, malformed, or does not hold. Nothing moved.
+            return tool_error(
+                f"kanban_complete blocked: {void_err} Retry kanban_complete with the same "
+                f"handoff and either a premise_void block whose measurements all hold, or the "
+                f"not_the_basis disclaimer with a real why.")
         except kb.ProofGateError as proof_err:
             # Deploy-proof gate: the card is authored ``landed`` and its handoff's run
             # record does not cover the deployed artifact. The gate runs before the write
@@ -1020,6 +1037,11 @@ def _handle_complete(args: dict, **kw) -> str:
             # nobody can read is a fence nobody can satisfy (t_88f6cb12).
             if isinstance(ok, kb.CompletionRefusal) and ok.cause in (
                     "landing_carrier_missing", "landing_state_unknown"):
+                raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
+            # The dirty-unit-checkout fence names the checkout, the paths and the remedy in
+            # ``detail`` (t_b151a247). A card that cannot see WHY it is refused is re-run
+            # blind, and a blind re-run dirties the same tree again.
+            if isinstance(ok, kb.CompletionRefusal) and ok.cause == "dirty_unit_checkout":
                 raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
             # A reopened or never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.

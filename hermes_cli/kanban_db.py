@@ -4987,6 +4987,11 @@ COMPLETION_REFUSAL_CAUSES = (
     # is the fail-closed channel when the forge cannot answer AND nothing is declared.
     "landing_carrier_missing",     # declared PR is unmerged with no carrier/exemption on any board
     "landing_state_unknown",       # the landing state of the declared PR cannot be judged
+    # The dirty-unit-checkout fence (t_b151a247): the card worked inside a protected
+    # deployment source (canonical unit checkout) that is dirty. ``done`` must not close
+    # over bytes that exist only in a working tree -- gate.py check 1 refuses every
+    # deploy sourced from that checkout, so the card would read done while prod stalls.
+    "dirty_unit_checkout",         # the checkout the card worked in has uncommitted paths
 )
 
 
@@ -5476,6 +5481,11 @@ def complete_task(
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    # A card that worked in a dirty deployment source cannot close over bytes that
+    # exist only in its working tree (t_b151a247). Refused before any acceptance work.
+    checkout_refusal = _gate_unit_checkout_clean(conn, task_id, force=force)
+    if isinstance(checkout_refusal, CompletionRefusal):
+        return checkout_refusal
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -5569,6 +5579,20 @@ def complete_task(
     landing_refusal = _gate_landing_carrier(conn, task_id, metadata)
     if landing_refusal is not None:
         return landing_refusal
+    # THE DISCHARGE GATE (design record platform-stl t_0608ce6d, card t_9a2aaaea). Both halves
+    # judge the ARGUMENT a completion closes on, at the seam, BEFORE the card is written:
+    #   E -- every ``t_<hex>`` id the handoff cites must exist on SOME board (a phantom ref is a
+    #        fabricated record; ``unknown`` never refuses, because a store that will not open is
+    #        a coverage gap and not a verdict);
+    #   F -- a completion that argues its premise is VOID must carry the measurement it is void
+    #        by, and the kernel evaluates every measurement itself.
+    # Placed exactly here, with the other completion gates: after the landing carrier (a close
+    # that already failed land is answered by that clause) and before the write txn, so a
+    # refusal leaves the card byte-untouched and hands the worker the cause that failed.
+    gate_completion_discharge(
+        conn, task_id, summary=summary, result=result, metadata=metadata,
+        verified_cards=verified_cards, force=force,
+    )
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
@@ -5888,6 +5912,135 @@ def _gate_empty_completion(
     raise EmptyCompletionError(task_id)
 
 
+def _gate_unit_checkout_clean(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    force: bool = False,
+) -> Optional["CompletionRefusal"]:
+    """Refuse ``done`` when the card worked in a protected unit checkout that is dirty.
+
+    Card t_b151a247, design decision 1 (platform-stl): a card cannot close over bytes
+    that exist only in a working tree. ``done`` requires
+    ``git status --porcelain --untracked-files=normal`` = 0 on the checkout the run
+    worked in — the SAME command ``gate.py`` check 1 runs, so the completion boundary
+    and the deploy gate cannot disagree about what "dirty" means. The refusal names the
+    paths, because a card that cannot see why it was refused will be re-run blind.
+
+    SCOPE, deliberately narrow — this must never become a fleet-wide deadlock:
+
+    * only a card that HAS a workspace path is examined, and only when that path sits
+      inside a SHARED SOURCE root as the shared-tree guard declares them (read from the
+      guard itself, see :mod:`hermes_cli.kanban_protected_trees`). A card in its own
+      scratch dir, a linked worktree or a lane tree is untouched by this gate;
+    * a LIVE root is out of scope: bytes there are drift, found by the census, and a
+      card does not work in a deployment target at all;
+    * the sweep is per-CHECKOUT, not fleet-wide: a dirty unrelated checkout can never
+      refuse a card that did not work in it (the dirty-sweep + board-refusals DAG is
+      the layer that files those).
+
+    FAIL-OPEN, like the guard that owns the rule: an unresolvable guard, no declared
+    roots, a missing workspace, or any git failure means NO refusal. A broken perimeter
+    must never brick the whole fleet's completions.
+
+    ``force`` is the operator door (``hermes kanban complete --force``).
+    """
+    if force:
+        return None
+    row = conn.execute(
+        "SELECT status, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    workspace = row["workspace_path"]
+    if not workspace:
+        return None
+    from hermes_cli import kanban_protected_trees as protected
+
+    root = protected.shared_source_root(workspace)
+    if root is None:
+        return None
+    checkout = os.path.realpath(os.path.expanduser(workspace))
+    dirty = _checkout_dirty_paths(checkout)
+    if not dirty:
+        return None
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_blocked_dirty_unit_checkout",
+            {
+                "checkout": checkout,
+                "protected_root": root,
+                "path_count": len(dirty),
+                "paths": dirty[:50],
+            },
+        )
+    named = ", ".join(dirty[:_DIRTY_PATHS_NAMED])
+    more = "" if len(dirty) <= _DIRTY_PATHS_NAMED else f" (+{len(dirty) - _DIRTY_PATHS_NAMED} more)"
+    return CompletionRefusal(
+        "dirty_unit_checkout",
+        f"{task_id} worked in the protected unit checkout {checkout}, which is DIRTY "
+        f"({len(dirty)} path(s): {named}{more}). done must not close over uncommitted "
+        f"bytes: every deploy sourced from {root} is refused on check 1 until the tree "
+        f"reads `git status --porcelain --untracked-files=normal` = 0. Carry the bytes "
+        f"through a branch/PR and work in a card worktree (or move them to your own tree "
+        f"with `{_reconcile_remedy(root)}`), then retry completion.",
+    )
+
+
+#: How many dirty paths a refusal names. Bounded so the message (which a model reads and
+#: a human quotes) stays readable; the event carries up to 50.
+_DIRTY_PATHS_NAMED = 8
+
+#: Timeout on the porcelain read: an advisory limit on a completion path, never a
+#: correctness knob. A timeout is a "could not tell" and therefore no refusal.
+_DIRTY_STATUS_TIMEOUT_S = 15
+
+
+def _reconcile_remedy(root: str) -> str:
+    """The guard's own lossless repair verb, named as the guard spells it."""
+    from hermes_cli import kanban_protected_trees as protected
+
+    guard = protected.guard_script() or "guard-shared-trees.py"
+    return f"python3 {guard} --reconcile {root} -- <paths>"
+
+
+def _checkout_dirty_paths(checkout: str) -> list[str]:
+    """Paths ``git status --porcelain --untracked-files=normal`` reports, or ``[]``.
+
+    An EMPTY list means "clean OR could not tell" — the caller treats both as no
+    refusal (fail-open). Paths are the strings the deploy gate itself sees: relative to
+    the CHECKOUT root (git normalises that even when ``checkout`` is a subdirectory),
+    with a wholly-new directory collapsed to that directory because the flag is
+    ``--untracked-files=normal``. Naming them any other way here would describe the dirt
+    differently from the gate that refuses the deploy over it.
+    """
+    try:
+        if not os.path.isdir(checkout):
+            return []
+        result = subprocess.run(
+            ["git", "-C", checkout, "status", "--porcelain", "--untracked-files=normal"],
+            capture_output=True, text=True, timeout=_DIRTY_STATUS_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        # Not a git checkout (or git refused): nothing this gate can assert.
+        return []
+    paths: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        # Porcelain v1: two status columns, a space, then the path (a rename reads
+        # ``old -> new``; the NEW path is the one that exists in the tree).
+        entry = line[3:] if len(line) > 3 else line.strip()
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        paths.append(entry.strip().strip('"'))
+    return paths
+
+
 def _stage_completion_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: dict, now: int, *,
     uploaded_by: str = "kanban_complete",
@@ -5944,19 +6097,17 @@ def _flag_phantom_prose_refs(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
     summary: Optional[str], result: Optional[str], verified_cards: list[str],
 ) -> None:
-    """Advisory post-commit scan of summary+result for unresolvable ``t_<hex>``
-    references; emits ``suspected_hallucinated_references`` in its own txn so
-    the completion is already durable. Never blocks."""
-    scan_text = " ".join(filter(None, [summary, result]))
-    if not scan_text:
-        return
-    phantom_refs = [p for p in _scan_prose_for_phantom_ids(conn, scan_text) if p not in set(verified_cards)]
-    if phantom_refs:
-        with write_txn(conn):
-            _append_event(
-                conn, task_id, "suspected_hallucinated_references",
-                {"phantom_refs": phantom_refs, "source": "completion_summary"}, run_id=run_id,
-            )
+    """Advisory post-commit scan of summary+result for ``t_<hex>`` references that NO
+    reachable board carries; emits ``suspected_hallucinated_references`` in its own txn so
+    the completion is already durable. Never blocks.
+
+    The RESOLVER is not here: ``hermes_cli/kanban_completion_refs.py`` owns the one tri-state
+    resolver the discharge gate also judges with (design record platform-stl t_0608ce6d), so
+    "phantom" means one thing on this host. Delegated rather than duplicated for exactly that
+    reason - two resolvers would drift, and the drift is invisible until a real card is called
+    a fabrication.
+    """
+    flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
 
 
 def _merge_completion_prose_artifacts(
@@ -8172,6 +8323,17 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+from hermes_cli.kanban_completion_refs import (
+    PhantomRefsRefused,
+    VoidClaimRefused,
+    VoidClaimUnmeasured,
+    discharge_gate_mode,
+    flag_phantom_prose_refs,
+    gate_completion_discharge,
+    gate_completion_refs,
+    gate_void_claim,
+    resolve_refs as resolve_completion_refs,
+)
 from hermes_cli.kanban_db_boards import (
     _default_board_display_name,
     board_dispatch_enabled,

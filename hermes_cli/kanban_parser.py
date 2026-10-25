@@ -377,9 +377,11 @@ _SPECS = [
                   '"tests_run": 12}\'). Stored on the closing run.'),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
-                  "even without owning its run (closes the worker's run). It does NOT "
-                  "bypass PR acceptance, the landing-carrier fence or the deploy proof: "
-                  "those still judge the card's own evidence."),
+                  "even without owning its run (closes the worker's run). It also waives "
+                  "the DISCHARGE gate (a cited card id that resolves nowhere, or a void "
+                  "claim with no measurement) and records the waiver on the card. It does "
+                  "NOT bypass PR acceptance, the landing-carrier fence or the deploy "
+                  "proof: those still judge the card's own evidence."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
