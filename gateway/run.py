@@ -3600,6 +3600,8 @@ class GatewayRunner(
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: OrderedDict[tuple[str, str, object], None] = OrderedDict()
         self._completion_delivery_retention = 2048
+        # Consecutive retryable drain results per completion identity, for the bounded requeue cap.
+        self._completion_delivery_requeues: dict[tuple[str, str, object], int] = {}
         # Agent-triggered terminal completions from one conversation often land in the same scheduler
         # tick; hold them briefly so the agent gets one synthetic turn instead of one per process.
         # See #70300.
@@ -5918,7 +5920,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _refresh_host_gateway_record(runner)
     _log_standalone_profiles_at_boot(runner)
 
-    def _lifecycle_record_startup() -> Optional[Dict[str, Any]]:
+    def _lifecycle_record_startup() -> Optional[dict[str, Any]]:
         # Report if the previous life died uncleanly (SIGKILL / OOM / VM death), then claim the
         # sentinel for this life. After the PID-file claim so a --replace loser can't clobber it.
         # The forensic state.db integrity scan is DEFERRED to a post-connect daemon thread: run
