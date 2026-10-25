@@ -2268,3 +2268,43 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_respawn_guard_active_pr_lifts_on_reopen(kanban_home):
+    """A card carrying an open PR is guarded against a DUPLICATE implementation —
+    until it is reopened. ``reopen_task`` writes the ``reopened`` event, which is a
+    deliberate re-entry by definition: the next worker finishes THAT PR instead of
+    the card being unschedulable forever.
+
+    Regression: before ``reopened`` was in the clearing set, a done→ready reopen
+    left ``active_pr`` engaged with no event that could ever lift it, so a card at
+    the top priority band sat ready and unschedulable until a human remembered to
+    reassign it twice (measured: rank 1 of 2107 ready cards, 96 min idle)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="pr-guard", assignee="a")
+        kb.add_comment(
+            conn, tid, "coder",
+            "Opened https://github.com/o/r/pull/1 for review",
+        )
+        # The PR comment above is exactly what the guard reads. Wait past the
+        # second boundary: the guard compares events STRICTLY after the comment
+        # and fail-closes on a same-second tie, so a fast test would assert the
+        # tie-break instead of the reopen.
+        time.sleep(1.1)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        assert kb.complete_task(
+            conn, tid, summary="phase 1 for review",
+            metadata={"evidence": {"class": "none", "why": "guard-response probe: no run behind it"}},
+        ) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+        ok, err, _info = kb.reopen_task(
+            conn, tid, actor="platform-stl", reason="changes requested",
+        )
+        assert (ok, err) == (True, None)
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # The reopen is the deliberate re-entry: the guard must let the worker back
+        # in to finish the SAME PR.
+        assert kbd.check_respawn_guard(conn, tid) is None

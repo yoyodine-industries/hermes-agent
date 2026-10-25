@@ -3497,7 +3497,7 @@ def check_respawn_guard(
             # Strictly after: a same-second tie stays guarded (fail closed).
             "SELECT kind, payload FROM task_events "
             "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
+            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'reopened')",
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
