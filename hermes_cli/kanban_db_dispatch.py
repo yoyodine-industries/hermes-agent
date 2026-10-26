@@ -2184,17 +2184,25 @@ def _apply_default_assignee(
 
     Mutating the row keeps board state honest: the task is legitimately owned
     by the default, not "unassigned but secretly routed". ``dry_run`` reports
-    without writing. Returns False when the write failed.
+    without writing. Returns False when the write failed, or when the row was
+    no longer unassigned by the time the write ran.
     """
     if dry_run:
         return True
     try:
         with _kb.write_txn(conn):
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                 "AND (assignee IS NULL OR assignee = '')",
                 (assignee, task_id),
             )
+            if cur.rowcount != 1:
+                # The WHERE clause matched no row: something assigned this card
+                # between the caller's read and this write. Recording the event
+                # here would leave ``task_events`` naming an assignee ``tasks``
+                # does not carry, and the caller must not dispatch the card as
+                # if this attach had won it.
+                return False
             _kb._append_event(
                 conn, task_id, "assigned",
                 {"assignee": assignee, "source": "kanban.default_assignee"},

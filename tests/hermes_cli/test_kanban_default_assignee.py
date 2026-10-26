@@ -67,6 +67,41 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
     assert payload["source"] == "kanban.default_assignee"
 
 
+def test_repeat_attach_records_no_second_assigned_event(isolated_kanban_home):
+    """A second attach whose UPDATE matches no row must write nothing.
+
+    The guarded UPDATE skips an already-assigned row, so the bare event append
+    that used to follow it recorded an ``assigned`` event naming an assignee
+    ``tasks`` does not carry — and the caller, seeing True, dispatched the card
+    to that assignee anyway. One attach, one event, one dispatch.
+    """
+    kb, _home = isolated_kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        task_id = kb.create_task(conn, title="t1", assignee=None)
+    with kbc.connect_closing() as conn:
+        assert kbd._apply_default_assignee(
+            conn, task_id, "default", dry_run=False,
+        ) is True
+        # The row carries 'default' now, so the next attach matches no row —
+        # the state a concurrent assignee leaves behind.
+        assert kbd._apply_default_assignee(
+            conn, task_id, "racer", dry_run=False,
+        ) is False
+
+    with kbc.connect_closing() as conn:
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        evs = list(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'assigned'",
+            (task_id,),
+        ))
+    assert row["assignee"] == "default"
+    assert len(evs) == 1
+    assert json.loads(evs[0][0])["assignee"] == "default"
+
+
 
 
 
