@@ -108,11 +108,19 @@ zero outside a kanban task (footprint ladder rung 3).
 - **Toolset:** `tools/kanban_tools.py` — `kanban_show, kanban_complete, kanban_request_review,
   kanban_request_changes, kanban_block, kanban_schedule, kanban_heartbeat, kanban_comment,
   kanban_create, kanban_link,
-  kanban_attach, kanban_attach_url, kanban_attachments`; platforms whose saved selection enables
+  kanban_attach, kanban_attach_url, kanban_attachments, kanban_adjudicate`; platforms whose saved
+  selection enables
   `kanban` (`hermes tools enable kanban --platform <p>`; default-off, in `CONFIGURABLE_TOOLSETS`) get
   the full set plus `kanban_list`/`kanban_unblock` for board routing. The check_fn reads the schema
   build's own selection (`tools/kanban_toolset_context.py`), never the legacy top-level `toolsets`
   key alone.
+- **Every status has a door, and the matrix is code.** `hermes_cli/kanban_exits.py` is the
+  status × door enumeration (`EXITS`, and `DOOR_SOURCES` derived from `_COMPLETABLE`, never a
+  hand-kept list); `hermes_cli/kanban_adjudicate.py` owns the three statuses the completion door
+  cannot reach (`triage`, `todo`, `scheduled`) and checks `set(ROUTES) == DOOR_SOURCES` **at
+  import**, so a new status is un-importable rather than silently un-doored. Adding a kanban tool
+  that moves a card means placing it in the matrix: `tests/hermes_cli/test_kanban_exits.py` fails
+  in both directions (matrix→registry and registry→matrix).
 - **Dispatcher:** long-lived loop (default 60s) that reclaims stale claims, promotes ready tasks,
   atomically claims, and spawns assigned profiles. Runs **inside the gateway** by default
   (`kanban.dispatch_in_gateway: true`). Standalone: `plugins/kanban/systemd/hermes-kanban-dispatcher.service`.
