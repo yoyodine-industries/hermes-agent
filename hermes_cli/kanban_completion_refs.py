@@ -49,13 +49,13 @@ GATE_DEFAULT = "refuse"
 #: whose store is wedged: past the deadline the unresolved ids are ``unknown`` (never absent).
 REF_TIMEOUT_SECONDS = 2.0
 
-#: Budget for the ARCHIVED-snapshot half of the sweep, granted ONCE when the scan first reaches
-#: ``boards/_archived/<slug>-<stamp>/kanban.db``. It is separate from the live budget on purpose:
-#: a host may keep dozens of snapshots, and a real phantom should not be recorded ``unknown``
-#: (which never refuses) merely because the live boards spent the clock first.
+#: Budget for the ARCHIVED-snapshot half of the sweep: when the scan REACHES the first
+#: ``boards/_archived/<slug>-<stamp>/kanban.db`` it re-arms the deadline to this much time, so the
+#: snapshot phase is not cut short by what little remains of the live phase's clock. Separate from
+#: ``REF_TIMEOUT_SECONDS`` because a host may keep dozens of snapshots.
 #:
-#: This is the DELIVERED mechanism, and it is narrower than "the snapshots always get a clock":
-#: they get this one only when the live phase finished INSIDE ``REF_TIMEOUT_SECONDS``. If the live
+#: That re-arm is the DELIVERED mechanism, and it is narrower than "the snapshots always get a
+#: clock": it happens only if the live phase finished INSIDE ``REF_TIMEOUT_SECONDS``. If the live
 #: half exhausts its budget the loop ``break``s at a LIVE store, the snapshot phase is never
 #: entered, and every unresolved id comes back ``unknown`` - advisory, never a refusal. That
 #: fail-open is deliberate and is the rule above, not a gap: refusing from a sweep that never
