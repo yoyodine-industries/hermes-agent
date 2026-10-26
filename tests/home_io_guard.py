@@ -11,6 +11,8 @@ import sqlite3
 import sys
 import threading
 
+_CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 } | {
@@ -23,13 +25,60 @@ _INTERPRETER_PREFIXES = tuple({
     # INSTALL_DIR=$HERMES_HOME/hermes-agent). Reading test data, sources for tracebacks, or the
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
-    Path(__file__).resolve().parent.parent,
+    _CHECKOUT_ROOT,
 })
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
 # resolve once at import, as before: they are fixed for the process lifetime.
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
+
+
+def _linked_worktree_git_dir(checkout: Path) -> Path | None:
+    """Where a linked worktree's ``.git`` FILE points, or None for a plain checkout.
+
+    ``git worktree add`` (the recipe every repair card prescribes: ``.worktrees/<card>``) replaces
+    the directory with a file holding ``gitdir: <dir>``, and that dir is
+    ``<main checkout>/.git/worktrees/<name>`` — INSIDE the guarded root when the install is the
+    default in-home layout the exemption above already covers. It holds only this worktree's own
+    HEAD/index/operation markers: the operator's config, hooks, objects and refs stay in the common
+    dir one level up, which stays guarded. Mirrors ``hermes_cli._early_recovery._git_dir``, whose
+    interrupted-update marker probe is what reaches into it at launch.
+    """
+    pointer = checkout / ".git"
+    try:
+        if not pointer.is_file():
+            return None
+        text = pointer.read_text(encoding="utf-8-sig")
+    except Exception:  # noqa: BLE001 — an unreadable pointer just keeps the strict behaviour
+        return None
+    for line in text.splitlines():
+        if line.startswith("gitdir:"):
+            target = line[len("gitdir:"):].strip()
+            if target:
+                try:
+                    return Path(checkout, target).resolve()
+                except Exception:  # noqa: BLE001 — same: no exemption rather than a guard crash
+                    return None
+    return None
+
+
+# A linked worktree's own git dir: this checkout's bookkeeping, not Hermes state. Empty for a plain
+# checkout, so nothing changes wherever the install is not in-home.
+_worktree_git_dir = _linked_worktree_git_dir(_CHECKOUT_ROOT)
+_CHECKOUT_GIT_PREFIX_STRS = () if _worktree_git_dir is None else (
+    _normcase(os.fspath(_worktree_git_dir)),
+)
+# The sealed-payload descriptor beside the checkout (hmp/pm ``_payload_manifest`` reads
+# ``<root>.parent/manifest.json`` at launch and DISCARDS it unless its ``repo`` names this very
+# tree). Reading it describes the checkout in hand — the same class as the .venv and sources above —
+# but it is one file outside the tree, so it is exempt for reads only: a test never writes the
+# install's own record.
+_CHECKOUT_PAYLOAD_MANIFESTS = frozenset(
+    _normcase(p)
+    for p in (os.path.abspath(_CHECKOUT_ROOT.parent / "manifest.json"),
+              os.path.realpath(_CHECKOUT_ROOT.parent / "manifest.json"))
+)
 
 
 def _within(path: str, prefix: str) -> bool:
@@ -100,6 +149,16 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
                     return
+            # A linked worktree's own git dir (see _linked_worktree_git_dir): the interrupted-update
+            # marker the launch path probes lives there. Its ANCESTORS are not exempt — the common
+            # dir holds the operator's config, hooks and objects.
+            for prefix in _CHECKOUT_GIT_PREFIX_STRS:
+                if _within(absolute, prefix):
+                    return
+            # The payload descriptor beside the checkout: a READ is the install describing itself, a
+            # write is a test corrupting the operator's install record.
+            if not destructive and absolute in _CHECKOUT_PAYLOAD_MANIFESTS:
+                return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
             for root in roots:
@@ -113,6 +172,11 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(resolved, prefix):
                     return
+            for prefix in _CHECKOUT_GIT_PREFIX_STRS:
+                if _within(resolved, prefix):
+                    return
+            if not destructive and resolved in _CHECKOUT_PAYLOAD_MANIFESTS:
+                return
             for root in roots:
                 if _within(resolved, root):
                     self.refuse(value)
