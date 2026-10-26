@@ -206,10 +206,50 @@ def _archive_as_curator(_u, name: str) -> bool:
                 reset_ledger_actor(tok)
 
 
-def apply_automatic_transitions(now: Optional[datetime] = None) -> dict[str, int]:
+def _auto_summary_line(counts: dict[str, int], dry_run: bool = False) -> str:
+    """The one-line auto-transition summary, shared by state, notification and REPORT.md.
+
+    A real run reads ``auto: 1 marked stale; blocked: git-tracked 3 (curator.protect_git_tracked)``
+    and a preview reads ``dry-run auto: 2 would-mark-stale, 3 blocked: git-tracked`` — the
+    blocked count is never dropped, because a run that skips work without saying so is the
+    failure mode this counter exists for.
+    """
+    pairs = (("marked_stale", "marked stale", "would-mark-stale"),
+             ("archived", "archived", "would-archive"),
+             ("reactivated", "reactivated", "would-reactivate"))
+    parts = [f"{counts[key]} {dry if dry_run else live}" for key, live, dry in pairs if counts.get(key)]
+    if blocked := int(counts.get("blocked_git_tracked", 0) or 0):
+        parts.append(f"{blocked} blocked: git-tracked" if dry_run
+                     else f"blocked: git-tracked {blocked} (curator.protect_git_tracked)")
+    return ", ".join(parts) or "no changes"
+
+
+def get_protect_git_tracked() -> bool:
+    """``curator.protect_git_tracked`` (default True) — never archive bytes a git repo tracks.
+
+    The reader lives in ``tools.skill_usage`` so the guard inside ``archive_skill`` and this
+    module's dry-run walk read the SAME flag; this is the module-level door onto it.
+    """
+    return skill_usage.protect_git_tracked_enabled()
+
+
+def apply_automatic_transitions(now: Optional[datetime] = None, apply: bool = True) -> dict[str, int]:
     """Move every curator-managed skill between active/stale/archived based on its latest real activity; pinned skills are
     never touched. Built-ins are seeded with a baseline record on first sight so their inactivity clock starts NOW, not at epoch.
-    Returns a counter dict."""
+
+    ``apply=False`` walks the SAME rows and counts what it WOULD do without writing anything —
+    no state, no seed, no re-anchor, and the archive branch is decided by the guard predicate
+    instead of by performing the move. Until this existed, a dry run read
+    ``marked_stale: 0, archived: 0`` from a constant and was evidence for nothing: it is what
+    let a pure-time pass archive eight tracked skills while the preview said it would not
+    (card t_4c38630b).
+
+    ``blocked_git_tracked`` counts the archives the guard refused — the visible, counted thing.
+    A guard that silently skipped a skill would BE the silent loss it was added to prevent,
+    so the counter rides every path: the summary line, ``run.json``, REPORT.md and the metric.
+
+    Returns a counter dict.
+    """
     from tools import skill_usage as _u
 
     now = now or datetime.now(UTC)
@@ -218,10 +258,13 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> dict[str, int
     # Cron-referenced skills are in use by definition (usage only bumps when a
     # job fires, so paused/rare jobs would age them out). Treat as pinned.
     protected = _cron_referenced_skills()
-    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
+    protect_tracked = _u.protect_git_tracked_enabled()
+    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0,
+              "blocked_git_tracked": 0}
 
     def _set(name: str, state: str, key: str) -> None:
-        _u.set_state(name, state)
+        if apply:
+            _u.set_state(name, state)
         counts[key] += 1
 
     for row in _u.curated_report():
@@ -231,13 +274,15 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> dict[str, int
             continue
         # First sight with no persisted record: anchor its clock to now and defer.
         if not row.get("_persisted", True):
-            _u.seed_record_if_missing(name)
+            if apply:
+                _u.seed_record_if_missing(name)
             counts["seeded"] += 1
             continue
         # A bundled skill's telemetry record predates the curator's first sight of it; anchor the clock here, once.
         if (row.get("provenance") == "bundled" and int(row.get("use_count", 0) or 0) == 0
                 and not _parse_iso(row.get("last_activity_at")) and not row.get("first_seen_at")):
-            _u.reanchor_clock(name)
+            if apply:
+                _u.reanchor_clock(name)
             counts["seeded"] += 1
             continue
         # Never-active skills anchor on created_at so they don't self-archive.
@@ -252,7 +297,11 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> dict[str, int
                 _set(name, _u.STATE_ACTIVE, "reactivated")
             continue
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
-            if _archive_as_curator(_u, name):
+            # The guard, asked the same question the mover will ask: one predicate, so the
+            # preview and the real pass cannot disagree about what is blocked.
+            if protect_tracked and _u.git_tracked_refusal(name) is not None:
+                counts["blocked_git_tracked"] += 1
+            elif not apply or _archive_as_curator(_u, name):
                 counts["archived"] += 1
         elif anchor <= stale_cutoff and current == _u.STATE_ACTIVE:
             _set(name, _u.STATE_STALE, "marked_stale")
@@ -799,7 +848,8 @@ def _render_report_markdown(p: dict[str, Any]) -> str:
         f"Agent-created skills: {counts.get('before', 0)} → {counts.get('after', 0)} ({counts.get('delta', 0):+d})\n",
         *([f"> ⚠ LLM pass error: `{error}`\n"] if error else []),
         "## Auto-transitions (pure, no LLM)\n", f"- checked: {auto.get('checked', 0)}", f"- marked stale: {auto.get('marked_stale', 0)}",
-        f"- archived (no LLM, pure time-based staleness): {auto.get('archived', 0)}", f"- reactivated: {auto.get('reactivated', 0)}", "",
+        f"- archived (no LLM, pure time-based staleness): {auto.get('archived', 0)}", f"- reactivated: {auto.get('reactivated', 0)}",
+        f"- blocked: git-tracked {auto.get('blocked_git_tracked', 0)} (curator.protect_git_tracked — a repo's tracked bytes are never archived)", "",
         "## LLM consolidation pass\n",
         f"- tool calls: **{counts.get('tool_calls_total', 0)}** (by name: {', '.join(f'{k}={v}' for k, v in sorted(tc_counts.items())) or 'none'})",
         f"- consolidated into umbrellas: **{counts.get('consolidated_this_run', 0)}**",
@@ -925,8 +975,8 @@ def run_curator_review(
     consolidate = get_consolidate() if consolidate is None else consolidate
     start = datetime.now(UTC)
     hermes_home = get_hermes_home()  # the LLM pass may run on a thread with no profile binding
-    if dry_run:  # count candidates without mutating state
-        counts = {"checked": len(_safe_curated_report()), "marked_stale": 0, "archived": 0, "reactivated": 0}
+    if dry_run:  # walk the same rows, count the same transitions, mutate nothing
+        counts = apply_automatic_transitions(now=start, apply=False)
     else:
         from agent import curator_backup
         # The prune-only pass just renames directories into .archive/ (its own undo) and every edit is
@@ -944,9 +994,7 @@ def run_curator_review(
             with contextlib.suppress(Exception):
                 curator_backup.prune_old_snapshots()
         counts = apply_automatic_transitions(now=start)
-    auto_summary = ", ".join(
-        f"{counts[key]} {label}" for key, label in (("marked_stale", "marked stale"), ("archived", "archived"), ("reactivated", "reactivated")) if counts[key]
-    ) or "no changes"
+    auto_summary = _auto_summary_line(counts, dry_run=dry_run)
 
     # Persist before the LLM pass so a crash mid-review still records the run.
     # Dry-run does NOT bump last_run_at/run_count (a preview must not push the
