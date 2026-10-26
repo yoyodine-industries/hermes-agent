@@ -54,6 +54,68 @@ DEFAULT_PATTERNS: tuple[str, ...] = (
 
 _FALSE_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
 
+#: A heredoc introducer: ``<<EOF``, ``<<-EOF``, ``<<'YAML'``, ``<< "MARKER"``. Not ``<<<``
+#: (a herestring carries its data on the command line) and not inside quotes (the shell only
+#: opens a heredoc for an unquoted ``<<``).
+_HEREDOC_RE = re.compile(r"<<-?[ \t]*([\"']?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _heredoc_delimiters(line: str) -> list[str]:
+    """The heredoc delimiters *line* opens, skipping any ``<<`` that sits inside quotes."""
+    delimiters: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            index += 1
+            continue
+        if line.startswith("<<", index) and not line.startswith("<<<", index):
+            match = _HEREDOC_RE.match(line, index)
+            if match:
+                delimiters.append(match.group(2))
+                index = match.end()
+                continue
+        index += 1
+    return delimiters
+
+
+def _without_heredoc_bodies(command: str) -> str:
+    """*command* with every heredoc BODY dropped, leaving the lines the shell executes.
+
+    A heredoc body is stdin DATA, not a command line: ``cat > notes.md <<'EOF'`` whose text
+    quotes ``python -m yoyoflow.run`` launches nothing, and detaching it would take the
+    caller's own file write away from it (t_4b9843a4 review). Lines carrying an introducer are
+    kept -- a launcher on that line is real -- and only the body up to the delimiter goes. An
+    unterminated heredoc swallows the rest, exactly as the shell would.
+    """
+    lines = command.splitlines()
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        for delimiter in _heredoc_delimiters(line):
+            index = _past_delimiter(lines, index, delimiter)
+    return "\n".join(kept)
+
+
+def _past_delimiter(lines: list[str], index: int, delimiter: str) -> int:
+    """Index just past the line closing *delimiter*'s heredoc, or EOF."""
+    while index < len(lines):
+        stripped = lines[index].strip()
+        index += 1
+        if stripped == delimiter:
+            break
+    return index
+
 
 def detach_enabled() -> bool:
     """Whether workflow departures are detached on this host (default: yes)."""
@@ -68,7 +130,7 @@ def departure_patterns() -> tuple[str, ...]:
         return DEFAULT_PATTERNS
     if os.path.isfile(raw):
         try:
-            with open(raw, encoding="utf-8") as fh:
+            with open(raw, encoding="utf-8-sig") as fh:
                 lines = [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
         except OSError:
             return DEFAULT_PATTERNS
@@ -80,13 +142,16 @@ def is_departure_command(command: object) -> bool:
     """True when *command* INVOKES a workflow carrier (the only thing that detaches).
 
     Read-only inspection of a carrier (``grep ... yoyoflow.run``, ``cat cron/sdlc.sh``) is
-    not a departure: the patterns anchor on the launcher form, not on the name.
+    not a departure: the patterns anchor on the launcher form, not on the name. Heredoc
+    BODIES are data and never matched (see :func:`_without_heredoc_bodies`), so writing a
+    document that quotes a carrier invocation does not detach the write.
     """
     if not isinstance(command, str) or not command.strip():
         return False
+    executable = _without_heredoc_bodies(command)
     for pattern in departure_patterns():
         try:
-            if re.search(pattern, command):
+            if re.search(pattern, executable):
                 return True
         except re.error:
             continue
@@ -117,9 +182,11 @@ def pid_is_departure(pid: int) -> bool:
         return False
     try:
         import psutil  # local dependency; imported lazily so the module costs nothing
-    except Exception:
+    except ImportError:
         return False
     try:
         return is_departure_env(psutil.Process(pid).environ())
-    except Exception:
+    except psutil.Error:
+        # Gone, a zombie, or an environ we may not read (another user's process): no evidence of
+        # the marker, which is exactly what "not a departure" means here.
         return False

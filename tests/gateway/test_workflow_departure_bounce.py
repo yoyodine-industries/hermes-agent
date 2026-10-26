@@ -1,17 +1,25 @@
 """A sanctioned bounce must not reap a live production workflow run (t_4b9843a4).
 
-Real processes, a real ledger, the real shutdown sweep. Two arms:
+Real processes, a real ledger, the real shutdown sweep. Four arms:
 
 * **detached** (default): the run is spawned as a workflow departure, the gateway's own kill
   sweep runs over it, and the run survives to its own terminal state with a complete row;
 * **detach disabled** (``HERMES_WORKFLOW_DETACH=0``): the run is an ordinary child, the sweep
   reaps it, and the drain says ``1 in-flight workflow run(s)`` while the run's record names the
-  bounce as its actor instead of leaving a bare ``interrupted (SystemExit(143))``.
+  bounce as its actor instead of leaving a bare ``interrupted (SystemExit(143))``;
+* **finished during the drain**: the run reaches its own terminal outcome while the census is
+  still the pre-drain snapshot. The record keeps ``error IS NULL`` -- a flight that finished is
+  not a victim, so the stamp's UPDATE is guarded on the row's status
+  (``workflow_runs.STAMPABLE_STATUSES``);
+* **orphaned**: a ``running`` row whose owner is already gone is a leftover (SIGKILL/OOM/reboot),
+  never a flight. The census names it beside the live count instead of counting it, and the
+  attribution pass never invents a bounce victim out of it.
 
 On 2026-10-21 the drain reported ``0 in-flight cron job(s)`` while exactly this happened to a
 32-minute sdlc flight: no census, no actor, nothing for the failure actor to classify.
 """
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -100,6 +108,31 @@ def _row(path, run_id="20261020-1941"):
         conn.close()
 
 
+def _insert_run(path, run_id, *, status="running", pid=0, error=None):
+    """Add a row the fixture runner never touches (an orphan left by a killed engine)."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO runs (id, workflow_name, status, owner_pid, started_at, error) "
+            "VALUES (?, 'sdlc', ?, ?, '2026-10-25T03:00:00+00:00', ?)",
+            (run_id, status, pid, error),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_row(path, run_id, *, status, pid, error):
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE runs SET status=?, owner_pid=?, error=? WHERE id=?", (status, pid, error, run_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _start_runner(tmp_path, path, *, hold_s=6.0, departure=True):
     script = tmp_path / "fake_runner.py"
     script.write_text(RUNNER)
@@ -172,15 +205,8 @@ def test_detached_departure_survives_the_gateway_kill_sweep(ledger):
     assert _row(ledger)[2] is None
 
 
-def test_drain_names_an_undetached_run_and_the_record_names_the_bounce(ledger, caplog, monkeypatch):
-    """Arm 2: detach off. The drain says so, and the record gets the actor."""
-    monkeypatch.setenv(wd.ENV_GATE, "0")
-    session = _start_runner(ledger.parent, ledger, hold_s=30.0, departure=False)
-    census = wfr.running_runs()
-    assert len(census) == 1
-    runner_pid = census[0].pid
-
-    # The drain's own sentence: a real `_stop_drain_active_work` on a sized double.
+def _sized_runner():
+    """A gateway-shaped double with just enough surface for the real drain method."""
     runner = object.__new__(GatewayRunner)
     runner._running_agents = {}
     runner._running_agents_ts = {}
@@ -191,16 +217,31 @@ def test_drain_names_an_undetached_run_and_the_record_names_the_bounce(ledger, c
         return [], False
 
     runner._drain_active_agents = _fake_drain
-    ctx = GatewayShutdownMixin._StopContext(
-        deferred_count=lambda: 0, started_at=time.monotonic()
-    )
-    import asyncio
+    return runner
 
+
+def _stop_context():
+    return GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, started_at=time.monotonic())
+
+
+def _drain_messages(runner, caplog):
+    """Run the real `_stop_drain_active_work` and return the lines it logged."""
     with caplog.at_level("INFO", logger="gateway.run"):
-        asyncio.run(GatewayShutdownMixin._stop_drain_active_work(runner, 1.0, ctx))
-    assert any("1 in-flight workflow run(s)" in r.getMessage() for r in caplog.records), [
-        r.getMessage() for r in caplog.records
-    ]
+        asyncio.run(GatewayShutdownMixin._stop_drain_active_work(runner, 1.0, _stop_context()))
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_drain_names_an_undetached_run_and_the_record_names_the_bounce(ledger, caplog, monkeypatch):
+    """Arm 2: detach off. The drain says so, and the record gets the actor."""
+    monkeypatch.setenv(wd.ENV_GATE, "0")
+    _start_runner(ledger.parent, ledger, hold_s=30.0, departure=False)  # the sweep reaps it
+    census = wfr.running_runs()
+    assert len(census) == 1
+    runner_pid = census[0].pid
+
+    # The drain's own sentence: a real `_stop_drain_active_work` on a sized double.
+    runner = _sized_runner()
+    assert any("1 in-flight workflow run(s)" in m for m in _drain_messages(runner, caplog))
 
     # ... and the real sweep, then the real attribution pass.
     GatewayShutdownMixin._stop_kill_tool_subprocesses("fixture-bounce")
@@ -244,3 +285,78 @@ def test_stamp_is_idempotent(ledger):
     assert first == ["20261020-1941"]
     assert wfr.stamp_reaped(census, pid=1234, started="t0", reason="Gateway shutting down", settle_s=0.0) == []
     assert _row(ledger)[2].count("interrupted by gateway bounce") == 1
+
+
+def test_a_run_that_finishes_during_the_drain_keeps_its_clean_record(ledger):
+    """Arm 3 (review fix 1): a flight that reaches its own outcome during the drain.
+
+    The census saw it alive, and its owner is gone by the time the attribution pass runs -- the
+    exact shape a naive stamp calls a victim. The run's verdict is its own: ``error`` stays NULL.
+    """
+    session = _start_runner(ledger.parent, ledger, hold_s=3.0, departure=True)
+    census = wfr.running_runs()
+    assert [r.id for r in census] == ["20261020-1941"]
+    assert census[0].pid_alive is True, "the census must see the owner alive before the drain"
+
+    assert _wait(lambda: _row(ledger)[0] == "done", timeout=15), _row(ledger)
+    assert _wait(lambda: not _alive(census[0].pid), timeout=10), "the runner's process is still there"
+
+    assert wfr.stamp_reaped(
+        census, pid=os.getpid(), started="2026-10-21T00:13:33+00:00",
+        reason="Gateway shutting down", settle_s=0.5,
+    ) == []
+
+    status, _, error = _row(ledger)
+    assert status == "done", "the run's own terminal outcome was rewritten"
+    assert error is None, error
+    process_registry.kill_process(session.id)
+
+
+@pytest.mark.parametrize("terminal", ["completed", "done"])
+def test_a_terminal_status_is_never_stamped(ledger, terminal):
+    """Production's terminal success value is ``completed`` (measured 2026-10-26: 4297 rows);
+    the fixture's is ``done``. Neither may be argued with."""
+    _set_row(ledger, "20261020-1941", status=terminal, pid=999_999, error=None)
+    # Constructed directly so the row is genuinely "alive at census, gone now": the ONLY thing
+    # left to stop the stamp is the row's terminal status.
+    victim = wfr.RunningRun(
+        id="20261020-1941", workflow="sdlc", pid=999_999,
+        started_at="2026-10-20T23:41:27+00:00", pid_alive=True,
+    )
+    assert wfr.stamp_reaped(
+        [victim], pid=os.getpid(), started="t0", reason="Gateway shutting down", settle_s=0.0,
+    ) == []
+    assert _row(ledger) == (terminal, 999_999, None)
+
+
+def test_orphaned_running_rows_are_named_never_counted_never_stamped(ledger):
+    """Arm 4 (review fix 2): a ``running`` row whose owner is gone is a leftover, not a flight."""
+    _insert_run(ledger, "20261025-0300", pid=999_999)  # nothing is running under that pid
+    census = wfr.running_runs()
+    assert [r.id for r in census] == ["20261025-0300"]
+    assert census[0].pid_alive is False
+    assert wfr.live_runs(census) == []
+    assert [r.id for r in wfr.orphaned_runs(census)] == ["20261025-0300"]
+    assert wfr.in_flight_count() == 0
+    assert wfr.census_fragment(0, 1) == (
+        "0 in-flight workflow run(s) (1 orphaned 'running' row(s) not counted)"
+    )
+    # Nobody reaped it, so no bounce may be named on it -- not now, not on every future bounce.
+    assert wfr.stamp_reaped(
+        census, pid=os.getpid(), started="t0", reason="Gateway shutting down", settle_s=0.0,
+    ) == []
+    assert _row(ledger, "20261025-0300")[2] is None
+
+
+def test_the_drain_names_orphans_beside_the_live_flights(ledger, caplog):
+    """The drain sentence counts flights in the air and names the leftovers separately."""
+    _insert_run(ledger, "20261025-0300", pid=999_999)
+    session = _start_runner(ledger.parent, ledger, hold_s=30.0)
+    try:
+        messages = _drain_messages(_sized_runner(), caplog)
+        assert any(
+            "1 in-flight workflow run(s) (1 orphaned 'running' row(s) not counted)" in m
+            for m in messages
+        ), messages
+    finally:
+        process_registry.kill_process(session.id)

@@ -7,6 +7,10 @@ here: the carrier invocation is DETECTED and spawned detached, and the sweep mac
 to reap a departure even when it is handed one.
 """
 
+import os
+import subprocess
+import sys
+
 import pytest
 
 from tools import workflow_departure as wd
@@ -39,6 +43,32 @@ def test_reading_about_a_carrier_is_not_a_departure(command):
     assert wd.is_departure_command(command) is False
 
 
+@pytest.mark.parametrize("command", [
+    # A heredoc BODY is stdin data: writing a document that quotes a carrier launches nothing,
+    # and detaching the write would take the file away from the caller.
+    "cat > notes.md <<'EOF'\npython -m yoyoflow.run --workflow sdlc\nEOF",
+    "cat <<EOF > /tmp/howto.txt\n  bash /opt/hermes_prod/yaan-platform/cron/sdlc.sh\nEOF",
+    "python3 - <<'PY'\nprint('quoting <<EOF inside a body')\nPY",
+])
+def test_a_heredoc_body_is_data_not_a_departure(command):
+    assert wd.is_departure_command(command) is False
+
+
+def test_a_carrier_after_a_heredoc_is_still_a_departure():
+    """Stripping bodies must not swallow a launcher that follows one on a later line."""
+    command = (
+        "cat > /tmp/flight.yaml <<'YAML'\nworkflow: sdlc\nYAML\n"
+        "bash /opt/hermes_prod/yaan-platform/cron/sdlc.sh --now"
+    )
+    assert wd.is_departure_command(command) is True
+
+
+def test_a_quoted_introducer_opens_no_heredoc():
+    """The shell only opens a heredoc for an UNQUOTED ``<<``; a quoted one must not hide a launch."""
+    assert wd.is_departure_command("echo 'a <<EOF' && bash cron/sdlc.sh") is True
+    assert wd.is_departure_command("bash cron/sdlc.sh <<< 'tick'") is True
+
+
 def test_detach_gate_is_on_by_default_and_can_be_killed(monkeypatch):
     monkeypatch.delenv(wd.ENV_GATE, raising=False)
     assert wd.detach_enabled() is True
@@ -56,6 +86,31 @@ def test_marker_env_stamps_without_mutating_the_source():
     assert wd.is_departure_env(marked) is True
     assert wd.is_departure_env(base) is False
     assert wd.is_departure_env({wd.ENV_MARKER: "0"}) is False
+
+
+def _spawn_probe(**extra_env):
+    """A live stand-in process, so the marker can be read off a REAL environment."""
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        env={**os.environ, **extra_env},
+    )
+
+
+def test_pid_is_departure_reads_the_marker_off_a_live_process():
+    """The environment teardown's setsid-escapee sweep asks exactly this before sparing a pid."""
+    marked = _spawn_probe(**{wd.ENV_MARKER: "1"})
+    plain = _spawn_probe()
+    try:
+        assert wd.pid_is_departure(marked.pid) is True
+        assert wd.pid_is_departure(plain.pid) is False
+    finally:
+        for proc in (marked, plain):
+            proc.kill()
+            proc.wait(timeout=10)
+    # Ids that cannot be a live process are never a departure (and never raise).
+    assert wd.pid_is_departure(0) is False
+    assert wd.pid_is_departure(-1) is False
+    assert wd.pid_is_departure(marked.pid) is False  # now gone: no marker to read
 
 
 def test_patterns_are_overridable(monkeypatch, tmp_path):
@@ -91,7 +146,7 @@ def _collect_kills(registry):
 
 @pytest.mark.parametrize("source", [
     "kill_all", "gateway_shutdown", "post-interrupt", "final-cleanup", "agent_close",
-    "gateway_turn_timeout", "cli.stop", "test",
+    "gateway_turn_timeout", "release", "test",
 ])
 def test_no_sweep_reaps_a_departure(source):
     """Every bulk sweep -- shutdown included -- leaves a production flight alone."""
@@ -105,6 +160,24 @@ def test_no_sweep_reaps_a_departure(source):
     assert registry.kill_all("session-a", source=source) == 1
     assert calls == ["proc_volatile"]
     assert departure.exited is False
+
+
+@pytest.mark.parametrize("source", [
+    # process_manage kill and the two interactive /stop doors a human actually stands at. An
+    # operator must always be able to stop a flight on purpose.
+    "process.kill", "cli.stop", "slash.stop",
+])
+def test_an_explicit_operator_stop_reaches_a_departure(source):
+    registry = ProcessRegistry()
+    departure = _session("proc_departure", departure=True)
+    volatile = _session("proc_volatile")
+    registry._running[departure.id] = departure
+    registry._running[volatile.id] = volatile
+    calls = _collect_kills(registry)
+
+    assert registry.kill_all("session-a", source=source) == 2
+    assert calls == ["proc_departure", "proc_volatile"]
+    assert departure.exited is True
 
 
 def test_persist_on_release_alone_still_dies_at_shutdown():

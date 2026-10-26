@@ -9,8 +9,10 @@ while the drain reports "0 in-flight cron job(s)". That is a false green, and it
 
 This module gives the drain the two things it was missing:
 
-* **a census** -- :func:`running_runs` reads the yoyoflow ledger's ``running`` rows, so the
-  drain can say "N in-flight workflow run(s)" instead of reporting silence;
+* **a census** -- :func:`running_runs` reads the yoyoflow ledger's ``running`` rows and
+  annotates each with its owner's liveness, so the drain can say "N in-flight workflow
+  run(s)" instead of reporting silence -- and can tell a real flight from a row a SIGKILL
+  left behind (``census_fragment`` names both halves);
 * **an actor** -- :func:`stamp_reaped` writes the bounce into the record of every counted
   run whose process the sweep actually killed, so the failure actor has something
   attributable to classify instead of an unattributed interruption.
@@ -47,12 +49,19 @@ _SQLITE_TIMEOUT_S = 1.0
 
 @dataclass(frozen=True)
 class RunningRun:
-    """One in-flight workflow run, as the ledger records it."""
+    """One in-flight workflow run, as the ledger records it.
+
+    ``pid_alive`` is the census's own liveness verdict on ``pid`` at the moment the row was
+    read. A ``running`` row whose owner is already gone is an ORPHAN -- a SIGKILL, an OOM or a
+    reboot leaves one behind for ever -- so it is named as one, never counted as a flight and
+    never attributed to this bounce.
+    """
 
     id: str
     workflow: str
     pid: int
     started_at: str
+    pid_alive: bool = True
 
     def __str__(self) -> str:  # pragma: no cover - diagnostics only
         return f"{self.workflow}:{self.id} (pid {self.pid})"
@@ -76,8 +85,16 @@ def _connect(path: str, *, read_only: bool) -> sqlite3.Connection:
     return conn
 
 
-def running_runs(ledger: Optional[str] = None) -> list[RunningRun]:
-    """The ledger's in-flight workflow runs (empty when unreadable/absent)."""
+def running_runs(
+    ledger: Optional[str] = None, *, alive: Optional[Callable[[int], bool]] = None,
+) -> list[RunningRun]:
+    """The ledger's ``running`` rows, each annotated with its owner's liveness.
+
+    Annotating at read time is what makes the census honest: the row set alone says "a run
+    never wrote its terminal outcome", which is not the same statement as "a flight is in the
+    air" (see :func:`census_fragment` and :func:`orphaned_runs`). Empty when
+    unreadable/absent -- a census is not a gate.
+    """
     path = ledger or ledger_path()
     if not path or not os.path.exists(path):
         return []
@@ -89,9 +106,10 @@ def running_runs(ledger: Optional[str] = None) -> list[RunningRun]:
             ).fetchall()
         finally:
             conn.close()
-    except Exception as exc:  # absent schema, locked, corrupt: a census is not a gate
+    except (OSError, sqlite3.Error, ValueError) as exc:  # absent schema, locked, corrupt: not a gate
         logger.debug("workflow run census unavailable (%s): %s", path, exc)
         return []
+    is_alive = alive or _pid_alive
     runs: list[RunningRun] = []
     for run_id, workflow, pid, started_at in rows:
         try:
@@ -100,19 +118,41 @@ def running_runs(ledger: Optional[str] = None) -> list[RunningRun]:
             pid_int = 0
         runs.append(RunningRun(
             id=str(run_id or ""), workflow=str(workflow or ""), pid=pid_int,
-            started_at=str(started_at or ""),
+            started_at=str(started_at or ""), pid_alive=bool(is_alive(pid_int)),
         ))
     return runs
 
 
+def live_runs(runs: Iterable[RunningRun]) -> list[RunningRun]:
+    """The rows whose owner was alive at census time -- the flights actually in the air."""
+    return [r for r in runs if r.pid_alive]
+
+
+def orphaned_runs(runs: Iterable[RunningRun]) -> list[RunningRun]:
+    """``running`` rows whose owner was already gone: leftovers, never flights.
+
+    A killed engine (SIGKILL, OOM, reboot) never writes its terminal outcome, so its row stays
+    ``running`` for ever. Reporting one as in flight asserts a flight that is not in the air.
+    """
+    return [r for r in runs if not r.pid_alive]
+
+
 def in_flight_count(ledger: Optional[str] = None) -> int:
-    """How many workflow runs are in flight right now."""
-    return len(running_runs(ledger))
+    """How many workflow runs are in flight right now (live owners only)."""
+    return len(live_runs(running_runs(ledger)))
 
 
-def census_fragment(count: int) -> str:
-    """The drain's own words for a workflow census, so logs read as one sentence."""
-    return f"{count} in-flight workflow run(s)"
+def census_fragment(live: int, orphaned: int = 0) -> str:
+    """The drain's own words for a workflow census, so logs read as one sentence.
+
+    Only live-owner rows are counted as in flight; orphaned rows are named beside the count
+    rather than silently dropped, so the reader can tell "the ledger had nothing" from "the
+    ledger had leftovers nobody reaped".
+    """
+    text = f"{live} in-flight workflow run(s)"
+    if orphaned:
+        text += f" ({orphaned} orphaned 'running' row(s) not counted)"
+    return text
 
 
 def bounce_actor_text(*, pid: int, started: str, reason: str) -> str:
@@ -121,26 +161,22 @@ def bounce_actor_text(*, pid: int, started: str, reason: str) -> str:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True when *pid* is a live, non-zombie process (our own liveness evidence)."""
+    """True when *pid* is a live, non-zombie process (our own liveness evidence).
+
+    ``gateway.status._pid_exists`` is the house check: psutil first, and never ``os.kill(pid, 0)``
+    on Windows, where that sends ``CTRL_C_EVENT`` to the target's whole console group (bpo-14484).
+    A zombie counts as dead: treating one as alive would invent a flight that is already over.
+    """
     if not pid or pid <= 0:
         return False
-    try:
-        import psutil
-    except Exception:
-        psutil = None
-    if psutil is not None:
-        try:
-            proc = psutil.Process(pid)
-            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-        except Exception:
-            return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    from gateway.status import _pid_exists
+    return _pid_exists(pid)
+
+
+#: Statuses a reaped run may still be in when the bounce is stamped onto it. Anything else is
+#: a TERMINAL outcome -- the engine wrote its own verdict (`completed` in production, `done` in
+#: the fixture, and any future terminal name) -- and a run that finished is not a run we killed.
+STAMPABLE_STATUSES = ("running", "failed")
 
 
 def stamp_reaped(
@@ -150,16 +186,26 @@ def stamp_reaped(
 ) -> list[str]:
     """Name the bounce on every counted run that this sweep actually reaped.
 
-    Evidence, never inference: a run is stamped only when its ``owner_pid`` was alive at
-    census time and is gone now. *settle_s* is a bounded wait for the engine to write its
-    own abort line first, so the bounce is prefixed onto that line instead of racing it.
+    Evidence, never inference -- both halves of that sentence are enforced here:
+
+    * **alive at census** -- only a row the census saw with a LIVE owner counts. A row whose
+      owner was already gone was not killed by this sweep, so naming the bounce on it would
+      invent a victim (and, for an orphan nobody ever reaped, keep inventing it on every
+      future bounce);
+    * **still in flight now** -- the owner must be gone after the sweep, and the row must not
+      have reached a terminal outcome in the meantime (``STAMPABLE_STATUSES``). A run that
+      completed during the drain is a finished flight: the UPDATE is guarded so its record's
+      ``error`` stays NULL and its verdict is not rewritten as an interruption.
+
+    *settle_s* is a bounded wait for the engine to write its own abort line first, so the
+    bounce is prefixed onto that line instead of racing it.
     """
     path = ledger or ledger_path()
     if not path or not runs:
         return []
     is_alive = alive or _pid_alive
     deadline = time.monotonic() + max(0.0, settle_s)
-    dead = [r for r in runs if not is_alive(r.pid)]
+    dead = [r for r in runs if r.pid_alive and not is_alive(r.pid)]
     if not dead:
         return []
     # Bounded settle: a SIGTERMed engine writes `run aborted: ...` within milliseconds.
@@ -177,7 +223,7 @@ def stamp_reaped(
                 }
             finally:
                 conn.close()
-        except Exception:
+        except (OSError, sqlite3.Error):
             pending = set()
         if not pending:
             break
@@ -194,16 +240,31 @@ def stamp_reaped(
                 if row is None:
                     continue
                 status, existing = row[0], (row[1] or "")
+                if status not in STAMPABLE_STATUSES:
+                    # The engine reached its own verdict during the drain (or a previous pass):
+                    # a finished flight is not a victim of this bounce. Leave the record alone.
+                    logger.info(
+                        "workflow run %s finished as %s during the drain; not stamped", run.id, status,
+                    )
+                    continue
                 if BOUNCE_PREFIX in existing:
                     continue
                 error = f"{text}; {existing}" if existing else text
-                conn.execute("UPDATE runs SET error = ? WHERE id = ?", (error, run.id))
-                stamped.append(run.id)
+                # Guarded again in the statement itself, so the check and the write cannot be
+                # split by an engine writing its terminal outcome in between.
+                cursor = conn.execute(
+                    "UPDATE runs SET error = ? WHERE id = ? AND status IN (?, ?)",
+                    (error, run.id, *STAMPABLE_STATUSES),
+                )
+                if cursor.rowcount:
+                    stamped.append(run.id)
             conn.commit()
         finally:
             conn.close()
-    except Exception as exc:
-        logger.warning("could not stamp %d reaped workflow run(s) in %s: %s", len(dead), path, exc)
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning(
+            "could not stamp %d reaped workflow run(s) in %s: %s", len(dead), path, exc, exc_info=True,
+        )
         return []
     if stamped:
         logger.warning(
@@ -219,6 +280,6 @@ def now_utc_iso() -> str:
 
 def reaped_or_none(runs: Iterable[RunningRun], *, alive: Optional[Callable[[int], bool]] = None
                    ) -> list[RunningRun]:
-    """The runs among *runs* whose process is gone (used by tests and diagnostics)."""
+    """The runs among *runs* that were live at census and are gone now (tests and diagnostics)."""
     is_alive = alive or _pid_alive
-    return [r for r in runs if not is_alive(r.pid)]
+    return [r for r in runs if r.pid_alive and not is_alive(r.pid)]

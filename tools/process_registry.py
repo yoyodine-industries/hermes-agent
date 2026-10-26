@@ -35,6 +35,7 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import format_process_notification
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_termination import ProcessTerminationMixin
+from tools.process_registry_output import _not_found, _output_tail
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
 
@@ -501,28 +502,6 @@ def _stop_systemd_unit(unit_name: str) -> bool:
         return False
 
 
-def format_uptime_short(seconds: int) -> str:
-    s = max(0, int(seconds))
-    if s < 60:
-        return f"{s}s"
-    mins, secs = divmod(s, 60)
-    if mins < 60:
-        return f"{mins}m {secs}s"
-    hours, mins = divmod(mins, 60)
-    return f"{hours}h {mins}m"
-
-
-def _not_found(session_id: str) -> dict:
-    return {"status": "not_found", "error": f"No process with ID {session_id}"}
-
-
-def _output_tail(session: "ProcessSession", n: int) -> str:
-    """Last *n* chars of the session output with ANSI sequences stripped."""
-    from tools.ansi_strip import strip_ansi
-
-    return strip_ansi(session.output_buffer[-n:])
-
-
 def _completion_output(session: "ProcessSession") -> dict:
     """``output`` sized by the session's ``completion_output_chars`` plus ``output_cut`` when trimmed.
 
@@ -565,9 +544,8 @@ class ProcessSession:
     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
     persist_on_release: bool = False           # opt out of agent-lifecycle cleanup (release()/turn-abandon kill
                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
-    departure: bool = False                     # a WORKFLOW DEPARTURE: a production flight in its own session that
-                                                # no lifecycle OR shutdown sweep may reap (t_4b9843a4). Only an
-                                                # explicit operator stop (source "process.*") reaches one.
+    departure: bool = False                     # a WORKFLOW DEPARTURE: a production flight no sweep may reap;
+                                                # only an explicit operator stop (process.*, cli.stop, slash.stop) (t_4b9843a4)
     # Watcher/notification routing (persisted for crash recovery)
     # systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
     # (#70716)
@@ -2541,6 +2519,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     # string and still reaches them.
     _LIFECYCLE_KILL_SOURCES = frozenset({"kill_all", "gateway_turn_timeout", "agent_close"})
 
+    #: Sources that are an EXPLICIT OPERATOR STOP, not a sweep: ``process.*`` is ``process_manage
+    #: kill``; ``cli.stop`` the CLI's /stop; ``slash.stop`` the TUI's. Only these reach a departure.
+    _EXPLICIT_STOP_SOURCES = frozenset({"cli.stop", "slash.stop"})
+
     def kill_started_since(self, task_id: str, baseline_ids, *, source: str) -> int:
         """Kill ``task_id`` processes created after ``baseline_ids``. Output is
         consumed so an abandoned turn can't enqueue a follow-up reviving work the
@@ -2558,16 +2540,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         agent-lifecycle sweep (the default ``kill_all`` release path, a gateway turn
         timeout, or ``agent_close``): an explicitly persisted background job must survive
         session end / compression / error recovery (#41225). An explicit operator stop
-        (``process.kill`` via process_manage, CLI /stop) passes its own source and still
-        reaches them, so the user can always stop a persisted process on purpose.
-
-        A ``departure`` session (a production workflow flight, t_4b9843a4) is skipped by EVERY
-        sweep except an explicit operator stop: the whole point of detaching a departure is
-        that no bounce, no turn timeout and no agent close may reap a live production run.
+        (``process_manage kill`` via ``process.*``, the CLI's ``/stop``, the TUI's slash
+        ``/stop``) passes its own source and still reaches them, so the user can always stop
+        a persisted process on purpose. A ``departure`` session (a production workflow flight,
+        t_4b9843a4) is skipped by EVERY sweep except such an explicit operator stop.
         """
         lifecycle = source in self._LIFECYCLE_KILL_SOURCES
-        # Explicit operator stop: process_manage kill / CLI /stop pass "process.*" sources.
-        operator_stop = source.startswith("process.")
+        # Explicit operator stop: process_manage kill / CLI /stop / TUI slash /stop.
+        operator_stop = source.startswith("process.") or source in self._EXPLICIT_STOP_SOURCES
         with self._lock:
             targets = [
                 s for s in (*self._running.values(), *self._finished.values())
