@@ -30,11 +30,33 @@ from agent.lsp.workspace import clear_cache, is_trusted_workspace, operator_work
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+# Residency bounds — a language server is DEMAND-spawned, never resident per lane.  One shared pyright
+# accumulates a programme per attached workspace root (measured on yoyodine 2026-10-25: 25 roots from one
+# coder session = 1.8 GB RSS), and an untrusted root is keyed per root so it cannot share that process.
+# Both are capped here so a long session cannot grow the estate's resident set without limit; eviction is
+# LRU and the next write in an evicted root simply re-attaches (one spawn) or re-spawns its client.
+DEFAULT_MAX_ROOTS = 4  # attached workspace folders per multi-root client (its own spawn root excluded)
+DEFAULT_MAX_CLIENTS = 3  # live server processes per profile
 _DELTA_BASELINE_CAP = 256  # per-file pre-write snapshots; paths never written again would otherwise live forever (#62950)
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
 
 _Key = tuple[str, str]
 _Diags = list[dict[str, Any]]
+
+
+def _count_setting(value: Any, default: int) -> int:
+    """A residency count from config: junk falls back to *default*, ``0``/negative disables the cap.
+
+    A typo must not narrow the bound to something useless (``"4"`` is a count, ``"four"`` is not), and it
+    must not raise at service construction — LSP is off the critical path of a session, so a bad number
+    costs the default, never the turn.
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _float_or(value: Any, default: float) -> float:
@@ -149,6 +171,8 @@ class LSPService:
         warmup_timeout: float = 0.0,
         exclude_roots: Any = None,
         trusted_workspaces: Any = None,
+        max_roots: int = DEFAULT_MAX_ROOTS,
+        max_clients: int = DEFAULT_MAX_CLIENTS,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -159,6 +183,10 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        # 0 (or a negative) DISABLES that bound, matching idle_timeout=0; a value below 1 is meaningless
+        # as a count, so it is treated as "no cap" rather than silently capping at zero clients.
+        self._max_roots = max(0, int(max_roots))
+        self._max_clients = max(0, int(max_clients))
         self._extra_servers: list[ServerDef] = list(extra_servers or [])
         self._broken_retry = max(0.0, broken_retry_seconds)
         self._warmup_timeout = max(0.0, warmup_timeout)
@@ -180,6 +208,8 @@ class LSPService:
         self._broken: dict[_Key, float] = {}
         self._spawning: dict[_Key, asyncio.Future] = {}
         self._last_used: dict[_Key, float] = {}
+        # (server_id, attached root) → last use, for the per-client root cap's LRU victim choice.
+        self._root_used: dict[tuple[str, str], float] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
         # abs file path → diagnostics snapshot taken immediately before a write.
@@ -227,6 +257,8 @@ class LSPService:
             warmup_timeout=_float_or(lsp_cfg.get("warmup_timeout"), 0.0),
             exclude_roots=lsp_cfg.get("exclude_roots"),
             trusted_workspaces=lsp_cfg.get("trusted_workspaces"),
+            max_roots=_count_setting(lsp_cfg.get("max_roots_per_server"), DEFAULT_MAX_ROOTS),
+            max_clients=_count_setting(lsp_cfg.get("max_clients"), DEFAULT_MAX_CLIENTS),
         )
 
     def _server_for(self, file_path: str) -> Optional[ServerDef]:
@@ -482,6 +514,8 @@ class LSPService:
             "broken_retry_seconds": self._broken_retry, "warmup_timeout": self._warmup_timeout,
             "exclude_roots": list(self._exclude_roots) if self._exclude_roots is not None else "INVALID",
             "trusted_workspaces": list(self._trusted_workspaces), "untrusted_skipped": untrusted,
+            # 0 = that residency bound is off (see DEFAULT_MAX_ROOTS / DEFAULT_MAX_CLIENTS).
+            "max_roots_per_server": self._max_roots, "max_clients": self._max_clients,
         }
 
     # ---- async internals ----
@@ -587,17 +621,86 @@ class LSPService:
                     self._last_used[key] = time.time()
                 eventlog.log_active(srv.server_id, root)
             spawning.set_result(client)
+            if client is not None:
+                await self._release_over_cap(key)
             return client
         finally:
             with self._state_lock:
                 self._spawning.pop(key, None)
 
-    @staticmethod
-    async def _attach_root(srv: ServerDef, client: LSPClient, root: str) -> LSPClient:
-        """Multi-root servers: announce ``root`` to the shared process instead of spawning another."""
+    async def _attach_root(self, srv: ServerDef, client: LSPClient, root: str) -> LSPClient:
+        """Multi-root servers: announce ``root`` to the shared process instead of spawning another,
+        then keep the shared process's ROOT SET bounded (``lsp.max_roots_per_server``).
+
+        Unbounded attachment is how one profile ends up resident: pyright builds a programme per
+        workspace folder and never releases it, so a session that walks 25 worktrees holds all 25
+        for the life of the process (measured: 1.8 GB RSS, card t_83304682). The cap drops the
+        least-recently-used folder — never the client's own spawn root, which it was initialized
+        with — as a *folder removal*, so the process keeps serving its siblings.
+        """
         if srv.multi_root:
             await client.add_workspace_folder(root)
+            with self._state_lock:
+                self._root_used[(srv.server_id, root)] = time.time()
+            await self._trim_roots(srv, client, keep=root)
         return client
+
+    async def _trim_roots(self, srv: ServerDef, client: LSPClient, *, keep: str) -> None:
+        """Detach LRU workspace folders until a multi-root client is within its root cap."""
+        if self._max_roots <= 0:
+            return
+        limit = self._max_roots + 1  # the client's own spawn root is pinned and does not count
+        while True:
+            with self._state_lock:
+                pinned = {client.workspace_root, keep}
+                candidates = [f for f in client.workspace_folders if f not in pinned]
+                if len(client.workspace_folders) <= limit or not candidates:
+                    return
+                victim = min(candidates, key=lambda f: self._root_used.get((srv.server_id, f), 0.0))
+                self._root_used.pop((srv.server_id, victim), None)
+            try:
+                await client.remove_workspace_folder(victim)
+            except Exception as e:  # a failed detach must not take the caller's write down
+                logger.debug("LSP root trim for %s failed: %s", victim, e)
+                return
+            eventlog.log_root_trimmed(srv.server_id, victim, len(client.workspace_folders))
+
+    def _claim_client_cap(self, keep: _Key) -> list[LSPClient]:
+        """Pop clients beyond ``lsp.max_clients``, LRU first, never *keep*; return them to shut down.
+
+        An untrusted root cannot share a trusted multi-root process (it would inherit that process's
+        trust), so it is keyed per root: every new untrusted workspace used to add a permanent server
+        to the profile. The cap makes membership of the resident set a policy, not an accident.
+        """
+        if self._max_clients <= 0:
+            return []
+        evicted: list[LSPClient] = []
+        with self._state_lock:
+            while len(self._clients) > self._max_clients:
+                candidates = [k for k in self._clients if k != keep]
+                if not candidates:
+                    break
+                victim = min(candidates, key=lambda k: self._last_used.get(k, 0.0))
+                evicted.append(self._clients.pop(victim))
+                self._last_used.pop(victim, None)
+                self._root_used.pop(victim, None)
+        return evicted
+
+    async def _release_over_cap(self, keep: _Key) -> None:
+        """Shut down whatever :meth:`_claim_client_cap` evicted, after the caller's client is live.
+
+        Shutdown runs outside the lock and its failures are logged, never raised: the write that
+        triggered the spawn has already got its diagnostics, and a wedged child must not turn a
+        residency bound into a failed edit.
+        """
+        evicted = self._claim_client_cap(keep)
+        if not evicted:
+            return
+        eventlog.log_released([(c.server_id, c.workspace_root) for c in evicted], "max_clients cap")
+        results = await asyncio.gather(*(c.shutdown() for c in evicted), return_exceptions=True)
+        for client, result in zip(evicted, results):
+            if isinstance(result, Exception):
+                logger.debug("LSP eviction shutdown for %s failed: %s", client.workspace_root, result)
 
     async def _spawn_client(self, srv: ServerDef, root: str, trusted: bool) -> Optional[LSPClient]:
         """Resolve the binary and start a client; ``None`` (after logging) when either fails."""
