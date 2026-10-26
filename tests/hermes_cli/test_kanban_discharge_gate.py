@@ -569,9 +569,11 @@ def test_a_phantom_still_refuses_with_an_archived_snapshot_present(fresh_home):
 def test_archived_snapshots_are_searched_after_every_live_board(fresh_home):
     """Cost order, pinned: live boards first, snapshots last and newest-first.
 
-    A citation almost always resolves on a live board, so the snapshot half must cost nothing in
-    that case. It is only reached once the live sweep has missed, which is also what keeps a
-    wedged live store from turning every phantom into ``unknown`` (which never refuses).
+    A citation almost always resolves on a live board, so the snapshot half is only SEARCHED once
+    the live sweep has missed. Its enumeration is not free - a sub-millisecond glob+stat is paid
+    on every resolve that cites a ref - but opening the snapshots is the expensive half and it is
+    reached only on a miss. Order alone does NOT make the snapshot clock unconditional: see
+    ``test_a_spent_live_budget_leaves_the_snapshot_half_unreached_and_advisory``.
     """
     _boards("alpha", "beta")
     _old_id, _old_label = _archive_a_board_with_a_card("retired-old")
@@ -587,4 +589,61 @@ def test_archived_snapshots_are_searched_after_every_live_board(fresh_home):
     assert any(slug in ("alpha", "beta") for slug, _p, arch in stores if not arch)
 
 
+def test_a_spent_live_budget_leaves_the_snapshot_half_unreached_and_advisory(
+    fresh_home, monkeypatch
+):
+    """The snapshot clock is CONDITIONAL - pinned so the code cannot claim more than it does.
 
+    The delivered mechanism, stated exactly (platform-stl review of PR #162, 2026-10-26): the
+    deadline check ``time.monotonic() > deadline`` sits ABOVE the ``is_archived`` branch that
+    grants ``ARCHIVED_REF_TIMEOUT_SECONDS``, so an exhausted LIVE budget ``break``s the sweep at a
+    live store and the snapshot phase is never entered. An id the snapshots hold therefore comes
+    back ``unknown`` - and ``unknown`` NEVER refuses (Gate E's three-valued rule).
+
+    Fail-open is the correct outcome here, not a bug being recorded: a sweep that never finished
+    the live boards must not block a truthful citation. The advisory
+    ``phantom_refs_unverified`` event is what makes the unsearched half visible on the card.
+
+    ``beta`` is required, not decoration: the caller's own store is skipped BEFORE the deadline
+    check, so a home holding only the caller's board never trips it - and the ``is_archived``
+    branch re-arms the deadline with ``max()`` the moment the snapshot phase is reached at all.
+    The break needs a live store that is neither the caller's nor the snapshots: that is ``beta``.
+    """
+    _boards("alpha", "beta")
+    archived_id, snapshot_label = _archive_a_board_with_a_card("retired")
+    # The live clock is already spent when the first live store is examined. A negative budget
+    # rather than 0.0 so the comparison cannot turn on clock resolution.
+    monkeypatch.setattr(refs, "REF_TIMEOUT_SECONDS", -1.0)
+
+    with kbc.connect(board="alpha") as conn:
+        beyond = refs.resolve_refs(conn, [archived_id, "t_deadbeefdeadbeef"])
+
+        assert beyond[archived_id].state == "unknown", (
+            "a spent live budget must leave the id UNKNOWN, never absent"
+        )
+        assert beyond["t_deadbeefdeadbeef"].state == "unknown"
+        assert snapshot_label not in beyond[archived_id].boards_searched, (
+            f"the snapshot phase was reached although the live budget was spent: "
+            f"{beyond[archived_id].boards_searched!r}"
+        )
+
+        card = kb.create_task(conn, title="closing card", assignee="platform-coder")
+        admitted = _complete(conn, card, result=f"rides the archived card {archived_id}")
+
+        assert admitted is True, "an UNSEARCHED snapshot must not refuse a cited id"
+        assert _events(conn, card, "completion_blocked_phantom_refs") == []
+        advisory = _events(conn, card, "phantom_refs_unverified")
+        assert len(advisory) == 1, "the unsearched half must be visible as an advisory"
+        payload = advisory[0].payload
+        assert payload is not None
+        assert archived_id in payload["unverified"]
+        assert snapshot_label not in payload["boards_searched"]
+
+        # The pre-existing advisory scan also fires - but it must name the id UNVERIFIED, never
+        # a phantom: nothing searched the snapshots, so nothing has any right to call it a fake.
+        scan = _events(conn, card, "suspected_hallucinated_references")
+        assert len(scan) == 1
+        scan_payload = scan[0].payload
+        assert scan_payload is not None
+        assert scan_payload["phantom_refs"] == []
+        assert archived_id in scan_payload["unverified"]

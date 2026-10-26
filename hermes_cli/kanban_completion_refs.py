@@ -51,9 +51,18 @@ REF_TIMEOUT_SECONDS = 2.0
 
 #: Budget for the ARCHIVED-snapshot half of the sweep, granted ONCE when the scan first reaches
 #: ``boards/_archived/<slug>-<stamp>/kanban.db``. It is separate from the live budget on purpose:
-#: a host may keep dozens of snapshots, and a phantom must not be recorded ``unknown`` (which
-#: never refuses) merely because the live boards spent the whole clock first. Measured on this
-#: host 2026-10-26: 25 snapshots, 1.3 GB on disk, 142 ms to open and probe every one.
+#: a host may keep dozens of snapshots, and a real phantom should not be recorded ``unknown``
+#: (which never refuses) merely because the live boards spent the clock first.
+#:
+#: This is the DELIVERED mechanism, and it is narrower than "the snapshots always get a clock":
+#: they get this one only when the live phase finished INSIDE ``REF_TIMEOUT_SECONDS``. If the live
+#: half exhausts its budget the loop ``break``s at a LIVE store, the snapshot phase is never
+#: entered, and every unresolved id comes back ``unknown`` - advisory, never a refusal. That
+#: fail-open is deliberate and is the rule above, not a gap: refusing from a sweep that never
+#: finished searching the live boards is the false-positive class this resolver exists to remove.
+#: Pinned by ``test_a_spent_live_budget_leaves_the_snapshot_half_unreached_and_advisory``.
+#: Measured on this host 2026-10-26: enumerating 25 snapshots costs a median 0.51 ms (max 1.69 ms,
+#: n=20); opening and probing all 25 costs a median 24 ms, so the half is cheap but not free.
 ARCHIVED_REF_TIMEOUT_SECONDS = 2.0
 
 #: Matches ``kanban_create`` (12 hex) and ``_new_task_id`` (8 hex) ids; 8+ for forward compat.
@@ -275,8 +284,10 @@ def _board_store_paths() -> list[tuple[str, Path, bool]]:
     ``boards/_archived/kanban.db`` falls out of the same glob: it is a store like any other, and
     a card archived into it is still a card that exists. Archived board SNAPSHOTS live one level
     deeper and are appended after every live board by :func:`_archived_store_paths`, newest
-    first: live stores answer the overwhelming majority, so the snapshot half costs nothing
-    unless an id has already missed everywhere else.
+    first: live stores answer the overwhelming majority, so the snapshot half is only SEARCHED
+    once an id has already missed everywhere else. Its enumeration is paid on every resolve that
+    cites a ref even when nothing needs it - a measured median 0.51 ms of glob+stat over 25
+    snapshots on this host 2026-10-26 (max 1.69 ms, n=20). Small, but not nothing.
     """
     kb = _kb()
     out: list[tuple[str, Path, bool]] = [(kb.DEFAULT_BOARD, kb.kanban_home() / "kanban.db", False)]
@@ -312,8 +323,12 @@ def resolve_refs(conn: sqlite3.Connection, tids: Iterable[str]) -> dict[str, Ref
 
     The sweep runs in cost order: the caller's own board (free), every live board, then the
     archived board snapshots newest-first (see :func:`_archived_store_paths`) - so a card that
-    was archived together with its board is still ``present``, and the snapshot half is paid for
-    only when an id has missed everywhere else.
+    was archived together with its board is still ``present``, and the snapshot half is only
+    SEARCHED once an id has missed everywhere else (enumerating it is a sub-millisecond glob+stat
+    paid up front; opening it is not - see :func:`_board_store_paths`). When the live half spends
+    ``REF_TIMEOUT_SECONDS`` first, the sweep stops at a live store and the unresolved ids are
+    ``unknown``, not ``absent``: the snapshots go unsearched rather than the completion becoming
+    a false refusal.
     """
     ordered = [tid for tid in dict.fromkeys(tids) if tid]
     if not ordered:
@@ -349,9 +364,13 @@ def resolve_refs(conn: sqlite3.Connection, tids: Iterable[str]) -> dict[str, Ref
         if not remaining:
             break
         if is_archived and not archive_budget_spent:
-            # The live boards got ``REF_TIMEOUT_SECONDS``; the snapshots get their own clock so a
-            # real phantom is never recorded ``unknown`` (which never refuses) just because the
-            # live half used the budget first.
+            # The snapshots get their own clock - but ONLY if the live phase finished inside its
+            # own: control reaches this line only while no live store has exhausted
+            # ``REF_TIMEOUT_SECONDS``. If the live half spends the budget first, the loop breaks
+            # ABOVE at a live store, this branch never runs, and the unresolved ids stay
+            # ``unknown`` (advisory, never a refusal). That fail-open is deliberate: a refusal
+            # from a sweep that never searched the live boards is the false-positive class this
+            # resolver exists to remove. Not a guarantee of "snapshots always get a clock".
             archive_budget_spent = True
             deadline = max(deadline, time.monotonic() + ARCHIVED_REF_TIMEOUT_SECONDS)
         try:
