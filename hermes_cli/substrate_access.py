@@ -666,49 +666,28 @@ def _iso_epoch(value: Any) -> Optional[float]:
         return None
 
 
-def guards_blind(since: Optional[float] = None) -> list[dict]:
+def guards_blind(since: Optional[float] = None) -> dict:
     """The fail-open hook degradations, folded into the episode (design §3.5 / §6).
 
-    Reads ``<hermes_home>/ops-checks/hook-degradation.jsonl`` (boot volume) and returns the
-    records that name a denied body. A fail-open that is counted is a degradation; a fail-open
-    nobody reads is a silent failure. Never raises.
+    Delegates the parsing to :mod:`hermes_cli.substrate_view`, which is the ONE reader
+    every mirror shares (``hermes doctor``, ``/api/substrate``, the gateway's
+    ``/substrate``): two parsers would eventually disagree about what "blind" means.
+    The result is ``{blind, total, items, ...}`` — ``blind`` counts ARMED ROWS whose
+    body is failing open right now, ``total`` counts the armed rows in this home.
+
+    ``since`` is accepted for call-site compatibility and deliberately NOT applied: an
+    ongoing fail-open is current whether it began before or during this episode, and
+    filtering by ``first_tick`` would hide a guard that went blind first and stayed
+    blind. Never raises.
     """
-    path = hermes_home() / "ops-checks" / "hook-degradation.jsonl"
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return []
-    out: list[dict] = []
-    for line in lines[-200:]:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(record, dict):
-            continue
-        out.append(
-            {
-                "marker": record.get("marker"),
-                "pid": record.get("pid"),
-                "reason": record.get("reason"),
-                "target": record.get("target"),
-                "ts": record.get("ts"),
-            }
-        )
-    if since:
-        kept = []
-        for record in out:
-            try:
-                stamp = _iso_epoch(record.get("ts"))
-            except Exception:  # noqa: BLE001
-                stamp = None
-            if stamp is None or stamp >= float(since):
-                kept.append(record)
-        out = kept
-    return out
+        from hermes_cli.substrate_view import blind_guards
+
+        return blind_guards()
+    except Exception as exc:  # noqa: BLE001 - a degraded reader must not break the record
+        log.warning("substrate: could not fold the hook degradation ledger: %s", exc)
+        return {"blind": 0, "total": None, "items": [], "ledger_state": "unreadable",
+                "registry_state": "unreadable"}
 
 
 def record(
@@ -744,6 +723,7 @@ def record(
         first_tick = stamp
     episode = episode_identity(sig, first_tick)
     delivery = prior.get("delivery") if prior.get("episode") == episode else None
+    guards = guards_blind()
     payload = {
         "version": SCHEMA_VERSION,
         "yielded": bool(report.denied) if yielded is None else bool(yielded),
@@ -758,7 +738,9 @@ def record(
         "delivery": delivery,
         "matrix": report.matrix(),
         "held": list(held or prior.get("held") or []),
-        "guards_blind": guards_blind(since=first_tick),
+        "guards_blind": int(guards.get("blind") or 0),
+        "guards_total": guards.get("total"),
+        "guards": list(guards.get("items") or []),
         "read_findings": list(report.findings),
         "cleared_at": None,
         "duration_s": None,

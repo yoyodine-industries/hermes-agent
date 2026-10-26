@@ -4734,7 +4734,9 @@ def _substrate_admission_body(
     record = _sa.read_status()
     matrix = yielded.matrix or (record.get("matrix") or [])
     held = record.get("held") or []
-    blind = record.get("guards_blind") or []
+    blind = record.get("guards") or []
+    blind_count = record.get("guards_blind")
+    blind_total = record.get("guards_total")
 
     lines = [
         SUBSTRATE_ADMISSION_ACTOR_DECLARATION,
@@ -4778,10 +4780,16 @@ def _substrate_admission_body(
         "",
         "## Guards blind (fail-open hooks)",
         "",
-        f"- hook degradations recorded in this window: **{len(blind)}**",
+        f"- **{int(blind_count or 0)} of {blind_total if blind_total is not None else '?'} "
+        "launcher-armed hook row(s) are failing OPEN** — observation is lost, and nothing is "
+        "being blocked by them either. Counted, never silent: a fail-open nobody reads is a "
+        "silent failure.",
     ]
-    for item in blind[-5:]:
-        lines.append(f"  - `{item.get('ts')}` {item.get('reason')} -> `{item.get('target')}`")
+    for item in blind[:5]:
+        lines.append(
+            f"  - `{item.get('since')}` `{item.get('hook')}` row `{item.get('row')}`: "
+            f"{item.get('reason')} -> `{item.get('body')}`"
+        )
     lines += [
         "",
         "## Where the evidence lives",
