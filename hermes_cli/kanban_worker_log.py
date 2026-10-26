@@ -1,4 +1,7 @@
-"""Per-task worker log rotation, split out of ``hermes_cli.kanban_db_dispatch``."""
+"""Per-task worker log rotation and the worker-log text vocabulary.
+
+Split out of ``hermes_cli.kanban_db_dispatch``.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +34,18 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, 
 
 def _rotated_log_path(log_path: Path, generation: int) -> Path:
     return log_path.with_suffix(log_path.suffix + f".{generation}")
+
+
+def _exit_summary_marker() -> str:
+    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
+    from agent.i18n import t
+    return t("cli.session.exit_resume_hint")
+
+
+def _log_noise_prefixes() -> tuple[str, ...]:
+    """Leading markers of a worker log's chrome, which never carries the reason."""
+    from agent.i18n import t
+    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
 
 
 def rotate_worker_log(
