@@ -18,7 +18,10 @@ from pathlib import Path
 
 import pytest
 
-from agent.lsp.manager import DEFAULT_MAX_CLIENTS, DEFAULT_MAX_ROOTS, LSPService
+from agent.lsp.manager import (
+    DEFAULT_MAX_CLIENTS, DEFAULT_MAX_RESIDENT_SERVERS, DEFAULT_MAX_ROOTS, LSPService,
+)
+from agent.lsp.residency import RESIDENT_DIR_ENV
 from agent.lsp.servers import SERVERS, ServerContext, ServerDef, SpawnSpec
 from agent.lsp.workspace import clear_cache
 
@@ -30,6 +33,13 @@ def _clear_workspace_cache():
     clear_cache()
     yield
     clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_census(tmp_path, monkeypatch):
+    """These tests bound one profile; keep their servers out of the HOST-wide census directory so a
+    test run can never read — or evict — the operator's real servers (see test_host_residency)."""
+    monkeypatch.setenv(RESIDENT_DIR_ENV, str(tmp_path / "host-census"))
 
 
 def _make_repo(tmp_path: Path, name: str) -> Path:
@@ -90,10 +100,12 @@ def _folder_events(folders_log: Path) -> list[dict]:
 
 def test_defaults_bound_residency():
     """The bound is on out of the box — a missing config key must not mean "unbounded"."""
-    assert DEFAULT_MAX_ROOTS > 0 and DEFAULT_MAX_CLIENTS > 0
+    assert DEFAULT_MAX_ROOTS > 0 and DEFAULT_MAX_CLIENTS > 0 and DEFAULT_MAX_RESIDENT_SERVERS > 0
     status = _service().get_status()
     assert status["max_roots_per_server"] == DEFAULT_MAX_ROOTS
     assert status["max_clients"] == DEFAULT_MAX_CLIENTS
+    assert status["max_resident_servers"] == DEFAULT_MAX_RESIDENT_SERVERS
+    assert status["resident_servers"] == [] or status["resident_count"] == len(status["resident_servers"])
 
 
 def test_max_roots_setting_accepts_a_string_and_falls_back_on_junk():
