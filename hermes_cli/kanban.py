@@ -329,8 +329,13 @@ def _ok_or_err(ok, fail: str, done: str) -> int:
 
 
 def _bulk_ids(args: argparse.Namespace) -> list[str]:
-    """Positional ``task_id`` plus ``--ids`` extras (bulk verbs)."""
-    return [args.task_id] + list(getattr(args, "ids", None) or [])
+    """Positional ``task_id`` plus ``--ids`` extras (bulk verbs).
+
+    Delegates to the guard's one definition so the cards a verb MUTATES and the cards its bulk
+    scope BINDS are the same set, computed once — the drift between the two is what left a
+    two-card ``promote``/``block``/``schedule`` ungated (card t_6d0e6cdb).
+    """
+    return kbg.bulk_ids_from_args(args)
 
 
 def _require_ids(args: argparse.Namespace) -> tuple[list[str], int]:
