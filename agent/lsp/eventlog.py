@@ -165,6 +165,14 @@ def log_released(keys: list[tuple[str, str]], reason: str) -> None:
     _emit("reaper", logging.INFO, f"released {len(keys)} client(s) ({reason}): {summary}")
 
 
+def log_root_trimmed(server_id: str, root: str, remaining: int) -> None:
+    """One workspace folder was detached to keep a multi-root server inside its root cap (LRU).
+
+    INFO: this is a residency bound firing, not an error — the root re-attaches on its next write.
+    """
+    _emit(server_id, logging.INFO, f"trimmed root {root} ({remaining} folder(s) left)")
+
+
 def reset_announce_caches() -> None:
     """Test-only: clear the dedup caches.  Production code never calls this."""
     with _announce_lock:
