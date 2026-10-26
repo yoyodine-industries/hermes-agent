@@ -1509,6 +1509,12 @@ DEFAULT_CONFIG = {
         # `skills_list` because nobody loaded them for 30 days surprised people (57 gone in one
         # startup tick). true = built-ins age out like agent-created skills.
         "prune_builtins": False,
+        # Never archive bytes a git repo tracks. ON by default and structural (the predicate is
+        # git-tracked-ness, not a path allow-list): on 2026-10-15 a pure-time pass archived 8
+        # skills out of ~/.hermes/skills/yoyodine — a git checkout — as an undeclared deletion
+        # in a repo nobody re-reads (card t_4c38630b). false lets ONE deliberate archive through
+        # (the deletion is then recorded in the mutation ledger with its repo and tracked count).
+        "protect_git_tracked": True,
         # TTL purge of skills/.archive/: 0 = never; > 0 lets the explicit `hermes curator purge`
         # delete older archived skills (never automatic; logged in the ledger).
         "archive_ttl_days": 0,
