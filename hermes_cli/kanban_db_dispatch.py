@@ -1041,6 +1041,24 @@ class DispatchResult:
     could not tell "queue deep, capacity full" (healthy) from "cannot spawn"
     (broken). A deferral, never a failure."""
 
+    spawn_budget_detail: dict = field(default_factory=dict)
+    """The MEASURED numbers behind ``spawn_budget_blocked``, so the cap is a value
+    a reader can check rather than a name to interpret: ``blocked_by`` (the gate),
+    ``cap`` (the ceiling that was met), ``board_running`` (this board's running
+    workers), ``host_cap``/``host_running`` (the host-wide pair, when that gate is
+    the one that held), and ``deferred`` (how many cards it held). Card
+    ``t_843cb0a9``: a saturated board read as a wedged one because the tick said
+    nothing; the name alone still leaves "is the cap 8 and 8 running, or is the
+    cap misread?" unanswerable from the output."""
+
+    deferred_in_progress_capped: list[str] = field(default_factory=list)
+    """Task ids the HOST-WIDE ``kanban.max_in_progress`` ceiling held back this
+    tick (it was already met by the sum over every board). Same class as
+    ``deferred_board_capped`` — no per-card refusal exists, so without this the
+    host cap is the one budget gate that names nothing (card ``t_843cb0a9``,
+    where a host at 12/8 reported every skip bucket empty). Counted by
+    ``describe_suppression`` as ``in_progress_deferred=N``."""
+
     deferred_board_capped: list[str] = field(default_factory=list)
     """Task ids the BOARD'S OWN ceiling held back this tick: the board was
     already at ``kanban.max_spawn_by_board`` (or ``kanban.max_spawn``), so a free
@@ -1396,6 +1414,14 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             # per-card refusal exists, so a capped board would otherwise read
             # exactly like an idle one.
             counts["board_cap_deferred"] = counts.get("board_cap_deferred", 0) + len(res.deferred_board_capped)
+        in_progress_held = getattr(res, "deferred_in_progress_capped", None)
+        if in_progress_held:
+            # The HOST-WIDE max_in_progress ceiling held these back. Without it
+            # the one gate that stops every board at once (card t_843cb0a9: 12
+            # running against a cap of 8) contributed NOTHING to this line, so
+            # the "held back" annotation was empty exactly when the host was
+            # saturated -- the state an operator most needs named.
+            counts["in_progress_deferred"] = counts.get("in_progress_deferred", 0) + len(in_progress_held)
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
@@ -3881,6 +3907,76 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     return total
 
 
+def measure_host_budget(
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    ceilings: Optional[Mapping[str, int]] = None,
+    boards: Optional[Iterable[str]] = None,
+) -> dict:
+    """How much spawn capacity the CONFIG grants the host, as measured numbers.
+
+    ``max_spawn`` is per BOARD while ``max_in_progress`` is per HOST, so a fleet of
+    N dispatch boards advertises ``N x max_spawn`` local slots of which only
+    ``max_in_progress`` can ever hold a worker. That arithmetic used to live only
+    in the reader's head: ``kanban.max_spawn: 8`` x a handful of boards read as
+    "8 slots", the host sat at 12 running, and nothing said which number was the
+    real ceiling (card ``t_843cb0a9``).
+
+    ``ceilings`` is the already-resolved per-board map (``kanban.max_spawn_by_board``
+    where a board named one, the global value otherwise — the same resolution the
+    gateway's ``max_spawn_for_board`` applies); an absent map means every board
+    takes ``max_spawn``. ``boards`` overrides the enumeration (the dispatcher passes
+    the slugs it actually visits); by default the dispatch-enabled boards are
+    enumerated, and an unreadable inventory reports ``boards=None`` with no claim
+    either way — a measurement that cannot be taken is never reported as a number.
+
+    ``unreachable_slots`` is ``ceiling_sum - max_in_progress`` floored at 0, and it
+    is ``None`` (not 0) when no host cap is derived: uncapped dispatch wastes
+    nothing, and 0 would read as "measured, nothing wrong".
+    """
+    caps = {str(k): int(v) for k, v in (ceilings or {}).items() if v is not None}
+    slugs: Optional[list[str]]
+    if boards is not None:
+        slugs = [str(slug) for slug in boards]
+    else:
+        try:
+            slugs = [
+                (meta.get("slug") or _kb.DEFAULT_BOARD)
+                for meta in _kb.list_dispatch_boards()
+            ]
+        except Exception:
+            slugs = None
+
+    per_board: dict[str, Optional[int]] = {}
+    if slugs is not None:
+        for slug in slugs:
+            cap = caps.get(slug)
+            per_board[slug] = int(cap) if cap is not None else (
+                int(max_spawn) if max_spawn is not None else None
+            )
+    ceiling_sum: Optional[int] = None
+    if slugs is not None:
+        resolved = [per_board[slug] for slug in slugs]
+        if resolved and all(cap is not None for cap in resolved):
+            ceiling_sum = sum(int(cap) for cap in resolved if cap is not None)
+
+    unreachable: Optional[int] = None
+    oversubscribed = False
+    if ceiling_sum is not None and max_in_progress is not None:
+        unreachable = max(int(ceiling_sum) - int(max_in_progress), 0)
+        oversubscribed = int(ceiling_sum) > int(max_in_progress)
+
+    return {
+        "max_spawn": int(max_spawn) if max_spawn is not None else None,
+        "max_in_progress": int(max_in_progress) if max_in_progress is not None else None,
+        "boards": slugs,
+        "ceilings": per_board,
+        "ceiling_sum": ceiling_sum,
+        "unreachable_slots": unreachable,
+        "oversubscribed": oversubscribed,
+    }
+
+
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify system memory pressure: ok/elevated/critical/unknown.
 
@@ -5766,13 +5862,32 @@ def _tick_spawn_budget(
             # full" and stay quiet, not as "nothing spawned, something is broken".
             result.spawn_budget_blocked = "max_spawn"
             result.deferred_board_capped = spawnable_pending_ids(conn)
+            result.spawn_budget_detail = {
+                "blocked_by": "max_spawn",
+                "cap": int(max_spawn),
+                "board_running": int(running_count),
+                "deferred": len(result.deferred_board_capped),
+            }
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            # The HOST-wide cap held the tick. Its held cards are named too: a
+            # gate that declines every card without naming one is the SEV1 of
+            # card t_843cb0a9 -- the operator surface reported every skip bucket
+            # empty while the host sat at 12 running against a cap of 8.
             result.spawn_budget_blocked = "max_in_progress"
+            result.deferred_in_progress_capped = spawnable_pending_ids(conn)
+            result.spawn_budget_detail = {
+                "blocked_by": "max_in_progress",
+                "cap": int(max_in_progress),
+                "board_running": int(running_count),
+                "host_running": int(total_running),
+                "host_cap": int(max_in_progress),
+                "deferred": len(result.deferred_in_progress_capped),
+            }
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
