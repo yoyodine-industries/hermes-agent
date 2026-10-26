@@ -190,6 +190,107 @@ def test_one_service_over_the_host_ceiling_evicts_its_own_lru(
         svc.shutdown()
 
 
+def test_two_profiles_each_at_max_clients_three_still_hold_the_host_ceiling(
+    tmp_path, mock_pyright, monkeypatch, _isolated_census
+):
+    """The LIVE shape: ``max_clients: 3`` per profile under a ceiling of 4, two profiles at once.
+
+    This is the case that made the per-profile cap useless (6-7 ``pyright-langserver`` processes,
+    10.8-13.3 GB RSS, measured on the host): 3 clients is legal for each profile on its own, so no
+    service ever evicts itself, and only the HOST census can bind 2 x 3 = 6 spawns down to 4.  The
+    two victims are the host-wide LRU — both of them the first profile's — and their processes are
+    gone, not merely unregistered, which is what actually frees the RSS.
+    """
+    _spawns, install = mock_pyright
+    install(multi_root=False)
+    services = []
+    try:
+        repos = {
+            "profile-a": [_make_repo(tmp_path, f"a{i}") for i in range(3)],
+            "profile-b": [_make_repo(tmp_path, f"b{i}") for i in range(3)],
+        }
+        pids: dict[str, int] = {}
+        for profile, profile_repos in repos.items():
+            svc = _service(_isolated_census, profile, max_clients=3, max_resident_servers=4)
+            services.append(svc)
+            for repo in profile_repos:
+                monkeypatch.chdir(str(repo))
+                svc.get_diagnostics_sync(str(repo / "x.py"))
+                client = svc._clients[("pyright", str(repo))]
+                assert client.pid is not None
+                pids[str(repo)] = int(client.pid)
+            assert len(svc._clients) == 3, "3 clients is AT the per-profile cap, so it never fires"
+
+        assert _spawns["value"] == 6
+        census = HostResidency(str(_isolated_census)).census()
+        assert len(census) == 4, "2 profiles x 3 clients is 6 spawns; the HOST's 4 is the bound"
+        assert [entry.profile for entry in census] == [
+            "profile-a", "profile-b", "profile-b", "profile-b",
+        ], "the two victims are the host-wide LRU, and both belong to the first profile"
+        assert {entry.workspace_root for entry in census} == {
+            str(repos["profile-a"][2]), str(repos["profile-b"][0]),
+            str(repos["profile-b"][1]), str(repos["profile-b"][2]),
+        }
+        for evicted in repos["profile-a"][:2]:
+            assert _wait_until(
+                lambda path=str(evicted): process_state(pids[path])[0] == "gone"
+            ), evicted
+        for kept in (repos["profile-a"][2], *repos["profile-b"]):
+            assert process_state(pids[str(kept)])[0] == "alive", kept
+    finally:
+        for svc in services:
+            svc.shutdown()
+
+
+def test_a_profile_at_its_own_client_cap_evicts_locally_not_a_foreign_server(
+    tmp_path, mock_pyright, monkeypatch, _isolated_census
+):
+    """Composition: when both caps can bind one spawn, the profile's own LRU goes first.
+
+    A profile at ``max_clients`` 2 pays for its own 3rd root: its local cap fires and shuts down
+    its own least-recently-used client, which leaves the host AT the ceiling, so the host bound
+    finds nothing to reach for.  The other profile's servers stay alive — evicting a stranger to
+    spare one's own stale client would be exactly the unfairness the host-wide LRU prevents.
+    """
+    _spawns, install = mock_pyright
+    install(multi_root=False)
+    services = []
+    try:
+        repos = {
+            "profile-a": [_make_repo(tmp_path, f"ca{i}") for i in range(2)],
+            "profile-b": [_make_repo(tmp_path, f"cb{i}") for i in range(3)],
+        }
+        pids: dict[str, int] = {}
+        svc_a = _service(_isolated_census, "profile-a", max_clients=2, max_resident_servers=4)
+        svc_b = _service(_isolated_census, "profile-b", max_clients=2, max_resident_servers=4)
+        services.extend([svc_a, svc_b])
+        for svc, profile in ((svc_a, "profile-a"), (svc_b, "profile-b")):
+            for repo in repos[profile]:
+                monkeypatch.chdir(str(repo))
+                svc.get_diagnostics_sync(str(repo / "x.py"))
+                client = svc._clients[("pyright", str(repo))]
+                assert client.pid is not None
+                pids[str(repo)] = int(client.pid)
+
+        assert len(svc_b._clients) == 2, "the local cap evicted its own LRU, not a foreign server"
+        census = HostResidency(str(_isolated_census)).census()
+        assert [entry.profile for entry in census] == [
+            "profile-a", "profile-a", "profile-b", "profile-b",
+        ]
+        assert {entry.workspace_root for entry in census} == {
+            str(repos["profile-a"][0]), str(repos["profile-a"][1]),
+            str(repos["profile-b"][1]), str(repos["profile-b"][2]),
+        }
+        assert _wait_until(
+            lambda: process_state(pids[str(repos["profile-b"][0])])[0] == "gone"
+        ), "the profile's own local victim is shut down"
+        for kept in (*repos["profile-a"], repos["profile-b"][1], repos["profile-b"][2]):
+            assert process_state(pids[str(kept)])[0] == "alive", kept
+    finally:
+        for svc in services:
+            svc.shutdown()
+
+
 def test_zero_disables_the_host_ceiling(tmp_path, mock_pyright, monkeypatch, _isolated_census):
     _spawns, install = mock_pyright
     install(multi_root=False)
