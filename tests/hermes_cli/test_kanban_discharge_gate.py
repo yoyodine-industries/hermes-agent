@@ -495,3 +495,96 @@ def test_a_store_that_cannot_be_read_still_never_refuses(fresh_home, monkeypatch
     assert "broken" in unverified[0].payload["unknown_boards"]
 
 
+# --- Gate E: archived board SNAPSHOTS ------------------------------------------------------
+
+
+def _archive_a_board_with_a_card(slug: str) -> tuple[str, str]:
+    """Create ``slug`` carrying one card, archive the board for real, return (card, snapshot)."""
+    _boards(slug)
+    with kbc.connect(board=slug) as conn:
+        card = kb.create_task(conn, title="the archived card", assignee="platform-coder")
+    moved = kb.remove_board(slug, archive=True)
+    snapshot = Path(moved["new_path"])
+    assert (snapshot / "kanban.db").is_file(), f"archive did not produce a snapshot: {moved!r}"
+    assert snapshot.parent.name == "_archived", "the snapshot must sit under boards/_archived/"
+    return card, snapshot.name
+
+
+def test_a_card_archived_with_its_board_is_present_and_the_completion_proceeds(fresh_home):
+    """A card archived TOGETHER WITH its board is a record, not a fabrication.
+
+    Measured live 2026-10-26 (card t_b7b58bbe, answering the advisory events on the platform and
+    financially boards): ``t_bf0b4aac`` sits in
+    ``boards/_archived/defcon-20261024-230331/kanban.db``, but the sweep enumerated only
+    ``boards/*/kanban.db`` - one level too shallow - so a truthful citation resolved ``absent``.
+    With Gate E armed (``refuse``, the shipped default) that does not merely warn: it BLOCKS the
+    completion. Archived snapshots are therefore searched, newest-first, after every live board.
+    """
+    _boards("alpha")
+    archived_id, snapshot_label = _archive_a_board_with_a_card("retired")
+
+    with kbc.connect(board="alpha") as conn:
+        card = kb.create_task(conn, title="closing card", assignee="platform-coder")
+        done = _complete(conn, card, result=f"rides the archived card {archived_id}")
+        assert done is True, "a card archived with its board refused a legitimate completion"
+        closed = kb.get_task(conn, card)
+        assert closed is not None and closed.status == "done"
+        assert _events(conn, card, "suspected_hallucinated_references") == []
+        assert _events(conn, card, "completion_blocked_phantom_refs") == []
+        assert _events(conn, card, "phantom_refs_unverified") == []
+
+        # And the resolver NAMES the snapshot it found it in - the audit trail says where.
+        found = refs.resolve_refs(conn, [archived_id])[archived_id]
+
+    assert found.state == "present"
+    assert found.board == snapshot_label
+    assert snapshot_label in found.boards_searched
+
+
+def test_a_phantom_still_refuses_with_an_archived_snapshot_present(fresh_home):
+    """The snapshot half must not water the gate down: archives are searched, not waived.
+
+    An id that is nowhere - not on a live board, not in any snapshot - stays ``absent`` and
+    refuses, and the refusal's ``boards_searched`` proves the snapshots were actually reached.
+    """
+    _boards("alpha")
+    _archived_id, snapshot_label = _archive_a_board_with_a_card("retired")
+
+    with kbc.connect(board="alpha") as conn:
+        card = kb.create_task(conn, title="closing card", assignee="platform-coder")
+        with pytest.raises(refs.PhantomRefsRefused) as excinfo:
+            _complete(conn, card, result="landed with t_deadbeefdeadbeef")
+        refused = _events(conn, card, "completion_blocked_phantom_refs")
+
+    assert len(refused) == 1
+    payload = refused[0].payload
+    assert payload["phantom_refs"] == ["t_deadbeefdeadbeef"]
+    assert payload["unknown_boards"] == []
+    assert snapshot_label in payload["boards_searched"], (
+        f"the archived snapshot was never consulted: {payload['boards_searched']!r}"
+    )
+    assert "t_deadbeefdeadbeef" in str(excinfo.value)
+
+
+def test_archived_snapshots_are_searched_after_every_live_board(fresh_home):
+    """Cost order, pinned: live boards first, snapshots last and newest-first.
+
+    A citation almost always resolves on a live board, so the snapshot half must cost nothing in
+    that case. It is only reached once the live sweep has missed, which is also what keeps a
+    wedged live store from turning every phantom into ``unknown`` (which never refuses).
+    """
+    _boards("alpha", "beta")
+    _old_id, _old_label = _archive_a_board_with_a_card("retired-old")
+    # Two snapshots, distinguishable by mtime, to pin the newest-first rule.
+    _new_id, new_label = _archive_a_board_with_a_card("retired-new")
+
+    stores = refs._board_store_paths()
+    flags = [is_archived for _slug, _path, is_archived in stores]
+    assert flags[-1] is True, f"snapshots must come last, got {flags!r}"
+    assert True not in flags[: flags.index(True)], "a live board followed an archived snapshot"
+    labels = [slug for slug, _path, is_archived in stores if is_archived]
+    assert labels[0] == new_label, f"snapshots must be newest-first, got {labels!r}"
+    assert any(slug in ("alpha", "beta") for slug, _p, arch in stores if not arch)
+
+
+

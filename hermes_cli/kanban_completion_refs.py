@@ -49,6 +49,13 @@ GATE_DEFAULT = "refuse"
 #: whose store is wedged: past the deadline the unresolved ids are ``unknown`` (never absent).
 REF_TIMEOUT_SECONDS = 2.0
 
+#: Budget for the ARCHIVED-snapshot half of the sweep, granted ONCE when the scan first reaches
+#: ``boards/_archived/<slug>-<stamp>/kanban.db``. It is separate from the live budget on purpose:
+#: a host may keep dozens of snapshots, and a phantom must not be recorded ``unknown`` (which
+#: never refuses) merely because the live boards spent the whole clock first. Measured on this
+#: host 2026-10-26: 25 snapshots, 1.3 GB on disk, 142 ms to open and probe every one.
+ARCHIVED_REF_TIMEOUT_SECONDS = 2.0
+
 #: Matches ``kanban_create`` (12 hex) and ``_new_task_id`` (8 hex) ids; 8+ for forward compat.
 #: The SAME extraction the advisory scan always used - the ref set does not change, only the
 #: resolver behind it.
@@ -228,8 +235,36 @@ def _connection_path(conn: sqlite3.Connection) -> Optional[Path]:
     return None
 
 
-def _board_store_paths() -> list[tuple[str, Path]]:
-    """Every board store on this host, by slug: the ``default`` store plus ``boards/*/*.db``.
+def _archived_store_paths(root: Path) -> list[tuple[str, Path]]:
+    """Archived board SNAPSHOTS under ``root/_archived/<slug>-<stamp>/kanban.db``, newest first.
+
+    Archiving a board moves its whole store one level DOWN: the flat ``root/*/kanban.db`` glob
+    reaches only the ``_archived`` husk, never a snapshot. A card archived with its board is
+    still a card that exists, so a truthful citation of one resolved ``absent`` - and with Gate E
+    armed (``refuse``, the shipped default) that BLOCKED the completion outright. Measured live
+    2026-10-26 on this card: ``t_bf0b4aac`` sits in ``_archived/defcon-20261024-230331/kanban.db``
+    while the flat glob reported ``absent``, so this is a refusal of a real record, not cosmetic.
+
+    Newest-first because a freshly archived board is the likeliest thing a handoff cites, and the
+    sweep stops as soon as every id is answered. ``stat`` per store is the sort key (and is also
+    the ``is_file`` check); a store that cannot be stat'ed is skipped rather than crashing the
+    sweep - the resolver's outage rule (never refuse on a read failure) stays upstream of this.
+    """
+    out: list[tuple[str, Path, float]] = []
+    for path in glob.glob(str(root / "_archived" / "*" / "kanban.db")):
+        store = Path(path)
+        try:
+            if not store.is_file():
+                continue
+            out.append((store.parent.name, store, store.stat().st_mtime))
+        except OSError:  # pragma: no cover - defensive
+            continue
+    out.sort(key=lambda row: row[2], reverse=True)
+    return [(label, store) for label, store, _mtime in out]
+
+
+def _board_store_paths() -> list[tuple[str, Path, bool]]:
+    """Every board store on this host, by slug, as ``(slug, path, is_archived)``.
 
     The layout rule is ``kanban_db.board_for_store_path``'s inverse and is spelled HERE rather
     than through ``kanban_db_path(<slug>)`` on purpose: the env pin (``HERMES_KANBAN_DB``) is a
@@ -238,10 +273,13 @@ def _board_store_paths() -> list[tuple[str, Path]]:
     rest "absent" (measured 2026-10-13, card t_2187558e).
 
     ``boards/_archived/kanban.db`` falls out of the same glob: it is a store like any other, and
-    a card archived into it is still a card that exists.
+    a card archived into it is still a card that exists. Archived board SNAPSHOTS live one level
+    deeper and are appended after every live board by :func:`_archived_store_paths`, newest
+    first: live stores answer the overwhelming majority, so the snapshot half costs nothing
+    unless an id has already missed everywhere else.
     """
     kb = _kb()
-    out: list[tuple[str, Path]] = [(kb.DEFAULT_BOARD, kb.kanban_home() / "kanban.db")]
+    out: list[tuple[str, Path, bool]] = [(kb.DEFAULT_BOARD, kb.kanban_home() / "kanban.db", False)]
     try:
         root = kb.boards_root()
     except Exception:  # pragma: no cover - a home that cannot be resolved says so upstream
@@ -253,7 +291,9 @@ def _board_store_paths() -> list[tuple[str, Path]]:
                 continue
         except OSError:  # pragma: no cover - defensive
             continue
-        out.append((store.parent.name, store))
+        out.append((store.parent.name, store, False))
+    for label, store in _archived_store_paths(root):
+        out.append((label, store, True))
     return out
 
 
@@ -269,6 +309,11 @@ def resolve_refs(conn: sqlite3.Connection, tids: Iterable[str]) -> dict[str, Ref
     A store that raises on open or read is recorded in ``unknown_boards`` and contributes NO
     evidence. ``absent`` therefore requires that every store TOUCHED answered - and an id is
     only ever ``absent`` while nothing is unknown.
+
+    The sweep runs in cost order: the caller's own board (free), every live board, then the
+    archived board snapshots newest-first (see :func:`_archived_store_paths`) - so a card that
+    was archived together with its board is still ``present``, and the snapshot half is paid for
+    only when an id has missed everywhere else.
     """
     ordered = [tid for tid in dict.fromkeys(tids) if tid]
     if not ordered:
@@ -298,10 +343,17 @@ def resolve_refs(conn: sqlite3.Connection, tids: Iterable[str]) -> dict[str, Ref
     found: dict[str, Optional[str]] = {tid: here for tid in ordered if tid not in missing}
     remaining = missing
     timed_out = False
+    archive_budget_spent = False
 
-    for slug, path in _board_store_paths():
+    for slug, path, is_archived in _board_store_paths():
         if not remaining:
             break
+        if is_archived and not archive_budget_spent:
+            # The live boards got ``REF_TIMEOUT_SECONDS``; the snapshots get their own clock so a
+            # real phantom is never recorded ``unknown`` (which never refuses) just because the
+            # live half used the budget first.
+            archive_budget_spent = True
+            deadline = max(deadline, time.monotonic() + ARCHIVED_REF_TIMEOUT_SECONDS)
         try:
             if own_path is not None and path.is_file() and path.resolve() == own_path:
                 continue
