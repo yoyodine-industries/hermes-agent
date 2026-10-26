@@ -551,6 +551,154 @@ def _close_cleared_cards_on(
     return closed
 
 
+def _substrate_close_kwargs(record: dict) -> dict:
+    """The declaration every automatic substrate-guard close carries (same shape as the skew one).
+
+    ``class='none'`` is the honest class: board repair with no run behind it. The proof is a
+    verified normal tick -- this sweep only runs from a tick that PASSED the substrate door and
+    holds the board's dispatch lock -- plus the recovery receipt the design requires
+    (``cleared_at`` / ``duration_s`` / the cleared matrix), which this close quotes verbatim.
+    """
+    matrix = record.get("cleared_matrix") or record.get("matrix") or []
+    released = record.get("released") or []
+    return {
+        "result": (
+            "substrate readable again -- the admission guard was cleared by a normal tick"
+        ),
+        "summary": (
+            "Closed by the dispatcher's OWN tick: the substrate admission episode this card "
+            f"carried is over (cleared_at {record.get('cleared_at')}, "
+            f"duration {record.get('duration_s')}s). A tick probed every declared root, every "
+            "reading came back ok, and work is being admitted again -- no lane action is owed on "
+            "this card."
+        ),
+        "metadata": {
+            "evidence": {
+                "class": "none",
+                "why": (
+                    "board repair with no run behind it: the proof is a verified normal tick "
+                    "whose own probe cleared the substrate, recorded as cleared_at/duration_s "
+                    "on the boot-volume authority record"
+                ),
+            },
+            "substrate_recovery": {
+                "cleared_at": record.get("cleared_at"),
+                "duration_s": record.get("duration_s"),
+                "episode": record.get("episode"),
+                "sig": record.get("sig"),
+                "cleared_matrix": matrix,
+                "released": released,
+                "observed_by_pid": os.getpid(),
+                "at": int(time.time()),
+            },
+        },
+    }
+
+
+def _close_cleared_substrate_cards(conn: sqlite3.Connection, *, attempted: Optional[set] = None) -> list:
+    """Close every substrate-admission guard card on ONE board whose episode is over.
+
+    Selection is the card's own KEY (``substrate-denied:`` -- what ``_file_tick_yield_actor`` mints
+    for this kind and nothing else writes) OR the ``substrate_admission_actor_filed`` event, so a
+    card filed without the event is still recognised. ``running`` is excluded outright (a live
+    claim is somebody's work, and the kernel would refuse the close anyway), and a card carrying
+    ``..._retire_failed`` has already GIVEN UP and is not touched again.
+    """
+    f = _facade()
+    try:
+        rows = conn.execute(
+            "SELECT t.id AS id, t.status AS status, t.idempotency_key AS key, t.rowid AS rowid "
+            "FROM tasks t "
+            "WHERE t.status NOT IN (?, ?, ?, ?, ?) AND ("
+            "  t.idempotency_key LIKE ? || '%' OR EXISTS ("
+            "    SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = ?)) "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM task_events x WHERE x.task_id = t.id AND x.kind = ?) "
+            "ORDER BY t.rowid LIMIT ?",
+            (*_TERMINAL_OR_CLAIMED, f.SUBSTRATE_ADMISSION_ACTOR_IDEMPOTENCY_PREFIX,
+             f.SUBSTRATE_ADMISSION_ACTOR_EVENT, f.TICK_YIELD_RETIRE_FAILED_EVENT,
+             f.TICK_YIELD_RETIRE_BATCH),
+        ).fetchall()
+    except Exception as exc:  # health: allow BLE001 -- no board history, nothing to close
+        _db()._log.debug(
+            "kanban dispatcher: substrate-guard sweep could not read the board: %s", exc,
+        )
+        return []
+    if not rows:
+        return []
+    record = f._sa.read_status()
+    close_kwargs = _substrate_close_kwargs(record)
+    closed: list = []
+    for row in rows:
+        card_id, status, key = row["id"], row["status"], row["key"] or ""
+        provenance = _tree_skew_actor_provenance(conn, card_id, key)
+        outcome = _retire_one_tree_skew_actor(
+            conn,
+            card_id,
+            status=status,
+            key=key,
+            provenance=provenance,
+            reason="substrate-clear",
+            log_what="kanban dispatcher: the cleared substrate-admission guard",
+            close_kwargs=close_kwargs,
+            attempted=attempted,
+        )
+        if outcome != "retired":
+            continue
+        closed.append(card_id)
+        _db()._log.info(
+            "kanban dispatcher: closed substrate-admission guard %s (was %s) -- a normal tick "
+            "probed the substrate and found every root readable", card_id, status,
+        )
+    return closed
+
+
+def _retire_cleared_substrate_cards(conn: sqlite3.Connection, *, board: Optional[str] = None) -> list:
+    """DOOR 3's retirement (design §3.7, card ``t_0ae49984``): close the guards, write the receipt.
+
+    Runs from ``dispatch_once`` beside the skew retirement, under the dispatch lock and BEFORE the
+    claim phase -- the same placement proof: a tick that reached here passed the substrate door, so
+    the episode is over. Cards are CLOSED FIRST so the recovery receipt the record carries can name
+    what was released; the record is only cleared when something was actually retired (or when the
+    record itself is stale), never inferred from the absence of refusals.
+
+    Fault-isolated: a close that raises is logged and the tick carries on.
+    """
+    f = _facade()
+    record = f._sa.read_status()
+    if not record.get("yielded"):
+        return []
+    attempted: set = set()
+    closed: list = []
+    ops_conn, ops_board, close_it = f._ops_board_connection(conn)
+    try:
+        closed.extend(_close_cleared_substrate_cards(ops_conn, attempted=attempted))
+    except Exception as exc:  # health: allow BLE001 -- a close is never allowed to break a tick
+        _db()._log.warning(
+            "kanban dispatcher: substrate guard close failed on %s: %s", board, exc, exc_info=True,
+        )
+    finally:
+        if close_it:
+            try:
+                ops_conn.close()
+            except Exception:  # health: allow BLE001 -- closing a scratch connection never matters
+                pass
+    try:
+        ticking_board = _db().board_for_connection(conn)
+    except Exception:  # health: allow BLE001 -- an unnamed board means "skip the extra sweep"
+        ticking_board = None
+    if ticking_board and ticking_board != ops_board:
+        try:
+            closed.extend(_close_cleared_substrate_cards(conn, attempted=attempted))
+        except Exception as exc:  # health: allow BLE001
+            _db()._log.warning(
+                "kanban dispatcher: substrate guard close failed on ticking board %s: %s",
+                ticking_board, exc,
+            )
+    f._clear_tick_yield_status(kind=f.SUBSTRATE_ADMISSION_KIND, released=closed)
+    return closed
+
+
 def _retire_cleared_tree_skew_cards(conn: sqlite3.Connection, *, board: Optional[str] = None) -> list:
     """THE one entry the tick calls: retire the guards whose episode is over, before the claim.
 

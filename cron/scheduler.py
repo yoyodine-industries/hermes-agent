@@ -202,6 +202,40 @@ class CronTickYielded(RuntimeError):
 _STALE_YIELD_RE = re.compile(r"stale code: booted on (\S+), disk is at (\S+)\)")
 
 
+class CronSubstrateDenied(RuntimeError):
+    """A cron tick held EVERY job because the substrate it needs answered a denial.
+
+    Raised by ``tick()`` BEFORE the tick lock, exactly like :class:`CronTickYielded` and for the
+    same reason -- but the condition is the machine, not the code: a root the tick must read or
+    write (a DAG script, the prod tree, the store) refused a REAL operation with EACCES/EPERM/EROFS
+    (card ``t_0ae49984``, design ``t_72e9bf03`` §3.3).
+
+    Nothing is advanced and nothing is marked failed: ``next_run_at`` is untouched (so the overdue
+    job fires on the first tick after recovery instead of being silently lost) and no job takes a
+    ``last_status: error`` row -- that is the whole point of the door, because the error-row storm
+    is how a host fault reads as eighteen broken jobs. One EPISODE replaces them, and the ticker
+    wrapper records this class name in ``ticker_last_error`` like the stale-code yield, so
+    ``hermes cron status`` is never falsely green.
+
+    Raised, not returned, and never thrown for an indeterminate reading: fail-open is invariant I4.
+    """
+
+    def __init__(self, report=None) -> None:
+        self.report = report
+        try:
+            from hermes_cli import substrate_access as _sa
+
+            detail = _sa._matrix_sentence(report.matrix()) if report is not None else "no report"
+        except Exception:  # health: allow BLE001 -- the exception message must never raise
+            detail = "probe report unavailable"
+        super().__init__(
+            "Cron tick held by substrate admission: a root this tick must use refused a real "
+            f"operation ({detail}). No job was advanced or marked failed; the overdue work fires "
+            "on the first tick after the substrate is readable again."
+        )
+
+
+
 def stale_code_yield_labels(recorded_error: str | None) -> tuple[str, str] | None:
     """``(boot_rev, disk_rev)`` when a persisted ``ticker_last_error`` is a ``CronTickYielded``.
 
