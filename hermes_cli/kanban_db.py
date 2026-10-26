@@ -4992,6 +4992,10 @@ COMPLETION_REFUSAL_CAUSES = (
     # over bytes that exist only in a working tree -- gate.py check 1 refuses every
     # deploy sourced from that checkout, so the card would read done while prod stalls.
     "dirty_unit_checkout",         # the checkout the card worked in has uncommitted paths
+    # The card was never in a status the completion door accepts (card t_012fb74e): ``triage``,
+    # ``todo``/``scheduled`` are the seat-scoped door's remit, and the terminal pair belongs to
+    # ``hermes kanban reopen``. Distinct from ``not_running``, which is a run that moved.
+    "status_not_completable",      # the card never held a completable status
 )
 
 
@@ -5431,6 +5435,40 @@ def _park_unsatisfiable_contract(
     ))
 
 
+def _not_completable_refusal(conn: sqlite3.Connection, task_id: str) -> CompletionRefusal:
+    """The honest cause when a card was never in a status the completion door accepts.
+
+    ``prepare_acceptance`` returns ``False`` for two different facts: the card is not in a
+    completable status at all, or its run moved under the caller. Only the second is a race, so
+    only the second is ``not_running``; the first is ``status_not_completable`` and names the
+    status plus the act that owns it, because "retry" against a ``triage`` card can never
+    succeed (card t_012fb74e).
+    """
+    # Late imports: this module is the facade the door and the matrix import, so neither can be
+    # a module-level dependency here.
+    from hermes_cli.kanban_exits import owning_door
+    from hermes_cli.kanban_pr_acceptance_store import _COMPLETABLE
+
+    status = _task_status(conn, task_id)
+    if status is None:
+        return CompletionRefusal("unknown_id", f"no task {task_id} on this board")
+    if status in _COMPLETABLE or status in ("done", "archived"):
+        # A completable status that moved, or a card that already reached the terminal pair:
+        # both are "it moved while you were closing it", which is what ``not_running`` means
+        # (D3, tests/hermes_cli/test_kanban_completion_contract_release.py).
+        return CompletionRefusal(
+            "not_running",
+            f"{task_id} left a completable status while it was being closed (it is {status!r})",
+        )
+    door = owning_door(status)
+    return CompletionRefusal(
+        "status_not_completable",
+        f"{task_id} is {status!r}, which the completion door does not accept (it accepts "
+        f"{', '.join(sorted(_COMPLETABLE))}). The act that exits {status!r} is "
+        f"{door or 'undocumented -- the status has no door'}",
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -5516,10 +5554,12 @@ def complete_task(
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
-        return CompletionRefusal(
-            "not_running",
-            f"{task_id} left a completable status while it was being closed",
-        )
+        # ``prepare_acceptance`` returns False when the card is not in a COMPLETABLE status --
+        # i.e. it never held one, which is a different fact from a run that ended underneath
+        # the caller. Reporting both as ``not_running`` ("left a completable status") was a
+        # lie: a card in ``triage``/``scheduled`` never left anything, and the worker was told
+        # to retry a race instead of being told which door owns the status (card t_012fb74e).
+        return _not_completable_refusal(conn, task_id)
     if acceptance is not None and not acceptance[1].get("ok"):
         # The acceptance receipt is not green. TWO outcomes, decided by whether a verdict
         # EXISTS (R1, card t_c4a9d940):
@@ -5650,10 +5690,12 @@ def complete_task(
         sql += guard_sql
         params = (*params, *guard_params)
         if conn.execute(sql, params).rowcount != 1:
-            return CompletionRefusal(
-                "not_running",
-                f"{task_id} left a completable status while it was being closed",
-            )
+            # The UPDATE is guarded on a completable status, so a zero rowcount is either a
+            # status this door never accepts (``triage``/``todo``/``scheduled``) or a run that
+            # moved under the caller. They are different facts and get different causes —
+            # "left a completable status" was printed for both, telling a worker holding a
+            # ``triage`` card to retry a race that never happened (card t_012fb74e).
+            return _not_completable_refusal(conn, task_id)
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -5917,7 +5959,7 @@ def _gate_unit_checkout_clean(
     task_id: str,
     *,
     force: bool = False,
-) -> Optional["CompletionRefusal"]:
+) -> Optional[CompletionRefusal]:
     """Refuse ``done`` when the card worked in a protected unit checkout that is dirty.
 
     Card t_b151a247, design decision 1 (platform-stl): a card cannot close over bytes

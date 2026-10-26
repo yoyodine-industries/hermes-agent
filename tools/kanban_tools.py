@@ -21,6 +21,7 @@ from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
+    KANBAN_ADJUDICATE_SCHEMA,
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_CLOSE_SIBLING_SCHEMA,
@@ -1269,6 +1270,43 @@ def _handle_record_landing_verdict(args: dict, **kw) -> str:
     return _ok(**receipt)
 
 
+@_kanban_handler("kanban_adjudicate")
+def _handle_adjudicate(args: dict, **kw) -> str:
+    """Exit another card out of ``triage``/``todo``/``scheduled`` (card t_012fb74e)."""
+    _reject_delegated_child_mutation("kanban_adjudicate")
+    from hermes_cli.kanban_adjudicate import adjudicate
+
+    target = str(_require_text(args, "target_task_id")).strip()
+    disposition = str(_require_text(args, "disposition")).strip()
+    expect_status = str(_require_text(args, "expect_status")).strip()
+    reason = _redact(_require_text(args, "reason"))
+    # The caller's own card and run are the provenance SIDE of every write the door makes;
+    # ``_default_task_id`` is None outside a dispatcher-spawned worker, and the kernel refuses
+    # that as ``no_caller`` rather than borrowing an author.
+    caller = _default_task_id(None)
+    result = args.get("result")
+    result = _redact(result) if isinstance(result, str) and result.strip() else None
+    title = args.get("title")
+    title = str(title) if isinstance(title, str) and title.strip() else None
+    body = args.get("body")
+    body = _redact(body) if isinstance(body, str) and body.strip() else None
+    board = args.get("board")
+    with _board(board) as (_kb, conn):
+        receipt = adjudicate(
+            conn,
+            target,
+            disposition=disposition,
+            expect_status=expect_status,
+            reason=reason,
+            result=result,
+            title=title,
+            body=body,
+            caller_task_id=caller,
+            caller_run_id=_worker_run_id(caller) if caller else None,
+        )
+    return _ok(**receipt)
+
+
 def _store_attachment(board, tid, filename, data, content_type) -> str:
     """Store via ``kanban_db.store_attachment_bytes`` (shared size cap, per-task
     dir, metadata row) so agent, dashboard, and CLI surfaces stay in lockstep."""
@@ -1668,7 +1706,8 @@ _TOOLS = (
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
     ("kanban_close_sibling", KANBAN_CLOSE_SIBLING_SCHEMA, _handle_close_sibling, "🤝"),
     ("kanban_record_landing_verdict", KANBAN_RECORD_LANDING_VERDICT_SCHEMA,
-     _handle_record_landing_verdict, "🛬"))
+     _handle_record_landing_verdict, "🛬"),
+    ("kanban_adjudicate", KANBAN_ADJUDICATE_SCHEMA, _handle_adjudicate, "⚖"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

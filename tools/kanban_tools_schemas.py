@@ -712,3 +712,59 @@ KANBAN_LINK_SCHEMA = _schema(
     },
     ["parent_id", "child_id"],
 )
+
+KANBAN_ADJUDICATE_SCHEMA = _schema(
+    "kanban_adjudicate",
+    (
+        "The ONE seat-scoped exit door for a card the ordinary completion door cannot "
+        "reach: a card sitting in `triage`, `todo` or `scheduled`. You must be a live "
+        "worker (your own card, your own run) and the target must be ANOTHER card in the "
+        "lane you are working. `disposition='promote'` releases the card and returns it to "
+        "the dispatch queue (`triage`/`todo`/`scheduled` -> `ready`, or stays `todo` while a "
+        "parent is unfinished — the receipt then names the blocking parents and `gated` is "
+        "true). `disposition='close'` releases it, claims it and completes it with your "
+        "reason as the closing summary; a card that cannot be claimed or whose completion "
+        "gate refuses is returned to `ready` and the refusal is written on YOUR card as "
+        "`adjudication_refused`. Only these three statuses are adjudicable: a `ready`, "
+        "`running`, `blocked` or `review` card is closed with `kanban_complete`, and a "
+        "`done`/`archived` card is reopened with `hermes kanban reopen`. Every refusal is "
+        "machine-readable (`no_caller`, `own_card`, `caller_run_not_current`, "
+        "`target_unknown`, `not_a_door_source`, `status_moved`, `lane_mismatch`, "
+        "`claim_lost`, `gate_refused`) and writes nothing before the claim. The act is "
+        "recorded on the target as one `adjudicated` event plus a comment naming you and "
+        "your run."
+    ),
+    {
+        "target_task_id": _prop("string", (
+            "The OTHER card to adjudicate — never your own. It must be in `expect_status`."
+        )),
+        "disposition": {
+            "type": "string",
+            "enum": ["close", "promote"],
+            "description": (
+                "`promote` — release the card and make it dispatchable (never claims it). "
+                "`close` — release it, claim it, and finish it."
+            ),
+        },
+        "expect_status": _prop("string", (
+            "The status you read on the target: `triage`, `todo` or `scheduled`. A "
+            "mismatch is refused as `status_moved` rather than acted on, so a card that "
+            "moved under you is never pushed to a state you did not intend."
+        )),
+        "reason": _prop("string", (
+            "Why, in words a reader does not have to interpret. Recorded verbatim on the "
+            "target: it becomes the closing summary when `disposition='close'`."
+        )),
+        "result": _prop("string", (
+            "Optional result line for the close. Defaults to `reason`."
+        )),
+        "title": _prop("string", (
+            "Optional spec title, applied when the target is in `triage` (the specify "
+            "step writes it). Omit to leave the card's own title alone."
+        )),
+        "body": _prop("string", (
+            "Optional spec body, applied only on the `triage` -> `todo` step."
+        )),
+    },
+    ["target_task_id", "disposition", "expect_status", "reason"],
+)
