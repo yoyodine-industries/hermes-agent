@@ -164,6 +164,36 @@ _TRANSIENT_STORAGE_REASONS = frozenset({
 })
 
 
+# A turn the LEASE REFRESHER killed is a storage condition too, but it arrives as an INTERRUPT
+# (``interrupted: True``), not as ``failure_reason``: agent/turn_facade_lease.py stamps
+# ``_REASON_LEASE_LOST`` on ``agent._tool_interrupt_reason`` when the renewal could not land
+# before the row expired, and the finalizer copies it onto the result as ``interrupt_reason``.
+# Without this the mapping below returned 130 FIRST and the dispatcher booked an unexplained
+# crash, spending ``kanban.failure_limit`` and parking a healthy card as ``blocked`` — a runtime
+# death reported as a dependency. Measured cause: LEASE_TTL_SECONDS 300.0 vs a renewal that must
+# take the state.db write lock; under a contention burst every refresh tick fails locked and the
+# turn is interrupted at the deadline.
+_TURN_LEASE_INTERRUPT_REASON = "session turn lease lost"
+_TURN_LEASE_INTERRUPT_REASONS = frozenset({_TURN_LEASE_INTERRUPT_REASON})
+_TURN_LEASE_INTERRUPT_PREFIX = "Session turn lease"
+
+
+def _storage_reason_from_interrupt(result) -> str:
+    """Return the transient-storage reason an interrupted turn died of, else ``""``.
+
+    Reads the machine-readable ``interrupt_reason`` when present and falls back to the
+    interrupt message prefix, so an older worker build (which sets only the message) still
+    maps to the same exit code instead of a fake crash.
+    """
+    reason = (result.get("interrupt_reason") or "").strip() if isinstance(result, dict) else ""
+    if reason in _TURN_LEASE_INTERRUPT_REASONS:
+        return reason
+    message = (result.get("interrupt_message") or "") if isinstance(result, dict) else ""
+    if message.startswith(_TURN_LEASE_INTERRUPT_PREFIX):
+        return _TURN_LEASE_INTERRUPT_REASON
+    return ""
+
+
 def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
                             credentials_terminal: bool = False) -> int:
     """Map a one-shot turn result onto a process exit code, for both `-q` and `-Q`.
@@ -202,6 +232,12 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
             return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
         return 1
     if result.get("interrupted"):
+        # A lease-refresher kill is a state-store condition, not a card failure: map it to the
+        # transient-storage exit code (requeue without spending the give-up budget) instead of
+        # 130, which the dispatcher books as an unexplained crash and parks the card ``blocked``.
+        if kanban_task_id() and _storage_reason_from_interrupt(result):
+            from hermes_cli.kanban_db import KANBAN_STORAGE_LOCKED_EXIT_CODE
+            return KANBAN_STORAGE_LOCKED_EXIT_CODE
         return 130
     if not (result.get("failed") or result.get("partial") or result.get("completed") is False):
         return 0

@@ -6,11 +6,14 @@ with the refusal naming the honest path. The measurements behind ``hermes kanban
 report`` / ``reconcile`` are covered too, since they are what makes a disabled gate visible.
 
 These tests ARM the evidence gate explicitly (``HERMES_KANBAN_EVIDENCE_GATE=refuse``), because
-the suite as a whole declares ``measure`` (see ``tests/conftest.py``) — the kernel default is
-refuse, and the refusal is what production runs.
+the suite as a whole declares ``measure`` (the root ``conftest.py``, landed on the live line by
+t_987793ae and pinned as a regression guard, card t_4931c16f) — the kernel default is refuse,
+and the refusal is what production runs.
 """
 
 from __future__ import annotations
+
+import json
 
 import pytest
 
@@ -70,7 +73,7 @@ class _Refusal:
         self.cause = cause
         self.value = None
 
-    def __enter__(self) -> "_Refusal":
+    def __enter__(self) -> _Refusal:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -421,6 +424,121 @@ def test_the_evidence_family_measures_what_the_gate_recorded(conn, home):
     assert gates.reconcile(conn, "default")["violations_after"]["evidence"] == 1
 
 
+def test_measure_admits_a_declared_run_the_board_cannot_resolve(conn, home, monkeypatch):
+    """R3 (ruling t_f3eefbdb): the kill switch disarms BOTH judged paths.
+
+    The declared-but-unresolvable run is the second one. Before R3 it raised ``run_unknown``
+    straight through ``measure``, which made the mode's own docstring ("keeps the whole
+    measurement and drops only the refusal") false. The SAME payload still raises under
+    ``refuse`` — the repair narrows nothing on the enforcing path.
+    """
+    _profile(home, "lane")
+    payload = {"class": "run", "run": {"store": "card", "id": 999999}}
+
+    monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_GATE", "refuse")
+    refused = kb.create_task(conn, title="refused", assignee="lane")
+    with _refusal("evidence") as excinfo:
+        kb.complete_task(conn, refused, result="done", metadata={"evidence": payload})
+    assert excinfo.value.cause in ("run_unknown", "run_not_green")
+    assert kb.get_task(conn, refused).status != "done"
+
+    monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_GATE", "measure")
+    admitted = kb.create_task(conn, title="admitted", assignee="lane")
+    assert kb.complete_task(conn, admitted, result="done",
+                            metadata={"evidence": payload}) is True
+    rows = [dict(r) for r in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=?", (admitted,))]
+    kinds = [r["kind"] for r in rows]
+    assert "evidence_gate_measure" in kinds
+    assert "completion_blocked_evidence" not in kinds
+    measured = next(r["payload"] for r in rows if r["kind"] == "evidence_gate_measure")
+    assert excinfo.value.cause in measured      # the cause is KEPT; only the refusal is dropped
+    assert "why" in measured                    # EVIDENCE_SHAPE rides along
+
+
+def test_measure_admits_a_malformed_declaration(conn, home, monkeypatch):
+    """R3: the FIRST judged path — a malformed declaration (``parse_evidence``) used to raise
+    ``evidence_malformed`` through ``measure``.
+
+    ``test_a_malformed_declaration_is_refused_with_its_own_cause`` is the enforcing half; this
+    is the measuring half of the same payload."""
+    _profile(home, "lane")
+    monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_GATE", "measure")
+    tid = kb.create_task(conn, title="card", assignee="lane")
+    assert kb.complete_task(conn, tid, result="done",
+                            metadata={"evidence": {"class": "vibes"}}) is True
+    rows = [dict(r) for r in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=?", (tid,))]
+    kinds = [r["kind"] for r in rows]
+    assert "evidence_gate_measure" in kinds
+    assert "completion_blocked_evidence" not in kinds
+    measured = next(r["payload"] for r in rows if r["kind"] == "evidence_gate_measure")
+    assert "evidence_malformed" in measured
+    assert "class" in measured                  # EVIDENCE_SHAPE rides along
+
+
+def test_a_landed_card_with_no_evidence_still_defers_to_the_deploy_proof_gate(conn, home):
+    """R1 (ruling t_f3eefbdb): the landed claim is judged ONCE, by the deploy-proof gate.
+
+    ``gate_completion_evidence`` early-returns for a ``landed`` contract, so wiring it must not
+    add a second, generic refusal on the landed path — the clause-specific one still owns it,
+    and no evidence-family event is written for a landed completion.
+    """
+    _profile(home, "lane")
+    tid = kb.create_task(conn, title="card", assignee="lane", completion_contract="landed")
+    with pytest.raises(kb.ProofGateError) as caught:
+        kb.complete_task(conn, tid, result="done")           # no proof and no evidence
+    assert caught.value.clause == "no_proof"
+    kinds = [r["kind"] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+    assert "completion_blocked_proof_gate" in kinds
+    assert "completion_blocked_evidence" not in kinds
+    assert "evidence_gate_measure" not in kinds
+
+
+def test_the_refusal_reaches_the_caller_verbatim_with_no_tool_layer_handling(conn, home,
+                                                                            monkeypatch):
+    """R1 (ruling t_f3eefbdb, DoD 4): the tool layer carries NO ``EvidenceRefused`` /
+    ``GateRefused`` handling — asserted against the shipped source, not assumed — so the
+    refusal must reach the caller as the KERNEL's own message.
+
+    Driving the raw handler is the honest probe: it has no ``except`` for this refusal, so the
+    text the caller sees IS the kernel's own, naming the declared shape and the honest paths.
+    """
+    import pathlib
+
+    import hermes_cli
+
+    root = pathlib.Path(hermes_cli.__file__).resolve().parent.parent
+    tool_src = (root / "tools" / "kanban_tools.py").read_text(encoding="utf-8")
+    assert "EvidenceRefused" not in tool_src
+    assert "GateRefused" not in tool_src
+
+    from tools import kanban_tools as kt
+
+    # This suite runs inside a worker session, so the tool layer's delegated-child guard would
+    # answer first. The subject here is the evidence door, not board ownership.
+    monkeypatch.setattr(kt, "_delegation_ctx", lambda *a, **k: False)
+
+    _profile(home, "lane")
+    tid = kb.create_task(conn, title="card", assignee="lane")
+    try:
+        surfaced = kt._handle_complete({"task_id": tid, "summary": "done, trust me"})
+    except Exception as exc:                     # not swallowed: the raw handler re-raises it
+        surfaced = str(exc)
+    # The tool layer answers in JSON (``tool_error``); decode it so the assertions read the
+    # KERNEL's message rather than the JSON escaping of it.
+    try:
+        surfaced = json.loads(surfaced).get("error") or surfaced
+    except ValueError:
+        pass
+    assert "REFUSED" in surfaced
+    assert '"class": "none"' in surfaced         # the declared shape, verbatim
+    assert "why" in surfaced                     # ...and the cheap honest path
+    assert "Nothing was written" in surfaced     # ...and that the card was left untouched
+    assert kb.get_task(conn, tid).status != "done"
+
+
 # ── Invariant D: the attribution names a live identity ─────────────────────
 
 def test_a_retired_identity_is_refused_as_created_by_and_a_live_seat_passes(conn, home):
@@ -441,7 +559,7 @@ def test_a_retired_identity_is_refused_as_created_by_and_a_live_seat_passes(conn
 def test_a_non_profile_producer_origin_is_not_a_retired_identity(conn, home):
     """A DENYLIST, not an allowlist: the fleet's producer origins are not profiles."""
     _profile(home, "default")
-    for origin in ("pr-evergreen", "deploy-train", "sdlc", "land.sh", "ci-watch", "dashboard"):
+    for origin in ("hermes_pr_update", "deploy-train", "sdlc", "land.sh", "ci-watch", "dashboard"):
         gates.gate_created_by(origin, board="default", where="create")
     # and None/empty is not an attribution at all
     gates.gate_created_by(None, board="default", where="create")

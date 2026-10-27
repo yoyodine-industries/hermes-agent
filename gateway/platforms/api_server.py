@@ -1597,7 +1597,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _readiness_work_counts(self) -> tuple[int, int, int]:
         """Return bounded work counts from each subsystem's public state."""
-        active_api_runs = self._active_structured_run_count()
+        # R5: readiness reports R1's live number, so /health/detailed and the published
+        # metrics can never disagree about how much api work is executing.
+        active_api_runs = self._live_api_run_count()
         process_depth = 0
         active_delegations = 0
         with suppress(Exception):
@@ -1608,14 +1610,29 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             active_delegations = active_count()
         return active_api_runs, process_depth, active_delegations
 
-    def _active_structured_run_count(self) -> int:
-        """Count structured runs that still have executable work."""
+    def _nonterminal_run_row_count(self) -> int:
+        """Count the RUN ROWS in {queued, running, waiting_for_approval, stopping} — the CENSUS.
+
+        Named for what it measures: rows, not live tasks (t_5976163f R2). A status string is
+        a report, not a handle, so this number may only ever be published as ``active_rows``:
+        ``active_rows > active_runs`` is the leak signal, never a liveness figure.
+        """
         # "stopping" is not terminal: executor work continues until the agent notices.
         return sum(
             1
             for status in self._run_statuses.values()
             if status.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
         )
+
+    def _live_api_run_count(self) -> int:
+        """R1's ONE arithmetic for "live api work": live run tasks + in-flight inline turns.
+
+        No status string enters this arithmetic. ``_live_run_task_count`` is the gate's own
+        task census and ``_inflight_agent_runs`` counts the inline bot/chat turns the gate
+        counts too (they are deliberately not task entries) — so a row whose last writer died
+        can never be published as executing work.
+        """
+        return self._live_run_task_count() + max(0, int(getattr(self, "_inflight_agent_runs", 0) or 0))
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1687,11 +1704,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return {
             "host": self._host,
             "port": self._port,
-            "active_runs": self._active_structured_run_count() + self._inflight_agent_runs,
+            "active_runs": self._live_api_run_count(),
+            # The non-terminal ROW census, named as rows (R2): a leaked row can only move this
+            # number, and `active_rows > active_runs` is the leak signal an ops seat reads.
+            "active_rows": self._nonterminal_run_row_count(),
             # The AGENT-WORK gate as the limiter itself sees it (t_376b3fbd): ``count`` vs
-            # ``limit`` and the holders that make the count up. ``active_runs`` above is the
-            # structured-run census and can exceed the cap (it counts queued/stopped rows);
-            # this block is the pair an ops seat should act on.
+            # ``limit`` and the holders that make the count up. ``active_runs`` is executing
+            # work; ``agent_work_gate`` is admitted-or-admitting vs limit; ``active_rows`` is
+            # the row census, which a leaked row inflates without any work behind it.
             "agent_work_gate": (gate if gate is not None else self._agent_gate_snapshot()),
             "stored_runs": len(self._run_statuses),
             "last_request_at": self._iso_timestamp(self._metrics_last_request_at),
@@ -4391,6 +4411,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # exists, so /v1/runs/{id}* control is confined to the starting profile.
         # See #93689.
         self._run_owners[run_id] = self._run_idempotency_scope(request)
+        # Take the live handle BEFORE the row (t_5976163f R4): this turn's task is deliberately
+        # NOT in _active_run_tasks (``_run_agent`` already counts the turn for the gate and the
+        # drain), so the token is what proves the row is held. Taken in the same synchronous
+        # frame as the row, so no reader and no sweep sees one without the other.
+        self._register_live_run_handle(run_id, family="inline")
         self._set_run_status(
             run_id, "queued", session_id=session_id, model=ctx["body"].get("model", self._model_name))
 
@@ -4462,12 +4487,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             finally:
                 self._active_run_agents.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                # Release the handle in the turn's own finally — that release IS the fence's
+                # clock (t_5976163f R4): the row is only non-terminal while this token exists.
+                self._release_live_run_handle(run_id)
                 self._release_run_owner_if_forgotten(run_id)
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
         # NOT in _active_run_tasks: _run_agent already counts this turn for the shutdown drain.
         task = asyncio.create_task(_run_and_signal())
+        # Bind the task to the handle: a task that dies before its turn starts must not keep
+        # the queued row looking live.
+        self._attach_live_run_handle_task(run_id, task)
         self._track_background_task(task)
         response = await self._prepare_sse_response(request, session_id, gateway_session_key)
         try:
@@ -5101,6 +5132,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
                     clear_session_vars(tokens)
         self._activate_admitted_request()
+        # This term covers EVERY _run_agent caller -- /v1/chat/completions, /v1/responses,
+        # /api/sessions/{id}/chat[/stream] AND the peer-delivery drain turns (run_record /
+        # drain_under_lock). Callers never count themselves: an admitted request's own
+        # pending_requests reservation was just transferred above, so one turn is exactly
+        # one counted unit (t_376b3fbd, pinned by t_21572e62).
         self._inflight_agent_runs += 1
         # Attribution for the gate (t_376b3fbd): an in-flight turn is the biggest single
         # consumer of the cap, so a saturated gate must be able to name it. The token is
@@ -5131,6 +5167,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, Any]:
         return _api_runs._set_run_status(self, run_id, status, **fields)
+
+    # -- live run handles: ONE registry, both run families (t_5976163f R4) --------------
+
+    def _register_live_run_handle(self, run_id: str, *, family: str) -> None:
+        return _api_runs._register_live_run_handle(self, run_id, family=family)
+
+    def _attach_live_run_handle_task(self, run_id: str, task: Any) -> None:
+        return _api_runs._attach_live_run_handle_task(self, run_id, task)
+
+    def _release_live_run_handle(self, run_id: str) -> None:
+        return _api_runs._release_live_run_handle(self, run_id)
+
+    def _run_has_live_handle(self, run_id: str) -> bool:
+        """The fence predicate: does this process still hold executable work for the run?"""
+        return _api_runs._run_has_live_handle(self, run_id)
 
     def _make_run_event_callback(self, run_id: str, loop: asyncio.AbstractEventLoop):
         return _api_runs._make_run_event_callback(self, run_id, loop, _api_server=sys.modules[__name__])

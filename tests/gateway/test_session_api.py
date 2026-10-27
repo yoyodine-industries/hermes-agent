@@ -457,12 +457,19 @@ async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_
         # _inflight_agent_runs; a task entry would double-count them in the
         # shutdown drain (active_agent_work_count).
         assert run_id not in adapter._active_run_tasks
+        # R4a (t_5976163f): the inline turn holds a live-handle TOKEN instead, so the
+        # orphan fence can tell a working inline row from an abandoned one. Mid-turn the
+        # row must read as live — never fenced — even though no task holds it.
+        assert adapter._run_has_live_handle(run_id) is True
+        assert adapter._durable_run_status(request, run_id)["status"] != "interrupted"
         assert not handler_task.done()
 
         allow_finish.set()
         await handler_task
 
     assert run_id not in adapter._active_run_agents
+    # The token is released in the turn's own finally, which is the fence's clock.
+    assert adapter._run_has_live_handle(run_id) is False
 
 
 @pytest.mark.asyncio
