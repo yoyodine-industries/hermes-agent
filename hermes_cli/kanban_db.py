@@ -826,6 +826,76 @@ def assert_board_matches_pin(board: Optional[str]) -> None:
         )
 
 
+def board_env_pin() -> tuple[Optional[str], str]:
+    """The board this PROCESS is pinned to by the environment, and what pins it.
+
+    ``("slug", "HERMES_KANBAN_DB")`` when the pin names a board, ``(None, var)`` when a pin
+    exists but names no board (a non-canonical store file), ``(None, "")`` when the process
+    carries no board pin at all. ``HERMES_KANBAN_DB`` (a store file) outranks
+    ``HERMES_KANBAN_BOARD`` (a slug) — the same order :func:`_board_path` and
+    :func:`get_current_board` resolve in, so the answer describes the pin that actually wins.
+    """
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if override:
+        pinned = _pinned_board_slug(Path(override).expanduser(), ("kanban.db",), "kanban.db")
+        return pinned, "HERMES_KANBAN_DB"
+    slug = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if slug:
+        try:
+            normed = _normalize_board_slug(slug)
+        except ValueError:
+            normed = None
+        if normed:
+            return normed, "HERMES_KANBAN_BOARD"
+    return None, ""
+
+
+def assert_board_matches_env_pin(board: Optional[str]) -> Optional[str]:
+    """Refuse an explicit ``board=`` that contradicts this process's board PIN.
+
+    A board pin is a FENCE, not a default: it keeps a dispatched worker on the board it
+    holds a claim on (the dispatcher injects ``HERMES_KANBAN_DB``) and an operator's shell on
+    the board they selected (``HERMES_KANBAN_BOARD``). Both pins work by resolving EVERY slug
+    to the pinned store, so an explicit board naming a DIFFERENT board used to be served from
+    the pinned one — ``hermes kanban --board platform show <id>`` answered "no such task"
+    while the write verbs mutated the pinned board, and ``boards show platform`` rendered the
+    platform board's description above the pinned store's path and counts (measured
+    2026-10-27, card t_398313ec). A read from the wrong board is indistinguishable from
+    success, so the fence must SAY so: raise :class:`ValueError` carrying the same sentence
+    the model-facing tools use for this condition, naming both boards.
+
+    No-op when the caller named no board, or when this process carries no board pin — a
+    top-level session's ``--board X`` is its own intent and keeps resolving to X's store.
+    ALSO a no-op where the pin does not actually override intent: the refusal exists only
+    because the resolver would otherwise serve the pinned store, and
+    :func:`_explicit_board_intent_pinned` is the ONE place that decides that. Judging the
+    pin without it refuses a shape the resolver serves correctly: a shell that merely
+    carries ``HERMES_KANBAN_BOARD`` (an operator's selected board — every ``hermes kanban
+    watch`` banner case, and the live-claim provenance harness) still resolves ``--board
+    beta`` to beta's own store, and ``boards`` still needs per-slug counts. Refusing there
+    would be a false refusal on a resolution that is already right — the fence only has to
+    speak where the pin WINS.
+    Returns the normalised slug for callers that want it.
+    """
+    normed = _normalize_board_slug(board) if board else None
+    if not normed:
+        return None
+    if not _explicit_board_intent_pinned():
+        # Unfenced: ``--board`` outranks the pin (``_board_path``), so no contradiction exists.
+        return normed
+    pinned_slug, pin_var = board_env_pin()
+    if pin_var == "HERMES_KANBAN_DB":
+        # The file pin's own comparison (canonical-path aware, same sentence as the tools).
+        assert_board_matches_pin(normed)
+        return normed
+    if pinned_slug and pinned_slug != normed:
+        raise ValueError(
+            f"refusing to target board {normed!r}: this process is pinned to "
+            f"board {pinned_slug!r} (HERMES_KANBAN_BOARD)"
+        )
+    return normed
+
+
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
