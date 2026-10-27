@@ -378,6 +378,21 @@ def _cmd_create(args: argparse.Namespace) -> int:
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
+        # THE FILING-BUDGET REFUSAL. No row was written and the line was already printed to
+        # stderr by the kernel's own module; rc 3 is the machine-readable half of that answer,
+        # so a shell or a workflow node can tell "the budget door said no" from a usage error
+        # (2) and from a board fault (1) without parsing prose.
+        from hermes_cli.kanban_filing_policy import is_refusal as _is_refusal
+
+        if _is_refusal(task_id):
+            record = getattr(task_id, "record", {}) or {}
+            if getattr(args, "json", False):
+                _print_json({"refused": True, "reason": str(task_id),
+                             "filing_policy": dict(record)})
+            elif record.get("why"):
+                print(f"filing policy: {record['why']}", file=sys.stderr)
+                print(f"filing policy: {record.get('policy', '-')}", file=sys.stderr)
+            return 3
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))

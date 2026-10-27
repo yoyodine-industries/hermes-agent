@@ -1147,6 +1147,13 @@ def _handle_create(args: dict, **kw) -> str:
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
+        # THE FILING-BUDGET REFUSAL: the kernel answered with a refusal rather than a card, so
+        # there is nothing to read back. The line already went to stderr from the kernel's own
+        # module; it rides this tool's error envelope so the worker records it in its run
+        # output instead of believing it filed a card that does not exist.
+        from hermes_cli.kanban_filing_policy import is_refusal as _is_refusal
+
+        _check(not _is_refusal(new_tid), str(new_tid))
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}

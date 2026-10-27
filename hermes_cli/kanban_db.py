@@ -1233,6 +1233,24 @@ def create_task(
         if row:
             return row["id"]
 
+    # THE FILING-BUDGET DOOR. The budget is enforced HERE - the one moment every filing
+    # surface reaches - so a producer cannot opt out by wiring: the tool verb, the CLI, a
+    # decomposer and another lane's agent all land on this call. It runs AFTER the
+    # idempotency early-return above (a keyed refresh re-uses an identity the board already
+    # holds: not a birth, and it draws nothing) and BEFORE any write, so a refused filing
+    # leaves the database untouched. A host with no policy file is INERT - nothing read,
+    # nothing printed, no event key: the behaviour every existing caller has, byte for byte.
+    # The refusal is an ANSWER (a falsy ``str`` whose value is the printed line), never an
+    # exception: ``hermes_cli.kanban_filing_policy`` owns the roster, the bands and the pool,
+    # and this module owns only the moment.
+    from hermes_cli import kanban_filing_policy as _filing
+
+    filing_refusal, filing_record = _filing.apply(
+        conn, created_by=created_by, title=title, body=body,
+    )
+    if filing_refusal is not None:
+        return filing_refusal
+
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -1300,6 +1318,10 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        # The filing budget's reading, when this host HAS a policy: a card born
+                        # under the pool states which pool it drew from. No policy file = no
+                        # key (every existing caller's payload, byte for byte).
+                        **({"filing_policy": filing_record} if filing_record else {}),
                     },
                 )
                 if task_status == "blocked":
