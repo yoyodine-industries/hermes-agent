@@ -505,25 +505,22 @@ def _run_job_script(
         if argv is None:
             return False, err
         from tools.environments.local import build_subprocess_env
-        # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
-        # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
-        # ``errors=`` must not stay 'strict': one stray non-UTF-8 byte in the script's stdout
-        # or stderr raises UnicodeDecodeError in communicate() and fails the whole run,
-        # discarding the output (#105582; the Windows branch decodes lossily per #45099).
+        # The decode pin lives at the READER (the Popen call below), NOT in ``**popen_kwargs``:
+        # a splat is invisible to the AST decode guard, and a second ``encoding=`` in the dict
+        # would collide with the call's own keyword on win32 (TypeError: multiple values).
+        # Encoding stays gated to win32 — unconditional UTF-8 leaked into POSIX and was
+        # reverted (#66566) — while ``errors=`` must not stay 'strict' on either branch: one
+        # stray non-UTF-8 byte in the script's stdout or stderr raises UnicodeDecodeError in
+        # the reader thread and fails the whole run, discarding the output (#105582; the
+        # Windows branch decodes as lossy UTF-8 per #45099).
         popen_kwargs: dict[str, Any] = {
             "start_new_session": True,
-            "errors": "replace",
         }
         if sys.platform == "win32":
             popen_kwargs = {
                 "creationflags": windows_hide_flags()
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-                # Lossy UTF-8 decode — locale-mismatched bytes from the STT command must not raise in the
-                # reader threads on non-UTF-8 Windows (#45099).
-                # Lossy UTF-8 decode — locale-mismatched bytes from the TTS command must not raise in the
-                # reader threads on non-UTF-8 Windows (#45099).
-                "encoding": "utf-8",
-                "errors": "replace"}
+            }
         # The process env is the LAUNCH profile's. For a job owned by a routed profile, drop that
         # profile's .env residue from the base first (no-op for the launch profile's own jobs), then
         # overlay the routed profile's own scope (which never enters os.environ under multiplex
@@ -543,6 +540,10 @@ def _run_job_script(
         # gateway sessions (#69396).
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            # The decode pin, AT THE READER: win32 pins UTF-8 (#45099); POSIX keeps the
+            # platform default (None) because unconditional UTF-8 there was reverted (#66566).
+            encoding="utf-8" if sys.platform == "win32" else None,
+            errors="replace",
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
         deadline = time.monotonic() + script_timeout
         while True:

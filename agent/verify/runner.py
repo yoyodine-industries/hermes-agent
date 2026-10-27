@@ -27,7 +27,7 @@ PHASE_ORDER = ("bootstrap", "build", "test")
 # Project-authored shell commands; see module docstring.
 _SUBPROCESS_KW: dict[str, Any] = dict(
     shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    text=True, errors="replace",
+    text=True, encoding="utf-8", errors="replace",
 )
 
 
@@ -197,7 +197,7 @@ def _compose_live_state_reason(root: Path) -> str | None:
     try:
         result = subprocess.run(
             ["docker", "compose", "ps", "--status", "running", "--format", "{{.Name}}"],
-            cwd=root, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+            cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError:
         return None
