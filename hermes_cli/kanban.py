@@ -24,6 +24,7 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_bulk_guard as kbg
 from hermes_cli import kanban_workflow
+from hermes_cli.kanban_filing_policy import is_refusal as kb_is_filing_refusal
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, BOARD_PIN_REMEDY, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -481,6 +482,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    if bool(getattr(args, "resurrect", False)) and not getattr(args, "idempotency_key", None):
+        # Nothing to resurrect without an identity: silently accepting the flag would teach
+        # a producer that it had overridden a dedupe that never ran.
+        return _err("kanban: --resurrect needs --idempotency-key "
+                    "(it re-opens a KEYED identity that is already closed)", 2)
     # A card fired from another card lands on the SAME board as the card that fired
     # it (operator standing order): the source card's board outranks the ambient
     # board, which is only a fallback for a filing with no source card (a loop, a
@@ -506,6 +512,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
                 parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
                 idempotency_key=getattr(args, "idempotency_key", None),
+                resurrect=bool(getattr(args, "resurrect", False)),
                 max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
                 max_retries=max_retries, model_override=getattr(args, "model_override", None),
                 provider_override=getattr(args, "provider_override", None),
@@ -525,6 +532,19 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 # The receipt's dead-assignee probe reads THIS process's live profiles.
                 profiles=list_profile_names(),
             )
+            # THE FILING-BUDGET REFUSAL (card t_80ff9b6a). No row was written and the line was
+            # already printed to stderr by the kernel's own module; rc 3 is the machine-readable
+            # half of that answer, so a shell or DAG node can tell "the budget door said no"
+            # from a usage error (2) and from a board fault (1) without parsing prose.
+            if kb_is_filing_refusal(task_id):
+                record = getattr(task_id, "record", {}) or {}
+                if getattr(args, "json", False):
+                    _print_json({"refused": True, "reason": str(task_id),
+                                 "filing_policy": dict(record)})
+                elif record.get("why"):
+                    print(f"filing policy: {record['why']}", file=sys.stderr)
+                    print(f"filing policy: {record.get('policy', '-')}", file=sys.stderr)
+                return 3
             task = kb.get_task(conn, task_id)
     except InboxRefusal as exc:
         # A usage refusal, not a board fault: rc 2 so a shell can tell "the provenance could
@@ -1741,7 +1761,8 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_decompose as decomp
 
     return _run_triage_sweep(args, "decompose", decomp, decomp.decompose_task, "decomposed",
-                             ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
+                             ("task_id", "ok", "reason", "fanout", "child_ids", "new_title",
+                              "refused"), _decompose_ok_line)
 
 
 def _defcon_authority(args: argparse.Namespace) -> str:

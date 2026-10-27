@@ -231,6 +231,10 @@ _SPECS = [
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
+        _arg("--resurrect", action="store_true",
+             help="With --idempotency-key: file it again even though a task with that "
+                  "key was already CLOSED inside the filing window (the filing-budget "
+                  "door otherwise answers `refused: duplicate-closed-key`)."),
         _arg("--max-runtime",
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
