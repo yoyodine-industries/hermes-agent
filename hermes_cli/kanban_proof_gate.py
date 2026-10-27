@@ -760,10 +760,12 @@ def _checkout_state(directory: str, relpath: str) -> tuple:
     state: tuple = (None, None)
     try:
         head = subprocess.run(["git", "-C", directory, "rev-parse", "HEAD"],
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=30)
         if head.returncode == 0 and head.stdout.strip():
             status = subprocess.run(["git", "-C", directory, "status", "--porcelain", "--",
-                                     relpath], capture_output=True, text=True, timeout=30)
+                                     relpath], capture_output=True, text=True,
+                                     encoding="utf-8", errors="replace", timeout=30)
             state = (head.stdout.strip().lower(), not status.stdout.strip())
     except (OSError, subprocess.SubprocessError):
         state = (None, None)
@@ -1603,7 +1605,8 @@ def _phantom_mechanism(proof: dict) -> Optional[str]:
 def _git_out(*args: str) -> tuple:
     """One git invocation -> ``(returncode, stdout, stderr)``; never raises, never blocks long."""
     try:
-        proc = subprocess.run(("git",) + args, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(("git",) + args, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
         return 127, "", str(exc)
     return proc.returncode, proc.stdout, proc.stderr

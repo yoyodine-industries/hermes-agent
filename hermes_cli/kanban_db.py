@@ -6062,7 +6062,8 @@ def _checkout_dirty_paths(checkout: str) -> list[str]:
             return []
         result = subprocess.run(
             ["git", "-C", checkout, "status", "--porcelain", "--untracked-files=normal"],
-            capture_output=True, text=True, timeout=_DIRTY_STATUS_TIMEOUT_S,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_DIRTY_STATUS_TIMEOUT_S,
             stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):

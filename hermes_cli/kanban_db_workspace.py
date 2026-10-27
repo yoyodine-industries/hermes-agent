@@ -997,6 +997,8 @@ def _git_ref_accepted(branch_name: str) -> bool:
             ["git", "check-ref-format", "--branch", branch_name],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
     except Exception:

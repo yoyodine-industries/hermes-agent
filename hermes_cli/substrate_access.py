@@ -846,7 +846,8 @@ def deliver_once(
             try:
                 proc = subprocess.run(
                     [exe, "peer", "run", target, line],
-                    capture_output=True, text=True, timeout=timeout,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=timeout,
                 )
                 attempt["state"] = "sent" if proc.returncode == 0 else "failed"
                 if proc.returncode != 0:
