@@ -266,6 +266,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # Content-Length that bypass the header check.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
+        # Boot-resident substrate read (design t_72e9bf03 §3.6 carrier 6): the ONE
+        # authority record, readable while the volume the ticks probe is denying.
+        app.router.add_get("/substrate", self._handle_substrate)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # /p/<profile>/ routes the event to that profile (honored only under gateway.multiplex_profiles).
         app.router.add_post("/p/{profile}/webhooks/{route_name}", self._handle_webhook)
@@ -388,6 +391,46 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: web.Request) -> web.Response:
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    async def _handle_substrate(self, request: web.Request) -> web.Response:
+        """GET /substrate — the substrate authority record, read on the BOOT volume.
+
+        The gateway is one of the two boot-resident processes (the other is the
+        dashboard), so this answers "is the runtime's substrate reachable" from
+        `<hermes_home>/substrate_status.json` while the volume is denying — which is
+        exactly when the volume-hosted health API cannot.
+
+        Sensitivity split, same as the dashboard: a caller that is not on loopback gets
+        the same low-sensitivity summary `/api/status` carries (state, episode,
+        guards_blind), never host paths or root names. `?format=text` renders the
+        loopback view as one plain-text block.
+        """
+        loopback = _is_loopback_host(getattr(request, "remote", None))
+        want_text = (request.query.get("format") or "").strip().lower() in ("text", "txt", "plain")
+
+        def _read():
+            from hermes_cli import substrate_view
+
+            return substrate_view.read()
+
+        try:
+            view = await asyncio.get_running_loop().run_in_executor(None, _read)
+        except Exception as exc:  # noqa: BLE001 - the reader never raises; this is the belt
+            logger.warning("[webhook] substrate read failed: %s", exc)
+            return web.json_response(
+                {"state": "unknown", "reason": "read_failed", "detail": str(exc)[:200]}, status=200
+            )
+        if loopback:
+            if want_text:
+                from hermes_cli import substrate_view
+
+                return web.Response(text=substrate_view.render_line(view) + "\n",
+                                    content_type="text/plain")
+            return web.json_response(view)
+        from hermes_cli import substrate_view
+
+        return web.json_response(substrate_view.summary(view))
+
 
     def _dynamic_route_allowed(self, name: str, route: dict) -> bool:
         """Reject dynamic routes whose effective secret is missing, blank, or not a string

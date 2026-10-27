@@ -15,6 +15,7 @@ import subprocess
 import time
 import unicodedata
 from pathlib import Path
+from typing import Any
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
@@ -1086,6 +1087,77 @@ def _board_anchor_repo(board: Optional[str]) -> Optional[Path]:
     # with the volume verdict so the caller does not fall through to ``WorktreeAnchorNotRepo``.
     _refuse_unreachable(anchor)
     return _repo_anchor_for(anchor)
+
+
+def _existing_anchor(path: Path) -> Path:
+    """``path`` itself when it exists, else its nearest existing ancestor (``/`` last resort).
+
+    ``os.path.isdir`` is deliberately the tool here, and that is not a contradiction of the
+    substrate gate's own rule. During the measured fault ``isdir`` answered TRUE for a path on a
+    volume nobody could read -- so this walk STOPS AT the denied path instead of skipping over it
+    to a readable ancestor, which is the honest answer. A path that genuinely does not exist yet
+    walks up to the parent it will be created under, which is the thing whose readability decides
+    whether creating it can work.
+    """
+    current = Path(path)
+    for _ in range(64):
+        try:
+            if os.path.isdir(current):
+                return current
+        except OSError:
+            return current
+        parent = current.parent
+        if parent == current:
+            return current
+        current = parent
+    return current
+
+
+def planned_workspace_root(task: Any, *, board: Optional[str] = None) -> Optional[Path]:
+    """Where THIS card's workspace will be created -- resolved WITHOUT creating it.
+
+    Door 3 of the substrate admission gate (card ``t_0ae49984``, design ``t_72e9bf03``) has to ask
+    "is the substrate this card needs readable?" BEFORE the claim, and it must not answer that
+    question by doing the very thing it is gating: :func:`resolve_workspace` MINTS a worktree and
+    mkdirs a scratch tree. So this function only computes:
+
+    * an explicit ``workspace_path`` (``dir`` and pinned ``worktree`` rows) -- used as given;
+    * ``worktree`` without one -- the board's anchor repo (``default_workdir``), the repo the
+      worktree would be added to;
+    * anything else -- :func:`kanban_db.workspaces_root`, the parent the per-card scratch dir lands
+      in.
+
+    and then reduces it to its NEAREST EXISTING ANCESTOR (see :func:`_existing_anchor`), because a
+    root that does not exist yet is not a denial, and the volume that holds it is the question.
+    ``None`` means "cannot be known without side effects" -- the caller then admits the card
+    unchanged, which is the fail-open answer the gate must give when it cannot see.
+
+    Accepts a ``Task`` or any mapping / sqlite row carrying ``workspace_kind`` and
+    ``workspace_path``, so a dispatcher can ask before it has claimed anything.
+    """
+
+    def _field(name: str) -> Any:
+        try:
+            return task[name]  # sqlite3.Row / mapping
+        except Exception:
+            return getattr(task, name, None)
+
+    kind = str(_field("workspace_kind") or "scratch").strip().lower()
+    explicit = _field("workspace_path")
+    if explicit:
+        return _existing_anchor(Path(str(explicit)).expanduser())
+    if kind == "worktree":
+        try:
+            anchor = _board_anchor_repo(board)
+        except WorkspaceVolumeUnavailable:
+            # The existing host refusal already owns this answer; the caller's own resolver will
+            # raise it with its evidence. Answering None here keeps this function side-effect free.
+            return None
+        return _existing_anchor(anchor) if anchor is not None else None
+    try:
+        return _existing_anchor(_kb.workspaces_root(board=board))
+    except Exception:
+        return None
 
 
 def _mirror_anchored_worktree(

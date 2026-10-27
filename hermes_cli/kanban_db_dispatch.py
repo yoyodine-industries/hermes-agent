@@ -970,6 +970,13 @@ class DispatchResult:
     worker is structurally fenced from it. The card is PARKED ``scheduled``
     (due_at NULL) -- never a silent skip -- and the tick's suppression line names
     the hold, because a silent hold is how a starved board reads as an idle one."""
+    substrate_held: list[str] = field(default_factory=list)
+    """Task ids HELD by per-unit substrate admission (door 3; card ``t_0ae49984``, design
+    ``t_72e9bf03``): the card's own workspace root answered a DENIAL to a real operation, so it
+    was not claimed this tick. NOT a failure, NOT a block and NOT a count against the card
+    (invariant I1) -- the card simply was not admitted, and the next tick re-probes. Siblings on
+    the same board carry on (invariant I2). Counted on the tick's suppression line, because a
+    silent hold is how a starved board reads as an idle one."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -1405,6 +1412,11 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             # never silently skipped, so the tick's own line must name the hold --
             # a silent hold is how a starved board reads as an idle one.
             counts["skipped_top_level_only"] = counts.get("skipped_top_level_only", 0) + len(res.skipped_top_level_only)
+        if res.substrate_held:
+            # DOOR 3 (card t_0ae49984, design t_72e9bf03): these cards were not claimed because
+            # their own workspace root was denied. They are still ready, so without this counter
+            # the tick would read exactly like an idle one.
+            counts["substrate_held"] = counts.get("substrate_held", 0) + len(res.substrate_held)
         if res.deferred_host_capped:
             # The HOST budget held these back: no per-card refusal of their own,
             # so without this the tick reads like an idle queue.
@@ -4128,27 +4140,86 @@ TICK_YIELD_RETIRE_FAILED_EVENT = "tree_skew_actor_retire_failed"
 TICK_YIELD_ACTOR_ABSORB_SKIP_STATUSES = ("done", "archived", "failed", "cancelled")
 
 
+#: --- substrate admission (card t_0ae49984, design t_72e9bf03) --------------------------
+#: A DIFFERENT condition, the SAME machinery. The tree-skew gate above asks "is this process
+#: serving a mixed revision?"; this one asks "can the substrate every spawn needs actually be
+#: READ?" --- measured live 2026-10-26: ``/Volumes/yoyofs1`` answered EPERM to ``open(2)`` and
+#: ``readdir`` while ``stat``/``exists``/``isdir`` stayed green, so both spawn doors kept
+#: admitting work into a volume nobody could read.
+#:
+#: Reusing the skew gate's episode/streak/card machinery is deliberate (design §3.2: "all
+#: inherited from the skew gate --- do not invent a parallel mechanism"). What is NOT shared is
+#: the status record: two conditions in one file would overwrite each other's streaks.
+TICK_YIELD_KIND_TREE_SKEW = "tree_skew"
+SUBSTRATE_ADMISSION_KIND = "substrate_denied"
+#: The one greppable string for this condition. ``tree-skew-yield:`` is left byte-identical.
+SUBSTRATE_ADMISSION_PREFIX = "substrate-denied-yield:"
+SUBSTRATE_ADMISSION_STATUS_FILENAME = "dispatcher_substrate_yield.json"
+SUBSTRATE_ADMISSION_ACTOR_IDEMPOTENCY_PREFIX = "substrate-denied:"
+SUBSTRATE_ADMISSION_ACTOR_TITLE = "[guard] the substrate is refusing admission --- nothing is being spawned"
+SUBSTRATE_ADMISSION_ACTOR_ASSIGNEE = "default"
+SUBSTRATE_ADMISSION_HELD_EVENT = "substrate_admission_held"
+SUBSTRATE_ADMISSION_ACTOR_EVENT = "substrate_admission_actor_filed"
+#: Same shape as the skew declaration, so the ladder bands it in the platform tier's top
+#: sub-band: this card gates every lane on the host and its remedy is host administration.
+SUBSTRATE_ADMISSION_ACTOR_DECLARATION = (
+    "- Blast radius: gateway runtime + kanban dispatcher + cron ticker (every lane on this host)"
+)
+
+
 class DispatcherTickYielded(RuntimeError):
-    """The tick refused to serve: the tree this process imported no longer matches the disk.
+    """The tick refused to serve: this process must not admit work this tick.
 
-    Mirrors ``cron.scheduler.CronTickYielded`` -- a yielding ticker must be distinguishable from a
-    healthy one at the status surface, never a silent or a false green. The exception carries the
-    forensics the status record and the acting card quote verbatim.
+    ``kind`` names WHICH condition refused, and with it which strings, record and card the
+    refusal uses:
 
-    ``str(exc)`` always starts with :data:`TICK_YIELD_PREFIX`.
+    * ``tree_skew`` (the DEFAULT, so every existing caller and pinned suite is unchanged) ---
+      the tree this process imported no longer matches the disk. ``str()`` starts with
+      ``tree-skew-yield:``;
+    * ``substrate_denied`` --- a ``tier: global`` root denied an operation. ``str()`` starts
+      with ``substrate-denied-yield:`` and ``report`` carries the matrix.
+
+    The exception carries the forensics the status record and the acting card quote verbatim.
     """
 
-    def __init__(self, boot_fingerprint: str, disk_fingerprint: str, *, boot_pid: int) -> None:
+    def __init__(
+        self,
+        boot_fingerprint: str,
+        disk_fingerprint: str,
+        *,
+        boot_pid: int,
+        kind: str = TICK_YIELD_KIND_TREE_SKEW,
+        report: Any = None,
+    ) -> None:
+        self.kind = str(kind or TICK_YIELD_KIND_TREE_SKEW)
+        self.report = report
         self.boot_fingerprint = str(boot_fingerprint)
         self.disk_fingerprint = str(disk_fingerprint)
         self.boot_pid = int(boot_pid)
         self.boot_label = _short_tree_fingerprint(self.boot_fingerprint)
         self.disk_label = _short_tree_fingerprint(self.disk_fingerprint)
+        if self.kind == SUBSTRATE_ADMISSION_KIND:
+            self.signature = _sa.signature(report) if report is not None else self.boot_fingerprint
+            summary = report.summary() if report is not None else "substrate readings unavailable"
+            super().__init__(
+                f"{SUBSTRATE_ADMISSION_PREFIX} {summary}; refusing to admit work "
+                f"(signature {self.signature or 'unknown'}, door dispatcher)."
+            )
+            return
+        self.signature = self.boot_fingerprint
         super().__init__(
             f"{TICK_YIELD_PREFIX} this dispatcher imported tree content {self.boot_label} "
             f"(pid {self.boot_pid}) but the checkout on disk is now {self.disk_label}; refusing "
             f"to spawn from a mixed revision until the gateway is reloaded onto the new code."
         )
+
+    @property
+    def matrix(self) -> list:
+        """The substrate matrix (``[]`` for a tree-skew refusal)."""
+        try:
+            return list(self.report.matrix()) if self.report is not None else []
+        except Exception:  # noqa: BLE001 - evidence must never raise inside a refusal
+            return []
 
 
 def _short_tree_fingerprint(fingerprint: Optional[str]) -> str:
@@ -4220,6 +4291,24 @@ def tick_yield_status_path(path: Any = None) -> Path:
     return _kb.kanban_home() / "kanban" / TICK_YIELD_STATUS_FILENAME
 
 
+def substrate_admission_status_path(path: Any = None) -> Path:
+    """The substrate refusal's OWN status record (design §3.2: a sibling, never shared).
+
+    Two conditions in one file would overwrite each other's streaks, so the substrate record is
+    ``<kanban_home>/kanban/dispatcher_substrate_yield.json``: same schema v2, plus ``matrix``.
+    """
+    if path is not None:
+        return Path(path)
+    return _kb.kanban_home() / "kanban" / SUBSTRATE_ADMISSION_STATUS_FILENAME
+
+
+def _tick_yield_status_path_for(yielded: DispatcherTickYielded) -> Path:
+    """The record this refusal writes: per KIND, so neither condition can clobber the other."""
+    if getattr(yielded, "kind", TICK_YIELD_KIND_TREE_SKEW) == SUBSTRATE_ADMISSION_KIND:
+        return substrate_admission_status_path()
+    return tick_yield_status_path()
+
+
 def _yield_signature(yielded: DispatcherTickYielded) -> str:
     """The EPISODE's content: the tree content this process IMPORTED, and nothing else.
 
@@ -4236,8 +4325,13 @@ def _yield_signature(yielded: DispatcherTickYielded) -> str:
     disk side without ending the stall, so a disk-sensitive identity would reset the streak on
     every landing and file a second card mid-stall. The disk fingerprint is EVIDENCE (status record
     + card body), never identity.
+
+    KIND is the one branch: a tree-skew refusal's identity is the imported content (unchanged,
+    byte-compatible); a substrate refusal's identity is ``substrate_access.signature`` --- a
+    ``sha256`` over the sorted ``path\\top\\terrno`` of every DENIED reading, so it aggregates by
+    CAUSE, not by count. The exception carries both, so this function re-derives neither.
     """
-    return str(yielded.boot_fingerprint)
+    return str(yielded.signature)
 
 
 def _episode_identity(signature: str, first_tick: int) -> str:
@@ -4302,7 +4396,7 @@ def _record_tick_yield(
     refusal cannot re-register, re-notify or re-file. The streak is recomputed every tick; the
     delivery is not.
     """
-    path = tick_yield_status_path()
+    path = _tick_yield_status_path_for(yielded)
     prior = _read_tick_yield_status(path)
     now = int(time.time())
     sig = _yield_signature(yielded)
@@ -4336,6 +4430,11 @@ def _record_tick_yield(
         "delivery": delivery,
         "recorded_at": now,
     }
+    if getattr(yielded, "kind", TICK_YIELD_KIND_TREE_SKEW) == SUBSTRATE_ADMISSION_KIND:
+        # The substrate half: the SAME v2 schema, plus what a reader needs to see the cause
+        # without opening anything else. The skew record is left byte-identical.
+        payload["kind"] = SUBSTRATE_ADMISSION_KIND
+        payload["matrix"] = yielded.matrix
     return _write_tick_yield_status(payload, path), payload
 
 
@@ -4355,7 +4454,9 @@ def _merge_tick_yield_delivery(delivery: dict) -> str:
     return _write_tick_yield_status(record, path)
 
 
-def _clear_tick_yield_status() -> bool:
+def _clear_tick_yield_status(
+    kind: str = TICK_YIELD_KIND_TREE_SKEW, *, released: Optional[list] = None,
+) -> bool:
     """Retire a stale non-green marker once a tick serves normally again. ``True`` when retired.
 
     Cleared ONLY when this process wrote the record (it is the one that is now healthy), or when
@@ -4363,10 +4464,16 @@ def _clear_tick_yield_status() -> bool:
     dispatcher process must never clear a live gateway's marker -- that would read green over a
     frozen gateway, which is the exact false green this record exists to prevent.
 
+    ``kind`` selects WHICH record: the skew sibling, or the substrate sibling. For the substrate
+    the retirement ALSO writes the RECOVERY RECEIPT onto the authority record
+    (``substrate_access.record_cleared``: ``cleared_at``, ``duration_s``, the cleared matrix, the
+    units released) -- design §3.7's proof that the episode is over, not merely unobserved.
+
     The return value is DEC-3's trigger: a tick that just retired a record is a tick whose episode
     CLEARED, and that is the moment the actor cards filed for it are retired too.
     """
-    path = tick_yield_status_path()
+    substrate = str(kind) == SUBSTRATE_ADMISSION_KIND
+    path = substrate_admission_status_path() if substrate else tick_yield_status_path()
     try:
         raw = path.read_text(encoding="utf-8")
     except (OSError, ValueError):
@@ -4376,7 +4483,7 @@ def _clear_tick_yield_status() -> bool:
     except (ValueError, TypeError):
         record = None
     if isinstance(record, dict):
-        recorded_pid = record.get("pid")
+        recorded_pid = record.get("boot_pid" if substrate else "pid")
         try:
             recorded_pid = int(recorded_pid)  # type: ignore[arg-type]
         except (TypeError, ValueError):
@@ -4384,6 +4491,13 @@ def _clear_tick_yield_status() -> bool:
         if recorded_pid is not None and recorded_pid != os.getpid():
             if _pid_liveness(recorded_pid) != WORKER_DEAD:
                 return False
+    if substrate:
+        try:
+            _sa.record_cleared(door="dispatcher", released=list(released or []))
+        except Exception:  # health: allow BLE001 -- the receipt is evidence, never a tick's work
+            _kb._log.warning(
+                "kanban dispatcher: could not write the substrate recovery receipt", exc_info=True,
+            )
     try:
         path.unlink()
     except OSError:
@@ -4592,6 +4706,155 @@ def _ops_board_connection(fallback_conn: sqlite3.Connection):
         return fallback_conn, fallback_board, False
 
 
+def _record_rows(record: Any, *keys: str) -> list[dict]:
+    """The dict rows under the first of ``keys`` that actually HAS rows; anything else dropped.
+
+    The authority record is written by ANOTHER process, so its shape is a claim to be checked,
+    not trusted: this runs inside a live refusal, where an exception costs exactly the card
+    that explains the stall (see :func:`_blind_guard_count`). An EMPTY list is not an answer --
+    a LEG A record carries ``guards: []``-shaped nothing and its rows in ``guards_blind``.
+    """
+    for key in keys:
+        value = record.get(key) if isinstance(record, dict) else None
+        if isinstance(value, (list, tuple)):
+            rows = [row for row in value if isinstance(row, dict)]
+            if rows:
+                return rows
+    return []
+
+
+def _blind_guard_count(record: Any) -> int:
+    """The blind-guard COUNT, tolerant of BOTH shapes the record has carried.
+
+    Leg B writes ``guards_blind`` as an int and keeps the rows in ``guards``. The LEG A build
+    deployed between the two wrote the ROW LIST in ``guards_blind`` -- and a bare ``int()`` on
+    that list raised TypeError inside the refusal path on 2026-10-26, so the hold was recorded
+    (matrix, episode, streak) and NO card carried it: 33 units queued behind a hold no reader
+    could see. A count is a count; a row list is its length.
+    """
+    value = record.get("guards_blind") if isinstance(record, dict) else None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return 0
+
+
+def _substrate_admission_body(
+    yielded: DispatcherTickYielded,
+    *,
+    board: Optional[str],
+    status_path: str,
+    streak: int = 0,
+    first_tick: int = 0,
+    last_tick: int = 0,
+    filed_on: Optional[str] = None,
+    episode: str = "",
+) -> str:
+    """The SUBSTRATE acting card's body: deterministic evidence, no model, no prose to interpret.
+
+    Design §3.2 asks for four things and nothing else: the MATRIX, the affected UNITS, the
+    ``guards_blind`` count, and the REMEDY -- bounded to host administration, so the reader is
+    never left choosing between a card-level retry and a host-level repair.
+    """
+    import datetime
+
+    def _iso(epoch):
+        try:
+            return datetime.datetime.fromtimestamp(int(epoch)).isoformat(timespec="seconds")
+        except (TypeError, ValueError, OSError):
+            return "?"
+
+    record = _sa.read_status()
+    if not isinstance(record, dict):  # read_status never raises; a stub caller might still lie
+        record = {}
+    # LEG A carried the blind ROWS in `guards_blind`; a record written by that build has no
+    # `guards` key at all, so both keys are consulted and the rows are read from whichever
+    # holds a list. The count comes from `_blind_guard_count` for the same reason.
+    matrix = yielded.matrix or (record.get("matrix") or [])
+    held = _record_rows(record, "held")
+    blind = _record_rows(record, "guards", "guards_blind")
+    blind_count = _blind_guard_count(record)
+    blind_total = record.get("guards_total")
+
+    lines = [
+        SUBSTRATE_ADMISSION_ACTOR_DECLARATION,
+        "",
+        "## Observed",
+        "",
+        f"`{SUBSTRATE_ADMISSION_PREFIX}` the kanban dispatcher is refusing to spawn: a root every worker",
+        "needs answered a DENIAL to a real operation (`open(2)` / `readdir` / `O_CREAT`), so any",
+        "worker admitted now would be born into a substrate nobody can read. Filed by the",
+        "substrate admission gate -- deterministic, no model consulted.",
+        "",
+        "READ THIS FIRST: `stat`/`exists`/`isdir` stay GREEN through this fault (measured",
+        "2026-10-26), so a check that only stats the path proves nothing either way.",
+        "",
+        "## The refusal streak",
+        "",
+        f"- consecutive refused ticks: **{streak}** (act threshold {TICK_YIELD_ACTOR_THRESHOLD})",
+        f"- first tick: `{_iso(first_tick)}` (epoch {int(first_tick)})",
+        f"- last tick: `{_iso(last_tick)}` (epoch {int(last_tick)})",
+        f"- episode: `{episode or 'unknown'}` (signature `{yielded.signature or 'unknown'}`)",
+        "",
+        "## The matrix",
+        "",
+    ]
+    if matrix:
+        for row in matrix:
+            lines.append(
+                f"- `{row.get('path')}` op={row.get('op')} **{row.get('errno')}** tier={row.get('tier')}"
+            )
+    else:
+        lines.append("- (no matrix on the record -- the refusal carried no readings)")
+    lines += [
+        "",
+        "## The affected units",
+        "",
+        f"- units held by per-unit admission this episode: **{len(held)}**",
+    ]
+    for item in held[:20]:
+        lines.append(f"  - `{item.get('unit')}` ({item.get('kind')}): {item.get('reason')}")
+    lines += [
+        "",
+        "## Guards blind (fail-open hooks)",
+        "",
+        f"- **{blind_count} of {blind_total if blind_total is not None else '?'} "
+        "launcher-armed hook row(s) are failing OPEN** — observation is lost, and nothing is "
+        "being blocked by them either. Counted, never silent: a fail-open nobody reads is a "
+        "silent failure.",
+    ]
+    for item in blind[:5]:
+        lines.append(
+            f"  - `{item.get('since')}` `{item.get('hook')}` row `{item.get('row')}`: "
+            f"{item.get('reason')} -> `{item.get('body')}`"
+        )
+    lines += [
+        "",
+        "## Where the evidence lives",
+        "",
+        f"- authority record (boot volume): `{_sa.status_path()}`",
+        f"- dispatcher tick record: `{status_path}`",
+        f"- board refused: `{board or 'unknown'}`",
+        f"- card filed on: `{filed_on or board or 'unknown'}`",
+        "",
+        "## What to do -- host administration, not a card retry",
+        "",
+        "1. Restore READ access on the roots named above (remount / reconnect the volume, or fix",
+        "   the permissions). Nothing on this board is waiting on a decision: no card was failed,",
+        "   blocked or failure-counted, and no workspace was created (invariant I1).",
+        "2. Confirm with the probe itself, not with `ls` or `stat`:",
+        "   `python3 -c \"from hermes_cli import substrate_access as s; print(s.probe_all(use_cache=False).matrix())\"`",
+        "   -- every row must say `ok`. `stat` answers `ok` during this fault and proves nothing.",
+        "3. The next healthy tick closes this card on its own and writes the recovery receipt",
+        "   (`cleared_at`, `duration_s`, the cleared matrix) into the authority record. Nothing",
+        "   needs to be re-filed or re-spawned by hand.",
+    ]
+    return "\n".join(lines)
+
+
 def _file_tick_yield_actor(
     conn: sqlite3.Connection,
     yielded: DispatcherTickYielded,
@@ -4623,8 +4886,17 @@ def _file_tick_yield_actor(
     Best-effort: a board that refuses the write is logged with the key it could not file and never
     takes the tick down.
     """
+    substrate = getattr(yielded, "kind", TICK_YIELD_KIND_TREE_SKEW) == SUBSTRATE_ADMISSION_KIND
     sig = _yield_signature(yielded)
-    prefix = f"{TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}{sig}"
+    # KIND-scoped key, title, assignee and event: a substrate episode and a skew episode can never
+    # absorb each other's cards, and each retirement sweep selects only its own.
+    prefix = (
+        f"{SUBSTRATE_ADMISSION_ACTOR_IDEMPOTENCY_PREFIX if substrate else TICK_YIELD_ACTOR_IDEMPOTENCY_PREFIX}"
+        f"{sig}"
+    )
+    actor_title = SUBSTRATE_ADMISSION_ACTOR_TITLE if substrate else TICK_YIELD_ACTOR_TITLE
+    actor_assignee = SUBSTRATE_ADMISSION_ACTOR_ASSIGNEE if substrate else TICK_YIELD_ACTOR_ASSIGNEE
+    actor_event = SUBSTRATE_ADMISSION_ACTOR_EVENT if substrate else TICK_YIELD_ACTOR_EVENT
     filed_on_conn, filed_on, close_it = _ops_board_connection(conn)
     try:
         # A skew that SURVIVED a reload is not a reload problem: file ONE escalation and stop
@@ -4641,7 +4913,7 @@ def _file_tick_yield_actor(
         # the fleet had already left (b1b9cb6 -> 47558cf, five minutes) into an "escalation" that
         # cited a guard card closed long before. The escalation is idempotent per EPISODE, so
         # every later refusal of the same surviving skew returns the same card.
-        survived = _skew_survived_a_reload(filed_on_conn, yielded)
+        survived = None if substrate else _skew_survived_a_reload(filed_on_conn, yielded)
         if survived is not None:
             return _file_tick_yield_escalation(
                 filed_on_conn, yielded, board=board, filed_on=filed_on,
@@ -4658,17 +4930,24 @@ def _file_tick_yield_actor(
             return existing["id"]
         key = f"{prefix}:{int(window_start)}"
 
-        body = _tick_yield_actor_body(
-            yielded, board=board, status_path=status_path, streak=streak,
-            first_tick=first_tick, last_tick=last_tick, filed_on=filed_on,
-            episode=_episode_identity(sig, window_start or first_tick),
-            escalation_ref=escalation_ref,
-        )
+        if substrate:
+            body = _substrate_admission_body(
+                yielded, board=board, status_path=status_path, streak=streak,
+                first_tick=first_tick, last_tick=last_tick, filed_on=filed_on,
+                episode=_episode_identity(sig, window_start or first_tick),
+            )
+        else:
+            body = _tick_yield_actor_body(
+                yielded, board=board, status_path=status_path, streak=streak,
+                first_tick=first_tick, last_tick=last_tick, filed_on=filed_on,
+                episode=_episode_identity(sig, window_start or first_tick),
+                escalation_ref=escalation_ref,
+            )
         # The ladder reads the card's OWN declaration line, so the body is built FIRST: asking it
         # about an empty body is how these cards were born in the tier's rest band (790000) while
         # declaring nothing at all.
         priority, ladder_note = _tick_yield_actor_priority(
-            title=TICK_YIELD_ACTOR_TITLE, body=body, board=filed_on or board or "",
+            title=actor_title, body=body, board=filed_on or board or "",
         )
         if ladder_note:
             body += f"\n\n_priority note: {ladder_note}_"
@@ -4677,17 +4956,18 @@ def _file_tick_yield_actor(
         # for a seat to be dispatched against it. Pinned by test_guard_card_is_ready_and_top_band.
         actor_id = _kb.create_task(
             filed_on_conn,
-            title=TICK_YIELD_ACTOR_TITLE,
+            title=actor_title,
             body=body,
-            assignee=TICK_YIELD_ACTOR_ASSIGNEE,
+            assignee=actor_assignee,
             created_by="kanban-dispatcher",
             priority=priority,
             idempotency_key=key,
         )
         with _kb.write_txn(filed_on_conn):
             _kb._append_event(
-                filed_on_conn, actor_id, TICK_YIELD_ACTOR_EVENT,
+                filed_on_conn, actor_id, actor_event,
                 {
+                    "kind": yielded.kind,
                     "boot_fingerprint": yielded.boot_fingerprint,
                     "disk_fingerprint": yielded.disk_fingerprint,
                     "boot_pid": yielded.boot_pid,
@@ -4702,6 +4982,13 @@ def _file_tick_yield_actor(
                     "escalation_ref": escalation_ref,
                 },
             )
+            if substrate:
+                # The matrix rides the event, not just the body: a card's body is prose a reader
+                # must parse, an event payload is what the sweeps and the audit read.
+                _kb._append_event(
+                    filed_on_conn, actor_id, SUBSTRATE_ADMISSION_HELD_EVENT,
+                    {"matrix": yielded.matrix, "sig": sig, "held": []},
+                )
         return actor_id
     except Exception as exc:
         _kb._log.warning(
@@ -5241,13 +5528,31 @@ def _tick_refused_for_tree_skew(
             sig = _yield_signature(yielded)
             first_tick = int(state.get("first_tick") or state.get("recorded_at") or time.time())
             episode = state.get("episode") or _episode_identity(sig, first_tick)
-            delivery = state.get("delivery") or {}
-            if not delivery.get("at"):
-                delivery = _deliver_tree_skew_escalation(
-                    yielded, episode=episode, status_path=status_path, streak=streak,
-                    record=state,
-                )
-                _merge_tick_yield_delivery(delivery)
+            if getattr(yielded, "kind", TICK_YIELD_KIND_TREE_SKEW) == SUBSTRATE_ADMISSION_KIND:
+                # The substrate door is the DM PAIR on the boot-resident gateway (invariant I5),
+                # NOT the escalation ledger: on 2026-10-26 every sanctioned raise path lived on the
+                # denied volume, so a guard that raised through it was silent in the one episode
+                # that needed it. One message per episode per target, bounded by the authority
+                # record's own ``delivery`` block -- a fourth refusal cannot re-notify (I6).
+                if getattr(yielded, "report", None) is not None:
+                    # Carrier 1 of the ONE signal: the authority record is written on EVERY
+                    # refused tick (the tick-streak sibling above is carrier 2, per-door
+                    # corroboration). The streak is derived from the signature, so the two
+                    # records agree in count and neither is the sole copy.
+                    _sa.record(yielded.report, door="dispatcher")
+                authority = _sa.read_status()
+                if not (authority.get("delivery") or {}).get("at"):
+                    delivery = _sa.deliver_once(authority, door="dispatcher")
+                    _sa.merge_delivery(delivery)
+                delivery = {}
+            else:
+                delivery = state.get("delivery") or {}
+                if not delivery.get("at"):
+                    delivery = _deliver_tree_skew_escalation(
+                        yielded, episode=episode, status_path=status_path, streak=streak,
+                        record=state,
+                    )
+                    _merge_tick_yield_delivery(delivery)
             _file_tick_yield_actor(
                 conn, yielded, board=board, status_path=status_path, streak=streak,
                 first_tick=first_tick,
@@ -5257,6 +5562,35 @@ def _tick_refused_for_tree_skew(
             )
     logger.error("kanban dispatcher: %s (status record: %s)", yielded, status_path)
     return DispatchResult(tick_yielded=str(yielded))
+
+
+def _raise_if_substrate_denied(*, report: Any = None, tier: str = "global") -> None:
+    """DOOR 1 (design §3.2): a ``tier: global`` denial refuses the WHOLE dispatcher tick.
+
+    Probe -> (record) -> refuse. The probe runs once per tick and its readings are cached for
+    ``FRESH_WITHIN``, so two 60 s tickers cost ~N syscalls each, not 2N.
+
+    * refused -> raise :class:`DispatcherTickYielded` with ``kind="substrate_denied"`` and the
+      report attached (the caller writes the record and files the card);
+    * denied but NOT refused (the kill switch is off) -> RECORD and admit: rollback step 1 turns
+      the guard into a recorder, never into a second outage;
+    * everything else -> return, having written nothing. A healthy tick must not touch the record,
+      or it would erase the recovery receipt written by the tick that cleared the episode.
+
+    I4 lives in ``substrate_access.refusal_for``: an ``indeterminate`` reading can never get here
+    as a refusal.
+    """
+    probe = report if report is not None else _sa.probe_all(tier=tier)
+    if _sa.refusal_for(probe, tier=tier):
+        raise DispatcherTickYielded(
+            _sa.signature(probe),
+            probe.summary(),
+            boot_pid=os.getpid(),
+            kind=SUBSTRATE_ADMISSION_KIND,
+            report=probe,
+        )
+    if probe.denied_global:
+        _sa.record(probe, door="dispatcher")
 
 
 def dispatch_once(
@@ -5309,6 +5643,7 @@ def dispatch_once(
 
     try:
         _raise_if_tree_skewed()
+        _raise_if_substrate_denied()
     except DispatcherTickYielded as yielded:
         result = _tick_refused_for_tree_skew(conn, yielded, board=board, dry_run=dry_run)
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -5356,6 +5691,10 @@ def dispatch_once(
             # Both doors keep their own fault isolation: neither may take a tick down.
             if not dry_run:
                 _retire_cleared_tree_skew_cards(conn, board=resolved_board)
+                # DOOR 3's retirement (card t_0ae49984): the substrate episode's guard, same
+                # placement proof and the same fault isolation -- a tick that reached here passed
+                # the substrate door, so the episode is over.
+                _retire_cleared_substrate_cards(conn, board=resolved_board)
             result = _locked_tick()
             # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
             _kbc._maybe_checkpoint_wal(conn, db_path)
@@ -5489,6 +5828,16 @@ def _dispatch_lane_task(
         result.skipped_top_level_only.append(task_id)
         return False
 
+    # SUBSTRATE ADMISSION -- door 3 (card t_0ae49984, design t_72e9bf03): a card whose own
+    # workspace root is on a denied substrate is HELD -- NOT claimed, NOT failed, NOT blocked --
+    # and this tick carries on with its siblings (invariant I2). Deliberately BEFORE the claim:
+    # claim-then-refuse would write a claim and charge the card a failure it did not earn, and it
+    # would mint a workspace on a volume nobody can read. The card stays `ready`, so the next tick
+    # re-probes and admits it the moment the substrate is readable again.
+    if _hold_substrate_denied(conn, task_id, dry_run=dry_run, board=board):
+        result.substrate_held.append(task_id)
+        return False
+
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -5560,6 +5909,107 @@ def _dispatch_lane_task(
         ):
             result.auto_blocked.append(claimed.id)
         return False
+
+
+def _hold_substrate_denied(
+    conn: sqlite3.Connection, task_id: str, *, dry_run: bool = False,
+    board: Optional[str] = None,
+) -> bool:
+    """DOOR 3 (design §3.4, card ``t_0ae49984``): is THIS card's own workspace root readable?
+
+    Returns True when the card must be HELD: its resolved workspace root answered a DENIAL to a
+    real operation. The card is NOT claimed, NOT failed, NOT blocked and NOT failure-counted
+    (invariant I1) -- it stays ``ready``, so the next tick re-probes and admits it the moment the
+    substrate is readable. Siblings are unaffected (invariant I2): this is asked per card, and a
+    False answer lets that card through unchanged.
+
+    WHY THE ROOT, NOT THE WORKSPACE: resolving a worktree workspace MINTS it, and minting one on a
+    denied volume is exactly what this gate exists to prevent. ``planned_workspace_root`` computes
+    where the workspace would land without creating anything, and the probe runs on the nearest
+    existing ancestor -- which, during the measured fault, IS the denied path itself, because
+    ``stat``/``exists``/``isdir`` answered TRUE throughout it (F1).
+
+    NOT SILENT: ONE deduped ``substrate_admission_held`` event plus ONE comment per hold episode,
+    the same shape as the top-level-only door -- the guard runs every tick, and a row per tick
+    would bury the board with the noise that makes a starved board read as an idle one. ``dry_run``
+    reports the hold and writes nothing. A store fault never takes the tick down.
+    """
+    try:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+    except Exception:
+        _kb._log.debug("kanban dispatch: substrate hold could not read %s", task_id, exc_info=True)
+        return False
+    if row is None:
+        return False
+    try:
+        root = _kbw.planned_workspace_root(
+            {"workspace_kind": row["workspace_kind"], "workspace_path": row["workspace_path"]},
+            board=board,
+        )
+    except Exception:
+        _kb._log.debug("kanban dispatch: no planned root for %s", task_id, exc_info=True)
+        return False
+    if root is None:
+        return False
+    probe = _sa.unit_substrate([root], tier="unit")
+    denied = _sa.refusal_for(probe, tier="unit")
+    if not denied:
+        return False
+    if dry_run:
+        return True
+    # Count the unit on the AUTHORITY record (design §3.4: "counted in the record as held").
+    # `yielded=False` is the honest state: the global tier is green and only THIS unit is held, so
+    # the record must not read as "the host is refusing to spawn" (that state owns the guard card
+    # and the retirement sweep).
+    try:
+        _sa.record(
+            probe, door="dispatcher", yielded=False,
+            held=[{
+                "task": task_id,
+                "root": str(root),
+                "errno": denied[0].errno if denied else None,
+                "op": denied[0].op if denied else None,
+            }],
+        )
+    except Exception:  # health: allow BLE001 -- evidence, never the hold itself
+        _kb._log.warning(
+            "kanban dispatch: could not record the substrate hold for %s", task_id, exc_info=True,
+        )
+    payload = {
+        "reason": "substrate_denied",
+        "root": str(root),
+        "sig": _sa.signature(probe),
+        "matrix": probe.matrix(),
+        "board": board,
+    }
+    try:
+        with _kb.write_txn(conn):
+            last = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                f"AND kind = '{SUBSTRATE_ADMISSION_HELD_EVENT}' "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if last is None or last["payload"] != _kb._json_or_null(payload):
+                _kb._append_event(conn, task_id, SUBSTRATE_ADMISSION_HELD_EVENT, payload)
+                _kb.add_comment(
+                    conn, task_id, "dispatcher",
+                    f"**Held by substrate admission** -- {SUBSTRATE_ADMISSION_PREFIX}\n\n"
+                    f"This card was NOT claimed, failed or blocked: its own workspace root "
+                    f"`{root}` answered a denial to a real operation "
+                    f"({_sa._matrix_sentence(probe.matrix())}), so a worker started on it now "
+                    f"would be born into a substrate nobody can read.\n\n"
+                    f"It stays `ready` and the next dispatcher tick re-probes; nothing here needs "
+                    f"a decision or a card-level retry. The evidence record is "
+                    f"`{_sa.status_path()}` (boot volume). Note that `stat`/`exists` answer OK "
+                    f"during this fault -- only the operation itself is the signal.",
+                )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: substrate hold could not be recorded for %s", task_id, exc_info=True,
+        )
+    return True
 
 
 def _hold_top_level_only(
@@ -7139,6 +7589,7 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
+from hermes_cli import substrate_access as _sa
 
 # The tree-skew RETIREMENT doors (card t_028ad743) live in a topical sibling and are re-exported
 # here: ``dispatch_once`` calls them by name at tick time, and the tests patch this module. Imported
@@ -7147,6 +7598,7 @@ from hermes_cli.kanban_db_dispatch_retire import (
     _close_cleared_cards_on,
     _close_cleared_tick_yield_cards,
     _retire_cleared_tree_skew_cards,
+    _retire_cleared_substrate_cards,
     _retire_tree_skew_actors,
     _tree_skew_actor_pid_from_key,
     _tree_skew_actor_provenance,

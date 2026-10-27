@@ -14,6 +14,170 @@ logger = logging.getLogger("cron.scheduler")
 _YIELD_LOG_INTERVAL_SECONDS = 3600.0
 _last_yield_log: dict[str, object] = {}
 
+# Same shape, same reason, for the substrate hold (card t_0ae49984): the probe runs every tick and
+# a line per interval would be the noise that makes a starved loop read as an idle one.
+_last_substrate_hold_log: dict[str, object] = {}
+
+
+def _log_substrate_hold_once(key: str, reason: str) -> None:
+    """Log a substrate hold at error level once per episode (keyed by signature / job set)."""
+    global _last_substrate_hold_log
+    now = time.monotonic()
+    last_key = _last_substrate_hold_log.get("key")
+    last_at = _last_substrate_hold_log.get("at")
+    last_at = float(last_at) if isinstance(last_at, (int, float)) else 0.0
+    if last_key != key or (now - last_at) >= _YIELD_LOG_INTERVAL_SECONDS:
+        logger.error(
+            "Cron tick held by substrate admission (%s): %s. Nothing was advanced or marked "
+            "failed -- the overdue work fires on the first tick after the substrate is readable.",
+            key, reason)
+    _last_substrate_hold_log = {"key": key, "at": now}
+
+
+def _substrate_tick_gate():
+    """DOOR 2 (design §3.3): probe the GLOBAL tier; the report when it denies, else ``None``.
+
+    Called from the tick BEFORE the lock race and BEFORE any advance, so a refusal costs nothing
+    and loses nothing. Fail-open in every direction that is not a real refusal: a probe that
+    raises, a broken map, or an indeterminate reading all let the tick through (invariant I4) --
+    the gate may never be the reason work stops.
+    """
+    from hermes_cli import substrate_access as _sa
+
+    try:
+        report = _sa.probe_all(tier="global")
+    except Exception:  # health: allow BLE001 -- the gate must never decide by crashing
+        logger.debug("Cron tick: global substrate probe failed; admitting the tick", exc_info=True)
+        return None
+    if not _sa.refusal_for(report, tier="global"):
+        return None
+    try:
+        _sa.record(report, door="cron")
+    except Exception:  # health: allow BLE001 -- the record is evidence, never the refusal itself
+        logger.warning("Cron tick: could not record the substrate refusal", exc_info=True)
+    return report
+
+
+def _job_substrate_roots(_sched, job: dict) -> list:
+    """The roots THIS job's entrypoint needs: its absolute script paths and its workdir."""
+    from pathlib import Path
+
+    out: list = []
+    script = str(job.get("script") or "").strip()
+    if script.startswith("/"):
+        out.append(Path(script))
+    workdir = str(job.get("workdir") or "").strip()
+    if workdir.startswith("/"):
+        out.append(Path(workdir))
+    elif not out:
+        # No absolute path at all: the job runs from the cron dir, so that is what must be readable.
+        try:
+            out.append(Path(_sched._get_lock_paths()[0]))
+        except Exception:  # health: allow BLE001 -- no derivable root means fail open
+            return []
+    return out
+
+
+def _job_overdue_seconds(job: dict, now: float):
+    """How overdue this job is, in seconds; ``None`` when it cannot be read (then HOLD, not skip)."""
+    raw = job.get("next_run_at")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, now - float(raw))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import UTC, datetime
+
+        text = str(raw).strip().replace("Z", "+00:00")
+        stamp = datetime.fromisoformat(text)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=UTC)
+        return max(0.0, now - stamp.timestamp())
+    except Exception:  # health: allow BLE001 -- unreadable age must fail toward HOLD
+        return None
+
+
+def _split_jobs_by_substrate(_sched, due_jobs: list):
+    """``(admitted, held, overdue)`` -- DOOR 3 for cron (design §3.4).
+
+    A due job whose OWN entrypoint sits on a denied root is HELD: removed from this tick with
+    ``next_run_at`` untouched and no ``last_status: error``. Its readable siblings still fire
+    (invariant I2 -- the blast radius rule), which is why this is per job and not a tick refusal.
+
+    ``overdue`` is the deterministic exception the design names: a job already older than the
+    map's ``hold_catchup_hours`` is SKIPPED-AND-ADVANCED rather than held, because a three-day
+    outage must not burst-fire fifty DAGs into the recovery window. That decision is made from
+    ``next_run_at`` and the map's own number -- no inference -- and it is recorded.
+    """
+    from hermes_cli import substrate_access as _sa
+
+    if not due_jobs:
+        return due_jobs, [], []
+    try:
+        catchup_h = float(_sa.roots().hold_catchup_hours or 6.0)
+    except Exception:  # health: allow BLE001 -- an unreadable map means the 6 h default
+        catchup_h = 6.0
+    now = time.time()
+    kept: list = []
+    held: list = []
+    overdue: list = []
+    for job in due_jobs:
+        roots = _job_substrate_roots(_sched, job)
+        if not roots:
+            kept.append(job)
+            continue
+        probe = _sa.unit_substrate(roots, tier="unit")
+        denied = _sa.refusal_for(probe, tier="unit")
+        if not denied:
+            kept.append(job)
+            continue
+        age = _job_overdue_seconds(job, now)
+        entry = {
+            "job": job.get("id"),
+            "name": job.get("name"),
+            "roots": [str(p) for p in roots],
+            "errno": getattr(denied[0], "errno", None),
+            "op": getattr(denied[0], "op", None),
+            "overdue_s": age,
+        }
+        entry["_probe"] = probe
+        if age is not None and age > catchup_h * 3600.0:
+            overdue.append(entry)
+            kept.append(job)  # advance + fire: the design's bounded-catchup rule
+        else:
+            held.append(entry)
+    return kept, held, overdue
+
+
+def _note_substrate_units(door_entries: list, *, door: str = "cron") -> None:
+    """Record held/skipped units on the AUTHORITY record, and say so once per episode.
+
+    ``held`` enumerates EVERY unit (job id, its roots, the errno) -- that list is the authoritative
+    record, so the matrix of the first denied probe is the illustration, never the claim.
+    """
+    from hermes_cli import substrate_access as _sa
+
+    entries = [e for e in door_entries if e.get("_probe") is not None]
+    if not entries:
+        return
+    public = [{k: v for k, v in e.items() if k != "_probe"} for e in entries]
+    probe = entries[0]["_probe"]
+    try:
+        _sa.record(probe, door=door, held=public)
+    except Exception:  # health: allow BLE001
+        logger.warning("Cron tick: could not record %d held unit(s)", len(public), exc_info=True)
+    try:
+        matrix = _sa._matrix_sentence(probe.matrix())
+    except Exception:  # health: allow BLE001
+        matrix = "probe matrix unavailable"
+    _log_substrate_hold_once(
+        f"{door}:{','.join(str(e.get('job')) for e in public)}",
+        f"{len(public)} due job(s) held ({matrix})",
+    )
+
+
 
 def _log_tick_yield_once(reason: str) -> None:
     """Log the yield at error level once per episode (skew signature)."""
@@ -85,6 +249,18 @@ def _tick_admitted(
         _log_tick_yield_once(f"boot={_skew[0]} disk={_skew[1]}")
         raise _sched.CronTickYielded(_skew[0], _skew[1])
 
+    # Substrate admission, DOOR 2 (card t_0ae49984, design t_72e9bf03 §3.3) — BEFORE the lock race
+    # and BEFORE any advance, exactly like the stale-code gate above. A refused root means a job
+    # dispatched now would die on EPERM and write an error row for a machine fault; the tick is held
+    # instead, next_run_at untouched, and the overdue work fires on the first readable tick.
+    _substrate = _substrate_tick_gate()
+    if _substrate is not None:
+        from hermes_cli import substrate_access as _sa
+        _log_substrate_hold_once(
+            f"global:{_sa.signature(_substrate)}", _sa._matrix_sentence(_substrate.matrix()),
+        )
+        raise _sched.CronSubstrateDenied(_substrate)
+
     lock_fd = _acquire_tick_lock_or_degrade(_sched)
     if lock_fd is None:
         return 0
@@ -115,9 +291,21 @@ def _tick_admitted(
         due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
+        # Substrate admission, DOOR 3 for cron (design §3.4): hold only the jobs whose OWN
+        # entrypoint sits on a denied root — before the advance, so no fire is lost and no
+        # `last_status: error` row is written for a machine fault. Readable siblings still fire.
+        due_jobs, _substrate_held, _substrate_overdue = _split_jobs_by_substrate(_sched, due_jobs)
+        if _substrate_held or _substrate_overdue:
+            _note_substrate_units(_substrate_held + _substrate_overdue)
+
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
-            if verbose:
+            if _substrate_held:
+                _sched.logger.info(
+                    "%s - %d due job(s) held by substrate admission; nothing else due",
+                    _sched._hermes_now().strftime('%H:%M:%S'), len(_substrate_held),
+                )
+            elif verbose:
                 # Idle tick: skip config load + pool partitioning entirely (#33612 — the gateway ticker
                 # calls tick(verbose=False) every 60s, so idle ticks previously fell through to
                 # load_config()). Still run the post-tick MCP orphan sweep: main intentionally sweeps on
