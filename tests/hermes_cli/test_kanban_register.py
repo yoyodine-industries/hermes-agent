@@ -29,6 +29,7 @@ What these tests pin, in the order the feature is layered:
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -122,7 +123,14 @@ def _count(board):
 
 
 def _designate(board, register_id):
-    kb.write_board_metadata(board, operator_register=register_id)
+    # The production designation WRITER is absent from this live line - the register stack's
+    # implementation did not come across with its tests (card t_740aa822 restores or retires
+    # it). The read path these tests exercise is intact, so designate through the store the
+    # reader actually reads rather than skipping the register tests wholesale.
+    path = kb.board_metadata_path(board)
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta[kr.META_KEY] = register_id
+    path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
 
 @pytest.fixture
