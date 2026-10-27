@@ -1484,6 +1484,9 @@ def _handle_create(args: dict, **kw) -> str:
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),
+            # The caller's own statement that it MEANS to re-open a keyed identity whose card
+            # is closed: the filing-budget door refuses `duplicate-closed-key` otherwise.
+            resurrect=_parse_bool_arg(args, "resurrect"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
@@ -1506,6 +1509,14 @@ def _handle_create(args: dict, **kw) -> str:
             # The receipt's dead-assignee probe needs the live profiles; injected at the
             # door (this process knows them) rather than guessed inside the kernel.
             profiles=list_profile_names())
+        # THE FILING-BUDGET REFUSAL (card t_80ff9b6a). The kernel answered with a refusal
+        # rather than a card: no row exists, so there is nothing to read back and nothing to
+        # subscribe to. The refusal line is the whole answer THIS door owes a worker - the
+        # kernel's own module already printed it to stderr - and it rides the tool's error
+        # envelope so the worker records it in its run output instead of discovering later
+        # that a card it believes it filed does not exist.
+        from hermes_cli.kanban_filing_policy import is_refusal as _is_refusal
+        _check(not _is_refusal(new_tid), str(new_tid))
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         # gated/gated_by keep their shape, and a create with no parents answers exactly what
         # it always did; with parents, parents_state/standing/warning/board_dispatch come from

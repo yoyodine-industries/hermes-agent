@@ -604,6 +604,13 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "exists, return that task's id instead of creating "
                 "a duplicate. Useful for retry-safe automation."
         )),
+        "resurrect": _prop("boolean", (
+                "With idempotency_key: file it again even though a "
+                "task with that key was already CLOSED inside the "
+                "filing window. Without it the create answers "
+                "'refused: duplicate-closed-key' and names the "
+                "closed card."
+        )),
         "max_runtime_seconds": _prop("integer", (
                 "Per-task runtime cap. When exceeded, the "
                 "dispatcher SIGTERMs the worker and re-queues the "
