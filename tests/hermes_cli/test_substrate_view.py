@@ -153,6 +153,29 @@ def test_a_record_nobody_refreshed_is_unknown_with_its_last_known_state(home):
     assert "stale after" in view["detail"]
 
 
+def test_a_stale_record_names_the_true_cause_and_the_way_to_measure_it(home, capsys):
+    """A stale record means UNMEASURED — the hint must not blame a tick that did not run.
+
+    ``substrate_access.record`` writes the authority record ONLY on a denial and on a
+    clearing; a healthy tick deliberately leaves it alone ("a healthy tick must not touch the
+    record, or it would erase the recovery receipt"). ``guards_blind`` is folded in at write
+    time, so a denial's record already carries it and needs no live fold. The old hint —
+    "if neither has run since the record was written" — named a cause the record cannot have,
+    and on 2026-10-26 it pointed readers at the scheduler while the substrate was the fault.
+    """
+    _denied_record(home, age_s=sv.STALE_AFTER + 60)
+    detail = sv.read()["detail"]
+    assert "only when a denial is observed" in detail, "the detail must state what a stale record means"
+    assert "not been measured" in detail, "unmeasured is the claim, and it must be the one made"
+
+    finding = _doctor_row()
+    out = capsys.readouterr().out
+    assert "Substrate UNKNOWN" in out
+    assert "probe_all(use_cache=False)" in out, "the hint must name the on-demand measurement"
+    assert "if neither has run since" not in out, "the false cause is gone from the doctor row"
+    assert not finding.manual_issues, "an unmeasured substrate is still not a fault to escalate"
+
+
 def test_a_fresh_admitted_record_is_ok(home):
     _record(home)
     view = sv.read()
@@ -271,6 +294,31 @@ def test_the_mirror_never_hides_a_guard_that_just_went_blind(home):
     assert view["guards_blind"] == 1
     assert view["guards_source"] == "ledger"
     assert view["guards"][0]["row"] == "pre_tool_call[0]:write_file"
+
+
+def test_the_mirror_counts_a_pre_leg_b_row_list_as_its_rows(home):
+    """LEG A wrote the blind ROWS in ``guards_blind``; the acting card then reads "2 of 5".
+
+    A mirror that understands only the int shape falls back to the live ledger and can print
+    "0 of 1" beside that card -- the contradiction :func:`_reconcile_guards` exists to
+    prevent, in the one older shape the record has actually carried on this host.
+    """
+    _registry(home, [("write_file", SHARED_TREES), ("patch", SHARED_TREES), ("terminal", UV_GUARD)])
+    rows = [
+        {"hook": "guard-shared-trees", "row": "pre_tool_call[0]:write_file",
+         "body": SHARED_TREES, "since": "2026-10-26T16:02:00-04:00", "reason": "EPERM"},
+        {"hook": "guard-shared-trees", "row": "pre_tool_call[1]:patch",
+         "body": SHARED_TREES, "since": "2026-10-26T16:02:00-04:00", "reason": "EPERM"},
+    ]
+    _record(home, guards_blind=list(rows), guards_total=5)
+    view = sv.read()
+    assert view["guards_blind"] == 2
+    assert view["guards_total"] == 5
+    assert view["guards_source"] == "record"
+    assert {item["row"] for item in view["guards"]} == {
+        "pre_tool_call[0]:write_file",
+        "pre_tool_call[1]:patch",
+    }
 
 
 def test_guards_blind_is_folded_into_the_authority_record(home, monkeypatch):

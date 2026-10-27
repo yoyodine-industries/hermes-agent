@@ -537,13 +537,22 @@ def _reconcile_guards(state: str, record: dict, live: dict) -> tuple[int, list, 
         return live_blind, live_items, live.get("total"), "ledger"
     recorded = record.get("guards_blind")
     recorded_items = record.get("guards")
+    if isinstance(recorded, (list, tuple)):
+        # The LEG A build carried the ROWS in ``guards_blind`` and wrote no ``guards`` key.
+        # The list's length is the count it claims and the rows are its detail: the same
+        # guarantee, one older shape (see ``kanban_db_dispatch._blind_guard_count``).
+        if not (isinstance(recorded_items, (list, tuple)) and recorded_items):
+            recorded_items = recorded
+        recorded = len(recorded)
     if isinstance(recorded, bool) or not isinstance(recorded, int) or recorded < 0:
         return live_blind, live_items, live.get("total"), "ledger"
     if recorded >= live_blind:
         total = record.get("guards_total")
         if total is None:
             total = live.get("total")
-        return recorded, list(recorded_items or []), total, "record"
+        items = [row for row in (recorded_items or []) if isinstance(row, dict)] \
+            if isinstance(recorded_items, (list, tuple)) else []
+        return recorded, items, total, "record"
     return live_blind, live_items, live.get("total"), "ledger"
 
 
@@ -560,7 +569,11 @@ def _detail(state: str, reason: Optional[str], error: Optional[str], age: Option
     if reason == "record_unparseable":
         return f"the record is not the JSON document the gate writes ({error})"
     if reason == "record_stale":
-        return f"the record has not been refreshed in {age:.0f}s (stale after {stale_after:.0f}s)"
+        return (
+            f"no denial has been recorded in {age:.0f}s and the substrate has not been measured "
+            "since: a verdict is written only when a denial is observed and when one clears "
+            f"(stale after {stale_after:.0f}s)"
+        )
     if reason == "record_unstamped":
         return "the record carries no readable timestamp, so its freshness cannot be judged"
     return "unknown"

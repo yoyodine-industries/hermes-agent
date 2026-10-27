@@ -4706,6 +4706,42 @@ def _ops_board_connection(fallback_conn: sqlite3.Connection):
         return fallback_conn, fallback_board, False
 
 
+def _record_rows(record: Any, *keys: str) -> list[dict]:
+    """The dict rows under the first of ``keys`` that actually HAS rows; anything else dropped.
+
+    The authority record is written by ANOTHER process, so its shape is a claim to be checked,
+    not trusted: this runs inside a live refusal, where an exception costs exactly the card
+    that explains the stall (see :func:`_blind_guard_count`). An EMPTY list is not an answer --
+    a LEG A record carries ``guards: []``-shaped nothing and its rows in ``guards_blind``.
+    """
+    for key in keys:
+        value = record.get(key) if isinstance(record, dict) else None
+        if isinstance(value, (list, tuple)):
+            rows = [row for row in value if isinstance(row, dict)]
+            if rows:
+                return rows
+    return []
+
+
+def _blind_guard_count(record: Any) -> int:
+    """The blind-guard COUNT, tolerant of BOTH shapes the record has carried.
+
+    Leg B writes ``guards_blind`` as an int and keeps the rows in ``guards``. The LEG A build
+    deployed between the two wrote the ROW LIST in ``guards_blind`` -- and a bare ``int()`` on
+    that list raised TypeError inside the refusal path on 2026-10-26, so the hold was recorded
+    (matrix, episode, streak) and NO card carried it: 33 units queued behind a hold no reader
+    could see. A count is a count; a row list is its length.
+    """
+    value = record.get("guards_blind") if isinstance(record, dict) else None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return 0
+
+
 def _substrate_admission_body(
     yielded: DispatcherTickYielded,
     *,
@@ -4732,10 +4768,15 @@ def _substrate_admission_body(
             return "?"
 
     record = _sa.read_status()
+    if not isinstance(record, dict):  # read_status never raises; a stub caller might still lie
+        record = {}
+    # LEG A carried the blind ROWS in `guards_blind`; a record written by that build has no
+    # `guards` key at all, so both keys are consulted and the rows are read from whichever
+    # holds a list. The count comes from `_blind_guard_count` for the same reason.
     matrix = yielded.matrix or (record.get("matrix") or [])
-    held = record.get("held") or []
-    blind = record.get("guards") or []
-    blind_count = record.get("guards_blind")
+    held = _record_rows(record, "held")
+    blind = _record_rows(record, "guards", "guards_blind")
+    blind_count = _blind_guard_count(record)
     blind_total = record.get("guards_total")
 
     lines = [
@@ -4780,7 +4821,7 @@ def _substrate_admission_body(
         "",
         "## Guards blind (fail-open hooks)",
         "",
-        f"- **{int(blind_count or 0)} of {blind_total if blind_total is not None else '?'} "
+        f"- **{blind_count} of {blind_total if blind_total is not None else '?'} "
         "launcher-armed hook row(s) are failing OPEN** — observation is lost, and nothing is "
         "being blocked by them either. Counted, never silent: a fail-open nobody reads is a "
         "silent failure.",

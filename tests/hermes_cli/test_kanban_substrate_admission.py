@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import builtins
 import errno
+import json
 import os
 import stat
+import time
 
 import pytest
 
@@ -390,3 +392,138 @@ def test_the_gate_is_off_when_the_kill_switch_is_set(monkeypatch):
     finally:
         monkeypatch.delenv("HERMES_SUBSTRATE_GATE", raising=False)
         importlib.reload(sa)
+
+
+# ---------------------------------------------------------------------------------------
+# The ACTING CARD's body: it renders a PRE-leg-B record instead of dying on it
+# ---------------------------------------------------------------------------------------
+
+BLIND_ROWS = [
+    {
+        "hook": "guard-shared-trees",
+        "row": "pre_tool_call[0]:write_file",
+        "body": "/opt/hermes_prod/yaan-majordomo/ops-checks/guard-shared-trees.py",
+        "since": "2026-10-26T16:02:00-04:00",
+        "reason": "EPERM",
+    },
+    {
+        "hook": "guard-shared-trees",
+        "row": "pre_tool_call[1]:patch",
+        "body": "/opt/hermes_prod/yaan-majordomo/ops-checks/guard-shared-trees.py",
+        "since": "2026-10-26T16:02:00-04:00",
+        "reason": "EPERM",
+    },
+]
+
+
+def _record_document(**overrides):
+    """A DENIED authority record. LEG A wrote ``guards_blind`` as the ROW LIST; leg B writes a count."""
+    now = time.time()
+    record = {
+        "version": 2,
+        "yielded": True,
+        "kind": "substrate_denied",
+        "door": "dispatcher",
+        "sig": "cafe",
+        "streak": 5,
+        "first_tick": now - 600,
+        "last_tick": now - 5,
+        "threshold": 3,
+        "episode": "cafe-1",
+        "delivery": None,
+        "matrix": [
+            {
+                "path": "/opt/hermes_prod/yaan-platform",
+                "op": "open",
+                "ok": False,
+                "errno": "EPERM",
+                "ms": 0.4,
+                "tier": "global",
+            }
+        ],
+        "held": [],
+        "guards_blind": list(BLIND_ROWS),
+        "guards_total": 5,
+        "read_findings": [],
+        "cleared_at": None,
+        "duration_s": None,
+        "recorded_at": now,
+    }
+    record.update(overrides)
+    return record
+
+
+def _write_record(**overrides):
+    target = sa.status_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(_record_document(**overrides)), encoding="utf-8")
+    return target
+
+
+def _yielded(report=None):
+    return kbd.DispatcherTickYielded(
+        "sig-boot",
+        "sig-disk",
+        boot_pid=os.getpid(),
+        kind=kbd.SUBSTRATE_ADMISSION_KIND,
+        report=report,
+    )
+
+
+def _body(yielded=None):
+    return kbd._substrate_admission_body(
+        yielded or _yielded(),
+        board="platform",
+        status_path="/tmp/dispatcher_tick.json",
+        streak=5,
+        first_tick=1_700_000_000,
+        last_tick=1_700_000_100,
+        filed_on="platform",
+        episode="cafe-1",
+    )
+
+
+def test_the_acting_body_renders_a_pre_leg_b_row_list_as_its_count():
+    """The body is written INSIDE a live refusal, so it must not raise on a legacy record.
+
+    Leg A wrote ``guards_blind`` as the row list; leg B (this branch) writes an int and
+    keeps the rows in ``guards``. A bare ``int()`` on the old shape raised TypeError in the
+    one path whose whole job is to explain the stall -- 2026-10-26, after which the hold was
+    recorded (``held``, episode, matrix) and no card carried it: 33 units queued unread.
+    """
+    _write_record()
+    body = _body()
+
+    assert "**2 of 5" in body, "the list-shaped count is the number of blind rows"
+    assert "guard-shared-trees" in body, "the legacy rows are the detail the card exists to carry"
+    assert "EPERM" in body
+
+    # A record that carries BOTH keys, the modern one empty, must still find the legacy rows.
+    _write_record(guards=[], guards_blind=list(BLIND_ROWS))
+    body_both = _body()
+    assert "**2 of 5" in body_both
+    assert "guard-shared-trees" in body_both
+
+
+def test_the_acting_body_renders_the_shipped_count_shape_unchanged():
+    _write_record(guards_blind=2, guards=list(BLIND_ROWS))
+    body = _body()
+    assert "**2 of 5" in body
+    assert "guard-shared-trees" in body
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"guards_blind": None, "guards_total": None},
+        {"guards_blind": "2", "guards_total": "5"},
+        {"guards_blind": 0, "guards_total": 0},
+        {"guards_blind": [], "guards_total": 5},
+        {"guards_blind": [{"row": "x"}], "held": [{"unit": "u"}, "not-a-dict"]},
+    ],
+)
+def test_the_acting_body_never_raises_on_a_malformed_record(overrides):
+    """A record is written by another process; a body that trusts its types loses the card."""
+    _write_record(**overrides)
+    body = _body()
+    assert "Guards blind" in body

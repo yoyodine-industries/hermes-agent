@@ -107,8 +107,10 @@ def _check_substrate(should_fix: bool, f: Finding) -> None:
         )
     if reason == "record_stale":
         check_info(
-            "the writers are the dispatcher and cron ticks: if neither has run since the "
-            "record was written, the substrate is unmeasured rather than healthy"
+            "unmeasured is not healthy, and the record cannot say which: a verdict is written "
+            "only when a denial is observed and when one clears, so nothing has looked since. "
+            "Measure it now: python3 -c \"from hermes_cli import substrate_access as s; "
+            "print(s.probe_all(use_cache=False).matrix())\""
         )
     check_info(f"guards: {_guard_sentence(view)}")
     _show_guards(view)
