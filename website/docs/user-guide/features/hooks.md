@@ -1923,6 +1923,34 @@ With `fail_closed: true`, each of these now **blocks** the tool call with `hook 
 
 `fail_closed` only applies to blocking-capable events (`pre_tool_call` today); setting it on any other event logs a warning at config-parse time and is ignored. `hermes hooks test` reflects these semantics — the `parsed` line shows exactly the block shape the dispatcher would receive.
 
+### Probe invocations: `HERMES_HOOK_PROBE=1`
+
+`hermes hooks doctor` and `hermes hooks test` fire your hook through the **production path** with a **synthetic payload**. A synthetic payload is shape-identical to a real one — deliberately, so the smoke test exercises the same code — which means a hook **cannot** tell a probe from a real firing by inspecting its stdin. Inference fails on any payload shape that drifts, and it failed here: a hook that files a task when its payload was taskless filed one per doctor run.
+
+So the probe-ness belongs to the **invocation**, and the caller declares it:
+
+```
+HERMES_HOOK_PROBE=1     # in the hook child's environment == "pre-flight smoke: do not act"
+```
+
+- Set by `hermes hooks doctor` (always) and `hermes hooks test` (default), and by nothing else. It is **never** set on a runtime dispatch path: env is the one channel runtime dispatch never populates.
+- Withheld only by `hermes hooks test --no-probe`, for an operator deliberately exercising the real path (e.g. replaying a `--payload-file`).
+
+**If your hook mutates durable state** — files tasks, writes a database, sends a message, creates files — it MUST honour the marker and become observer-only for that invocation. Exit 0 with a log line and no side effect:
+
+```python
+import os, sys, json
+
+payload = json.load(sys.stdin)
+if os.environ.get("HERMES_HOOK_PROBE") == "1":
+    print("probe invocation: observer-only, no action taken", file=sys.stderr)
+    sys.exit(0)          # 0 + empty stdout = "no decision"; a block here would poison every probe
+# … real path: act on the payload …
+sys.exit(0)
+```
+
+Two rules follow from the exit-code contract: **exit 0** (a non-zero exit is a failure the operator is asked to fix) and **no block directive on stdout** (a probe that blocks would make `doctor` report a healthy hook as broken). Hooks that only observe — logging, metrics, formatting — can ignore the marker entirely; nothing about their behaviour changes.
+
 ### Worked examples
 
 #### 1. Auto-format Python files after every write
@@ -2042,9 +2070,9 @@ The command string must match the configured hook command exactly. A path-keyed 
 | Command | What it does |
 |---------|--------------|
 | `hermes hooks list` | Dump configured hooks with matcher, timeout, and consent status |
-| `hermes hooks test <event> [--for-tool X] [--payload-file F]` | Fire every matching hook against a synthetic payload and print the parsed response |
+| `hermes hooks test <event> [--for-tool X] [--payload-file F] [--no-probe]` | Fire every matching hook against a synthetic payload and print the parsed response. Fires in **probe mode** (`HERMES_HOOK_PROBE=1`) unless `--no-probe` |
 | `hermes hooks revoke <command>` | Remove every allowlist entry matching `<command>` (takes effect on next restart) |
-| `hermes hooks doctor` | For every configured hook: check exec bit, allowlist status, mtime drift, JSON output validity, and rough execution time |
+| `hermes hooks doctor` | For every configured hook: check exec bit, allowlist status, mtime drift, and a declared-probe **liveness** run (spawn / exit code / JSON channel — never a behaviour test) |
 
 ### Security
 
