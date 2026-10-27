@@ -483,6 +483,101 @@ def _body(yielded=None):
     )
 
 
+def _units_section(body: str) -> str:
+    """The ``## The affected units`` section alone, so a row assertion cannot be met by the matrix."""
+    start = body.index("## The affected units")
+    end = body.index("\n## ", start + 1)
+    return body[start:end]
+
+
+def test_the_affected_units_name_a_dispatcher_held_card():
+    """The dispatcher's door 3 counts a CARD: ``{task, root, errno, op}`` and no ``unit`` key.
+
+    Card ``t_0b56c6a8``: the row loop read ``unit``/``kind``/``reason`` -- keys no writer has
+    ever emitted -- so the count line said 1 and the row under it said ``None (None): None``.
+    """
+    _write_record(held=[{
+        "task": "t_abc123",
+        "root": "/opt/hermes_prod/yaan-platform",
+        "errno": "EPERM",
+        "op": "open",
+    }])
+    section = _units_section(_body())
+
+    assert "**1**" in section, "the count line was already right and stays right"
+    assert "t_abc123" in section, "the held CARD is the unit a human must be able to name"
+    assert "/opt/hermes_prod/yaan-platform" in section, "the root that answered the denial"
+    assert "EPERM" in section and "open" in section, "the cause, as the probe measured it"
+    assert "(None)" not in section
+
+
+def test_the_affected_units_name_a_cron_held_job():
+    """The cron door counts a JOB: ``{job, name, roots, errno, op, overdue_s}``, roots in a LIST."""
+    _write_record(held=[{
+        "job": "cron-42",
+        "name": "nightly-train",
+        "roots": ["/opt/hermes_prod/dag-a", "/opt/hermes_prod/dag-b"],
+        "errno": "EPERM",
+        "op": "readdir",
+        "overdue_s": 7200,
+    }])
+    section = _units_section(_body())
+
+    assert "**1**" in section
+    for expected in ("cron-42", "nightly-train", "/opt/hermes_prod/dag-a", "/opt/hermes_prod/dag-b"):
+        assert expected in section, f"the held job's identity/location must be named: {expected}"
+    assert "EPERM" in section and "readdir" in section
+    assert "(None)" not in section
+
+
+def test_a_held_list_naming_both_writer_shapes_reads_each_row_on_its_own():
+    """A held list naming BOTH door shapes reads each row on its own -- a robustness arm.
+
+    Not a shape any writer produces today, and the name says ``list`` for that reason:
+    ``substrate_access.record`` writes ``list(held or prior.get("held") or [])``, so a NON-EMPTY
+    ``held`` REPLACES the prior list and the only carry-forward path (a writer passing no
+    ``held``) reproduces the prior rows verbatim -- no record mixes the two doors today. The rows
+    do arrive per door (dispatcher cards, cron jobs) and a future writer may differ from both, so
+    the renderer is asserted against a list it has not been given before.
+    """
+    _write_record(held=[
+        {"task": "t_card1", "root": "/opt/hermes_prod/x", "errno": "EPERM", "op": "open"},
+        {"job": "cron-7", "name": "nightly", "roots": ["/opt/hermes_prod/y"],
+         "errno": "EPERM", "op": "readdir", "overdue_s": 60},
+    ])
+    section = _units_section(_body())
+
+    assert "**2**" in section
+    assert "t_card1" in section and "cron-7" in section
+    assert "/opt/hermes_prod/x" in section and "/opt/hermes_prod/y" in section
+    assert "(None)" not in section
+
+
+def test_an_unrecognised_held_row_renders_its_own_keys_and_a_non_dict_row_still_counts():
+    """A shape nobody has written yet must read as itself, never as ``None`` -- and a row the
+    reader cannot parse is still a HELD UNIT, so the count must not shrink to hide it."""
+    _write_record(held=[{"whatever": 1}, "not-a-dict"])
+    section = _units_section(_body())
+
+    assert "**2**" in section, "a non-dict row is counted, not silently dropped"
+    assert "whatever=1" in section, "an unknown shape is legible instead of blank"
+    assert "not-a-dict" in section
+    assert "(None)" not in section
+
+
+def test_a_long_root_list_is_capped_and_the_elision_is_counted():
+    """The matrix rows are bounded; a held row's roots are bounded the same way, and the elision
+    is a NUMBER -- a truncated list that does not say it was truncated is the same lie."""
+    roots = [f"/opt/hermes_prod/r{i}" for i in range(10)]
+    _write_record(held=[{"job": "cron-9", "name": "n", "roots": roots,
+                         "errno": "EPERM", "op": "readdir"}])
+    section = _units_section(_body())
+
+    assert "/opt/hermes_prod/r0" in section
+    assert "/opt/hermes_prod/r9" not in section, "the list is capped, not printed whole"
+    assert "+2 more" in section, "the reader is told the list was cut, and by how much"
+
+
 def test_the_acting_body_renders_a_pre_leg_b_row_list_as_its_count():
     """The body is written INSIDE a live refusal, so it must not raise on a legacy record.
 

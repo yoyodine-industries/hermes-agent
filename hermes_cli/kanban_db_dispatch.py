@@ -4742,6 +4742,146 @@ def _blind_guard_count(record: Any) -> int:
     return 0
 
 
+#: At most this many ROOTS are named on one held row; the count is always exact and the elision
+#: is printed as ``+N more``. Same bound as the mirror's ``substrate_view.RENDERED_ROOTS`` so the
+#: card and the dashboard never disagree about how much of a root list they will show.
+HELD_ROW_ROOTS = 8
+
+#: At most this many characters of ONE value on a held row (paths, names, causes).
+HELD_ROW_VALUE_CHARS = 120
+
+#: The keys a held row may carry its OWNER under -- one per writer, and the writers differ.
+HELD_ROW_IDENTITY_KEYS = ("unit", "task", "job")
+
+#: The keys a held row may carry its LOCATION under: the dispatcher names one ``root``, the cron
+#: door names a list of ``roots``.
+HELD_ROW_LOCATION_KEYS = ("root", "roots")
+
+#: The keys that are the CAUSE, in the order the row reads them.
+HELD_ROW_CAUSE_KEYS = ("errno", "op", "reason")
+
+
+def _record_entries(record: Any, *keys: str) -> list:
+    """The RAW entries under the first of ``keys`` that is a non-empty list/tuple; NOTHING dropped.
+
+    :func:`_record_rows` keeps dict rows only, on purpose -- the row renderer must never raise on
+    a shape it cannot read. But a COUNT taken from those filtered rows then states fewer units
+    than the record names, which is the same false-statement fault this body exists to remove
+    (``held: [{...}, "not-a-dict"]`` counted 1 and rendered that 1 as ``None``; card t_0b56c6a8).
+    A row this reader cannot parse is still a HELD unit, so the count and the row loop come from
+    HERE, and every entry -- dict or not -- goes through :func:`_held_row_line`.
+    """
+    for key in keys:
+        value = record.get(key) if isinstance(record, dict) else None
+        if isinstance(value, (list, tuple)) and value:
+            return list(value)
+    return []
+
+
+def _held_absent(value: Any) -> bool:
+    """True when a value carries nothing worth printing -- and never raises deciding it.
+
+    ``value not in (None, "")`` reads harmless, but the record is JSON-decoded by ANOTHER
+    process and a value with a broadcasting ``==`` (an array-like) makes that test raise inside
+    the refusal path. ``0`` and ``False`` are PRESENT: ``overdue_s=0`` is a fact, not a blank.
+    """
+    if value is None:
+        return True
+    if isinstance(value, (str, list, tuple, dict)):
+        return len(value) == 0
+    return False
+
+
+def _held_text(value: Any, limit: int = HELD_ROW_VALUE_CHARS) -> str:
+    """ONE bounded, single-line spelling of a record value. Never raises.
+
+    ``repr`` of an arbitrary object is a claim to be survived here, not trusted: this runs inside
+    a live refusal, where an exception costs exactly the card that explains the stall.
+    """
+    try:
+        text = value if isinstance(value, str) else repr(value)
+    except Exception:  # noqa: BLE001 -- an unrenderable value is still a held unit
+        text = f"<unrenderable {type(value).__name__}>"
+    text = " ".join(str(text).split())
+    if limit and len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return text
+
+
+def _held_location_text(row: dict) -> tuple[str, str]:
+    """``(key, text)`` for the row's location, or ``("", "")`` when it names none.
+
+    The location is printed with the key the row ACTUALLY used, so ``root=/a`` and
+    ``roots=/a, /b`` are both readable and neither is invented.
+    """
+    for key in HELD_ROW_LOCATION_KEYS:
+        value = row.get(key)
+        if _held_absent(value):
+            continue
+        if isinstance(value, (list, tuple)):
+            names = [_held_text(one) for one in value]
+            names = [name for name in names if name]
+            if not names:
+                continue
+            if len(names) > HELD_ROW_ROOTS:
+                names = names[:HELD_ROW_ROOTS] + [f"+{len(names) - HELD_ROW_ROOTS} more"]
+            return key, ", ".join(f"`{name}`" for name in names)
+        return key, f"`{_held_text(value)}`"
+    return "", ""
+
+
+def _held_row_line(item: Any) -> str:
+    """ONE legible line for a HELD unit, built from the keys that row ACTUALLY carries.
+
+    The shape differs BY WRITER and always will: the dispatcher's door 3 counts a CARD
+    (``{task, root, errno, op}``) and the cron door 3 counts a JOB
+    (``{job, name, roots, errno, op, overdue_s}``). One record does NOT mix the two today --
+    ``substrate_access.record`` writes ``list(held or prior.get("held") or [])``, so a non-empty
+    ``held`` REPLACES the prior list, and the only carry-forward path (a writer passing no
+    ``held``) reproduces the prior rows verbatim. The per-row read is bought by the WRITER axis,
+    not by a mixed record: each door's rows are homogeneous today, and a future writer's rows may
+    differ from both. The body used to read ``unit``/``kind``/``reason``, keys no writer has ever
+    emitted, and rendered every row as ``None (None): None``: the count line was right and every
+    row under it named nothing (card t_0b56c6a8).
+
+    So each row is read on its own: identity (``unit`` | ``task`` | ``job``, plus ``name``),
+    location (``root`` | ``roots``, capped, elision counted), cause (``errno``, ``op``,
+    ``reason``), then EVERY remaining key as ``key=value`` -- which makes an unrecognised shape
+    legible instead of blank, and a key added by a future writer visible without another card.
+    A row that is not a dict is rendered as itself rather than dropped.
+    """
+    if not isinstance(item, dict):
+        return f"  - (unrecognised held row, {type(item).__name__}): {_held_text(item)}"
+    row = dict(item)
+    identity = next(
+        (key for key in HELD_ROW_IDENTITY_KEYS if not _held_absent(row.get(key))), None
+    )
+    if identity is None:
+        pairs = ", ".join(f"{key}={_held_text(row[key])}" for key in sorted(row, key=str))
+        return f"  - (unrecognised held row): {pairs or '(empty)'}"
+    label = identity
+    name = row.pop("name", None)
+    if not _held_absent(name):
+        label = f'{identity} "{_held_text(name)}"'
+    segments = [f"  - `{_held_text(row.pop(identity))}` ({label})"]
+    location_key, location = _held_location_text(row)
+    if location_key:
+        # Only the key that WON is consumed: a row carrying both `root` and `roots` keeps the
+        # other one visible below rather than having it dropped for being second.
+        row.pop(location_key, None)
+        segments.append(f"{location_key}={location}")
+    for key in HELD_ROW_CAUSE_KEYS:
+        value = row.pop(key, None)
+        if not _held_absent(value):
+            segments.append(f"{key}={_held_text(value)}")
+    for key in sorted(row, key=str):
+        value = row[key]
+        if _held_absent(value):
+            continue
+        segments.append(f"{key}={_held_text(value)}")
+    return " ".join(segments)
+
+
 def _substrate_admission_body(
     yielded: DispatcherTickYielded,
     *,
@@ -4774,7 +4914,9 @@ def _substrate_admission_body(
     # `guards` key at all, so both keys are consulted and the rows are read from whichever
     # holds a list. The count comes from `_blind_guard_count` for the same reason.
     matrix = yielded.matrix or (record.get("matrix") or [])
-    held = _record_rows(record, "held")
+    # The COUNT and the rows both come from the raw list: a held row the reader cannot parse is
+    # still a held unit, and a count that hides it is the fault this body removes (t_0b56c6a8).
+    held = _record_entries(record, "held")
     blind = _record_rows(record, "guards", "guards_blind")
     blind_count = _blind_guard_count(record)
     blind_total = record.get("guards_total")
@@ -4816,7 +4958,9 @@ def _substrate_admission_body(
         f"- units held by per-unit admission this episode: **{len(held)}**",
     ]
     for item in held[:20]:
-        lines.append(f"  - `{item.get('unit')}` ({item.get('kind')}): {item.get('reason')}")
+        lines.append(_held_row_line(item))
+    if len(held) > 20:
+        lines.append(f"  - (+{len(held) - 20} more held unit(s) not shown)")
     lines += [
         "",
         "## Guards blind (fail-open hooks)",
