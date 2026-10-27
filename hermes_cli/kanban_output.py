@@ -56,6 +56,19 @@ def _err(msg: str, rc: int = 1) -> int:
     return rc
 
 
+#: Second line of the board-pin refusal (card t_398313ec). The first line is the sentence the
+#: model-facing tools already use for this condition, so an operator learns ONE refusal; this
+#: line carries the remedy the CLI can offer, because a shell CAN clear the pin for one command
+#: (there is no escaping path inside a dispatched worker — the fence is the claim).
+#: Shared here so the `--board` seam (``kanban.py``) and ``kanban boards show``
+#: (``kanban_boards.py``) cannot drift into two different remedies.
+BOARD_PIN_REMEDY: str = (
+    "kanban: a board pin is a fence, not a default: run the command from a top-level session, "
+    "or clear the pin for this command — "
+    "`env -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD hermes kanban …`"
+)
+
+
 def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
                 ok_msg: Callable[[str], str], fail_msg: Callable[[str], str]) -> int:
     """Run ``op(tid) -> bool`` per id, print ok/fail lines, exit 1 if any failed."""

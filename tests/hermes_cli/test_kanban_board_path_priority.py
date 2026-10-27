@@ -124,12 +124,23 @@ def test_scoped_current_board_context_trumps_kanban_db_env(monkeypatch, tmp_path
     )
 
 
-def test_cli_board_flag_trumps_worker_env_pin_end_to_end(monkeypatch, tmp_path):
-    """Real boundary: a worker shell pinned via HERMES_KANBAN_DB/BOARD (the
-    exact env every dispatcher-spawned kanban worker runs with) invokes
+def test_cli_board_flag_under_a_worker_pin_is_refused_end_to_end(monkeypatch, tmp_path):
+    """Real boundary: a shell pinned via HERMES_KANBAN_DB/BOARD (the exact env
+    every dispatcher-spawned kanban worker runs with) invokes
     `hermes kanban --board B create ...` through the actual CLI parser.
-    Only board B's physical database may receive the write; the pinned
-    board's database must not also contain the task."""
+
+    RULING t_398313ec (2026-10-27) INVERTED this case: the pin is a FENCE and
+    it must be a LOUD one. The CLI's `--board` seam REFUSES a slug that
+    contradicts the pin, with the same sentence the model-facing tools use,
+    because the alternative — the silent serve — wrote the PINNED board while
+    the operator believed they named B (and `show` answered "no such task" for
+    a card that exists). So: non-zero exit, both slugs named, and neither
+    store receives the write.
+
+    The RESOLVER still honours a direct ``board=`` for unfenced callers
+    (``test_explicit_board_trumps_kanban_db_env`` above) — the refusal lives at
+    the CLI boundary, which is where the operator's intent is read.
+    """
     import argparse
 
     from hermes_cli import kanban as kc
@@ -143,37 +154,37 @@ def test_cli_board_flag_trumps_worker_env_pin_end_to_end(monkeypatch, tmp_path):
     kb.create_board("target-board")
 
     # Simulate the ambient env every MCP/dispatcher-spawned worker carries:
-    # pinned to its OWN board, distinct from the one it explicitly targets.
+    # pinned to its OWN board, distinct from the one it explicitly targets. HERMES_KANBAN_TASK is
+    # what makes this the DISPATCHED-WORKER shape — the shape in which the pin actually overrides
+    # an explicit board (`kanban_db._explicit_board_intent_pinned`), and so the only shape in
+    # which a contradicting `--board` is a contradiction. Without it this is an operator shell
+    # whose `--board beta` legitimately resolves to beta's own store.
     worker_pinned_db = kb.kanban_db_path(board="worker-own-board")
     monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_pinned_db))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "worker-own-board")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_syntheticworker")
 
     parser = argparse.ArgumentParser(prog="hermes", add_help=False)
     sub = parser.add_subparsers(dest="command")
     kc.build_parser(sub)
     args = parser.parse_args(["kanban", "--board", "target-board", "create", "cross-board task"])
     rc = kc.kanban_command(args)
-    assert rc == 0
+    assert rc != 0, "a contradicting --board under a pin must be REFUSED, not served"
 
-    target_db = kb.kanban_db_path(board="target-board")
+    # The target board's OWN store. `kanban_db_path(board=...)` cannot be asked here: with the
+    # worker marker set this process IS fenced, so that resolver answers the PINNED file for
+    # every slug (that is the silent serve this change refuses at the CLI boundary).
+    target_db = kb.board_store_path("target-board")
     assert target_db != worker_pinned_db
 
     from hermes_cli import kanban_db_connect as kbc
-    with kbc.connect(board="target-board") as conn:
-        rows = conn.execute("SELECT title FROM tasks").fetchall()
-    assert any(r[0] == "cross-board task" for r in rows), (
-        "explicit --board flag must land the write on the target board, "
-        f"got rows={rows!r} in {target_db}"
-    )
-
-    # And the worker's own pinned board must NOT have received the write —
-    # this is the exact silent-misroute failure class the fix closes.
-    with kbc.connect(board="worker-own-board") as conn:
-        own_rows = conn.execute("SELECT title FROM tasks").fetchall()
-    assert not any(r[0] == "cross-board task" for r in own_rows), (
-        f"--board must not fall through to the worker's env-pinned board, "
-        f"but found the task there too: {own_rows!r}"
-    )
+    for db, label in ((target_db, "target"), (worker_pinned_db, "pinned")):
+        with kbc.connect(db_path=db) as conn:
+            rows = conn.execute("SELECT title FROM tasks").fetchall()
+        assert not any(r[0] == "cross-board task" for r in rows), (
+            f"the refused write must land on NEITHER board, but {label} "
+            f"({db}) carries it: rows={rows!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +200,11 @@ def test_cli_board_flag_trumps_worker_env_pin_end_to_end(monkeypatch, tmp_path):
 # boards (gateway notifier / watcher / dispatcher ticks) are fenced the same
 # way via kanban_db.pin_first_board_resolution() — the enumerated slug is not
 # caller intent.
+#
+# Note (t_398313ec): the CLI's `--board` seam no longer lets an explicit board
+# COMPETE with a pin at all — a slug that contradicts the pin is refused with
+# the tools' sentence, so "who wins" is only ever asked here, inside the
+# resolver, by callers that legitimately own a board= argument.
 # ---------------------------------------------------------------------------
 
 def test_dispatched_worker_board_arg_stays_pinned(monkeypatch, tmp_path):

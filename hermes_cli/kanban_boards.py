@@ -10,7 +10,9 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli.kanban_output import _err, _fmt_counts, _json_out
+from hermes_cli.kanban_output import (
+    BOARD_PIN_REMEDY, _err, _fmt_counts, _json_out,
+)
 
 
 def _dispatch_boards(args: argparse.Namespace) -> int:
@@ -23,15 +25,34 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` for a board. Safe to call on an empty DB."""
+    """``{status: count}`` for a board's OWN store. Safe to call on an empty DB.
+
+    The store is resolved from the SLUG (:func:`kanban_db.board_store_path`), never from
+    :func:`kanban_db.kanban_db_path`: under a board pin (``HERMES_KANBAN_DB``) the latter
+    answers the PINNED file for every slug, so counts printed under another board's slug were
+    really the pinned board's — the same numbers on every line of ``boards`` (measured
+    2026-10-27, card t_398313ec).
+    """
     try:
-        if not kb.kanban_db_path(board=slug).exists():
+        path = kb.board_store_path(slug)
+        if not path.exists():
             return {}
-        with kbc.connect_closing(board=slug) as conn:
+        with kbc.connect_closing(db_path=path, board=slug) as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
     except Exception:
         return {}
+
+
+def _pin_note() -> str:
+    """One line explaining which store a pinned ``boards`` listing is allowed to read."""
+    pinned_slug, pin_var = kb.board_env_pin()
+    where = f"board {pinned_slug!r}" if pinned_slug else "a store that names no board"
+    return (
+        f"Counts: this process is pinned to {where} ({pin_var}), so task counts are printed "
+        "only for that board.\n"
+        "Per-board counts: env -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD hermes kanban boards"
+    )
 
 
 def _board_slug_arg(args: argparse.Namespace, cmd: str, *, must_exist: bool) -> tuple[Optional[str], int]:
@@ -51,10 +72,21 @@ def _board_slug_arg(args: argparse.Namespace, cmd: str, *, must_exist: bool) -> 
 def _cmd_boards_list(args: argparse.Namespace) -> int:
     boards = kb.list_boards(include_archived=bool(getattr(args, "all", False)))
     current = kb.get_current_board()
+    fenced = kb._explicit_board_intent_pinned()
+    pinned_slug, pin_var = kb.board_env_pin()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_task_counts(b["slug"])
-        b["total"] = sum(b["counts"].values())
+        # Where the pin OVERRIDES intent, a pinned process must not READ another board's store
+        # (the pin is that isolation), and must not print this one's counts under another
+        # board's slug either. Blank the counts for every board the process is not pinned to,
+        # so a count is only ever shown beside the store it was taken from (measured
+        # 2026-10-27, card t_398313ec). Where it does not override intent — the operator's own
+        # selected board — every slug still resolves to its own store, so per-slug counts are
+        # exactly right and stay as they were.
+        readable = not (fenced and pin_var) or b["slug"] == pinned_slug
+        counts = _board_task_counts(b["slug"]) if readable else None
+        b["counts"] = counts
+        b["total"] = sum(counts.values()) if counts is not None else None
     if _json_out(args, boards):
         return 0
     if not boards:
@@ -64,10 +96,14 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     for b in boards:
         marker = "●" if b["is_current"] else " "
         name = (b.get("name") or "") + (" [archived]" if b.get("archived") else "")
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {_fmt_counts(b['counts'] or {}, '(empty)')}")
+        cell = (_fmt_counts(b["counts"] or {}, "(empty)") if b["counts"] is not None
+                else "(not read — pinned)")
+        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {cell}")
     print(f"\nCurrent board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
+    if fenced and pin_var:
+        print(f"\n{_pin_note()}")
     return 0
 
 
@@ -147,7 +183,33 @@ def _cmd_boards_switch(args: argparse.Namespace) -> int:
 
 
 def _cmd_boards_show(args: argparse.Namespace) -> int:
-    slug = getattr(args, "slug", None) or kb.get_current_board()
+    requested = getattr(args, "slug", None)
+    fenced = kb._explicit_board_intent_pinned()
+    pinned_slug, pin_var = kb.board_env_pin()
+    if requested:
+        # Same fence as `--board` (card t_398313ec): this handler ignores `--board` by
+        # construction, but it prints a STORE (`DB path` + task counts) beside a board's
+        # metadata. Under a pin that OVERRIDES intent the store is the pinned one, so
+        # `boards show <other>` used to render <other>'s description and filename over the
+        # pinned board's path and counts. A display that mixes two boards is worse than an
+        # error: refuse instead. (`assert_board_matches_env_pin` is a no-op where the pin
+        # does not override intent, and there the per-slug read below is already right.)
+        try:
+            kb.assert_board_matches_env_pin(requested)
+        except ValueError as exc:
+            return _err(f"kanban boards show: {exc}\n{BOARD_PIN_REMEDY}")
+    elif fenced and pin_var and not pinned_slug:
+        return _err(
+            "kanban boards show: this process is pinned to a store that names no board "
+            f"({pin_var}=…), so there is no board whose metadata matches it; "
+            "run from a top-level session or clear the pin "
+            "(`env -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD hermes kanban boards show <slug>`)"
+        )
+    # No slug named: where the pin OVERRIDES intent, report the board this process is actually
+    # pinned to, not the ambient `current` pointer — those can be different boards, and showing
+    # the pointer's metadata beside the pin's store is the same mixed display. Where it does
+    # not (an operator's own selected board), the pointer is still the answer, as before.
+    slug = requested or (pinned_slug if fenced else None) or kb.get_current_board()
     meta = kb.read_board_metadata(slug)
     counts = _board_task_counts(slug)
     if _json_out(args, meta):

@@ -25,7 +25,7 @@ from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_bulk_guard as kbg
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_output import (
-    _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
+    _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, BOARD_PIN_REMEDY, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
     _task_to_dict,
 )
@@ -186,6 +186,17 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: {exc}", 2)
         if not normed:
             return _err("kanban: --board requires a slug", 2)
+        # The board pin is a FENCE, and it must be a LOUD one. Under HERMES_KANBAN_DB /
+        # HERMES_KANBAN_BOARD every slug resolves to the pinned store, so `--board <other>`
+        # used to run against <other>'s NAME and the pinned board's DATA: `show` answered
+        # "no such task" for a card that exists, and the write verbs (create/comment/complete/
+        # archive) mutated the pinned board while the operator believed they named <other>
+        # (measured 2026-10-27, card t_398313ec). Compared HERE, at the one seam every
+        # subcommand passes through, before anything is read or written — not per verb.
+        try:
+            kb.assert_board_matches_env_pin(normed)
+        except ValueError as exc:
+            return _err(f"kanban: {exc}\n{BOARD_PIN_REMEDY}")
         # Boards other than 'default' must already exist — typoed slugs would otherwise silently
         # create an empty board.
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
