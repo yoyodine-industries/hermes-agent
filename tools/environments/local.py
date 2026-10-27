@@ -851,7 +851,11 @@ def _wait_for_group_exit(proc, pgid: int, timeout: float) -> bool:
 def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
     """SIGKILL snapshotted survivors that escaped the process group via ``setsid``
     — after TERM→KILL so in-group members keep their grace; psutil's identity-aware
-    Process skips recycled PIDs. POSIX-only (see _IS_WINDOWS gate in caller)."""
+    Process skips recycled PIDs. POSIX-only (see _IS_WINDOWS gate in caller).
+
+    A WORKFLOW DEPARTURE (a production flight, marked ``HERMES_WORKFLOW_DEPARTURE``) is
+    spared even as an escapee: it shares an ancestor with this command tree but is owned by
+    no turn, and reaping it here is exactly the t_4b9843a4 defect."""
     for child in descendants:
         try:
             if not child.is_running():
@@ -861,6 +865,9 @@ def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
                     continue  # group-kill already covers it
             except OSError:  # ProcessLookupError / PermissionError included
                 pass
+            from tools.workflow_departure import pid_is_departure
+            if pid_is_departure(child.pid):
+                continue  # a detached production flight is not ours to reap
             child.kill()
         except Exception:
             continue

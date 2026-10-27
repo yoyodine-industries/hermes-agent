@@ -30,6 +30,10 @@ def build_hooks_parser(subparsers, *, cmd_hooks: Callable) -> None:
         "--payload-file", dest="payload_file", default=None,
         help="Path to a JSON file whose contents are merged into the "
             "synthetic payload before execution")
+    _hk_test.add_argument(
+        "--no-probe", dest="no_probe", action="store_true",
+        help="Withhold the probe marker (HERMES_HOOK_PROBE) and fire the REAL path: "
+            "a hook that mutates durable state WILL act on the synthetic payload")
 
     _hk_revoke = hooks_subparsers.add_parser(
         "revoke", aliases=["remove", "rm"],
@@ -40,6 +44,6 @@ def build_hooks_parser(subparsers, *, cmd_hooks: Callable) -> None:
     hooks_subparsers.add_parser(
         "doctor",
         help="Check each configured hook: exec bit, allowlist, mtime drift, "
-            "JSON validity, and synthetic run timing")
+            "and a declared-probe liveness run (never a behaviour test)")
 
     hooks_parser.set_defaults(func=cmd_hooks)
