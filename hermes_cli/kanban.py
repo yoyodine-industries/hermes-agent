@@ -24,6 +24,7 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_bulk_guard as kbg
 from hermes_cli import kanban_workflow
+from hermes_cli.kanban_filing_policy import is_refusal as kb_is_filing_refusal
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -487,6 +488,19 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 # The receipt's dead-assignee probe reads THIS process's live profiles.
                 profiles=list_profile_names(),
             )
+            # THE FILING-BUDGET REFUSAL (card t_80ff9b6a). No row was written and the line was
+            # already printed to stderr by the kernel's own module; rc 3 is the machine-readable
+            # half of that answer, so a shell or DAG node can tell "the budget door said no"
+            # from a usage error (2) and from a board fault (1) without parsing prose.
+            if kb_is_filing_refusal(task_id):
+                record = getattr(task_id, "record", {}) or {}
+                if getattr(args, "json", False):
+                    _print_json({"refused": True, "reason": str(task_id),
+                                 "filing_policy": dict(record)})
+                elif record.get("why"):
+                    print(f"filing policy: {record['why']}", file=sys.stderr)
+                    print(f"filing policy: {record.get('policy', '-')}", file=sys.stderr)
+                return 3
             task = kb.get_task(conn, task_id)
     except InboxRefusal as exc:
         # A usage refusal, not a board fault: rc 2 so a shell can tell "the provenance could
