@@ -185,7 +185,7 @@ def test_the_ops_alert_files_and_the_handle_it_replaced_is_refused(tmp_path, mon
     replaced is refused by the same gate — the control that shows the gate was armed here, not
     standing down on an empty roster.
     """
-    import hermes_cli.subcommands.pause as pause
+    from hermes_cli.subcommands import pause
     from hermes_cli import kanban_db_boards as boards
 
     roster = {name for name in HANDLES}

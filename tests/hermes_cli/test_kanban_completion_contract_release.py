@@ -67,13 +67,18 @@ def github(monkeypatch):
                   "status": "completed", "conclusion": "success",
                   "html_url": "https://github.com/acme/repo/actions/runs/42"}],
         "calls": 0,
+        # The PR's own state, which is the acceptance evidence once the repository
+        # declares no required checks (ruling t_9082c751).
+        "pr_state": "OPEN",
+        "merge_sha": "b" * 40,
     }
 
     def fake_api(endpoint, *, query=None, paginate=False, profile_home=None):
         state["calls"] += 1
         if endpoint == "graphql":
             return {"data": {"repository": {"pullRequest": {
-                "headRefOid": SHA, "baseRefName": "main", "state": "OPEN",
+                "headRefOid": SHA, "baseRefName": "main", "state": state["pr_state"],
+                "mergeCommit": {"oid": state["merge_sha"]},
                 "baseRef": {"branchProtectionRule": {"requiredStatusChecks": state["required"]}},
             }}}}
         if "/rules/branches/" in endpoint:
@@ -121,8 +126,15 @@ def test_completion_records_the_publication_without_rebinding_the_contract(board
     """D2: the published PR is recorded on the receipt, never written back to the card."""
     with connect() as conn:
         tid = kb.create_task(conn, title="publish", completion_contract="acme/repo")
+        # A close that RECORDS a published PR owes its landing leg on EVERY transition --
+        # the landing-carrier clause's trigger was widened off the review transition by
+        # card t_502a28bd, so this fixture has to name the carrier. The fence is not this
+        # test's subject; the receipt is, and it is still the only thing asserted below.
+        carrier = kb.create_task(conn, title=f"[land] {PR_URL} for {tid}",
+                                 initial_status="running")
         assert kb.complete_task(conn, tid, result="done",
-                                metadata={"published_pr": PR_URL}) is True
+                                metadata={"published_pr": PR_URL,
+                                          "landing_card": carrier}) is True
         task = kb.get_task(conn, tid)
         assert task.status == "done"
         assert task.completion_contract == "acme/repo"  # the declaration never moves
@@ -160,8 +172,15 @@ def test_refusal_causes_are_distinguishable(board, github):
         assert parent in gated.detail  # names the blocker, not "unknown id"
 
 
-def test_unsatisfiable_contract_parks_the_card_blocked_capability(board, github):
-    """D4: no required checks can ever appear, so the refusal is made terminal, not retried."""
+def test_no_required_checks_is_satisfied_by_merge_state(board, github):
+    """D4, re-ruled by t_9082c751: a repository with no required checks is CLOSABLE.
+
+    The old answer refused such a contract as unsatisfiable and parked the card
+    ``blocked``/``capability`` with its work done -- which, beside the landing fence
+    refusing ``local-only`` next to the same publication, left the card no legal
+    contract at all. Now an OPEN PR there is ``pending`` (retryable, never parked) and
+    a MERGED one is the acceptance evidence.
+    """
     github["required"] = []
     with connect() as conn:
         tid = kb.create_task(conn, title="ci task", completion_contract="acme/repo")
@@ -169,22 +188,104 @@ def test_unsatisfiable_contract_parks_the_card_blocked_capability(board, github)
                                             metadata={"published_pr": PR_URL}))
 
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
-        assert task.block_kind == "capability"
-        blocked = [json.loads(row[0]) for row in conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'", (tid,))]
-        reason = blocked[-1]["reason"]
-        assert "acme/repo" in reason and "set-contract" in reason
-
+        assert task.status != "blocked"          # NOT parked: the verdict is retryable
+        assert task.block_kind is None
         assert refusal.cause == "acceptance_refusal"
-        assert "set-contract" in refusal.detail  # the release is named on both surfaces
-        assert _receipts(conn, tid)[-1]["classification"] == "missing"
-        assert github["calls"] > 0
+        assert "MERGED" in refusal.detail and "merge the PR" in refusal.detail
+        assert "local-only" not in refusal.detail
+        receipt = _receipts(conn, tid)[-1]
+        assert receipt["classification"] == "pending"
+        assert receipt["required"] == []
 
-        # ... and the release really is the way out of the park.
-        assert kb.set_contract(conn, tid, "local-only", reason="repo requires no checks")
-        assert kb.unblock_task(conn, tid)
-        assert kb.complete_task(conn, tid, result="done") is True
+        # ... and once the PR merges, the SAME declaration closes the card: the acceptance
+        # door passes on merge state, and the landing fence (unchanged, and right) still
+        # wants the published PR's landing leg named.
+        carrier = kb.create_task(conn, title=f"[land] {PR_URL} for {tid}",
+                                 initial_status="running")
+        github["pr_state"] = "MERGED"
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": PR_URL,
+                                          "landing_card": carrier}) is True
+        assert kb.get_task(conn, tid).status == "done"
+        done_receipt = _receipts(conn, tid)[-1]
+        assert done_receipt["classification"] == "success"
+        assert done_receipt["merge_sha"] == github["merge_sha"]
+        assert kb.get_task(conn, tid).completion_contract == "acme/repo"
+
+
+def test_a_persisted_unsatisfiable_receipt_offers_the_merge_route_not_local_only():
+    """Direction 3 (t_9082c751): a card that HAS published is never told to use ``local-only``.
+
+    ``collect_acceptance`` can no longer produce the shape, but receipts persisted before
+    the ruling still sit on cards; releasing one must name a route that exists.
+    """
+    assert kb._contract_is_unsatisfiable({"classification": "missing", "required": []}) is True
+    published = kb._unsatisfiable_contract_release(
+        "t_abc123", "acme/repo", {"classification": "missing", "required": [], "pr_url": PR_URL})
+    assert "MERGED" in published
+    assert "local-only" not in published
+    unpublished = kb._unsatisfiable_contract_release(
+        "t_abc123", "acme/repo", {"classification": "missing", "required": []})
+    assert "local-only" in unpublished      # no publication to contradict: the old door is legal
+    assert "MERGED" in unpublished
+
+
+def _blocked_reasons(conn, tid: str) -> list[str]:
+    """The reason strings the ``blocked`` events carry — the card's own record of the park."""
+    return [json.loads(row[0]).get("reason") or "" for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'", (tid,))]
+
+
+def test_the_park_door_stamps_its_named_release_on_the_card(board):
+    """The lost sibling of the two above: the PARK door itself, driven directly.
+
+    ``collect_acceptance`` cannot produce an unsatisfiable receipt any more (t_9082c751), but
+    ``_park_unsatisfiable_contract`` stays live for receipts PERSISTED before that ruling, and it
+    had no test of its own — the generation that covered it also covered patches the live line no
+    longer carries. Driving the door rather than the classifier keeps this independent of the
+    forge: a contract no retry can satisfy parks the card ``blocked`` / ``capability``, the
+    ``blocked`` event's reason names the contract AND the release that EXISTS for that card (the
+    merge route once something is published, ``set-contract`` while nothing is), and the stamped
+    release really releases the card.
+    """
+    with connect() as conn:
+        tids = {name: kb.create_task(conn, title=f"parked, {name}",
+                                     completion_contract="local-only")
+                for name in ("published", "unpublished")}
+        for tid in tids.values():
+            # The declaration the park is about, without a create-time forge read.
+            assert kb.set_contract(conn, tid, "acme/repo", reason="fixture declaration") is True
+
+        assert kb._park_unsatisfiable_contract(
+            conn, tids["published"], "acme/repo",
+            receipt={"classification": "missing", "required": [], "pr_url": PR_URL}) is True
+        assert kb._park_unsatisfiable_contract(
+            conn, tids["unpublished"], "acme/repo",
+            receipt={"classification": "missing", "required": []}) is True
+
+        for name, tid in tids.items():
+            parked = kb.get_task(conn, tid)
+            assert parked.status == "blocked", name         # parked, not silently closed
+            assert parked.block_kind == "capability", name  # no human input owed
+            reasons = _blocked_reasons(conn, tid)
+            assert len(reasons) == 1, name
+            assert "acme/repo" in reasons[0], name          # names the contract it is about
+
+        # A card that published is never sent back to `local-only`: the reason offers the merge.
+        published_reason = _blocked_reasons(conn, tids["published"])[0]
+        assert "MERGED" in published_reason
+        assert "local-only" not in published_reason
+        # A card that published nothing may take the declaration release.
+        unpublished_reason = _blocked_reasons(conn, tids["unpublished"])[0]
+        assert "set-contract" in unpublished_reason
+
+        # The stamped door is REAL, not prose: the release it names is the release that works.
+        assert kb.unblock_task(conn, tids["published"]) is True
+        assert kb.set_contract(conn, tids["published"], "local-only",
+                               reason="repository declares no required checks") is True
+        released = kb.get_task(conn, tids["published"])
+        assert released.status != "blocked", released.status
+        assert released.completion_contract == "local-only"
 
 
 def test_retryable_missing_check_does_not_park(board, github):

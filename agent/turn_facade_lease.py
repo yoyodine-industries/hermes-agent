@@ -29,6 +29,12 @@ LEASE_WAIT_SECONDS = 1800.0
 _REFRESH_WRITE_PATIENCE_S = 20.0
 # Headroom before expiry for one BEGIN IMMEDIATE blocked in the writer's 1s busy handler, plus jitter.
 _REFRESH_EXPIRY_MARGIN_S = 2.0
+# A renewal that lost the write lock is retried on this SHORT cadence instead of waiting a full
+# refresh interval. state.db is a single-writer store and a bulk write can hold the lock for tens
+# of seconds at a time; at the 60 s interval a burst spends the whole 300 s authority in five
+# steps and kills a turn that a 2 s retry renews on its first free moment. Measured: lock-error
+# ticks over 218 s, then exit on "could not be refreshed" 348.3 s into one long tool call.
+_REFRESH_LOCK_RETRY_S = 2.0
 
 
 class DurableTurnLease:
@@ -55,6 +61,20 @@ class DurableTurnLease:
         self.interrupt_message: Optional[str] = None
         self.watchdog = None  # TurnLivenessWatchdog when configured
         self.timer_handles: list = []  # periodic_scheduler handles, cancelled in join_threads
+        # True while the interval chain is stopped and a one-shot lock-retry carries the refresher.
+        self._lock_retry_chain = False
+
+    def _arm_refresh(self, interval: float) -> None:
+        """Arm one refresher tick ``interval`` seconds out, pruning finished handles.
+
+        The refresher deliberately runs on NEW handles rather than sleeping inside a tick: each
+        callback gets its own scheduler worker, so a lock-retry chain can never starve the
+        liveness watchdog by occupying one.
+        """
+        from agent.periodic_scheduler import schedule
+
+        self.timer_handles = [h for h in self.timer_handles if not getattr(h, "cancelled", False)]
+        self.timer_handles.append(schedule(self.refresh_tick, interval))
 
     def _current_session_id(self) -> str:
         return getattr(self.agent, "session_id", None) or self.session_id
@@ -225,6 +245,11 @@ class DurableTurnLease:
                 patience_s=min(_REFRESH_WRITE_PATIENCE_S, patience),
             ):
                 self._authority_deadline = started + LEASE_TTL_SECONDS
+                if self._lock_retry_chain:
+                    # This tick ran from the retry chain, which returned False to stop the interval
+                    # chain: restore the normal cadence now that the row is renewed.
+                    self._lock_retry_chain = False
+                    self._arm_refresh(self.refresh_interval)
                 return None
             if self.stop.is_set():
                 return False
@@ -238,15 +263,18 @@ class DurableTurnLease:
             from hermes_state_errors import is_sqlite_lock_error
 
             if is_sqlite_lock_error(exc):
-                # The scheduler will not try again until one interval from now. If that attempt
-                # could not finish before the row expiry, stop before a successor can claim it.
-                if time.time() + self.refresh_interval + _REFRESH_EXPIRY_MARGIN_S >= self._authority_deadline:
+                # Retry on the SHORT cadence, not one interval out: waiting a whole interval per
+                # lock error is what turns a contention burst into a dead turn. If even the short
+                # retry could not finish before the row expiry, stop before a successor claims it.
+                if time.time() + _REFRESH_LOCK_RETRY_S + _REFRESH_EXPIRY_MARGIN_S >= self._authority_deadline:
                     return self._stop_on_exhausted_authority()
                 logger.warning(
-                    "Session turn lease refresh hit a SQLite lock; will retry: %s",
-                    self._current_session_id(),
+                    "Session turn lease refresh hit a SQLite lock; retrying in %ss: %s",
+                    _REFRESH_LOCK_RETRY_S, self._current_session_id(),
                 )
-                return None
+                self._lock_retry_chain = True
+                self._arm_refresh(_REFRESH_LOCK_RETRY_S)
+                return False
             logger.warning(
                 "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
             )
@@ -342,8 +370,16 @@ def admit_durable_turn_lease(
         )
 
     authority_floor = time.time()  # every acquisition attempt stamps its expiry after this instant
+    # Delivery turns pass a bounded lease probe (lease_probe_seconds ~2s) so a contended
+    # session is handed back to the queue (requeue_unstarted) instead of blocking a
+    # gateway turn thread for the full LEASE_WAIT_SECONDS (1800s). Ordinary turns keep
+    # the full wait; the attr is only set by the delivery path.
+    wait_seconds = min(
+        LEASE_WAIT_SECONDS,
+        getattr(agent, "_session_turn_lease_wait_seconds", LEASE_WAIT_SECONDS),
+    )
     if not db.acquire_session_turn_lease(
-        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
+        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=wait_seconds,
         on_wait=_on_wait, on_contended=_on_contended,
         should_abort=lambda: getattr(agent, "_interrupt_requested", False),
     ):

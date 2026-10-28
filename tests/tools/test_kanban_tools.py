@@ -9,6 +9,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 
@@ -80,6 +81,51 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+
+
+def test_board_refuses_mismatched_pin(monkeypatch, tmp_path):
+    """Regression (7654ac4bfe): a tool call targeting board=X while DB-pinned to
+    board=Y raises instead of silently serving the pinned board (fail-closed board
+    resolution)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    pinned = kb.kanban_db_path(board="ops")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+
+    from tools import kanban_tools as kt
+    with pytest.raises(ValueError, match="refusing to target board 'financially'"):
+        with kt._board("financially"):
+            pass  # pragma: no cover
+
+
+def test_board_accepts_pinned_slug(monkeypatch, tmp_path):
+    """The matching case still works: board= naming the pinned board is served."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    pinned = kb.kanban_db_path(board="test-worker-board")
+    kb.create_board("test-worker-board", name="Test Worker Board")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+
+    from tools import kanban_tools as kt
+    with kt._board("test-worker-board") as (_, conn):
+        assert conn is not None
 
 
 def test_show_bare_call_outside_worker_returns_orientation_not_error(monkeypatch, worker_env):
@@ -756,6 +802,8 @@ def test_create_explicit_scratch_ignores_ambient_board_project(
 
     repo = tmp_path / "repo"
     repo.mkdir()
+    # A project primary must be a GIT REPO, not merely a folder (spawn gate, t_e5ff985b).
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True, text=True)
     with pdb.connect_closing() as pconn:
         project_id = pdb.create_project(pconn, name="Ambient", primary_path=str(repo))
     kb.write_board_metadata("default", project_id=project_id)

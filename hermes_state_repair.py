@@ -535,14 +535,25 @@ def _backup_db_file(db_path: Path) -> tuple[Optional[Path], Optional[str]]:
 
 
 def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> None:
-    """Refuse-or-repair read-only DB files BEFORE the first connection opens.
+    """Refuse-or-repair read-only DB paths BEFORE the first connection opens.
 
-    A stray read-only ``state.db`` / ``-wal`` / ``-shm`` (sudo run, restored backup, copied dotfiles) otherwise
-    surfaces as an opaque "attempt to write a readonly database" inside ``_init_schema``, and the obvious wrong
-    "fix" (deleting the ``-wal``) loses committed transactions. ``chmod u+rw`` repair only inside the Hermes home
-    tree (Hermes owns those files; ``chmod`` fails on files the user doesn't own, bounding the repair exactly);
-    otherwise fail fast naming the file and command. Never deletes/truncates a WAL sidecar — once writable, the
-    normal open checkpoints it. ``:memory:``/``file:`` skipped. Shared with ``kanban_db``.
+    A stray read-only ``state.db`` (sudo run, restored backup, copied dotfiles) otherwise surfaces as an opaque
+    "attempt to write a readonly database" inside ``_init_schema``, and the obvious wrong "fix" (deleting the
+    ``-wal``) loses committed transactions. ``chmod u+rw`` repair only inside the Hermes home tree (Hermes owns
+    those files; ``chmod`` fails on files the user doesn't own, bounding the repair exactly); otherwise fail fast
+    naming the file and command.
+
+    Only paths that MUST exist are judged: the directory and the main database file. SQLite's own bookkeeping is
+    not ours to police — ``-wal``/``-shm``/``-journal`` are created, truncated and UNLINKED by every connection at
+    checkpoint, so their *absence* is the normal state, not a permission fault. A sidecar is therefore never
+    tested, never repaired from here and never reported: a check made from this function cannot tell "checkpointed
+    away a microsecond ago" from "owned by another user", and reading it as a permissions problem invented
+    "state.db is not writable" on healthy stores — pointing the operator at the one action that destroys committed
+    data. If the store is genuinely unwritable the first connection raises the real error, and that is the correct
+    signal.
+
+    Never deletes/truncates a WAL sidecar — once the directory and the main file are writable, the normal open
+    checkpoints it. ``:memory:``/``file:`` skipped. Shared with ``kanban_db``.
 
     Port of Kilo-Org/kilocode#12508's startup preflight. This preflight:
     """
@@ -551,9 +562,14 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
     home: Optional[Path] = None
     with contextlib.suppress(Exception):  # pragma: no cover - defensive
         home = Path(get_hermes_home()).resolve()
-    # SQLite needs a writable directory in every journal mode (WAL/SHM sidecars, or the DELETE-mode journal).
-    sidecars = (db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm"))
-    for p, is_dir in [(db_path.parent, True), *((p, False) for p in (db_path, *sidecars) if p.is_file())]:
+    # Only the paths that must exist for SQLite to open the store: the directory (every journal mode needs a
+    # writable one) and the main DB file. Sidecars are SQLite's bookkeeping and are deliberately NOT inspected:
+    # they are created, truncated and UNLINKED at checkpoint, so absence is the normal state, not a permission
+    # fault — a snapshot here cannot tell the two apart, and reporting the first as the second points the operator
+    # at deleting the one file that holds committed data. If the store is genuinely unwritable the first
+    # connection raises the real error, and that is the correct signal.
+    files = ((db_path, False),) if db_path.is_file() else ()
+    for p, is_dir in [(db_path.parent, True), *files]:
         if (is_dir and not p.is_dir()) or os.access(p, os.R_OK | os.W_OK):
             continue
         x = "x" if is_dir else ""
@@ -565,12 +581,10 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
         if in_scope and os.access(p, os.R_OK | os.W_OK):
             logger.info("%s preflight: repaired read-only %s (chmod u+rw%s)", db_label, p, x)
             continue
-        wal_note = (" Do NOT delete the -wal file — it contains committed data that "
-                    "will be merged into the database once it is writable." if p.name.endswith("-wal") else "")
         raise sqlite3.OperationalError(
             f"{db_label} is not writable: {'directory' if is_dir else 'file'} {p} is read-only for this user. Hermes "
             f"needs read-write access to open the database. Fix with: chmod u+rw{x} '{p}' (files owned by another "
-            f"user may need sudo/chown).{wal_note}")
+            f"user may need sudo/chown).")
 
 
 def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.Connection:

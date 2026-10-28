@@ -569,11 +569,24 @@ class OpenAICompatRoutesMixin:
         """Expose a streaming completion as a run for ``POST /v1/runs/{completion_id}/approval``
         (#51871) -> ``(notify, on_done)``. Owner + status are stamped like the session stream, so
         ``_load_owned_run`` finds it; keyed by the completion id (never the shared session key) so
-        concurrent turns can't cross-resolve. ``on_done`` retires it when the agent task ends."""
+        concurrent turns can't cross-resolve. ``on_done`` retires it when the agent task ends.
+
+        The live handle is taken at ADMISSION, in the same synchronous frame as the row
+        (t_5976163f R4): this turn's task is deliberately NOT in ``_active_run_tasks``
+        (``_run_agent`` already counts it for the gate and the drain), so the token is the only
+        proof that a ``waiting_for_approval`` row is held work rather than an orphan the fence
+        must close.
+        """
         from gateway.platforms.api_server import _approval_request_event
         self._run_owners[completion_id] = self._run_idempotency_scope(request)
-        self._set_run_status(completion_id, "running", session_id=session_id or "")
-        self._run_approval_sessions[completion_id] = completion_id
+        self._register_live_run_handle(completion_id, family="inline")
+        try:
+            self._set_run_status(completion_id, "running", session_id=session_id or "")
+            self._run_approval_sessions[completion_id] = completion_id
+        except BaseException:
+            # No agent task exists yet, so no done callback will ever release this handle.
+            self._release_live_run_handle(completion_id)
+            raise
 
         def _approval_notify(approval_data):
             event = _approval_request_event(completion_id, approval_data, session_id=session_id or "")
@@ -591,8 +604,14 @@ class OpenAICompatRoutesMixin:
             else:
                 result = (fut.result() or (None,))[0]
                 status = terminal_run_status(result)[0] if isinstance(result, dict) else "completed"
-            self._set_run_status(completion_id, status)
-            self._release_run_owner_if_forgotten(completion_id)
+            try:
+                self._set_run_status(completion_id, status)
+            finally:
+                # The release is the fence's clock and every exit path ends here — this runs in
+                # the agent task's done callback, so completion, failure and cancellation all
+                # arrive; the finally keeps a raising terminal stamp from leaking the token.
+                self._release_live_run_handle(completion_id)
+                self._release_run_owner_if_forgotten(completion_id)
         return _approval_notify, _on_done
 
     def _spawn_stream_agent(self, stream_q, *, on_done=None, **run_kwargs) -> tuple:
@@ -772,10 +791,16 @@ class OpenAICompatRoutesMixin:
             # turn ends (POST /v1/runs/{id}/approval then answers 409) and sets the terminal status.
             approval_notify, end_stream_run = self._register_stream_approval(
                 request, completion_id, _stream_q, session_id)
-            agent_task, agent_ref = self._spawn_stream_agent(
-                _stream_q, on_done=end_stream_run, tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete, approval_notify_callback=approval_notify,
-                approval_session_key=completion_id, **run_kwargs)
+            try:
+                agent_task, agent_ref = self._spawn_stream_agent(
+                    _stream_q, on_done=end_stream_run, tool_start_callback=_on_tool_start,
+                    tool_complete_callback=_on_tool_complete, approval_notify_callback=approval_notify,
+                    approval_session_key=completion_id, **run_kwargs)
+            except BaseException:
+                # No task means no done callback: drop the handle so the row is fenced as
+                # orphaned instead of standing in for work nothing in this process is doing.
+                self._release_live_run_handle(completion_id)
+                raise
             # #13437 identity contract: an explicit-header client keeps addressing the id it
             # sent; the response echoes that stable id while reads/writes adopt the live tip,
             # so a rotation mid-turn (after these headers are prepared) never changes what the

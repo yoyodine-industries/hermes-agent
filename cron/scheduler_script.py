@@ -21,8 +21,9 @@ import threading
 import time
 from cron.env_settings import cron_env_setting
 from cron.jobs import _ensure_cron_dir
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -64,8 +65,53 @@ def _timeout_from_env_or_config(
     return None
 
 
-def _get_script_timeout() -> int:
-    """Resolve cron pre-run script timeout from module/env/config with a safe default."""
+def _job_script_timeout(job: Optional[Mapping[str, Any]]) -> Optional[int]:
+    """The job's OWN ``script_timeout_seconds`` as a positive int, or None to keep resolving.
+
+    Most-specific rung of the timeout chain: one long script job (e.g. a cross-markets report that
+    legitimately runs for hours) raises its own budget without raising every other script job in the
+    profile. An unusable stored value (0, negative, unparsable, wrong type) is deliberately NOT an
+    error here: resolution WARNs and falls through to the profile-wide rungs. Wedging a job on a
+    value that write-time validation (``cron.jobs._normalize_job_script_timeout``) already refuses
+    would turn a hand-edited jobs.json into a job that can never run at all.
+    """
+    if not isinstance(job, Mapping):
+        return None
+    raw = job.get("script_timeout_seconds")
+    if raw is None:
+        return None
+    job_id = job.get("id")
+    try:
+        timeout = _positive_int(raw)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning(
+            "Job '%s': invalid script_timeout_seconds=%r; using env/config/default",
+            job_id, raw)
+        return None
+    if timeout is None:
+        logger.warning(
+            "Job '%s': script_timeout_seconds=%r is not positive; using env/config/default",
+            job_id, raw)
+    return timeout
+
+
+def _get_script_timeout(job: Optional[Mapping[str, Any]] = None) -> int:
+    """Resolve cron pre-run script timeout from the job, then module/env/config, with a safe default.
+
+    Precedence, most specific first:
+
+    (a) the job's own ``script_timeout_seconds`` (validated at write time; ignored with a warning
+        when a stored record holds junk),
+    (b) the module-level test-injection seam ``_SCRIPT_TIMEOUT`` when it differs from the default,
+    (c) ``HERMES_CRON_SCRIPT_TIMEOUT``,
+    (d) ``cron.script_timeout_seconds`` in config.yaml,
+    (e) the built-in default (3600s).
+
+    ``job=None`` (monitor probes, ad-hoc callers) reproduces the pre-per-job chain exactly.
+    """
+    job_timeout = _job_script_timeout(job)
+    if job_timeout is not None:
+        return job_timeout
     if _sched._SCRIPT_TIMEOUT != _sched._DEFAULT_SCRIPT_TIMEOUT:
         try:
             timeout = _positive_int(_sched._SCRIPT_TIMEOUT)
@@ -433,6 +479,7 @@ def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
     identity: Optional[Mapping[str, str]] = None,
+    job: Optional[Mapping[str, Any]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -445,36 +492,35 @@ def _run_job_script(
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
     ``.py`` scripts (#8714). identity: the fire's occurrence identity
     (``cron.execution_identity.cron_execution_env``), overlaid LAST so the sanitizer inside
-    ``build_subprocess_env`` cannot strip the Hermes-owned names it carries.
+    ``build_subprocess_env`` cannot strip the Hermes-owned names it carries. job: Optional job
+    record whose own ``script_timeout_seconds`` bounds THIS run; omitted/None falls back to the
+    profile-wide chain.
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
-    script_timeout = _get_script_timeout()
+    script_timeout = _get_script_timeout(job)
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
             return False, err
         from tools.environments.local import build_subprocess_env
-        # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
-        # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
-        # ``errors=`` must not stay 'strict': one stray non-UTF-8 byte in the script's stdout
-        # or stderr raises UnicodeDecodeError in communicate() and fails the whole run,
-        # discarding the output (#105582; the Windows branch decodes lossily per #45099).
+        # The decode pin lives at the READER (the Popen call below), NOT in ``**popen_kwargs``:
+        # a splat is invisible to the AST decode guard, and a second ``encoding=`` in the dict
+        # would collide with the call's own keyword on win32 (TypeError: multiple values).
+        # Encoding stays gated to win32 — unconditional UTF-8 leaked into POSIX and was
+        # reverted (#66566) — while ``errors=`` must not stay 'strict' on either branch: one
+        # stray non-UTF-8 byte in the script's stdout or stderr raises UnicodeDecodeError in
+        # the reader thread and fails the whole run, discarding the output (#105582; the
+        # Windows branch decodes as lossy UTF-8 per #45099).
         popen_kwargs: dict[str, Any] = {
             "start_new_session": True,
-            "errors": "replace",
         }
         if sys.platform == "win32":
             popen_kwargs = {
                 "creationflags": windows_hide_flags()
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-                # Lossy UTF-8 decode — locale-mismatched bytes from the STT command must not raise in the
-                # reader threads on non-UTF-8 Windows (#45099).
-                # Lossy UTF-8 decode — locale-mismatched bytes from the TTS command must not raise in the
-                # reader threads on non-UTF-8 Windows (#45099).
-                "encoding": "utf-8",
-                "errors": "replace"}
+            }
         # The process env is the LAUNCH profile's. For a job owned by a routed profile, drop that
         # profile's .env residue from the base first (no-op for the launch profile's own jobs), then
         # overlay the routed profile's own scope (which never enters os.environ under multiplex
@@ -494,6 +540,10 @@ def _run_job_script(
         # gateway sessions (#69396).
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            # The decode pin, AT THE READER: win32 pins UTF-8 (#45099); POSIX keeps the
+            # platform default (None) because unconditional UTF-8 there was reverted (#66566).
+            encoding="utf-8" if sys.platform == "win32" else None,
+            errors="replace",
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
         deadline = time.monotonic() + script_timeout
         while True:
@@ -574,8 +624,10 @@ def _run_job_script_with_claim_heartbeat(
     identity = cron_execution_env(job)
 
     def run() -> tuple[bool, str]:
+        # Every call site forwards ``job`` so the job's own script_timeout_seconds is honoured on
+        # this path too — the heartbeat wrapper is the ONLY entry point the scheduler uses.
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"), identity=identity)
+                               interpreter=job.get("interpreter"), identity=identity, job=job)
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")

@@ -442,7 +442,7 @@ class InProcessCronScheduler(CronScheduler):
         self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None,
         profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
     ):
-        from cron.scheduler import CronTickYielded
+        from cron.scheduler import CronSubstrateDenied, CronTickYielded
         from cron.scheduler import tick as cron_tick
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
@@ -506,8 +506,12 @@ class InProcessCronScheduler(CronScheduler):
                 # intentionally caught here too — gateway shutdown is driven by stop_event (set by the main
                 # thread's signal handler), not by an exception in this daemon thread, so swallowing it and
                 # re-checking stop_event keeps shutdown clean.
-                if isinstance(e, CronTickYielded):
+                if isinstance(e, (CronTickYielded, CronSubstrateDenied)):
                     # Expected while a fresh gateway owns the lock; still recorded for status.
+                    # CronSubstrateDenied joins it (card t_0ae49984): a host refusal is not a
+                    # broken ticker, and logging it as an error with a traceback every 60 s is
+                    # the noise that hides a real fault. It is still recorded below, so
+                    # `hermes cron status` is never falsely green.
                     logger.info("Cron tick yielded: %s", e)
                 else:
                     logger.error("Cron tick error: %s", e, exc_info=True)
@@ -542,7 +546,7 @@ class InProcessCronScheduler(CronScheduler):
         home)``, when given, is consulted every cycle; a rejected profile is neither ticked nor
         heartbeated."""
         from cron.scheduler import tick as cron_tick
-        from cron.scheduler import CronTickYielded, _is_fd_exhaustion
+        from cron.scheduler import CronSubstrateDenied, CronTickYielded, _is_fd_exhaustion
         from cron.scheduler_preflight import (
             SharedRouteAdapters, _primary_profile_routes_for_current_home,
         )
@@ -626,7 +630,7 @@ class InProcessCronScheduler(CronScheduler):
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
                                     sync=False, can_dispatch=can_dispatch,
                                 )
-                        except CronTickYielded as e:
+                        except (CronTickYielded, CronSubstrateDenied) as e:
                             # Yield for THIS profile only; one fresh gateway must not stop others.
                             logger.info("Cron tick yielded for profile at %s: %s", home, e)
                             _profile_errors[str(home)] = f"{type(e).__name__}: {e}"

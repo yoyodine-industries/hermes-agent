@@ -646,11 +646,20 @@ def open_board_ro(board: str) -> Optional[sqlite3.Connection]:
 
     Read-only is the contract: a roll-up (or a cross-board reference probe) must never
     initialize, migrate or repair somebody else's board.
+
+    The path is ``board``'s OWN (``kanban_db.board_store_path``), resolved from the kanban
+    home rather than through ``HERMES_KANBAN_DB``: the pin belongs to the calling PROCESS,
+    so under a pin ``kanban_db_path(<any slug>)`` answers the pinned file for EVERY slug
+    and a probe returns the first slug it guessed instead of the one that holds the card
+    (measured 2026-10-13: every defcon card resolved to ``'default'``, which then tripped
+    the pin guard at the tool door and refused a worker's own child). A board whose own
+    file is not there answers ``None`` - "cannot be told" - never a fabricated slug
+    (design ruling D3, card t_2187558e).
     """
     from hermes_cli import kanban_db as kb
 
     try:
-        path = kb.kanban_db_path(board=board)
+        path = kb.board_store_path(board)
     except Exception:
         return None
     if not Path(path).exists():

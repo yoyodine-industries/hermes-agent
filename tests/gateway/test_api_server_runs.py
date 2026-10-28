@@ -79,6 +79,16 @@ def _claim_run(adapter: APIServerAdapter, run_id: str) -> None:
     adapter._run_owners[run_id] = adapter._run_idempotency_scope(request)
 
 
+def _hold_live_run(adapter: APIServerAdapter, run_id: str) -> None:
+    """Hold *run_id* with a live handle — what any non-terminal row must have (t_5976163f).
+
+    A row written by this process stays non-terminal only while a handle holds it; a test
+    that fabricates a ``running`` row without one is modelling orphaned work, which the fence
+    correctly reports as ``interrupted``.
+    """
+    adapter._register_live_run_handle(run_id, family="v1_runs")
+
+
 def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     """Create an aiohttp app with /v1/runs routes registered."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
@@ -492,6 +502,7 @@ class TestRunStatus:
         """
         status = adapter._set_run_status("run_live", "running")
         _claim_run(adapter, "run_live")
+        _hold_live_run(adapter, "run_live")
         scope = adapter._run_owners["run_live"]
         adapter._run_idempotency_store.reserve(
             scope, "shutdown-test-key", "shutdown-test-fingerprint", "run_live", status)
@@ -917,6 +928,7 @@ class TestSteerRun:
         adapter._run_streams["run_123"] = stream
         adapter._set_run_status("run_123", "running")
         _claim_run(adapter, "run_123")
+        _hold_live_run(adapter, "run_123")
 
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/runs/run_123/steer", json={"input": "tighten the ending"})
@@ -966,6 +978,7 @@ class TestSteerRun:
         adapter._active_run_agents["run_123"] = agent
         adapter._set_run_status("run_123", "running")
         _claim_run(adapter, "run_123")
+        _hold_live_run(adapter, "run_123")
 
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/runs/run_123/steer", json={"input": ""})
@@ -2614,3 +2627,239 @@ class TestRunEventsHeadFlush:
             assert first, "no body byte arrived before the first event"
 
             resp.close()
+
+
+# ---------------------------------------------------------------------------
+# t_5976163f (impl t_86e21fa3) — liveness from live handles, the row census named as
+# rows, ONE handle predicate for both run families, and the fence that stops a
+# non-terminal row from outliving its work.
+# ---------------------------------------------------------------------------
+
+
+class TestActiveRunsCensusAndFence:
+    @pytest.mark.asyncio
+    async def test_active_runs_counts_live_handles_and_active_rows_counts_rows(self, adapter):
+        """A1: {queued leaked (no handle), running (live task), completed} + 1 inline turn.
+
+        active_runs == 2 (the live task + the inline turn), active_rows == 2 (the two
+        non-terminal ROWS), stored_runs == 3 (all rows held) — and active_runs is exactly
+        the gate's ``live_runs + inflight_turns``, so the published gauge and the limiter
+        can never tell two stories.
+        """
+
+        async def _never():
+            await asyncio.Event().wait()
+
+        live_task = asyncio.create_task(_never())
+        try:
+            adapter._run_statuses = {
+                "run_leaked": {"status": "queued"},     # a row no handle owns
+                "run_live": {"status": "running"},      # held by a live task
+                "run_done": {"status": "completed"},
+            }
+            adapter._active_run_tasks = {"run_live": live_task}
+            adapter._inflight_agent_runs = 1            # one inline bot/chat turn in flight
+
+            payload = adapter._api_server_status_payload()
+
+            assert payload["active_runs"] == 2
+            assert payload["active_rows"] == 2
+            assert payload["stored_runs"] == 3
+            terms = adapter._agent_work_terms()
+            assert payload["active_runs"] == terms["live_runs"] + terms["inflight_turns"]
+            # The cap arithmetic is untouched (R6): three terms, same names and membership.
+            assert set(terms) == {"pending_requests", "inflight_turns", "live_runs"}
+            assert "agent_work_gate" in payload
+        finally:
+            live_task.cancel()
+            await asyncio.gather(live_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_a_row_without_a_handle_moves_only_active_rows(self, adapter):
+        """A2: a non-terminal row with no live task/handle does not move active_runs."""
+
+        async def _never():
+            await asyncio.Event().wait()
+
+        live_task = asyncio.create_task(_never())
+        try:
+            adapter._run_statuses = {"run_live": {"status": "running"}}
+            adapter._active_run_tasks = {"run_live": live_task}
+            adapter._inflight_agent_runs = 0
+            before = adapter._api_server_status_payload()
+
+            adapter._run_statuses["run_orphan"] = {"status": "stopping"}
+            after = adapter._api_server_status_payload()
+
+            assert after["active_rows"] == before["active_rows"] + 1
+            assert after["active_runs"] == before["active_runs"], "a status string is not liveness"
+            assert after["active_rows"] > after["active_runs"], "the leak signal an ops seat reads"
+        finally:
+            live_task.cancel()
+            await asyncio.gather(live_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_one_handle_predicate_answers_for_both_run_families(self, adapter):
+        """R4: /v1/runs tasks and inline turns answer through the same predicate."""
+
+        async def _never():
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(_never())
+        try:
+            adapter._active_run_tasks["run_v1"] = task
+            assert adapter._run_has_live_handle("run_v1") is True
+            assert adapter._live_run_task_count() == 1
+
+            # Inline family: a handle token, deliberately NOT a task entry — the turn is
+            # counted by _inflight_agent_runs, so a task entry would double count it.
+            adapter._register_live_run_handle("run_inline", family="inline")
+            assert "run_inline" not in adapter._active_run_tasks
+            assert adapter._run_has_live_handle("run_inline") is True
+            assert adapter._live_run_task_count() == 1, "the inline turn must not enter the gate"
+            assert adapter._nonterminal_run_row_count() == 0
+
+            adapter._release_live_run_handle("run_inline")
+            assert adapter._run_has_live_handle("run_inline") is False
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        # A task that has already finished is not a live handle: a run whose task died
+        # before its turn started must not keep a dead row looking alive.
+        done = asyncio.create_task(asyncio.sleep(0))
+        await done
+        adapter._active_run_tasks["run_dead"] = done
+        try:
+            assert adapter._run_has_live_handle("run_dead") is False
+        finally:
+            adapter._active_run_tasks.pop("run_dead", None)
+
+    @pytest.mark.asyncio
+    async def test_a_self_owned_record_without_a_handle_is_fenced_and_persists(
+        self, adapter, tmp_path
+    ):
+        """A3: a durable record owned by THIS process, with no live handle.
+
+        It reads back as ``interrupted`` (not ``running``), it is not counted as live work,
+        the fence persists through the idempotency store, and the same record WITH a live
+        handle is left alone — so the fence can only ever fire on work nobody holds.
+        """
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        request = MagicMock()
+        request.headers = {}
+        scope = adapter._run_idempotency_scope(request)
+        now = time.time()
+
+        def _row(run_id: str) -> dict:
+            return {
+                "object": "hermes.run", "run_id": run_id, "status": "running",
+                "created_at": now, "updated_at": now,
+            }
+
+        # Identical rows, both written by this process (the record carries our own owner
+        # stamp), so both take the SAME-PROCESS arm: a handle is required.
+        adapter._run_statuses["run_mem"] = _row("run_mem")
+        adapter._run_owners["run_mem"] = scope
+        adapter._run_idempotency_store.reserve(
+            scope, "mem-twin", "fp", "run_store", _row("run_store"),
+            owner_pid=adapter._run_owner_pid, owner_started=adapter._run_owner_started)
+        # The same two rows, each held by a live handle: untouched.
+        adapter._run_statuses["run_mem_live"] = _row("run_mem_live")
+        adapter._run_owners["run_mem_live"] = scope
+        _hold_live_run(adapter, "run_mem_live")
+        adapter._run_idempotency_store.reserve(
+            scope, "store-live", "fp", "run_store_live", _row("run_store_live"),
+            owner_pid=adapter._run_owner_pid, owner_started=adapter._run_owner_started)
+        _hold_live_run(adapter, "run_store_live")
+        # A terminal row is never touched, held or not.
+        adapter._run_statuses["run_mem_done"] = {
+            "object": "hermes.run", "run_id": "run_mem_done", "status": "completed",
+            "created_at": now, "updated_at": now,
+        }
+        adapter._run_owners["run_mem_done"] = scope
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            fenced_mem = await (await cli.get("/v1/runs/run_mem")).json()
+            fenced_store = await (await cli.get("/v1/runs/run_store")).json()
+            live_mem = await (await cli.get("/v1/runs/run_mem_live")).json()
+            live_store = await (await cli.get("/v1/runs/run_store_live")).json()
+            done = await (await cli.get("/v1/runs/run_mem_done")).json()
+
+        for fenced in (fenced_mem, fenced_store):
+            assert fenced["status"] == "interrupted"
+            assert fenced["last_event"] == "run.interrupted"
+            assert fenced["error"] == (
+                "The run has no live worker in this gateway process; fenced closed.")
+        assert fenced_mem["status"] == fenced_store["status"], "the two read paths must agree"
+        assert live_mem["status"] == "running"
+        assert live_store["status"] == "running"
+        assert done["status"] == "completed"
+        assert "error" not in done
+
+        # Fenced rows are not live work (the row census only claims non-terminal rows), and
+        # the fence is durable: a fresh read through the store sees ``interrupted`` too.
+        assert adapter._api_server_status_payload()["active_rows"] == 2
+        durable = adapter._run_idempotency_store.status_for_run(scope, "run_store")
+        assert durable["status"]["status"] == "interrupted", "the fence must persist"
+
+    def test_clearing_a_handles_token_fences_the_same_row_on_the_next_read(self, adapter):
+        """R4b: the fence follows the handle — live, then gone."""
+        request = MagicMock()
+        request.headers = {}
+        adapter._run_statuses["run_inline"] = {
+            "object": "hermes.run", "run_id": "run_inline", "status": "running",
+            "updated_at": time.time(),
+        }
+        adapter._run_owners["run_inline"] = adapter._run_idempotency_scope(request)
+        adapter._register_live_run_handle("run_inline", family="inline")
+        try:
+            assert adapter._durable_run_status(request, "run_inline")["status"] == "running"
+        finally:
+            adapter._release_live_run_handle("run_inline")
+        assert adapter._durable_run_status(request, "run_inline")["status"] == "interrupted"
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_fences_an_unheld_nonterminal_row_once_and_persists_it(
+        self, adapter, tmp_path
+    ):
+        """A4: the sweep fences what no read ever asked about, and persists the verdict."""
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        request = MagicMock()
+        request.headers = {}
+        scope = adapter._run_idempotency_scope(request)
+        now = time.time()
+
+        def _row(run_id: str, status: str) -> dict:
+            return {
+                "object": "hermes.run", "run_id": run_id, "status": status,
+                "created_at": now, "updated_at": now,
+            }
+
+        adapter._run_statuses["run_swept"] = _row("run_swept", "running")
+        adapter._run_owners["run_swept"] = scope
+        adapter._run_idempotency_ids.add("run_swept")
+        adapter._run_idempotency_store.reserve(
+            scope, "sweep-key", "fp", "run_swept", _row("run_swept", "running"),
+            owner_pid=adapter._run_owner_pid, owner_started=adapter._run_owner_started)
+        adapter._run_statuses["run_held"] = _row("run_held", "running")
+        adapter._run_owners["run_held"] = scope
+        _hold_live_run(adapter, "run_held")
+
+        adapter._sweep_orphaned_runs_once(now)
+
+        swept = adapter._run_statuses["run_swept"]
+        assert swept["status"] == "interrupted"
+        assert swept["last_event"] == "run.interrupted"
+        assert swept["error"] == (
+            "The run has no live worker in this gateway process; fenced closed.")
+        durable = adapter._run_idempotency_store.status_for_run(scope, "run_swept")
+        assert durable["status"]["status"] == "interrupted", "the fence must persist"
+        fenced_at = swept["updated_at"]
+        assert adapter._run_statuses["run_held"]["status"] == "running", "live work is not fenced"
+
+        # A second pass is a no-op: the row is terminal now, so nothing re-fences it.
+        adapter._sweep_orphaned_runs_once(now + 120)
+        assert adapter._run_statuses["run_swept"]["updated_at"] == fenced_at
+        assert adapter._run_statuses["run_swept"]["status"] == "interrupted"

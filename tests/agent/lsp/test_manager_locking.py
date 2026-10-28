@@ -32,6 +32,10 @@ def test_reused_multiroot_client_attaches_outside_state_lock(monkeypatch):
 
     class StubClient:
         is_running = True
+        # The real LSPClient always carries these two (the residency caps read them); a fake that
+        # omits them is not a faithful stand-in for the object under test.
+        workspace_root = root
+        workspace_folders: list = []
 
         async def add_workspace_folder(self, attached_root: str) -> None:
             assert attached_root == root

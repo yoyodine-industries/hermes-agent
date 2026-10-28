@@ -165,6 +165,25 @@ def log_released(keys: list[tuple[str, str]], reason: str) -> None:
     _emit("reaper", logging.INFO, f"released {len(keys)} client(s) ({reason}): {summary}")
 
 
+def log_root_trimmed(server_id: str, root: str, remaining: int) -> None:
+    """One workspace folder was detached to keep a multi-root server inside its root cap (LRU).
+
+    INFO: this is a residency bound firing, not an error — the root re-attaches on its next write.
+    """
+    _emit(server_id, logging.INFO, f"trimmed root {root} ({remaining} folder(s) left)")
+
+
+def log_host_evicted(keys: list[tuple[str, str, str]], limit: int) -> None:
+    """The HOST-wide resident ceiling fired: servers were shut down, LRU first, across profiles.
+
+    ``keys`` is ``(server_id, workspace_root, profile)``.  INFO, one line per eviction: this is the
+    bound doing its job, not an error — the evicted root re-spawns (one spawn) on its next write.
+    """
+    summary = ", ".join(f"{sid} ({root}) [{profile}]" for sid, root, profile in keys)
+    _emit("residency", logging.INFO,
+          f"host-wide residency ceiling ({limit}) evicted {len(keys)} server(s): {summary}")
+
+
 def reset_announce_caches() -> None:
     """Test-only: clear the dedup caches.  Production code never calls this."""
     with _announce_lock:
@@ -178,6 +197,7 @@ __all__ = [
     "log_clean",
     "log_diagnostics",
     "log_disabled",
+    "log_host_evicted",
     "log_no_project_root",
     "log_reaped",
     "log_root_excluded",

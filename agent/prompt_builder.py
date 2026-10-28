@@ -28,9 +28,17 @@ from agent.skill_utils import (
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
+from hermes_yaml import YamlEngineUnavailable
 from utils import atomic_json_write, file_signature
 
 logger = logging.getLogger(__name__)
+
+# An unavailable YAML engine (missing ``ruamel.yaml``) is an ENVIRONMENT fault, never skill
+# content — the same class ``hermes_yaml`` raises rather than returning a document. Every
+# broad ``except Exception`` on a skills surface would otherwise downgrade it to "skill missing"
+# or "compatible with no description", which is a different answer, not a lesser one. These
+# surfaces re-raise it so the fault reaches a caller that can name the engine.
+_ENGINE_FAULT_ERRORS = (YamlEngineUnavailable, ImportError)
 
 
 # Default read deadline for context files (SOUL.md, AGENTS.md, .cursorrules,
@@ -327,9 +335,11 @@ KANBAN_GUIDANCE = (
     "Workers may only attach to their own task.\n"
     "- **Created cards.** List ids in `kanban_complete(created_cards=[...])` ONLY when captured from a successful "
     "`kanban_create` return — never invent or paste ids; the kernel rejects the completion on any phantom id.\n"
-    "- **Orchestrating: discover profiles first.** The dispatcher SILENTLY drops a card with an unknown assignee (it "
-    "sits in `ready` forever). Ground every assignee in a real profile (`hermes profile list`, or ask the user), and "
-    "express dependencies via `parents=[...]` on `kanban_create`, not prose.\n"
+    "- **Orchestrating: discover profiles first.** `kanban_create` REFUSES a card whose assignee is not a live "
+    "profile — the dispatcher never spawns such a card, so the create is rejected at source. Ground every assignee "
+    "in a real profile (`hermes profile list`, or ask the user); a genuine control-plane pull lane or probe fixture "
+    "must be declared once in `kanban.control_plane_assignees`. Express dependencies via `parents=[...]` on "
+    "`kanban_create`, not prose.\n"
     "\n"
     "## Do NOT\n\n"
     "- Do not shell out to `hermes kanban <verb>` for board operations. Use the `kanban_*` tools — they work across "
@@ -1280,7 +1290,12 @@ def _build_snapshot_entry(skill_file: Path, skills_dir: Path, frontmatter: dict,
 
 
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
-    """Read a SKILL.md once -> (is_compatible, frontmatter, description); errors yield (True, {}, "")."""
+    """Read a SKILL.md once -> (is_compatible, frontmatter, description).
+
+    A content/read error yields ``(True, {}, "")`` so one odd file cannot kill the prompt build.
+    An UNAVAILABLE YAML ENGINE does not: that is an environment fault, not this skill's content,
+    and it propagates so it can never be reported as a compatible skill with no description.
+    """
     try:
         raw = skill_file.read_text(encoding="utf-8-sig")
         frontmatter, _ = parse_frontmatter(raw)
@@ -1288,6 +1303,8 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter) or not skill_matches_apps(frontmatter):
             return False, frontmatter, extract_skill_description(frontmatter)
         return True, frontmatter, extract_skill_description(frontmatter)
+    except _ENGINE_FAULT_ERRORS:
+        raise
     except Exception as e:
         logger.warning("Failed to parse skill file %s: %s", skill_file, e)
         return True, {}, ""
@@ -1364,7 +1381,7 @@ def build_skills_system_prompt(
 ) -> str:
     """Compact skill index for the system prompt.
 
-    Same-named skills resolve like skill_view: project > local > create_dir > external_dirs, and a
+    Same-named skills resolve like skill_view: local > create_dir > external_dirs > project, and a
     same-tier duplicate is listed under its exact relative path (``agent.skill_utils.resolve_skill_catalog``).
     ``compact_categories`` (coding posture) demotes categories to a names-only line — nothing is ever hidden.
     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
@@ -1402,6 +1419,8 @@ def _read_category_descriptions(root: Path, log_fmt: str) -> dict[str, str]:
             if cat_desc:
                 rel = desc_file.relative_to(root)
                 found["/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"] = str(cat_desc).strip().strip("'\"")
+        except _ENGINE_FAULT_ERRORS:
+            raise
         except Exception as e:
             logger.debug(log_fmt, desc_file, e)
     return found
@@ -1414,6 +1433,8 @@ def _scan_extra_root(root: Path, skill_files, tier: int, log_fmt: str) -> list[t
         try:
             is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
             rows.append(({**_build_snapshot_entry(skill_file, root, frontmatter, desc), "tier": tier, "root": root}, is_compatible))
+        except _ENGINE_FAULT_ERRORS:
+            raise
         except Exception as e:
             logger.debug(log_fmt, skill_file, e)
     return rows
@@ -1430,14 +1451,85 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
         skills_by_category.setdefault(category, []).append((entry["load_name"], desc))
 
 
+# --------------------------------------------------------------------------------------------- #
+# DEPRECATED 2026-09-30 (card t_cc3c6951, operator ruling): the FLAT SKILLS INDEX is RETIRED.
+#
+# What it was: every visible skill rendered as one `- name: one-line description` line, under a
+# heading that told the agent to SCAN the list and load whatever looked relevant. It was a
+# keyword/description- and search-shaped routing surface.
+#
+# Why it went: it duplicated the curated hierarchical surface every lane's SOUL already carries
+# (`## Skills — your curated surface`, grouped yoyodine / domain / role, loaded by name), it routed
+# lanes to skills their own shelf does not carry, and it charged every call on every lane for a
+# list most lanes never searched. The curated shelf is the routing surface now.
+#
+# What did NOT go: nothing is disabled. `skills_list()` still enumerates the same tree on demand
+# (a tool call the lane chooses to pay for, instead of a per-call prompt tax), `skill_view(name)`
+# still loads any skill by name, and a profile with no curated surface can restore the legacy
+# index with `skills.index: flat` in its config.yaml or `HERMES_SKILLS_INDEX=flat`.
+#
+# ENFORCEMENT: tests/agent/test_skills_index_deprecated.py fails if an index line is rendered
+# again. Do not restore the index by editing this file back — the guard is the point of the change.
+SKILLS_INDEX_DEPRECATED_ON = "2026-09-30"
+SKILLS_INDEX_REPLACEMENT = "## Skills — your curated surface"
+
+SKILLS_INDEX_DEPRECATION_BANNER = (
+    "## Skills\n"
+    f"DEPRECATED {SKILLS_INDEX_DEPRECATED_ON} — the flat skills index is RETIRED. It listed every "
+    "visible skill as `name: description`; that list is gone. Your routing surface is the curated "
+    f"hierarchical shelf this profile's SOUL carries (`{SKILLS_INDEX_REPLACEMENT}`, grouped "
+    "yoyodine / domain / role): load those skills BY NAME with skill_view(name). A skill that is "
+    "not named there is not on your shelf — route the need to the majordomo rather than searching a "
+    "list. `skills_list()` still enumerates the tree if you explicitly need to look."
+)
+
+
+def skills_index_dark() -> bool:
+    """True when the flat skills index is suppressed (the DEFAULT).
+
+    The operator ruling is that the curated hierarchy wins, so dark is the default and re-enabling
+    the index is an explicit, per-profile act:
+
+      * ``HERMES_SKILLS_INDEX=flat`` (env override, wins over config), or
+      * ``skills.index: flat`` in the active profile's ``config.yaml``.
+
+    Anything else — unset, unreadable config, ``dark``/``off``/``false`` — is dark. A profile with
+    no curated SOUL surface is the only legitimate caller of the hatch: every lane carries one.
+    """
+    env = (os.environ.get("HERMES_SKILLS_INDEX") or "").strip().lower()
+    if env in ("flat", "legacy", "on", "1", "true"):
+        return False
+    if env in ("dark", "deprecated", "off", "0", "false"):
+        return True
+    node: Any = None
+    try:
+        node = _config_readonly("skills.index")
+        for part in ("skills", "index"):
+            node = node.get(part) if isinstance(node, dict) else None
+            if node is None:
+                break
+    except Exception:
+        node = None
+    if node is True or (isinstance(node, str) and node.strip().lower() in ("flat", "legacy", "on", "true")):
+        return False
+    return True
+
+
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (),
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list. *unloadable* names (different skills
-    sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
+    sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse.
+
+    DEPRECATED 2026-09-30: the flat index is retired by default and this function returns the
+    deprecation banner instead of the per-skill index lines (see the block above). The index-line
+    rendering below stays reachable only through the explicit escape hatch.
+    """
     if not skills_by_category:
         return ""
+    if skills_index_dark():
+        return SKILLS_INDEX_DEPRECATION_BANNER
     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
     # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
     demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
@@ -1552,19 +1644,20 @@ def _build_skills_system_prompt_inner(
         for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
             is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
             candidates.append((_build_snapshot_entry(skill_file, skills_dir, frontmatter, desc), is_compatible))
-    # Every tier is resolved together, exactly as skill_view resolves names (agent.skill_utils precedence:
-    # project > local > create_dir > external_dirs; same-tier duplicates listed by exact path). Hidden and
-    # incompatible copies still take part — skill_view sees them too.
+    # Every tier is resolved together, exactly as skill_view resolves names (agent.skill_utils
+    # precedence: local > create_dir > external_dirs > project; same-tier duplicates listed by exact
+    # path). Hidden and incompatible copies still take part — skill_view sees them too.
     from agent.skill_utils import TIER_PROJECT, is_disabled_entry, iter_project_skill_files, resolve_skill_catalog
-    project_roots = [d for t, d in extra_roots if t == TIER_PROJECT and d.exists()]
     rows: list[tuple[dict, bool]] = []
-    for root in project_roots:
-        rows += _scan_extra_root(root, iter_project_skill_files(root), TIER_PROJECT, "Error reading project skill %s: %s")
     rows += [({**entry, "tier": TIER_LOCAL, "root": skills_dir}, ok) for entry, ok in candidates]
     for tier, root in ((t, d) for t, d in extra_roots if t != TIER_PROJECT and d.exists()):
         rows += _scan_extra_root(root, iter_skill_index_files(root, "SKILL.md"), tier, "Error reading external skill %s: %s")
         for cat, cat_desc in _read_category_descriptions(root, "Could not read external skill description %s: %s").items():
             category_descriptions.setdefault(cat, cat_desc)
+    # Trusted project checkouts are the LOWEST tier: a repo checkout changes under the fleet with a
+    # `git pull`, so it may never shadow a curated (profile-local or shared) skill.
+    for root in (d for t, d in extra_roots if t == TIER_PROJECT and d.exists()):
+        rows += _scan_extra_root(root, iter_project_skill_files(root), TIER_PROJECT, "Error reading project skill %s: %s")
     resolved = resolve_skill_catalog([
         {**entry, "name": _entry_name(entry), "path": entry["root"] / entry["rel"],
          "visible": ok and not hides(entry.get("skill_name") or "", entry.get("conditions") or {})}

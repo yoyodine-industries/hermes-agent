@@ -721,15 +721,13 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
-    from agent.delegation_context import ancestor_owns_live_kanban_claim, kanban_path_is_fenced
-    # The PROVENANCE arm joins the marker arm here for the same reason it exists (ruling
-    # t_fcf7a321): a descendant that has stripped the marker is still a descendant. It must
-    # take the READ-ONLY route below, not fall through to the schema/backfill write pass —
-    # ``_migrate_add_optional_columns`` runs ``write_txn``, whose durable assertion would
-    # otherwise refuse every verb the CLI initializes (reads included: ``kanban_command``
-    # calls ``kb.init_db()`` before dispatch). Reads stay served; mutations are still refused
-    # by ``_assert_not_delegated_child_mutation`` at the write seams.
-    if kanban_path_is_fenced(path) or ancestor_owns_live_kanban_claim(path):
+    from agent.delegation_context import child_kanban_write_purpose, kanban_path_is_fenced
+    # ONE exception, consulted HERE so it reaches both doors (card t_703af8d1, defect D11):
+    # a caller inside the reviewed child-context write allowance
+    # (``agent.delegation_context.child_kanban_write_allowance``, purpose
+    # ``peer-refusal-report``) is here to WRITE, so it opens read-write; the write itself
+    # still passes the allowance check at the write seam, which logs every use.
+    if kanban_path_is_fenced(path) and not child_kanban_write_purpose():
         # Reads must not enter schema/backfill write transactions. Never create a
         # missing board or migrate on a descendant's behalf; the owner initializes it.
         conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
@@ -1262,8 +1260,23 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     ``add_comment``) opt in — helpers with post-commit side effects
     (``complete_task`` & co.) must never run under an open outer transaction,
     since those side effects would fire while the outer txn can still roll back.
+
+    The child-context fence is enforced here, with ONE reviewed exception: a caller that
+    has explicitly entered a NAMED allowance
+    (``agent.delegation_context.child_kanban_write_allowance``) may write — logged at
+    WARNING so the exception is visible rather than silent. See the allowlist's own
+    comment for why that single write is safe from a child context (card t_703af8d1).
     """
-    _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
+    from agent.delegation_context import child_kanban_write_purpose
+
+    purpose = child_kanban_write_purpose()
+    if purpose:
+        _kb._log.warning(
+            "kanban: child-context write ALLOWED by the reviewed exception %r on %s",
+            purpose, _main_db_file(conn),
+        )
+    else:
+        _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(

@@ -14,6 +14,8 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1200,3 +1202,540 @@ def test_landed_completion_with_unadmitted_proof_is_refused_by_the_landed_clause
     assert "completion_blocked_proof_gate" in kinds
     assert "pr_acceptance" not in kinds
     assert "completed" not in kinds
+
+
+# -- a run store OUTAGE is not a verdict (card t_66a21ced) ---------------------
+#
+# The gate's questions are "did the reviewed bytes land?" and "did a run happen AFTER that
+# landing?". The run store is only where the second answer is STORED, so an unreadable store is
+# an OUTAGE — not evidence that any run is missing. These tests pin the three-way distinction
+# the old code could not make: answered / answered-without-the-run / could-not-answer.
+
+
+def _broken_store(tmp_path: Path):
+    """The incident's exact shape: a REAL SQLite store, truncated mid-page.
+
+    ``sqlite3`` OPENS it happily and the READ raises ``DatabaseError: database disk image is
+    malformed`` — measured on a truncated copy of the live store 2026-10-16, the same error that
+    refused card t_20fbada3's close on 2026-10-08. It is the OUTAGE arm: neither "the file is
+    absent" nor "the store answered and holds no such run".
+    """
+    path = _run_store(tmp_path)
+    path.write_bytes(path.read_bytes()[:512])
+    return path
+
+
+def _receipt(tmp_path: Path, run_id: str = "20260926-1835", *, outcome: str | None = "pass",
+             closed: bool = True, nodes: int = 3, at: str = "2026-09-26T22:50:00+00:00",
+             name: str = "run.log", directory: str | None = None, log_run_id: str | None = None):
+    """The run's OWN receipt: ``<run_details>/<run_id>/run.log`` beside the store.
+
+    ``at`` is the first event's ISO timestamp; every later event is one minute on, in the order
+    the runner writes them (node events, then the resolved outcome, then the close marker).
+    """
+    root = tmp_path if directory is None else tmp_path / directory
+    run_dir = root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    named = log_run_id or run_id
+    start = datetime.fromisoformat(at)
+    lines = []
+    for index in range(nodes):
+        lines.append(json.dumps({
+            "ts": (start + timedelta(minutes=index)).isoformat(), "event": "node_completed",
+            "run_id": named, "node_id": f"node{index}"}))
+    if outcome is not None:
+        lines.append(json.dumps({
+            "ts": (start + timedelta(minutes=nodes)).isoformat(), "event": "outcome_resolved",
+            "run_id": named, "node_id": "run", "outcome": outcome, "reason": outcome}))
+    if closed:
+        lines.append(json.dumps({
+            "ts": (start + timedelta(minutes=nodes + 1)).isoformat(), "event": "pin_retired",
+            "run_id": named, "node_id": "run", "because": "run_close"}))
+    (run_dir / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return run_dir
+
+
+def _outage_proof(tmp_path, *, ref: str = "abc123def4567890", run_id: str = "20260926-1835",
+                  digest: str | None = None, path: Path | None = None):
+    """The outage block's proof: the suite's own builder, with its artifact created for it."""
+    if path is None:
+        path, digest = _artifact(tmp_path)
+    return _proof(path, digest, ref=ref, run_id=run_id)
+
+
+def test_an_unreadable_store_resolves_on_the_runs_own_receipt(tmp_path):
+    """The card CLOSES: the store is down, the run's own receipt stands (and says it did)."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")  # landing before the run
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00")          # 22:50Z..22:54Z, outcome pass
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is True, verdict.failures
+    assert verdict.facts["run_store_state"] == "unavailable"
+    assert verdict.facts["degraded"] is True
+    assert verdict.facts["run_receipt"].endswith("20260926-1835/run.log")
+    assert verdict.facts["run_outcome"] == "pass"
+    assert "database disk image is malformed" in verdict.facts["run_store_error"]
+    # never a SILENT pass: the green close names the outage that forced the fallback
+    assert "DEGRADED" in verdict.detail and str(store) in verdict.detail
+    assert "DEGRADED" in gate.render("t_witness1", verdict)
+
+
+def test_an_unreadable_store_with_a_predating_receipt_is_still_refused(tmp_path):
+    """Anti-fabrication: the fallback buys no time. A receipt before the landing is refused."""
+    ledger = _ledger(tmp_path, at="2026-09-27T02:00:00-04:00")   # 06:00Z, AFTER the run
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00")           # only 22:50Z..22:54Z
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "proof_predates_landing", verdict.failures
+    assert verdict.facts["run_store_state"] == "unavailable"      # the outage IS recorded
+
+
+def test_an_unreadable_store_with_no_receipt_is_refused_by_name(tmp_path):
+    """No receipt: the refusal names the STORE and its repair — never "run_unknown"."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = tmp_path / "absent" / "yoyoflow-state.db"            # the store is not there at all
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_store_unavailable", verdict.failures
+    detail = gate.render("t_witness1", verdict)
+    assert str(store) in detail                                  # names the blocker
+    assert "UNAVAILABLE" in detail and "integrity-check" in detail
+    assert "cannot clear a timing failure" not in detail         # the misleading trailer is gone
+    assert "run_unknown" not in [f["clause"] for f in verdict.failures]
+
+
+def test_a_readable_store_that_holds_no_such_run_is_still_run_unknown(tmp_path):
+    """A store that ANSWERS is the authority: a green receipt cannot override its "no such run".
+
+    This is the distinction the card is about — and it holds in BOTH directions: the receipt is
+    not consulted while the store answers, and ``run_unknown`` still means exactly one thing.
+    """
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _run_store(tmp_path, run_id="20260926-9999")         # readable, other run
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00")           # a green receipt, ignored
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_unknown", verdict.failures
+    assert "not a store outage" in verdict.detail
+    assert "run_receipt" not in verdict.facts                    # the receipt was never read
+
+
+def test_an_unreadable_store_with_a_not_pass_receipt_is_not_green(tmp_path):
+    """The receipt's OUTCOME decides: a ``not_pass`` run is not evidence that the work was done."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, outcome="not_pass", at="2026-09-26T22:50:00+00:00")
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_not_green", verdict.failures
+
+
+def test_a_truncated_receipt_cannot_manufacture_a_green_run(tmp_path):
+    """No resolved outcome and no close marker: an in-flight or truncated log proves nothing."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, outcome=None, closed=False, at="2026-09-26T22:50:00+00:00")
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_not_green", verdict.failures
+
+
+def test_a_closed_receipt_with_no_resolved_outcome_mirrors_the_stores_rule(tmp_path):
+    """The store's own rule read off the log: completed with NO verdict is green, as it is there."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, outcome=None, closed=True, at="2026-09-26T22:50:00+00:00")
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is True, verdict.failures
+    assert verdict.facts["run_closed"] is True and verdict.facts["run_outcome"] is None
+
+
+def test_a_receipt_that_does_not_name_the_run_is_not_that_runs_log(tmp_path):
+    """One run's log cannot be offered for another: the events must name the declared id."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00", log_run_id="20260101-0000")
+
+    verdict = gate.evaluate(_outage_proof(tmp_path), ledger_path=str(ledger),
+                            run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_store_unavailable", verdict.failures
+    assert "carries no event naming run" in verdict.detail
+
+
+def test_a_run_id_outside_the_receipt_root_is_refused(tmp_path):
+    """``run.id`` is one path segment: a traversal must never reach a file outside the root."""
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+
+    verdict = gate.evaluate(_outage_proof(tmp_path, run_id="../20260926-1835"),
+                            ledger_path=str(ledger), run_store_path=str(store))
+
+    assert verdict.ok is False
+    assert verdict.cause == "run_store_unavailable", verdict.failures
+    assert "not a single safe path segment" in verdict.detail
+
+
+def test_the_kernel_close_is_degraded_but_the_card_still_closes(conn, tmp_path, monkeypatch):
+    """End to end through the firing path: the landed card CLOSES and the audit says DEGRADED.
+
+    This is the acceptance of card t_66a21ced on the door the incident used: a landed card whose
+    unit is deployed and whose run is green closes on its recorded run while the shared store is
+    unreadable — and the ``proof_gate_admitted`` event carries the outage, so nothing is quiet.
+    """
+    path, digest = _artifact(tmp_path)
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = _broken_store(tmp_path)
+    _receipt(tmp_path, at="2026-09-26T22:50:00+00:00")
+    monkeypatch.setenv("HERMES_PROOF_LEDGER", str(ledger))
+    monkeypatch.setenv("HERMES_PROOF_RUN_STORE", str(store))
+    tid = _task(conn, contract="landed", title="landed work during a store outage")
+    proof = {"artifacts": [{"path": str(path), "sha256": digest}],
+             "landing": {"ref": "abc123def4567890"},
+             "run": {"store": "yoyoflow", "id": "20260926-1835"}}
+
+    assert kb.complete_task(conn, tid, summary="landed and proven, store down",
+                            metadata={"proof": proof}) is True
+
+    payload = json.loads(conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'proof_gate_admitted'",
+        (tid,)).fetchone()["payload"])
+    facts = payload["facts"]
+    assert facts["run_store_state"] == "unavailable"
+    assert facts["degraded"] is True and facts["run_receipt_events"] == 5
+    assert "run store" in facts["degraded_reason"]
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "done"
+
+
+def test_a_landed_card_with_no_receipt_and_no_store_is_refused_by_name(conn, tmp_path,
+                                                                      monkeypatch):
+    """End to end: the outage the incident hit refuses with ITS OWN cause, not "run_unknown"."""
+    path, digest = _artifact(tmp_path)
+    ledger = _ledger(tmp_path, at="2026-09-26T20:00:00+00:00")
+    store = tmp_path / "absent" / "yoyoflow-state.db"
+    monkeypatch.setenv("HERMES_PROOF_LEDGER", str(ledger))
+    monkeypatch.setenv("HERMES_PROOF_RUN_STORE", str(store))
+    tid = _task(conn, contract="landed", title="landed work, store gone")
+    proof = {"artifacts": [{"path": str(path), "sha256": digest}],
+             "landing": {"ref": "abc123def4567890"},
+             "run": {"store": "yoyoflow", "id": "20260926-1835"}}
+
+    with pytest.raises(kb.ProofGateError) as caught:
+        kb.complete_task(conn, tid, summary="landed, but the store is gone",
+                         metadata={"proof": proof})
+
+    assert caught.value.clause == "run_store_unavailable"
+    assert "UNAVAILABLE" in str(caught.value)
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running"  # nothing mutated
+
+
+
+# -- the fan-out phantom arm (card t_e7f27489) -----------------------------------------
+#
+# The measured incident: a merge into `yaan-platform` fanned out one `landed` card per unit,
+# and the cards for units the merge never touched had no artifact, no run and no probe -- and
+# never would. Every landed clause was unsatisfiable by construction, so the only door left was
+# ARCHIVING them, which records no reason. These tests hold the alternative door to its two
+# jobs: it must CLOSE a proven phantom, and it must REFUSE to close a card that is real work.
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo)] + list(args), check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _canonical_repo(tmp_path, *, shipped=(), merged=(), name="canonical"):
+    """A checkout whose HEAD is a MERGE whose FIRST-PARENT diff touches exactly *merged*.
+
+    The side branch carries *merged*; main moves on its own file before the merge, so the
+    merge's first-parent diff is the side branch's paths and nothing else -- the exact shape
+    the fan-out got wrong (it read the WHOLE diff, side branch included).
+    """
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "gate@test.invalid")
+    _git(repo, "config", "user.name", "gate test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    for rel in shipped:
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{rel}\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "checkout", "-qb", "side")
+    for rel in merged:
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{rel}\nSIDE BRANCH\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "side work")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "README.md").write_text("main moved on its own\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "main moved")
+    _git(repo, "merge", "--no-ff", "-qm", "merge side into main", "side")
+    return repo, _git(repo, "rev-parse", "HEAD")
+
+
+def _control_plane(tmp_path, repo, *, unit="unit-a", includes=(), dest="/opt/hermes_prod/unit-a",
+                   manifest_lines=None):
+    """A control root in the train's own grammar: projects.conf + the unit's manifest."""
+    root = tmp_path / "control"
+    (root / "manifests").mkdir(parents=True, exist_ok=True)
+    if manifest_lines is None:
+        manifest_lines = [f"include {spec}" for spec in includes] + ["preserve run_details"]
+    (root / "manifests" / f"{unit}.conf").write_text(
+        "# test manifest\n" + "\n".join(manifest_lines) + "\n", encoding="utf-8")
+    (root / "projects.conf").write_text(
+        "# unit  canonical-checkout  dest  manifest\n"
+        f"{unit}  {repo}  {dest}  manifests/{unit}.conf\n"
+        "# a registry-only row: a checkout and no live dest\n"
+        f"{unit}-registry  {repo}  -  -\n", encoding="utf-8")
+    return root
+
+
+def _phantom_proof(unit, merge, paths):
+    return {"mechanism": "fan-out-phantom", "unit": unit, "merge": merge, "paths": list(paths)}
+
+
+def test_the_phantom_arm_closes_a_unit_that_ships_none_of_the_merges_paths(tmp_path):
+    """The measured incident, closed HONESTLY: no artifact, no landing, no run -- and admitted."""
+    repo, merge = _canonical_repo(tmp_path, shipped=("scripts/unit_a.py", "cron/unit-a.sh"),
+                                  merged=("scripts/sdlc_nodes.py",))
+    root = _control_plane(tmp_path, repo, includes=("scripts/unit_a.py", "cron/unit-a.sh"))
+
+    verdict = gate.evaluate(_phantom_proof("unit-a", merge, ["scripts/sdlc_nodes.py"]),
+                            control_root=str(root))
+
+    assert verdict.ok is True, verdict.failures
+    assert verdict.facts["closure"] == "not-work"
+    assert verdict.facts["mechanism"] == "fan-out-phantom"
+    assert verdict.facts["unit"] == "unit-a" and verdict.facts["merge"] == merge
+    assert verdict.facts["paths"] == ["scripts/sdlc_nodes.py"]
+    assert verdict.facts["path_count"] == 1 and verdict.facts["ship_set_size"] == 2
+    assert verdict.facts["manifest_sha256"] and verdict.facts["include_count"] == 2
+    assert "NOT-WORK" in verdict.detail and "not a discharge" in verdict.detail
+
+
+def test_the_phantom_arm_refuses_a_unit_that_ships_a_merge_path(tmp_path):
+    """The claim is FALSE for this unit: the card is real work, and the refusal says so."""
+    repo, merge = _canonical_repo(
+        tmp_path, shipped=("scripts/unit_a.py",),
+        merged=("scripts/occupancy_summary.py", "scripts/unit_a.py"))
+    root = _control_plane(tmp_path, repo, includes=("scripts/unit_a.py",))
+
+    verdict = gate.evaluate(
+        _phantom_proof("unit-a", merge, ["scripts/occupancy_summary.py", "scripts/unit_a.py"]),
+        control_root=str(root))
+
+    assert verdict.ok is False
+    assert verdict.cause == "phantom_paths_shipped", verdict.failures
+    assert "scripts/unit_a.py" in verdict.detail
+    text = gate.render("t_phantom1", verdict)
+    assert "NOT a phantom" in text and "ordinary landed proof" in text
+
+
+def test_the_phantom_arm_measures_the_first_parent_diff_and_refuses_a_claimed_list(tmp_path):
+    """The declared list is never taken on trust: the gate re-measures, and prints what it saw."""
+    repo, merge = _canonical_repo(tmp_path, shipped=("scripts/unit_a.py",),
+                                  merged=("scripts/sdlc_nodes.py",))
+    root = _control_plane(tmp_path, repo, includes=("scripts/unit_a.py",))
+
+    verdict = gate.evaluate(_phantom_proof("unit-a", merge, ["scripts/not_it.py"]),
+                            control_root=str(root))
+
+    assert verdict.ok is False
+    assert verdict.cause == "phantom_diff_mismatch", verdict.failures
+    assert "scripts/sdlc_nodes.py" in verdict.detail  # the MEASURED list is handed back
+    assert "scripts/not_it.py" not in verdict.detail
+
+
+def test_the_phantom_arm_refuses_a_unit_the_control_plane_does_not_carry(tmp_path):
+    repo, merge = _canonical_repo(tmp_path, merged=("scripts/x.py",))
+    root = _control_plane(tmp_path, repo, includes=("scripts/unit_a.py",))
+
+    verdict = gate.evaluate(_phantom_proof("no-such-unit", merge, ["scripts/x.py"]),
+                            control_root=str(root))
+
+    assert verdict.ok is False and verdict.cause == "phantom_unit_unknown", verdict.failures
+    assert "projects.conf key" in verdict.detail
+
+
+def test_the_phantom_arm_refuses_a_registry_only_row(tmp_path):
+    """A row with no live dest has no ship set: it cannot host a fan-out card."""
+    repo, merge = _canonical_repo(tmp_path, merged=("scripts/x.py",))
+    root = _control_plane(tmp_path, repo, includes=("scripts/unit_a.py",))
+
+    verdict = gate.evaluate(_phantom_proof("unit-a-registry", merge, ["scripts/x.py"]),
+                            control_root=str(root))
+
+    assert verdict.ok is False and verdict.cause == "phantom_unverifiable", verdict.failures
+    assert "registry-only" in verdict.detail
+
+
+def test_the_phantom_arm_refuses_a_merge_that_is_not_in_the_units_checkout(tmp_path):
+    repo, _merge = _canonical_repo(tmp_path, merged=("scripts/x.py",))
+    _other, foreign = _canonical_repo(tmp_path, merged=("scripts/y.py",), name="other")
+    root = _control_plane(tmp_path, repo, includes=("scripts/unit_a.py",))
+
+    verdict = gate.evaluate(_phantom_proof("unit-a", foreign, ["scripts/y.py"]),
+                            control_root=str(root))
+
+    assert verdict.ok is False
+    assert verdict.cause == "phantom_merge_unresolved", verdict.failures
+    assert "canonical checkout" in verdict.detail
+
+
+def test_the_phantom_arm_refuses_a_manifest_with_no_ship_set(tmp_path):
+    """`preserve`/`reap` are NOT ship lines, and a ship set of nothing proves nothing."""
+    repo, merge = _canonical_repo(tmp_path, shipped=("run_details/keep.txt",),
+                                  merged=("scripts/x.py",))
+    root = _control_plane(tmp_path, repo,
+                          manifest_lines=["preserve run_details", "reap old-*"])
+
+    verdict = gate.evaluate(_phantom_proof("unit-a", merge, ["scripts/x.py"]),
+                            control_root=str(root))
+
+    assert verdict.ok is False and verdict.cause == "phantom_unverifiable", verdict.failures
+    assert "no `include` line" in verdict.detail
+
+
+def test_the_phantom_arm_needs_a_unit_a_merge_and_a_paths_list(tmp_path):
+    verdict = gate.evaluate({"mechanism": "fan-out-phantom", "unit": "unit-a"},
+                            control_root=str(tmp_path))
+    assert verdict.ok is False and verdict.cause == "malformed_proof"
+    assert "fan-out-phantom arm needs" in verdict.detail
+
+
+def test_a_proof_without_the_mechanism_still_takes_the_landed_door(tmp_path):
+    """The two doors never leak: no mechanism, no phantom verdict -- the landed clauses judge."""
+    verdict = gate.evaluate({"artifacts": [], "unit": "unit-a"}, control_root=str(tmp_path))
+    assert verdict.ok is False
+    assert verdict.cause == "malformed_proof"
+    assert "proof.artifacts must name at least one deployed artifact" in verdict.detail
+
+
+def test_the_mechanism_aliases_normalise_to_one_name(tmp_path):
+    repo, merge = _canonical_repo(tmp_path, shipped=("scripts/unit_a.py",),
+                                  merged=("scripts/other.py",))
+    root = _control_plane(tmp_path, repo, includes=("scripts/unit_a.py",))
+
+    for alias in ("fan-out-phantom", "fanout_phantom", "phantom", "fan_out_phantom"):
+        proof = _phantom_proof("unit-a", merge, ["scripts/other.py"])
+        proof["mechanism"] = alias
+        verdict = gate.evaluate(proof, control_root=str(root))
+        assert verdict.ok is True, (alias, verdict.failures)
+        assert verdict.facts["mechanism"] == "fan-out-phantom"
+
+
+def test_the_kernel_close_admits_a_phantom_and_records_WHAT_it_closed_as(conn, tmp_path,
+                                                                       monkeypatch):
+    """End to end through the firing path: the landed card CLOSES, and the audit says NOT-WORK.
+
+    This is the acceptance of card t_e7f27489 on the door the residue used: the card is
+    authored ``landed``, carries a phantom proof instead of an artifact, and closes -- with the
+    ``proof_gate_admitted`` event saying it was closed as not-work, on which unit, which merge
+    and which measured paths. A later reader never has to guess why it went.
+    """
+    repo, merge = _canonical_repo(tmp_path, shipped=("scripts/unit_a.py",),
+                                  merged=("scripts/sdlc_nodes.py",))
+    root = _control_plane(tmp_path, repo, includes=("scripts/unit_a.py",))
+    monkeypatch.setenv("YAAN_PROOF_CONTROL_ROOT", str(root))
+    monkeypatch.setenv("HERMES_PROOF_LEDGER", str(tmp_path / "no-ledger.jsonl"))
+    tid = _task(conn, contract="landed", title="yaan-platform#1600 changed unit unit-a")
+
+    assert kb.complete_task(
+        conn, tid, summary="not-work: the fan-out over-filed this unit",
+        metadata={"proof": _phantom_proof("unit-a", merge, ["scripts/sdlc_nodes.py"])}) is True
+
+    payload = json.loads(conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'proof_gate_admitted'",
+        (tid,)).fetchone()["payload"])
+    facts = payload["facts"]
+    assert facts["closure"] == "not-work"
+    assert facts["mechanism"] == "fan-out-phantom"
+    assert facts["unit"] == "unit-a" and facts["merge"] == merge
+    assert facts["paths"] == ["scripts/sdlc_nodes.py"]
+    assert payload["detail"].startswith("closed as NOT-WORK")
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "done"
+
+
+def test_the_kernel_refuses_a_phantom_claim_that_is_real_work(conn, tmp_path, monkeypatch):
+    """The fence still holds the line: a phantom claim on a shipped path leaves the card alone."""
+    repo, merge = _canonical_repo(tmp_path, shipped=("scripts/unit_a.py",),
+                                  merged=("scripts/unit_a.py",))
+    root = _control_plane(tmp_path, repo, includes=("scripts/unit_a.py",))
+    monkeypatch.setenv("YAAN_PROOF_CONTROL_ROOT", str(root))
+    tid = _task(conn, contract="landed", title="yaan-platform#1600 changed unit unit-a")
+
+    with pytest.raises(kb.ProofGateError) as caught:
+        kb.complete_task(conn, tid, summary="claiming not-work",
+                         metadata={"proof": _phantom_proof("unit-a", merge,
+                                                           ["scripts/unit_a.py"])})
+
+    assert caught.value.clause == "phantom_paths_shipped"
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running"
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = 'completion_blocked_proof_gate'",
+        (tid,)).fetchone()["n"] == 1
+
+
+def test_the_phantom_arm_reads_projects_conf_like_the_train(tmp_path):
+    """ONE map, ONE grammar: the gate's reader and ``deploy_train_nodes.projects`` must agree.
+
+    Two readers of the same control-plane file is exactly how a dest or a manifest column comes
+    to mean two things. The train's reader is the authority; where it is not importable (the
+    override running outside a yaan-platform checkout) the test skips rather than passes blind.
+    """
+    root = Path(__file__).resolve().parents[3]
+    # LIVE-INSTALL LAYOUT (t_ed5f4912, 2026-10-20): this module also runs as an OVERRIDE inside
+    # the hermes install (~/.hermes/hermes-agent), where `parents[3]` is the hermes HOME - so the
+    # repo-relative probe below would stat a path under the real home, which this tree's I/O
+    # guard refuses and which is no checkout in any case. Pure path arithmetic, no I/O: a
+    # checkout has a repo root here, the live install has the home.
+    if root.name == ".hermes":
+        pytest.skip(f"live-install layout, no yaan-platform checkout beside the module: {root}")
+    train = root / "scripts" / "deploy_train_nodes.py"
+    if not train.is_file():
+        pytest.skip(f"not inside a yaan-platform checkout: {train}")
+    sys.path.insert(0, str(train.parent))
+    try:
+        import deploy_train_nodes  # noqa: WPS433 - the train's own parser, by design
+    except Exception as exc:  # pragma: no cover - an unimportable train is a skip, not a pass
+        pytest.skip(f"deploy_train_nodes is not importable here: {exc}")
+    finally:
+        sys.path.pop(0)
+
+    control_root = os.environ.get("YAAN_PROOF_CONTROL_ROOT") or gate.DEFAULT_CONTROL_ROOT
+    if not os.path.isfile(os.path.join(control_root, "projects.conf")):
+        pytest.skip(f"no live control plane at {control_root}")
+    assert gate._projects_rows(control_root) == deploy_train_nodes.projects(
+        path=os.path.join(control_root, "projects.conf"))

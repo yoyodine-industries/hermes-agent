@@ -314,6 +314,13 @@ lsp:
   # clamped to 30 so a sweep can never reap a client mid-operation.
   idle_timeout: 600
 
+  # HOST-wide ceiling on live language-server processes — every Hermes
+  # profile on this host counted together, not one per profile. When a
+  # spawn would push the host past it, the least recently used server is
+  # shut down (whichever profile owns it) and respawns on its next file
+  # operation. 0 disables the ceiling. See "Host-wide residency" below.
+  max_resident_servers: 4
+
   # Per-server overrides (all optional).
   servers:
     pyright:
@@ -441,6 +448,32 @@ Servers that support multi-root workspaces (currently pyright) run as a
 it, and every further project root — for example sibling git worktrees
 edited by parallel subagents — is attached to that same server as an
 additional workspace folder instead of starting another copy.
+
+## Host-wide residency
+
+Idle reaping bounds one process; it does not bound the **host**. Ten
+profile gateways each holding three servers is thirty language servers,
+which is how a host ends up with several `pyright` processes at ~10 GB
+RSS each. `lsp.max_resident_servers` (default **4**, `0` disables) is
+the ceiling for the whole host: every profile's server registers in one
+shared census directory (`<hermes root>/run/lsp-resident`, one small
+file per live server), and after each spawn the least recently used
+server on the host is shut down — whoever's profile owns it. The
+evicted file's next operation re-spawns it in one go, the same trade an
+idle reap makes.
+
+`hermes lsp status` prints the host's resident set (`host residency:
+2/4 resident servers (all profiles)`) and `hermes lsp status --json`
+publishes `max_resident_servers`, `resident_count` and a
+`resident_servers` array — `server_id`, `workspace_root`, `profile`,
+`pid`, `owner_pid`, `age_seconds`, `idle_seconds` — read from the
+census, so a status command in a process that owns no servers still
+shows every profile's. The census also reaps leaks the id-reaper cannot
+see: a server whose owning process was killed outright is terminated by
+the next reader instead of holding a host slot forever.
+
+A server is only counted once it registered, i.e. servers spawned by
+other tools (an editor's own `pyright`) are outside this ceiling.
 
 ## Disabling
 

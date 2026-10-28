@@ -202,6 +202,40 @@ class CronTickYielded(RuntimeError):
 _STALE_YIELD_RE = re.compile(r"stale code: booted on (\S+), disk is at (\S+)\)")
 
 
+class CronSubstrateDenied(RuntimeError):
+    """A cron tick held EVERY job because the substrate it needs answered a denial.
+
+    Raised by ``tick()`` BEFORE the tick lock, exactly like :class:`CronTickYielded` and for the
+    same reason -- but the condition is the machine, not the code: a root the tick must read or
+    write (a DAG script, the prod tree, the store) refused a REAL operation with EACCES/EPERM/EROFS
+    (card ``t_0ae49984``, design ``t_72e9bf03`` §3.3).
+
+    Nothing is advanced and nothing is marked failed: ``next_run_at`` is untouched (so the overdue
+    job fires on the first tick after recovery instead of being silently lost) and no job takes a
+    ``last_status: error`` row -- that is the whole point of the door, because the error-row storm
+    is how a host fault reads as eighteen broken jobs. One EPISODE replaces them, and the ticker
+    wrapper records this class name in ``ticker_last_error`` like the stale-code yield, so
+    ``hermes cron status`` is never falsely green.
+
+    Raised, not returned, and never thrown for an indeterminate reading: fail-open is invariant I4.
+    """
+
+    def __init__(self, report=None) -> None:
+        self.report = report
+        try:
+            from hermes_cli import substrate_access as _sa
+
+            detail = _sa._matrix_sentence(report.matrix()) if report is not None else "no report"
+        except Exception:  # health: allow BLE001 -- the exception message must never raise
+            detail = "probe report unavailable"
+        super().__init__(
+            "Cron tick held by substrate admission: a root this tick must use refused a real "
+            f"operation ({detail}). No job was advanced or marked failed; the overdue work fires "
+            "on the first tick after the substrate is readable again."
+        )
+
+
+
 def stale_code_yield_labels(recorded_error: str | None) -> tuple[str, str] | None:
     """``(boot_rev, disk_rev)`` when a persisted ``ticker_last_error`` is a ``CronTickYielded``.
 
@@ -1649,14 +1683,35 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
     except Exception as e:
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
+    # Host fallback (card t_92b4a684): a NAMED profile with no ``model:`` of its own still runs
+    # unpinned jobs on the HOST root config's default model + provider, as the root profile does,
+    # instead of dying at the raise below.
+    if not (isinstance(model, str) and model.strip()):
+        try:
+            from cron.jobs import host_default_model
+            _host_model, _host_provider, _host_model_cfg = host_default_model(_get_hermes_home())
+        except Exception as e:
+            logger.debug("Job '%s': host model fallback failed: %s", job_id, e)
+            _host_model = _host_provider = ""
+            _host_model_cfg = {}
+        if _host_model:
+            model = _host_model
+            if not _cron_default_provider and _host_provider:
+                _cron_default_provider = _host_provider
+            if not _model_cfg:
+                _model_cfg = _host_model_cfg
+
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400.
     # See #23979.
     if not (isinstance(model, str) and model.strip()):
+        _active_home = _get_hermes_home()
+        _store = _active_home.name if _active_home.parent.name == "profiles" else "default"
         raise RuntimeError(
-            f"Cron job '{job_name}' has no model configured "
+            f"Cron job '{job_name}' has no model configured in the '{_store}' profile's store "
             f"(job.model={job.get('model')!r}, "
             f"HERMES_MODEL={cron_env_setting('HERMES_MODEL')!r}, "
-            "config.yaml model.default missing or empty). "
+            "that profile's config.yaml model.default missing or empty, and the host config carries "
+            "no model.default either). "
             f"Set a per-job model via "
             f"`hermes cron edit {job_id} --model <name>` or set a "
             "default with `hermes model <name>`."

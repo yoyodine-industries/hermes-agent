@@ -8,20 +8,25 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import os
+import logging
 import shutil
 import sqlite3
 import subprocess
 import time
 import unicodedata
 from pathlib import Path
+from typing import Any
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
 
 from hermes_cli.worktree_ops import release_lsp_clients
+from hermes_cli.projects_db import sanitize_branch_name
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+
+_log = logging.getLogger(__name__)
 
 _REMOVABLE_KINDS = ("scratch", "worktree")
 
@@ -149,8 +154,36 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
         if resolved in seen:
             continue
         seen.add(resolved)
+        if not _db_has_tasks_table(resolved):
+            # A stub board (``boards/default`` and ``boards/_archived`` in the
+            # live home carry only metadata tables) answers "no such table:
+            # tasks", which the caller reads as an unreadable sibling and
+            # therefore defers EVERY cleanup on EVERY board. A board with no
+            # task table cannot be using this workspace: skip it.
+            _kb._log.debug("Ignoring tasks-less board db %s", resolved)
+            continue
         found.append(resolved)
     return found
+
+
+def _db_has_tasks_table(db_file: Path) -> bool:
+    """Whether *db_file* is a board store at all (it has a ``tasks`` table).
+
+    Unknown answers True so an unreadable board still makes the caller fail
+    closed; only a readable database that provably has no task table is skipped.
+    """
+    try:
+        other = sqlite3.connect(db_file.as_uri() + "?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = other.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1"
+            ).fetchone()
+            return row is not None
+        finally:
+            other.close()
+    except sqlite3.Error as exc:
+        _kb._log.warning("Cannot inspect board db %s: %s", db_file, exc)
+        return True
 
 
 def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
@@ -423,15 +456,69 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+def _archive_untracked_and_clear(task_id: str, wp: Path) -> bool:
+    """Archive a dirty worktree's UNTRACKED files, then clear them from the tree.
+
+    Returns True only when the tree holds no tracked change and every untracked
+    path was copied to ``<hermes home>/archive/worktree-prune/<task>-<stamp>``
+    and deleted. A tracked modification (anything but ``??``) is real work:
+    return False and let the caller preserve the tree in place.
+
+    Clearing rather than ``worktree remove --force`` keeps git's own dirty guard
+    as the last line of defence — a file written between the archive and the
+    removal makes the removal fail and the tree is preserved (TOCTOU safe).
+    """
+    try:
+        from hermes_cli.worktree_gc import _archive_untracked, _dirty_split
+    except Exception:
+        return False
+    tracked_dirty, untracked = _dirty_split(str(wp))
+    if tracked_dirty:
+        _kb._log.info(
+            "Preserving worktree for task %s: uncommitted tracked changes at %s",
+            task_id, wp,
+        )
+        return False
+    if not untracked:
+        return False
+    dest = _archive_untracked(wp, untracked)
+    if dest is None:
+        _kb._log.warning(
+            "Preserving worktree for task %s: could not archive untracked files at %s",
+            task_id, wp,
+        )
+        return False
+    for rel in untracked:
+        target = wp / rel
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target, ignore_errors=True)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+        except OSError as exc:
+            _kb._log.warning(
+                "Preserving worktree for task %s: cannot clear %s after archiving: %s",
+                task_id, target, exc,
+            )
+            return False
+    _kb._log.info(
+        "Archived untracked files for task %s to %s and cleared them from %s",
+        task_id, dest, wp,
+    )
+    return True
+
+
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
     """Remove a finished task's linked git worktree when it holds no work.
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
-    requires a clean tree AND every commit reachable from a remote-tracking
-    ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
-    branches are kept. Best-effort."""
+    requires no tracked modification AND every commit reachable from a
+    remote-tracking ref; any doubt (tracked-dirty, unpushed, unresolvable repo,
+    failing git, unarchivable scratch) preserves it. Untracked scratch is not
+    work: it is archived under ``<hermes home>/archive/worktree-prune/<task>``
+    and cleared, then the tree goes. The auto-generated ``wt/<task-id>`` branch
+    is deleted with it; custom branches are kept. Best-effort."""
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
     except Exception:
@@ -441,17 +528,22 @@ def _cleanup_worktree_workspace(
         if not wp.is_dir():
             return
         common = _git_common_dir(wp)
-        if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
-        repo_root = common.parent
+        if common is None or not _is_linked_worktree_checkout(wp):
+            return  # not a linked worktree of a repo — never guess
+        # A normal checkout's common dir is ``<repo>/.git``; a bare canonical
+        # mirror's common dir IS the mirror dir, so anchor removal on it.
+        repo_root = common.parent if common.name == ".git" else common
         if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
             return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
+        if _worktree_has_unpushed_commits(str(wp)):
             _kb._log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
+                "Preserving worktree for task %s: unpushed commits at %s",
                 task_id, wp,
             )
             return
+        if _worktree_is_dirty(str(wp), str(repo_root)):
+            if not _archive_untracked_and_clear(task_id, wp):
+                return
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own
         # linked worktree, so move this process back to the main checkout
@@ -632,6 +724,209 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         return Path(out).expanduser()
 
 
+# ---------------------------------------------------------------------------
+# Spawn gate: a worktree anchor MUST be a git repository (card t_e5ff985b)
+# ---------------------------------------------------------------------------
+#
+# Measured 2026-10-18: 26 open cards on the migrations + platform boards carried a
+# ``workspace_path`` of ``/opt/hermes_sandbox/platform/<program>/.worktrees/<id>``. That
+# directory is the program's STATE folder (LOOPING / TASKS / EVIDENCE) -- a plain folder,
+# never a repo -- because the project was registered with ``primary`` pointing at the state
+# folder instead of at the repo it lands in. Every claim died at this seam, the dispatcher
+# retried once and gave up, and the card went back to ``ready`` looking unattended: 26 cards
+# dead with free workers, throughput down to 5/day.
+#
+# The seam already refused the spawn. What it could not do was (a) SAY WHY in the card's own
+# terms -- which project, which folder, which command fixes it -- or (b) STOP retrying, which
+# no retry can fix. Both belong here, at the one place an anchor is resolved: a distinct
+# exception type the dispatcher classifies deterministically (never prose), and a message
+# that names the repair.
+
+#: Greppable prefix of the marker the dispatcher writes on the card. It LEADS the comment and
+#: the stored error because ``_record_task_failure`` cuts the error at 500 chars.
+SPAWN_FAILED_NO_REPO_PREFIX = "spawn_failed: no repo at "
+
+
+def no_repo_refusal(
+    *,
+    anchor: Path | str,
+    task_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    project_slug: Optional[str] = None,
+) -> str:
+    """The ONE message for a worktree anchor that is not a git repo.
+
+    Names the anchor, the project that bound it, the card, and the two commands that fix it —
+    a refusal a lane can act on without reading this module.
+    """
+    anchor = str(anchor)
+    card = task_id or "<card>"
+    if project_slug and project_id:
+        who = f" Project {project_slug!r} ({project_id})."
+    elif project_slug or project_id:
+        who = f" Project {project_slug or project_id!r}."
+    else:
+        who = ""
+    slug = project_slug or "<project>"
+    fix_project = (
+        f"give the project a real repo primary (hermes project add-folder {slug} "
+        f"{slug} <git-repo> then hermes project set-primary {slug} <git-repo>)"
+    )
+    return (
+        f"{SPAWN_FAILED_NO_REPO_PREFIX}{anchor}; a worktree card materialises "
+        f"<repo>/.worktrees/{card}, so its anchor must be inside a git repository and this "
+        f"path is a plain folder.{who} Fix: either {fix_project}, or re-anchor this one card "
+        f"(hermes kanban retarget {card} --workspace worktree:<git-repo>). A project whose "
+        "cards land in SEVERAL repos must name the repo per card rather than declare a "
+        "primary folder. Not retried: no retry turns a folder into a repo."
+    )
+
+
+#: Marker that LEADS the refusal text: ``_record_task_failure`` truncates the stored error at 500
+#: chars, and this string is also the dispatcher's event kind for the deferral.
+WORKSPACE_VOLUME_MARKER = "workspace_volume_unavailable: "
+
+
+def _unreachable_component(path: Path | str) -> Optional[Path]:
+    """The first SYMLINK prefix of ``path`` whose target is not an existing directory, else None.
+
+    A component that is NOT a link and does not exist is fine: materialising a workspace creates
+    its parents. Only an EXISTING symlink is judged, and only by whether its target is a directory
+    -- that is what "the volume is not mounted" looks like from here (``/opt/hermes_sandbox ->
+    /Volumes/yoyofs1/hermes_sandbox`` with the volume gone: the link is present, the target is not).
+    """
+    try:
+        candidate = Path(path).expanduser()
+    except (TypeError, ValueError):  # pragma: no cover - a non-path argument is the caller's bug
+        return None
+    for prefix in [*candidate.parents[::-1], candidate]:
+        if not prefix.is_symlink():
+            continue
+        if not Path(os.path.realpath(prefix)).is_dir():
+            return prefix
+    return None
+
+
+def container_reachable(path: Path | str) -> bool:
+    """True when every SYMLINK prefix of ``path`` resolves to a directory that exists.
+
+    The predicate a workspace materialiser MUST ask before it creates anything: ``mkdir`` through
+    a dangling link does not fail, it creates the missing directory INSIDE the resolved target, so
+    a card whose volume is unmounted silently gets a workspace on the wrong volume. Callers treat
+    False as :class:`WorkspaceVolumeUnavailable`.
+    """
+    return _unreachable_component(path) is None
+
+
+class WorkspaceVolumeUnavailable(RuntimeError):
+    """A workspace path component is a symlink whose target is gone: the volume is not mounted.
+
+    INFRASTRUCTURE and RETRYABLE, in one class so no caller prose-parses it: nothing of the card
+    ran, the repair is on the host (remount the volume), and the card must keep its retry budget
+    and stay claimable for the first tick after the volume returns. Also kept distinct from
+    :class:`WorktreeAnchorNotRepo`, which is the opposite verdict (the card's own wiring, blocked
+    on the first attempt) and would otherwise swallow this case: a gone volume makes every anchor
+    lookup answer "not a repo".
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        component: Path | str,
+        task_id: Optional[str] = None,
+    ) -> None:
+        self.path = str(path)
+        self.component = str(component)
+        self.task_id = task_id
+        super().__init__(
+            f"{WORKSPACE_VOLUME_MARKER}{path} cannot be used: the symlinked component "
+            f"{component} does not resolve to a directory, so its volume is not mounted. "
+            f"Nothing was created through the link. Remount the volume; the card retries on the "
+            f"next dispatcher tick"
+            + (f" (task {task_id})." if task_id else ".")
+        )
+
+
+def _refuse_unreachable(path: Path | str, *, task_id: Optional[str] = None) -> None:
+    """Raise :class:`WorkspaceVolumeUnavailable` when ``path`` sits behind a dangling symlink."""
+    component = _unreachable_component(path)
+    if component is not None:
+        raise WorkspaceVolumeUnavailable(path, component=component, task_id=task_id)
+
+
+class WorktreeAnchorNotRepo(ValueError):
+    """A ``worktree`` card's anchor is not (inside) a git repository.
+
+    A NON-RETRYABLE class: a plain folder cannot become a repo by claiming the card again, so
+    the dispatcher blocks the card on the FIRST such failure and names the repair, instead of
+    spending the retry budget and leaving the card ``ready`` as if it were waiting its turn.
+    """
+
+    def __init__(
+        self,
+        anchor: Path | str,
+        *,
+        task_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        project_slug: Optional[str] = None,
+    ) -> None:
+        self.anchor = str(anchor)
+        self.task_id = task_id
+        self.project_id = project_id
+        self.project_slug = project_slug
+        super().__init__(
+            no_repo_refusal(
+                anchor=anchor, task_id=task_id, project_id=project_id, project_slug=project_slug
+            )
+        )
+
+
+def project_label(project_id: Optional[str]) -> Optional[str]:
+    """Best-effort project slug for a refusal message; ``None`` when unresolvable.
+
+    Cross-profile registry reads are optional here by design: the message must still name the
+    project id (which every board row carries) when no registry can be opened.
+    """
+    if not project_id:
+        return None
+    try:
+        from hermes_cli import projects_db as _pdb
+
+        with _pdb.connect_closing() as pconn:
+            row = pconn.execute(
+                "SELECT slug FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def assert_repo_anchor(
+    anchor: Path | str,
+    *,
+    task_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    project_slug: Optional[str] = None,
+) -> Path:
+    """Return the git root containing *anchor*, or refuse with ``WorktreeAnchorNotRepo``.
+
+    Used at BIRTH (a project's primary before it may anchor a worktree), at RETARGET (before a
+    card is re-pointed) and at CLAIM (before a worktree is materialised) — the same rule at
+    every door, so a misconfigured project cannot produce a card that is born impossible.
+    """
+    path = Path(str(anchor)).expanduser()
+    root = _git_toplevel(path) if path.exists() else None
+    if root is None:
+        raise WorktreeAnchorNotRepo(
+            path,
+            task_id=task_id,
+            project_id=project_id,
+            project_slug=project_slug if project_slug is not None else project_label(project_id),
+        )
+    return root
+
+
 def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     try:
         result = _git(repo_root, "show-ref", "--verify", f"refs/heads/{branch_name}", timeout=30)
@@ -685,9 +980,212 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _git_ref_accepted(branch_name: str) -> bool:
+    """True only when git itself confirms *branch_name* as a branch ref.
+
+    Fails CLOSED. A probe that cannot run — no git on PATH, a timeout, or a name
+    carrying a NUL byte that ``execve`` refuses — is a name we could not verify,
+    and a name we could not verify is not a name we hand to ``git worktree add``.
+    Returning the unverified name unchanged is what let a NUL-carrying stored
+    name through; the caller now repairs it (``sanitize_branch_name`` maps NUL
+    into ``-`` as an illegal control character).
+    """
+    if not branch_name or "\x00" in branch_name:
+        return False
+    try:
+        probe = subprocess.run(
+            ["git", "check-ref-format", "--branch", branch_name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except Exception:
+        _log.warning(
+            "kanban workspace: could not verify branch name %r with git; treating it as "
+            "invalid and repairing it",
+            branch_name,
+        )
+        return False
+    return probe.returncode == 0
+
+
+def safe_branch_name(branch_name: str, *, task_id: str = "") -> str:
+    """Return a branch name ``git worktree add`` accepts, repairing a bad one.
+
+    Derivation is sanitized at the source (``projects_db.branch_name_for``), but a
+    STORED ``branch_name`` can predate that fix, or be written straight to the
+    column by an API caller. git rejects the whole ref, so one trailing ``.``
+    turns into ``git worktree add`` failing and the dispatch dying with a
+    ``workspace: ...`` spawn failure, before any checkout exists. Verifying here —
+    the one seam every worktree path crosses — turns that dead card into a
+    repaired, logged name.
+    """
+    name = (branch_name or "").strip()
+    if not name or _git_ref_accepted(name):
+        return name
+    repaired = sanitize_branch_name(name, fallback=f"wt/{task_id}" if task_id else "")
+    if not repaired or not _git_ref_accepted(repaired):
+        repaired = f"wt/{task_id}" if task_id else "wt/branch"
+    _log.warning(
+        "kanban workspace: stored branch name %r is not a valid git ref; "
+        "using %r for task %s",
+        name,
+        repaired,
+        task_id or "?",
+    )
+    return repaired
+
+
+def _git_is_bare_repo(path: Path) -> bool:
+    """True iff *path* is a bare repository with no worktree of its own.
+
+    A bare canonical mirror is a legal ``git worktree add`` anchor, but it has
+    no ``--show-toplevel``, so :func:`_git_toplevel` cannot see it.
+    """
+    out = _kb._git_out(path, "rev-parse", "--is-bare-repository")
+    return out is not None and out.strip() == "true"
+
+
+def _repo_anchor_for(path: Path) -> Optional[Path]:
+    """Return the repo a worktree can be anchored on at *path*.
+
+    A normal checkout anchors on its working-tree root; a **bare canonical
+    mirror** anchors on the mirror directory itself. ``None`` when *path* is
+    neither.
+    """
+    root = _git_toplevel(path)
+    if root is not None:
+        return root
+    if _git_is_bare_repo(path):
+        try:
+            return path.expanduser().resolve(strict=False)
+        except OSError:
+            return path.expanduser()
+    return None
+
+
+def _board_anchor_repo(board: Optional[str]) -> Optional[Path]:
+    """The board's ``default_workdir`` as an anchor repo, or ``None``.
+
+    Lets a per-card worktree target live OUTSIDE the repo (e.g. under the
+    owning profile's work dir) while still sharing the canonical clone's
+    object store. Accepts a normal checkout or a bare canonical mirror.
+    """
+    board_slug = board if board else _kb.get_current_board()
+    try:
+        board_default = (
+            _kb.read_board_metadata(board_slug).get("default_workdir") or ""
+        ).strip()
+    except Exception:
+        return None
+    if not board_default:
+        return None
+    anchor = Path(board_default).expanduser()
+    if not anchor.is_absolute():
+        return None
+    # A board anchor behind a dangling symlink is a HOST condition, not a missing repo: answer it
+    # with the volume verdict so the caller does not fall through to ``WorktreeAnchorNotRepo``.
+    _refuse_unreachable(anchor)
+    return _repo_anchor_for(anchor)
+
+
+def _existing_anchor(path: Path) -> Path:
+    """``path`` itself when it exists, else its nearest existing ancestor (``/`` last resort).
+
+    ``os.path.isdir`` is deliberately the tool here, and that is not a contradiction of the
+    substrate gate's own rule. During the measured fault ``isdir`` answered TRUE for a path on a
+    volume nobody could read -- so this walk STOPS AT the denied path instead of skipping over it
+    to a readable ancestor, which is the honest answer. A path that genuinely does not exist yet
+    walks up to the parent it will be created under, which is the thing whose readability decides
+    whether creating it can work.
+    """
+    current = Path(path)
+    for _ in range(64):
+        try:
+            if os.path.isdir(current):
+                return current
+        except OSError:
+            return current
+        parent = current.parent
+        if parent == current:
+            return current
+        current = parent
+    return current
+
+
+def planned_workspace_root(task: Any, *, board: Optional[str] = None) -> Optional[Path]:
+    """Where THIS card's workspace will be created -- resolved WITHOUT creating it.
+
+    Door 3 of the substrate admission gate (card ``t_0ae49984``, design ``t_72e9bf03``) has to ask
+    "is the substrate this card needs readable?" BEFORE the claim, and it must not answer that
+    question by doing the very thing it is gating: :func:`resolve_workspace` MINTS a worktree and
+    mkdirs a scratch tree. So this function only computes:
+
+    * an explicit ``workspace_path`` (``dir`` and pinned ``worktree`` rows) -- used as given;
+    * ``worktree`` without one -- the board's anchor repo (``default_workdir``), the repo the
+      worktree would be added to;
+    * anything else -- :func:`kanban_db.workspaces_root`, the parent the per-card scratch dir lands
+      in.
+
+    and then reduces it to its NEAREST EXISTING ANCESTOR (see :func:`_existing_anchor`), because a
+    root that does not exist yet is not a denial, and the volume that holds it is the question.
+    ``None`` means "cannot be known without side effects" -- the caller then admits the card
+    unchanged, which is the fail-open answer the gate must give when it cannot see.
+
+    Accepts a ``Task`` or any mapping / sqlite row carrying ``workspace_kind`` and
+    ``workspace_path``, so a dispatcher can ask before it has claimed anything.
+    """
+
+    def _field(name: str) -> Any:
+        try:
+            return task[name]  # sqlite3.Row / mapping
+        except Exception:
+            return getattr(task, name, None)
+
+    kind = str(_field("workspace_kind") or "scratch").strip().lower()
+    explicit = _field("workspace_path")
+    if explicit:
+        return _existing_anchor(Path(str(explicit)).expanduser())
+    if kind == "worktree":
+        try:
+            anchor = _board_anchor_repo(board)
+        except WorkspaceVolumeUnavailable:
+            # The existing host refusal already owns this answer; the caller's own resolver will
+            # raise it with its evidence. Answering None here keeps this function side-effect free.
+            return None
+        return _existing_anchor(anchor) if anchor is not None else None
+    try:
+        return _existing_anchor(_kb.workspaces_root(board=board))
+    except Exception:
+        return None
+
+
+def _mirror_anchored_worktree(
+    mirror: Path, task_id: str, branch_name: str
+) -> tuple[Path, str]:
+    """Materialize ``<mirror>.worktrees/<task-id>`` off a bare canonical mirror.
+
+    The worktree is a SIBLING of the mirror dir: a bare anchor has no working
+    tree to hold ``.worktrees/``, so the per-card tree cannot live inside it.
+    """
+    target = mirror.with_name(mirror.name + ".worktrees") / task_id
+    _ensure_git_worktree(mirror, target, branch_name)
+    return target, branch_name
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    Both ends are checked for a mounted volume FIRST: a ``git worktree add`` through a dangling
+    symlink would create the tree inside whatever the link resolves to on the host, so the refusal
+    is :class:`WorkspaceVolumeUnavailable` (infrastructure, retryable) rather than a git error the
+    classifier would charge to the card.
+    """
     target = target.expanduser()
+    _refuse_unreachable(repo_root)
+    _refuse_unreachable(target)
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
         return
@@ -714,10 +1212,16 @@ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
-    every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
-    instead of the dispatcher's incidental CWD (whatever dir the gateway was
-    launched from); with no anchor configured we fail loudly rather than guess."""
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``,
+    or ``<mirror>.worktrees/<id>`` for a bare canonical mirror) instead of the
+    dispatcher's incidental CWD (whatever dir the gateway was launched from);
+    with no anchor configured we fail loudly rather than guess. An explicit
+    ``workspace_path`` may sit OUTSIDE any repo (e.g. under the owning
+    profile's work dir): it is anchored on the board's ``default_workdir``
+    clone/mirror when its parent is not itself inside a repo."""
+    branch_name = safe_branch_name(
+        (task.branch_name or "").strip() or f"wt/{task.id}", task_id=task.id
+    )
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
@@ -734,12 +1238,19 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"board {board_slug!r} default_workdir {board_default!r} is not "
                 "absolute; use an absolute path to a git repo"
             )
-        repo_root = _git_toplevel(anchor)
+        # BEFORE the anchor is probed for a repo: with the volume gone every anchor answers
+        # "not a repo", which is the NON-RETRYABLE verdict and would block the card on a
+        # host condition. The volume verdict is asked first so the card stays retryable.
+        _refuse_unreachable(anchor, task_id=task.id)
+        repo_root = _repo_anchor_for(anchor)
         if repo_root is None:
-            raise ValueError(
-                f"task {task.id} has workspace_kind=worktree but board "
-                f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
+            raise WorktreeAnchorNotRepo(
+                anchor,
+                task_id=task.id,
+                project_id=getattr(task, "project_id", None),
             )
+        if _git_is_bare_repo(repo_root):
+            return _mirror_anchored_worktree(repo_root, task.id, branch_name)
         return _anchored_worktree(repo_root, task.id, branch_name)
 
     requested = Path(task.workspace_path).expanduser()
@@ -748,6 +1259,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"task {task.id} has non-absolute worktree path "
             f"{task.workspace_path!r}; use an absolute path"
         )
+    # Asked BEFORE ``resolve``/``exists``: resolving a dangling link rewrites the path into the
+    # missing target, and every probe after that answers "not a repo" -- the wrong verdict.
+    _refuse_unreachable(requested, task_id=task.id)
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
@@ -759,12 +1273,14 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         # verbatim, so siblings all point here). Reusing it would run this task
         # on the other task's branch — silent cross-task provenance corruption,
         # unsafe under concurrency — so fall back to our own worktree.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        fallback_root = _repo_root_for_worktree_target(requested.parent) or _board_anchor_repo(board)
         if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
-            if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
+            if _git_is_bare_repo(fallback_root):
+                fallback, _ = _mirror_anchored_worktree(fallback_root, task.id, branch_name)
+            else:
+                fallback = fallback_root / ".worktrees" / task.id
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
+            return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
         return requested_resolved, actual_branch or branch_name
@@ -775,10 +1291,20 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
-        raise ValueError(
-            f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
-            "and does not point at a git repo root"
+        # A per-card worktree may legitimately sit OUTSIDE any repo — e.g.
+        # under the owning profile's work dir — anchored on the board's
+        # canonical clone/mirror so the object store stays shared.
+        repo_root = _board_anchor_repo(board)
+    if repo_root is None:
+        raise WorktreeAnchorNotRepo(
+            requested,
+            task_id=task.id,
+            project_id=getattr(task, "project_id", None),
         )
+    if _path_key(requested_resolved) == _path_key(repo_root):
+        # The requested path IS the anchor repo (typically a bare canonical
+        # mirror): materialize the sibling worktree instead of in-place.
+        return _mirror_anchored_worktree(repo_root, task.id, branch_name)
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 
@@ -820,6 +1346,10 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
             )
     else:
         raise ValueError(f"unknown workspace_kind: {kind}")
+    # THE gate the ruling names: never create a directory through a symlink whose volume is gone.
+    # ``mkdir`` would happily create ``<resolved-target>/<...>`` and put the card's workspace on
+    # whatever volume the link happens to fall back to, so the check has to precede the create.
+    _refuse_unreachable(p, task_id=task.id)
     p.mkdir(parents=True, exist_ok=True)
     return p
 

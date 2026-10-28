@@ -99,6 +99,12 @@ def _print_curator_config(curator) -> None:
     print(
         f"  consolidate:    {'on' if consolidate else 'off'}"
         f"{'' if consolidate else ' (prune-only; LLM merge pass opt-in)'}")
+    # The guard that stops an autonomous pass deleting a repo's tracked bytes is only
+    # trustworthy if its state is visible where a human looks (card t_4c38630b).
+    tracked = curator.get_protect_git_tracked()
+    print(
+        f"  protect:        git-tracked {'on' if tracked else 'OFF'}"
+        f"{'' if tracked else ' (curator.protect_git_tracked=false — archives may delete tracked bytes)'}")
 
 
 def _cmd_status(args) -> int:
@@ -166,14 +172,18 @@ def _cmd_run(args) -> int:
     auto = result.get("auto_transitions", {})
     if auto and dry:
         print(
-            f"auto (preview): {auto.get('checked', 0)} candidate skill(s) "
-            "— no transitions applied in dry-run")
+            f"auto (preview): checked={auto.get('checked', 0)} "
+            f"would_stale={auto.get('marked_stale', 0)} "
+            f"would_archive={auto.get('archived', 0)} "
+            f"would_reactivate={auto.get('reactivated', 0)} "
+            f"blocked_git_tracked={auto.get('blocked_git_tracked', 0)} — no transitions applied in dry-run")
     elif auto:
         print(
             f"auto: checked={auto.get('checked', 0)} "
             f"stale={auto.get('marked_stale', 0)} "
             f"archived={auto.get('archived', 0)} "
-            f"reactivated={auto.get('reactivated', 0)}")
+            f"reactivated={auto.get('reactivated', 0)} "
+            f"blocked_git_tracked={auto.get('blocked_git_tracked', 0)}")
     if not synchronous:
         print("llm pass running in background — check `hermes curator status` later")
     if dry:

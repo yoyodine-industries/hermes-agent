@@ -830,7 +830,7 @@ def _install_skill(identifier: str, category: str, force: bool, c: Console, skip
     attempt = attempt if attempt is not None else {}
     attempt["registry"] = "none"
     from tools.skills_hub import HubLockFile, ensure_hub_dirs, skills_hub_http_session
-    from tools.skills_hub_install import install_from_quarantine, quarantine_bundle
+    from tools.skills_hub_install import AdmissionRefused, install_from_quarantine, quarantine_bundle
     from tools.skills_guard import should_allow_install
     ensure_hub_dirs()
     from tools.skills_sync_bundled_ops import bundled_skill_for_install
@@ -915,6 +915,13 @@ def _install_skill(identifier: str, category: str, force: bool, c: Console, skip
 
     try:
         install_dir = install_from_quarantine(q_path, bundle.name, category, bundle, result)
+    except AdmissionRefused as exc:
+        # Refused for what the bundle SAYS, not for a malformed bundle: say so, and name the
+        # skill it collided with (the refusal text carries the fold target and the fix).
+        c.print(Panel(str(exc), title="Not installed: admission refused", border_style="yellow"))
+        shutil.rmtree(q_path, ignore_errors=True)
+        attempt["failure_class"] = "admission_refused"
+        return bundle, failed, False
     except ValueError as exc:
         _invalid_path(c, bundle, exc, q_path)
         attempt["failure_class"] = "invalid_bundle"
@@ -1003,6 +1010,108 @@ def do_list(source_filter: str = "all", enabled_only: bool = False,
             else f"{enabled_count} enabled, {disabled_count} disabled")
     c.print(f"[dim]{counts['hub']} hub-installed, {counts['builtin']} builtin, "
             f"{counts['local']} local — {tail}[/]\n")
+    _print_project_quarantine_notice(c)
+
+
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def _print_project_quarantine_notice(c: Console) -> None:
+    """Name every project skill the scan-time quarantine excluded, and WHERE its report is.
+
+    A skill that is on disk and simply never loads is indistinguishable from a skill nobody
+    wrote — the author sees the directory, the table does not have a row, and nothing says why.
+    Read from the walk that actually decided what loads (agent.skill_utils records the skips),
+    so this costs no second scan of the checkout.
+    """
+    from agent.skill_utils import get_project_skills_dirs, get_quarantined_project_skills
+    excluded = get_quarantined_project_skills(get_project_skills_dirs())
+    if not excluded:
+        return
+    c.print(f"[bold red]Quarantined project skills — on disk but NOT loaded ({len(excluded)}):[/]")
+    for skill_dir, result, root in sorted(excluded, key=lambda e: str(e[0])):
+        if result is None:  # fail-closed: the scanner itself failed
+            c.print(f"  [bold]{skill_dir.name}[/] — scanner failed, so it failed closed"
+                    f"  [dim]({root})[/]")
+            continue
+        findings = sorted(result.findings, key=lambda f: _SEVERITY_ORDER.get(f.severity, 4))
+        counts = {sev: sum(1 for f in findings if f.severity == sev) for sev in ("critical", "high")}
+        top = findings[0] if findings else None
+        detail = f"{counts['critical']} critical, {counts['high']} high"
+        if top is not None:
+            detail += f" · top {top.severity} {top.pattern_id} at {top.file}:{top.line}"
+        c.print(f"  [bold]{skill_dir.name}[/] — {detail}  [dim]({root})[/]")
+    c.print("[dim]Full report: hermes skills scan <path>. A quarantined skill is excluded from the "
+            "index, /commands and skill_view until the finding is fixed.[/]\n")
+
+
+def _scan_target_skill_dirs(path: Optional[str]) -> tuple[list[Path], str]:
+    """Skill dirs named by the `scan` argument, plus a message when it names none.
+
+    *path* is a skill dir, a single skill file, or a tree holding any number of them. With no
+    argument: the enclosing checkout's TRUSTED project skill dirs — the same dirs whose skills
+    the load-time quarantine gates, so an exit code here answers "will my skills load?".
+    """
+    from agent.skill_utils import (find_project_root, get_project_skills_dirs,
+                                   get_untrusted_project_skills_root, iter_skill_index_files)
+    if path:
+        target = Path(path).expanduser()
+        if not target.exists():
+            return [], f"No such path: {target}"
+        if (target / "SKILL.md").is_file() or target.name == "SKILL.md":
+            return [target if target.is_dir() else target.parent], ""
+        found = sorted(p.parent for p in iter_skill_index_files(target, "SKILL.md"))
+        return (found, "") if found else ([], f"No skill found under {target} (no SKILL.md)")
+    dirs = get_project_skills_dirs()
+    if not dirs:
+        untrusted = get_untrusted_project_skills_root()
+        if untrusted:
+            root, count = untrusted
+            return [], (f"{root} has {count} project skill(s) but is not trusted, so none of them "
+                        f"load — trust it with `hermes skills trust`, or pass a path.")
+        root = find_project_root()
+        if root is None:
+            return [], "Not inside a project checkout — pass a path to scan."
+        return [], (f"{root} has no project skill dirs ({', '.join(('.hermes/skills', '.agents/skills'))}).")
+    return sorted({p.parent for d in dirs for p in iter_skill_index_files(d, "SKILL.md")}), ""
+
+
+def do_scan(path: Optional[str] = None, console: Optional[Console] = None) -> int:
+    """Scan skills on demand and print the report the load-time quarantine acted on.
+
+    Same scanner and the same ``project-local`` source label the quarantine uses (so the same
+    content-hash cache entry, never a second copy in the user's checkout): the verdict printed
+    here is the verdict that decided whether the skill loads. Exit 0 clean, 1 when any verdict
+    is dangerous, 2 when the scanner could not run at all (fail-closed territory).
+    """
+    from agent.skill_utils import _PROJECT_SCAN_SOURCE
+    from hermes_constants import get_hermes_home
+    from tools.skills_guard import format_scan_report, scan_skill_cached
+    c = console or _console
+    skill_dirs, problem = _scan_target_skill_dirs(path)
+    if problem:
+        c.print(f"[yellow]{problem}[/]\n")
+        return 2  # not "your skills are quarantined" — we could not answer the question
+    cache_dir = get_hermes_home() / "cache" / "project_skill_scans"
+    tally = {"safe": 0, "caution": 0, "dangerous": 0}
+    failed = 0
+    for skill_dir in skill_dirs:
+        try:
+            result, _prov = scan_skill_cached(skill_dir, source=_PROJECT_SCAN_SOURCE, cache_dir=cache_dir)
+        except Exception as exc:  # the quarantine fails closed here; a report must say so plainly
+            failed += 1
+            c.print(f"[red]{skill_dir.name}: scan failed — {exc}[/]")
+            continue
+        tally[result.verdict] += 1
+        c.print(format_scan_report(result))
+        c.print()
+    c.print(f"[bold]{len(skill_dirs)} skill(s) scanned:[/] {tally['safe']} safe, {tally['caution']} caution, "
+            f"{tally['dangerous']} dangerous" + (f", {failed} failed" if failed else ""))
+    if tally["dangerous"]:
+        c.print("[dim]A dangerous verdict quarantines a project skill: it is excluded from the skill "
+                "index, /commands and skill_view until the finding is fixed.[/]")
+    c.print()
+    return 2 if failed else 1 if tally["dangerous"] else 0
 
 
 def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> None:
@@ -1550,6 +1659,7 @@ _CLI_ACTIONS = {
     "list": lambda a: do_list(source_filter=a.source,
                               enabled_only=getattr(a, "enabled_only", False)),
     "check": lambda a: do_check(name=getattr(a, "name", None)),
+    "scan": lambda a: do_scan(path=getattr(a, "path", None)),
     "update": lambda a: do_update(name=getattr(a, "name", None), force=getattr(a, "force", False)),
     "audit": lambda a: do_audit(name=getattr(a, "name", None), deep=getattr(a, "deep", False)),
     "uninstall": lambda a: do_uninstall(a.name, skip_confirm=getattr(a, "yes", False)),
@@ -1571,14 +1681,19 @@ def skills_command(args) -> Optional[int]:
     """Router for `hermes skills <subcommand>` — called from hermes_cli/main.py."""
     handler = _CLI_ACTIONS.get(getattr(args, "skills_action", None))
     if handler is None:
-        _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap]\n")
+        _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|scan|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap]\n")
         _console.print("Run 'hermes skills <command> --help' for details.\n")
         return None
     # A handler reporting a real failure (install/update/uninstall's False) must exit non-zero: the
     # Desktop Hub reads the spawned action's exit code to decide whether to toast, so an exit-0
     # failure renders as "the button did nothing" while the reason sits unread in the action log.
+    # Handlers that know their own exit code (`scan`: 0 clean / 1 dangerous / 2 cannot answer) return
+    # that int and it is passed through unchanged — a boolean is still the older True/False convention.
     # Returned, not sys.exit()-ed: `hermes` turns a handler's int into the exit code.
-    return 1 if handler(args) is False else None
+    outcome = handler(args)
+    if isinstance(outcome, bool):
+        return 1 if outcome is False else None
+    return outcome
 
 
 # --- Slash command entry point (/skills in chat) ---

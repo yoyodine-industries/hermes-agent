@@ -155,9 +155,14 @@ class HostedRoomService:
                 "This Group Chat is managed by another gateway.")
         return gateway_id, epoch
 
-    def _turn_lock(self, profile: str) -> contextlib.AbstractContextManager[Path]:
+    def _turn_lock(self, profile: str, session: str | None = None) -> contextlib.AbstractContextManager[Path]:
+        """The turn lock for ONE transcript of ``profile`` (``t_47082c1d``).
+
+        ``session`` is a transcript handle (``bot_relay.room_session_key(room_id)``), never the
+        profile: a Group Chat room's turn must not exclude the seat's DM/Desktop turns.
+        """
         from tools.bot_relay import acquire_turn_lock
-        return acquire_turn_lock(self.root, profile)
+        return acquire_turn_lock(self.root, profile, session=session)
 
     def start(self) -> None:
         self.runtime.start()
@@ -451,12 +456,13 @@ class HostedRoomService:
         self.runtime.wakeup()
         return room
 
-    def send(self, *, room_id: str, event_id: str, payload: Any) -> dict[str, Any]:
+    def send(self, *, room_id: str, event_id: str, payload: Any,
+             actor_id: str = "desktop") -> dict[str, Any]:
         normalized = discussion.validate_user_payload(payload)
         gateway_id, epoch = self._owned_authority(room_id)
         event = hosted_rooms.append_event(
             self.db_path, room_id=room_id, event_id=event_id, kind="message.user",
-            actor={"kind": "user", "id": "desktop"}, payload=normalized,
+            actor={"kind": "user", "id": actor_id}, payload=normalized,
             authority_gateway_id=gateway_id, authority_epoch=epoch)
         binding = next((b for b in self.bindings() if b.room_id == room_id), None)
         if binding is None:

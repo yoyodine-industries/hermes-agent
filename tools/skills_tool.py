@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
+from hermes_yaml import YamlEngineUnavailable
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
@@ -29,6 +30,12 @@ from tools.skills_tool_dedup import (
 from tools.skill_provenance import is_background_review
 
 logger = logging.getLogger(__name__)
+
+# An unavailable YAML engine is an ENVIRONMENT fault, never a skill's content. The broad
+# ``except Exception`` below would otherwise log it at DEBUG and let every skill silently vanish
+# from the listing ("No skills found"), which reads as a bad skill tree rather than a broken
+# interpreter. Re-raise it so ``skills_list`` answers with a skill-load error naming the engine.
+_ENGINE_FAULT_ERRORS = (YamlEngineUnavailable, ImportError)
 
 # Per-session discovery cache: {cache_key: (signature, timestamp, skills_list)}. Signature =
 # per-dir max mtime of the dir and its immediate children (add/remove inside a category does
@@ -222,6 +229,10 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
                                                       and skill_matches_apps(frontmatter))})
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
+            except _ENGINE_FAULT_ERRORS:
+                # Environment fault, not this skill's content: surface it instead of letting the
+                # whole tree silently disappear from the listing.
+                raise
             except Exception as e:
                 logger.debug("Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True)
     skills = [s for s in resolve_skill_catalog(scanned)
@@ -470,7 +481,7 @@ def _owning_search_dir(skill_md: Path, all_dirs) -> Optional[Path]:
 
 def _locate_skill(name: str, local_category_name: Optional[str], roots):
     """Unique on-disk skill for *name* over ``(tier, dir)`` *roots*: cross-tier precedence
-    (project > local > create_dir > external, shadowed copies logged), same-tier collision refusal,
+    (local > create_dir > external > project, shadowed copies logged), same-tier collision refusal,
     same-root identical-copy ranking, quarantine gate, not-found listing. ``(error_json, skill_dir,
     skill_md)``; skill_md set iff no error."""
     from agent.skill_utils import AMBIGUOUS_SKILL_PREFIX, TIER_PROJECT, pick_skill_candidate, skill_candidate_rank
@@ -486,8 +497,8 @@ def _locate_skill(name: str, local_category_name: Optional[str], roots):
             (tier_of[root], str(root), skill_candidate_rank(c[1], root), c[1]) for c, root in owned])
         if won is not None:
             if dropped := [str(smd) for i, (_sd, smd) in enumerate(candidates) if i != won]:
-                logger.info("Skill '%s' resolved to %s by precedence (project > local > create_dir > "
-                            "external_dirs, then identical same-root copies); not loaded: %s",
+                logger.info("Skill '%s' resolved to %s by precedence (local > create_dir > external > "
+                            "project, then identical same-root copies); not loaded: %s",
                             name, candidates[won][1], "; ".join(dropped))
             candidates = [candidates[won]]
         else:

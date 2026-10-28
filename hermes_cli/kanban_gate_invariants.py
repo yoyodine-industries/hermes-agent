@@ -404,7 +404,7 @@ def gate_created_by(created_by: Optional[str], *, board: Optional[str] = None,
     provenance points at nothing, and no lane can be asked to own a card attributed to a ghost.
     Refused at create so the class cannot recur from ANY filer.
 
-    A DENYLIST, never an allowlist: a legitimate non-profile producer origin (``pr-evergreen``,
+    A DENYLIST, never an allowlist: a legitimate non-profile producer origin (``hermes_pr_update``,
     ``deploy-train``, ``sdlc``, ``land.sh``, ...) is not a profile name and is left alone, and
     ``None``/empty is not an attribution at all.
 
@@ -833,6 +833,18 @@ def gate_completion_evidence(conn: sqlite3.Connection, task_id: str,
     try:
         cls, payload, why = parse_evidence(declared)
     except EvidenceRefused as exc:
+        if evidence_gate_mode() == "measure":
+            # R3 (ruling t_f3eefbdb): ``measure`` keeps the whole measurement and drops ONLY
+            # the refusal -- on EVERY judged path, not merely the no-declaration branch. A
+            # malformed declaration is the first of the two that used to raise through the
+            # kill switch; it is recorded under its own cause and admitted.
+            record("evidence_gate_measure", {
+                "cause": exc.cause,
+                "detail": str(exc),
+                "declared": declared,
+                "shape": EVIDENCE_SHAPE,
+            })
+            return
         record("completion_blocked_evidence",
                {"cause": exc.cause, "detail": str(exc), "declared": declared})
         raise
@@ -841,6 +853,19 @@ def gate_completion_evidence(conn: sqlite3.Connection, task_id: str,
         return
 
     verdict = proof_gate.witness(payload, conn=conn)
+    if not verdict.ok and evidence_gate_mode() == "measure":
+        # R3: the second judged path the kill switch must disarm -- a declared run/probe this
+        # board cannot resolve (``run_unknown`` / ``run_not_green`` / ...). The class, the
+        # cause and the facts are all kept; only the refusal is dropped. A switch that
+        # half-disarms would make the mode it advertises a lie.
+        record("evidence_gate_measure", {
+            "class": cls,
+            "cause": verdict.cause,
+            "detail": verdict.detail,
+            "facts": verdict.facts,
+            "shape": EVIDENCE_SHAPE,
+        })
+        return
     record("evidence_declared" if verdict.ok else "completion_blocked_evidence", {
         "class": cls,
         "cause": verdict.cause,

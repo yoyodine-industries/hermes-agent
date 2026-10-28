@@ -752,3 +752,70 @@ def test_publication_uses_the_runtime_store_when_the_tree_records_none(tmp_path,
     assert len(written) == len(_launchers.WINDOWS_BIN_LAUNCHERS)
     for path in written:
         assert shlex.quote(str(python)) in Path(path).read_text(encoding="utf-8-sig")
+
+
+def _live_install_layout(tmp_path, monkeypatch, *, stamp: bool):
+    """This host's shape: the checkout INSIDE the data root it serves.
+
+    ``<user>/.hermes/hermes-agent`` with ``<user>/.hermes/tools`` and this checkout's committed
+    install state under its own root, beside a rehearsal HOLD home that booted its own
+    toolchain -- the layout t_ab6a1d65 tripped: the critical-section verb shim boots the
+    deployed ``hermes`` from the shared checkout with ``HERMES_HOME=<hold>``.
+    """
+    user = tmp_path / "user"
+    user.mkdir()
+    monkeypatch.setenv("HOME", str(user))
+    home = user / ".hermes"
+    repo = home / "hermes-agent"
+    for relative in BOOT_FILES:
+        destination = repo / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+    (repo / "acp_adapter").mkdir()
+    (repo / "acp_adapter" / "__init__.py").write_text("", encoding="utf-8")
+    interpreter = Path(sys._base_executable).resolve()
+    install_python = _record_store_python(home / "tools", interpreter)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+    state = install_state_dir(repo)  # <home>/installs/<key>: this checkout's own committed state
+    state.mkdir(parents=True)
+    (state / "facts.json").write_text(json.dumps({"packages": {}}), encoding="utf-8")
+    if stamp:
+        # A source install's stamp records no runtimeDir -- this host's own does not.
+        (repo / "install-stamp.json").write_text(json.dumps({
+            "schemaVersion": 2, "source": "git", "updateMechanism": "self", "payload": "bootstrap",
+        }), encoding="utf-8")
+    hold = tmp_path / "hold-home"
+    _record_store_python(hold / "tools", interpreter)
+    monkeypatch.setenv("HERMES_HOME", str(hold))
+    return repo, home, hold, install_python
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("seeded", [True, False])
+@pytest.mark.parametrize("stamp", [True, False])
+def test_sandbox_home_boot_never_binds_shared_launchers_to_the_hold_store(tmp_path, monkeypatch, stamp, seeded):
+    """#131745's class reached one step earlier: not an inherited ``HERMES_RUNTIME_DIR`` but
+    the caller's ``HERMES_HOME``. A rehearsal hold home is a store a later cleanup deletes, so
+    a shared launcher minted against it is the same exit-127 crash loop.
+
+    ``stamp=False`` is the telling arm: a fresh clone or a git worktree carries no untracked
+    ``install-stamp.json``, so the tree has to be identified by the root that OWNS it.
+    """
+    repo, home, hold, install_python = _live_install_layout(tmp_path, monkeypatch, stamp=stamp)
+    local = repo / ".hermes" / "bin"
+    local.mkdir(parents=True)
+    if seeded:
+        # The launch immediately before the rehearsal: the launchers are already the
+        # install's own, and the hold boot must not re-pin them.
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        assert len(_launchers.ensure_install_launchers(repo, local)) == len(_launchers.WINDOWS_BIN_LAUNCHERS)
+        monkeypatch.setenv("HERMES_HOME", str(hold))
+
+    written = _launchers.ensure_install_launchers(repo, local)
+
+    assert len(written) == len(_launchers.WINDOWS_BIN_LAUNCHERS)
+    for name in _launchers.WINDOWS_BIN_LAUNCHERS:
+        text = (local / name).read_text(encoding="utf-8-sig")
+        assert shlex.quote(str(install_python)) in text
+        assert str(hold) not in text

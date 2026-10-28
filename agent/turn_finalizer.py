@@ -748,6 +748,11 @@ def finalize_turn(
     agent._reused_response_text = None
     if interrupted and agent._interrupt_message:
         result["interrupt_message"] = agent._interrupt_message
+        # Machine-readable cause, so a consumer never has to parse the message text: the
+        # turn-lease refresher stamps ``session turn lease lost`` (agent/turn_facade_lease.py
+        # ``_REASON_LEASE_LOST``) on the interrupt it publishes. A Kanban worker reads this to
+        # tell "a peer state-store write lock killed my turn" from "the card failed".
+        result["interrupt_reason"] = getattr(agent, "_tool_interrupt_reason", None)
     agent.clear_interrupt()
     agent._stream_callback = None  # don't leak into future calls
 
