@@ -184,6 +184,7 @@ def _insert_decomposed_child(
         _new_task_id, _canonical_assignee, _append_event, _apply_board_priority_policy,
         board_for_connection,
     )
+    from hermes_cli.kanban_register import normalise_body
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
@@ -214,7 +215,7 @@ def _insert_decomposed_child(
         " workspace_path, tenant, created_at, created_by) "
         "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
-            new_id, child["title"].strip(), body if isinstance(body, str) else None,
+            new_id, child["title"].strip(), normalise_body(body),
             child_assignee, priority, child_ws_kind, child_ws_path,
             root_row["tenant"], now, (author or "decomposer"),
         ),
