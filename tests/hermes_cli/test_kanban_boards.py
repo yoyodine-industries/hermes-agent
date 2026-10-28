@@ -746,6 +746,14 @@ class TestBoardsListPerRowCounts:
         monkeypatch.setenv("HERMES_KANBAN_DB", str(cls._own_store(home, slug)))
 
     def test_each_rows_counts_and_store_come_from_its_own_board(self, fresh_home, monkeypatch, capsys):
+        """The row's STORE is its own board in every mode; its COUNTS obey the pin.
+
+        Two contracts meet here and both must hold (the second landed later on the live
+        line, card ``t_398313ec``): an inventory names each row's own directory, and a
+        process pinned by ``HERMES_KANBAN_DB`` may not READ another board's store — so
+        under the pin the non-pinned rows carry ``counts = None`` while still naming
+        their own path. This case asserts the pair rather than one side of it.
+        """
         import argparse
 
         from hermes_cli import kanban_boards as kboards
@@ -759,6 +767,22 @@ class TestBoardsListPerRowCounts:
         assert kb.kanban_db_path(board="alpha") == self._own_store(fresh_home, "beta")
         assert self._own_store(fresh_home, "alpha") != self._own_store(fresh_home, "beta")
 
+        rc = kboards._cmd_boards_list(argparse.Namespace(json=True, all=False))
+        assert rc == 0
+        pinned_rows = {r["slug"]: r for r in json.loads(capsys.readouterr().out)}
+
+        # PINNED: only the pinned board's store may be read, so only its row carries a census.
+        assert pinned_rows["beta"]["counts"] == {"ready": 5, "blocked": 1}
+        assert pinned_rows["beta"]["total"] == 6
+        assert pinned_rows["alpha"]["counts"] is None and pinned_rows["alpha"]["total"] is None
+        assert pinned_rows["default"]["counts"] is None and pinned_rows["default"]["total"] is None
+        # ... and EVERY row still names its OWN store, pin or no pin.
+        for slug in ("alpha", "beta", "default"):
+            assert pinned_rows[slug]["db_path"] == str(self._own_store(fresh_home, slug))
+
+        # UNPINNED - the operator's own view: every row's census is its own board's.
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
         rc = kboards._cmd_boards_list(argparse.Namespace(json=True, all=False))
         assert rc == 0
         rows = {r["slug"]: r for r in json.loads(capsys.readouterr().out)}
@@ -777,7 +801,11 @@ class TestBoardsListPerRowCounts:
 
         self._seed(fresh_home, "alpha", running=2)
         self._seed(fresh_home, "beta", running=6)
-        self._pin_a_worker_to(fresh_home, monkeypatch, "beta")
+        # UNPINNED on purpose: the subject is that two rows RENDER differently because each
+        # counts its own store. Under a board pin the live line withholds every non-pinned
+        # row's census by design (card t_398313ec), so the pin would empty the very difference
+        # this case asserts; that half is pinned in
+        # test_each_rows_counts_and_store_come_from_its_own_board.
 
         rc = kboards._cmd_boards_list(argparse.Namespace(json=False, all=False))
         assert rc == 0
@@ -799,7 +827,9 @@ class TestBoardsListPerRowCounts:
         self._seed(fresh_home, "beta", running=4)
         kb.create_board("hollow")          # registered, live, but never written to
         self._own_store(fresh_home, "hollow").unlink()
-        self._pin_a_worker_to(fresh_home, monkeypatch, "beta")
+        # UNPINNED: the case asks what a missing store READS as, which only an unpinned
+        # process can answer — under the pin the live line withholds hollow's census anyway
+        # (card t_398313ec), so a pinned run would pass for the wrong reason.
 
         rc = kboards._cmd_boards_list(argparse.Namespace(json=True, all=False))
         assert rc == 0
