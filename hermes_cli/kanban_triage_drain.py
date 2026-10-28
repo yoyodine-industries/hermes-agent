@@ -253,6 +253,13 @@ def _decompose_capped(
     except Exception as exc:
         logger.exception("drain: DB error decomposing %s", task_id)
         return Action(task_id, "refuse", f"DB error: {type(exc).__name__}")
+    # THE FILING BUDGET'S ANSWER (card t_80ff9b6a): the fan-out seam reaches the same door the
+    # create path does, and a spent pool refuses the WHOLE decomposition. Reported as this
+    # pass's own refusal - the caller comments it on the root - never folded into the "already
+    # decomposed" no-op, which would leave the decision invisible in the drain's output.
+    from hermes_cli.kanban_filing_policy import is_refusal
+    if is_refusal(child_ids):
+        return Action(task_id, "refuse", str(child_ids))
     if child_ids is None:
         return Action(task_id, "refuse", "task already decomposed or moved out of triage")
     return Action(

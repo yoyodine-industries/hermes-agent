@@ -896,6 +896,13 @@ class _KanbanDispatcher:
             logger.exception("kanban auto-decompose: decompose_task crashed on %s", tid)
             return 0
         if not outcome.ok:
+            # A FILING-BUDGET REFUSAL is a decision, not a no-op: it must be visible in this
+            # producer's own output (operator rule: no silent failures), because the work it
+            # refused stays in triage and a debug-only line is how a spent pool goes unnoticed.
+            if getattr(outcome, "refused", False):
+                logger.warning("kanban auto-decompose [%s]: %s refused by the filing budget: %s",
+                               slug, tid, outcome.reason)
+                return 0
             # Common no-op reasons (no aux client) must not spam logs every tick.
             logger.debug("kanban auto-decompose [%s]: %s skipped: %s", slug, tid, outcome.reason)
             return 0
