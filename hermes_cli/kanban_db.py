@@ -253,21 +253,6 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
 
 
-def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None:
-    """Reject Kanban mutations from ``delegate_task`` child contexts.
-
-    The tool/CLI fast-fail guards are UX, not a trust boundary (a child can shell
-    out or import this module); the invariant lives here so every ``write_txn``
-    user and board-metadata mutator fails closed before touching durable state.
-    *path* is the board DB / metadata root being mutated; ``None`` means the
-    lineage's own board (``kanban_home()``).
-    """
-    from agent.delegation_context import kanban_path_is_fenced
-
-    if kanban_path_is_fenced(kanban_home() if path is None else path):
-        raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
-
-
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Best-effort lifecycle hook. Call AFTER the write txn commits (plugins never
     run under the SQLite write lock, always see durable state); failures are
@@ -632,7 +617,7 @@ def get_current_board() -> str:
 def set_current_board(slug: str) -> Path:
     """Persist ``slug`` as the active board; returns the file written. Does NOT
     check the board exists — callers do (so ``boards switch <typo>`` errors)."""
-    _assert_not_delegated_child_mutation()
+    _assert_not_delegated_child_mutation(root=kanban_home())
     normed = _require_slug(slug)
     path = current_board_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -642,7 +627,7 @@ def set_current_board(slug: str) -> Path:
 
 def clear_current_board() -> None:
     """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
-    _assert_not_delegated_child_mutation()
+    _assert_not_delegated_child_mutation(root=kanban_home())
     with contextlib.suppress(FileNotFoundError):
         current_board_path().unlink()
 
@@ -3475,7 +3460,7 @@ def arm_priority_tranche_guard(board: Optional[str] = None) -> list:
     ``CREATE TRIGGER IF NOT EXISTS`` on its own would silently keep whatever floor the board
     was first armed with.
     """
-    _assert_not_delegated_child_mutation(kanban_db_path(board=board))
+    _assert_not_delegated_child_mutation(board=board)
     floor = _board_priority_floor(board)
     with _connect_board(board) as conn:
         for name in PRIORITY_TRANCHE_TRIGGERS:
@@ -3487,7 +3472,7 @@ def arm_priority_tranche_guard(board: Optional[str] = None) -> list:
 
 def disarm_priority_tranche_guard(board: Optional[str] = None) -> list:
     """Drop the storage guard from *board* - the unwired board's behaviour, exactly."""
-    _assert_not_delegated_child_mutation(kanban_db_path(board=board))
+    _assert_not_delegated_child_mutation(board=board)
     with _connect_board(board) as conn:
         for name in PRIORITY_TRANCHE_TRIGGERS:
             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
@@ -4019,7 +4004,7 @@ def designate_priority(conn: sqlite3.Connection, task_id: str, *, reason: str,
     no post-commit side effect can fire while an outer txn can still roll back.
     """
     policy = _designation_policy()
-    _assert_not_delegated_child_mutation(kanban_db_path(board=board))
+    _assert_not_delegated_child_mutation(conn=conn, board=board)
     reason = (reason or "").strip()
     if not reason:
         raise ValueError("a designation needs a reason (it is the audit answer)")
@@ -4137,7 +4122,7 @@ def revoke_priority_designation(conn: sqlite3.Connection, task_id: str, *, reaso
     RESTS, not what it may HOLD, so a gate that still holds designated work is re-lifted by the
     relation - a revoke never leaves the board out of order, and never silently either.
     """
-    _assert_not_delegated_child_mutation(kanban_db_path())
+    _assert_not_delegated_child_mutation(conn=conn)
     row = priority_designation(conn, task_id)
     if row is None or row["revoked_at"]:
         return None
@@ -8485,6 +8470,12 @@ from hermes_cli.kanban_db_connect import (
     _INITIALIZED_PATHS,
     init_db,
     write_txn,
+)
+from hermes_cli.kanban_db_fence import (
+    _assert_not_delegated_child_mutation,
+    fence_subject,
+    fence_verdict,
+    is_delegated_child_mutation,
 )
 from hermes_cli.kanban_db_workspace import (
     _cleanup_workspace,
