@@ -874,3 +874,204 @@ def test_tool_door_renders_the_contradiction_for_a_local_only_worker_close(conn,
     assert "CONTRADICTION FIRST" in err, err
     assert "landing_carrier_missing" in err, err
     assert _status(conn, task_id) == "running"
+
+
+# --------------------------------------------------------------------------- #
+# the carrier IDENTITY: the key first, prose as the legacy fallback
+# (card t_4a87bb75, ruling t_2bc058fc)
+# --------------------------------------------------------------------------- #
+
+
+def _pr_url(ref: str) -> str:
+    repo, _, number = ref.partition("#")
+    return f"https://github.com/{repo}/pull/{number}"
+
+
+def _archived_carrier(conn, *, key=None, title=None, body=None) -> str:
+    """A carrier card that served its landing and was then archived by the sweep.
+
+    Archiving is what the board does to a carrier once its PR lands, so an archived
+    tombstone is the NORMAL end state of a carrier -- and its key is the record that
+    the landing was carried, not an absence.
+    """
+    card = kb.create_task(
+        conn,
+        title=title or f"[land] {PR} for somebody",
+        body=body,
+        initial_status="running",
+        idempotency_key=key,
+    )
+    assert kb.archive_task(conn, card) is True
+    assert _status(conn, card) == "archived"
+    return card
+
+
+def test_an_archived_keyed_tombstone_admits_the_close(conn, forge):
+    """ACCEPTANCE: the ONLY carrier is an archived, KEYED tombstone -> ADMITTED.
+
+    The PR is still OPEN at the forge, so nothing but the carrier can admit this
+    close: if the keyed lookup did not find the archived row the close is refused
+    ``landing_carrier_missing``. No forge read is spent on the admitted path.
+    """
+    tombstone = _archived_carrier(conn, key=f"landing-carrier:{PR}")
+    task_id = _review_card(conn)
+
+    assert kb.complete_task(
+        conn, task_id, summary="carried", metadata={"published_pr": PR_URL},
+    ) is True
+    assert _status(conn, task_id) == "done"
+    assert forge["asked"] == []
+    assert _blocked_events(conn, task_id) == []
+
+    # And the carrier the clause found IS the tombstone, named by its key.
+    described = klc._find_carrier(
+        PR, conn=conn, task_id=task_id, landing_cards=[], stores=klc._board_stores(),
+    )
+    assert described == (
+        f"the keyed carrier card {tombstone} on board default "
+        f"(idempotency_key landing-carrier:{PR})"
+    ), described
+
+
+def test_an_archived_carrier_is_admitted_by_the_id_path_and_already_was_by_prose(conn, forge):
+    """Both sides of the inconsistency this card removes, in one test.
+
+    Arc 1 -- the DECLARED id path (``metadata.landing_card`` -> ``_card_by_id``): the
+    base refused an archived card here, because that read carried
+    ``status != 'archived'``. Arc 2 -- the PROSE path (``_candidate_cards``): the base
+    carried no status filter at all, so the SAME archived card was already admitted.
+    One question ("does a carrier exist for this ref") answered two ways; after the
+    fix both admit, and arc 2 is the control that proves the filter was never a
+    safety property.
+    """
+    declared = _archived_carrier(conn)  # titled "[land] ..." AND named below
+    first = _review_card(conn)
+    described = klc._find_carrier(
+        PR, conn=conn, task_id=first, landing_cards=[declared], stores=klc._board_stores(),
+    )
+    assert described == f"the declared landing_card {declared}", described
+    assert kb.complete_task(
+        conn, first, summary="carried",
+        metadata={"published_pr": PR_URL, "landing_card": declared},
+    ) is True
+
+    _archived_carrier(conn)  # the prose path alone: no declaration names it
+    second = _review_card(conn)
+    assert kb.complete_task(
+        conn, second, summary="carried", metadata={"published_pr": PR_URL},
+    ) is True
+
+    assert forge["asked"] == []
+
+
+def test_an_archived_linked_child_naming_the_pr_still_carries(conn, forge):
+    """The third existence read (``_child_cards``) admits an archived child too."""
+    task_id = _review_card(conn)
+    child = kb.create_task(
+        conn, title="carry the landing", body=f"lands {PR_URL}", initial_status="running",
+    )
+    kb.link_tasks(conn, task_id, child)
+    assert kb.archive_task(conn, child) is True
+
+    assert kb.complete_task(
+        conn, task_id, summary="carried", metadata={"published_pr": PR_URL},
+    ) is True
+    assert forge["asked"] == []
+
+
+def test_the_remedy_prints_the_keyed_create_and_says_archived_is_enough(conn, forge):
+    """ACCEPTANCE: the one instruction the fleet copies carries the key verbatim."""
+    task_id = _review_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="approved", metadata={"published_pr": PR_URL},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    detail = refusal.detail
+    # The paste-ready create, with the canonical key IN the call.
+    assert f'kanban_create(title="[land] {PR} for {task_id}"' in detail, detail
+    assert f'parents=["{task_id}"]' in detail, detail
+    assert f'idempotency_key="landing-carrier:{PR}"' in detail, detail
+    # The doctrine sentence now AGREES with the code: an archived keyed card counts.
+    assert "ARCHIVED IS ENOUGH" in detail, detail
+    assert "non-archived card on any board" not in detail, detail
+    # ... and the legacy alias is named as the read-only fallback, so a lane holding
+    # one of the older carriers knows it still counts.
+    assert "landing-reconcile:<repo>#<N>" in detail, detail
+
+
+def test_a_legacy_alias_naming_another_owner_does_not_admit_the_close(conn, forge):
+    """ACCEPTANCE: ``landing-reconcile:hermes-agent#101`` is owner-less.
+
+    The fork and upstream both have a PR #101, so the alias alone must never admit a
+    close for ``NousResearch/hermes-agent#101`` when the card it found names the
+    FORK's #101 instead. The forge is consulted -- and reports the PR open -- so the
+    close is refused.
+    """
+    declared = "NousResearch/hermes-agent#101"
+    kb.create_task(
+        conn,
+        title="Land #101: the fork's carrier",
+        body="carries yoyodine-industries/hermes-agent#101",
+        initial_status="running",
+        idempotency_key="landing-reconcile:hermes-agent#101",
+    )
+    task_id = _review_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="carried", metadata={"published_pr": _pr_url(declared)},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal), refusal
+    assert refusal.cause == "landing_carrier_missing"
+    assert declared in refusal.detail
+    assert forge["asked"] == [("NousResearch/hermes-agent", "101")]
+
+
+def test_a_legacy_alias_that_also_names_the_full_ref_admits_the_close(conn, forge):
+    """The alias IS accepted when the card it finds also names the full owner/repo ref.
+
+    That is the whole read-only compatibility rule: no migration -- the flow's keyed
+    rows keep working, and the ones that name the ref keep working.
+    """
+    declared = "NousResearch/hermes-agent#101"
+    carrier = kb.create_task(
+        conn,
+        title="Land #101: upstream",
+        body=f"carries {declared}",
+        initial_status="running",
+        idempotency_key="landing-reconcile:hermes-agent#101",
+    )
+    task_id = _review_card(conn)
+
+    assert kb.complete_task(
+        conn, task_id, summary="carried", metadata={"published_pr": declared},
+    ) is True
+    assert forge["asked"] == []
+    described = klc._find_carrier(
+        declared, conn=conn, task_id=task_id, landing_cards=[], stores=klc._board_stores(),
+    )
+    assert described == (
+        f"the legacy-keyed carrier card {carrier} on board default "
+        f"(idempotency_key landing-reconcile:hermes-agent#101, and the card names {declared})"
+    ), described
+
+
+def test_a_keyless_carrier_still_satisfies_the_fence(conn, forge):
+    """ACCEPTANCE: 521 of 801 measured carriers are keyless -- none may start failing."""
+    kb.create_task(conn, title=f"[land] {PR} for somebody", initial_status="running")
+    task_id = _review_card(conn)
+
+    assert kb.complete_task(
+        conn, task_id, summary="carried", metadata={"published_pr": PR_URL},
+    ) is True
+    assert forge["asked"] == []
+
+
+def test_the_carrier_key_builders_are_the_one_shape():
+    """One builder each, no ad-hoc string formatting at call sites."""
+    assert klc._carrier_key("example-org/example-repo#7") == "landing-carrier:example-org/example-repo#7"
+    # The legacy alias is OWNER-LESS by construction -- which is why a hit is only
+    # accepted when the card also names the full ref.
+    assert klc._carrier_key_legacy("example-org/example-repo#7") == "landing-reconcile:example-repo#7"

@@ -116,13 +116,30 @@ THE RULE. For each declared PR the close must satisfy ONE of:
     (``/opt/hermes_prod/deploy-ledger.jsonl``); or the card declares
     ``landing_not_owed: "<reason>"`` naming the replacement (re-cut / superseded /
     rides another card's PR).
-  * **carried** -- (a) ``metadata.landing_card: t_...`` resolving to a card naming
-    the same ``owner/repo#N``; or (b) a ``task_links`` CHILD of this card whose
+  * **carried** -- THE KEY FIRST, PROSE AS THE LEGACY FALLBACK (card
+    ``t_4a87bb75``; ruling ``t_2bc058fc``): (a) a card on ANY board whose
+    ``idempotency_key`` is ``landing-carrier:<owner>/<repo>#<N>`` -- ARCHIVED
+    INCLUDED, because a carrier that has served its landing is archived by the
+    board sweep and its key is a RECORD that the landing was carried, not an
+    absence; (a') the read-only legacy alias ``landing-reconcile:<repo>#<N>`` the
+    landing flow has filed since 2026-10, accepted ONLY when that card also names
+    the full ``owner/repo#N`` (the alias is owner-less, and
+    ``hermes-agent#101`` is measurably the fork or upstream); or (b)
+    ``metadata.landing_card: t_...`` resolving to a card naming the same
+    ``owner/repo#N``; or (c) a ``task_links`` CHILD of this card whose
     title/body names it (the doctrine chain review -> ``[land*]`` ->
-    deploy/verify); or (c) any non-archived card on ANY board whose title begins
+    deploy/verify); or (d) any card on ANY board whose title begins
     ``[land`` / ``[owner act]`` and which names it. Not title-prefix alone:
     measured ``[owner act] Land t_0051db75 ...`` (``t_ecc636a4``) is a real
     carrier a ``^\\[land`` filter misses.
+
+    The prose paths are KEPT as the legacy fallback, never deleted: 521 of the 801
+    measured carrier receipts are keyless, and a keyless carrier must not start
+    failing closes (the fence is fed by what the fleet already filed). Every path
+    above is an EXISTENCE read -- "does a carrier exist for this ref" -- so every
+    one of them admits an archived card; the LIVE-card filter belongs to callers
+    that will ACT on a card (``kanban_db.create_task``'s idempotency dedupe), not
+    to this question.
   * **stamp** -- a run declares the landed revision (``merged_as`` / ``merge_sha``
     / ``landed_sha`` / ``deploy_stamp``) and it resolves to an ADMITTED row in the
     deploy ledger. This is the DEPLOY STAMP leg: the artifact on the dest names the
@@ -447,9 +464,15 @@ def _rows(path: Path, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         conn.close()
 
 
-_CARRIER_TITLE_FILTER = (
-    "status != 'archived' AND (title LIKE '[land%' OR title LIKE '[owner act%')"
-)
+# "Does a carrier exist for this ref" -- the CARRIER EXISTENCE READ, and the only
+# question this module asks of a card. ARCHIVED IS INCLUDED on purpose (card
+# ``t_4a87bb75``): a carrier that has served its landing is archived by the board
+# sweep, and a tombstone whose key still names the PR is a RECORD that the landing
+# was carried, not an absence. This filter used to say ``status != 'archived'``
+# while ``_candidate_cards`` applied no status filter at all -- one question
+# answered two ways, so the same archived carrier was ADMITTED through the prose
+# path and REFUSED through the id path. One question, one answer.
+_CARRIER_TITLE_FILTER = "(title LIKE '[land%' OR title LIKE '[owner act%')"
 
 
 def _candidate_cards(stores: Optional[list[tuple[Path, str]]] = None) -> list[_Card]:
@@ -462,10 +485,19 @@ def _candidate_cards(stores: Optional[list[tuple[Path, str]]] = None) -> list[_C
 
 
 def _card_by_id(task_id: str, stores: Optional[list[tuple[Path, str]]] = None) -> Optional[_Card]:
+    """The card with this id on any board -- ARCHIVED INCLUDED (an existence read).
+
+    The status filter came off with ``_CARRIER_TITLE_FILTER``'s (card
+    ``t_4a87bb75``): a caller here is asking whether a carrier exists for a ref, and
+    naming an archived carrier is a DECLARATION that the landing was carried. The
+    live-card filter stays where a caller will ACT on the card -- see
+    ``kanban_db.create_task``'s idempotency dedupe, which must not return an archived
+    row to a caller about to work it.
+    """
     for path, board in stores if stores is not None else _board_stores():
         rows = _rows(
             path,
-            "SELECT id, title, body FROM tasks WHERE id = ? AND status != 'archived'",
+            "SELECT id, title, body FROM tasks WHERE id = ?",
             (task_id,),
         )
         if rows:
@@ -478,12 +510,14 @@ def _child_cards(conn: sqlite3.Connection, task_id: str) -> list[_Card]:
     """This card's ``task_links`` children (the doctrine chain's second edge).
 
     Links are intra-board by construction (``task_links`` is per-store), so the
-    children are read off the closing card's own connection.
+    children are read off the closing card's own connection. ARCHIVED INCLUDED, for
+    the same reason as ``_card_by_id``: a child that named the PR and has since been
+    archived still records that the landing was carried.
     """
     try:
         rows = conn.execute(
             "SELECT t.id, t.title, t.body FROM task_links l JOIN tasks t ON t.id = l.child_id "
-            "WHERE l.parent_id = ? AND t.status != 'archived'",
+            "WHERE l.parent_id = ?",
             (task_id,),
         ).fetchall()
     except sqlite3.Error:
@@ -492,6 +526,66 @@ def _child_cards(conn: sqlite3.Connection, task_id: str) -> list[_Card]:
         _Card(row["id"], row["title"] or "", row["body"] or "", "this board")
         for row in rows
     ]
+
+
+# --------------------------------------------------------------------------- #
+# the carrier IDENTITY: one key per landing
+# --------------------------------------------------------------------------- #
+
+_CARRIER_KEY_PREFIX = "landing-carrier:"
+_CARRIER_KEY_LEGACY_PREFIX = "landing-reconcile:"
+
+
+def _carrier_key(ref: str) -> str:
+    """The ONE identity a carrier card carries: ``landing-carrier:<owner>/<repo>#<N>``.
+
+    Owner-qualified on purpose. The flow's own key shape
+    (:func:`_carrier_key_legacy`) is owner-less, and this estate holds both
+    ``yoyodine-industries/hermes-agent#101`` and ``NousResearch/hermes-agent#101`` --
+    an owner-less key cannot tell them apart, so it can never be the identity. No
+    sha, no timestamp, no run id: the key names the PR's LANDING, which is one act,
+    so a second close about the same PR FINDS the same carrier instead of filing
+    another one (measured: 521 of 801 carrier receipts keyless, 32 of the 33 born in
+    the last 24h -- ruling on card ``t_2bc058fc``).
+    """
+    return f"{_CARRIER_KEY_PREFIX}{ref}"
+
+
+def _carrier_key_legacy(ref: str) -> str:
+    """The older, owner-less alias the landing flow has filed: ``landing-reconcile:<repo>#<N>``.
+
+    Read-only, and never sufficient on its own: it is owner-less, so a hit is
+    accepted only when the card it found ALSO names the full ``owner/repo#N``
+    (:func:`_find_carrier`). No migration -- the keyed rows the flow already wrote
+    keep satisfying the fence exactly as they do today, and every NEW carrier
+    carries :func:`_carrier_key`.
+    """
+    repo, _, number = ref.partition("#")
+    owner, _, name = repo.partition("/")
+    return f"{_CARRIER_KEY_LEGACY_PREFIX}{(name or owner)}#{number}"
+
+
+def _cards_by_key(key: str, stores: Optional[list[tuple[Path, str]]] = None) -> Optional[_Card]:
+    """The card holding ``key`` on any board store -- ARCHIVED INCLUDED.
+
+    Identity resolves across EVERY store the same way the prose scan already does
+    ("any board"), and the newest row wins per store -- ``create_task``'s own dedupe
+    orders that way, so a re-filed duplicate can never hide the keyed row that
+    actually landed. A store whose schema predates ``idempotency_key`` yields no
+    rows instead of raising: ``_rows`` swallows ``sqlite3.Error``, and this clause
+    never raises.
+    """
+    for path, board in stores if stores is not None else _board_stores():
+        rows = _rows(
+            path,
+            "SELECT id, title, body FROM tasks WHERE idempotency_key = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (key,),
+        )
+        if rows:
+            row = rows[0]
+            return _Card(row["id"], row["title"] or "", row["body"] or "", board)
+    return None
 
 
 def _find_carrier(
@@ -503,7 +597,29 @@ def _find_carrier(
     candidates: Optional[list[_Card]] = None,
     stores: Optional[list[tuple[Path, str]]] = None,
 ) -> Optional[str]:
-    """A carrier for ``ref``, described, or None. Never raises."""
+    """A carrier for ``ref``, described, or None. Never raises.
+
+    Resolution ORDER (card ``t_4a87bb75``): the canonical key, then the flow's legacy
+    alias, then the three prose paths UNCHANGED. Identity before prose because a key
+    is a DECLARATION -- the card states which landing it carries -- while a prose
+    match is an inference over text. The prose paths stay as the legacy fallback so
+    the measured keyless carriers keep satisfying the fence; nothing here deletes
+    them.
+    """
+    key = _carrier_key(ref)
+    card = _cards_by_key(key, stores)
+    if card is not None:
+        return (
+            f"the keyed carrier card {card.task_id} on board {card.board} "
+            f"(idempotency_key {key})"
+        )
+    legacy = _carrier_key_legacy(ref)
+    card = _cards_by_key(legacy, stores)
+    if card is not None and (_names_ref(card.title, ref) or _names_ref(card.body, ref)):
+        return (
+            f"the legacy-keyed carrier card {card.task_id} on board {card.board} "
+            f"(idempotency_key {legacy}, and the card names {ref})"
+        )
     for card_id in landing_cards:
         card = _card_by_id(card_id, stores)
         if card is not None and (_names_ref(card.title, ref) or _names_ref(card.body, ref)):
@@ -690,46 +806,73 @@ def _render_contradiction(contract: Optional[str], refs: list[str]) -> str:
     )
 
 
+def _carrier_create_spec(ref: str, task_id: str) -> str:
+    """The paste-ready create for ``ref``'s carrier -- the KEY is inside the spec.
+
+    The remedy is the one instruction the whole fleet copies, so the identity has to
+    live in the call itself rather than in a sentence beside it: a lane that retypes
+    this text must not be able to drop the key. Measured before card ``t_4a87bb75``:
+    521 of 801 carrier receipts keyless, 32 of the 33 born in the last 24h, every one
+    of them compliant with the spec this function printed.
+    """
+    return (
+        f"kanban_create(title=\"{_carrier_title(ref, task_id)}\", "
+        f"assignee=\"{landing_lane_hint(ref.partition('#')[0])}\", "
+        f"parents=[\"{task_id}\"], idempotency_key=\"{_carrier_key(ref)}\")"
+    )
+
+
+# The remedy's blocks are SEPARATE STRINGS on purpose (hotspot note on card
+# ``t_4a87bb75``): leg C2 (``t_c83a87dd``) amends the ESCAPE paragraph to name its
+# one-step `--mint-carrier` route, and that has to be a text swap here rather than a
+# second rewrite of ``_render_remedy``. One string per remedy line, no inline
+# conditionals woven through them.
+_CARRIER_ESCAPE_HEADER = "Escapes (recorded in this card's metadata):"
+_CARRIER_ESCAPE_LINES = (
+    "  * name the landing carrier: metadata.landing_card=\"t_...\" (or a linked child card) — "
+    "any board's card keyed landing-carrier:<owner>/<repo>#<N> (the spec above writes it), "
+    "AND ARCHIVED IS ENOUGH: a served carrier is usually archived, and its key still records "
+    "the landing. Keyless carriers still pass by prose: the alias "
+    "landing-reconcile:<repo>#<N> naming the full ref, or a live \"[land ...\" / "
+    "\"[owner act]\" card naming it. If the landing is owed but not yet carried, THIS is the "
+    "escape: file that carrier with the key and name it;",
+    "  * or if the PR is superseded or re-cut, say what it rides: "
+    "metadata.landing_not_owed=\"<the replacement it rides>\" (repo#N, a card id or a URL).",
+)
+_CARRIER_NO_DEFERRAL_LINE = (
+    "A deferral is NOT a third escape: metadata.landing_deferred must name a t_... carrier "
+    "card that names the PR — a bare reason cannot close an unmerged-PR card (2026-10-28). "
+    "A close rides EVIDENCE: the forge's MERGED state, or a landed revision "
+    "(merged_as / merge_sha / landed_sha / deploy_stamp) matching a deploy-ledger row."
+)
+_CARRIER_DOCTRINE_LINE = (
+    "Doctrine: a close whose declared PR is unmerged must name its landing carrier on EVERY "
+    "transition, worker closes included (t_9333ca24; t_88f6cb12; widened t_502a28bd; identity "
+    "keyed by t_4a87bb75). `--force` does not bypass a declaration fence."
+)
+
+
 def _render_remedy(task_id: str, entries: list[tuple[str, str]]) -> str:
     """The refusal, naming verbatim what the close owes. One remedy per PR."""
     lines: list[str] = []
     for ref, state in entries:
-        repo = ref.partition("#")[0]
         lines.append(
             f"  * {ref} — the forge reports it {state}, and no landing carrier names it. "
-            f"Create one: kanban_create(title=\"{_carrier_title(ref, task_id)}\", "
-            f"assignee=\"{landing_lane_hint(repo)}\", parents=[\"{task_id}\"])."
+            f"Create one: {_carrier_create_spec(ref, task_id)}"
         )
     return (
         f"{task_id} closes declaring {len(entries)} deliverable PR(s) with no landing leg, so the "
         f"published work would be stranded with the board green:\n"
         + "\n".join(lines)
-        + "\nEscapes, both of them recorded declarations on this card (kernel metadata):\n"
-        f"  * name the landing carrier: metadata.landing_card=\"t_...\" (or link it as a "
-        f"child of this card) — a carrier is a card naming {_first_ref(entries)}, or any "
-        f"non-archived card on any board titled \"[land ...\" / \"[owner act]\" that names it. "
-        f"If the landing is owed and merely not carried yet, THIS is the escape: file the "
-        f"carrier card and name it, so the board keeps a live handle on the unmerged PR;\n"
-        f"  * or if the PR is superseded or re-cut, say what it rides: "
-        f"metadata.landing_not_owed=\"<the replacement it rides>\" (a repo#N ref, a card id or a URL).\n"
-        f"A deferral is NOT a third escape: metadata.landing_deferred must name a t_... carrier "
-        f"card and that card must name the PR — a bare reason cannot close a card whose PR is "
-        f"unmerged (tightened 2026-10-28 by operator order). A close is admitted on EVIDENCE: "
-        f"the forge's MERGED state, or a landed revision (merged_as / merge_sha / landed_sha / "
-        f"deploy_stamp) resolving to an admitted deploy-ledger row.\n"
-        f"Doctrine: the landing-carrier rule — a close whose declared PR is unmerged must name "
-        f"its landing carrier, on EVERY transition, worker closes included (design ruling on card "
-        f"t_9333ca24; clause t_88f6cb12; widened 2026-10-14 by t_502a28bd). "
-        f"`--force` does not bypass a declaration fence."
+        + f"\n{_CARRIER_ESCAPE_HEADER}\n"
+        + "\n".join(_CARRIER_ESCAPE_LINES)
+        + f"\n{_CARRIER_NO_DEFERRAL_LINE}\n"
+        + _CARRIER_DOCTRINE_LINE
     )
 
 
 def _carrier_title(ref: str, task_id: str) -> str:
     return f"[land] {ref} for {task_id}"
-
-
-def _first_ref(entries: list[tuple[str, str]]) -> str:
-    return entries[0][0] if entries else "<the declared PR>"
 
 
 def evaluate(
