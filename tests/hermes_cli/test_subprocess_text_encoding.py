@@ -46,7 +46,7 @@ for their own reasons, and demanding ``encoding=`` from them raises ``TypeError`
 |---|---|
 | ``tests/`` | the suite itself; a decode failure here is a red test, loud by construction |
 | ``evals/`` | dev probes, run by hand, fail loudly |
-| ``scripts/`` | dev/CI tooling, not shipped runtime; loud in the job that runs it (its 11 sites are pinned by a separate card; they are deliberately not scanned here) |
+| ``scripts/`` | dev/CI tooling, not shipped runtime; loud in the job that runs it (its 11 sites are pinned by a separate card, t_ae7f7c5b, and are deliberately not scanned here) |
 | ``evidence/``, ``website/``, ``nix/``, ``optional-skills/`` | not shipped runtime: one-off proof harnesses, site/build tooling, opt-in skill assets |
 | ``.venv/``, ``venv/``, ``node_modules/``, ``build/``, ``dist/``, ``.worktrees/``, ``__pycache__/`` | vendored/generated, not ours |
 
