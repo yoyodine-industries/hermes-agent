@@ -5913,25 +5913,6 @@ def _gate_deploy_proof(
         raise ProofGateError(task_id, verdict)
 
 
-# The floor a recorded landing deferral must clear to count as a declaration (same rule
-# the clause module applies: ``hermes_cli/kanban_landing_carrier.py::MIN_REASON``).
-_LANDING_DEFERRAL_MIN = 20
-
-
-def _declares_landing_deferral(metadata: Optional[dict]) -> bool:
-    """A closing call's own recorded landing deferral, readable WITHOUT the clause module.
-
-    The clause's no-network escape has to survive the clause module itself being
-    absent, or an install defect would deadlock every review close on the board with
-    no declared way out. Deliberately the narrowest reading: a substantive
-    ``landing_deferred`` on THIS call's metadata, nothing inferred.
-    """
-    if not isinstance(metadata, dict):
-        return False
-    value = metadata.get("landing_deferred")
-    return isinstance(value, str) and len(value.strip()) >= _LANDING_DEFERRAL_MIN
-
-
 def _gate_landing_carrier(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5960,7 +5941,10 @@ def _gate_landing_carrier(
     NOT bypassable by ``force`` (consistent with ``_gate_deploy_proof``): neither
     ``--force`` nor the dashboard's drag-to-done is a door around a
     declaration-based fence. The escapes are DECLARED and recorded
-    (``landing_card`` / ``landing_not_owed`` / ``landing_deferred``).
+    (``landing_card`` / ``landing_not_owed``), and a landed revision that resolves in
+    the deploy ledger closes on evidence. A bare ``landing_deferred`` is NOT an escape
+    (tightened 2026-10-28): it must name a ``t_...`` carrier card and that card must
+    name the PR, so "owed, not yet carried" keeps a live card on the board.
 
     ONE LANDING SURFACE: when upstream #123429's ``hermes_cli/kanban_landing.py``
     (landed-evidence gate) is carried into the live install, this clause belongs
@@ -5978,16 +5962,17 @@ def _gate_landing_carrier(
     try:
         from hermes_cli import kanban_landing_carrier as clause
     except Exception as exc:  # a live override that is absent = an install defect, not a card's
-        if _declares_landing_deferral(metadata):
-            return None
+        # No deferral waiver here (tightened 2026-10-28): a bare landing_deferred used to
+        # short-circuit this fail-closed refusal, which is how a close went through in the
+        # one state where nobody could judge the landing at all.
         return CompletionRefusal(
             "landing_state_unknown",
             f"{task_id}: the landing-carrier clause (hermes_cli/kanban_landing_carrier.py) is not "
             f"loadable in this install ({type(exc).__name__}), so the landing state of a declared "
             f"deliverable PR cannot be judged and the close is refused rather than admitted blind. "
-            f"Restore that module through the sanctioned update route / live override set, or record "
-            f'metadata.landing_deferred="<why the landing is deferred, at least '
-            f'{_LANDING_DEFERRAL_MIN} characters>" if the landing is genuinely not owed yet.',
+            f"Restore that module through the sanctioned update route / live override set. A "
+            f"landing deferral is not a waiver: name the carrier card with "
+            f"metadata.landing_card=\"t_...\" once the clause is loadable again.",
         )
     verdict = clause.evaluate(
         conn=conn, task_id=task_id, metadata=metadata if isinstance(metadata, dict) else None,

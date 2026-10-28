@@ -52,8 +52,9 @@ the PR URL -- and never advises ``local-only`` to a card that has published.
 ACCEPTED TRADE (stated here so it is not discovered as a surprise). A worker close
 that declares a PR now costs ONE forge read where it used to cost none, and can be
 refused ``landing_state_unknown`` when the forge is unreachable. The no-network
-escape is the RECORDED ``landing_deferred``, and both refusal texts name it. The
-forge is still consulted only when neither a carrier nor a deferral is declared.
+escape is a NAMED CARRIER (``landing_card`` / a deferral naming a ``t_...`` card),
+and both refusal texts name it. The forge is still consulted only when no carrier
+is declared.
 
 WHY THIS EXISTS (measured, card `t_88f6cb12`, ruling on `t_9333ca24`). Approving a
 card out of ``review`` is the fleet's most-run transition (538 closes in a 7-day
@@ -122,9 +123,17 @@ THE RULE. For each declared PR the close must satisfy ONE of:
     ``[land`` / ``[owner act]`` and which names it. Not title-prefix alone:
     measured ``[owner act] Land t_0051db75 ...`` (``t_ecc636a4``) is a real
     carrier a ``^\\[land`` filter misses.
-  * **deferred** -- ``metadata.landing_deferred: "<reason>"`` (non-empty, >= 20
-    chars). The RECORDED deferral is the landing reconciler's own input class, so
-    it is visible and owned, never a silent door.
+  * **stamp** -- a run declares the landed revision (``merged_as`` / ``merge_sha``
+    / ``landed_sha`` / ``deploy_stamp``) and it resolves to an ADMITTED row in the
+    deploy ledger. This is the DEPLOY STAMP leg: the artifact on the dest names the
+    commit, so the close is evidence, not intent.
+  * **deferred, but only to a NAMED CARRIER** -- ``metadata.landing_deferred``
+    must name the card that carries the landing (a ``t_...`` id) and that card
+    must itself exist and name the same ``owner/repo#N``. A bare reason is not an
+    escape: "owed, not yet carried" IS the open state, so a close that wants to
+    move on files a carrier card and names it. (Tightened 2026-10-28 by operator
+    order: three cards closed "done" in one day on a >=20-character reason, with
+    their PRs unmerged and the defects they targeted still live.)
 
 Anything else is refused ``landing_carrier_missing`` with the remedy inline: the
 PR, the exact ``kanban_create`` spec for the carrier, both escapes, the doctrine
@@ -163,8 +172,9 @@ CAUSE_CARRIER_MISSING = "landing_carrier_missing"
 CAUSE_STATE_UNKNOWN = "landing_state_unknown"
 
 # The two RECORDED escapes. ``landing_deferred`` says "owed, not yet carried" and
-# is the landing reconciler's input class; ``landing_not_owed`` says "this PR is
-# not the landing" and must name the replacement.
+# only counts when it NAMES the carrier card (see ``is_named_carrier_deferral``);
+# ``landing_not_owed`` says "this PR is not the landing" and must name the
+# replacement.
 DEFERRED_KEYS = ("landing_deferred",)
 NOT_OWED_KEYS = ("landing_not_owed",)
 # Kept as aliases for readability at call sites; both are the same tuple shapes.
@@ -344,6 +354,24 @@ def is_named_exemption(reason: Any) -> bool:
     if len(text) < MIN_REASON:
         return False
     return bool(_PR_SHORT.search(text) or _CARD_ID.search(text) or _ANY_URL.search(text))
+
+
+def is_named_carrier_deferral(reason: Any) -> bool:
+    """True when a deferral NAMES the card that carries the landing.
+
+    Tightened 2026-10-28 by operator order. The old predicate was a length floor
+    (``>= MIN_REASON``), which made "the reconciler has not filed the carrier yet"
+    a valid reason to close a card whose PR was unmerged and whose defect was still
+    live. A deferral is not evidence; the carrier card is. So the reason must name
+    a ``t_...`` id, and ``evaluate`` then demands that card exist and name the same
+    PR (``_find_carrier``) before the close is admitted.
+    """
+    if not isinstance(reason, str):
+        return False
+    text = reason.strip()
+    if len(text) < MIN_REASON:
+        return False
+    return bool(_CARD_ID.search(text))
 
 
 def _declared_reason(keys: Iterable[str], mds: Iterable[dict], validator) -> Optional[str]:
@@ -574,8 +602,14 @@ def ledger_resolves(sha: Any) -> bool:
 
 
 def _merge_sha_declared(mds: Iterable[dict]) -> Optional[str]:
+    """The landed revision a run declares -- merge OR deploy stamp.
+
+    ``landed_sha`` / ``deploy_stamp`` are the dest-side names (the landing
+    reconciler and the deploy train write them); ``merged_as`` / ``merge_sha`` the
+    review-side ones. All four resolve the same way, through ``ledger_resolves``.
+    """
     for md in mds:
-        for key in ("merged_as", "merge_sha"):
+        for key in ("merged_as", "merge_sha", "landed_sha", "deploy_stamp"):
             value = md.get(key)
             if isinstance(value, str) and len(value.strip()) >= 7:
                 return value.strip()
@@ -671,15 +705,18 @@ def _render_remedy(task_id: str, entries: list[tuple[str, str]]) -> str:
         f"published work would be stranded with the board green:\n"
         + "\n".join(lines)
         + "\nEscapes, both of them recorded declarations on this card (kernel metadata):\n"
-        f"  * if a carrier already exists, name it: metadata.landing_card=\"t_...\" (or link it as a "
+        f"  * name the landing carrier: metadata.landing_card=\"t_...\" (or link it as a "
         f"child of this card) — a carrier is a card naming {_first_ref(entries)}, or any "
-        f"non-archived card on any board titled \"[land ...\" / \"[owner act]\" that names it;\n"
-        f"  * if the landing is genuinely not owed yet, record it: "
-        f"metadata.landing_deferred=\"<why it is deferred, at least {MIN_REASON} characters>\" — the "
-        f"recorded deferral is the landing reconciler's input class, so the work stays visible and "
-        f"owned;\n"
-        f"  * if the PR is superseded or re-cut, say what it rides: "
+        f"non-archived card on any board titled \"[land ...\" / \"[owner act]\" that names it. "
+        f"If the landing is owed and merely not carried yet, THIS is the escape: file the "
+        f"carrier card and name it, so the board keeps a live handle on the unmerged PR;\n"
+        f"  * or if the PR is superseded or re-cut, say what it rides: "
         f"metadata.landing_not_owed=\"<the replacement it rides>\" (a repo#N ref, a card id or a URL).\n"
+        f"A deferral is NOT a third escape: metadata.landing_deferred must name a t_... carrier "
+        f"card and that card must name the PR — a bare reason cannot close a card whose PR is "
+        f"unmerged (tightened 2026-10-28 by operator order). A close is admitted on EVIDENCE: "
+        f"the forge's MERGED state, or a landed revision (merged_as / merge_sha / landed_sha / "
+        f"deploy_stamp) resolving to an admitted deploy-ledger row.\n"
         f"Doctrine: the landing-carrier rule — a close whose declared PR is unmerged must name "
         f"its landing carrier, on EVERY transition, worker closes included (design ruling on card "
         f"t_9333ca24; clause t_88f6cb12; widened 2026-10-14 by t_502a28bd). "
@@ -758,7 +795,7 @@ def evaluate(
         "prs": [],
         "carriers": {},
     }
-    deferred = _declared_reason(DEFERRED_KEYS, mds, lambda v: len(v.strip()) >= MIN_REASON)
+    deferred = _declared_reason(DEFERRED_KEYS, mds, is_named_carrier_deferral)
     not_owed = _declared_reason(NOT_OWED_KEYS, mds, is_named_exemption)
     merge_sha = _merge_sha_declared(mds)
     landing_cards: list[str] = []
@@ -766,6 +803,11 @@ def evaluate(
         value = md.get("landing_card")
         if isinstance(value, str) and value.strip():
             landing_cards.append(value.strip())
+        # A deferral is a POINTER to the carrier, never a waiver: the card it names
+        # is verified below exactly like metadata.landing_card (exists, names the PR).
+        reason = md.get("landing_deferred")
+        if isinstance(reason, str) and is_named_carrier_deferral(reason):
+            landing_cards.extend(_CARD_ID.findall(reason))
 
     unsatisfied: list[tuple[str, str]] = []
     for ref in refs:
@@ -794,9 +836,10 @@ def evaluate(
             facts["prs"].append(entry)
             continue
         if deferred:
-            entry["state"] = "deferred"
-            facts["prs"].append(entry)
-            continue
+            # A deferral that survived the carrier lookup named a card which does NOT
+            # name this PR: recorded as a fact and refused only if the forge also says
+            # unmerged -- the forge still decides, a named-but-wrong card does not.
+            entry["deferred_named"] = deferred
         # No carrier, no recorded escape: the forge decides, and only now.
         repo, _, number = ref.partition("#")
         try:
@@ -809,10 +852,9 @@ def evaluate(
                 detail=(
                     f"{task_id}: the landing state of the declared PR {ref} could not be read from "
                     f"the forge ({exc}), so the close cannot be admitted. Nothing has been changed on "
-                    f"the card. This remedy needs no network: if the landing is owed but not yet "
-                    f"carried, record metadata.landing_deferred=\"<why, at least {MIN_REASON} "
-                    f"characters>\"; if a carrier already exists, name it with "
-                    f"metadata.landing_card=\"t_...\"; if the PR is superseded or re-cut, record "
+                    f"the card. This remedy needs no network: file the landing carrier card and name "
+                    f"it with metadata.landing_card=\"t_...\" (a bare landing_deferred reason no "
+                    f"longer closes a card, 2026-10-28); if the PR is superseded or re-cut, record "
                     f"metadata.landing_not_owed=\"<the replacement it rides>\". (Doctrine: the "
                     f"landing-carrier rule, design ruling t_9333ca24.)"
                 ),
