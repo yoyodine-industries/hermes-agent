@@ -9,7 +9,14 @@ Contract under test (ruling, card t_e31d9241):
   ``blocked``/``needs_input`` -- parked, never silently skipped;
 * a card with neither trigger is untouched, and a prohibition that merely NAMES
   a consent-gated surface is not a trigger (the measured false-positive class
-  that keeps the lexical "write verb + gated surface" rule out of the gate).
+  that keeps the lexical "write verb + gated surface" rule out of the gate);
+* the ``consent-gated`` DECLARED marker is a LINE-LEADING LABEL / PREDICATE, not
+  a substring: a card that only NAMES the mechanism mid-line is admitted (the
+  other measured false-positive class -- the gate's own cards), while a genuine
+  line-leading self-declaration still holds. The label must TERMINATE: a line
+  that begins with the phrase and then continues as prose is a mention too (the
+  WRAPPED-sentence shape measured on ``t_919ee6ad``'s own body), while a bare
+  ``consent-gated`` line holds.
 """
 
 from __future__ import annotations
@@ -66,13 +73,40 @@ def home(tmp_path, monkeypatch):
     ("Immediate liveness (operator approval attached): kanban.max_spawn=3", "claim"),
     ("Execute approved work order APR-0024: schedule the next platform leg", "claim"),
     ("APPROVED: raise the cap", "claim"),
-    ("This change is consent-gated: install the plist", "declared"),
+    # A MID-LINE mention of the phrase is NOT a self-declaration (ruling
+    # acceptance case 3; the shape measured on t_2460e4ba / t_919ee6ad, where the
+    # prose NAMES the mechanism inside a sentence). Line-leading labels only.
+    ("This change is consent-gated: install the plist", ""),
     ("Batch C: convert 11 live config.yaml sites (system change, needs Rob)", "declared"),
     ("CONSENT-GATED: activate ready-queue admission", "declared"),
+    # ...and the label must TERMINATE. A line that BEGINS with the phrase and then
+    # CONTINUES as prose is a mention too (the WRAPPED-sentence shape measured on
+    # t_919ee6ad's body), while a bare line still holds via the end-of-line arm.
+    ("consent-gated live path from a kanban worker context must carry an "
+     "APPROVED approval row that", ""),
+    ("consent-gated", "declared"),
     ("Rotate the compressor bloom filters", ""),
 ])
 def test_trigger_detection(text, trigger):
     assert cg.evaluate(text, approvals_db="x").trigger == trigger
+
+
+def test_label_must_terminate_the_line():
+    """The wrapped-sentence shape, on the body form it was measured in.
+
+    ``t_919ee6ad``'s body wraps a prose sentence so that it BEGINS a line with
+    the phrase -- a MENTION. A bare label line is still a self-declaration.
+    """
+    mention = ("Enforce the consent-gated SURFACE class at the WRITE boundary: a tool call\n"
+               "consent-gated live path from a kanban worker context must carry an APPROVED\n"
+               "approval row that COVERS that surface.\n")
+    assert cg.evaluate("Implement: enforce it at the write boundary", mention,
+                       approvals_db="x").trigger == ""
+    # A bare label line, and a label whose clause it introduces, both still hold.
+    assert cg.evaluate("Rewrite the plists", "consent-gated\n",
+                       approvals_db="x").trigger == "declared"
+    assert cg.evaluate("Rewrite the plists", "  - CONSENT-GATED: needs a decision.\n",
+                       approvals_db="x").trigger == "declared"
 
 
 @pytest.mark.parametrize("text", [
@@ -223,11 +257,43 @@ def test_dispatch_guard_parks_an_amended_claim(home, approvals, monkeypatch):
 def test_dispatch_guard_holds_a_declared_consent_gated_card(home, approvals, monkeypatch):
     monkeypatch.setenv(cg.APPROVALS_DB_ENV, approvals)
     with kbc.connect() as conn:
+        # Acceptance case 1: a line-leading label in the TITLE holds.
         tid = _ready_card_with(conn, "CONSENT-GATED: install the rewritten plists",
                                "bootout and bootstrap the agent")
         assert kbd.check_consent_guard(conn, tid) == "consent-refused:no_ref"
         assert conn.execute("SELECT block_kind FROM tasks WHERE id = ?",
                             (tid,)).fetchone()["block_kind"] == "needs_input"
+
+        # Acceptance case 2: a line-leading label in the BODY, colon form, holds
+        # (and the title alone carries no marker).
+        body_tid = _ready_card_with(
+            conn, "Rewrite the plists",
+            "Bootout and bootstrap the agent.\nconsent-gated: needs a decision.\n",
+        )
+        assert kbd.check_consent_guard(conn, body_tid) == "consent-refused:no_ref"
+        assert conn.execute("SELECT block_kind FROM tasks WHERE id = ?",
+                            (body_tid,)).fetchone()["block_kind"] == "needs_input"
+
+        # Acceptance case 3: the phrase NAMING the mechanism mid-line is a MENTION,
+        # not a declaration -- the measured false positive (t_2460e4ba /
+        # t_919ee6ad) must be allowed to run, and must not be parked.
+        mention_tid = _ready_card_with(
+            conn,
+            "Implement: enforce the consent-gated SURFACE class at the write boundary",
+            "(file/terminal/exec doors) -- the module's own cards must not be held.",
+        )
+        assert kbd.check_consent_guard(conn, mention_tid) is None
+        assert conn.execute("SELECT status FROM tasks WHERE id = ?",
+                            (mention_tid,)).fetchone()["status"] == "ready"
+
+        # Acceptance case 4: DECLARED#2 / DECLARED#3 and every CLAIM pattern keep
+        # their (unchanged) anchoring.
+        assert cg.evaluate("This work needs the operator's approval before it runs",
+                           approvals_db=approvals).trigger == "declared"
+        assert cg.evaluate("Batch C: convert 11 live config.yaml sites "
+                           "(system change, needs Rob)", approvals_db=approvals).trigger == "declared"
+        assert cg.evaluate("Operator approved the cap change (APR-0007)",
+                           approvals_db=approvals).trigger == "claim"
 
 
 def test_dispatch_guard_passes_a_backed_card(home, approvals, monkeypatch):

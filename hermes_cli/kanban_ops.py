@@ -231,6 +231,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, why) in res.spawn_failed
             ],
             "skipped_top_level_only": getattr(res, "skipped_top_level_only", []),
+            "consent_held": getattr(res, "consent_held", []),
             "tick_yielded": res.tick_yielded,
             "host_budget": host_budget,
         }, ascii=True)

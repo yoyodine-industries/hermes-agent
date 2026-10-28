@@ -977,6 +977,14 @@ class DispatchResult:
     (invariant I1) -- the card simply was not admitted, and the next tick re-probes. Siblings on
     the same board carry on (invariant I2). Counted on the tick's suppression line, because a
     silent hold is how a starved board reads as an idle one."""
+    consent_held: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` HELD at the consent gate's RUN door
+    (``hermes_cli/kanban_consent_gate.py``; ruling ``t_e31d9241``, re-wired by
+    ``t_2460e4ba`` / ``t_1fce1feb``): the card asserts operator consent it cannot
+    show, or declares itself consent-gated with no APPROVED row behind it. The card
+    is PARKED ``needs_input`` with ONE deduped event + ONE comment, never silently
+    skipped, and the hold is counted on the tick's suppression line -- a silent
+    hold is how a starved board reads as an idle one."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -1197,6 +1205,8 @@ def tick_deferral_reason(result: Optional[object]) -> Optional[str]:
         return f"memory_pressure:{pressure}"
     if getattr(result, "skipped_locked", False):
         return "board_held"
+    if getattr(result, "consent_held", None):
+        return "consent_held"
     if getattr(result, "respawn_guarded", None):
         return "respawn_guarded"
     if getattr(result, "skipped_per_profile_capped", None):
@@ -1417,6 +1427,12 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             # their own workspace root was denied. They are still ready, so without this counter
             # the tick would read exactly like an idle one.
             counts["substrate_held"] = counts.get("substrate_held", 0) + len(res.substrate_held)
+        if res.consent_held:
+            # The consent gate's RUN door (ruling t_e31d9241; re-wired by t_2460e4ba /
+            # t_1fce1feb): the card was PARKED needs_input, so it will never spawn on a
+            # later tick either. Without this counter the whole class is invisible on the
+            # "dispatcher stuck" line -- the exact shape that let the gate sit unwired.
+            counts["consent_held"] = counts.get("consent_held", 0) + len(res.consent_held)
         if res.deferred_host_capped:
             # The HOST budget held these back: no per-card refusal of their own,
             # so without this the tick reads like an idle queue.
@@ -5982,6 +5998,18 @@ def _dispatch_lane_task(
         result.substrate_held.append(task_id)
         return False
 
+    # CONSENT GATE (RUN door; ruling t_e31d9241, re-wired by t_2460e4ba / t_1fce1feb):
+    # a card that ASSERTS operator consent it cannot show, or that DECLARES itself
+    # consent-gated (line-leading label -- ``kanban_consent_gate.DECLARED_LABEL``) with
+    # no APPROVED row behind it, is refused the spawn and PARKED ``needs_input``. The
+    # card's LIVE text is re-read, so an amendment after filing is honoured. Counted on
+    # the tick's suppression line: a refusal that leaves only an event is a silent hold,
+    # and a silent hold is how a starved board reads as an idle one.
+    consent_reason = check_consent_guard(conn, task_id, dry_run=dry_run)
+    if consent_reason is not None:
+        result.consent_held.append((task_id, consent_reason))
+        return False
+
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -6220,6 +6248,58 @@ def _hold_top_level_only(
             "kanban dispatch: top-level-only park failed for %s", task_id, exc_info=True,
         )
     return True
+
+
+def check_consent_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    dry_run: bool = False,
+    approvals_db: Optional[str] = None,
+) -> Optional[str]:
+    """The RUN door of the consent gate: refuse a run that claims consent it cannot show.
+
+    Deterministic, like :func:`check_respawn_guard` -- one regex pass over the
+    card's own text plus a read-only lookup in the approvals store
+    (``hermes_cli/kanban_consent_gate.py``; ruling: card ``t_e31d9241``).
+
+    Returns a reason string when the card must not run, else ``None``. A refused
+    card is PARKED ``blocked``/``needs_input`` with one durable comment naming
+    the cause and the moves -- never merely skipped: a skipped-but-ready card
+    loops silently every tick, and a spawned consent-gated card is the defect
+    this gate exists to stop. ``dry_run`` reports the refusal without writing.
+
+    RESTORED by card t_1fce1feb, re-landed by t_2460e4ba: the door had been
+    dropped from this tracked file while the module it calls survived, so the
+    gate enforced NOTHING -- the assertion arm included. The import below is LAZY
+    and GUARDED, the fork's idiom for a pin-adjacent gate module (cf.
+    ``kanban_db._gate_deploy_proof``): a tree that has lost the module cannot
+    judge ANY card's text, so refusing the board is not an option and the loss is
+    reported here -- the update rig's own pin (``UNTRACKED_OVERRIDES``) is the
+    guard for it.
+    """
+    try:
+        from hermes_cli import kanban_consent_gate as _cg
+    except Exception as _import_exc:  # pragma: no cover - pinned module present
+        _kb._log.warning(
+            "kanban dispatch: consent gate module unavailable, the run door cannot "
+            "judge %s (%s)", task_id, _import_exc,
+        )
+        return None
+
+    row = conn.execute(
+        "SELECT title, body, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in ("ready", "review"):
+        return None
+    verdict = _cg.evaluate(row["title"], row["body"], approvals_db=approvals_db)
+    if not verdict.refused:
+        return None
+    reason = f"consent-refused:{verdict.cause}"
+    if dry_run:
+        return reason
+    _park_for_consent(conn, task_id, verdict)
+    return reason
 
 
 def _park_for_consent(conn: sqlite3.Connection, task_id: str, verdict) -> None:
