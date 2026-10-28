@@ -193,7 +193,7 @@ def write_board_metadata(
     refusal ("nothing written", exit 2). A policy that cannot be loaded must stay
     storeable so the birth seam can be exercised against one and watch it report
     ``unavailable`` rather than fail the filing."""
-    _kb._assert_not_delegated_child_mutation()
+    _fence._assert_not_delegated_child_mutation(root=_kb.kanban_home())
     slug = _kb._slug_or_default(board)
     meta = read_board_metadata(slug)
     # db_path is derived on every read; never persist it into board.json.
@@ -303,7 +303,7 @@ def list_dispatch_boards() -> list[dict]:
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
     ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
-    _kb._assert_not_delegated_child_mutation()
+    _fence._assert_not_delegated_child_mutation(root=_kb.kanban_home())
     normed = _kb._require_slug(slug)
     if normed == _kb.DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
@@ -355,3 +355,4 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_db_fence as _fence

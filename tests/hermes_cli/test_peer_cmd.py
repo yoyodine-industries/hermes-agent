@@ -819,7 +819,7 @@ def test_the_child_write_allowance_is_closed_outside_its_named_purpose(tmp_path,
             with kbc.write_txn(conn):
                 pass
         with pytest.raises(PermissionError):
-            kb._assert_not_delegated_child_mutation(tmp_path / "kanban" / "kanban.db")
+            kb._assert_not_delegated_child_mutation(store=tmp_path / "kanban" / "kanban.db")
 
         with dc.child_kanban_write_allowance(dc.CHILD_KANBAN_WRITE_PURPOSES[0]):
             with kbc.write_txn(conn):

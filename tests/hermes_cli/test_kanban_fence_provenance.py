@@ -477,3 +477,210 @@ def test_unregistered_name_is_not_a_pin_violation(home, tmp_path):
         f"{foreign.stderr}"
     )
 
+
+
+# --- EVERY durable write door answers the ONE verdict (card t_e88054a6) -------------------------
+#
+# DEFECT: the arms were answerable SEPARATELY. ``kanban_path_is_fenced`` (the two cooperative
+# arms) was consulted at every durable seam; ``ancestor_owns_live_kanban_claim`` (provenance) only
+# in the CLI's ``--board`` fast-fail. A shell that stripped the marker was therefore refused at
+# the CLI and ADMITTED at the durable seam behind it. Each door below drives the REAL mutator from
+# such a shell (parent == the live claim's ``worker_pid``, no marker): at the pre-fix base the
+# write LANDS, with the fix it is REFUSED and the durable state is untouched.
+#
+# One table, because a door that answers differently is the defect. Adding a door here is how the
+# next seam gets covered instead of re-deriving which arms it happens to consult.
+
+DURABLE_DOOR_PROBE_SRC = """\
+import sys
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+
+door, task_id, board = sys.argv[1], sys.argv[2], sys.argv[3]
+conn = kbc.connect()
+try:
+    if door == "write_txn":
+        # The cheapest real ``write_txn`` caller a read verb runs (kanban list's mini-dispatch).
+        kb.recompute_ready(conn)
+    elif door == "board_metadata":
+        kb.write_board_metadata(board, name="renamed-by-a-descendant")
+    elif door == "board_removal":
+        kb.remove_board(board, archive=False)
+    elif door == "designate":
+        kb.designate_priority(conn, task_id, reason="provenance-door probe", board=board)
+    elif door == "revoke":
+        kb.revoke_priority_designation(conn, task_id, reason="provenance-door probe")
+    elif door == "arm_guard":
+        kb.arm_priority_tranche_guard(board)
+    elif door == "disarm_guard":
+        kb.disarm_priority_tranche_guard(board)
+    else:
+        raise SystemExit("unknown door: " + door)
+except PermissionError as exc:
+    print("REFUSED:", exc)
+    raise SystemExit(7)
+print("ADMITTED")
+raise SystemExit(0)
+"""
+
+_TRANCHE_TRIGGER_SQL = (
+    "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'tasks_priority_tranche_guard%'"
+)
+
+
+def _door_state(root: Path, slug: str, task_id: str, door: str):
+    """The piece of durable state *door* would move, read the way its own reader reads it."""
+    if door == "board_metadata":
+        return kb.read_board_metadata(slug).get("name")
+    if door == "board_removal":
+        return _board_db(root, slug).parent.exists()
+    conn = kbc.connect(db_path=_board_db(root, slug))
+    try:
+        if door == "write_txn":
+            return conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        if door == "designate":
+            row = kb.priority_designation(conn, task_id)
+            return row["designated_at"] if row else None
+        if door == "revoke":
+            row = kb.priority_designation(conn, task_id)
+            return row["revoked_at"] if row else "no-designation"
+        return sorted(r[0] for r in conn.execute(_TRANCHE_TRIGGER_SQL).fetchall())
+    finally:
+        conn.close()
+
+
+def _prepare_door(door: str, root: Path, slug: str, task_id: str) -> None:
+    """The state a door needs to exist before its write can be observed moving it."""
+    if door == "disarm_guard":
+        kb.arm_priority_tranche_guard(slug)
+    elif door == "revoke":
+        conn = kbc.connect(db_path=_board_db(root, slug))
+        try:
+            kb.designate_priority(conn, task_id, reason="the designation a revoke would end",
+                                  board=slug)
+        finally:
+            conn.close()
+
+
+@pytest.mark.parametrize("door", [
+    "write_txn", "board_metadata", "board_removal", "designate", "revoke",
+    "arm_guard", "disarm_guard",
+])
+def test_every_durable_write_door_answers_the_provenance_arm(door, home, tmp_path):
+    """Each door: REFUSED from the marker-stripped descendant, and nothing moved."""
+    task_id = _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                          fingerprint=_fingerprint_of_this_process())
+    _prepare_door(door, home, BOARD, task_id)
+    before = _door_state(home, BOARD, task_id, door)
+    script = _write(tmp_path / "door.py", DURABLE_DOOR_PROBE_SRC)
+
+    res = _run(script, home, BOARD, door, task_id, BOARD)
+
+    assert res.returncode == 7, (
+        f"{door} was ADMITTED from a shell descended from the live claim of this board: "
+        f"{res.stdout}{res.stderr}"
+    )
+    assert "descends from a LIVE dispatched worker" in res.stdout, res.stdout
+    assert _door_state(home, BOARD, task_id, door) == before, f"{door} moved durable state"
+
+
+def test_the_durable_doors_still_admit_a_top_level_caller(home, tmp_path):
+    """CONTROL: the same doors are not blanket-refused — no live-claim ancestry, no fence.
+
+    Without this the table above would pass against a ``raise PermissionError`` on every seam.
+    """
+    task_id = _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid() + 400000,
+                                          fingerprint=None)
+    script = _write(tmp_path / "door.py", DURABLE_DOOR_PROBE_SRC)
+    for door in ("write_txn", "board_metadata", "designate", "arm_guard", "disarm_guard"):
+        res = _run(script, home, BOARD, door, task_id, BOARD)
+        assert res.returncode == 0, f"{door}: {res.stdout}{res.stderr}"
+
+
+def test_the_subject_is_the_connection_not_the_named_board(home):
+    """D1: with a connection in hand, a NAME never becomes the subject of the verdict.
+
+    ``kanban_db_path(board=<name>)`` answers the ENV-PINNED store whenever a worker's pin is
+    authoritative, so keying a door off the name judged a store the write never touched
+    (card t_57e33100). The subject is the file ``write_txn`` will fence.
+    """
+    from hermes_cli.kanban_db_fence import fence_subject
+
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid() + 400000, fingerprint=None)
+    _make_foreign_board(home, OTHER_BOARD)
+    conn = kbc.connect(db_path=_board_db(home, BOARD))
+    try:
+        assert fence_subject(conn=conn, board=OTHER_BOARD) == _board_db(home, BOARD).resolve()
+    finally:
+        conn.close()
+
+
+def test_a_name_that_is_no_board_is_no_subject(home):
+    """D2: a malformed or unregistered name resolves to NO subject — never to another board."""
+    from hermes_cli.kanban_db_fence import fence_subject
+
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid() + 400000, fingerprint=None)
+    for name in (GHOST, "..", "a/b/c", ""):
+        assert fence_subject(board=name) is None, f"{name!r} became a fence subject"
+
+
+# --- the two conn doors are judged by the CONNECTION (ruling t_e88054a6 D3) ---------------------
+
+def test_the_conn_doors_are_judged_by_the_connection_not_the_pin(home, tmp_path, monkeypatch):
+    """The write lands on the CONNECTION's store — a name must not move the verdict off it.
+
+    ``kanban_db_path(board=<name>)`` answers the ENV-PINNED store whenever a worker's pin is
+    authoritative, so keyed off the name this door refused a caller whose write landed on a store
+    the fence does not hold: an over-refusal of the caller's own board, and one that flips when
+    the pin changes. The verdict is about the file ``write_txn`` fences. RED at the pre-fix base:
+    the write is refused.
+    """
+    from agent import delegation_context as dc
+
+    task_id = _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid() + 400000,
+                                          fingerprint=None)
+    elsewhere = tmp_path / "elsewhere" / "kanban.db"
+    conn = kbc.connect(db_path=elsewhere)
+    try:
+        own_task = kb.create_task(conn, title="a store outside the fence")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(_board_db(home, BOARD)))
+        monkeypatch.setenv(dc.DELEGATED_CHILD_ENV_MARKER, str(_board_db(home, BOARD).parent))
+        # The disagreement the old door suffered from: the name's store is fenced, this one is not.
+        assert dc.kanban_path_is_fenced(_board_db(home, BOARD))
+        assert not dc.kanban_path_is_fenced(elsewhere)
+
+        kb.designate_priority(conn, own_task, reason="a store the fence does not hold", board=BOARD)
+        assert kb.priority_designation(conn, own_task) is not None
+        assert kb.priority_designation(conn, task_id) is None
+    finally:
+        conn.close()
+
+
+def test_the_two_conn_doors_refuse_a_delegated_child_on_its_own_board(home, tmp_path):
+    """D5: a delegated child may not move its OWN board's designation through either door.
+
+    Asserted on BOTH arms — the cooperative ContextVar (in-process) and PROVENANCE (a shell
+    descended from the live claim) — because the defect was that the arms answered separately.
+    """
+    from agent import delegation_context as dc
+
+    task_id = _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid() + 400000,
+                                          fingerprint=None)
+    conn = kbc.connect()
+    try:
+        with dc.delegated_child_context():
+            with pytest.raises(PermissionError, match="child contexts cannot mutate"):
+                kb.designate_priority(conn, task_id, reason="own board, marker arm", board=BOARD)
+            with pytest.raises(PermissionError, match="child contexts cannot mutate"):
+                kb.revoke_priority_designation(conn, task_id, reason="own board, marker arm")
+    finally:
+        conn.close()
+
+    claim_task = _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                             fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "door.py", DURABLE_DOOR_PROBE_SRC)
+    for door in ("designate", "revoke"):
+        res = _run(script, home, BOARD, door, claim_task, BOARD)
+        assert res.returncode == 7, f"{door} admitted on the provenance arm: {res.stdout}{res.stderr}"
+        assert "descends from a LIVE dispatched worker" in res.stdout, res.stdout

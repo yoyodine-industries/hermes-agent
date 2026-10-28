@@ -721,13 +721,20 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
-    from agent.delegation_context import child_kanban_write_purpose, kanban_path_is_fenced
+    from agent.delegation_context import child_kanban_write_purpose
     # ONE exception, consulted HERE so it reaches both doors (card t_703af8d1, defect D11):
     # a caller inside the reviewed child-context write allowance
     # (``agent.delegation_context.child_kanban_write_allowance``, purpose
     # ``peer-refusal-report``) is here to WRITE, so it opens read-write; the write itself
     # still passes the allowance check at the write seam, which logs every use.
-    if kanban_path_is_fenced(path) and not child_kanban_write_purpose():
+    #
+    # The SAME ONE VERDICT the write door raises on decides this open (card t_e88054a6). Asking
+    # only the cooperative arms here while ``write_txn`` asked all three is how a shell that
+    # stripped the marker got a read-write handle, ran the schema/backfill pass, and was then
+    # refused mid-``connect()`` by the seam behind it — a read verb failing on a fence it never
+    # should have met. With one verdict the provenance descendant lands in the READ-ONLY branch
+    # below, which is exactly the contract: every read still works, no write does.
+    if _fence.is_delegated_child_mutation(store=path) and not child_kanban_write_purpose():
         # Reads must not enter schema/backfill write transactions. Never create a
         # missing board or migrate on a descendant's behalf; the owner initializes it.
         conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
@@ -1276,7 +1283,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             purpose, _main_db_file(conn),
         )
     else:
-        _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
+        _fence._assert_not_delegated_child_mutation(conn=conn)
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(
@@ -1323,3 +1330,4 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_db_fence as _fence

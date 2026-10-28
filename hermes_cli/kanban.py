@@ -18,6 +18,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.kanban_db_fence import is_delegated_child_mutation
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
@@ -266,86 +267,35 @@ _DELEGATED_CHILD_CLI_REFUSAL: str = (
 )
 
 
-def _fence_target_store(args: argparse.Namespace) -> Optional[Path]:
-    """The board store the invocation actually TARGETS, or ``None`` when a NAMED board is no board.
-
-    ``--board`` names the board a command addresses; the ambient chain
-    (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` -> ``<kanban>/current``) resolves only
-    the board that is ACTIVE in this process. Judging the fast-fail against the ambient board
-    refuses a mutation targeting a board this lineage holds no claim on, and lets the verdict
-    flip when ``<kanban>/current`` moves (card t_63a0c2d9).
-
-    THREE OUTCOMES, NOT TWO (ruling t_ecd51c9c): a name that resolves to no board is not a store
-    at all, so it answers ``None``. A fence may allow or deny the object the caller NAMED; it may
-    never SUBSTITUTE a different object, and falling back to the AMBIENT board did exactly that —
-    it judged the invocation against a board it never named, over-refusing a caller descended from
-    a live worker there and MASKING the CLI's own ``board '<x>' does not exist`` (measured on the
-    sdlc birth node: run 20261008-0844, gateway caller -> honest error, the item BIRTHS; run
-    20261008-0958, worker caller -> the fence message; cron 16b8c8db4ed7 failure_streak=10).
-
-    The ``boards …`` actions are the exception: they ignore ``--board`` by construction (board
-    metadata and the current-board pointer live at the root), so the caller keeps the ambient
-    resolution for them.
-    """
-    named = getattr(args, "board", None)
-    if named:
-        # Existence is the CLI's own question, and the CLI's own validation asks the board
-        # REGISTRY (:func:`kanban_command` refuses an unregistered slug before dispatch). Asking
-        # the registry first is what keeps the verdict scoped to the board that was NAMED: the
-        # store path cannot answer it, because a worker's env pin legitimately overrides explicit
-        # intent (``explicit_board_intent_is_pinned``) and would hand back the PINNED board.
-        try:
-            normed = kb._normalize_board_slug(named)
-        except ValueError:
-            return None
-        if not normed or (normed != kb.DEFAULT_BOARD and not kb.board_exists(normed)):
-            return None
-        try:
-            return kb.kanban_db_path(board=named)
-        except Exception:  # health: allow BLE001, S110 -- fail-open (t_fcf7a321): the fast-fail must never raise; a name that resolves to no store answers "no board"
-            # The fast-fail must never raise from here (that property is why the guard exists).
-            # What it must NOT do is fall back to the ambient board: that is a DIFFERENT board's
-            # verdict, and it would refuse this invocation before :func:`kanban_command` can
-            # print the honest board-resolution error.
-            return None
-    return kb.kanban_db_path()
-
-
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     """Fence a mutating CLI verb from a non-top-level session.
 
-    Two cooperative arms (the ContextVar and the ``HERMES_DELEGATED_CHILD_CONTEXT`` marker,
-    both inside :func:`kanban_path_is_fenced`) plus the PROVENANCE arm (ruling t_fcf7a321,
-    Decision 1): a process descended from a LIVE dispatched worker is refused even after the
-    marker has been stripped. Reads never reach this helper — the caller checks the action
-    vocabulary first.
+    The VERDICT is not taken here: all three arms (the ContextVar, the inherited
+    ``HERMES_DELEGATED_CHILD_CONTEXT`` marker, and the PROVENANCE arm of ruling t_fcf7a321) are
+    asked by :func:`hermes_cli.kanban_db_fence.fence_verdict` about ONE subject, which is how a
+    shell that strips the marker stopped being refused here and admitted at the durable seam
+    (card t_e88054a6). This helper only decides WHICH subject, and it decides it the way the write
+    itself will:
 
-    Both arms are judged against the board the invocation TARGETS (:func:`_fence_target_store`),
-    never the host-global ambient board: a mutation aimed at another board is not this lineage's
-    to fence, and the verdict must not move when ``<kanban>/current`` does. A NAMED board that
-    resolves to no board is no board at all, so the verdict is ``False`` — no fence verdict, not a
-    refusal — and the CLI's own board validation produces the honest error (ruling t_ecd51c9c).
+    * a task action lands on the board the invocation TARGETS — ``--board`` when it names a
+      registered board, the ambient store when it does not. A mutation aimed at another board is
+      not this lineage's to fence, and the verdict must not move when ``<kanban>/current`` does;
+    * ``boards …`` ignores ``--board`` by construction (board metadata and the current-board
+      pointer live at the root), so its subject is the root.
+
+    A NAMED board that resolves to no board is no board at all, so the verdict is ``False`` — no
+    fence verdict, not a refusal — and the CLI's own board validation produces the honest error
+    (ruling t_ecd51c9c). Reads never reach this helper — the caller checks the action vocabulary
+    first.
     """
     action = getattr(args, "kanban_action", None)
     if action == "boards":
         if (getattr(args, "boards_action", None) or "list") not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
             return False
-    elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
+        return is_delegated_child_mutation(root=kb.kanban_home())
+    if action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
-    from agent.delegation_context import ancestor_owns_live_kanban_claim, kanban_path_is_fenced
-
-    # ``boards …`` ignores ``--board``, so its target is the ambient board (as before).
-    target = kb.kanban_db_path() if action == "boards" else _fence_target_store(args)
-    if target is None:
-        # A NAMED board that resolved to no board: no store exists for this lineage to hold a
-        # claim on, and there is nothing here to mutate. Answer "no fence verdict" — the CLI
-        # refuses the invocation itself, naming the board, instead of this fast-fail speaking for
-        # (and masking) a board the caller never touched.
-        return False
-    if kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(target):
-        return True
-    # Durable arm: the marker is clearable, ancestry is not. Same fence, proven from the TARGET board.
-    return ancestor_owns_live_kanban_claim(target)
+    return is_delegated_child_mutation(board=getattr(args, "board", None))
 
 
 def _joined_words(words) -> Optional[str]:
@@ -619,8 +569,12 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if args.mine and not assignee:
         assignee = _profile_author()
     with kbc.connect_closing() as conn:
-        # Cheap mini-dispatch so list reflects dependencies cleared since the last tick.
-        kb.recompute_ready(conn)
+        # Cheap mini-dispatch so list reflects dependencies cleared since the last tick. A FENCED
+        # caller gets a read-only handle (``kanban_db_connect.connect``) and this sweep is the one
+        # write a read verb carries: skip it rather than turn ``list`` into a fence refusal — the
+        # board's OWNER runs the sweep on its next tick (card t_e88054a6).
+        if not is_delegated_child_mutation():
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
             include_archived=args.archived, order_by=getattr(args, "sort", None),
@@ -1829,11 +1783,13 @@ _GATES_DELEGATED_CHILD_REFUSAL: str = (
 
 
 def _gates_from_delegated_child() -> bool:
-    """Is this invocation a delegated-child / card context? (the write door's own predicate)"""
-    from agent.delegation_context import kanban_path_is_fenced
+    """Is this invocation a delegated-child / card context? (the write door's own predicate)
 
-    return (kanban_path_is_fenced(kb.kanban_home())
-            or kanban_path_is_fenced(kb.kanban_db_path()))
+    Asked of the ONE verdict (``kanban_db_fence.fence_verdict``) about the store ``gates
+    reconcile`` writes — so a shell that stripped the marker is not told to read on and then hit
+    a ``PermissionError`` from the seam behind this message (card t_e88054a6).
+    """
+    return is_delegated_child_mutation(store=kb.kanban_db_path())
 
 
 def _print_discharge(discharge: dict) -> None:
