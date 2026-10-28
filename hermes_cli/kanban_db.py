@@ -2018,6 +2018,7 @@ def create_task(
     allow_off_board_ask: bool = False,
     from_inbox: Optional[str] = None,
     from_inbox_item: Optional[str] = None,
+    resurrect: bool = False,
     archived_key_policy: Optional[str] = None,
     archived_key_actor: Optional[str] = None,
     archived_key_reason: Optional[str] = None,
@@ -2027,7 +2028,10 @@ def create_task(
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
     ``idempotency_key``: an existing non-archived task with the key is returned
-    instead of a duplicate. ``archived_key_policy`` is what a filing does when the key
+    instead of a duplicate. ``resurrect``: the caller's statement that it MEANS to
+    re-open a keyed identity whose card is closed — without it the filing-budget
+    door refuses ``duplicate-closed-key`` and names the closed card.
+    ``archived_key_policy`` is what a filing does when the key
     is held by an ARCHIVED card instead: ``"recreate"`` (the default, and today's
     behaviour -- the archived card does NOT answer, so a second card is minted under
     the same key), ``"return_tombstone"`` (hand back the archived card's id and insert
@@ -2245,6 +2249,31 @@ def create_task(
                         % (tombstone, idempotency_key, why_not or "refused"))
                 return tombstone
 
+    # THE FILING-BUDGET DOOR (card t_80ff9b6a; platform-stl ruling t_ff465032 Decision 1).
+    # The budget is enforced HERE - the one moment EVERY filing surface reaches - so a
+    # producer cannot opt out by wiring: the tool verb, the CLI, a decomposer and another
+    # lane's agent all land on this call. It runs AFTER the idempotency early-return above (a
+    # keyed refresh re-uses an identity the board already holds: not a birth, draws nothing)
+    # and BEFORE any write, so a refused filing leaves the database untouched. A host with no
+    # policy file is INERT - nothing read, nothing printed, no event key, no module imported
+    # beyond the kernel's own: that is upstream's behaviour, byte for byte, and it is what
+    # makes the change upstream-able. The refusal is an ANSWER (a falsy ``str`` whose value is
+    # the printed line), never an exception: ``hermes_cli.kanban_filing_policy`` owns the
+    # roster, the bands and the pool, and this module owns only the moment.
+    #
+    # The KEY goes through with the create: the early-return above answers any row that is not
+    # archived, so a keyed identity whose card was ARCHIVED used to be re-filed by the next
+    # tick of whatever producer owns it - the measured re-birth loop. The hook's closure leg
+    # asks the BOARD about that key and refuses ``duplicate-closed-key`` naming the closed
+    # card; ``resurrect=True`` is the caller's own statement that it means to re-open it.
+    from hermes_cli import kanban_filing_policy as _filing
+    filing_refusal, filing_record = _filing.apply(
+        conn, created_by=created_by, title=title, body=body,
+        idempotency_key=idempotency_key, resurrect=resurrect,
+    )
+    if filing_refusal is not None:
+        return filing_refusal
+
     # An unresolvable project link is DROPPED either way (never a dangling reference, never a
     # crash), but a silent drop is a silent failure: the caller believes the card is grouped
     # and it is not. Warn on stderr AND carry the finding into the ``created`` event, so the
@@ -2397,6 +2426,11 @@ def create_task(
                         # unchanged card and every board without a policy keep the event
                         # payload they have always written.
                         **({"priority_policy": policy_provenance} if policy_provenance else {}),
+                        # The filing budget's reading, when this host HAS a policy: a card
+                        # born under the pool states which pool it drew from, so a refusal a
+                        # producer hit is readable next to the filings that got through. No
+                        # policy file = no key (upstream's payload, byte for byte).
+                        **({"filing_policy": filing_record} if filing_record else {}),
                     },
                 )
                 # The measured reason travels WITH the card (t_b58332a4 -> t_4bec5cfe): the author
@@ -2464,7 +2498,7 @@ def create_task(
 
 def create_task_reported(
     conn: sqlite3.Connection, *, profiles: Optional[Iterable[str]] = None, **kwargs,
-) -> tuple[str, LinkOutcome]:
+) -> tuple[str, Optional[LinkOutcome]]:
     """Create a task through :func:`create_task`; return it with its dependency receipt.
 
     The same single write path, so ``create_task`` keeps its id-shaped contract for callers
@@ -2472,8 +2506,17 @@ def create_task_reported(
     by itself? ``profiles`` is the caller's live-profile list for the receipt's dead-assignee
     probe (``None`` = not injected: skipped, never guessed); the board is the caller's own
     ``board=``, never the ambient one.
+
+    A REFUSED filing returns ``(refusal, None)``: there is no card, so there is no dependency
+    receipt to answer with, and inventing one for a row that does not exist would be the
+    silent failure the refusal exists to prevent. The refusal is falsy, so a caller's own
+    ``if not task_id`` catches it without learning a new type.
     """
     task_id = create_task(conn, **kwargs)
+    from hermes_cli.kanban_filing_policy import FilingRefusal as _Refusal
+
+    if isinstance(task_id, _Refusal):
+        return task_id, None
     return task_id, created_outcome(conn, task_id, profiles=profiles, board=kwargs.get("board"))
 
 

@@ -1646,7 +1646,11 @@ def decompose_task_endpoint(task_id: str, payload: DecomposeBody, board: Optiona
     outcome = _run_aux(board, "kanban_decompose", "decompose_task", task_id, payload.author)
     return {
         "ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason,
-        "fanout": bool(outcome.fanout), "child_ids": outcome.child_ids or [], "new_title": outcome.new_title}
+        "fanout": bool(outcome.fanout), "child_ids": outcome.child_ids or [], "new_title": outcome.new_title,
+        # A refused fan-out carries the filing budget's line in ``reason``; the flag tells a
+        # caller that this was the DOOR's decision (the card is still in triage) rather than a
+        # malformed reply from the decomposer.
+        "refused": bool(getattr(outcome, "refused", False))}
 
 
 # --- Orchestration settings (kanban.orchestrator_profile / default_assignee /

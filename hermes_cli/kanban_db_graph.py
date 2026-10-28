@@ -90,7 +90,7 @@ def _validate_children_graph(children: list) -> None:
 def decompose_triage_task(
     conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
     author: Optional[str] = None, auto_promote: bool = True,
-) -> Optional[list[str]]:
+):
     """Fan a triage task out into children and move the root to ``todo``; the root
     waits on every child and wakes (``ready``) when all are done.
 
@@ -98,17 +98,58 @@ def decompose_triage_task(
     ``parents`` (indices into this list), optional workspace overrides.
     Returns child ids in input order, or None when the root is missing / not
     in triage, or has already decomposed. Atomic: malformed entries abort fan-out.
+
+    THE FILING BUDGET REACHES THIS SEAM TOO (card t_80ff9b6a, review round 3). This is the
+    kernel's SECOND row-creation seam — a decomposed child is born here, not through
+    ``create_task`` — so a budget wired into the create door alone leaves the fan-out free to
+    write N rows past a spent pool. It reaches the SAME door with the SAME reading: one
+    decision for the WHOLE fan-out (``quantity=len(children)``), judged at the ROOT's band
+    (the root is the card that claims the budget, so a SEV1 root exempts its own fan-out and
+    an alarm can never lose its decomposition), under the identity the children will be born
+    under (``author or "decomposer"``) so the arithmetic counts the same surface these rows do.
+
+    ALL OR NOTHING, and the refusal is a VALUE. A refused fan-out returns the
+    :class:`~hermes_cli.kanban_filing_policy.FilingRefusal` (a falsy ``str`` whose value is the
+    printed line) BEFORE the write transaction opens: no child row, no sibling or root link, no
+    ``decomposed`` event, and the root is left exactly where it was — in ``triage``, still the
+    card the next pass can decompose when the pool has headroom. There is deliberately no
+    partial fan-out: a decomposition is one filing, and a half-written graph would be a graph
+    nobody can read (children whose root never woke, or a root that decomposed "some" of its
+    work). The caller MUST tell the refusal apart from ``None`` — ``is_refusal`` — and report
+    the line in its own output; dropping it on the floor is the silent failure this exists to
+    prevent.
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
         write_txn, recompute_ready,
     )
+    from hermes_cli import kanban_filing_policy as _filing
 
     if not children:
         return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
     _validate_children_graph(children)
+
+    # THE FILING DOOR, before the write lock: it reads the estate's instrument (a subprocess,
+    # ~1 s), which must never happen inside a write transaction. The root's own row is read
+    # here WITHOUT a lock for the band only — the transaction below re-reads the root under
+    # the lock and keeps its own status / already-decomposed answer, so a race between this
+    # read and the write resolves exactly as it did before the door was wired in.
+    filing_creator = author or "decomposer"
+    root_pre = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    filing_record: Optional[dict] = None
+    if root_pre is not None:
+        filing_refusal, filing_record = _filing.apply(
+            conn, created_by=filing_creator,
+            title=root_pre["title"],
+            body=root_pre["body"] if isinstance(root_pre["body"], str) else None,
+            quantity=len(children),
+        )
+        if filing_refusal is not None:
+            return filing_refusal
 
     # ONE txn so the fan-out is atomic; helpers that open their own write_txn
     # (create_task, link_tasks, add_comment) must not be called in here.
@@ -128,7 +169,8 @@ def decompose_triage_task(
         ).fetchone():
             return None
         child_ids = [
-            _insert_decomposed_child(conn, task_id, root_row, child, author, now)
+            _insert_decomposed_child(conn, task_id, root_row, child, author, now,
+                                     filing_record=filing_record)
             for child in children
         ]
         # Sibling edges within the decomposed graph.
@@ -168,7 +210,7 @@ def decompose_triage_task(
 
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
-    author: Optional[str], now: int,
+    author: Optional[str], now: int, filing_record: Optional[dict] = None,
 ) -> str:
     """Insert one decomposed child as ``todo`` (linked under the root later so
     the dispatcher only ever sees a coherent graph); returns its id.
@@ -227,6 +269,10 @@ def _insert_decomposed_child(
             # The policy's own record, verbatim, and only on a card it moved - the same rule
             # the create seam applies, so a fan-out is readable the same way a filing is.
             **({"priority_policy": policy_provenance} if policy_provenance else {}),
+            # And the FILING door's reading, when this host has a policy: a child born under
+            # the pool states which pool it drew from and (for a fan-out) the batch it was part
+            # of, so the fan-out's arithmetic is legible from the rows themselves.
+            **({"filing_policy": filing_record} if filing_record else {}),
         },
     )
     inherit_creator_origin(conn, new_id, root_id, created_at=now)

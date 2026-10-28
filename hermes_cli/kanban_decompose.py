@@ -120,6 +120,12 @@ class DecomposeOutcome:
     fanout: bool = False
     child_ids: list[str] | None = None
     new_title: Optional[str] = None
+    #: True when the FILING BUDGET refused the fan-out (card t_80ff9b6a): ``ok`` is False and
+    #: ``reason`` IS the printed refusal line. Distinct from an ordinary "nothing to do"
+    #: failure because a refusal is a decision about the pool - the dispatcher reports it at
+    #: warning level, and a caller that swallowed it as a no-op would be the silent failure the
+    #: ruling forbids.
+    refused: bool = False
 
 
 def _profile_author() -> str:
@@ -294,6 +300,14 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     except Exception as exc:
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
+    # THE FILING BUDGET'S ANSWER, carried to this producer's own output. The kernel's fan-out
+    # seam consults the same door the create path does and refuses the WHOLE decomposition when
+    # the pool cannot pay for every child; the refusal is a falsy str, not ``None`` and not a
+    # list, so it is reported here rather than being mistaken for "already decomposed" (which
+    # would read as a no-op and lose the decision).
+    from hermes_cli.kanban_filing_policy import is_refusal
+    if is_refusal(child_ids):
+        return DecomposeOutcome(task_id, False, str(child_ids), refused=True)
     if child_ids is None:
         return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
     return DecomposeOutcome(
