@@ -1914,6 +1914,92 @@ def operator_ask_event(ask_ref: Any, ask_pair: Optional[tuple[str, str]]) -> dic
     return {}
 
 
+#: What a filing does when the key it carries is HELD BY A TOMBSTONE (an ``archived``
+#: card). Named, validated, and OPT-IN: the default is what every caller on the host does
+#: today, and a default flip is refused (ruling on card ``t_2bc058fc``, leg B
+#: ``t_0f97637f``) because it would turn every re-filing caller into a silent no-op.
+#:
+#:   * ``recreate`` -- mint a second card under the same key (today's behaviour);
+#:   * ``return_tombstone`` -- hand back the archived card's id and insert NOTHING;
+#:   * ``reopen`` -- hand back that card AND move it back to a live status through
+#:     :func:`reopen_task`, one audited act, inserting nothing.
+#:
+#: Measured on the live ``platform`` board 2026-10-28: 17,309 keyed rows over 14,752
+#: distinct keys -- 2,557 duplicate keyed rows -- and 1,357 keys holding BOTH an archived
+#: card and a later one: keys that came back from the dead and were re-filed beside
+#: their own tombstone.
+ARCHIVED_KEY_POLICIES = ("recreate", "return_tombstone", "reopen")
+DEFAULT_ARCHIVED_KEY_POLICY = "recreate"
+
+
+def _norm_archived_key_policy(policy: Any) -> str:
+    """The policy NAME, or :class:`ValueError` naming the one that was asked for.
+
+    ``None`` is "the caller did not ask", so it takes the default. Anything else must be
+    one of :data:`ARCHIVED_KEY_POLICIES`: guessing here would either file the twin this
+    seam exists to prevent or answer a filing with a finished card, and neither is a
+    thing to decide on a caller's behalf.
+    """
+    name = DEFAULT_ARCHIVED_KEY_POLICY if policy is None else policy
+    normalized = name.strip().lower() if isinstance(name, str) else name
+    if normalized not in ARCHIVED_KEY_POLICIES:
+        raise ValueError(
+            "archived_key_policy %r is not a policy: one of %s (default %r). Refused by "
+            "name rather than guessed." % (
+                policy, ", ".join(repr(p) for p in ARCHIVED_KEY_POLICIES),
+                DEFAULT_ARCHIVED_KEY_POLICY))
+    return normalized
+
+
+def _archived_key_authority(policy: str, actor: Optional[str],
+                            reason: Optional[str]) -> tuple[str, str]:
+    """``(actor, reason)`` for a ``reopen`` filing, or the blank pair for any other.
+
+    The reopen lands on ANOTHER card's history, so the kernel takes the authority from
+    the caller and REFUSES to invent it: a reopen with no actor is anonymous and one with
+    no reason is silent, and both outlive the session that caused them.
+    """
+    if policy != "reopen":
+        return "", ""
+    who = (actor or "").strip()
+    why = (reason or "").strip()
+    if not who:
+        raise ValueError(
+            "archived_key_policy='reopen' needs archived_key_actor: the reopen is an "
+            "AUDITED act on the archived card's own history, and the kernel will not "
+            "invent who asked for it.")
+    if not why:
+        raise ValueError(
+            "archived_key_policy='reopen' needs archived_key_reason: the reopened card's "
+            "comment carries it verbatim, and an unexplained reopen is a silent one.")
+    return who, why
+
+
+def _keyed_live_task(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    """The newest non-archived card holding ``key`` -- the dedupe every caller has today.
+
+    ``done`` is LIVE for this purpose and always has been: the historical lookup was
+    ``status != 'archived'``, and the archived-key seam must not quietly change which
+    finished cards answer a filing.
+    """
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? "
+        "AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1", (key,),
+    ).fetchone()
+    return str(row["id"]) if row else None
+
+
+def _keyed_archived_task(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    """The newest ARCHIVED card holding ``key`` -- the tombstone that frees the key today."""
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? "
+        "AND status = 'archived' "
+        "ORDER BY created_at DESC LIMIT 1", (key,),
+    ).fetchone()
+    return str(row["id"]) if row else None
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1933,6 +2019,9 @@ def create_task(
     from_inbox: Optional[str] = None,
     from_inbox_item: Optional[str] = None,
     resurrect: bool = False,
+    archived_key_policy: Optional[str] = None,
+    archived_key_actor: Optional[str] = None,
+    archived_key_reason: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1942,6 +2031,22 @@ def create_task(
     instead of a duplicate. ``resurrect``: the caller's statement that it MEANS to
     re-open a keyed identity whose card is closed — without it the filing-budget
     door refuses ``duplicate-closed-key`` and names the closed card.
+    ``archived_key_policy`` is what a filing does when the key
+    is held by an ARCHIVED card instead: ``"recreate"`` (the default, and today's
+    behaviour -- the archived card does NOT answer, so a second card is minted under
+    the same key), ``"return_tombstone"`` (hand back the archived card's id and insert
+    nothing) or ``"reopen"`` (that card, moved back to a live status through
+    :func:`reopen_task` in one audited act, inserting nothing). An unknown policy name
+    is REFUSED by name rather than guessed; ``"reopen"`` additionally requires
+    ``archived_key_actor`` and ``archived_key_reason``, because the reopen lands on
+    another card's history and neither the actor nor the reason may be invented here.
+    A LIVE card under the key always wins, whatever the policy: the seam only decides
+    what a TOMBSTONE means.
+    A key that legitimately recurs must carry its GENERATION in the key itself -- the
+    ``...:g<N>`` vocabulary the SDLC door already mints (``<base>:g1``, ``<base>:g2``,
+    card ``t_9f61f782``) -- so a recurrence files a NEW key instead of asking a dedupe
+    setting to pretend the same incident is a different one. A generation-less key that
+    recurs is a NAMING bug in the caller; no policy here papers over it.
     ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
@@ -2109,14 +2214,40 @@ def create_task(
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
+    #
+    # THE ARCHIVED-KEY SEAM (ruling t_2bc058fc, card t_0f97637f). `status != 'archived'`
+    # FREED the key of every archived card, so the same incident was re-filed beside its
+    # own tombstone (2,557 duplicate keyed rows on the live `platform` board, 1,357 key
+    # groups holding an archived row, measured 2026-10-28). The policy decides what a
+    # TOMBSTONE means and nothing else: a live card still answers first, and a policy
+    # other than the default only runs when a caller asked for it BY NAME.
     if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+        archive_policy = _norm_archived_key_policy(archived_key_policy)
+        reopen_actor, reopen_reason = _archived_key_authority(
+            archive_policy, archived_key_actor, archived_key_reason)
+        live_hit = _keyed_live_task(conn, idempotency_key)
+        if live_hit:
+            return live_hit
+        if archive_policy != DEFAULT_ARCHIVED_KEY_POLICY:
+            tombstone = _keyed_archived_task(conn, idempotency_key)
+            if tombstone:
+                if archive_policy == "return_tombstone":
+                    # The identity is HELD: nothing is inserted, and the caller gets the
+                    # card that already carries it rather than a twin of it.
+                    return tombstone
+                reopened, why_not, _info = reopen_task(
+                    conn, tombstone, actor=reopen_actor, reason=reopen_reason)
+                if not reopened:
+                    # The card moved between this probe and the door. A live card under
+                    # the key answers the filing just as well; anything else is a
+                    # REFUSAL the caller must see -- minting a twin here is the defect.
+                    again = _keyed_live_task(conn, idempotency_key)
+                    if again:
+                        return again
+                    raise ValueError(
+                        "archived_key_policy='reopen' could not reopen %s (key %r): %s"
+                        % (tombstone, idempotency_key, why_not or "refused"))
+                return tombstone
 
     # THE FILING-BUDGET DOOR (card t_80ff9b6a; platform-stl ruling t_ff465032 Decision 1).
     # The budget is enforced HERE - the one moment EVERY filing surface reaches - so a
