@@ -20,6 +20,16 @@ from typing import Any, ContextManager, Protocol, cast
 
 from gateway import hosted_room_driver as state
 
+
+def room_session_key(room_id: str) -> str:
+    """The turn lock's transcript handle for one room (``t_47082c1d``).
+
+    Imported lazily on purpose: ``tools.bot_relay`` pulls in the delivery queue, which must not load
+    when the driver module is merely imported.
+    """
+    from tools.bot_relay import room_session_key as _key
+    return _key(room_id)
+
 _CANCEL_ROUTE_RETRIES = 8
 _STOP_ACK_STATUSES = {"cancelled", "interrupted"}
 
@@ -97,7 +107,7 @@ class HostedRoomRuntime:
     def __init__(
         self, *, db_path: Path | str,
         rooms: Iterable[HostedRoomBinding] | Callable[[], Iterable[HostedRoomBinding]],
-        turn_lock: Callable[[str], ContextManager[Any]], rpc: InternalSessionRPC | None = None,
+        turn_lock: Callable[..., ContextManager[Any]], rpc: InternalSessionRPC | None = None,
         transport_resolver: MemberTransportResolver | None = None,
         prepare_room: Callable[[HostedRoomBinding], None] | None = None,
         publish_terminal: Callable[[HostedRoomBinding, Mapping[str, Any]], None] | None = None,
@@ -584,7 +594,7 @@ class HostedRoomRuntime:
         with self._status_lock:
             self._current_tasks[binding.room_id] = attempt.identity
         try:
-            with self.turn_lock(profile):
+            with self.turn_lock(profile, room_session_key(binding.room_id)):
                 session = self._resolve_or_create(transport, profile, binding.room_id)
                 # A submit should fail before admission or return after it; an unexpected
                 # exception at that boundary is ambiguous, never a proven failure.
@@ -768,7 +778,7 @@ class HostedRoomRuntime:
     def _inspect_recovery_session(
         self, binding: HostedRoomBinding, task: Mapping[str, Any]) -> _RecoveryInspection:
         profile, transport = task["payload"]["target_profile"], self._transport_for(binding, task)
-        with self.turn_lock(profile):
+        with self.turn_lock(profile, room_session_key(binding.room_id)):
             session_id = self._resume_exact(transport, task["identity"].room_id, profile)
             if session_id is None:
                 return _NO_INSPECTION
@@ -782,7 +792,7 @@ class HostedRoomRuntime:
         until the user retries it under a new fenced generation.
         """
         profile = task["payload"]["target_profile"]
-        with self.turn_lock(profile):
+        with self.turn_lock(profile, room_session_key(task["identity"].room_id)):
             session = self.rpc.resolve_exact(
                 profile=profile, title=room_session_title(task["identity"].room_id),
                 source=ROOM_SESSION_SOURCE)

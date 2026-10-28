@@ -286,7 +286,34 @@ describe('disband', () => {
       'hermes-bots-groups'
     ]
 
-    expect(envelope.deleted?.['name:Gone']).toBeGreaterThan(0)
+    expect(Object.keys((envelope as { rooms?: object }).rooms || {})).toEqual([])
+    // A pre-roomId room has no durable identity to tombstone, and a `name:`
+    // key must never be published: it is immortal in the mirror and would bar
+    // that name from reuse forever.
+    expect(envelope.deleted).toBeUndefined()
+  })
+
+  it('publishes an id tombstone when an id-keyed room is disbanded', async () => {
+    const room = await loadRoom()
+    room.chat.$groupChats.set({
+      Gone: {
+        log: [{ at: 1, from: { kind: 'user', name: 'You' }, id: 'g2', text: 'bye' }],
+        roomId: 'rm-gone-1',
+        watermarks: {}
+      }
+    } as unknown as Record<string, GroupChat>)
+
+    await room.view.disbandGroupChat('Gone', [])
+    await drain(() => room.gateway.rpcFor('profiles.configure').length < 1, 50)
+
+    const configure = room.gateway.rpcFor('profiles.configure').at(-1)
+
+    const envelope = (configure?.params.ui_meta as Record<string, { deleted?: Record<string, number> }>)[
+      'hermes-bots-groups'
+    ]
+
+    expect(envelope.deleted?.['id:rm-gone-1']).toBeGreaterThan(0)
+    expect(envelope.deleted?.['name:Gone']).toBeUndefined()
   })
 
   it('outlives a gateway mirror that missed the tombstone push (#105275)', async () => {

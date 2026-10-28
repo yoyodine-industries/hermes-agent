@@ -1509,6 +1509,12 @@ DEFAULT_CONFIG = {
         # `skills_list` because nobody loaded them for 30 days surprised people (57 gone in one
         # startup tick). true = built-ins age out like agent-created skills.
         "prune_builtins": False,
+        # Never archive bytes a git repo tracks. ON by default and structural (the predicate is
+        # git-tracked-ness, not a path allow-list): on 2026-10-15 a pure-time pass archived 8
+        # skills out of ~/.hermes/skills/yoyodine — a git checkout — as an undeclared deletion
+        # in a repo nobody re-reads (card t_4c38630b). false lets ONE deliberate archive through
+        # (the deletion is then recorded in the mutation ledger with its repo and tracked count).
+        "protect_git_tracked": True,
         # TTL purge of skills/.archive/: 0 = never; > 0 lets the explicit `hermes curator purge`
         # delete older archived skills (never automatic; logged in the ledger).
         "archive_ttl_days": 0,
@@ -1930,6 +1936,22 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Lane-fair spawn allocation (ruling t_b2865b89): the ready lane is walked in
+        # three passes — designated reach, lane reach, fill — so a lane with ready work
+        # and no running work is reached within ceil(L / budget) ticks instead of
+        # waiting behind whichever lane filed the highest cards. False = the plain
+        # ``priority DESC, created_at ASC`` walk (byte-identical to pre-fairness).
+        "lane_fair_spawn": True,
+        # Slots the designated tranche (priority >= TRANCHE_FLOOR) may NOT take while
+        # spawnable ordinary ready work waits: the tier can hold at most
+        # ``budget - designated_pool_reserve`` slots. 0 = unbounded tranche precedence
+        # (the pre-fairness tier behaviour).
+        "designated_pool_reserve": 1,
+        # Slot recycling (ruling t_b2865b89 §4): seconds stamped onto a card that carries
+        # no ``max_runtime_seconds`` AT CLAIM TIME, so every running slot stays reapable by
+        # ``enforce_max_runtime`` instead of a NULL cap holding it forever. A card's own
+        # value (including an explicit 0 = unlimited) always wins. 0 disables the stamp.
+        "default_max_runtime_seconds": 7200,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
@@ -1961,10 +1983,32 @@ DEFAULT_CONFIG = {
         # error reply (reason 'queued_expired') so a DM can't land hours late as a zombie. 0 = no
         # drain-time expiry (the 6h stale-artifact sweep still applies).
         "envelope_ttl_seconds": 900,
-        # How long a second delivery into a busy target profile queues behind the current turn
-        # before failing with a structured 'target_busy' error. Deliveries are serialized per
-        # profile with a cross-process file lock.
+        # How long a synchronous send call may block trying to run the delivery turn before
+        # returning result "receipt" (the message is durably queued, not lost).
+        "receipt_after_seconds": 15,
+        # Durable receiver-side delivery queue (tools/bot_delivery_queue.py). A busy target's
+        # delivery is queued and retried by the receiver — reported to the sender as result
+        # "receipt", never a failure (this removes the target_busy retry storm).
+        "delivery_queue_ttl_seconds": 1800,
+        "delivery_queue_max_per_profile": 32,
+        "delivery_queue_max_per_sender": 8,
+        "delivery_retry_base_seconds": 2,
+        "delivery_sweep_seconds": 30,
+        "delivery_max_turn_attempts": 3,
+        "delivery_probe_base_seconds": 0.5,
+        "delivery_probe_max_seconds": 2.0,
+        "delivery_probe_jitter": 0.2,
+        "lease_probe_seconds": 2,
+        "dedup_window_seconds": 900,
+        # Remaining meaning of turn_wait_seconds: the synchronous wait for a local delivery turn
+        # lock when no caller budget (X-Hermes-Wait-Seconds) is passed. Not repurposed to 1800.
         "turn_wait_seconds": 120,
+    },
+    # Peer bot-to-bot messaging (hermes peer dm/run). dm_wait_seconds is the optional client poll
+    # budget (CLI --wait): how long a send call may block polling a receipt before returning
+    # result "unknown". Default 600 s (was the DM_TIMEOUT_S module constant).
+    "peer": {
+        "dm_wait_seconds": 600,
     },
     "code_execution": {  # execute_code settings (programmatic tool calls).
         # project = run in the session cwd with the active venv/conda python so project deps and
@@ -2284,14 +2328,21 @@ DEFAULT_CONFIG = {
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,
-        # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
-        # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
-        # deleted AND freelist/page_count > 25%.
-        # SQLite does not reclaim disk space on DELETE — freed pages are just reused on subsequent INSERTs —
-        # so without VACUUM the file stays bloated even after pruning. See #54189.
+        # Reclaim space after a prune that deleted rows (SQLite never reclaims disk on DELETE).
+        # A store NOT already in auto_vacuum=INCREMENTAL is converted ONCE (the only full
+        # rewrite this path ever issues); every later pass drains bounded
+        # `PRAGMA incremental_vacuum(N)` chunks, holding the write lock for tens of ms each
+        # instead of for a whole multi-GB rewrite. See #54189 and card t_f8db44f6.
         "vacuum_after_prune": True,
-        # Minimum days between VACUUM rewrites; pruning keeps its normal cadence.
-        "min_vacuum_interval_days": 30,
+        # Minimum days between reclaim passes; pruning keeps its normal cadence. 1 = every day
+        # auto-maintenance runs. The pass is bounded (budgets below), so cadence is the lever.
+        "min_vacuum_interval_days": 1,
+        # Pages bound handed to each `PRAGMA incremental_vacuum(N)` chunk.
+        "vacuum_chunk_pages": 512,
+        # Per-pass ceiling on pages returned to the file system (~16 MiB at 4 KiB pages).
+        "vacuum_max_pages_per_pass": 4096,
+        # Per-pass wall-clock ceiling in seconds; the pass stops here even mid-freelist.
+        "vacuum_max_seconds_per_pass": 5.0,
         # Minimum hours between auto-maintenance runs (tracked in state.db state_meta, shared across
         # processes).
         "min_interval_hours": 24,

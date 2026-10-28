@@ -86,6 +86,13 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     skills_audit.add_argument("name", nargs="?", help="Specific skill to audit (default: all)")
     _flag(skills_audit, "--deep", help="Run AST-level analysis on Python files (opt-in diagnostic)")
 
+    # `scan` is the on-demand face of the load-time quarantine: the same scanner, the same
+    # source label, so its verdict is the verdict that decided whether the skill loads.
+    skills_scan = skills_subparsers.add_parser(
+        "scan", help="Scan a skill/tree with the load-time scanner (project skills by default)")
+    skills_scan.add_argument("path", nargs="?", default=None,
+        help="Skill directory or a tree of them (default: this checkout's project skill dirs)")
+
     skills_uninstall = skills_subparsers.add_parser(
         "uninstall", help="Remove a hub-installed skill")
     skills_uninstall.add_argument("name", help="Skill name to remove")

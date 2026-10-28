@@ -54,7 +54,34 @@ const GROUP_CHAT_SYNC_MESSAGES = 16
 const GROUP_CHAT_SYNC_TEXT_CHARS = 1200
 const GROUP_CHAT_SYNC_TRUNCATION_MARK = '… [truncated]'
 const GROUP_CHAT_SYNC_IMAGE_CHARS = 24000
+// Ceiling on durable tombstones carried in one publish.
+const GROUP_CHAT_SYNC_TOMBSTONES = 64
 let groupChatSyncTimer: ReturnType<typeof setTimeout> | null = null
+
+/** The tombstones a publish may emit: `id:` keys only.
+ *
+ *  A `name:` tombstone is a permanent lie. Legacy (pre-roomId) rooms are keyed
+ *  by display name and carry no identity, so every reader applies the
+ *  tombstone to whatever now holds that name — and a recreated room starts at
+ *  syncRevision 0, so the tombstone always outranks it. Worse, each publish
+ *  writes the union of remote and local `deleted` maps back, so one name key
+ *  survives every mirror, forever: the name can never be reused, and a room
+ *  remade under it is deleted seconds after creation (2026-10-24 incident).
+ *
+ *  So the read path keeps honouring `name:` keys from older mirrors — that is
+ *  the only compat they are entitled to — and nothing republishes them. An
+ *  id-keyed tombstone needs none of that licence: it names one room, and a
+ *  recreate mints a fresh id, so it can never be misapplied. */
+function groupChatPublishableTombstones(
+  deleted: Record<string, number> = {}
+): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(deleted)
+      .filter(([key]) => key.startsWith('id:'))
+      .sort(([, left], [, right]) => Number(right || 0) - Number(left || 0))
+      .slice(0, GROUP_CHAT_SYNC_TOMBSTONES)
+  )
+}
 
 /** One room inside the bounded ui_meta projection: a compacted log plus the
  *  identity fields, without any of `GroupChat`'s runtime/orchestration state. */
@@ -285,7 +312,18 @@ export function groupChatSyncSnapshot(
   const ranked = Object.entries(all || {})
     // Empty runtime tombstones are used to stop an in-flight room after
     // disband. They are not real rooms and must never reappear on mobile.
-    .filter(([, room]) => room && Array.isArray(room.log) && room.log.length > 0)
+    // A room the user JUST made has an empty log too — publishing only rooms
+    // that already carry a message meant a new room never reached the mirror
+    // until someone spoke in it, so the room they had just created was simply
+    // not there (2026-10-24). A seated roster is what makes an empty room a
+    // real one; a husk left by a disband carries no members and stays out.
+    .filter(
+      ([, room]) =>
+        room &&
+        Array.isArray(room.log) &&
+        !room.tombstone &&
+        (room.log.length > 0 || (Array.isArray(room.members) && room.members.length > 0))
+    )
     .sort(([, left], [, right]) => {
       const leftAt = Number(left.log[left.log.length - 1]?.at || 0)
       const rightAt = Number(right.log[right.log.length - 1]?.at || 0)
@@ -294,12 +332,10 @@ export function groupChatSyncSnapshot(
     })
 
   const rooms: Record<string, GroupChatSyncRoom> = {}
+  // Pre-trim entry counts, so `omitted` stays truthful after the fit.
+  const totalEntries = new Map<string, number>()
 
-  const boundedDeleted = Object.fromEntries(
-    Object.entries(deleted)
-      .sort(([, left], [, right]) => Number(right || 0) - Number(left || 0))
-      .slice(0, 64)
-  )
+  const boundedDeleted = groupChatPublishableTombstones(deleted)
 
   const envelope: GroupChatSyncSnapshot = {
     version: 3,
@@ -393,23 +429,99 @@ export function groupChatSyncSnapshot(
 
     const key = groupChatRoomKey(name, room)
     rooms[key] = compact
-    noteGroupChatSyncOmitted(compact, room.log.length)
+    totalEntries.set(key, room.log.length)
+  }
 
-    while (compact.log.length > 1 && groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
-      compact.log.shift()
-      noteGroupChatSyncOmitted(compact, room.log.length)
+  groupChatFitSyncEnvelope(rooms, totalEntries, envelope)
+
+  return envelope
+}
+
+/** Fit the envelope into ONE budget, at the writer.
+ *
+ *  Shed log entries from every room, never the rooms themselves. The previous
+ *  fit deleted whole rooms: it trimmed each room to a single entry and then
+ *  removed whatever still did not fit — newest-room-last, so the room the user
+ *  had just created was the one deleted, on every publish (2026-10-24: rooms
+ *  vanished from every mirror seconds after creation while the payload sat at
+ *  46.7 KB of a 48 KB budget, almost all of it one room's history).
+ *
+ *  Order: images, then the longest log, entry by entry, down to zero; then
+ *  member rows on the oldest rooms. Dropping a room is the absolute last
+ *  resort and cannot be reached while the skeletons alone fit the budget —
+ *  and this ceiling sits below the gateway's own, so an over-budget write
+ *  would be dropped wholesale instead of losing one room. */
+function groupChatFitSyncEnvelope(
+  rooms: Record<string, GroupChatSyncRoom>,
+  totalEntries: Map<string, number>,
+  envelope: GroupChatSyncSnapshot
+) {
+  const size = () => groupChatGatewayJsonSize(envelope)
+  const fits = () => size() <= GROUP_CHAT_SYNC_MAX_BYTES
+
+  if (fits()) {
+    for (const [key, room] of Object.entries(rooms)) {
+      noteGroupChatSyncOmitted(room, totalEntries.get(key) || room.log.length)
     }
 
-    if (compact.image && groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
-      delete compact.image
+    return
+  }
+
+  for (const room of Object.values(rooms)) {
+    if (fits()) {
+      break
     }
 
-    if (groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
+    delete room.image
+  }
+
+  for (;;) {
+    if (fits()) {
+      break
+    }
+
+    let heaviest: GroupChatSyncRoom | null = null
+    let heaviestSize = -1
+
+    // Shed from the room that actually costs the bytes, not from whichever
+    // room happens to be first: a small room must not lose its history
+    // because another room is fat.
+    for (const room of Object.values(rooms)) {
+      if (room.log.length === 0) {
+        continue
+      }
+
+      const roomSize = groupChatGatewayJsonSize(room)
+
+      if (roomSize > heaviestSize) {
+        heaviest = room
+        heaviestSize = roomSize
+      }
+    }
+
+    if (!heaviest) {
+      break
+    }
+
+    heaviest.log.shift()
+  }
+
+  for (const room of Object.values(rooms)) {
+    if (fits()) {
+      break
+    }
+
+    delete room.members
+  }
+
+  for (const [key, room] of Object.entries(rooms)) {
+    noteGroupChatSyncOmitted(room, totalEntries.get(key) || room.log.length)
+
+    // Unreachable while the skeletons alone fit; see the note above.
+    if (!fits()) {
       delete rooms[key]
     }
   }
-
-  return envelope
 }
 
 function groupChatSyncEntryKey(entry: GroupMessage) {
@@ -627,11 +739,7 @@ function groupChatSyncEnvelope(
   rooms: Record<string, GroupChatSyncRoom>,
   deleted: Record<string, number> = {}
 ): GroupChatSyncSnapshot {
-  const boundedDeleted = Object.fromEntries(
-    Object.entries(deleted)
-      .sort(([, left], [, right]) => Number(right || 0) - Number(left || 0))
-      .slice(0, 64)
-  )
+  const boundedDeleted = groupChatPublishableTombstones(deleted)
 
   const envelope: GroupChatSyncSnapshot = {
     version: 3,
@@ -874,9 +982,20 @@ export function mergeRemoteGroupChatSnapshotIntoRooms(
       // legitimate higher-revision recreation to protect.
       delete rooms[targetName]
     } else {
+      const target = rooms[targetName]
       const deletedRevision = Math.max(0, Number(deletedAt || 0))
 
-      if (deletedRevision >= Number(rooms[targetName]?.syncRevision || 0)) {
+      // A `name:` tombstone remembers a LEGACY room — one minted before room
+      // ids existed. A local room carrying a roomId is provably not that
+      // room (a recreate mints a fresh id), and its syncRevision restarts at
+      // 0, so the revision gate below can never outrank the tombstone. This
+      // is how one stale mirror's immortal name tombstone used to delete the
+      // room the user had just remade under the same name.
+      if (target?.roomId) {
+        continue
+      }
+
+      if (deletedRevision >= Number(target?.syncRevision || 0)) {
         delete rooms[targetName]
       }
     }

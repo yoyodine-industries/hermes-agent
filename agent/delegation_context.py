@@ -74,7 +74,33 @@ def is_dispatcher_owned_worker_context() -> bool:
     return not (is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get())
 
 
-def explicit_board_intent_is_pinned() -> bool:
+def board_name_resolves(board: str) -> bool:
+    """Whether *board* names a REGISTERED board — the question the CLI's own ``--board``
+    validation asks before it refuses ``board '<x>' does not exist``.
+
+    ``default`` always resolves; any other slug resolves iff a ``board.json`` is registered under
+    it (the registry probe, never the store path — a pin legitimately overrides that), and a
+    malformed slug resolves nowhere. An error that is NOT an answer to the question (the registry
+    cannot be imported at all) answers ``True``, so a caller asking "must this still go through the
+    pin?" keeps its pin: an isolation pin is never dropped blind.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+
+        slug = kb._normalize_board_slug(board)
+    except ValueError:
+        return False
+    except Exception:  # health: allow BLE001 -- an unreadable registry is not an answer to "does this name resolve"; the caller keeps its pin
+        return True
+    if not slug:
+        return False
+    try:
+        return slug == kb.DEFAULT_BOARD or kb.board_exists(slug)
+    except Exception:  # health: allow BLE001 -- same rule: an unreadable registry keeps the pin
+        return True
+
+
+def explicit_board_intent_is_pinned(board: str | None = None) -> bool:
     """Whether an explicit kanban ``board=`` argument must still resolve through
     the dispatcher-injected env pins (``HERMES_KANBAN_DB`` & friends) rather than
     its own board directory.
@@ -86,7 +112,15 @@ def explicit_board_intent_is_pinned() -> bool:
     pinned path / fenced root — an explicit board that resolved elsewhere would
     also escape that fence. Outside these fences an explicit board is the
     caller's own intent and wins.
+
+    A name that resolves to NO board is not a pin violation, so it is not pinned (ruling
+    t_ecd51c9c): there is nothing to pin and no board's data to protect. That boundary protects
+    data on boards that EXIST; refusing an unresolved name here would refuse one layer earlier
+    than the store resolution the pin exists to protect, and re-mask the CLI's honest
+    ``board '<x>' does not exist`` — teaching operators that a typo is a permission problem.
     """
+    if board and not board_name_resolves(board):
+        return False
     if _DELEGATED_CHILD_CONTEXT.get():
         return True
     if os.environ.get(DELEGATED_CHILD_ENV_MARKER):
@@ -161,6 +195,57 @@ def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
     except ValueError:
         return False
     return True
+
+
+# --- the ONE reviewed exception to the child-context Kanban write fence -------------------------
+#
+# WHY IT EXISTS. A `hermes peer dm` refusal is how a lane learns that the control channel
+# between lanes is broken, and the context where it breaks is a DISPATCHER-SPAWNED WORKER:
+# that worker's CLI inherits this marker AND descends from the live claim, so every board
+# write is refused. Measured 2026-10-14 (card t_703af8d1): the refusal report printed
+# "NO CARD FILED (the board write failed)" -- mis-attributing a fenced-context refusal as an
+# I/O failure -- and the report of a fleet-wide DM outage vanished into a stderr line nobody
+# reads. That is the exact failure the report existed to end.
+#
+# WHY THIS WRITE IS SAFE FROM A CHILD CONTEXT. The fence exists so a worker cannot MOVE the
+# estate it holds a claim on -- re-rank it, complete its own card, dispatch itself, tear a
+# board down. A refusal report is none of that: it is a NEW row on the OPS board, addressed
+# to a lane other than the filer, idempotency-keyed so a repeat is a no-op, and it mutates
+# no existing row. It is the REPORT of a failure, never an act on the estate.
+#
+# HOW IT IS KEPT NARROW. Not a fence flag, not an environment variable (a worker's shell can
+# strip either): a ContextVar a caller MUST set explicitly, for one of the NAMED purposes
+# below, around the single write. The write door logs every use at WARNING, so an abuse is
+# visible rather than silent, and a purpose that is not named here is refused AT THE SEAM.
+CHILD_KANBAN_WRITE_PURPOSES: tuple[str, ...] = ("peer-refusal-report",)
+_CHILD_KANBAN_WRITE_PURPOSE: ContextVar[str] = ContextVar(
+    "hermes_child_kanban_write_purpose", default=""
+)
+
+
+@contextmanager
+def child_kanban_write_allowance(purpose: str) -> Iterator[str]:
+    """Allow ONE named child-context Kanban write (the reviewed exception above).
+
+    Set only around the single filing it is granted for; a purpose not in
+    :data:`CHILD_KANBAN_WRITE_PURPOSES` is refused here, so the exception cannot be
+    widened by a caller that merely wants a write.
+    """
+    if purpose not in CHILD_KANBAN_WRITE_PURPOSES:
+        raise ValueError(
+            f"unknown child-context kanban write purpose {purpose!r}; "
+            f"named purposes: {', '.join(CHILD_KANBAN_WRITE_PURPOSES)}"
+        )
+    token = _CHILD_KANBAN_WRITE_PURPOSE.set(purpose)
+    try:
+        yield purpose
+    finally:
+        _CHILD_KANBAN_WRITE_PURPOSE.reset(token)
+
+
+def child_kanban_write_purpose() -> str:
+    """The purpose of the allowance in force, or ``""`` -- in which case the fence holds."""
+    return str(_CHILD_KANBAN_WRITE_PURPOSE.get() or "")
 
 
 # --- provenance arm (ruling t_fcf7a321, Decision 1) --------------------------------------------

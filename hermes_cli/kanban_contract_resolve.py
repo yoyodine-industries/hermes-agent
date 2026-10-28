@@ -1,11 +1,12 @@
 """Resolve a card's completion contract against the target repo's required checks.
 
 Card t_b58332a4. A card born with an ``OWNER/REPO`` (or exact-PR-URL) completion
-contract can never satisfy the acceptance gate when that repository requires no
-status checks: ``kanban_pr_acceptance.collect_acceptance`` returns
-``classification=missing`` with ``required=[]``, so ``complete_task`` parks the
-card ``blocked``/``capability`` with its work already done, and nothing a worker
-does can change it. Such a card must never be BORN on that contract.
+contract must be CLOSABLE. When that repository requires no status checks the
+acceptance gate has nothing to wait on -- it used to answer ``classification=missing``
+with ``required=[]`` and park the card ``blocked``/``capability`` with the work already
+done. Since the ruling of 2026-10-18 (card ``t_9082c751``) the gate accepts the PR's
+MERGED state as the evidence instead, so such a card is satisfiable as filed; the
+resolver no longer re-scopes it and only records what it measured.
 
 The one moment every filing surface reaches is ``kanban_db.create_task``; this
 module answers THERE whether the declared repository actually requires checks,
@@ -16,11 +17,10 @@ rules API, through the same ``gh`` transport the acceptance gate uses), never an
 inference from the card's text or from another card's contract. Four verdicts:
 
 * ``checks``  — the repository requires at least one status check: keep it.
-* ``none``    — the repository is readable and requires none: fall back.
+* ``none``    — the repository is readable and requires none: keep it, and record
+  that MERGE STATE is the acceptance evidence.
 * ``gated``   — the repository is readable but its checks APIs are gated (the
-  plan/user cannot consult them): treat it as "no required checks" and SAY SO in
-  the reason, because the alternative is leaving the card on a contract no worker
-  action can satisfy.
+  plan/user cannot consult them): keep it, and SAY SO in the reason.
 * ``unverifiable`` — the repository itself cannot be read at all. That is an
   access gap, which the acceptance gate already surfaces as a fixable ``auth``
   cause, so the declaration is KEPT: stripping the CI gate on an invisible repo
@@ -30,17 +30,18 @@ inference from the card's text or from another card's contract. Four verdicts:
 (``needs_repository_checks`` -> False), so a card carrying a DEPLOYED unit never
 reaches this resolver and its deploy-proof gate is never touched. Only an
 ``OWNER/REPO`` / PR-URL declaration — a repository-CI sign-off intent — is
-resolved, and its only fallback is ``local-only``.
+resolved, and since the ruling of 2026-10-18 (card ``t_9082c751``) every verdict
+KEEPS the declaration: the only thing this module still changes is what it
+records.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from urllib.parse import quote
 
-# The fallback a repo/PR declaration takes when the repository requires no checks.
-# ``landed`` is deliberately NOT a candidate here: a card carrying a deployed unit
-# declares ``landed``, and such a declaration never enters this path -- so the
-# deploy-proof gate cannot be stripped by a fallback.
+# Kept for readers that still name the old downgrade target. It is no longer applied:
+# a repository that requires no checks keeps the declaration it was filed on and is
+# satisfied by the PR's MERGED state (ruling 2026-10-18, card ``t_9082c751``).
 FALLBACK_CONTRACT = "local-only"
 
 
@@ -49,14 +50,15 @@ class ContractResolution:
     """What a declared contract resolves to at the set seam.
 
     ``contract`` is the value the card should carry (equal to ``declared`` when
-    nothing moved); ``reason`` is the measured, credential-free explanation and
-    is populated only when ``changed``.
+    nothing moved); ``reason`` is the measured, credential-free explanation, and it
+    is populated whenever ``state`` is not ``checks`` -- a KEPT declaration still
+    records what was measured, because that is the fact the next reader needs.
     """
 
     declared: str
     contract: str
     changed: bool
-    state: str = "checks"          # "checks" | "none" | "unknown"
+    state: str = "checks"          # "checks" | "none" | "gated" | "unverifiable"
     repo: str | None = None
     branch: str | None = None
     reason: str | None = None
@@ -160,9 +162,16 @@ def required_checks_state(repo: str, *, profile_home: str | None = None):
 def resolve_contract_at_set(contract: str, *, profile_home: str | None = None) -> ContractResolution:
     """Resolve a declared contract against the target repo's required checks.
 
-    Returns the contract the card should carry plus, when it moved, the measured
-    reason.  Inert for every contract that is not repo/PR backed (``local-only``,
-    ``landed``) and for a contract with no parseable repository.
+    Returns the contract the card should carry plus the measured reason.  Inert for
+    every contract that is not repo/PR backed (``local-only``, ``landed``) and for a
+    contract with no parseable repository.
+
+    A repository that requires no checks does NOT re-scope the card any more: the
+    declaration is KEPT and the measured state is recorded (``changed=False``, with
+    ``reason`` populated), because ``kanban_pr_acceptance`` now accepts the PR's
+    MERGED state as the evidence. Downgrading to ``local-only`` here was one half of
+    the mutual dead end of card ``t_9082c751``: the downgrade left a published card
+    on a contract its own publication refuted.
     """
     from hermes_cli import kanban_pr_acceptance as _accept
 
@@ -181,14 +190,13 @@ def resolve_contract_at_set(contract: str, *, profile_home: str | None = None) -
     if state == "none":
         reason = (
             f"{repo} requires no status checks on {branch or 'its default branch'} "
-            f"({detail}); a repository-CI contract there can never clear, so the card "
-            f"was filed with completion_contract={FALLBACK_CONTRACT}"
+            f"({detail}); the declaration is KEPT -- a PR contract there is satisfied by "
+            f"the PR's MERGED state"
         )
     else:  # gated
         reason = (
-            f"could not determine required checks for {repo} ({detail}); treating the "
-            f"repository as requiring no checks and filing the card with "
-            f"completion_contract={FALLBACK_CONTRACT}"
+            f"could not determine required checks for {repo} ({detail}); the declaration is "
+            f"KEPT -- a PR contract there is satisfied by the PR's MERGED state"
         )
-    return ContractResolution(contract, FALLBACK_CONTRACT, True, state, repo, branch, reason)
+    return ContractResolution(contract, contract, False, state, repo, branch, reason)
 

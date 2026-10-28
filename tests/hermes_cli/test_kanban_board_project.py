@@ -7,6 +7,7 @@ metadata round-trip and the create-time inheritance.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,6 +20,19 @@ if str(_WORKTREE) not in sys.path:
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import projects_db as pdb
+
+
+def _repo(path):
+    """A real git repo: a project's primary must be one to anchor a worktree.
+
+    t_e5ff985b: a plain folder as a project primary used to produce a card born with an
+    impossible ``<folder>/.worktrees/<id>``; it is now refused at creation, so these
+    cases (which assert the path/branch derivation) must register a real repo.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main", str(path)],
+                   check=True, capture_output=True, text=True)
+    return path
 
 
 @pytest.fixture
@@ -58,8 +72,7 @@ def test_create_board_accepts_project_id(fresh_home):
 
 
 def test_create_task_inherits_board_project(fresh_home, tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _repo(tmp_path / "repo")
     with pdb.connect_closing() as pconn:
         proj_id = pdb.create_project(pconn, name="Widget", primary_path=str(repo))
 
@@ -75,6 +88,8 @@ def test_create_task_inherits_board_project(fresh_home, tmp_path):
 def test_create_task_explicit_project_beats_board(fresh_home, tmp_path):
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
+    _repo(tmp_path / "a")
+    _repo(tmp_path / "b")
     with pdb.connect_closing() as pconn:
         board_proj = pdb.create_project(pconn, name="BoardProj", primary_path=str(tmp_path / "a"))
         task_proj = pdb.create_project(pconn, name="TaskProj", primary_path=str(tmp_path / "b"))
@@ -92,8 +107,7 @@ def test_create_task_explicit_scratch_beats_board(fresh_home, tmp_path):
     """#106342: every surface (CLI --workspace scratch, dashboard workspace_kind,
     tool) funnels here; an explicit scratch on a project-scoped board must stay
     scratch, while an omitted kind still inherits the project worktree."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _repo(tmp_path / "repo")
     with pdb.connect_closing() as pconn:
         proj_id = pdb.create_project(pconn, name="Widget", primary_path=str(repo))
 

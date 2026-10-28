@@ -28,7 +28,7 @@ from gateway.restart import (
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
-from gateway.run_shutdown_session_end import GatewaySessionEndMixin
+from gateway.run_shutdown_workflow import GatewayWorkflowCensusMixin
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
@@ -169,7 +169,7 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
-class GatewayShutdownMixin(GatewaySessionEndMixin):
+class GatewayShutdownMixin(GatewayWorkflowCensusMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -224,51 +224,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         try:
             return self._running_cron_job_count()
         except Exception:
-            return 0
-
-    def _api_server_hook(self, name: str, *args: Any) -> int:
-        """Call the primary API-server adapter's ``name`` hook, clamped >= 0 (0 when the hook is absent).
-
-        Only the primary API server owns the HTTP listener, so only it is a source of this work.
-        """
-        helper = getattr(getattr(self, "adapters", {}).get(Platform.API_SERVER), name, None)
-        return max(0, int(helper(*args))) if callable(helper) else 0
-
-    def _active_api_run_count(self) -> int:
-        """API-server work that is outside ``_running_agents``."""
-        try:
-            return self._api_server_hook("active_agent_work_count")
-        except Exception:
-            return 0
-
-    def _active_api_worker_count(self) -> int:
-        """API-server executor threads still inside an agent turn (#116535).
-
-        Module-level, like the cron registry above: the handler-side adapter count is already
-        unreachable here (``adapters`` was cleared a phase earlier) and, worse, drops on handler
-        cancellation while the worker thread lives on. Read live at the close gate instead of
-        snapshotting.
-        """
-        try:
-            from gateway.platforms.api_server_runs import api_worker_live_count
-            return max(0, int(api_worker_live_count()))
-        except Exception:
-            return 0
-
-    def _interrupt_api_server_runs(self, reason: str) -> int:
-        """Interrupt API-server agents not in ``_running_agents`` (same set ``_active_api_run_count`` counts)."""
-        try:
-            return self._api_server_hook("interrupt_active_runs", reason)
-        except Exception as exc:
-            logger.debug("Failed interrupting api_server runs during shutdown: %s", exc)
-            return 0
-
-    def _mark_api_runs_shutdown_requested(self) -> int:
-        """Persist the shutdown boundary on API runs before the drain can await."""
-        try:
-            return self._api_server_hook("mark_shutdown_requested")
-        except Exception as exc:
-            logger.debug("Failed marking api_server runs as shutdown-requested: %s", exc)
             return 0
 
     def _active_deferred_agent_worker_count(self) -> int:
@@ -1876,6 +1831,13 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _cron_at_start = self._active_cron_job_count()
         _api_at_start = self._active_api_run_count()
         _deferred_at_start = ctx.deferred_count()
+        # Production workflow runs are none of the three counts above (t_4b9843a4): a yoyoflow
+        # flight launched from a gateway-served turn used to be reaped by a bounce while this
+        # drain reported "0 in-flight cron job(s)". Census it in the same breath, and never wait
+        # on it — a departure is meant to outlive the bounce, and blocking a restart behind a
+        # two-hour flight is exactly what the detach exists to prevent. The count is the LIVE
+        # flights; orphaned `running` rows are named beside it (gateway.run_shutdown_workflow).
+        _wf_at_start, _wf_orphans_start, _wf_fragment_start = self._workflow_census_at_start()
         # Cron floor clamped to the watchdog leash; getattr-guard for bare shutdown-path doubles.
         _cron_drain_cfg = getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT)
         # Under launchd the real leash is launchd's own exit timeout, not our watchdog
@@ -1887,22 +1849,36 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _cron_timeout = resolve_cron_drain_budget(
             timeout, _cron_drain_cfg, watchdog_delay=_cron_leash, elapsed=ctx.elapsed(),
         )
-        if (_cron_at_start or _api_at_start) and _cron_timeout > timeout:
+        if (_cron_at_start or _api_at_start or _wf_at_start) and _cron_timeout > timeout:
             logger.info(
-                "Shutdown drain: %d in-flight cron job(s), %d api_server run(s) — waiting up to "
+                "Shutdown drain: %d in-flight cron job(s), %d api_server run(s), "
+                "%s — waiting up to "
                 "%.0fs for them (cron_drain_timeout=%.0fs, restart_drain_timeout=%.0fs)",
-                _cron_at_start, _api_at_start, _cron_timeout, _cron_drain_cfg, timeout,
+                _cron_at_start, _api_at_start, _wf_fragment_start, _cron_timeout, _cron_drain_cfg, timeout,
+            )
+        elif _wf_at_start or _wf_orphans_start:
+            # No cron/api work to wait on, but production flights are in the air (or the ledger
+            # holds leftovers): say so rather than reporting silence. Flights are NOT waited on
+            # (they must outlive the bounce).
+            logger.info(
+                "Shutdown drain: 0 in-flight cron job(s), 0 api_server run(s), "
+                "%s — not waiting on them (a departure outlives the bounce)",
+                _wf_fragment_start,
             )
         _drain_started_at = time.monotonic()
         ctx.active_agents, ctx.timed_out = await self._drain_active_agents(timeout, _cron_timeout)
         ctx.drain_elapsed = time.monotonic() - _drain_started_at
+        _wf_live_now, _wf_orphans_now = self._workflow_census_now()
         logger.info(
             "Shutdown phase: drain done at +%.2fs (drain took %.2fs, timed_out=%s, active_at_start=%d, "
             "active_now=%d, cron_at_start=%d, cron_now=%d, api_at_start=%d, api_now=%d, "
-            "deferred_at_start=%d, deferred_now=%d)", ctx.elapsed(), ctx.drain_elapsed,
+            "deferred_at_start=%d, deferred_now=%d, workflow_at_start=%d, workflow_now=%d, "
+            "workflow_orphaned=%d)",
+            ctx.elapsed(), ctx.drain_elapsed,
             ctx.timed_out, len(ctx.active_agents), self._running_agent_count(), _cron_at_start,
             self._active_cron_job_count(), _api_at_start, self._active_api_run_count(),
-            _deferred_at_start, ctx.deferred_count(),
+            _deferred_at_start, ctx.deferred_count(), _wf_at_start,
+            _wf_live_now, _wf_orphans_now,
         )
         if ctx.timed_out:
             return
@@ -1918,11 +1894,16 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
     async def _stop_interrupt_remaining_work(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Drain timed out: mark resume_pending, interrupt, settle, kill tool subprocesses, notify cron."""
         from gateway.run import GatewayRunner
+        self._workflow_runs_in_flight()  # initialise the attribution snapshot (pre-sweep)
+        _wf_frag = self._workflow_census_fragment()
         logger.warning(
             "Gateway drain timed out after %.1fs with %d active agent(s), "
-            "%d in-flight cron job(s), %d api_server run(s), and %d deferred agent worker(s); "
+            "%d in-flight cron job(s), %d api_server run(s), %s, "
+            "and %d deferred agent worker(s); "
             "interrupting remaining work.", ctx.drain_elapsed, self._running_agent_count(),
-            self._active_cron_job_count(), self._active_api_run_count(), ctx.deferred_count(),
+            self._active_cron_job_count(), self._active_api_run_count(),
+            _wf_frag,
+            ctx.deferred_count(),
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
@@ -1950,6 +1931,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # Off-loop: the sweep does blocking kills that must not monopolize the event loop (#116327).
         _interrupted_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")
         logger.info("Shutdown phase: post-interrupt tool kill done at +%.2fs", ctx.elapsed())
+        # What the sweep actually reaped gets the bounce as its actor, not a bare SystemExit(143).
+        self._stamp_reaped_workflow_runs(reason)
         # Last window with the transport up (the cron worker's own notice arrives after teardown).
         with _log_suppressed(logging.DEBUG, "Cron interrupt notification failed: %s"):
             # The cron worker whose run we just killed will try to deliver its own "interrupted" notice, but
@@ -2031,6 +2014,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
         await GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
+        # Second attribution pass: a run whose engine took the settle window to die is stamped
+        # here, and re-stamping is a no-op for the ones the first pass already named.
+        self._stamp_reaped_workflow_runs(self._shutdown_interrupt_reason(), settle_s=0.0)
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
         def _reap_aux_clients() -> None:
             # Reap the process-global auxiliary-client cache once at the very end of teardown. Per-turn

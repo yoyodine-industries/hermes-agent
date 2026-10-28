@@ -30,6 +30,7 @@ from hermes_cli.kanban_specify import (
     _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
 )
 from hermes_cli.kanban_specify import _profile_author as _specify_author
+from hermes_cli.kanban_scope import scope_refusal_reason
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +313,14 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    # Deterministic scope gate (hermes_cli.kanban_scope): an OVERSIZE declared
+    # scope is refused — this path fans work out, so an unsized card that is over
+    # the one-turn threshold must be re-scoped by its owner, never dispatched
+    # whole off a single-task reply. The capped drain is what splits it.
+    refusal = scope_refusal_reason(task.body or "")
+    if refusal:
+        return DecomposeOutcome(task_id, False, refusal)
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(

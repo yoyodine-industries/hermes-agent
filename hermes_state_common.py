@@ -289,6 +289,36 @@ SCHEMA_VERSION = 31
 # few MB (#54189). Composes with ``min_vacuum_interval_days``.
 AUTO_VACUUM_MIN_FREELIST_RATIO = 0.25
 
+# ── Bounded incremental reclaim (card t_f8db44f6) ──────────────────────────────
+# A full `VACUUM` is an EXCLUSIVE whole-file rewrite: SQLite holds the single write
+# lock for the whole multi-GB rewrite (seconds to minutes on the stores this host
+# runs), so the maintenance pass that finally runs is enormous and every writer is
+# blocked behind it. The bounded path instead migrates each store ONCE to
+# `PRAGMA auto_vacuum = INCREMENTAL` and then returns space in small
+# `PRAGMA incremental_vacuum(N)` chunks, each its own implicit transaction, so the
+# write lock is held for tens of milliseconds at a time and the pass can stop on a
+# budget.
+# Measured 2026-10-05 on a scratch COPY of a profile store (344 MB -> 127 MB):
+# `PRAGMA auto_vacuum=INCREMENTAL; VACUUM;` = 2.66 s ONCE; then
+# `PRAGMA incremental_vacuum(512)` = 0.023 s. Measured 2026-10-13 on SQLite 3.54.0:
+# one `incremental_vacuum(N)` statement returns ONE page to the file system (the N
+# argument is a bound, not a batch), so the drain loops; each statement is
+# sub-millisecond to ~5 ms of write lock.
+RECLAIM_CHUNK_PAGES = 512           # pages bound passed to each `PRAGMA incremental_vacuum(N)`
+RECLAIM_MAX_PAGES_PER_PASS = 4096   # per-pass ceiling: <= ~16 MiB of writes per store per pass at 4 KiB pages
+RECLAIM_MAX_SECONDS_PER_PASS = 5.0  # per-pass wall-clock ceiling; the pass stops here even mid-freelist
+RECLAIM_MIN_FREELIST_PAGES = 64     # below this many free pages a bounded pass is not worth opening a txn for
+# Cooperative yield between chunks. One `PRAGMA incremental_vacuum(N)` statement returns ONE page
+# (measured, SQLite 3.54.0), so a large freelist is drained by many back-to-back statements; a loop
+# that re-acquires the write lock immediately starves a competing writer for the WHOLE pass (measured
+# 2026-10-13: a 839-chunk drain starved a competing writer for 428 ms, worse than the 46 ms the
+# old full VACUUM of the same store cost it). This sleep hands the lock over between chunks.
+RECLAIM_CHUNK_YIELD_MS = 1.0
+# The ONE-TIME migration is the only `VACUUM` the automatic path may issue. It is an
+# exclusive rewrite, so it keeps AUTO_VACUUM_MIN_FREELIST_RATIO as its admission gate:
+# below it a rewrite costs more I/O than it returns.
+RECLAIM_MIGRATE_MIN_FREELIST_RATIO = AUTO_VACUUM_MIN_FREELIST_RATIO
+
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
 # freely on open (so future migrations always land); the FTS *layout* only

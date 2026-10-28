@@ -112,7 +112,7 @@ class BulkActionRefused(ValueError):
     def __init__(self, cause: str, message: str, *, remedy: str, facts: Optional[dict] = None):
         self.cause = cause
         self.remedy = remedy
-        self.facts: Dict[str, Any] = dict(facts or {})
+        self.facts: dict[str, Any] = dict(facts or {})
         super().__init__(f"{REFUSAL_PREFIX} {cause}: {message} Required: {remedy}")
 
 
@@ -124,7 +124,7 @@ def _csv_ids(value: Optional[Sequence[str]]) -> str:
 
 #: verb -> (is_bulk(params) -> bool, scope(params) -> canonical string). The scope IS the binding:
 #: the digest an approval names is computed from it, so a parameter change is a different action.
-BULK_SURFACES: Dict[str, Dict[str, Callable]] = {
+BULK_SURFACES: dict[str, dict[str, Callable]] = {
     "gc": {
         "bulk": lambda p: True,
         "scope": lambda p: (
@@ -174,7 +174,7 @@ for _verb in ("block", "schedule", "promote"):
     }
 
 #: ``hermes kanban boards …`` sub-actions that move or destroy a whole board.
-BULK_BOARD_ACTIONS: Dict[str, Dict[str, Callable]] = {
+BULK_BOARD_ACTIONS: dict[str, dict[str, Callable]] = {
     "rm": {"bulk": lambda p: True,
            "scope": lambda p: f"slug={p.get('slug')} "
                               f"mode={'DELETE' if p.get('delete') else 'archive'}"
@@ -189,7 +189,7 @@ BULK_BOARD_ACTIONS: Dict[str, Dict[str, Callable]] = {
 
 #: Every verb this guard can gate (CLI actions). Kept as one tuple so a test can assert the
 #: estate's mutating-verb fences are never WIDER than this classification without failing.
-GATED_VERBS: Tuple[str, ...] = tuple(BULK_SURFACES) + tuple(
+GATED_VERBS: tuple[str, ...] = tuple(BULK_SURFACES) + tuple(
     f"boards-{a}" for a in BULK_BOARD_ACTIONS
 )
 
@@ -243,10 +243,10 @@ def audit_path() -> Path:
     return ledger_dir() / AUDIT_FILENAME
 
 
-def read_ledger(path: Optional[Path] = None) -> List[dict]:
+def read_ledger(path: Optional[Path] = None) -> list[dict]:
     """Every ledger row, oldest first. A malformed line is skipped, never fatal."""
     p = path or ledger_path()
-    rows: List[dict] = []
+    rows: list[dict] = []
     try:
         text = p.read_text(encoding="utf-8")
     except OSError:
@@ -319,7 +319,7 @@ def record_approval(
     })
 
 
-def bundle_for(digest: str, path: Optional[Path] = None) -> List[dict]:
+def bundle_for(digest: str, path: Optional[Path] = None) -> list[dict]:
     return [row for row in read_ledger(path) if row.get("digest") == digest]
 
 
@@ -336,7 +336,7 @@ def _apr_numeric(ref: str) -> Optional[int]:
     return int(digits) if digits else None
 
 
-def resolve_apr(apr_ref: str, *, db_path: Optional[str] = None) -> Dict[str, Any]:
+def resolve_apr(apr_ref: str, *, db_path: Optional[str] = None) -> dict[str, Any]:
     """Resolve an APR row for the ASK, at FILING time (the gate itself never calls out).
 
     Returns ``{"ok": bool, "status": str, "decided_at": str, "title": str}``. A caller that cannot
@@ -431,10 +431,10 @@ def _run_deployed_preimage(store_path: Path) -> dict:
     )
 
 
-def verified_snapshots(root: Optional[Path] = None) -> List[dict]:
+def verified_snapshots(root: Optional[Path] = None) -> list[dict]:
     """Every verified preimage receipt on this host, newest first."""
     base = (root or snapshot_root()) / "preimages"
-    out: List[dict] = []
+    out: list[dict] = []
     try:
         entries = sorted(base.glob("*.json"))
     except OSError:
@@ -551,7 +551,7 @@ def evaluate(
     is skipped, while the destination claim, the verified snapshot and the ledger/audit record
     are all kept. The caller has already refused on the marker/current-board/live-claim gates.
     """
-    facts: Dict[str, Any] = {"board": board, "verb": verb, "scope": scope}
+    facts: dict[str, Any] = {"board": board, "verb": verb, "scope": scope}
     if store_path is not None:
         assert_write_destination(store_path, board=board, run_root=run_root)
         facts["destination"] = str(Path(store_path).expanduser().resolve())
@@ -627,7 +627,7 @@ def evaluate(
     facts["approach"] = approaches.pop()
 
     approvals = [r for r in rows if r.get("role") == "approval"]
-    seen: List[str] = []
+    seen: list[str] = []
     for row in approvals:
         actor = str(row.get("actor") or "")
         if actor == AUTHORIZED_ASK_PROFILE:
@@ -781,7 +781,7 @@ def assert_bulk_approved(
     return facts
 
 
-def _estate_state(board: str) -> "tuple[bool, str]":
+def _estate_state(board: str) -> tuple[bool, str]:
     """``(declares_estate, why)`` for *board*'s OWN ``board.json``.
 
     The DECLARATION is read through ``kanban_db.read_board_metadata`` — one reader, never
@@ -936,6 +936,22 @@ def _append_audit(board: str, verb: str, scope: str, outcome: str, cause: str, *
 
 # --- the CLI seam ----------------------------------------------------------------------------
 
+def bulk_ids_from_args(args: Any) -> list[str]:
+    """The cards a ``--ids`` verb ACTS ON: the required positional ``task_id`` plus ``--ids`` extras.
+
+    ONE definition, both callers: the CLI handler (``kanban._bulk_ids``) and the scope builder
+    (:func:`params_from_args`) read this, so the gate can never bind a narrower set than the verb
+    mutates. It used to be defined twice and drifted: the scope took ``--ids`` alone while the
+    handler acted on ``[task_id] + ids``, so ``promote a --ids b`` moved TWO cards while classifying
+    as a non-bulk single-card action (defect card ``t_6d0e6cdb``).
+
+    Order is preserved, ``task_id`` first, duplicates dropped: the effective set is the DISTINCT
+    cards acted on, so ``block a --ids a`` is one card (and stays ungated at cardinality 1).
+    """
+    raw = [getattr(args, "task_id", None), *(getattr(args, "ids", None) or ())]
+    return list(dict.fromkeys(i for i in raw if i))
+
+
 def params_from_args(action: str, args: Any) -> dict:
     """Extract the parameters the canonical scope is rendered from, for one CLI action."""
     get = lambda name, default=None: getattr(args, name, default)  # noqa: E731
@@ -948,7 +964,8 @@ def params_from_args(action: str, args: Any) -> dict:
         return {"all_triage": bool(get("all_triage")), "tenant": get("tenant"),
                 "ids": [get("task_id")] if get("task_id") else []}
     if action in ("block", "schedule", "promote"):
-        return {"ids": list(get("ids") or ())}
+        # The positional task_id counts: it is one of the cards the verb mutates (t_6d0e6cdb).
+        return {"ids": bulk_ids_from_args(args)}
     if action == "reassign":
         # The CLI verb names ONE card; a reclaim-reassign over more than one id can only be
         # assembled by the dashboard, so this is non-bulk by cardinality (card t_f1f22f8c).
@@ -1006,7 +1023,7 @@ def gate_cli(args: Any) -> Optional[dict]:
     )
 
 
-def profiles_on_host() -> List[str]:
+def profiles_on_host() -> list[str]:
     """Profile ids that exist on this host (the estate's assignee trap: names are not ids)."""
     from hermes_constants import get_default_hermes_root
 

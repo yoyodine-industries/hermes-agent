@@ -216,6 +216,15 @@ def store_root(project_root: Path, *, honor_runtime_override: bool = True) -> Pa
     ``honor_runtime_override=False``: a persisted artifact (an installed
     launcher) has to bind the store of the tree it serves, never a runtime
     directory inherited through the environment.
+
+    A tree that records no store of its own resolves the OWNING root's
+    (``_unstamped_store``), never the caller's ``HERMES_HOME``-derived
+    ``tools``: a boot under another home (a rehearsal hold, a per-task home)
+    would otherwise mint the checkout's shared launchers against a store that
+    home's later cleanup deletes (#131745's exit-127 class, one step earlier
+    than the ``HERMES_RUNTIME_DIR`` override that fix already pins). A tree
+    nothing owns is a fresh install -- there the caller's home IS the store,
+    so it is unchanged.
     """
     if honor_runtime_override:
         override = os.environ.get("HERMES_RUNTIME_DIR")
@@ -236,11 +245,15 @@ def store_root(project_root: Path, *, honor_runtime_override: bool = True) -> Pa
                 return _unstamped_store(root)
             value = data.get("runtimeDir") if isinstance(data, dict) else None
             return Path(value).resolve() if value else _unstamped_store(root)
-    return get_default_hermes_root() / "tools"
+    return _unstamped_store(root)
 
 
 def _unstamped_store(project_root: Path) -> Path:
-    """The store of a stamp that names none (source stamps never do): the owning root's.
+    """The store of a tree that records none of its own: the owning root's.
+
+    Two stamps reach here: one that names no ``runtimeDir`` (source stamps never do) and none
+    at all (a checkout whose untracked ``install-stamp.json`` a fresh clone or a git worktree
+    never carries).
 
     The data root's ``tools/`` is the default, but a borrowing root's would be a new store per
     temporary home -- a full tool download on its first launch, and an interpreter that dies

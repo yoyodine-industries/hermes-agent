@@ -34,15 +34,68 @@ def validate_contract(value: str | None) -> str:
 
 
 def needs_repository_checks(value: str | None) -> bool:
-    """True when the contract is signed off by repository-required CI rather than the local run.
+    """True when the contract is a repository claim rather than the local run.
 
-    A repository that requires no checks can never satisfy one: ``collect_acceptance``
-    reports ``missing`` with an empty ``required`` list and no retry can change that, which
-    is why authoring one warns and completion parks the card (see ``complete_task``).
-    ``landed`` is NOT a repository check: its fence is the deploy-proof gate, so routing it
-    into the GitHub path would park every proof-contract card as unsatisfiable.
+    A repository that declares no required checks cannot be WAITED on, but it can
+    still be CLOSED: ``collect_acceptance`` treats the PR's MERGED state as the
+    evidence (ruling of 2026-10-18, card ``t_9082c751``), so such a contract is
+    satisfiable and never parks the card. ``landed`` is NOT a repository check: its
+    fence is the deploy-proof gate, so routing it into the GitHub path would park
+    every proof-contract card as unsatisfiable.
     """
     return validate_contract(value) not in ("local-only", "landed")
+
+
+def contract_is_readable(value: str | None) -> bool:
+    """True when the stored value is a declaration this gate can act on.
+
+    A board can hold a value ``create_task`` never validated -- an older row, a hand edit, a
+    truncated write. Card ``t_c4a9d940`` held a bare space and refused every close for it, so
+    the load path asks this BEFORE collecting anything (ruling R4).
+    """
+    try:
+        validate_contract(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _declaration_mismatch(receipt: dict, contract: str, published_pr) -> dict:
+    """R2 (card ``t_c4a9d940``): quote the declaration and the offer, never "the persisted
+    contract".
+
+    The old detail told the worker to supply ``metadata.published_pr`` "matching the persisted
+    completion contract" and never said what that contract WAS -- so a card refused against a
+    contract holding a space was unanswerable by reading the refusal. The remedy is named too:
+    supplying the right PR, or an owner re-scoping the declaration.
+    """
+    if published_pr is None:
+        detail = (
+            "metadata.published_pr is absent, so nothing names the PR the card's persisted "
+            f"completion contract {contract!r} requires."
+        )
+    elif not isinstance(published_pr, str):
+        detail = (
+            f"metadata.published_pr must be a GitHub PR URL string, got "
+            f"{type(published_pr).__name__} {published_pr!r} -- which cannot name the PR the "
+            f"card's persisted completion contract {contract!r} requires."
+        )
+    else:
+        detail = (
+            f"metadata.published_pr {published_pr!r} does not name the PR required by the "
+            f"card's persisted completion contract {contract!r}."
+        )
+    receipt.update(
+        classification="missing",
+        cause="declaration_mismatch",
+        detail=detail,
+        recovery=(
+            "Pass metadata.published_pr naming the PR this contract requires (a full "
+            "https://github.com/OWNER/REPO/pull/N URL in that repository), or have the card's "
+            "owner re-scope the declaration with `hermes kanban set-contract`."
+        ),
+    )
+    return receipt
 
 
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
@@ -130,15 +183,31 @@ def collect_acceptance(contract: str, published_pr: str | None,
     try:
         profile_home = _assignee_profile_home(assignee)
         declared = _PR.fullmatch(contract)
+        if declared is None and not _REPO.fullmatch(contract or ""):
+            # R4 (card t_c4a9d940): an unreadable declaration has no verdict to give. The
+            # load path repairs one before we get here; if a caller still reaches this line
+            # the receipt says WHY, so the close is degraded instead of refused forever.
+            receipt.update(
+                classification="missing",
+                cause="contract_unreadable",
+                detail=(f"The card's persisted completion contract {contract!r} is not a "
+                        "declaration this gate can read (local-only, landed, OWNER/REPO or an "
+                        "exact PR URL)."),
+            )
+            return receipt
+        if published_pr is not None and not isinstance(published_pr, str):
+            # A malformed publication is a DECLARATION error: the old code raised a TypeError
+            # inside the URL match and reported 'infra', sending the worker to check gh auth
+            # for a card that was simply mis-declared (t_c4a9d940, run 2).
+            return _declaration_mismatch(receipt, contract, published_pr)
         url = contract if declared else published_pr
         match = _PR.fullmatch(url or "")
         if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
-            receipt["detail"] = "Supply metadata.published_pr matching the persisted completion contract."
-            return receipt
+            return _declaration_mismatch(receipt, contract, published_pr)
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
+        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state mergeCommit{{oid}}\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
         if repository is None:
             # A private repo the login cannot read resolves to null, not an error.
@@ -159,7 +228,25 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+            # A repository that declares no required checks cannot be WAITED on, and refusing
+            # its PR contract outright left a published card with no legal contract at all:
+            # `local-only` contradicts its own publication, and the PR contract was refused
+            # here (ruling of 2026-10-18, card ``t_9082c751``). MERGE STATE is the evidence.
+            if pr["state"] == "MERGED":
+                receipt["classification"] = "success"
+                receipt["ok"] = True
+                merge_sha = (pr.get("mergeCommit") or {}).get("oid")
+                if merge_sha:
+                    receipt["merge_sha"] = merge_sha
+                receipt["detail"] = (
+                    f"{repo}#{number} is MERGED (head {sha}); the repository declares no required "
+                    "checks, so merge state is this contract's acceptance evidence.")
+                return receipt
+            receipt["classification"] = "pending"
+            receipt["detail"] = (
+                f"{repo}#{number} is OPEN at {sha} and the repository declares no required checks, "
+                f"so the PR's MERGED state is this contract's acceptance evidence: merge the PR, "
+                f"then retry completion. Nothing is missing from the card.")
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)

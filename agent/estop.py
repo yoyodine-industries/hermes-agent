@@ -529,7 +529,7 @@ def _boot_id() -> str:
 
         done = subprocess.run(
             ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, check=False,
         )
         return done.stdout.strip() if done.returncode == 0 else ""
     except Exception:

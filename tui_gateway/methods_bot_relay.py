@@ -51,6 +51,27 @@ def _run_delivery(profile: str, tmp: str, env: dict | None = None, *,
             os.unlink(report)
 
 
+def _refusal_data(exc: BaseException, reason: str) -> dict:
+    """The ``data`` of a refusal: the typed ``reason`` plus the holder when one is known (§2/§3.7).
+
+    ``data.reason`` is the only field the Desktop forwards to the sending agent, so a busy
+    profile's holder must ride BESIDE it (additive — a client that ignores it loses nothing) or
+    the sender can only retry blind against the same stuck turn. An exception that names no
+    holder (or has no ``holder_payload``) yields the bare ``{"reason": …}`` of before.
+    """
+    data: dict = {"reason": reason}
+    payload = getattr(exc, "holder_payload", None)
+    if not callable(payload):
+        return data
+    try:
+        holder = payload()
+    except Exception:  # pragma: no cover - defensive
+        return data
+    if isinstance(holder, dict) and holder:
+        data["holder"] = holder
+    return data
+
+
 @method("bot_relay.roster.sync")
 def _(rid, params: dict, _root=_relay_root) -> dict:
     """Replace this gateway's view of agents on OTHER connections → ``{count}`` accepted rows
@@ -89,7 +110,7 @@ def _(rid, params: dict, _root=_relay_root) -> dict:
 
 @method("bot_relay.deliver")
 def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
-      _failure_reason=delivery_failure_reason) -> dict:
+      _failure_reason=delivery_failure_reason, _data=_refusal_data) -> dict:
     """Deliver a relayed DM (``profile``, attribution-prefixed ``message``) into a Bot Chat ON THIS
     GATEWAY via the one-turn ``hermes -p <profile> chat -c "Bot Chat"`` transport local DMs use →
     ``{reply}``. Blocking by design (Desktop relay worker; the RPC pool keeps it off the reader)."""
@@ -100,7 +121,7 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
         return _err(rid, 4090, "profile and message required")
     try:
         from tools.bot_mode_dm import MESSAGE_MAX_CHARS
-        from tools.bot_relay import acquire_turn_lock
+        from tools.bot_relay import BOT_CHAT_SESSION_KEY, acquire_turn_lock
         if len(message) > MESSAGE_MAX_CHARS + 200:  # + attribution headroom
             return _err(rid, 4091, "message too long")
         root = _root()
@@ -207,7 +228,7 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
             # Worst-case handler hold is lock wait (bot_mode.turn_wait_seconds, default 120s) + the 600s
             # turn timeout below — doubled when the retry policy grants one bounded re-run — so clients
             # calling bot_relay.deliver must tolerate ~1320s before assuming failure. See #93091.
-            with acquire_turn_lock(root, resolved):
+            with acquire_turn_lock(root, resolved, session=BOT_CHAT_SESSION_KEY):
                 proc = _run(resolved, tmp, turn_env)
                 if proc.returncode != 0:
                     # Retry policy: transient classes re-run the SAME session once; context_overflow
@@ -242,7 +263,9 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
         return _err(rid, 5093, "delivery turn timed out", data={"reason": DELIVERY_TIMEOUT})
     except Exception as e:
         reason = _failure_reason(e)
-        return _err(rid, 5096 if reason == "target_busy" else 5094, str(e), data={"reason": reason})
+        # The holder rides BESIDE data.reason (the only field the Desktop forwards): a busy
+        # profile's refusal must name the process holding it, or the sender retries blind.
+        return _err(rid, 5096 if reason == "target_busy" else 5094, str(e), data=_data(e, reason))
 
 
 @method("bot_relay.reply")

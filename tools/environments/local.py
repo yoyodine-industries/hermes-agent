@@ -613,7 +613,16 @@ def _resolve_hermes_bin_dir() -> str | None:
 
     # A payload's venv also holds a `hermes`, but on Windows its redirector names the
     # build machine's interpreter, so PATH order must not decide which copy children get.
-    payload_dir = payload_command_dir(Path(__file__).resolve().parents[2])
+    #
+    # The framing probe reads `<tree>/../manifest.json`, so a tree that cannot be probed
+    # (an unreadable manifest, a guarded/foreign home, any fault inside PM) reads as "not a
+    # sealed payload" and the resolution falls through to the PATH candidates below. PATH
+    # construction must never be able to fail a spawn — `cron.scheduler_worker_env` takes the
+    # same posture around its own PM read.
+    try:
+        payload_dir = payload_command_dir(Path(__file__).resolve().parents[2])
+    except Exception:
+        payload_dir = None
     if payload_dir is not None and payload_dir.is_dir():
         _HERMES_BIN_DIR, _HERMES_BIN_DIR_IS_PAYLOAD = str(payload_dir), True
         return _HERMES_BIN_DIR
@@ -842,7 +851,11 @@ def _wait_for_group_exit(proc, pgid: int, timeout: float) -> bool:
 def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
     """SIGKILL snapshotted survivors that escaped the process group via ``setsid``
     — after TERM→KILL so in-group members keep their grace; psutil's identity-aware
-    Process skips recycled PIDs. POSIX-only (see _IS_WINDOWS gate in caller)."""
+    Process skips recycled PIDs. POSIX-only (see _IS_WINDOWS gate in caller).
+
+    A WORKFLOW DEPARTURE (a production flight, marked ``HERMES_WORKFLOW_DEPARTURE``) is
+    spared even as an escapee: it shares an ancestor with this command tree but is owned by
+    no turn, and reaping it here is exactly the t_4b9843a4 defect."""
     for child in descendants:
         try:
             if not child.is_running():
@@ -852,6 +865,9 @@ def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
                     continue  # group-kill already covers it
             except OSError:  # ProcessLookupError / PermissionError included
                 pass
+            from tools.workflow_departure import pid_is_departure
+            if pid_is_departure(child.pid):
+                continue  # a detached production flight is not ours to reap
             child.kill()
         except Exception:
             continue

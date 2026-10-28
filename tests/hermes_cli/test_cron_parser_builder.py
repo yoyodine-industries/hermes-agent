@@ -40,3 +40,16 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_script_timeout_flag_on_create_and_edit():
+    parser = _build()
+    # --script-timeout-seconds is the per-job budget (mirrors --reasoning-effort): a bare string so
+    # "" can CLEAR the override on edit, and it exists on both create and edit.
+    assert parser.parse_args(
+        ["cron", "create", "30m", "--script-timeout-seconds", "11700"]).script_timeout_seconds == "11700"
+    assert parser.parse_args(
+        ["cron", "edit", "j", "--script-timeout-seconds", "11700"]).script_timeout_seconds == "11700"
+    assert parser.parse_args(["cron", "edit", "j"]).script_timeout_seconds is None
+    assert parser.parse_args(
+        ["cron", "edit", "j", "--script-timeout-seconds", ""]).script_timeout_seconds == ""

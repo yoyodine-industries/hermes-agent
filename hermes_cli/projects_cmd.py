@@ -48,6 +48,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     project_sub("remove-folder", "Remove a folder from a project").add_argument("path", help="Folder path")
     project_sub("rename", "Rename a project").add_argument("name", help="New name")
     project_sub("set-primary", "Set the primary folder").add_argument("path", help="Folder path (must already be in project)")
+    project_sub("set-about", "Set the project's about (one-line description)").add_argument(
+        "text", help="New about text, stored verbatim (pass \"\" to clear it)"
+    )
     p_use = sub.add_parser("use", help="Set the active project")
     p_use.add_argument("project", nargs="?", default=None, help="Project id or slug (omit to clear)")
     project_sub("archive", "Archive a project")
@@ -192,6 +195,17 @@ def _cmd_set_primary(args, conn, proj):
     return f"Set primary of {proj.slug} -> {args.path}"
 
 
+@_with_project
+def _cmd_set_about(args, conn, proj) -> str:
+    """``hermes project set-about <project> <text>`` — the post-create about editor.
+
+    Stored verbatim (no strip, no rewriting) so ``show`` round-trips byte-exactly; ``""`` is
+    legal and clears it, which makes ``_print_project`` drop the ``about:`` line.
+    """
+    pdb.update_project(conn, proj.id, description=args.text)
+    return f"Set about of {proj.slug}"
+
+
 @_db_command
 def _cmd_use(args, conn):
     if not args.project:
@@ -276,7 +290,7 @@ def _board_refusal(proj, board: str, refusal: str) -> int:
 
 
 @_with_project
-def _cmd_bind_board(args, conn, proj) -> "int | str":
+def _cmd_bind_board(args, conn, proj) -> int | str:
     """``hermes project bind-board <project> [board]`` — the board half of the link.
 
     Binding writes the board's DEFAULT PROJECT (``board.json:project_id``) beside the
@@ -315,6 +329,7 @@ _HANDLERS = {
     "remove-folder": _cmd_remove_folder,
     "rename": _cmd_rename,
     "set-primary": _cmd_set_primary,
+    "set-about": _cmd_set_about,
     "use": _cmd_use,
     "archive": _flag_command("archive_project", "Archived"),
     "restore": _flag_command("restore_project", "Restored"),

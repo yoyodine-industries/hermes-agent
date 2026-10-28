@@ -65,7 +65,7 @@ def test_reopen_done_card_lands_ready_and_clears_completion(conn):
 
     kinds = [e.kind for e in kb.list_events(conn, tid)]
     assert "reopened" in kinds
-    reopened = [e for e in kb.list_events(conn, tid) if e.kind == "reopened"][0]
+    reopened = next(e for e in kb.list_events(conn, tid) if e.kind == "reopened")
     assert reopened.payload["actor"] == "flow"
     assert reopened.payload["reason"] == "repair"
     # The legacy `status` event the dashboard live feed and the sweep read.
@@ -206,3 +206,56 @@ def test_cli_reopen_reaches_the_same_function(kanban_home, capsys):
     assert kb_cli._cmd_reopen(_reopen_ns(tid, dry_run=True)) == 0
     with kbc.connect() as conn:
         assert _status(conn, tid) == "done"
+
+
+def test_reopen_explicit_todo_landing_is_not_dispatchable(conn):
+    """``--to todo`` is a LANDING, not a request to re-gate: the card must come back
+
+    restored but NOT dispatchable even when every parent is closed (which is exactly the
+    state a repaired card is in: its parents all finished, and the card must not go back
+    into a worker's queue).
+    """
+    tid = _done_card(conn, title="todo landing")
+    ok, err, info = kb.reopen_task(conn, tid, actor="flow", dest_status="todo")
+    assert ok and err is None, (ok, err)
+    assert info == {"from_status": "done", "to_status": "todo"}
+    assert _status(conn, tid) == "todo"
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.completed_at is None
+
+
+def test_reopen_parser_exposes_json_and_the_three_landings(kanban_home):
+    """The PARSER is the surface the deployment drives, so it is asserted directly.
+
+    Both halves were dead before round 2: `--json` was read by the handler but never added
+    to the parser (so `reopen <id> --json` exited 2 and the JSON branch could never run),
+    and `--to todo` was rejected even though `reopen_task` accepts it.
+    """
+    from hermes_cli.kanban import build_parser
+
+    wrap = argparse.ArgumentParser(prog="wrap", add_help=False)
+    parser = build_parser(wrap.add_subparsers(dest="_top"))
+    ns = parser.parse_args(["reopen", "t_abc123", "--to", "todo", "--json",
+                            "--reason", "repair"])
+    assert ns.to == "todo"
+    assert ns.json is True
+    assert ns.task_id == "t_abc123"
+    for landing in ("ready", "todo", "blocked"):
+        ns_landing = parser.parse_args(["reopen", "t_abc123", "--to", landing])
+        assert ns_landing.to == landing
+    # The default landing is unchanged (the operator's ordinary reopen).
+    assert parser.parse_args(["reopen", "t_abc123"]).to == "ready"
+
+
+def test_cli_reopen_json_prints_the_landing(kanban_home, capsys):
+    """`--json` must actually reach the handler and print a parseable object."""
+    import json
+
+    from hermes_cli import kanban as kb_cli
+
+    with kbc.connect() as conn:
+        tid = _done_card(conn, title="json card")
+    assert kb_cli._cmd_reopen(_reopen_ns(tid, reason="repair", to="todo",
+                                         as_json=True)) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload == {"id": tid, "from_status": "done", "to_status": "todo"}

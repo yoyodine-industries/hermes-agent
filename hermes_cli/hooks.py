@@ -219,9 +219,19 @@ def _cmd_test(args) -> None:
         return
 
     print(f"Firing {len(specs)} hook(s) for event '{event}':\n")
+    # Probe-ness is the caller's declaration, not the payload's shape: a synthetic payload is
+    # identical to a real one, and a hook cannot tell them apart. Default is PROBE (observer-only);
+    # --no-probe is the deliberate opt-in to the real path.
+    probe = not getattr(args, "no_probe", False)
+    if probe:
+        print(f"Probe mode: {shell_hooks.PROBE_ENV_VAR}=1 in the hook environment — a hook that mutates "
+              f"durable state must become observer-only.\n")
+    else:
+        print("Real-path mode (--no-probe): the probe marker is withheld, so a hook that mutates durable "
+              "state WILL act on this synthetic payload.\n")
     for spec in specs:
         print(f"  → {spec.command}")
-        _print_run_result(shell_hooks.run_once(spec, payload))
+        _print_run_result(shell_hooks.run_once(spec, payload, probe=probe))
         print()
 
 
@@ -320,7 +330,11 @@ def _doctor_one(spec, shell_hooks) -> int:
               "Approve the hook first (via TTY prompt or --accept-hooks), "
               "then re-run `hermes hooks doctor`.")
     elif shell_hooks.script_is_executable(spec.command):
-        result = shell_hooks.run_once(spec, _DEFAULT_PAYLOADS.get(spec.event, {"extra": {}}))
+        # 4. LIVENESS smoke — spawn / exit / JSON channel, never a behaviour test. The run is DECLARED
+        # a probe (HERMES_HOOK_PROBE=1 in the child env), so a hook that files cards or writes durable
+        # state stays observer-only: doctor can no longer mint board state or resurrect a closed card.
+        # Behaviour is the hook's own suite's job.
+        result = shell_hooks.run_once(spec, _DEFAULT_PAYLOADS.get(spec.event, {"extra": {}}), probe=True)
         if result.get("timed_out"):
             problems += 1
             print(f"      ✗ timed out after {result['elapsed_seconds']}s "
@@ -333,13 +347,13 @@ def _doctor_one(spec, shell_hooks) -> int:
             elapsed = result.get("elapsed_seconds", 0)
             stdout = (result.get("stdout") or "").strip()
             if not stdout:
-                print(f"      ✓ ran clean with empty stdout "
-                      f"(exit={rc}, {elapsed}s) — hook is observer-only")
+                print(f"      ✓ liveness check passed — spawned, exited {rc} in {elapsed}s, nothing on the "
+                      f"JSON channel (behaviour NOT exercised: {shell_hooks.PROBE_ENV_VAR}=1)")
             else:
                 try:
                     json.loads(stdout)
-                    print(f"      ✓ produced valid JSON on synthetic payload "
-                          f"(exit={rc}, {elapsed}s)")
+                    print(f"      ✓ liveness check passed — spawned, exited {rc} in {elapsed}s, valid JSON "
+                          f"on the wire (behaviour NOT exercised: {shell_hooks.PROBE_ENV_VAR}=1)")
                 except json.JSONDecodeError:
                     problems += 1
                     print(f"      ✗ stdout was not valid JSON (exit={rc}, "

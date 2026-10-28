@@ -116,7 +116,8 @@ class CLICommandsSessionToolsMixin:
 
     def _handle_agents_command(self):
         """Handle /agents — show background processes and agent status."""
-        from tools.process_registry import format_uptime_short, process_registry
+        from tools.process_registry import process_registry
+        from tools.process_registry_output import format_uptime_short
         processes = process_registry.list_sessions()
         running = [p for p in processes if p.get("status") == "running"]
         finished = [p for p in processes if p.get("status") != "running"]

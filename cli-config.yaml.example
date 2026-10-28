@@ -1150,6 +1150,16 @@ skills:
   # Set to 0 to disable.
   creation_nudge_interval: 15
 
+  # Admission gate on NEW skills and NEW reference files (default true).
+  # A new skill is judged against every skill the agent can see, with the same rule the
+  # skills publish door applies: one whose intent surface is >=60% covered by an existing
+  # skill (or whose description overlaps one >=80%) is a restatement and is refused with the
+  # skill to extend named; under 15% new content with no single owner is refused as a spread
+  # restatement. A new `references/` file that restates another skill is refused too, as is a
+  # Hub install that duplicates a local skill. Refusals are recorded in
+  # `<skills>/.admission_refusals.jsonl`. Set false only to bootstrap a corpus.
+  # admission_gate: true
+
   # External skill directories — share skills across tools/agents without
   # copying them into ~/.hermes/skills/.  Each path is expanded (~ and ${VAR})
   # and resolved to an absolute path.  External dirs are read-only: skill

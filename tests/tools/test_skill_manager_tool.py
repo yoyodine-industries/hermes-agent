@@ -720,7 +720,15 @@ class TestSkillManageDispatcher:
                  patch("tools.skill_usage.is_bundled",
                        side_effect=lambda skill_name: skill_name == "bundled"):
                 skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
-                skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT)
+                # Distinct content: two skills with one body would now be refused by the
+                # admission gate, and this test is about the DELETE guard, not admission.
+                skill_manage(action="create", name="bundled", content=(
+                    "---\nname: bundled\n"
+                    "description: A bundled skill managed by the installer.\n"
+                    "---\n\n# Bundled\n\n## Ownership\n\n"
+                    "Bundled skills ship with the release and are never removed by a review "
+                    "pass.\n\n## Refusal\n\nThe refusal names the skill and leaves its directory "
+                    "in place.\n"))
                 raw = skill_manage(
                     action="delete",
                     name="bundled",

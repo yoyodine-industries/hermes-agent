@@ -16,14 +16,18 @@ from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_cli import kanban_cross_close as kb_cross_close
 from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
+    KANBAN_ADJUDICATE_SCHEMA,
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+    KANBAN_CLOSE_SIBLING_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+    KANBAN_LIST_SCHEMA, KANBAN_RECORD_LANDING_VERDICT_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
+    KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
@@ -366,7 +370,9 @@ def _require_orchestrator_tool(tool_name: str) -> None:
 def _board(board: Optional[str], *, quiet_close: bool = False):
     """``with _board(slug) as (kb, conn)``; lazy import so the module loads in non-kanban
     contexts. ``board=None`` keeps the env/symlink resolution chain; an explicit slug
-    overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges).
+    targets that board, but a slug that resolves to a different board than the pinned DB
+    (``HERMES_KANBAN_DB``) is REFUSED instead of silently served from the pin. ``quiet_close``
+    swallows close() errors (best-effort bridges).
 
     An explicit ``board`` must name a REGISTERED board before it can reach a
     ``connect()``: the creating seam mints a store for any slug-shaped string, so
@@ -376,6 +382,7 @@ def _board(board: Optional[str], *, quiet_close: bool = False):
     """
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    kb.assert_board_matches_pin(board)
     board = kb.assert_board_registered(board)
     conn = kbc.connect(board=board)
     try:
@@ -982,6 +989,23 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"kanban_complete blocked: {empty_err}. Your task is still in-flight (no state "
                 f"change). Retry kanban_complete with a non-empty summary or result describing "
                 f"what was done.")
+        except kb.PhantomRefsRefused as ref_err:
+            # The DISCHARGE gate's citing half (design record platform-stl t_0608ce6d): the
+            # handoff cites a card id no reachable board carries. The gate runs before the write
+            # txn, so nothing moved and the audit event is on the card. The remedy is IN the
+            # kernel's message; the retry is spelt out because a model reads an unqualified
+            # tool_error as terminal and would otherwise stall instead of correcting the handoff.
+            return tool_error(
+                f"kanban_complete blocked: {ref_err} Retry kanban_complete with the same "
+                f"handoff and the citation corrected: name the real card id (and the board it "
+                f"lives on, if it is not this one), or drop the id from the prose.")
+        except (kb.VoidClaimUnmeasured, kb.VoidClaimRefused) as void_err:
+            # The DISCHARGE gate's void-claim half: the completion argues its premise is void and
+            # the declared measurement is missing, malformed, or does not hold. Nothing moved.
+            return tool_error(
+                f"kanban_complete blocked: {void_err} Retry kanban_complete with the same "
+                f"handoff and either a premise_void block whose measurements all hold, or the "
+                f"not_the_basis disclaimer with a real why.")
         except kb.ProofGateError as proof_err:
             # Deploy-proof gate: the card is authored ``landed`` and its handoff's run
             # record does not cover the deployed artifact. The gate runs before the write
@@ -1006,6 +1030,19 @@ def _handle_complete(args: dict, **kw) -> str:
             # card with a named fix reads as a generic stall, and how the worker respawns
             # against the same verdict.
             if isinstance(ok, kb.CompletionRefusal) and ok.cause == "acceptance_refusal":
+                raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
+            # The landing-carrier fence carries its own remedy inline: the declared PR, the exact
+            # ``kanban_create`` spec for the carrier, and the two RECORDED escapes. The REVIEW LANE
+            # closes through this door, so answering it from the live row would hand the refused
+            # reviewer a run-ownership sentence with no cause, no PR and no way out -- a fence
+            # nobody can read is a fence nobody can satisfy (t_88f6cb12).
+            if isinstance(ok, kb.CompletionRefusal) and ok.cause in (
+                    "landing_carrier_missing", "landing_state_unknown"):
+                raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
+            # The dirty-unit-checkout fence names the checkout, the paths and the remedy in
+            # ``detail`` (t_b151a247). A card that cannot see WHY it is refused is re-run
+            # blind, and a blind re-run dirties the same tree again.
+            if isinstance(ok, kb.CompletionRefusal) and ok.cause == "dirty_unit_checkout":
                 raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
             # A reopened or never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.
@@ -1206,6 +1243,70 @@ def _handle_comment(args: dict, **kw) -> str:
         return _ok(task_id=tid, comment_id=cid)
 
 
+@_kanban_handler("kanban_record_landing_verdict")
+def _handle_record_landing_verdict(args: dict, **kw) -> str:
+    """Record a landing verdict on the card that DECLARES the PR (one door, t_765136ce)."""
+    _reject_delegated_child_mutation("kanban_record_landing_verdict")
+    from hermes_cli.kanban_landing_verdict import record_landing_verdict
+
+    target = str(_require_text(args, "target_task_id")).strip()
+    verdict = str(_require_text(args, "verdict")).strip()
+    reason = _require_text(args, "reason")
+    # The caller's own card is the SECOND audit end. ``_default_task_id`` returns None for a
+    # delegated child and for a caller with no dispatcher task, and the writer records the
+    # target end only in that case -- it never guesses an author.
+    caller = _default_task_id(None)
+    result = args.get("result")
+    result = _redact(result) if isinstance(result, str) and result.strip() else None
+    board = args.get("board")
+    with _board(board) as (_kb, conn):
+        receipt = record_landing_verdict(
+            conn, target, verdict, reason,
+            caller_task_id=caller,
+            caller_run_id=_worker_run_id(caller) if caller else None,
+            result=result,
+            board=board,
+        )
+    return _ok(**receipt)
+
+
+@_kanban_handler("kanban_adjudicate")
+def _handle_adjudicate(args: dict, **kw) -> str:
+    """Exit another card out of ``triage``/``todo``/``scheduled`` (card t_012fb74e)."""
+    _reject_delegated_child_mutation("kanban_adjudicate")
+    from hermes_cli.kanban_adjudicate import adjudicate
+
+    target = str(_require_text(args, "target_task_id")).strip()
+    disposition = str(_require_text(args, "disposition")).strip()
+    expect_status = str(_require_text(args, "expect_status")).strip()
+    reason = _redact(_require_text(args, "reason"))
+    # The caller's own card and run are the provenance SIDE of every write the door makes;
+    # ``_default_task_id`` is None outside a dispatcher-spawned worker, and the kernel refuses
+    # that as ``no_caller`` rather than borrowing an author.
+    caller = _default_task_id(None)
+    result = args.get("result")
+    result = _redact(result) if isinstance(result, str) and result.strip() else None
+    title = args.get("title")
+    title = str(title) if isinstance(title, str) and title.strip() else None
+    body = args.get("body")
+    body = _redact(body) if isinstance(body, str) and body.strip() else None
+    board = args.get("board")
+    with _board(board) as (_kb, conn):
+        receipt = adjudicate(
+            conn,
+            target,
+            disposition=disposition,
+            expect_status=expect_status,
+            reason=reason,
+            result=result,
+            title=title,
+            body=body,
+            caller_task_id=caller,
+            caller_run_id=_worker_run_id(caller) if caller else None,
+        )
+    return _ok(**receipt)
+
+
 def _store_attachment(board, tid, filename, data, content_type) -> str:
     """Store via ``kanban_db.store_attachment_bytes`` (shared size cap, per-task
     dir, metadata row) so agent, dashboard, and CLI surfaces stay in lockstep."""
@@ -1347,6 +1448,7 @@ def _handle_create(args: dict, **kw) -> str:
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     from hermes_cli import kanban_db as _kb_board
+    from hermes_cli.profiles import list_profile_names
     self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                 if _is_dispatcher_owned_worker() else None)
     # A card fired from another card lands on the SAME board as the card that fired
@@ -1371,7 +1473,7 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
-        new_tid = kb.create_task(
+        new_tid, outcome = kb.create_task_reported(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
@@ -1391,14 +1493,25 @@ def _handle_create(args: dict, **kw) -> str:
             # inherits it from this card's own session (the dispatcher exports it), from the
             # body, or from the parents - so an agent never has to remember the register.
             serves=args.get("serves"),
+            # Provenance for a card filed FROM a seat's inbox. The gate is in create_task, so
+            # this door and the CLI share ONE refusal (an InboxRefusal, i.e. a ValueError,
+            # which the handler envelope already reports without a traceback) and neither
+            # can create the row when the seat file does not hold the item.
+            from_inbox=args.get("from_inbox"),
+            from_inbox_item=args.get("from_inbox_item"),
             # Escape hatch for the ASK-HOME rule: a NEW ask filed off its register's board
             # is refused unless the caller opts in deliberately (see kanban_register).
             allow_off_board_ask=bool(args.get("allow_off_board_ask")),
-            created_by=_persisted_identity(), session_id=session_id)
+            created_by=_persisted_identity(), session_id=session_id,
+            # The receipt's dead-assignee probe needs the live profiles; injected at the
+            # door (this process knows them) rather than guessed inside the kernel.
+            profiles=list_profile_names())
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
-        gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
-        return _ok(task_id=new_tid, **landed, **gate,
+        # gated/gated_by keep their shape, and a create with no parents answers exactly what
+        # it always did; with parents, parents_state/standing/warning/board_dispatch come from
+        # the SAME receipt the link door reports, so a card filed behind a parent that will
+        # never move is visible in the answer that created it, not after a second lookup.
+        return _ok(task_id=new_tid, **landed, **kb.receipt_fields(outcome),
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 
@@ -1523,17 +1636,52 @@ def _handle_unblock(args: dict, **kw) -> str:
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links/running
     children → ValueError). A worker linking its OWN running card proves ownership
-    with its run id so the dependency-block handoff still works."""
+    with its run id so the dependency-block handoff still works.
+
+    The receipt names the new dependency set's PROMOTION state: ``parents`` (per-edge
+    code/text/self_moves), ``standing`` (the ids that will not move on their own) and
+    ``warning`` — a link into a parent nobody will finish is a silent park otherwise.
+    """
     _reject_delegated_child_mutation("kanban_link")
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
+    from hermes_cli.profiles import list_profile_names
+
     with _board(args.get("board")) as (kb, conn):
-        gated = kb.link_tasks(
+        outcome = kb.link_tasks_reported(
             conn, parent_id=parent_id, child_id=child_id,
-            expected_child_run_id=_worker_run_id(str(child_id)))
-        return _ok(parent_id=parent_id, child_id=child_id, gated=gated,
-                   **({"gated_by": parent_id} if gated else {}))
+            expected_child_run_id=_worker_run_id(str(child_id)),
+            profiles=list_profile_names(), board=args.get("board"))
+        return _ok(parent_id=parent_id, child_id=child_id, gated=outcome.gated,
+                   **({"gated_by": parent_id} if outcome.gated else {}),
+                   parents=[{"id": p.id, "status": p.status, "code": p.code,
+                             "self_moves": p.self_moves} for p in outcome.parents],
+                   standing=outcome.standing, warning=outcome.warning,
+                   board_dispatch=outcome.board_dispatch)
+
+
+@_kanban_handler("kanban_close_sibling")
+def _handle_close_sibling(args: dict, **kw) -> str:
+    """Close a SIBLING card as delegated work, through the kernel's own completion path.
+
+    The auditing end is the card THIS session owns (``_default_task_id(None)`` restores
+    the dispatcher-scoped env default), never a caller-supplied id: a prompt-injected
+    worker must not be able to attribute its close to someone else's card.
+    """
+    _reject_delegated_child_mutation("kanban_close_sibling")
+    sibling = args.get("sibling_task_id")
+    _check(sibling, "sibling_task_id is required: name the sibling card whose work this "
+                    "lane absorbed. Nothing was closed.")
+    caller = _default_task_id(None)
+    with _board(None) as (_kb, conn):
+        receipt = kb_cross_close.close_sibling(
+            conn, str(sibling),
+            caller_task_id=caller,
+            caller_run_id=_worker_run_id(caller) if caller else None,
+            summary=args.get("summary"), result=args.get("result"),
+        )
+        return _ok(**receipt)
 
 
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
@@ -1555,7 +1703,11 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_close_sibling", KANBAN_CLOSE_SIBLING_SCHEMA, _handle_close_sibling, "🤝"),
+    ("kanban_record_landing_verdict", KANBAN_RECORD_LANDING_VERDICT_SCHEMA,
+     _handle_record_landing_verdict, "🛬"),
+    ("kanban_adjudicate", KANBAN_ADJUDICATE_SCHEMA, _handle_adjudicate, "⚖"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

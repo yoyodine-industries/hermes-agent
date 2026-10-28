@@ -1,19 +1,22 @@
-"""The set-seam contract verification (card t_b58332a4).
+"""The set-seam contract verification (card t_b58332a4, re-ruled by t_9082c751).
 
 A card born with an ``OWNER/REPO`` (or exact-PR-URL) completion contract on a
-repository that requires no status checks can never satisfy the acceptance gate:
-the receipt stays ``classification=missing`` / ``required=[]`` and the card parks
-``blocked``/``capability`` with its work already done.  These tests pin the fix at
-the one seam every filing surface reaches (``kanban_db.create_task``):
+repository that requires no status checks used to be downgraded to ``local-only``
+here, because the receipt stayed ``classification=missing`` / ``required=[]`` and
+the card parked ``blocked``/``capability`` with its work already done.
+
+That downgrade was half of a mutual dead end (card ``t_9082c751``): the landing
+fence then refused the downgraded card whose own metadata recorded the PR it had
+published, while a PR contract was refused for the missing checks. Acceptance now
+takes the PR's MERGED state as the evidence when the repository requires no checks,
+so this seam KEEPS every declaration and only records what it measured:
 
 * a repository WITH required checks keeps the declared contract;
-* a repository WITHOUT falls back to ``local-only`` and records the measured
-  reason on a ``contract_changed`` event;
-* a repository whose CHECKS APIs are plan-gated is the card's "cannot determine"
-  case: also a fallback, with that said in the reason;
+* a repository WITHOUT also keeps it -- nothing is downgraded, and the measured
+  state says MERGE STATE is the acceptance evidence;
+* a repository whose CHECKS APIs are plan-gated keeps it, with that said;
 * a repository that cannot be read AT ALL is left alone -- an access gap the
-  acceptance gate already surfaces as a fixable ``auth`` -- so the CI gate is
-  never silently stripped;
+  acceptance gate already surfaces as a fixable ``auth``;
 * ``landed`` -- the deploy-proof class, a card that carries a DEPLOYED unit -- is
   never routed through the resolver, so its deploy-proof gate is never touched.
 
@@ -108,30 +111,39 @@ def test_repo_with_required_checks_keeps_the_pr_contract(board, monkeypatch):
     assert any(call.endswith("protection") for call in calls)
 
 
-# --- branch B: the repository requires none -> local-only + measured reason -----
+# --- branch B: the repository requires none -> the declaration STANDS -----------
 
-def test_repo_without_required_checks_falls_back_to_local_only(board, monkeypatch):
+def test_repo_without_required_checks_keeps_the_declaration(board, monkeypatch):
+    """The ruling (t_9082c751): no required checks is not a downgrade -- MERGE STATE is the
+    acceptance evidence, so the card keeps the contract it was filed on."""
+    from hermes_cli import kanban_contract_resolve as resolve
+
     _install_provider(monkeypatch)
     with connect() as conn:
         tid = kb.create_task(conn, title="publish", completion_contract="acme/nochecks")
-        assert kb.get_task(conn, tid).completion_contract == "local-only"
-        events = _events(conn, tid, "contract_changed")
-    assert len(events) == 1
-    payload = events[0]
-    assert payload["old"] == "acme/nochecks"
-    assert payload["new"] == "local-only"
-    assert "required_status_checks=null" in payload["reason"]
-    assert "acme/nochecks" in payload["reason"]
+        assert kb.get_task(conn, tid).completion_contract == "acme/nochecks"
+        assert _events(conn, tid, "contract_changed") == []
+    out = resolve.resolve_contract_at_set("acme/nochecks")
+    assert out.changed is False
+    assert out.contract == "acme/nochecks"
+    assert out.state == "none"
+    assert "required_status_checks=null" in out.reason
+    assert "acme/nochecks" in out.reason
+    assert "MERGED" in out.reason
 
 
-def test_gated_checks_api_is_treated_as_no_checks_and_says_so(board, monkeypatch):
+def test_gated_checks_api_keeps_the_declaration_and_says_so(board, monkeypatch):
+    from hermes_cli import kanban_contract_resolve as resolve
+
     _install_provider(monkeypatch)
     with connect() as conn:
         tid = kb.create_task(conn, title="publish", completion_contract="acme/gated")
-        assert kb.get_task(conn, tid).completion_contract == "local-only"
-        reason = _events(conn, tid, "contract_changed")[0]["reason"]
-    assert "could not determine" in reason
-    assert "HTTP 403" in reason
+        assert kb.get_task(conn, tid).completion_contract == "acme/gated"
+        assert _events(conn, tid, "contract_changed") == []
+    out = resolve.resolve_contract_at_set("acme/gated")
+    assert out.changed is False and out.state == "gated"
+    assert "could not determine" in out.reason
+    assert "HTTP 403" in out.reason
 
 
 def test_unreadable_repo_is_left_alone(board, monkeypatch):
@@ -177,33 +189,36 @@ def test_landed_contract_is_never_routed_through_the_resolver(board, monkeypatch
     assert calls == []  # never even read the provider
 
 
-def test_pr_url_contract_is_resolved_too(board, monkeypatch):
+def test_pr_url_contract_is_kept_too(board, monkeypatch):
     _install_provider(monkeypatch)
     url = "https://github.com/acme/nochecks/pull/12"
     with connect() as conn:
         tid = kb.create_task(conn, title="publish", completion_contract=url)
-        assert kb.get_task(conn, tid).completion_contract == "local-only"
-        assert _events(conn, tid, "contract_changed")[0]["old"] == url
+        assert kb.get_task(conn, tid).completion_contract == url
+        assert _events(conn, tid, "contract_changed") == []
 
 
 # --- the measured regression case (ops cards t_b516e265 / t_0396c536 / t_dba735ff) --
 
-def test_regression_case_the_three_yaan_platform_cards_fall_back(board, monkeypatch):
+def test_regression_case_the_three_yaan_platform_cards_keep_their_contract(board, monkeypatch):
     """The three measured instances: ops cards t_b516e265 / t_0396c536 / t_dba735ff.
 
     Each was born on ``yoyodine-industries/yaan-platform`` (readable, 0 rulesets,
-    unprotected branch) and could never clear its OWNER/REPO contract, so it parked
-    blocked with its work already done. The set-seam fallback is what stops the next
-    card repeating it.
+    unprotected branch). The seam used to downgrade them to ``local-only`` -- which is
+    also what made their published closes refusable by the landing fence. They now keep
+    the contract they were filed on and close on the PR's MERGED state.
     """
+    from hermes_cli import kanban_contract_resolve as resolve
+
     _install_provider(monkeypatch)
     with connect() as conn:
         tid = kb.create_task(conn, title="publish",
                              completion_contract="yoyodine-industries/yaan-platform")
-        assert kb.get_task(conn, tid).completion_contract == "local-only"
-        payload = _events(conn, tid, "contract_changed")[0]
-    assert payload["old"] == "yoyodine-industries/yaan-platform"
-    assert "required_status_checks=null" in payload["reason"]
+        assert kb.get_task(conn, tid).completion_contract == "yoyodine-industries/yaan-platform"
+        assert _events(conn, tid, "contract_changed") == []
+    out = resolve.resolve_contract_at_set("yoyodine-industries/yaan-platform")
+    assert out.changed is False and out.state == "none"
+    assert "required_status_checks=null" in out.reason
 
 
 def test_missing_resolver_module_keeps_the_declared_contract(board, monkeypatch, caplog):

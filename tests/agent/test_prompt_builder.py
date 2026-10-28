@@ -9,10 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent import prompt_builder
 from agent.prompt_builder import (
     _scan_context_content,
     _truncate_content,
     _parse_skill_file,
+    _read_category_descriptions,
+    _scan_extra_root,
     _skill_should_show,
     _find_hermes_md,
     _find_git_root,
@@ -24,6 +27,7 @@ from agent.prompt_builder import (
     _get_context_file_max_chars,
     drain_truncation_warnings,
 )
+from hermes_yaml import YamlEngineUnavailable
 
 
 @pytest.fixture(autouse=True)
@@ -245,13 +249,85 @@ class TestParseSkillFile:
         assert str(skill_file) in caplog.text
 
 
+# =========================================================================
+# engine fault is not skill content — it must not read as "no description"
+# =========================================================================
 
 
+def _engine_fault_raiser(exc_type):
+    """A stand-in ``parse_frontmatter`` that fails the way an absent engine does."""
+    def _raise(_content):
+        raise exc_type("ruamel.yaml is not importable in /nonexistent/python")
+    return _raise
+
+
+class TestEngineFaultIsNotSkillContent:
+    """An unavailable YAML engine is an environment fault, not a skill's content.
+
+    Every skills surface wraps ``parse_frontmatter`` in a broad ``except Exception`` and
+    downgrades the fault to a silent skip: ``_parse_skill_file`` returns ``(True, {}, "")``
+    ("compatible with no description") and the index/description readers just drop the item.
+    A missing engine is not malformed content — it must propagate so the caller sees the
+    engine named, never a skill that merely reads as empty.
+    """
+
+    @pytest.mark.parametrize("engine_failure", [ImportError, YamlEngineUnavailable])
+    def test_parse_skill_file_propagates_engine_fault(self, tmp_path, monkeypatch, engine_failure):
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text("---\nname: test-skill\ndescription: A useful test skill\n---\n")
+        monkeypatch.setattr(prompt_builder, "parse_frontmatter", _engine_fault_raiser(engine_failure))
+        with pytest.raises(engine_failure, match="ruamel"):
+            _parse_skill_file(skill_file)
+
+    def test_parse_skill_file_still_swallows_read_errors(self, tmp_path, monkeypatch):
+        # The engine clause must be NARROWER than the old blanket: a genuine read/parse error
+        # still yields the documented defaults, so one odd file cannot kill the prompt build.
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text("---\nname: broken\n---\n")
+
+        def boom(*_args, **_kwargs):
+            raise OSError("read exploded")
+
+        monkeypatch.setattr(type(skill_file), "read_text", boom)
+        assert _parse_skill_file(skill_file) == (True, {}, "")
+
+    def test_read_category_descriptions_propagates_engine_fault(self, tmp_path, monkeypatch):
+        root = tmp_path / "skills"
+        (root / "devops").mkdir(parents=True)
+        (root / "devops" / "DESCRIPTION.md").write_text("---\ndescription: DevOps\n---\n")
+        monkeypatch.setattr(prompt_builder, "parse_frontmatter", _engine_fault_raiser(YamlEngineUnavailable))
+        with pytest.raises(YamlEngineUnavailable, match="ruamel"):
+            _read_category_descriptions(root, "Could not read skill description %s: %s")
+
+    def test_scan_extra_root_propagates_engine_fault(self, tmp_path, monkeypatch):
+        # _scan_extra_root wraps _parse_skill_file in its own broad except; without the matching
+        # engine clause the fix inside _parse_skill_file is defeated for external and project
+        # skill dirs.
+        from agent.skill_utils import TIER_EXTERNAL
+        skill_md = tmp_path / "ext" / "skill-a" / "SKILL.md"
+        skill_md.parent.mkdir(parents=True)
+        skill_md.write_text("---\nname: skill-a\ndescription: A.\n---\n")
+        monkeypatch.setattr(prompt_builder, "parse_frontmatter", _engine_fault_raiser(YamlEngineUnavailable))
+        with pytest.raises(YamlEngineUnavailable, match="ruamel"):
+            _scan_extra_root(tmp_path / "ext", [skill_md], TIER_EXTERNAL, "Error reading skill %s: %s")
 
 
 # =========================================================================
 # Skills system prompt builder
 # =========================================================================
+
+
+@pytest.fixture(autouse=True)
+def _legacy_flat_skills_index(monkeypatch):
+    """This module covers the LEGACY flat skills index renderer.
+
+    The index is RETIRED by default (card t_cc3c6951, operator ruling 2026-09-30): the curated
+    hierarchical surface each lane's SOUL carries is the routing surface now. The renderer that
+    these tests exercise still exists behind the explicit escape hatch and must keep working for a
+    profile that opts back in, so the hatch is pinned ON here. The DARK default is guarded by
+    tests/agent/test_skills_index_deprecated.py.
+    """
+    monkeypatch.setenv("HERMES_SKILLS_INDEX", "flat")
 
 
 class TestBuildSkillsSystemPrompt:

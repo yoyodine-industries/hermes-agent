@@ -58,10 +58,97 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
+def _max_spawn_by_board(_kanban_cfg: dict) -> dict:
+    """``kanban.max_spawn_by_board`` as ``{slug: int}``, junk dropped silently.
+
+    Read here for the MEASUREMENT only: the CLI never passes these ceilings to
+    ``dispatch_once`` (that is the gateway dispatcher's job, and it resolves and
+    warns about the same map). A value that is not a positive int can never be a
+    ceiling, so it is left out rather than coerced into one.
+    """
+    raw = _kanban_cfg.get("max_spawn_by_board") if isinstance(_kanban_cfg, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    ceilings: dict = {}
+    for slug, value in raw.items():
+        if isinstance(value, bool):
+            continue
+        try:
+            ival = int(value)
+        except (TypeError, ValueError):
+            continue
+        if ival < 1 or ival != value:
+            continue
+        ceilings[str(slug)] = ival
+    return ceilings
+
+
+def _held_lines(res: object, host_budget: dict) -> list[str]:
+    """Every card a gate held this tick, named on one line, or ``[]``.
+
+    The SEV1 (card ``t_843cb0a9``): a board at its ceiling and a wedged dispatcher
+    printed EXACTLY the same output, because the budget gate's two fields were
+    recorded on the result and never published. A held card is the estate's
+    normal loaded state, so it prints as a deferral with the cap that held it —
+    never as silence, and never as a failure.
+    """
+    lines: list[str] = []
+    detail = getattr(res, "spawn_budget_detail", None) or {}
+    gate = getattr(res, "spawn_budget_blocked", None)
+
+    board_ids = list(getattr(res, "deferred_board_capped", None) or [])
+    host_ids = list(getattr(res, "deferred_in_progress_capped", None) or [])
+    share_ids = list(getattr(res, "deferred_host_capped", None) or [])
+
+    def _cards(ids: list) -> str:
+        shown = ", ".join(ids[:12])
+        more = "" if len(ids) <= 12 else f" (+{len(ids) - 12} more)"
+        return f" — {shown}{more}" if ids else ""
+
+    if gate == "max_spawn":
+        lines.append(
+            f"Held (board ceiling max_spawn={detail.get('cap')} met: "
+            f"{detail.get('board_running')} running on this board): "
+            f"{len(board_ids)} ready card(s){_cards(board_ids)}"
+        )
+    elif gate == "max_in_progress":
+        lines.append(
+            f"Held (host cap max_in_progress={detail.get('host_cap')} met: "
+            f"{detail.get('host_running')} running host-wide, "
+            f"{detail.get('board_running')} on this board): "
+            f"{len(host_ids)} ready card(s){_cards(host_ids)}"
+        )
+    elif board_ids:
+        lines.append(
+            f"Held (board ceiling reached): {len(board_ids)} ready card(s){_cards(board_ids)}"
+        )
+    if share_ids:
+        lines.append(
+            f"Held (no host slot for this board this tick — another board drew "
+            f"the share): {len(share_ids)} ready card(s){_cards(share_ids)}"
+        )
+    for task_id, assignee, reason in getattr(res, "spawn_failed", None) or []:
+        lines.append(f"Spawn failed: {task_id} ({assignee}): {reason}")
+    yielded = getattr(res, "tick_yielded", "")
+    if yielded:
+        lines.append(f"Tick yielded: {yielded}")
+    if host_budget.get("oversubscribed"):
+        boards = host_budget.get("boards") or []
+        lines.append(
+            f"Host ceiling: {len(boards)} x max_spawn={host_budget.get('max_spawn')} = "
+            f"{host_budget.get('ceiling_sum')} against max_in_progress="
+            f"{host_budget.get('max_in_progress')} — "
+            f"{host_budget.get('unreachable_slots')} slot(s) are unreachable by config; "
+            f"set kanban.max_spawn_by_board to fit."
+        )
+    return lines
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path.
+    max_spawn_by_board: dict = {}
     try:
         from hermes_cli.config import load_config
         _cfg = load_config()
@@ -79,6 +166,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = (
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
+        max_spawn_by_board = _max_spawn_by_board(_kanban_cfg)
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
@@ -92,6 +180,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+    # The CONFIG's own arithmetic: max_spawn is per board, max_in_progress is per
+    # host, so the fleet advertises more slots than it can ever hold. Measured
+    # here so the numbers ride every dispatch output instead of living in a
+    # reader's head (card t_843cb0a9 requirement 2).
+    host_budget = kbd.measure_host_budget(
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        ceilings=max_spawn_by_board,
+    )
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
@@ -119,6 +216,23 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_locked": res.skipped_locked,
             "skipped_board_disabled": res.skipped_board_disabled,
             "memory_pressure": res.memory_pressure,
+            # The budget gates. These were recorded on the result and never
+            # published, so a saturated board reported every bucket empty: the
+            # tick that spawns nothing for want of capacity now names the gate,
+            # the ceiling that was met, the measured running count, and the cards
+            # it held (card t_843cb0a9).
+            "spawn_budget_blocked": res.spawn_budget_blocked,
+            "spawn_budget": res.spawn_budget_detail,
+            "deferred_board_capped": res.deferred_board_capped,
+            "deferred_host_capped": res.deferred_host_capped,
+            "deferred_in_progress_capped": res.deferred_in_progress_capped,
+            "spawn_failed": [
+                {"task_id": tid, "assignee": who, "reason": why}
+                for (tid, who, why) in res.spawn_failed
+            ],
+            "skipped_top_level_only": getattr(res, "skipped_top_level_only", []),
+            "tick_yielded": res.tick_yielded,
+            "host_budget": host_budget,
         }, ascii=True)
         return 0
     if res.skipped_board_disabled:
@@ -179,6 +293,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    for line in _held_lines(res, host_budget):
+        print(line)
     return 0
 
 

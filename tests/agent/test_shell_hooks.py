@@ -745,3 +745,78 @@ def test_unroutable_script_hook_names_the_remediation(tmp_path):
 
     assert result["returncode"] is None
     assert "interpreter" in result["error"] and "bash" in result["error"]
+
+
+# ── probe declaration: HERMES_HOOK_PROBE ─────────────────────────────────
+# Probe-ness belongs to the INVOCATION, not the payload (ruling t_3be6949a): a probe payload is
+# shape-identical to a real one by design, so a hook cannot tell them apart by looking at stdin.
+# `run_once(..., probe=True)` declares the invocation a pre-flight smoke; a runtime firing never does.
+
+
+def _marker_reporter(tmp_path: Path, name: str = "probe_reporter.py") -> Path:
+    """A hook that echoes the probe marker it saw, so a test reads the CHILD's environment."""
+    return _write_script(
+        tmp_path, name,
+        "import json, os, sys\n"
+        "json.load(sys.stdin)\n"
+        "print(json.dumps({'marker': os.environ.get('HERMES_HOOK_PROBE'),"
+        " 'present': 'HERMES_HOOK_PROBE' in os.environ}))\n",
+    )
+
+
+def _reporter_spec(script: Path) -> shell_hooks.ShellHookSpec:
+    return shell_hooks.ShellHookSpec(event="on_session_start", command=f'"{sys.executable}" "{script}"')
+
+
+class TestProbeDeclaration:
+
+    def test_probe_true_exports_the_marker_to_the_child(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(shell_hooks.PROBE_ENV_VAR, raising=False)
+        result = shell_hooks.run_once(_reporter_spec(_marker_reporter(tmp_path)), {"session_id": "t"}, probe=True)
+        assert result["error"] is None, result["error"]
+        assert json.loads(result["stdout"]) == {"marker": "1", "present": True}
+
+    def test_the_marker_is_absent_without_the_declaration(self, tmp_path, monkeypatch):
+        """probe=False is byte-identical to the runtime path: the marker is not merely empty, it is
+        absent from the child's environment."""
+        monkeypatch.delenv(shell_hooks.PROBE_ENV_VAR, raising=False)
+        result = shell_hooks.run_once(_reporter_spec(_marker_reporter(tmp_path)), {"session_id": "t"})
+        assert result["error"] is None, result["error"]
+        assert json.loads(result["stdout"]) == {"marker": None, "present": False}
+
+    def test_a_runtime_firing_cannot_declare_a_probe(self, tmp_path, monkeypatch):
+        """`_make_callback` is the runtime dispatch path and has no way to reach the flag. If a REAL
+        firing carried the marker, every hook that honours it would go observer-only in production."""
+        monkeypatch.delenv(shell_hooks.PROBE_ENV_VAR, raising=False)
+        seen = tmp_path / "env.json"
+        script = _write_script(
+            tmp_path, "runtime_env.py",
+            "import json, os, sys\n"
+            "json.load(sys.stdin)\n"
+            f"open({str(seen)!r}, 'w').write(json.dumps({{'present': 'HERMES_HOOK_PROBE' in os.environ}}))\n")
+        shell_hooks._make_callback(_reporter_spec(script))(session_id="parent-sess")
+        assert json.loads(seen.read_text()) == {"present": False}
+
+    def test_the_marker_survives_the_multiplex_secret_scrub(self, monkeypatch):
+        """The scrub is the silent-false-green path: it rebuilds the child env, so a marker applied
+        before it would vanish exactly when profiles are multiplexed."""
+        from tools.environments import local as local_env
+
+        # The child-env factory probes the install tree for a hermes shim; that probe touches the real
+        # home, which the suite's home_io_guard refuses. PATH construction is not this test's subject.
+        monkeypatch.setattr(local_env, "_HERMES_BIN_DIR", None)
+        env = local_env.build_subprocess_env(scrub_secrets=True, extra={shell_hooks.PROBE_ENV_VAR: "1"})
+        assert env[shell_hooks.PROBE_ENV_VAR] == "1"
+
+    def test_the_marker_reaches_the_child_under_multiplexing(self, tmp_path, monkeypatch):
+        from tools.environments import local as local_env
+
+        monkeypatch.setattr(local_env, "_HERMES_BIN_DIR", None)  # see the scrub test above
+        monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        (tmp_path / "home").mkdir()
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-not-a-real-key")
+        monkeypatch.delenv(shell_hooks.PROBE_ENV_VAR, raising=False)
+        result = shell_hooks.run_once(_reporter_spec(_marker_reporter(tmp_path)), {"session_id": "t"}, probe=True)
+        assert result["error"] is None, result["error"]
+        assert json.loads(result["stdout"]) == {"marker": "1", "present": True}

@@ -32,6 +32,14 @@ class TestSkillManageBatch(unittest.TestCase):
         import tools.skill_manager_tool as smt
         importlib.reload(smt)
         self.smt = smt
+        # These fixtures seed SEVERAL skills from one template. That corpus is exactly what the
+        # admission gate forbids (a create that restates an existing skill) and this module is
+        # about batch atomicity, not admission — so the gate is stubbed off here. Its own
+        # behaviour is covered by tests/tools/test_skill_manager_tool_admission.py.
+        from unittest.mock import patch
+        self._admission_gate = patch.object(smt, "_admission_gate_enabled", return_value=False)
+        self._admission_gate.start()
+        self.addCleanup(self._admission_gate.stop)
 
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)

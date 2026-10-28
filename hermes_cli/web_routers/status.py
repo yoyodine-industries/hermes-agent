@@ -113,6 +113,46 @@ async def get_ssh_ownership(request: Request):
             "runtimeIntact": _ssh_runtime_intact()}
 
 
+@router.get("/api/substrate")
+async def get_substrate(format: Optional[str] = None):
+    """The substrate authority record, as the ONE normalized read (design §3.6 carrier 6).
+
+    Read-only, boot-volume only, and deliberately dumb: it answers "is the runtime's
+    substrate reachable" from `<hermes_home>/substrate_status.json` without touching
+    the volume the ticks probe, so it still answers while `/Volumes/yoyofs1` is
+    denying. `state` is `ok` / `denied` / `unknown` — `unknown` (no record, unreadable
+    record, or a record nobody has refreshed) is a real answer and never rendered as
+    green. `guards_blind` counts the launcher-armed hook rows currently failing open.
+
+    `?format=text` renders the same read as one plain-text block, which is what a
+    browser tab or a `curl` on :8643 shows without the SPA build.
+
+    Host paths and root names live here (gated), NOT on `/api/status`, which is public.
+    """
+    from hermes_cli import substrate_view
+
+    view = await run_in_threadpool(substrate_view.read)
+    if (format or "").strip().lower() in ("text", "txt", "plain"):
+        from fastapi.responses import PlainTextResponse
+
+        lines = [substrate_view.render_line(view)]
+        if view.get("roots"):
+            lines.append("denied roots:")
+            lines += [
+                f"  {root.get('path')}  op={root.get('op')}  errno={root.get('errno')}  tier={root.get('tier')}"
+                for root in view["roots"]
+            ]
+        if view.get("guards"):
+            lines.append(f"blind guards ({view.get('guards_blind')} of {view.get('guards_total')}):")
+            lines += [
+                f"  {item.get('hook')}  row={item.get('row')}  since={item.get('since')}  {item.get('reason')}"
+                for item in view["guards"]
+            ]
+        lines.append(f"record: {view.get('record', {}).get('path')}  generated: {view.get('generated_at')}")
+        return PlainTextResponse("\n".join(lines) + "\n")
+    return view
+
+
 @router.get("/api/health")
 async def get_health():
     """Lightweight process liveness for desktop/backend readiness probes.
@@ -541,6 +581,11 @@ async def get_status(profile: Optional[str] = None):
         status["components"] = components
         status["overall"] = ("ok" if all(item.get("status") == "ok" for item in components.values())
                              else "degraded")
+        # The substrate read, low-sensitivity half only (state / episode / guards_blind):
+        # this handler is in PUBLIC_API_PATHS, so host paths stay on /api/substrate.
+        from hermes_cli import substrate_view
+
+        status["substrate"] = await run_in_threadpool(substrate_view.summary)
         await _advisory_pressure(status, profile_dir if profile_dir else get_hermes_home())
 
         # Profile NAMES and ``gateway_mode`` are low-sensitivity product surface (Hermes Cloud

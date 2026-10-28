@@ -11,6 +11,7 @@ recovery action and auto-clears when the failure mode resolves.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 import json
 import time
@@ -809,6 +810,113 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+# --- workspace resolution (card t_15dce81a / t_e5ff985b) ---------------------
+
+#: Repo probes memoised per ANCHOR for a SHORT window (``_ANCHOR_REPO_TTL``). A board snapshot
+#: asks the same question about sibling cards that share an anchor, and a ``git rev-parse``
+#: subprocess per card would make the snapshot cost O(cards). The window is deliberately short:
+#: the dashboard runs this in a LONG-LIVED gateway process, so a folder that an operator turns
+#: into a repo must stop being reported within a minute, not for the life of the process.
+_ANCHOR_HAS_REPO_CACHE: dict[str, tuple[float, bool]] = {}
+_ANCHOR_REPO_TTL = 60.0
+
+
+def _anchor_has_repo(anchor: str) -> bool:
+    """True when *anchor* resolves into a git repository — the SPAWN SEAM's own predicate.
+
+    ``kanban_db_workspace._repo_root_for_worktree_target`` walks from the nearest EXISTING path
+    upward, which is exactly what ``resolve_workspace`` does before materialising
+    ``<repo>/.worktrees/<id>``. Reusing it (instead of a second, hand-rolled check) is what makes
+    this rule and the dispatcher unable to disagree about whether a card can resolve.
+
+    Fail-open: a broken import must never invent a defect.
+    """
+    now = time.monotonic()
+    cached = _ANCHOR_HAS_REPO_CACHE.get(anchor)
+    if cached is not None and now - cached[0] < _ANCHOR_REPO_TTL:
+        return cached[1]
+    try:
+        from hermes_cli import kanban_db_workspace as kbw
+
+        ok = kbw._repo_root_for_worktree_target(Path(anchor)) is not None
+    except Exception:
+        ok = True
+    _ANCHOR_HAS_REPO_CACHE[anchor] = (now, ok)
+    return ok
+
+
+def workspace_anchor_cannot_resolve(task, cfg) -> Optional[str]:
+    """The anchor this card would materialise under IF it can never resolve, else ``None``.
+
+    The single predicate behind both the per-card diagnostic and the board-level count below, so
+    the number a burndown snapshot prints and the cards it names cannot drift apart.
+    """
+    if _task_field(task, "status") != "ready":
+        return None
+    if _task_field(task, "claim_lock"):
+        # Claimed: past the resolution seam, being worked on.
+        return None
+    if (_task_field(task, "workspace_kind") or "scratch") != "worktree":
+        return None
+    workspace_path = _task_field(task, "workspace_path")
+    if workspace_path:
+        anchor = str(workspace_path)
+    else:
+        # No path of its own: the dispatcher anchors on the board's default_workdir.
+        anchor = str(cfg.get("board_default_workdir") or "").strip()
+        if not anchor:
+            return None
+    return None if _anchor_has_repo(anchor) else anchor
+
+
+def _rule_workspace_cannot_resolve(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``ready`` worktree card whose workspace can NEVER resolve (not a git repo).
+
+    Measured 2026-10-18: cards born with ``workspace_kind=worktree`` anchored on a program's
+    STATE folder (a plain directory, never a repo) died at every claim — the dispatcher retried
+    once, charged the card, and left it ``ready`` looking as though it were merely waiting its
+    turn. The spawn gate blocks such a card on its FIRST attempt and names the repair; this rule
+    is the BOARD-level half, so a snapshot counts the class instead of an operator inferring it
+    from a pile of ``stranded_in_ready`` warnings whose real cause is invisible.
+    """
+    anchor = workspace_anchor_cannot_resolve(task, cfg)
+    if anchor is None:
+        return []
+    task_id = _task_field(task, "id") or ""
+    project_id = _task_field(task, "project_id")
+    detail = f"``{anchor}`` cannot resolve into a git repository."
+    try:
+        from hermes_cli import kanban_db_workspace as kbw
+
+        detail = kbw.no_repo_refusal(
+            anchor=anchor,
+            task_id=task_id,
+            project_id=project_id,
+            project_slug=kbw.project_label(project_id),
+        )
+    except Exception:
+        pass
+    actions = [
+        _cli_hint(
+            "Re-anchor this card onto a git repo",
+            f"hermes kanban retarget {task_id} --workspace worktree:<git-repo>",
+            suggested=True,
+        ),
+        _cli_hint("Board health snapshot", "hermes kanban diagnostics"),
+    ]
+    return [Diagnostic(
+        kind="workspace_cannot_resolve", severity="critical",
+        title="Workspace cannot resolve: anchor is not a git repo",
+        detail=detail,
+        actions=actions,
+        first_seen_at=int(_task_field(task, "created_at", default=0) or 0),
+        last_seen_at=int(now),
+        count=1,
+        data={"anchor": anchor, "workspace_path": _task_field(task, "workspace_path"),
+              "project_id": project_id, "workspace_kind": "worktree"},
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -821,6 +929,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_workspace_cannot_resolve,
     _rule_overdue_scheduled,
 ]
 

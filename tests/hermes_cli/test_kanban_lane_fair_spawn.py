@@ -42,8 +42,21 @@ def env(monkeypatch):
     kanban path pins from the *worker* environment are cleared explicitly — the
     hermetic conftest fixture already does this, and a scratch board must never
     resolve to the operator's live board even if that fixture changes.
+
+    The ``hermes_cli`` purge is UNDONE on teardown (as in
+    ``test_kanban_default_max_runtime_seconds.py``): a later test file binds its
+    ``hermes_cli.kanban_db`` / ``gateway`` objects at COLLECTION time, so leaving
+    the re-imported modules in ``sys.modules`` would hand that file a different
+    module than the one it bound — and its dispatcher would then read a board
+    nobody seeded. That is a test-isolation defect, not a property of the code
+    under test.
     """
     test_home = tempfile.mkdtemp(prefix="kanban_lane_fair_spawn_test_")
+
+    def _is_hermes_ish(mod: str) -> bool:
+        return (mod.startswith("hermes_cli") or mod.startswith("hermes_state")
+                or mod == "hermes_constants")
+
     for prof in (*_LANES, "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
         with open(os.path.join(test_home, "profiles", prof, "config.yaml"), "w") as fh:
@@ -52,15 +65,20 @@ def env(monkeypatch):
     for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME",
                  "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_DELEGATED_CHILD_CONTEXT"):
         monkeypatch.delenv(name, raising=False)
+    saved = {m: sys.modules[m] for m in list(sys.modules) if _is_hermes_ish(m)}
     for mod in list(sys.modules.keys()):
-        if (mod.startswith("hermes_cli") or mod.startswith("hermes_state")
-                or mod == "hermes_constants"):
+        if _is_hermes_ish(mod):
             del sys.modules[mod]
     from hermes_cli import (kanban_db, kanban_db_connect, kanban_db_dispatch,
                             kanban_priority_policy)
     with kanban_db_connect.connect_closing() as conn:
         kanban_db.create_board(slug="default", name="Test")
-    return kanban_db, kanban_db_connect, kanban_db_dispatch, kanban_priority_policy
+    yield kanban_db, kanban_db_connect, kanban_db_dispatch, kanban_priority_policy
+    # Hand the collection-time modules back to whatever file runs next.
+    for mod in list(sys.modules.keys()):
+        if _is_hermes_ish(mod):
+            del sys.modules[mod]
+    sys.modules.update(saved)
 
 
 def _fake_spawn(*args, **kwargs):

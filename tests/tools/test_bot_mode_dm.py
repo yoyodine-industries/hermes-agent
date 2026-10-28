@@ -5,6 +5,7 @@ canonical Bot Chat session on a Bot-Mode-managed install, and must refuse to
 deliver from anywhere else even if a schema leaks.
 """
 
+import hashlib
 import json
 import os
 import shlex
@@ -278,6 +279,12 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     assert result["status"] == "queued"
     assert result["to"] == "@researcher"
     assert result["process_id"] == "proc_test1234"
+    # P9(a)/§1.2: the ack is a RECEIPT — the receipt word rides "result"; "status" keeps the
+    # live line's dispatch word.
+    assert result["result"] == "receipt"
+    assert len(result["delivery_id"]) == 64  # content-addressed, never a send_id
+    assert result["detail"] == "accepted and queued — do NOT resend; receipt is retained"
+    assert "do NOT wait" in result["guidance"]
 
     assert len(calls) == 1
     call = calls[0]
@@ -290,6 +297,7 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     command = call["command"]
     mode, dm_file, transport_argv = _runner_parts(command)
     assert mode == "query-file"
+    assert result["delivery_id"] == hashlib.sha256(str(Path(dm_file).resolve()).encode()).hexdigest()
     assert transport_argv == [
         "hermes",
         "-p",
@@ -683,7 +691,7 @@ def test_live_dm_wait_reports_reply_after_initial_wait_budget(tmp_path, monkeypa
 
     notice = json.loads(capsys.readouterr().out)
     assert exit_code == 0
-    assert notice["status"] == "settled"
+    assert notice["status"] == "delivered"
     assert notice["reply"] == "PONG"
 
 
@@ -719,7 +727,7 @@ def test_live_dm_wait_rechecks_receipt_when_owner_disappears_at_claim(tmp_path, 
     monkeypatch.setattr(live, "find_canonical_live_owner", settle_during_owner_check)
     assert bot_mode_dm._wait_live_dm(str(tmp_path), record["delivery_id"]) == 0
     notice = json.loads(capsys.readouterr().out)
-    assert notice["status"] == "settled"
+    assert notice["status"] == "delivered"
     assert notice["reply"] == "PONG"
 
 
@@ -746,7 +754,7 @@ def test_live_dm_wait_keeps_claimed_turn_until_it_settles(tmp_path, monkeypatch,
 
     assert exit_code == 0
     notice = json.loads(capsys.readouterr().out)
-    assert notice["status"] == "settled"
+    assert notice["status"] == "delivered"
     assert notice["reply"] == "PONG"
 
 
@@ -773,7 +781,7 @@ def test_live_dm_wait_releases_claimed_runner_after_owner_is_gone(tmp_path, monk
     assert stopped_with_unknown_outcome, "a vanished owner must not retain the runner indefinitely"
     assert outcomes == [0]
     notice = json.loads(capsys.readouterr().out)
-    assert notice["status"] == "claimed"
+    assert notice["status"] == "running"
     final = live.read_delivery_result(tmp_path, record["delivery_id"])
     assert final is not None and final["status"] == "claimed"
 
@@ -796,7 +804,9 @@ def test_live_dm_wait_releases_runner_when_owner_lookup_keeps_failing(tmp_path, 
     monkeypatch.setattr(live, "find_canonical_live_owner", lookup_fails)
     assert bot_mode_dm._wait_live_dm(str(tmp_path), record["delivery_id"]) == 0
     notice = json.loads(capsys.readouterr().out)
-    assert notice["status"] == status
+    # §4.8/P11: the SENDER-facing word is ENUM B ("claimed" -> "running"); the store keeps the
+    # storage word (asserted below on the record itself).
+    assert notice["status"] == {"queued": "queued", "claimed": "running"}[status]
     assert "Do not resend" in notice["detail"]
     assert live.read_delivery_result(tmp_path, record["delivery_id"])["status"] == status
 
@@ -875,9 +885,9 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     assert not dm_file.exists()
 
 
-def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
-    """#100523: the CLI's single-owner lease refusal is a delivery FAILURE the
-    sender can read, not a raw exit-1 with the payload silently gone."""
+def test_delivery_runner_reports_live_owner_hold_as_receipt(tmp_path, capsys):
+    """#100523 + §5.2/P12: the CLI's single-owner hold on a DELIVERY turn is a RECEIPT —
+    the payload is accepted and retained, so the sender must not resend."""
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("hi", encoding="utf-8")
     child = tmp_path / "owned.py"
@@ -892,9 +902,16 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
         [sys.executable, str(child), "-p", "ops"], str(dm_file), stdin_file=False
     )
 
-    assert returncode == 1
+    assert returncode == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["reason"] == "target_busy"
+    assert payload["object"] == "hermes.peer.send_result"
+    assert payload["result"] == "receipt"
+    assert payload["status"] == "queued"
+    assert payload["status_detail"] == "live_owner_present"
+    assert payload["attempts"] == 0 and payload["busy"] is True
+    assert payload["reason"] is None and payload["error"] is None
+    assert "target_busy" not in json.dumps(payload["reason"])
+    assert "NOT delivered" not in json.dumps(payload)
 
 
 def test_local_turn_reemits_empty_stdout_for_a_bare_silence_marker(tmp_path, capsys):

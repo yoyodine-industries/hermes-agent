@@ -108,21 +108,28 @@ def test_create_task_refuses_disabled_skill(kanban_home, profile_skills):
 
 def test_create_task_skill_check_skips_when_no_profile_is_resolvable(kanban_home, profile_skills):
     """No assignee means no dispatch; an unknown profile is its own error. Neither
-    has a registry to judge names against, so neither refuses them.
+    has a registry to judge names against, so neither produces a SKILL verdict.
 
-    The unresolvable-profile arm attaches through ``assign_task``, not
-    ``create_task``: the live line's assignee gate refuses a handle with no profile
-    on disk at the create door already (``gate_assignee``), and that verdict is an
-    assignee-resolution one, not the skill verdict this test pins.
+    The unresolvable-profile arm used to route through ``assign_task``, because the
+    assign door had no assignee-resolution gate (only the create door did, and that
+    verdict is an assignee-resolution one, not the skill verdict this test pins).
+    Since the assign door carries ``gate_assignee`` too (ruling ESC-01650 /
+    platform/t_52183ba9, card t_041d673a), an unresolvable handle can no longer be
+    ATTACHED at all — so the arm now asserts exactly that: the refusal is the
+    assignee-resolution verdict, the card keeps its unjudged names, and no skill
+    verdict is ever produced for a profile that cannot exist.
     """
     with kbc.connect_closing() as conn:
         unassigned = kb.get_task(conn, kb.create_task(conn, title="unassigned", skills=["nope"]))
         assert unassigned is not None
         assert unassigned.skills == ["nope"]
-        assert kb.assign_task(conn, unassigned.id, "ghost") is True
-        ghost = _task(conn, unassigned.id)
-        assert ghost.assignee == "ghost"
-        assert ghost.skills == ["nope"], "an unresolvable profile judges no skill names"
+        with pytest.raises(ValueError) as excinfo:
+            kb.assign_task(conn, unassigned.id, "ghost")
+        assert getattr(excinfo.value, "invariant", None) == "assignee", (
+            "an unresolvable assignee is the ASSIGNEE verdict, never a skill verdict")
+        stuck = _task(conn, unassigned.id)
+        assert stuck.assignee in (None, "")
+        assert stuck.skills == ["nope"], "an unresolvable profile judges no skill names"
 
 
 # ---------------------------------------------------------------------------

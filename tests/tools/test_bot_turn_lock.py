@@ -5,6 +5,14 @@ cross-process flock; the queued one waits a bounded budget and then fails
 with a structured 'target_busy' refusal. Real flock on real (short)
 tmp_path lockfiles — flock contends between separate fds even within one
 process, so threads exercise the true kernel-lock semantics.
+
+``posix``, not ``linux``: the subject is ``fcntl.flock`` plus the holder record a live
+turn publishes (paths, pids, ``os.kill(pid, 0)``), all of which behave the same on macOS —
+where the delivery lane this protects actually runs (t_4a32d803: the routable seat wedged
+under ``hermes -p default chat``, and a file gated to linux exercises none of it there).
+The three ``tui_gateway.server``-driven handler tests moved to
+``tests/tools/test_bot_relay_deliver_lane.py`` and stay declared ``linux``: importing that
+server boots ``hermes_bootstrap``, which settles an update against the checkout's gitdir.
 """
 
 from __future__ import annotations
@@ -22,10 +30,16 @@ import time
 
 import pytest
 
-pytestmark = pytest.mark.platforms("linux")
+pytestmark = pytest.mark.platforms("posix")
 
+from tools import bot_delivery_queue as delivery_queue
 from tools import bot_mode_dm, bot_relay
-from tools.bot_relay import TurnBusyError, acquire_turn_lock, turn_lock_path
+from tools.bot_relay import (
+    TurnBusyError,
+    acquire_delivery_turn_lock,
+    acquire_turn_lock,
+    turn_lock_path,
+)
 
 
 @pytest.fixture
@@ -116,6 +130,181 @@ def test_lock_released_when_holder_fd_closes(root):
         pass  # acquires immediately — no TurnBusyError
 
 
+# ── the holder record (t_4a32d803 SEV1 residual / t_f93b2489 §2-§3) ──────────
+# A wedged profile used to refuse every sender with "another delivery turn is
+# already running" and name nobody: the seat stayed dead for 30+ hours because no
+# waiter (and no operator) could tell WHICH process held the turn or how old it was.
+# The holder now publishes itself into its own lockfile and every receipt/refusal
+# that reports the slot as held names it.
+
+
+def _hold_flock_with_holder(path, profile, hold_event, release_event, *, pid=None, started_at=None):
+    """Grab the lock on a separate fd and publish a holder record, as a live turn does."""
+    assert fcntl is not None  # POSIX-only module (pytestmark pins it)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    record = {"pid": os.getpid() if pid is None else pid, "ppid": os.getppid(), "profile": profile,
+              "started_at": time.time() if started_at is None else started_at, "host": "test-host"}
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, json.dumps(record).encode("utf-8"))
+    hold_event.set()
+    release_event.wait(timeout=10)
+    os.close(fd)  # close releases the flock — process-death semantics
+
+
+_HOLDER_CHILD = '''\
+import fcntl, json, os, sys, time
+path, profile, hold_seconds = sys.argv[1], sys.argv[2], float(sys.argv[3])
+os.makedirs(os.path.dirname(path), exist_ok=True)
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.lseek(fd, 0, os.SEEK_SET)
+os.write(fd, (json.dumps({"pid": os.getpid(), "ppid": os.getppid(), "profile": profile,
+                          "started_at": time.time(), "host": "child"}) + "\\n").encode("utf-8"))
+print(os.getpid(), flush=True)
+time.sleep(hold_seconds)
+'''
+
+
+def _spawn_holder_child(tmp_path, root, profile, hold_seconds=30.0):
+    """A REAL separate process holding ``profile``'s turn, publishing its own pid → (proc, pid)."""
+    script = tmp_path / "holder_child.py"
+    script.write_text(_HOLDER_CHILD, encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(turn_lock_path(root, profile)), profile, str(hold_seconds)],
+        stdout=subprocess.PIPE, text=True,
+    )
+    assert proc.stdout is not None
+    try:
+        pid = int(proc.stdout.readline().strip())
+    except ValueError:  # pragma: no cover - the child never published
+        proc.kill()
+        raise
+    return proc, pid
+
+
+def test_turn_holder_is_published_while_held_and_cleared_after(root):
+    """A held turn names itself (pid/profile/start), and leaves nothing stale behind."""
+    with acquire_turn_lock(root, "ops", timeout_seconds=0.5):
+        holder = bot_relay.read_turn_lock_holder(root, "ops")
+        assert holder is not None
+        assert holder["kind"] == "turn_lock"
+        assert holder["pid"] == os.getpid()
+        assert holder["profile"] == "ops"
+        assert holder["host"]
+        assert holder["alive"] is True, "the probe must see the live holder, not a guess"
+        assert 0 <= holder["age_seconds"] < 30
+    assert bot_relay.read_turn_lock_holder(root, "ops") is None
+    assert turn_lock_path(root, "ops").read_bytes() == b"", "release clears the record"
+
+
+def test_refusal_names_the_holder_and_its_age(root):
+    """The bounded refusal carries who held the turn and for how long (the SEV1 acceptance)."""
+    held, release = threading.Event(), threading.Event()
+    t = threading.Thread(
+        target=_hold_flock_with_holder,
+        args=(turn_lock_path(root, "default"), "default", held, release),
+        kwargs={"started_at": time.time() - 300},
+    )
+    t.start()
+    assert held.wait(timeout=5)
+    try:
+        with pytest.raises(TurnBusyError) as excinfo:
+            with acquire_turn_lock(root, "default", timeout_seconds=0.3):
+                pass  # pragma: no cover — must not acquire
+    finally:
+        release.set()
+        t.join(timeout=5)
+    err = excinfo.value
+    assert err.holder["pid"] == os.getpid()
+    assert err.holder["alive"] is True
+    assert err.holder["age_seconds"] is not None and err.holder["age_seconds"] >= 300
+    assert f"pid {os.getpid()}" in str(err)
+    assert "for 5m" in str(err), f"the refusal must state the holder's AGE: {err}"
+    payload = err.holder_payload()
+    assert payload["kind"] == "turn_lock"
+    assert payload["pid"] == os.getpid()
+    assert payload["profile"] == "default"
+    assert payload["alive"] is True
+
+
+def test_refusal_without_a_holder_record_stays_structured_target_busy(root):
+    """An older build's empty lockfile refuses exactly as before — unknown, never an error."""
+    held, release = threading.Event(), threading.Event()
+    t = threading.Thread(target=_hold_flock, args=(turn_lock_path(root, "ops"), held, release))
+    t.start()
+    assert held.wait(timeout=5)
+    try:
+        with pytest.raises(TurnBusyError) as excinfo:
+            with acquire_turn_lock(root, "ops", timeout_seconds=0.3):
+                pass  # pragma: no cover
+    finally:
+        release.set()
+        t.join(timeout=5)
+    err = excinfo.value
+    assert err.reason == "target_busy"
+    assert err.holder is None and err.holder_payload() == {}
+    assert "held by pid" not in str(err), "no pid is named when the lockfile carries no record"
+    assert str(err).endswith("Do not resend."), "nothing is appended for an unknown holder"
+    assert "Do not resend." in str(err)
+    assert "target_busy: turn slot held by another turn; delivery queued" in str(err)
+
+
+def test_a_stale_holders_record_is_reported_as_not_running(root, monkeypatch):
+    """A leftover record from a killed holder says so — that is not a live turn to wait behind."""
+    monkeypatch.setattr(bot_relay, "_pid_alive", lambda pid: False)
+    held, release = threading.Event(), threading.Event()
+    t = threading.Thread(
+        target=_hold_flock_with_holder,
+        args=(turn_lock_path(root, "default"), "default", held, release), kwargs={"pid": 4242},
+    )
+    t.start()
+    assert held.wait(timeout=5)
+    try:
+        with pytest.raises(TurnBusyError) as excinfo:
+            with acquire_turn_lock(root, "default", timeout_seconds=0.3):
+                pass  # pragma: no cover
+    finally:
+        release.set()
+        t.join(timeout=5)
+    err = excinfo.value
+    assert "pid 4242, no longer running" in str(err)
+    assert err.holder_payload()["alive"] is False
+
+
+def test_the_named_holder_can_be_reclaimed_and_the_queued_delivery_completes(tmp_path, root):
+    """ACCEPTANCE (t_4a32d803): a real, separate holder process is NAMED by the refusal, so
+    reclaiming exactly that process lets the queued delivery complete — no seat, gateway or
+    agent process is touched, and no human has to guess which pid wedged the profile."""
+    proc, pid = _spawn_holder_child(tmp_path, root, "default")
+    try:
+        with pytest.raises(TurnBusyError) as excinfo:
+            with acquire_turn_lock(root, "default", timeout_seconds=0.3):
+                pass  # pragma: no cover — the child holds it
+        err = excinfo.value
+        assert err.holder["pid"] == pid, "the refusal must name the OTHER process holding the seat"
+        assert err.holder["alive"] is True
+        assert f"pid {pid}" in str(err)
+
+        # Reclaim exactly the named holder (kill it); its fd closes and the kernel drops the flock.
+        proc.kill()
+        proc.wait(timeout=10)
+        assert proc.stdout is not None
+        proc.stdout.close()
+
+        start = time.monotonic()
+        with acquire_turn_lock(root, "default", timeout_seconds=5):
+            holder = bot_relay.read_turn_lock_holder(root, "default")
+            assert holder is not None and holder["pid"] == os.getpid()
+        assert time.monotonic() - start < 1.0, "the queued delivery must proceed, not wedge again"
+    finally:
+        if proc.poll() is None:  # pragma: no cover - the assertion path killed it
+            proc.kill()
+            proc.wait(timeout=10)
+
 
 
 def test_lock_path_is_short_and_sanitized(root):
@@ -144,8 +333,12 @@ def test_turn_wait_seconds_reads_config(monkeypatch):
 # ── wiring: local teammate delivery (tools/bot_mode_dm.py) ──────────────────
 
 
-def test_run_delivery_holds_profile_lock_during_turn(root, tmp_path, monkeypatch):
-    """The local `hermes -p <profile>` turn runs UNDER the profile lock."""
+def test_run_delivery_holds_the_bot_chat_lock_during_turn(root, tmp_path, monkeypatch):
+    """The local `hermes -p <profile>` delivery turn runs UNDER the profile's BOT CHAT lock.
+
+    …and only under that one (``t_47082c1d``): while the turn runs, a second delivery into the same
+    Bot Chat must fail, while a turn on another transcript of the same seat must not.
+    """
     home = root / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -154,10 +347,15 @@ def test_run_delivery_holds_profile_lock_during_turn(root, tmp_path, monkeypatch
     observed = {}
 
     def _fake_run(argv, **kwargs):
-        # While the turn runs, a second acquire on the same profile must fail.
+        # While the turn runs, a second acquire on the same transcript must fail…
         with pytest.raises(TurnBusyError):
-            with acquire_turn_lock(home, "ops", timeout_seconds=0.15):
+            with acquire_turn_lock(home, "ops", timeout_seconds=0.15,
+                                   session=bot_relay.BOT_CHAT_SESSION_KEY):
                 pass  # pragma: no cover
+        # …and a different transcript of the same profile is free.
+        with acquire_turn_lock(home, "ops", timeout_seconds=0.15,
+                               session=bot_relay.room_session_key("other-room")):
+            pass
         observed["argv"] = argv
 
         class _P:
@@ -174,12 +372,69 @@ def test_run_delivery_holds_profile_lock_during_turn(root, tmp_path, monkeypatch
     assert rc == 0
     assert observed["argv"][:3] == ["hermes", "-p", "ops"]
     # …and after the turn, the lock is free again.
-    with acquire_turn_lock(home, "ops", timeout_seconds=0.5):
+    with acquire_turn_lock(home, "ops", timeout_seconds=0.5,
+                           session=bot_relay.BOT_CHAT_SESSION_KEY):
         pass
 
 
+def test_turn_busy_message_says_queued_not_failed():
+    """§3.1/P10(a): a held turn slot queues the delivery — the old 'NOT delivered' text is gone.
+
+    The holder is additive (§2): with none known, the message is the LIVE one verbatim — the
+    durable-queue sentence, ``Do not resend.`` and the typed ``target_busy`` reason all survive.
+    """
+    from tools.bot_failure_reasons import delivery_failure_reason
+
+    error = TurnBusyError("ops", 0.05)
+    assert error.reason == "target_busy"
+    assert error.status_detail == "target_busy: turn slot held by another turn; delivery queued"
+    assert ("The delivery is durably queued; the receiver re-offers it when the turn slot frees "
+            "(status_detail: 'target_busy: turn slot held by another turn; delivery queued'). "
+            "Do not resend.") in str(error)
+    assert "NOT delivered" not in str(error) and "retry shortly" not in str(error)
+    assert delivery_failure_reason(error) == "target_busy"
+    # Unknown holder ⇒ nothing appended: the fragment is the ONLY difference (append at the END).
+    assert not str(error).endswith(" ")
+    assert error.holder is None and error.holder_payload() == {}
+
+    named = TurnBusyError("ops", 0.05, {"kind": "turn_lock", "pid": 1234, "age_seconds": 252.0,
+                                        "alive": True})
+    assert str(named) == str(error) + " — held by pid 1234 for 4m 12s"
+    assert delivery_failure_reason(named) == "target_busy"
+
+
+def test_delivery_turn_lock_probe_is_non_blocking(root, tmp_path, monkeypatch):
+    """P10(b)/§2.5 step 1: the delivery path probes with timeout 0 — a held lock raises now."""
+    home = root / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(bot_relay, "turn_wait_seconds", lambda: 30)  # must be irrelevant
+    held = threading.Event()
+    release = threading.Event()
+    t = threading.Thread(target=_hold_flock,
+                         args=(turn_lock_path(home, "ops", bot_relay.BOT_CHAT_SESSION_KEY),
+                               held, release))
+    t.start()
+    assert held.wait(timeout=5)
+    try:
+        started = time.monotonic()
+        with pytest.raises(TurnBusyError):
+            with acquire_delivery_turn_lock(home, "ops", bot_relay.BOT_CHAT_SESSION_KEY):
+                pass
+        assert time.monotonic() - started < 1.0, "the delivery probe must never wait"
+    finally:
+        release.set()
+        t.join(timeout=5)
+
+
 def test_delivery_main_reports_target_busy_json(root, tmp_path, monkeypatch, capsys):
-    """A queued delivery that exceeds its budget surfaces the structured error."""
+    """A delivery that cannot take the turn slot is RETAINED: the sender gets a receipt.
+
+    P9(b)/§3.1 — stdout carries the 24-field envelope, the exit code stays 0, and
+    ``target_busy`` appears only as the receipt's ``status_detail`` (never as a reason).
+    NEGATIVE CONTROL (§5.2, D2 "measured, never assumed"): this holder writes NO record — an
+    older build's empty lockfile — so ``holder`` stays ``None`` and ``detail`` is unchanged.
+    """
     home = root / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -190,7 +445,8 @@ def test_delivery_main_reports_target_busy_json(root, tmp_path, monkeypatch, cap
     held = threading.Event()
     release = threading.Event()
     t = threading.Thread(
-        target=_hold_flock, args=(turn_lock_path(home, "ops"), held, release)
+        target=_hold_flock,
+        args=(turn_lock_path(home, "ops", bot_relay.BOT_CHAT_SESSION_KEY), held, release)
     )
     t.start()
     assert held.wait(timeout=5)
@@ -198,14 +454,70 @@ def test_delivery_main_reports_target_busy_json(root, tmp_path, monkeypatch, cap
         rc = bot_mode_dm._delivery_main(
             ["--run-delivery", "query-file", str(dm), "hermes", "-p", "ops", "chat"]
         )
-        assert rc == 1
+        assert rc == 0
         payload = json.loads(capsys.readouterr().out.strip())
-        assert payload["reason"] == "target_busy"  # #93091 item-1 enum extension
-        assert "ops" in payload["error"]
+        assert payload["result"] == "receipt"
+        assert payload["status"] == "queued"
+        assert payload["status_detail"] == "target_busy: turn slot held by another turn; delivery queued"
+        assert payload["busy"] is True and payload["attempts"] == 0
+        assert payload["reason"] is None
+        assert payload["profile"] == "ops"
+        assert list(payload) == list(delivery_queue.ENVELOPE_FIELDS)  # §1.3 order, no extras
+        assert payload["holder"] is None, "no holder record ⇒ unknown, and `{}` is never printed"
+        assert payload["detail"] == delivery_queue.DETAIL_RECEIPT, "no fragment without a holder"
+        assert "reoffer_count" not in payload  # internal bookkeeping only
     finally:
         release.set()
         t.join(timeout=5)
-    assert not dm.exists(), "DM plaintext must be reclaimed even on refusal"
+    assert not dm.exists(), "DM plaintext must be reclaimed even when the delivery is retained"
+
+
+def test_delivery_main_names_the_holder_in_the_retained_receipt(root, tmp_path, monkeypatch, capsys):
+    """§5.1: a held slot's receipt NAMES the holder, in the envelope AND in the human text.
+
+    The sender agent reads the receipt's ``detail`` (the Desktop forwards only ``data.reason``
+    and the TEXT), so a receipt that reports "busy" without a name leaves the SEV1 gap open.
+    """
+    home = root / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(bot_relay, "turn_wait_seconds", lambda: 0.2)
+    dm = tmp_path / "dm.txt"
+    dm.write_text("hi", encoding="utf-8")
+
+    held = threading.Event()
+    release = threading.Event()
+    t = threading.Thread(
+        target=_hold_flock_with_holder,
+        args=(turn_lock_path(home, "ops", bot_relay.BOT_CHAT_SESSION_KEY), "ops", held, release),
+        kwargs={"started_at": time.time() - 90},
+    )
+    t.start()
+    assert held.wait(timeout=5)
+    try:
+        rc = bot_mode_dm._delivery_main(
+            ["--run-delivery", "query-file", str(dm), "hermes", "-p", "ops", "chat"]
+        )
+        assert rc == 0, "a held slot is a durable hand-off, never a failure"
+        payload = json.loads(capsys.readouterr().out.strip())
+    finally:
+        release.set()
+        t.join(timeout=5)
+
+    assert payload["result"] == "receipt"
+    assert payload["status"] == "queued"
+    assert payload["status_detail"] == delivery_queue.STATUS_DETAIL_TARGET_BUSY, "byte-identical"
+    assert payload["busy"] is True and payload["attempts"] == 0
+    assert payload["reason"] is None
+    assert list(payload) == list(delivery_queue.ENVELOPE_FIELDS)
+    holder = payload["holder"]
+    assert holder["kind"] == "turn_lock"
+    assert holder["pid"] == os.getpid(), "the REAL holder's pid"
+    assert holder["age_seconds"] >= 90
+    assert holder["alive"] is True
+    assert "held by pid" in payload["detail"], payload["detail"]
+    assert payload["detail"] == f"{delivery_queue.DETAIL_RECEIPT} — held by pid {os.getpid()} for 1m" \
+                                f" {int(holder['age_seconds']) % 60:02d}s"
 
 
 def test_peer_stdin_delivery_skips_local_lock(root, tmp_path, monkeypatch):
@@ -242,6 +554,9 @@ def test_peer_stdin_delivery_skips_local_lock(root, tmp_path, monkeypatch):
 
 
 # ── wiring: relay deliver RPC (tui_gateway/methods_bot_relay.py) ─────────────
+# The bound handler is driven in tests/tools/test_bot_relay_deliver_lane.py
+# (platforms("linux"): importing tui_gateway.server boots the gateway bootstrap).
+# What is asserted here is importable without that boot.
 
 
 def test_local_delivery_command_never_reenters_the_lock():
@@ -261,136 +576,17 @@ def test_local_delivery_command_never_reenters_the_lock():
     assert not any("bot_mode_dm" in part for part in argv)
 
 
-def test_relay_deliver_returns_target_busy_error(tmp_path, monkeypatch):
-    import tui_gateway.server as srv
-
-    h = tmp_path / "h"
-    (h / "profiles" / "ops").mkdir(parents=True)
-    (h / "profiles" / "ops" / "config.yaml").touch()  # identity marker: bare dirs are not profiles
-    monkeypatch.setenv("HERMES_HOME", str(h))
-    monkeypatch.setattr(bot_relay, "turn_wait_seconds", lambda: 0.2)
-
-    spawned = {}
-
-    # Deterministic spawn detection: sentinel argv from the exact factory the
-    # deliver handler uses. A global subprocess.run patch also intercepts
-    # unrelated gateway-init calls (git rev-parse / ls-remote in CI), so
-    # never fuzzy-match argv — mark the delivery command itself.
-    monkeypatch.setattr(
-        bot_relay, "local_delivery_command", lambda prof, tmp: ["__delivery__", prof]
-    )
-
-    def _fake_run(argv, **kwargs):
-        argv = list(argv or [])
-        if argv and argv[0] == "__delivery__":
-            spawned["argv"] = argv
-
-        class _Done:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-
-        return _Done()
-
-    monkeypatch.setattr("hermes_cli.quiet_single_query.run_reported_turn", _fake_run)
-
-    held = threading.Event()
-    release = threading.Event()
-    t = threading.Thread(
-        target=_hold_flock, args=(turn_lock_path(h, "ops"), held, release)
-    )
-    t.start()
-    assert held.wait(timeout=5)
-    try:
-        out = srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "x"})
-        assert "error" in out
-        assert out["error"]["code"] == 5096
-        assert "target_busy" in out["error"]["message"]
-        assert out["error"]["data"]["reason"] == "target_busy"
-        assert not spawned, "turn must not spawn while the profile is busy"
-    finally:
-        release.set()
-        t.join(timeout=5)
-
-
-def test_relay_deliver_serializes_then_succeeds(tmp_path, monkeypatch):
-    import tui_gateway.server as srv
-
-    h = tmp_path / "h"
-    (h / "profiles" / "ops").mkdir(parents=True)
-    (h / "profiles" / "ops" / "config.yaml").touch()  # identity marker: bare dirs are not profiles
-    monkeypatch.setenv("HERMES_HOME", str(h))
-    monkeypatch.setattr(bot_relay, "turn_wait_seconds", lambda: 5.0)
-
-    class _Proc:
-        returncode = 0
-        stdout = "pong"
-        stderr = ""
-
-    monkeypatch.setattr("hermes_cli.quiet_single_query.run_reported_turn", lambda *a, **k: _Proc())
-
-    held = threading.Event()
-    release = threading.Event()
-    t = threading.Thread(
-        target=_hold_flock, args=(turn_lock_path(h, "ops"), held, release)
-    )
-    t.start()
-    assert held.wait(timeout=5)
-    threading.Timer(0.3, release.set).start()
-    start = time.monotonic()
-    out = srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "x"})
-    t.join(timeout=5)
-    assert "error" not in out, out
-    assert out["result"]["reply"] == "pong"
-    assert time.monotonic() - start >= 0.2, "deliver should have queued"
-
-
 class _WithReason(RuntimeError):
     """An exception carrying its own ``reason``. ``reason`` is a stdlib attribute on
     ``ssl.SSLError`` and ``urllib.error.URLError`` too, so a refusal must not forward whatever
-    it finds there into a channel whose consumers expect a closed vocabulary."""
+    it finds there into a channel whose consumers expect a closed vocabulary.
+
+    Shared with ``tests/tools/test_bot_relay_deliver_lane.py``, which imports it from here.
+    """
 
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
-
-
-@pytest.mark.parametrize(
-    ("failure", "code", "reason"),
-    [
-        (TurnBusyError("ops", 0.2), 5096, "target_busy"),
-        (subprocess.TimeoutExpired(["hermes"], 600), 5093, "delivery_timeout"),
-        (RuntimeError("Error code: 401 - invalid api key"), 5094, "provider_auth_or_access"),
-        (RuntimeError("something nobody has a rule for"), 5094, "unknown"),
-        (_WithReason("CERTIFICATE_VERIFY_FAILED", "ssl handshake failed"), 5094, "unknown"),
-        (_WithReason("provider_quota_limit", "quota exhausted"), 5094, "provider_quota_limit"),
-    ],
-    ids=["busy", "turn-timed-out", "classifiable-failure", "unclassifiable-failure",
-         "reason-outside-the-vocabulary", "reason-inside-the-vocabulary"],
-)
-def test_every_relay_refusal_carries_its_typed_reason(tmp_path, monkeypatch, failure, code, reason):
-    """`data.reason` is the only channel the Desktop forwards: it reads `error.data.reason` and puts
-    it in the sender's reply file, and the sender re-classifies from free text otherwise — which can
-    never produce these codes. A refusal that ships only a JSON-RPC code reaches the sending agent as
-    `[reason: unknown]`, so it cannot tell "retry shortly" from an auth failure. The turn-failure
-    branch already did this; these three did not."""
-    import tui_gateway.server as srv
-
-    h = tmp_path / "h"
-    (h / "profiles" / "ops").mkdir(parents=True)
-    (h / "profiles" / "ops" / "config.yaml").touch()  # identity marker: bare dirs are not profiles
-    monkeypatch.setenv("HERMES_HOME", str(h))
-    monkeypatch.setattr(bot_relay, "local_delivery_command", lambda prof, tmp: ["__delivery__", prof])
-
-    def _raise(argv, **kwargs):
-        raise failure
-
-    monkeypatch.setattr("hermes_cli.quiet_single_query.run_reported_turn", _raise)
-
-    out = srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "x"})
-
-    assert out["error"]["code"] == code
-    assert out["error"]["data"]["reason"] == reason
 
 
 @pytest.mark.parametrize(

@@ -40,22 +40,28 @@ def resolve_chat_cwd(raw: Optional[str]) -> Optional[str]:
 
 def _collect_workspaces(profile: Optional[str], scan: bool) -> dict:
     # The dashboard hosts the in-process gateway (``web_server`` imports ``tui_gateway.server``
-    # at startup), so the sidebar's repo-discovery helpers are already bound there.
-    import tui_gateway.server as gateway
+    # at startup), and that import is what installs the split modules' bodies onto the gateway's
+    # globals (``method_ctx.bind_module``). Load it for that side effect, then reach the
+    # repo-discovery helpers through the modules that DEFINE them: the gateway only hosts them,
+    # and a reference to a hosted name is invisible to a static reader (tree preflight
+    # t_07408bf7, 2026-10-22).
+    import tui_gateway.server  # installs the split modules' bodies (imported for that side effect)
     from hermes_cli import projects_db as pdb
+    from tui_gateway import methods_projects as gateway_projects
+    from tui_gateway import session_workdir as gateway_workdir
 
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
         with pdb.connect_closing() as conn:
-            policy = gateway._repo_discovery_policy()
+            policy = gateway_projects._repo_discovery_policy()
             if scan and policy["enabled"]:
-                gateway._scan_discovered_repos_remote(conn, policy)
+                gateway_projects._scan_discovered_repos_remote(conn, policy)
             projects = [p.to_dict() for p in pdb.list_projects(conn)]
-            repos = gateway._discover_repos_payload(
+            repos = gateway_projects._discover_repos_payload(
                 db, conn=conn, backfill=False, include_cached=policy["enabled"])
     finally:
         db.close()
-    default_cwd = gateway._completion_cwd({"profile": profile} if profile else {})
+    default_cwd = gateway_workdir._completion_cwd({"profile": profile} if profile else {})
     return {
         "projects": projects, "repos": repos, "default_cwd": default_cwd,
         "home": str(Path.home()), "scan_enabled": bool(policy["enabled"])}

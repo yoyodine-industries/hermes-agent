@@ -2,17 +2,74 @@
 
 Ruamel's native schema includes bare y/n booleans and rejects duplicate keys.
 Every operation owns its parser/emitter; instances must not be shared by threads.
+
+The engine is ruamel.yaml, a declared dependency, resolved once, here. This module still imports
+where the engine cannot be imported, and every operation that needs it raises
+``YamlEngineUnavailable``: a caller must never receive a missing engine as a parse result. A
+caller that wants to branch deliberately asks ``engine_available()`` instead of being told.
 """
 
 from io import StringIO
+import sys
 from typing import Any, IO, overload
 
-from ruamel.yaml import YAML
-from ruamel.yaml.error import YAMLError as YAMLError
-from ruamel.yaml.resolver import VersionedResolver
+
+class YamlEngineUnavailable(RuntimeError):
+    """The YAML engine (ruamel.yaml) is not importable in this interpreter.
+
+    Raised by every operation that needs the engine. Treat it as NO ANSWER: never as an empty
+    document and never as a reason to fall back to a different parse — a parse that differs is
+    not a parse that degraded.
+    """
 
 
-class _Yaml11Resolver(VersionedResolver):
+class _NoEngineYamlError(Exception):
+    """Stand-in for the engine's parse error; nothing raises it while the engine is absent."""
+
+
+_ENGINE_IMPORT_ERROR: BaseException | None = None
+
+# Typed Any on purpose: these names must exist whether or not ruamel.yaml imports, and every use
+# of them sits behind _require_engine().
+ENGINE: str = ""
+YAML: Any = None
+YAMLError: Any = _NoEngineYamlError
+VersionedResolver: Any = None
+
+try:
+    from ruamel.yaml import YAML as _RuamelYAML
+    from ruamel.yaml.error import YAMLError as _RuamelYamlError
+    from ruamel.yaml.resolver import VersionedResolver as _RuamelResolver
+
+    YAML = _RuamelYAML
+    YAMLError = _RuamelYamlError
+    VersionedResolver = _RuamelResolver
+    ENGINE = "ruamel.yaml"
+except ImportError as exc:  # the engine may genuinely be absent in this interpreter
+    _ENGINE_IMPORT_ERROR = exc
+
+
+def engine_available() -> bool:
+    """True when this interpreter can parse and emit YAML at all."""
+    return YAML is not None
+
+
+def _require_engine() -> None:
+    """Fail loudly, naming this interpreter, instead of returning a different parse."""
+    if YAML is None:
+        raise YamlEngineUnavailable(
+            "ruamel.yaml is not importable in "
+            f"{sys.executable}: {_ENGINE_IMPORT_ERROR}. Install it in the interpreter that runs "
+            "this code (the harness declares it as a dependency); do not read a missing engine "
+            "as a document that parsed empty."
+        )
+
+
+# A missing engine must not change the shape of this module: the resolver is always a class.
+_ResolverBase: Any = VersionedResolver if VersionedResolver is not None else object
+
+
+class _Yaml11Resolver(_ResolverBase):
     # Quote strings like "off" without adding a %YAML directive to every config/snippet.
     @property
     def processing_version(self) -> tuple[int, int]:
@@ -31,6 +88,7 @@ def safe_load(stream: str | bytes | IO[str] | IO[bytes]) -> Any:
     The pure parser defines what parses: Windows ARM64 has no C extension, and libyaml rejects
     documents the pure parser accepts (``[{url: http://h}]``), so a C rejection is re-read pure.
     """
+    _require_engine()
     document = stream if isinstance(stream, (str, bytes)) else stream.read()
     try:
         return _load(document, pure=False)
@@ -62,6 +120,7 @@ def safe_dump(
     width: int = 80,
 ) -> str | None:
     """Write standard YAML data with readable Unicode and indented block lists."""
+    _require_engine()
     # The C emitter ignores sequence offsets and escapes astral Unicode.
     yaml = YAML(typ="safe", pure=True)
     yaml.Resolver = _Yaml11Resolver
@@ -88,6 +147,7 @@ ROUNDTRIP_YAML_WIDTH = 2**31 - 1
 
 def roundtrip_yaml() -> YAML:
     """Create a fresh comment/quote-preserving editor for user-authored YAML."""
+    _require_engine()
     yaml = YAML(typ="rt")
     yaml.width = ROUNDTRIP_YAML_WIDTH
     yaml.Resolver = _Yaml11Resolver

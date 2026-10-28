@@ -491,6 +491,36 @@ def _worktree_local_trunk(path: str, timeout: float = 5) -> Optional[str]:
     return None
 
 
+def _bare_anchor_published_refs(path: str, timeout: float = 5) -> Optional[list]:
+    """Refs that publish a worktree of a BARE canonical mirror, or None.
+
+    A bare mirror is a legal ``git worktree add`` anchor and it carries no
+    ``refs/remotes``: its own branch refs ARE its published line. Judging such
+    a worktree against the local trunk alone marks every tree cut from a
+    non-trunk mirror HEAD as unpushed forever (measured: the mirror's HEAD sat
+    on ``card-t_5892a108`` while ``main`` lagged), so card close never released
+    it.
+
+    Returns the anchor's refs EXCLUDING this worktree's own branch -- a branch
+    must never publish itself -- or None when *path* is not a worktree of a
+    bare repository. May raise like ``_git``.
+    """
+    common = _git_out(["rev-parse", "--path-format=absolute", "--git-common-dir"], path,
+                      timeout=timeout)
+    if not common:
+        return None
+    if _git_out(["rev-parse", "--is-bare-repository"], common, timeout=timeout) != "true":
+        return None
+    listed = _git_out(["for-each-ref", "--format=%(refname)"], path, timeout=timeout)
+    if listed is None:
+        return None
+    own_branch = _git_out(["symbolic-ref", "-q", "--short", "HEAD"], path, timeout=timeout)
+    own_ref = f"refs/heads/{own_branch}" if own_branch else None
+    refs = [ref for ref in (line.strip() for line in listed.splitlines())
+            if ref and ref != own_ref]
+    return refs or None
+
+
 def _worktree_merge_base_ref(path: str, timeout: float = 5) -> Optional[str]:
     """Ref merged work is judged against: ``origin/HEAD``/``origin/main``/``origin/master``, or the
     local trunk when the repo has no remote-tracking refs at all. None = nothing to compare
@@ -519,10 +549,20 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
             return True
         baseline = ["--remotes"]
         if not remote_refs:
-            trunk = _worktree_local_trunk(worktree_path, timeout=timeout)
-            if trunk is None:
-                return True
-            baseline = [trunk]
+            # A bare canonical mirror carries no ``refs/remotes``: its own branch
+            # refs ARE its published line. Baselining such a worktree on the local
+            # trunk alone marks every tree cut from a non-trunk mirror HEAD as
+            # unpushed forever (measured: the mirror's HEAD sat on
+            # ``card-t_5892a108`` while ``main`` lagged), so card close never
+            # released it. A normal repo keeps the local-trunk fallback.
+            anchor_refs = _bare_anchor_published_refs(worktree_path, timeout=timeout)
+            if anchor_refs:
+                baseline = anchor_refs
+            else:
+                trunk = _worktree_local_trunk(worktree_path, timeout=timeout)
+                if trunk is None:
+                    return True
+                baseline = [trunk]
         unpushed = _git_out(["log", "--oneline", "HEAD", "--not", *baseline], worktree_path,
                             timeout=timeout)
         return unpushed is None or bool(unpushed)

@@ -3,6 +3,7 @@
 import json
 import multiprocessing as mp
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -342,7 +343,7 @@ def test_restoring_from_archive_clears_timestamp(skills_home):
 
 def test_archive_and_restore_key_on_skill_name_not_directory_name(skills_home):
     """`mlops/training/accelerate` is the skill `huggingface-accelerate`: archive lands under the NAME,
-    and an older archive flattened under the directory name is still found by `restore_skill`."""
+    and restore puts it back where it came from (the ledger's origin), not at the tree root."""
     from tools.skill_usage import archive_skill, mark_agent_created, restore_skill
     skills_dir = skills_home / "skills"
     d = skills_dir / "training" / "accelerate"
@@ -355,12 +356,23 @@ def test_archive_and_restore_key_on_skill_name_not_directory_name(skills_home):
     assert (skills_dir / ".archive" / "huggingface-accelerate" / "SKILL.md").exists()
     ok, msg = restore_skill("huggingface-accelerate")
     assert ok, msg
+    assert (skills_dir / "training" / "accelerate" / "SKILL.md").exists(), msg
 
-    # Legacy layout: archived under the directory name by an older build.
-    (skills_dir / "huggingface-accelerate").rename(skills_dir / ".archive" / "accelerate")
+
+def test_restore_falls_back_to_a_flat_move_when_the_archive_leaves_no_origin(skills_home):
+    """A legacy archive flattened under the DIRECTORY name, with no ledger entry to say where it
+    lived, is still found by its frontmatter name — restored flat, and the message SAYS the
+    nesting is unknown instead of reporting a clean restore it cannot vouch for."""
+    from tools.skill_usage import restore_skill
+    skills_dir = skills_home / "skills"
+    legacy = skills_dir / ".archive" / "accelerate"
+    legacy.mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("---\nname: huggingface-accelerate\ndescription: x\n---\n", encoding="utf-8")
+
     ok, msg = restore_skill("huggingface-accelerate")
     assert ok, msg
     assert (skills_dir / "huggingface-accelerate" / "SKILL.md").exists()
+    assert "original nesting unknown" in msg
 
 
 def test_forget_removes_record(skills_home):
@@ -613,3 +625,136 @@ def test_skill_file_lock_is_reentrant_in_thread_and_exclusive_across_threads(tmp
         assert not other_done.wait(timeout=0.2), "second thread acquired a held lock"
     t.join(timeout=2)
     assert entered.is_set() and other_done.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Git-tracked guard — the threshold IS tracked-ness (card t_4c38630b)
+# ---------------------------------------------------------------------------
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"})
+
+
+def _tracked_skill(skills_home: Path, name: str = "demo", category: str = "yoyodine",
+                   remote: bool = True) -> tuple[Path, Path]:
+    """skills/<category>/<name> committed inside a git repo at the skills root."""
+    import tools.skill_usage as mod
+    skills_dir = skills_home / "skills"
+    repo = skills_dir
+    d = skills_dir / category / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: x\n---\n", encoding="utf-8")
+    (d / "reference.md").write_text("body\n", encoding="utf-8")
+    _git(repo, "init")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "seed")
+    if remote:
+        bare = skills_home.parent / "origin.git"
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+        _git(repo, "remote", "add", "origin", str(bare))
+    mod.mark_agent_created(name)
+    return repo, d
+
+
+def test_archiving_tracked_bytes_is_REFUSED_and_the_git_index_stays_clean(skills_home, monkeypatch):
+    """THE regression for the 2026-10-15 loss: a curator pass archived 8 skills out of a git
+    checkout. `git ls-files` going empty under the repo is only possible here if the guard fails."""
+    import tools.skill_usage as mod
+    monkeypatch.setattr(mod, "protect_git_tracked_enabled", lambda: True)
+    repo, d = _tracked_skill(skills_home)
+
+    ok, msg = mod.archive_skill("demo")
+
+    assert not ok
+    assert msg.startswith(mod.REFUSED_GIT_TRACKED)
+    assert str(repo) in msg and "2 tracked file(s)" in msg        # the repo and the count are named
+    assert "protect_git_tracked: false" in msg                    # remedy (2) is offered
+    assert d.is_dir() and (d / "SKILL.md").exists()               # nothing moved
+    assert (skills_home / "skills" / ".archive").exists() is False
+    assert subprocess.run(["git", "-C", str(repo), "ls-files", "yoyodine/demo"],
+                          capture_output=True, text=True).stdout.split() == [
+        "yoyodine/demo/SKILL.md", "yoyodine/demo/reference.md"]
+    assert subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", "yoyodine/demo"],
+                          capture_output=True, text=True).stdout.strip() == ""
+
+
+def test_the_guard_reports_the_remote_as_the_recovery_hint(skills_home, monkeypatch):
+    import tools.skill_usage as mod
+    monkeypatch.setattr(mod, "protect_git_tracked_enabled", lambda: True)
+    _tracked_skill(skills_home, remote=True)
+    msg = mod.git_tracked_refusal("demo")
+    assert msg and "origin" in msg and "checkout --" in msg
+
+
+def test_a_tracked_repo_without_a_remote_still_refuses(skills_home, monkeypatch):
+    """The threshold is TRACKED-NESS, not 'tracked with a remote': an unpushed repo loses the work
+    identically, so a remote-less repo must not read as safe."""
+    import tools.skill_usage as mod
+    monkeypatch.setattr(mod, "protect_git_tracked_enabled", lambda: True)
+    _tracked_skill(skills_home, remote=False)
+    msg = mod.git_tracked_refusal("demo")
+    assert msg and msg.startswith(mod.REFUSED_GIT_TRACKED) and "NO remote" in msg
+
+
+def test_a_skill_inside_a_repo_that_ignores_it_still_archives(skills_home, monkeypatch):
+    """Backwards compatibility, and the reason the predicate is `git ls-files` and not 'an ancestor
+    has a .git': the host ~/.hermes is a repo that ignores skills/, and those 1,300 skills keep
+    archiving exactly as before."""
+    import tools.skill_usage as mod
+    monkeypatch.setattr(mod, "protect_git_tracked_enabled", lambda: True)
+    skills_dir = skills_home / "skills"
+    (skills_dir / ".gitignore").write_text("yoyodine/\n", encoding="utf-8")
+    d = skills_dir / "yoyodine" / "ignored"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("---\nname: ignored\ndescription: x\n---\n", encoding="utf-8")
+    _git(skills_dir, "init")
+    _git(skills_dir, "add", ".gitignore")
+    _git(skills_dir, "commit", "-m", "ignore")
+    mod.mark_agent_created("ignored")
+    assert mod.git_tracked_info(d) is None
+
+    ok, msg = mod.archive_skill("ignored")
+    assert ok, msg
+    assert (skills_home / "skills" / ".archive" / "ignored" / "SKILL.md").exists()
+
+
+def test_untracked_skills_outside_any_repo_are_unaffected(skills_home, monkeypatch):
+    import tools.skill_usage as mod
+    monkeypatch.setattr(mod, "protect_git_tracked_enabled", lambda: True)
+    d = skills_home / "skills" / "yoyodine" / "loose"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("---\nname: loose\ndescription: x\n---\n", encoding="utf-8")
+    mod.mark_agent_created("loose")
+
+    ok, msg = mod.archive_skill("loose")
+    assert ok, msg
+    assert (skills_home / "skills" / ".archive" / "loose" / "SKILL.md").exists()
+
+
+def test_protect_git_tracked_off_lets_the_archive_through_and_records_the_deletion(skills_home, monkeypatch):
+    """The escape hatch is deliberate, not silent: the ledger entry names the repo and how many
+    tracked files left it, so the deletion stays attributable and recoverable."""
+    import hermes_cli.config as cfg
+    import tools.skill_ledger as ledger
+    import tools.skill_usage as mod
+    monkeypatch.setattr(cfg, "load_config", lambda: {"curator": {"protect_git_tracked": False}})
+    assert mod.protect_git_tracked_enabled() is False
+    repo, _ = _tracked_skill(skills_home)
+
+    ok, msg = mod.archive_skill("demo")
+
+    assert ok, msg
+    entry = next(e for e in ledger.list_entries(skill="demo") if e.get("action") == "archive")
+    assert entry["evidence"]["git"] == {"repo": str(repo), "tracked_removed": 2, "remote": entry["evidence"]["git"]["remote"]}
+    assert entry["evidence"]["origin_rel"] == "yoyodine/demo"
+
+
+def test_protect_git_tracked_defaults_on_when_the_config_is_silent(monkeypatch):
+    import hermes_cli.config as cfg
+    import tools.skill_usage as mod
+    monkeypatch.setattr(cfg, "load_config", dict)
+    assert mod.protect_git_tracked_enabled() is True
+    monkeypatch.setattr(cfg, "load_config", lambda: {"curator": {}})
+    assert mod.protect_git_tracked_enabled() is True

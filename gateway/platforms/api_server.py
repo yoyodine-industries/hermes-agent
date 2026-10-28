@@ -99,7 +99,8 @@ _CAPABILITY_ENDPOINTS = (
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
-    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")))
+    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")),
+    ("gate_state", ("GET", "/api/gate/state")))
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
 
@@ -137,13 +138,15 @@ from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
+from gateway.platforms import api_server_rooms as _rooms
+from gateway.platforms import api_server_bot_delivery as _bot_delivery
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
     validate_media_delivery_path)
-from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore, run_status_for
 from agent.i18n import t
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
@@ -236,6 +239,15 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 10.0
 API_SERVER_HEARTBEAT_SECONDS = 30.0
 API_SERVER_LATENCY_SAMPLE_LIMIT = 512
+# How long one counted unit may hold the agent-work gate before the gate's own
+# attribution names it as a suspected latch. Long turns are legitimate; a PENDING
+# admission (or a /v1/runs task) that has outlived any plausible turn is not, and it
+# must be visible as work-in-progress-with-a-holder rather than as an unattributable
+# number that refuses every caller (t_376b3fbd).
+API_SERVER_GATE_LATCH_SUSPECT_SECONDS = 1800.0
+# Bound on the gate's attribution registry. Diagnostics only -- the count is DERIVED
+# from the three terms, never from this registry, so a lost entry cannot latch the gate.
+API_SERVER_GATE_HOLDER_LIMIT = 256
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -926,6 +938,78 @@ _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextV
     "api_agent_request_reservation", default=None)
 
 
+def _request_route_label(request: Any) -> str:
+    """``METHOD path`` for a gate holder's attribution, tolerant of test doubles."""
+    method = str(getattr(request, "method", "") or "").upper()
+    path = str(getattr(request, "path", "") or "")
+    return f"{method} {path}".strip()
+
+
+def _gate_registry(adapter: Any) -> dict:
+    """The adapter's gate-attribution registry, created on demand (test doubles rarely
+    carry one, and a diagnostic must never be the reason a request fails)."""
+    registry = getattr(adapter, "_agent_gate_holders", None)
+    if registry is None:
+        registry = {}
+        try:
+            adapter._agent_gate_holders = registry
+        except Exception:
+            return registry
+    return registry
+
+
+def _gate_hold(adapter: Any, term: str, **fields: Any) -> Optional[str]:
+    """Record WHO holds one counted unit; returns the token that releases it.
+
+    Diagnostics only (t_376b3fbd): the gate's count is derived from the three terms, so
+    an entry lost here cannot latch the gate shut -- it only costs attribution.
+    """
+    token = f"{term}:{uuid.uuid4().hex}"
+    registry = _gate_registry(adapter)
+    entry = {"term": term, "started_at": time.time()}
+    entry.update({k: v for k, v in fields.items() if v not in (None, "")})
+    registry[token] = entry
+    while len(registry) > API_SERVER_GATE_HOLDER_LIMIT:
+        registry.pop(next(iter(registry)))
+    return token
+
+
+def _gate_release(adapter: Any, token: Optional[str]) -> None:
+    """Drop one holder entry (idempotent; a missing entry is not an error)."""
+    if not token:
+        return
+    registry = getattr(adapter, "_agent_gate_holders", None)
+    if isinstance(registry, dict):
+        registry.pop(token, None)
+
+
+def _gate_route_label(route: Any) -> str:
+    """A short, log-safe label for the route/alias a turn was admitted on."""
+    if isinstance(route, dict):
+        for key in ("name", "alias", "route", "platform"):
+            value = route.get(key)
+            if value:
+                return str(value)[:80]
+        return ""
+    return str(route or "")[:80]
+
+
+def _gate_holders_summary(snapshot: dict[str, Any], limit: int = 4) -> list[str]:
+    """The oldest few gate holders, in a shape that fits on one log line."""
+    holders = snapshot.get("holders") or []
+    summary: list[str] = []
+    for holder in holders[:limit]:
+        bits = [str(holder.get("term") or "?")]
+        for key in ("route", "profile", "session_id", "run_id"):
+            if holder.get(key):
+                bits.append(f"{key}={holder[key]}")
+        bits.append(f"held={holder.get('held_seconds')}s")
+        summary.append(" ".join(bits))
+    if len(holders) > limit:
+        summary.append(f"+{len(holders) - limit} more")
+    return summary
+
+
 def _admit_api_agent_request(handler):
     """Reserve an authenticated API turn before its handler first awaits: drain check +
     reservation in one non-awaiting block so a request admitted just before shutdown can't go
@@ -944,6 +1028,13 @@ def _admit_api_agent_request(handler):
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        # Attribution rides the reservation, so release stays exactly-once by construction
+        # (t_376b3fbd): whoever frees the slot also drops the holder entry.
+        match_info = getattr(request, "match_info", None)
+        reservation["gate_token"] = _gate_hold(
+            self, "pending_requests", route=_request_route_label(request),
+            profile=_api_request_profile.get() or "",
+            session_id=(match_info.get("session_id") if hasattr(match_info, "get") else "") or "")
         try:
             return await handler(self, request, *args, **kwargs)
         finally:
@@ -953,10 +1044,11 @@ def _admit_api_agent_request(handler):
 
 
 def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
-    """Release a pending-work reservation exactly once."""
+    """Release a pending-work reservation exactly once (slot AND its holder entry)."""
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        _gate_release(adapter, reservation.pop("gate_token", None))
 
 
 def _require_auth(handler):
@@ -974,7 +1066,8 @@ def _require_auth(handler):
 def _reserve_pending_api_work(adapter):
     """Keep externally-triggered background work visible across awaits; a handler may detach
     the reservation to a task whose done callback then owns release."""
-    reservation = {"active": True, "detached": False}
+    reservation = {"active": True, "detached": False,
+                   "gate_token": _gate_hold(adapter, "pending_requests", route="background")}
     adapter._pending_agent_requests += 1
     try:
         yield reservation
@@ -1160,6 +1253,18 @@ def _room_grant_delegate(name: str):
     return _handler
 
 
+def _rooms_delegate(name: str):
+    """Adapter method forwarding to ``api_server_rooms.<name>`` (call-time lookup) for the
+    read-only room surface: ``GET /api/rooms`` and ``GET /api/rooms/{room_id}/log``.
+
+    aiohttp passes ONLY the request to a registered handler (API handlers here read path
+    parameters from ``request.match_info``), so the room id travels the same way."""
+    async def _handler(self, request):
+        return await getattr(_rooms, name)(self, request, _api_server=sys.modules[__name__])
+    _handler.__name__ = name
+    return _handler
+
+
 def _run_route_delegate(name: str):
     """Adapter method forwarding to ``api_server_runs.<name>`` (call-time lookup) with this
     module's namespace as ``_api_server``."""
@@ -1167,6 +1272,23 @@ def _run_route_delegate(name: str):
         return await getattr(_api_runs, name)(self, request, _api_server=sys.modules[__name__])
     _handler.__name__ = name
     return _handler
+
+
+def _observed_turn_lock_holder(home: Any, profile: str) -> Optional[dict]:
+    """The current holder of ``profile``'s turn slot, as the §2 holder observation.
+
+    The slot this receipt reports as busy is held by a NON-queue holder as often as by a queued
+    delivery (a desktop or card session mid-turn takes the same relay lock), and the lockfile's own
+    published record is the only authority for who that is. Additive and best-effort: an
+    absent/unreadable record is *unknown* (None), never an error, so a receipt is never lost to it.
+    """
+    try:
+        from tools.bot_mode_probe import _hermes_root
+        from tools.bot_relay import BOT_CHAT_SESSION_KEY, read_turn_lock_holder
+
+        return read_turn_lock_holder(_hermes_root(Path(home)), profile, BOT_CHAT_SESSION_KEY)
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
@@ -1264,16 +1386,165 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._metrics_latency_ms: list[float] = []
         self._metrics_last_request_at: Optional[float] = None
         self._metrics_last_heartbeat_at: Optional[float] = None
+        # Gate attribution (t_376b3fbd): one entry per counted unit, keyed by a unique
+        # holder token. Diagnostics ONLY -- the count is derived from the three terms, never
+        # from this registry, so a lost entry cannot latch the gate and a stale one cannot
+        # keep it shut. ``_gate_saturation_since`` records the current saturation episode so
+        # one WARNING is emitted per episode (a refusal that logs nothing is invisible).
+        self._agent_gate_holders: dict[str, dict[str, Any]] = {}
+        self._gate_saturation_since: Optional[float] = None
+
+    # -- the agent-work gate: one arithmetic, one attribution, no latch ------------------
+
+    def _live_run_task_count(self) -> int:
+        """/v1/runs tasks still open. A task whose state cannot be read is NOT counted: a
+        terminated run must leave the gate (the latch this instrument exists to prevent)."""
+        tasks = getattr(self, "_active_run_tasks", None) or {}
+        live = 0
+        for task in tasks.values():
+            try:
+                if not task.done():
+                    live += 1
+            except Exception:  # noqa: BLE001 - an unreadable task is not live work
+                continue
+        return live
+
+    def _agent_work_terms(self) -> dict[str, int]:
+        """The three counted terms, measured NOW.
+
+        The gate's count is their SUM, so there is no separate counter that can drift from
+        the work it describes: a term that is released is a term that stops being counted.
+        Each term is clamped at zero so a double release can never push the gate negative
+        (a negative count would silently over-admit).
+        """
+        return {
+            "pending_requests": max(0, int(getattr(self, "_pending_agent_requests", 0) or 0)),
+            "inflight_turns": max(0, int(getattr(self, "_inflight_agent_runs", 0) or 0)),
+            "live_runs": self._live_run_task_count(),
+        }
 
     def active_agent_work_count(self) -> int:
         """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
         (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
         try:
-            return (int(getattr(self, "_pending_agent_requests", 0))
-                    + int(self._inflight_agent_runs)
-                    + sum(not task.done() for task in self._active_run_tasks.values()))
+            return sum(self._agent_work_terms().values())
         except Exception:
             return 0
+
+    def _agent_gate_snapshot(self, *, subtract_current_request: bool = False) -> dict[str, Any]:
+        """Read-only, side-effect-free state of the agent-work admission gate.
+
+        ``count``/``limit`` are the published numbers; ``terms`` names every counted unit
+        and ``holders`` attributes each one (term / route / profile / session / started_at),
+        so a saturated gate is diagnosable without a gateway bounce. Nothing is cached and
+        nothing is latched: every call re-measures, which is what makes a printed count
+        evidence rather than a claim.
+        """
+        terms = self._agent_work_terms()
+        count = sum(terms.values())
+        if subtract_current_request:
+            # The calling request's own reservation must never consume its last slot.
+            reservation = _api_agent_request_reservation.get()
+            if reservation and reservation.get("active"):
+                count -= 1
+        limit = int(getattr(self, "_max_concurrent_runs", 0) or 0)
+        now = time.time()
+        holders: list[dict[str, Any]] = []
+        registry = getattr(self, "_agent_gate_holders", None) or {}
+        for entry in list(registry.values()):
+            started = float(entry.get("started_at") or 0.0)
+            held = round(max(0.0, now - started), 3)
+            holders.append({
+                **{k: v for k, v in entry.items() if k != "started_at"},
+                "started_at": self._iso_timestamp(started),
+                "held_seconds": held,
+                "suspect_latch": held > API_SERVER_GATE_LATCH_SUSPECT_SECONDS,
+            })
+        # /v1/runs registers its tasks, not its holders: attribute those from the run's own
+        # status row so every term in the count has a name attached to it.
+        run_statuses = getattr(self, "_run_statuses", None) or {}
+        for run_id, task in list((getattr(self, "_active_run_tasks", None) or {}).items()):
+            try:
+                if task.done():
+                    continue
+            except Exception:  # noqa: BLE001 - unreadable task is already uncounted
+                continue
+            status = run_statuses.get(run_id) or {}
+            created = float(status.get("created_at") or 0.0)
+            held = round(max(0.0, now - created), 3) if created else 0.0
+            holders.append({
+                "term": "live_runs",
+                "route": str(status.get("route") or "POST /v1/runs"),
+                "profile": str(status.get("profile") or ""),
+                "session_id": str(status.get("session_id") or ""),
+                "run_id": run_id,
+                "started_at": self._iso_timestamp(created) if created else None,
+                "held_seconds": held,
+                "suspect_latch": bool(created and
+                                      held > API_SERVER_GATE_LATCH_SUSPECT_SECONDS),
+            })
+        holders.sort(key=lambda holder: holder.get("held_seconds") or 0.0, reverse=True)
+        return {
+            "enabled": limit > 0,
+            "limit": limit,
+            "count": count,
+            "terms": terms,
+            "available": (max(0, limit - count) if limit > 0 else None),
+            "saturated": bool(limit > 0 and count >= limit),
+            "holders": holders,
+            # Counted units with no live holder entry: the number that WOULD betray a latch.
+            "unattributed": max(0, count - len(holders)),
+            "suspect_latch": [h for h in holders if h["suspect_latch"]],
+        }
+
+    def _agent_gate_has_room(self) -> bool:
+        """True when one more agent turn may START right now, measured (never latched).
+
+        A caller inside an admitted request subtracts its own reservation exactly as the 429
+        gate does, so a request never counts itself out of its own slot.
+        """
+        snapshot = self._agent_gate_snapshot(subtract_current_request=True)
+        if not snapshot["enabled"]:
+            return True
+        return snapshot["count"] < snapshot["limit"]
+
+    def _note_gate_saturation(self, snapshot: dict[str, Any]) -> None:
+        """One WARNING per saturation episode, one INFO when it clears.
+
+        The 429 used to be logged NOWHERE (0 hits in gateway.log, gateway.launchd.log and
+        errors.log while 9/9 lanes were refused), so a saturated cap was undiagnosable. The
+        episode markers are bookkeeping for the log, never for the count.
+        """
+        saturated = bool(snapshot.get("saturated"))
+        since = getattr(self, "_gate_saturation_since", None)
+        if saturated:
+            if since is None:
+                self._gate_saturation_since = time.time()
+                logger.warning(
+                    "[api_server] agent-work gate SATURATED: count=%s limit=%s terms=%s "
+                    "holders=%s (refusals are logged per request)",
+                    snapshot.get("count"), snapshot.get("limit"), snapshot.get("terms"),
+                    _gate_holders_summary(snapshot))
+            return
+        if since is not None:
+            self._gate_saturation_since = None
+            logger.info(
+                "[api_server] agent-work gate recovered: count=%s limit=%s after %.1fs",
+                snapshot.get("count"), snapshot.get("limit"), max(0.0, time.time() - since))
+
+    def _log_gate_refusal(self, snapshot: dict[str, Any], *, route: str,
+                          target_profile: str) -> None:
+        """Log one refusal with everything needed to attribute it (t_376b3fbd).
+
+        ``count`` is measured with the refusing request's own reservation already subtracted,
+        so it reads as "slots held by everyone else"; ``holders`` names them.
+        """
+        logger.warning(
+            "[api_server] agent-work gate refused %s for profile=%s: count=%s limit=%s "
+            "terms=%s holders=%s",
+            route or "unknown-route", target_profile or "unknown",
+            snapshot.get("count"), snapshot.get("limit"), snapshot.get("terms"),
+            _gate_holders_summary(snapshot))
 
     def interrupt_active_runs(self, reason: str) -> int:
         """Interrupt every adapter-owned agent during shutdown (they are not in
@@ -1326,7 +1597,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _readiness_work_counts(self) -> tuple[int, int, int]:
         """Return bounded work counts from each subsystem's public state."""
-        active_api_runs = self._active_structured_run_count()
+        # R5: readiness reports R1's live number, so /health/detailed and the published
+        # metrics can never disagree about how much api work is executing.
+        active_api_runs = self._live_api_run_count()
         process_depth = 0
         active_delegations = 0
         with suppress(Exception):
@@ -1337,14 +1610,29 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             active_delegations = active_count()
         return active_api_runs, process_depth, active_delegations
 
-    def _active_structured_run_count(self) -> int:
-        """Count structured runs that still have executable work."""
+    def _nonterminal_run_row_count(self) -> int:
+        """Count the RUN ROWS in {queued, running, waiting_for_approval, stopping} — the CENSUS.
+
+        Named for what it measures: rows, not live tasks (t_5976163f R2). A status string is
+        a report, not a handle, so this number may only ever be published as ``active_rows``:
+        ``active_rows > active_runs`` is the leak signal, never a liveness figure.
+        """
         # "stopping" is not terminal: executor work continues until the agent notices.
         return sum(
             1
             for status in self._run_statuses.values()
             if status.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
         )
+
+    def _live_api_run_count(self) -> int:
+        """R1's ONE arithmetic for "live api work": live run tasks + in-flight inline turns.
+
+        No status string enters this arithmetic. ``_live_run_task_count`` is the gate's own
+        task census and ``_inflight_agent_runs`` counts the inline bot/chat turns the gate
+        counts too (they are deliberately not task entries) — so a row whose last writer died
+        can never be published as executing work.
+        """
+        return self._live_run_task_count() + max(0, int(getattr(self, "_inflight_agent_runs", 0) or 0))
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1409,13 +1697,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         index = max(0, min(len(ordered) - 1, int(len(ordered) * 0.95 + 0.999999) - 1))
         return round(ordered[index], 2)
 
-    def _api_server_status_payload(self, *, heartbeat_at: Optional[float] = None) -> dict[str, Any]:
+    def _api_server_status_payload(self, *, heartbeat_at: Optional[float] = None,
+                                   gate: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         self._reset_metrics_if_needed()
         heartbeat = self._metrics_last_heartbeat_at if heartbeat_at is None else heartbeat_at
         return {
             "host": self._host,
             "port": self._port,
-            "active_runs": self._active_structured_run_count() + self._inflight_agent_runs,
+            "active_runs": self._live_api_run_count(),
+            # The non-terminal ROW census, named as rows (R2): a leaked row can only move this
+            # number, and `active_rows > active_runs` is the leak signal an ops seat reads.
+            "active_rows": self._nonterminal_run_row_count(),
+            # The AGENT-WORK gate as the limiter itself sees it (t_376b3fbd): ``count`` vs
+            # ``limit`` and the holders that make the count up. ``active_runs`` is executing
+            # work; ``agent_work_gate`` is admitted-or-admitting vs limit; ``active_rows`` is
+            # the row census, which a leaked row inflates without any work behind it.
+            "agent_work_gate": (gate if gate is not None else self._agent_gate_snapshot()),
             "stored_runs": len(self._run_statuses),
             "last_request_at": self._iso_timestamp(self._metrics_last_request_at),
             "last_heartbeat": self._iso_timestamp(heartbeat),
@@ -1430,10 +1727,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _publish_runtime_status(self) -> None:
         self._metrics_last_heartbeat_at = time.time()
+        gate = self._agent_gate_snapshot()
+        # One WARNING per saturation episode, one INFO when it clears (t_376b3fbd): the
+        # heartbeat is the one clock that runs whether or not anyone is being refused, so a
+        # gauge sitting above its own ceiling cannot stay silent.
+        with suppress(Exception):
+            self._note_gate_saturation(gate)
         self._write_runtime_status_safe(
             "api_server_heartbeat",
             platform_state="connected" if self.is_connected else "disconnected",
-            platform_metrics=self._api_server_status_payload(),
+            platform_metrics=self._api_server_status_payload(gate=gate),
         )
 
     def _record_api_metrics(self, usage: Optional[dict[str, Any]], latency_seconds: float) -> None:
@@ -1721,6 +2024,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         routes: list[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
+            # Read-only attribution for the agent-work gate (t_376b3fbd): who holds the
+            # slots, for how long, and whether any of it is old enough to be a latch.
+            ("GET", "/api/gate/state", self._handle_gate_state),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
@@ -1759,6 +2065,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
+        routes.extend(_rooms._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
@@ -2470,6 +2777,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "exit_reason": runtime.get("exit_reason"),
             # Contract: RFC3339 string | null, never a number (legacy epoch floats exist).
             "updated_at": normalize_updated_at(runtime.get("updated_at")), "pid": os.getpid()})
+
+    @_require_auth
+    async def _handle_gate_state(self, request: web.Request) -> web.Response:
+        """GET /api/gate/state — read-only attribution for the AGENT-WORK gate.
+
+        The 429 has no diagnostic surface of its own, so a saturated cap used to be
+        undiagnosable (t_376b3fbd). This endpoint re-measures on every call and returns the
+        count/limit pair the limiter itself uses, the term breakdown, and one entry per
+        counted unit (term / route / profile / session / run id / held_seconds). Entries
+        older than ``API_SERVER_GATE_LATCH_SUSPECT_SECONDS`` are flagged in
+        ``suspect_latch``. Read-only by construction: no reset, no eviction, no latch.
+        """
+        snapshot = self._agent_gate_snapshot()
+        snapshot["at"] = self._iso_timestamp(time.time())
+        return web.json_response({"object": "hermes.gate.state", **snapshot})
 
     @_require_auth
     async def _handle_models(self, request: web.Request) -> web.Response:
@@ -3415,6 +3737,438 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "user_message": user_message, "runtime_request": runtime_request,
             "lock_active": lock_active, "run_kwargs": run_kwargs}, None
 
+    # ------------------------------------------------------------------
+    # Peer delivery ("bot send"): admission (§4.6), the acceptance receipt
+    # (§3.2) and the in-call turn probe (§2.5, §2.7 curve 1). Additive: a chat
+    # request without the two delivery headers keeps its exact former shape.
+    # ------------------------------------------------------------------
+    BOT_SEND_KEY_HEADER = "Idempotency-Key"
+    BOT_SEND_SENDER_HEADER = "X-Hermes-Sender-Profile"
+    BOT_SEND_WAIT_HEADER = "X-Hermes-Wait-Seconds"
+    #: Delivery statuses (ENUM B) that are terminal: never run another turn.
+    _BOT_SEND_TERMINAL_STATUSES = frozenset(
+        {"delivered", "failed", "expired", "cancelled", "ambiguous"})
+
+    def _bot_send_request(self, request: "web.Request") -> Optional[Dict[str, Any]]:
+        """Parse a peer-delivery request, or ``None`` for an ordinary chat turn.
+
+        A request is a delivery only when it carries BOTH ``Idempotency-Key`` and
+        ``X-Hermes-Sender-Profile``; every other caller keeps the pre-existing
+        semantics -- no queue record, no idempotency row, no receipt.
+        """
+        key = (request.headers.get(self.BOT_SEND_KEY_HEADER) or "").strip()
+        sender = (request.headers.get(self.BOT_SEND_SENDER_HEADER) or "").strip()
+        if not key or not sender:
+            return None
+        return {
+            "idempotency_key": key,
+            "sender_profile": re.sub(r"[^A-Za-z0-9_.@-]", "_", sender)[:64] or "unknown",
+            "wait_seconds": self._bot_send_wait_seconds(request),
+        }
+
+    def _bot_send_wait_seconds(self, request: "web.Request") -> float:
+        """The caller's budget (``X-Hermes-Wait-Seconds``) in seconds (§2.9)."""
+        raw = (request.headers.get(self.BOT_SEND_WAIT_HEADER) or "").strip()
+        try:
+            return max(0.0, float(raw)) if raw else 0.0
+        except ValueError:
+            return 0.0
+
+    def _bot_send_home(self) -> Path:
+        """The home whose ``runtime/bot_delivery`` queue serves this request.
+
+        A request routed to a named profile queues in THAT profile's home, so the
+        request scope wins over the ambient ``HERMES_HOME``.
+        """
+        from hermes_cli.profiles import get_profile_dir
+        from tools.bot_mode_probe import _default_home
+
+        profile = _api_request_profile.get()
+        if profile and profile != "default":
+            try:
+                return Path(get_profile_dir(profile))
+            except Exception:  # pragma: no cover -- unknown profile name
+                logger.debug("[api_server] unknown delivery profile %r", profile, exc_info=True)
+        return Path(_default_home())
+
+    @staticmethod
+    def _bot_send_target_profile(home: Path) -> str:
+        from tools.bot_mode_probe import _profile_name
+
+        return _profile_name(home)
+
+    @staticmethod
+    def _bot_send_stored_status(stored: Optional[Dict[str, Any]]) -> str:
+        """The delivery status recorded on the idempotency row (§4.5), if any."""
+        projection = (stored or {}).get("status") or {}
+        return str(projection.get("delivery_status") or "")
+
+    def _bot_send_projection(self, request: "web.Request", delivery_id: str,
+                             stored: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The freshest delivery projection for this id: live row, else the reserve."""
+        return (self._durable_run_status(request, delivery_id)
+                or (stored or {}).get("status") or {})
+
+    @staticmethod
+    def _bot_send_status_record(
+        projection: Dict[str, Any], *, delivery_id: str, idempotency_key: str,
+        target_profile: str, sender_profile: str, session_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """A queue-record-shaped view of a registry row whose queue file is gone.
+
+        The row carries the sender-visible projection (§4.5), so a terminal delivery
+        whose settled file was swept replays honestly instead of looking like a
+        failure -- and never re-runs a turn that already happened.
+        """
+        created = float(projection.get("created_at") or time.time())
+        return {
+            "delivery_id": delivery_id,
+            "idempotency_key": idempotency_key,
+            "fingerprint": None,
+            "sender_profile": sender_profile,
+            "target_profile": target_profile,
+            "target_session_id": projection.get("session_id") or session_id,
+            "message": None,
+            "status": str(projection.get("delivery_status") or "queued"),
+            "status_detail": projection.get("status_detail"),
+            "attempts": int(projection.get("attempts") or 0),
+            "reoffer_count": 0,
+            "queue_position": None,
+            "created_at": int(created * 1e9),
+            "updated_at": int(time.time() * 1e9),
+            "claimed_at": None,
+            "attempts_log": [],
+            "reply": projection.get("reply") or None,
+            "error": projection.get("error") or None,
+            "reason": projection.get("reason") or None,
+            # Which cap refused the send, for the envelope's queue_full detail
+            # (VERIFICATION D6). Absent, the detail defaults to the per-profile cap.
+            "limit_kind": projection.get("limit_kind"),
+            "limit": projection.get("limit"),
+            "sequence": 0,
+        }
+
+    def _bot_send_record_status(
+        self, delivery_id: str, record: Dict[str, Any], *, result: str,
+        reply: Optional[str] = None, error: Optional[str] = None,
+    ) -> None:
+        """Keep the registry row's delivery projection in step with the record (§4.5)."""
+        from tools import bot_delivery_queue as delivery_queue
+
+        status = str(record.get("status") or delivery_queue.STATUS_QUEUED)
+        self._set_run_status(
+            delivery_id, run_status_for(status),
+            kind="bot_send", delivery_status=status,
+            status_detail=record.get("status_detail"), result=result,
+            attempts=int(record.get("attempts", 0)),
+            queued_seconds=round(delivery_queue.queued_seconds(record), 3),
+            reply=reply if reply is not None else (record.get("reply") or ""),
+            error=error if error is not None else (record.get("error") or ""),
+            reason=record.get("reason") or "",
+            session_id=record.get("target_session_id"),
+            retention_until=self._bot_send_retention_until())
+
+    @staticmethod
+    def _bot_send_json(envelope: Dict[str, Any]) -> "web.Response":
+        return web.json_response(envelope)
+
+    @staticmethod
+    def _bot_send_conflict() -> "web.Response":
+        return _error_response(
+            "Idempotency-Key is already used for a different message on this peer.",
+            409, code="idempotency_key_conflict")
+
+    def _bot_send_retention_until(self) -> float:
+        """Registry retention for a delivery row (VERIFICATION D4).
+
+        Every other run row carries the requesting room's retention; delivery rows
+        were reserved with ``retention_until=0``, which does not pin them to that
+        window: the store reaps them on the default age window (``updated_at < now
+        - RETENTION_SECONDS``) and a zero value is never extended by a later write,
+        so a sender still polling ``hermes peer status <delivery_id>`` could get 404
+        "Run not found" for a delivery the receiver had accepted. Pinning the row to
+        the registry's own window -- extended on every status write -- makes the
+        delivery handle live exactly as long as any other run handle.
+        """
+        return time.time() + RunIdempotencyStore.RETENTION_SECONDS
+
+    def _bot_send_receipt(self, delivery_id: str, record: Dict[str, Any], *,
+                          waited: float, home: Any,
+                          status_detail: Optional[str] = None) -> "web.Response":
+        """Hand back the acceptance receipt for a still-queued delivery (§3.2).
+
+        ``status_detail`` overrides the OBSERVED slot state when the cause is known to this
+        caller and not readable from the queue — the agent-work cap being full (t_376b3fbd):
+        probing the turn lock would report a free slot and blame a backlog that does not
+        exist.
+        """
+        from tools import bot_delivery_queue as delivery_queue
+
+        observed = status_detail or delivery_queue.STATUS_DETAIL_TARGET_BUSY
+        holder: Optional[dict] = None
+        if record.get("status") == delivery_queue.STATUS_QUEUED:
+            # Report the slot state OBSERVED here, not the one assumed on admission
+            # (VERIFICATION D2). With the slot free the honest cause is "queued
+            # behind earlier deliveries"; claiming "target busy" would be a claim
+            # the sender can disprove from the same second, and it is the claim
+            # that made a 53-deep backlog look like one busy turn.
+            target_profile = str(
+                record.get("target_profile") or self._bot_send_target_profile(home))
+            observed = status_detail or delivery_queue.observed_detail(home, target_profile)
+            record = delivery_queue.mark_contended(
+                home, delivery_id, status_detail=observed) or record
+            if observed == delivery_queue.STATUS_DETAIL_TARGET_BUSY:
+                # A held slot names its holder (§2): the sender reads the receipt's `detail`, so
+                # without it the fleet's dominant delivery surface reports "busy" and nobody.
+                holder = _observed_turn_lock_holder(home, target_profile)
+        envelope = delivery_queue.build_receipt(
+            record,
+            busy=observed == delivery_queue.STATUS_DETAIL_TARGET_BUSY,
+            waited_seconds=waited,
+            holder=holder)
+        self._bot_send_record_status(delivery_id, record,
+                                     result=delivery_queue.RESULT_RECEIPT)
+        return self._bot_send_json(envelope)
+
+    async def _handle_bot_send(
+        self, request: "web.Request", ctx: Dict[str, Any], bot_send: Dict[str, Any],
+        *, may_run_inline: bool = True,
+    ) -> "web.Response":
+        """Admission (§4.6) + the in-call turn probe (§2.5, §2.7 curve 1).
+
+        ``may_run_inline`` is the AGENT-WORK gate's answer for this request (t_376b3fbd).
+        Admission is unconditional — the record is durably written either way — but when the
+        cap is full the in-call turn is NOT started: the receiver's drainer runs it when a
+        slot frees, and the receipt says exactly that instead of claiming a busy slot.
+        """
+        from hermes_cli import delivery_keys
+        from tools import bot_delivery_queue as delivery_queue
+
+        store = getattr(self, "_run_idempotency_store", None)
+        if store is None:  # pragma: no cover -- every real gateway installs one
+            return _error_response("This gateway has no delivery registry.", 503,
+                                   code="delivery_unavailable")
+        home = self._bot_send_home()
+        target_profile = self._bot_send_target_profile(home)
+        sender_profile = bot_send["sender_profile"]
+        session_id = str(ctx["session_id"])
+        message = ctx["user_message"]
+        if not isinstance(message, str):
+            # A queued record must be replayable verbatim by the drainer; multimodal
+            # payloads cannot be fingerprinted yet, so refuse them visibly.
+            return _error_response("A peer delivery requires a text message.", 400,
+                                   code="invalid_payload")
+        try:
+            idempotency_key = delivery_queue.validate_idempotency_key(
+                bot_send["idempotency_key"])
+        except ValueError:
+            return _error_response(
+                "Idempotency-Key must be 1-255 characters without control newlines.",
+                400, code="invalid_idempotency_key")
+
+        scope = self._run_idempotency_scope(request)
+        fingerprint = delivery_keys.delivery_fingerprint(
+            sender_profile, target_profile, session_id, message)
+        delivery_id = delivery_keys.delivery_id_from(scope, idempotency_key)
+
+        # --- step 2: lookup. A duplicate learns the original id; a key whose work
+        # already started is never re-run (§4.6, §4.9).
+        outcome, stored = store.lookup(scope, idempotency_key, fingerprint)
+        if outcome == "conflict":
+            return self._bot_send_conflict()
+        replayed = outcome == "reused" and stored is not None
+        if replayed:
+            record = delivery_queue.read_record(home, delivery_id)
+            if record is not None and record.get("status") != delivery_queue.STATUS_AMBIGUOUS:
+                return self._bot_send_json(
+                    delivery_queue.build_envelope(record, replayed=True))
+            if record is None and self._bot_send_stored_status(stored) in (
+                    self._BOT_SEND_TERMINAL_STATUSES):
+                # Finished (or died) and its settled file has since been swept: replay
+                # the registry's own projection -- never a second turn.
+                return self._bot_send_json(delivery_queue.build_envelope(
+                    self._bot_send_status_record(
+                        self._bot_send_projection(request, delivery_id, stored),
+                        delivery_id=delivery_id, idempotency_key=idempotency_key,
+                        target_profile=target_profile, sender_profile=sender_profile,
+                        session_id=session_id),
+                    replayed=True))
+            # `ambiguous`, or a reservation whose queue record never landed (a crash
+            # between admission steps 4 and 5): exactly ONE recovery replay is
+            # permitted, and only under this same key (§4.9 rules 1-2).
+            if record is not None:
+                recovered = delivery_queue.reoffer_ambiguous(home, delivery_id)
+                if recovered is None:
+                    return self._bot_send_json(delivery_queue.build_envelope(
+                        delivery_queue.read_record(home, delivery_id) or record,
+                        replayed=True))
+
+        # --- step 3: capacity. An overflow takes NO reservation, which is what makes
+        # the sender's next action unambiguous (§2.4, §5.3).
+        try:
+            delivery_queue.check_capacity(
+                home, target_profile=target_profile, sender_profile=sender_profile)
+        except delivery_queue.QueueFullError as exc:
+            return self._bot_send_json(delivery_queue.build_envelope(
+                self._bot_send_status_record(
+                    {"delivery_status": delivery_queue.STATUS_FAILED,
+                     "reason": "queue_full", "created_at": time.time(),
+                     # VERIFICATION D6: name the cap that actually fired (per-sender
+                     # vs per-profile), not the historical per-profile default.
+                     "limit_kind": getattr(exc, "limit_kind", None),
+                     "limit": getattr(exc, "limit", None)},
+                    delivery_id=delivery_id, idempotency_key=idempotency_key,
+                    target_profile=target_profile, sender_profile=sender_profile,
+                    session_id=session_id)))
+
+        # --- step 4: reserve the delivery id as its own registry row (it is also its
+        # run_id, §4.5), then step 5 enqueues: a receipt is never handed out for work
+        # that was not durably recorded (§4.6).
+        # The slot state OBSERVED at admission (VERIFICATION D2): the receipt the
+        # sender gets carries this value, so it is measured, never assumed -- a
+        # default of "target busy" is what dressed a queue backlog up as one
+        # busy turn. A full AGENT-WORK gate is the observed cause when the in-call
+        # turn was not admitted (t_376b3fbd), and it outranks the turn-lock probe.
+        observed_detail = (
+            delivery_queue.STATUS_DETAIL_ADMISSION_CAP if not may_run_inline
+            else delivery_queue.observed_detail(home, target_profile))
+        reservation = self._set_run_status(
+            delivery_id, run_status_for(delivery_queue.STATUS_QUEUED),
+            kind="bot_send", created_at=time.time(),
+            delivery_status=delivery_queue.STATUS_QUEUED,
+            # The slot state OBSERVED at admission (VERIFICATION D2): the receipt the
+            # sender gets carries this value, so it is measured, never assumed -- a
+            # default of "target busy" is what dressed a queue backlog up as one
+            # busy turn.
+            status_detail=observed_detail,
+            result=delivery_queue.RESULT_RECEIPT, attempts=0, queued_seconds=0.0,
+            reply="", error="", reason="", session_id=session_id,
+            model=self._model_name, ttl_seconds=delivery_queue.queue_ttl_seconds(),
+            retention_until=self._bot_send_retention_until())
+        outcome, stored = store.reserve(
+            scope, idempotency_key, fingerprint, delivery_id, reservation,
+            owner_pid=getattr(self, "_run_owner_pid", 0),
+            owner_started=getattr(self, "_run_owner_started", 0),
+            retention_until=self._bot_send_retention_until())
+        if outcome == "conflict":
+            return self._bot_send_conflict()
+        if outcome == "reused":
+            # Lost the 2 -> 4 race against a concurrent first sender.
+            existing = delivery_queue.read_record(home, delivery_id)
+            if existing is not None:
+                return self._bot_send_json(
+                    delivery_queue.build_envelope(existing, replayed=True))
+            return self._bot_send_json(delivery_queue.build_envelope(
+                self._bot_send_status_record(
+                    self._bot_send_projection(request, delivery_id, stored),
+                    delivery_id=delivery_id, idempotency_key=idempotency_key,
+                    target_profile=target_profile, sender_profile=sender_profile,
+                    session_id=session_id),
+                replayed=True))
+        self._run_idempotency_ids.add(delivery_id)
+        try:
+            delivery_queue.admit(
+                home, sender_profile=sender_profile, target_profile=target_profile,
+                target_session_id=session_id, idempotency_key=idempotency_key,
+                fingerprint=fingerprint, delivery_id=delivery_id, message=message)
+        except delivery_queue.QueueFullError as exc:
+            # Lost the 3 -> 5 race: the row stays `receipt`-shaped and a same-key retry
+            # re-admits it under the same delivery_id (rule 1), so nothing is stranded.
+            return self._bot_send_json(delivery_queue.build_envelope(
+                self._bot_send_status_record(
+                    {"delivery_status": delivery_queue.STATUS_FAILED,
+                     "reason": "queue_full", "created_at": time.time(),
+                     # VERIFICATION D6: name the cap that actually fired (per-sender
+                     # vs per-profile), not the historical per-profile default.
+                     "limit_kind": getattr(exc, "limit_kind", None),
+                     "limit": getattr(exc, "limit", None)},
+                    delivery_id=delivery_id, idempotency_key=idempotency_key,
+                    target_profile=target_profile, sender_profile=sender_profile,
+                    session_id=session_id)))
+
+        # --- steps 6-7: probe the turn lock inside the bounded synchronous window,
+        # then run the turn in-call or hand back a receipt (§2.7 curve 1).
+        if not may_run_inline:
+            # Accepted, never refused (t_376b3fbd): the durable record exists (step 5), so
+            # the turn belongs to the drainer as soon as the cap frees a slot. The receipt
+            # names the cap as the observed cause -- a busy slot it does not hold, and one
+            # this process would have to be trusted about, is exactly the false cause that
+            # made a saturated gateway look like a wall of busy targets.
+            gate = self._agent_gate_snapshot()
+            logger.warning(
+                "[api_server] peer delivery %s ACCEPTED under a saturated agent-work gate: "
+                "delivery=%s target=%s count=%s limit=%s terms=%s holders=%s -> queued for "
+                "the drainer",
+                delivery_id, delivery_id, target_profile, gate.get("count"),
+                gate.get("limit"), gate.get("terms"), _gate_holders_summary(gate))
+            current = delivery_queue.read_record(home, delivery_id) or reservation
+            return self._bot_send_receipt(
+                delivery_id, current, waited=0.0, home=home,
+                status_detail=delivery_queue.STATUS_DETAIL_ADMISSION_CAP)
+        return await self._bot_send_probe_and_run(
+            request, ctx, bot_send, home=home, delivery_id=delivery_id,
+            target_profile=target_profile)
+
+    async def _bot_send_probe_and_run(
+        self, request: "web.Request", ctx: Dict[str, Any], bot_send: Dict[str, Any],
+        *, home: Path, delivery_id: str, target_profile: str,
+    ) -> "web.Response":
+        """Curve 1: non-blocking turn-lock probes inside ``receipt_after_seconds``."""
+        from tools import bot_delivery_queue as delivery_queue
+        from tools.bot_mode_probe import _hermes_root
+        from tools.bot_relay import BOT_CHAT_SESSION_KEY, TurnBusyError, acquire_turn_lock
+
+        budget = delivery_queue.receipt_after_seconds()
+        if bot_send["wait_seconds"] > 0:
+            # §2.9: never hold the caller (or start a turn) past its own budget.
+            budget = min(budget, bot_send["wait_seconds"])
+        root = _hermes_root(home)
+        started = time.monotonic()
+        deadline = started + budget
+        n = 0
+        while True:
+            try:
+                with acquire_turn_lock(root, target_profile, timeout_seconds=0,
+                                       session=BOT_CHAT_SESSION_KEY):
+                    # Under the lock we hold, drain the queue HEAD-FIRST
+                    # (VERIFICATION D1): a foreign head is RUN, never handed back.
+                    # Handing it back is what left the live backlog ownerless -- the
+                    # request that admitted a record is long gone by the time the
+                    # slot frees, so only a queue drainer can finish it.
+                    return await _bot_delivery.drain_under_lock(
+                        self, home=home, target_profile=target_profile,
+                        delivery_id=delivery_id, ctx=ctx,
+                        waited=time.monotonic() - started)
+            except TurnBusyError:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(delivery_queue.probe_delay(n), remaining))
+            n += 1
+        current = delivery_queue.read_record(home, delivery_id)
+        if current is None:  # pragma: no cover -- the drainer took it
+            current = delivery_queue.claim_next(
+                home, target_profile=target_profile, lease_ok=True) or {}
+        return self._bot_send_receipt(
+            delivery_id, current, waited=time.monotonic() - started, home=home)
+
+    async def _bot_send_turn(
+        self, request: "web.Request", ctx: Dict[str, Any], *, home: Path,
+        delivery_id: str, target_profile: str, session_id: str, waited: float,
+    ) -> "web.Response":
+        """Run this delivery's turn under the turn lock, or receipt it honestly.
+
+        Kept as the in-call entry point, but the work is the shared drainer
+        (VERIFICATION D1). One code path runs a delivery whether it was admitted a
+        second ago or has been waiting in the queue since yesterday, so an accepted
+        record can never be left without a runner.
+        """
+        del request, session_id
+        return await _bot_delivery.drain_under_lock(
+            self, home=home, target_profile=target_profile,
+            delivery_id=delivery_id, ctx=ctx, waited=waited)
+
     @staticmethod
     def _session_headers(session_id: str, gateway_session_key: Optional[str]) -> dict[str, str]:
         """``X-Hermes-Session-Id`` (+ ``X-Hermes-Session-Key`` when declared) response headers."""
@@ -3571,15 +4325,26 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
         one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""
         from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
-        # This turn runs through _run_agent, so it already COUNTS toward the cap (#7483).
-        # Spending the budget without checking it refused every other caller while never
-        # refusing this route — and a fleet's cross-machine DMs all arrive here.
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
+        # A peer delivery is an ACCEPTANCE, not agent work (t_376b3fbd). The two delivery
+        # headers are therefore read BEFORE the cap: a saturated gateway still writes the
+        # durable, idempotent queue record and answers with its receipt, because refusing a
+        # control-plane notice with 429 loses it (the sender's hook treats any non-zero exit
+        # as a failed DM). Only the in-call turn is admitted against the cap — when the cap is
+        # full the record is left to the receiver's drainer, which runs it when a slot frees.
+        # Callers carrying no delivery headers keep today's 429 exactly.
+        bot_send = self._bot_send_request(request)
+        if bot_send is None:
+            limited = self._concurrency_limited_response(route="POST /api/sessions/{id}/chat")
+            if limited is not None:
+                return limited
         ctx, err = await self._prepare_session_chat(request)
         if err is not None:
             return err
+        # A peer delivery rides the same endpoint: the two delivery headers turn this
+        # into a queued, idempotent delivery with an acceptance receipt (§3.2).
+        if bot_send is not None:
+            return await self._handle_bot_send(
+                request, ctx, bot_send, may_run_inline=self._agent_gate_has_room())
         handed_off = await self._answer_through_live_bot_chat(ctx)
         if handed_off is not None:
             return handed_off
@@ -3614,12 +4379,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: web.Request) -> web.StreamResponse:
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
+        # The invariant is route-independent (t_376b3fbd): a request carrying the two
+        # delivery headers is never refused by the AGENT-WORK cap. The delivery lane is
+        # non-streaming by contract, so such a request is served as its queued JSON receipt
+        # instead of an SSE stream — the sender gets a real acceptance, not a 429.
+        bot_send = self._bot_send_request(request)
+        if bot_send is None:
+            limited = self._concurrency_limited_response(route="POST /api/sessions/{id}/chat/stream")
+            if limited is not None:
+                return limited
         ctx, err = await self._prepare_session_chat(request)
         if err is not None:
             return err
+        if bot_send is not None:
+            return await self._handle_bot_send(
+                request, ctx, bot_send, may_run_inline=self._agent_gate_has_room())
         handed_off = await self._stream_through_live_bot_chat(request, ctx)
         if handed_off is not None:
             return handed_off
@@ -3637,6 +4411,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # exists, so /v1/runs/{id}* control is confined to the starting profile.
         # See #93689.
         self._run_owners[run_id] = self._run_idempotency_scope(request)
+        # Take the live handle BEFORE the row (t_5976163f R4): this turn's task is deliberately
+        # NOT in _active_run_tasks (``_run_agent`` already counts the turn for the gate and the
+        # drain), so the token is what proves the row is held. Taken in the same synchronous
+        # frame as the row, so no reader and no sweep sees one without the other.
+        self._register_live_run_handle(run_id, family="inline")
         self._set_run_status(
             run_id, "queued", session_id=session_id, model=ctx["body"].get("model", self._model_name))
 
@@ -3708,12 +4487,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             finally:
                 self._active_run_agents.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                # Release the handle in the turn's own finally — that release IS the fence's
+                # clock (t_5976163f R4): the row is only non-terminal while this token exists.
+                self._release_live_run_handle(run_id)
                 self._release_run_owner_if_forgotten(run_id)
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
         # NOT in _active_run_tasks: _run_agent already counts this turn for the shutdown drain.
         task = asyncio.create_task(_run_and_signal())
+        # Bind the task to the handle: a task that dies before its turn starts must not keep
+        # the queued row looking live.
+        self._attach_live_run_handle_task(run_id, task)
         self._track_background_task(task)
         response = await self._prepare_sse_response(request, session_id, gateway_session_key)
         try:
@@ -4077,22 +4862,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-    def _concurrency_limited_response(self) -> Optional[web.Response]:
-        """429 when the concurrent-run cap is reached (0 disables), else None. Uses the same
-        adapter-owned work count as shutdown draining (admitted requests included)."""
-        limit = self._max_concurrent_runs
-        if limit <= 0:
+    def _concurrency_limited_response(self, *, route: str = "") -> Optional[web.Response]:
+        """429 when the concurrent-run cap is reached (0 disables), else None.
+
+        Measured, attributable and never latent (t_376b3fbd): the count is re-derived from
+        the three live terms on every call, a refusal is logged with the count, the limit,
+        the term breakdown and the holders that make it up, and the same numbers are
+        published for ops. Delivery requests never reach here — their acceptance is the
+        durable queue, not a slot (see ``_handle_session_chat``).
+        """
+        snapshot = self._agent_gate_snapshot(subtract_current_request=True)
+        if not snapshot["enabled"] or snapshot["count"] < snapshot["limit"]:
             return None
-        inflight = self.active_agent_work_count()
-        # The current request's own reservation must not consume its last available slot.
-        reservation = _api_agent_request_reservation.get()
-        if reservation and reservation["active"]:
-            inflight -= 1
-        if inflight >= limit:
-            return _error_response(
-                f"Too many concurrent runs (max {limit})", 429, err_type="rate_limit_error",
-                code="rate_limit_exceeded", headers={"Retry-After": "1"})
-        return None
+        self._log_gate_refusal(snapshot, route=route,
+                               target_profile=_api_request_profile.get() or "")
+        return _error_response(
+            f"Too many concurrent runs (max {snapshot['limit']})", 429,
+            err_type="rate_limit_error", code="rate_limit_exceeded",
+            headers={"Retry-After": "1"})
 
     @staticmethod
     def _bind_api_server_session(
@@ -4194,6 +4981,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         route: Optional[dict[str, Any]] = None, session_model: Optional[str] = None,
         requested_runtime: Optional[dict[str, Any]] = None, route_source: str = "global",
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
+        lease_wait_seconds: Optional[float] = None,
         session_history_delivery: str = "", turn_author: Optional[dict[str, Any]] = None,
         relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
@@ -4250,6 +5038,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         from agent.session_persistence import adopt_unanswered_turn
 
                         adopt_unanswered_turn(conversation_history, user_message, agent)
+                    if lease_wait_seconds is not None:
+                        # Bounded lease probe for delivery turns: turn_facade_lease caps its
+                        # acquire_session_turn_lease wait to this budget so a busy session
+                        # yields a receipt quickly instead of a 1800s block.
+                        agent._session_turn_lease_wait_seconds = lease_wait_seconds
                     if active_run_id:
                         self._active_run_agents[active_run_id] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
@@ -4339,7 +5132,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
                     clear_session_vars(tokens)
         self._activate_admitted_request()
+        # This term covers EVERY _run_agent caller -- /v1/chat/completions, /v1/responses,
+        # /api/sessions/{id}/chat[/stream] AND the peer-delivery drain turns (run_record /
+        # drain_under_lock). Callers never count themselves: an admitted request's own
+        # pending_requests reservation was just transferred above, so one turn is exactly
+        # one counted unit (t_376b3fbd, pinned by t_21572e62).
         self._inflight_agent_runs += 1
+        # Attribution for the gate (t_376b3fbd): an in-flight turn is the biggest single
+        # consumer of the cap, so a saturated gate must be able to name it. The token is
+        # released in the same ``finally`` that decrements the counter -- one exit, one
+        # release, no way for the count and its attribution to disagree.
+        gate_token = _gate_hold(
+            self, "inflight_turns", route=_gate_route_label(route),
+            profile=request_profile or "", session_id=session_id or "",
+            run_id=active_run_id or "")
         started_at = time.perf_counter()
         usage: Optional[dict[str, Any]] = None
         try:
@@ -4348,7 +5154,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             result, usage = await _api_runs._submit_api_worker(loop, _run)
             return result, usage
         finally:
-            self._inflight_agent_runs -= 1
+            self._inflight_agent_runs = max(0, self._inflight_agent_runs - 1)
+            _gate_release(self, gate_token)
             if usage is not None:
                 self._record_api_metrics(usage, time.perf_counter() - started_at)
 
@@ -4360,6 +5167,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, Any]:
         return _api_runs._set_run_status(self, run_id, status, **fields)
+
+    # -- live run handles: ONE registry, both run families (t_5976163f R4) --------------
+
+    def _register_live_run_handle(self, run_id: str, *, family: str) -> None:
+        return _api_runs._register_live_run_handle(self, run_id, family=family)
+
+    def _attach_live_run_handle_task(self, run_id: str, task: Any) -> None:
+        return _api_runs._attach_live_run_handle_task(self, run_id, task)
+
+    def _release_live_run_handle(self, run_id: str) -> None:
+        return _api_runs._release_live_run_handle(self, run_id)
+
+    def _run_has_live_handle(self, run_id: str) -> bool:
+        """The fence predicate: does this process still hold executable work for the run?"""
+        return _api_runs._run_has_live_handle(self, run_id)
 
     def _make_run_event_callback(self, run_id: str, loop: asyncio.AbstractEventLoop):
         return _api_runs._make_run_event_callback(self, run_id, loop, _api_server=sys.modules[__name__])
@@ -4387,6 +5209,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return await _room_dispatch._normalize_room_dispatch(self, request, body, _api_server=sys.modules[__name__])
 
     _handle_room_member_invitation = _room_grant_delegate("_handle_room_member_invitation")
+    # Read-only room surface (GET /api/rooms, GET /api/rooms/{room_id}/log): a projection of the
+    # hosted-room STORE, never of the in-process worker, so it survives a generational handover.
+    _handle_rooms_listing = _rooms_delegate("_handle_rooms_listing")
+    _handle_room_log = _rooms_delegate("_handle_room_log")
     _handle_room_member_capabilities = _room_grant_delegate("_handle_room_member_capabilities")
     _handle_room_member_grant_refresh = _room_grant_delegate("_handle_room_member_grant_refresh")
     _handle_room_member_grant_revoke = _room_grant_delegate("_handle_room_member_grant_revoke")
@@ -4496,6 +5322,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
             self._track_background_task(asyncio.create_task(self._sweep_orphaned_runs()))
+            # Trigger 3 for peer deliveries (VERIFICATION D1): every 30s, recover
+            # orphaned claims / expire over-age records and drain any slot that is
+            # free. A slot held by anyone else is never fought for -- that holder
+            # drains when it releases.
+            self._track_background_task(
+                asyncio.create_task(_bot_delivery.sweep_loop(self)))
             # Network-accessible + unsandboxed local terminal backend = host-user RCE surface;
             # warn, don't refuse (the operator may have a firewall / strong key).
             if is_network_accessible(self._host):

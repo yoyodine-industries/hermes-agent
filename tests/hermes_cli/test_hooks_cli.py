@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -260,3 +261,82 @@ def test_hooks_test_distinguishes_fail_closed_from_fail_open(tmp_path):
     assert "failed closed" in closed
     assert '"action": "block"' not in open_
     assert "contributed nothing" in open_
+
+
+# ── probe declaration at the call sites ───────────────────────────────────
+
+
+class TestProbeCallSites:
+    """`HERMES_HOOK_PROBE=1` is the declared-probe marker (ruling t_3be6949a).
+
+    The marker is only as good as the two runners that set it, so these assert the CALL — a
+    monkeypatched spy records the ``probe`` keyword — rather than a downstream effect that a
+    later refactor could keep while silently dropping the declaration.
+    """
+
+    SCRIPT_BODY = "#!/usr/bin/env bash\nprintf '{}\\n'\n"
+
+    @staticmethod
+    def _spy(monkeypatch):
+        calls = []
+
+        def fake_run_once(spec, payload, probe=False):
+            calls.append({"command": spec.command, "probe": probe})
+            return {"returncode": 0, "stdout": "", "parsed": None, "elapsed_seconds": 0.0}
+
+        monkeypatch.setattr(shell_hooks, "run_once", fake_run_once)
+        return calls
+
+    def test_doctor_always_declares_a_probe(self, tmp_path, monkeypatch):
+        script = _hook_script(tmp_path, self.SCRIPT_BODY)
+        shell_hooks._record_approval("on_session_start", str(script))
+        calls = self._spy(monkeypatch)
+        cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+
+        assert [c["probe"] for c in calls] == [True]
+        # The smoke line is a LIVENESS statement — doctor never claims to have exercised behaviour.
+        assert "liveness check passed" in out
+        assert "behaviour NOT exercised" in out
+        assert "observer-only" not in out
+
+    def test_hooks_test_declares_a_probe_by_default(self, tmp_path, monkeypatch):
+        script = _hook_script(tmp_path, self.SCRIPT_BODY)
+        calls = self._spy(monkeypatch)
+        cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="test", event="on_session_start",
+                                       for_tool=None, payload_file=None))
+
+        assert [c["probe"] for c in calls] == [True]
+        assert "Probe mode: HERMES_HOOK_PROBE=1" in out
+
+    def test_no_probe_is_the_only_way_to_withhold_the_declaration(self, tmp_path, monkeypatch):
+        script = _hook_script(tmp_path, self.SCRIPT_BODY)
+        calls = self._spy(monkeypatch)
+        cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="test", event="on_session_start",
+                                       for_tool=None, payload_file=None, no_probe=True))
+
+        assert [c["probe"] for c in calls] == [False]
+        assert "Real-path mode (--no-probe)" in out
+
+    def test_the_marker_reaches_the_child_process(self, tmp_path, monkeypatch):
+        """End to end, no spy: CLI -> run_once -> _spawn -> build_subprocess_env -> child env."""
+        seen = tmp_path / "env.json"
+        script = _hook_script(
+            tmp_path,
+            "import json, os, sys\n"
+            "json.load(sys.stdin)\n"
+            f"open({str(seen)!r}, 'w').write(json.dumps({{'marker': os.environ.get('HERMES_HOOK_PROBE')}}))\n",
+            name="probe_env.py",
+        )
+        monkeypatch.delenv("HERMES_HOOK_PROBE", raising=False)
+        cfg = {"hooks": {"on_session_start": [{"command": f'"{sys.executable}" "{script}"'}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            _run(SimpleNamespace(hooks_action="test", event="on_session_start",
+                                 for_tool=None, payload_file=None))
+
+        assert json.loads(seen.read_text()) == {"marker": "1"}

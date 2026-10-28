@@ -1258,3 +1258,157 @@ def test_ws_events_for_archived_board_does_not_recreate_it(tmp_path, monkeypatch
         "/api/plugins/kanban/events?token=secret-xyz&board=alive"
     ) as ws:
         assert ws is not None
+
+
+# ---------------------------------------------------------------------------
+# Invariant B (the assignee can run) at the DASHBOARD doors
+#
+# A card may not be handed to a handle that resolves to no profile on disk and no declared
+# pull lane (``kanban_gate_invariants.gate_assignee``). The gate raises
+# ``AssigneeRefused`` — a ``ValueError`` on purpose — so every dashboard door that assigns has
+# to MAP it. Unmapped, a typo'd handle became a 500 (or killed a whole bulk sweep) and the
+# gate's carefully written remedy ("declare the lane / assign a profile that exists") never
+# reached a human, which is exactly the "a wall is not a gate" failure the refusal exists to
+# avoid. Each test is two-sided: the violation is refused WITH the invariant named, and the
+# legitimate write still passes.
+# ---------------------------------------------------------------------------
+
+def _arm_roster(home: Path, *names: str) -> None:
+    """Put profiles on disk: the roster the assignee invariant judges BY.
+
+    With an empty roster and no declared lanes the gate stands down (nothing to judge
+    against), so a test that wants a refusal has to create one.
+    """
+    for name in names:
+        p = home / "profiles" / name
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+
+def test_patch_assignee_to_a_dead_handle_answers_400_naming_the_invariant(client, kanban_home):
+    """PATCH /tasks/<id> with a handle that cannot run: 400 carrying ``invariant=assignee``."""
+    _arm_roster(kanban_home, "real-lane")
+    tid = client.post("/api/plugins/kanban/tasks", json={"title": "keep me"}).json()["task"]["id"]
+
+    refused = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"assignee": "gone-lane"})
+    assert refused.status_code == 400, refused.text
+    detail = refused.json()["detail"]
+    assert "invariant=assignee" in detail
+    assert "gone-lane" in detail
+    # The remedy travels with the refusal, or the caller is facing a wall.
+    assert "terminal_lanes" in detail
+    # Nothing was written: the card keeps its (absent) assignee.
+    assert client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]["assignee"] is None
+
+    # Two-sided: a handle that CAN run still passes at the same door.
+    ok = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"assignee": "real-lane"})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["task"]["assignee"] == "real-lane"
+
+    # And the 409 for a CLAIMED card survives: "release the claim first" is a different
+    # remedy from "this handle cannot run", so the two must not collapse into one status.
+    conn = kbc.connect()
+    try:
+        conn.execute("UPDATE tasks SET status='running', claim_lock='probe' WHERE id=?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+    claimed = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"assignee": "real-lane"})
+    assert claimed.status_code == 409, claimed.text
+
+
+def test_reassign_endpoint_maps_the_refusal_instead_of_500ing(client, kanban_home):
+    """POST /tasks/<id>/reassign had no mapping at all: the refusal escaped as a 500."""
+    _arm_roster(kanban_home, "real-lane")
+    tid = client.post("/api/plugins/kanban/tasks",
+                      json={"title": "reattribute", "assignee": "real-lane"}).json()["task"]["id"]
+
+    refused = client.post(f"/api/plugins/kanban/tasks/{tid}/reassign", json={"profile": "gone-lane"})
+    assert refused.status_code == 400, refused.text
+    assert "invariant=assignee" in refused.json()["detail"]
+    assert client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]["assignee"] == "real-lane"
+
+
+def _load_plugin_module():
+    """Load a private copy of the dashboard plugin module (for its internals, not its routes).
+
+    The ``client`` fixture mounts a router from its own module instance; the sweep's per-row
+    contract (``_bulk_apply_one``) is testable without HTTP, and a separate load keeps this
+    test independent of fixture ordering.
+    """
+    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+    spec = importlib.util.spec_from_file_location("kanban_plugin_api_bulk_refusal_test", plugin_file)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_bulk_apply_one_records_a_gate_refusal_and_the_sweep_continues(client, monkeypatch):
+    """A refused assignee is RECORDED on that row; the sweep does not stop.
+
+    ``_bulk_apply_one``'s own contract is "records refusals … without aborting the remaining
+    ops", and its assign arm caught only ``RuntimeError`` — so the gate's ``ValueError``
+    subclass escaped the function that is supposed to absorb it. (The route's blanket
+    ``except Exception`` masked it, which is worse: it would also swallow a genuine bug.)
+    The bulk patch carries ONE handle for every row, so a real dead handle refuses every row
+    and cannot show "continues past the refused one"; the kernel's own refusal is raised for
+    the first row and the real ``assign_task`` runs for the second.
+
+    Two-sided by construction: the catch is the gate FAMILY (``GateRefused``), not the whole
+    of ``ValueError``, so the second half pins the other arm — a plain ``ValueError`` is a
+    bug in this door, not a refusal, and must still propagate instead of being laundered
+    into an ``ok=False`` row.
+    """
+    from hermes_cli import kanban_gate_invariants as gates
+
+    refused_id = client.post("/api/plugins/kanban/tasks", json={"title": "refused"}).json()["task"]["id"]
+    applied_id = client.post("/api/plugins/kanban/tasks", json={"title": "applied"}).json()["task"]["id"]
+
+    real_assign = kb.assign_task
+
+    def _assign(conn, task_id, profile):
+        if task_id == refused_id:
+            raise gates.AssigneeRefused(
+                f"kanban_assign: assignee {profile!r} cannot run — no such profile on disk, "
+                f"and it is not a declared pull lane. Nothing was written.",
+                facts={"assignee": profile, "where": "kanban_assign"})
+        return real_assign(conn, task_id, profile)
+
+    mod = _load_plugin_module()
+    monkeypatch.setattr(kb, "assign_task", _assign)
+    payload = mod.BulkTaskBody(ids=[refused_id, applied_id], assignee="gone-lane")
+    results = []
+    conn = kbc.connect()
+    try:
+        for tid in (refused_id, applied_id):
+            entry = {"id": tid, "ok": True}
+            mod._bulk_apply_one(conn, tid, payload, None, entry)  # must not raise
+            results.append(entry)
+    finally:
+        conn.close()
+
+    refused_entry, applied_entry = results
+    assert refused_entry["ok"] is False
+    assert "cannot run" in refused_entry["error"], refused_entry
+    assert applied_entry["ok"] is True
+    assert client.get(f"/api/plugins/kanban/tasks/{applied_id}").json()["task"]["assignee"] == "gone-lane"
+    assert client.get(f"/api/plugins/kanban/tasks/{refused_id}").json()["task"]["assignee"] is None
+
+    # The other arm of the same catch: a PLAIN ``ValueError`` out of the same call belongs to
+    # no invariant and carries no remedy, so it is NOT a per-row refusal — it must leave the
+    # function (the route's blanket catch reports it) with the entry untouched, or the sweep
+    # turns a bug into a tidy-looking ``ok=False`` nobody investigates.
+    def _buggy_assign(conn, task_id, profile):
+        raise ValueError("assign_task: unexpected shape")
+
+    monkeypatch.setattr(kb, "assign_task", _buggy_assign)
+    bug_entry: dict = {"id": applied_id, "ok": True}
+    conn = kbc.connect()
+    try:
+        with pytest.raises(ValueError, match="unexpected shape"):
+            mod._bulk_apply_one(conn, applied_id, payload, None, bug_entry)
+    finally:
+        conn.close()
+    assert bug_entry == {"id": applied_id, "ok": True}, bug_entry

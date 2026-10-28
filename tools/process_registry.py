@@ -35,6 +35,7 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import format_process_notification
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_termination import ProcessTerminationMixin
+from tools.process_registry_output import _not_found, _output_tail
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
 
@@ -501,28 +502,6 @@ def _stop_systemd_unit(unit_name: str) -> bool:
         return False
 
 
-def format_uptime_short(seconds: int) -> str:
-    s = max(0, int(seconds))
-    if s < 60:
-        return f"{s}s"
-    mins, secs = divmod(s, 60)
-    if mins < 60:
-        return f"{mins}m {secs}s"
-    hours, mins = divmod(mins, 60)
-    return f"{hours}h {mins}m"
-
-
-def _not_found(session_id: str) -> dict:
-    return {"status": "not_found", "error": f"No process with ID {session_id}"}
-
-
-def _output_tail(session: "ProcessSession", n: int) -> str:
-    """Last *n* chars of the session output with ANSI sequences stripped."""
-    from tools.ansi_strip import strip_ansi
-
-    return strip_ansi(session.output_buffer[-n:])
-
-
 def _completion_output(session: "ProcessSession") -> dict:
     """``output`` sized by the session's ``completion_output_chars`` plus ``output_cut`` when trimmed.
 
@@ -565,6 +544,8 @@ class ProcessSession:
     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
     persist_on_release: bool = False           # opt out of agent-lifecycle cleanup (release()/turn-abandon kill
                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
+    departure: bool = False                     # a WORKFLOW DEPARTURE: a production flight no sweep may reap;
+                                                # only an explicit operator stop (process.*, cli.stop, slash.stop) (t_4b9843a4)
     # Watcher/notification routing (persisted for crash recovery)
     # systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
     # (#70716)
@@ -653,7 +634,7 @@ _CHECKPOINT_FIELDS = (
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release")
+    "heartbeat_seconds", "persist_on_release", "departure")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -1196,11 +1177,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     def spawn_local(
         self, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
         env_vars: dict | None = None, use_pty: bool = False, owner_task_id: str = "",
-        persist_on_release: bool = False) -> ProcessSession:
+        persist_on_release: bool = False, departure: bool = False) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing.
-        ``persist_on_release`` keeps the process out of agent-lifecycle kill sweeps (#41225)."""
+        ``persist_on_release`` keeps the process out of agent-lifecycle kill sweeps (#41225).
+        ``departure`` marks a WORKFLOW DEPARTURE: a production flight that also survives a
+        gateway shutdown sweep (t_4b9843a4)."""
         # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds our stdout
         # pipe open forever when B is a long-running server. The rewriter turns it into
         # ``A && { B & }``. Lazy import: terminal_tool imports this module.
@@ -1209,7 +1192,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
 
         safe_command = _rewrite_bg(command)
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
-                                    persist_on_release=persist_on_release)
+                                    persist_on_release=persist_on_release, departure=departure)
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -1288,14 +1271,16 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False) -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False,
+        departure: bool = False) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
         the correct sandbox context. ``persist_on_release`` keeps the process out of
-        agent-lifecycle kill sweeps (#41225)."""
+        agent-lifecycle kill sweeps (#41225); ``departure`` keeps a production workflow
+        flight out of the shutdown sweep too (t_4b9843a4)."""
         session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
-                                    persist_on_release=persist_on_release)
+                                    persist_on_release=persist_on_release, departure=departure)
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
@@ -2534,6 +2519,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     # string and still reaches them.
     _LIFECYCLE_KILL_SOURCES = frozenset({"kill_all", "gateway_turn_timeout", "agent_close"})
 
+    #: Sources that are an EXPLICIT OPERATOR STOP, not a sweep: ``process.*`` is ``process_manage
+    #: kill``; ``cli.stop`` the CLI's /stop; ``slash.stop`` the TUI's. Only these reach a departure.
+    _EXPLICIT_STOP_SOURCES = frozenset({"cli.stop", "slash.stop"})
+
     def kill_started_since(self, task_id: str, baseline_ids, *, source: str) -> int:
         """Kill ``task_id`` processes created after ``baseline_ids``. Output is
         consumed so an abandoned turn can't enqueue a follow-up reviving work the
@@ -2551,15 +2540,21 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         agent-lifecycle sweep (the default ``kill_all`` release path, a gateway turn
         timeout, or ``agent_close``): an explicitly persisted background job must survive
         session end / compression / error recovery (#41225). An explicit operator stop
-        (``process.kill`` via process_manage, CLI /stop) passes its own source and still
-        reaches them, so the user can always stop a persisted process on purpose."""
+        (``process_manage kill`` via ``process.*``, the CLI's ``/stop``, the TUI's slash
+        ``/stop``) passes its own source and still reaches them, so the user can always stop
+        a persisted process on purpose. A ``departure`` session (a production workflow flight,
+        t_4b9843a4) is skipped by EVERY sweep except such an explicit operator stop.
+        """
         lifecycle = source in self._LIFECYCLE_KILL_SOURCES
+        # Explicit operator stop: process_manage kill / CLI /stop / TUI slash /stop.
+        operator_stop = source.startswith("process.") or source in self._EXPLICIT_STOP_SOURCES
         with self._lock:
             targets = [
                 s for s in (*self._running.values(), *self._finished.values())
                 if (task_id is None or s.owner_task_id == task_id)
                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
                 and not (lifecycle and s.persist_on_release)
+                and not (s.departure and not operator_stop)
             ]
         results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]
         return sum(

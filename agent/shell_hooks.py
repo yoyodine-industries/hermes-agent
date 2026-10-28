@@ -310,8 +310,13 @@ def _windows_script_argv(argv: list[str]) -> list[str]:
     return [_find_bash(), *argv]
 
 
-def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
-    """The single subprocess site: run ``spec.command`` with ``stdin_json`` on stdin. Same result keys for every outcome."""
+def _spawn(spec: ShellHookSpec, stdin_json: str, extra_env: Optional[dict[str, str]] = None) -> dict[str, Any]:
+    """The single subprocess site: run ``spec.command`` with ``stdin_json`` on stdin. Same result keys for every outcome.
+
+    ``extra_env`` adds non-secret names to the CHILD environment only (the pool's ``build_subprocess_env``
+    applies them after the scrub, so they survive both plain and multiplexed runs). It carries the probe
+    marker and nothing else.
+    """
     result: dict[str, Any] = {"returncode": None, "stdout": "", "stderr": "", "timed_out": False, "elapsed_seconds": 0.0, "error": None}
 
     def failed(error: str) -> dict[str, Any]:
@@ -338,7 +343,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
             argv = _windows_script_argv(argv)
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding='utf-8', errors='replace', shell=False,
-                                env=build_subprocess_env(scrub_secrets=is_multiplex_active()), **popen_kwargs)
+                                env=build_subprocess_env(scrub_secrets=is_multiplex_active(), extra=extra_env), **popen_kwargs)
     except Exception as exc:
         for cls, msg in _POPEN_ERRORS:
             if isinstance(exc, cls):
@@ -655,8 +660,21 @@ def script_is_executable(command: str) -> bool:
     return argv is not None and os.access(expanded, os.X_OK if argv and argv[0] == path else os.R_OK)
 
 
-def run_once(spec: ShellHookSpec, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Fire one hook with a synthetic payload (``hermes hooks test`` / doctor) through the production path."""
-    result = _spawn(spec, _serialize_payload(spec.event, kwargs))
+#: The declared-probe marker. Set by the fork's OWN pre-flight runners (`hermes hooks doctor`,
+#: and `hermes hooks test` unless `--no-probe`), NEVER by a runtime dispatch: a hook that mutates
+#: durable state must honour it and become observer-only. Probe-ness belongs to the invocation
+#: because a probe payload is shape-identical to a real one — inferring it from payload content is
+#: what let a taskless blocked-hook file a card per doctor run.
+PROBE_ENV_VAR = "HERMES_HOOK_PROBE"
+
+
+def run_once(spec: ShellHookSpec, kwargs: dict[str, Any], probe: bool = False) -> dict[str, Any]:
+    """Fire one hook with a synthetic payload (``hermes hooks test`` / doctor) through the production path.
+
+    ``probe=True`` exports ``HERMES_HOOK_PROBE=1`` into the child environment, declaring the invocation a
+    pre-flight smoke. ``probe=False`` (the default) is byte-identical to the runtime dispatch path — it is
+    the ``--no-probe`` escape hatch, not the fallback.
+    """
+    result = _spawn(spec, _serialize_payload(spec.event, kwargs), extra_env={PROBE_ENV_VAR: "1"} if probe else None)
     result["parsed"] = _evaluate_result(spec, result)
     return result

@@ -590,15 +590,36 @@ def _bots_title(ui_meta: dict):
     return bots.get("title") if isinstance(bots, dict) else None
 
 
+UI_META_MAX_BYTES = 65536
+
+
+class UiMetaTooLarge(ValueError):
+    """A ``ui_meta`` write over the gateway cap. Raised, never swallowed: an over-cap
+    write used to ``return`` silently, so the caller saw a successful RPC with
+    ``applied.ui_meta = False`` buried in it — the payload simply never landed."""
+
+
 def _configure_ui_meta(profile_dir, params, applied) -> None:
-    """Merge ``params["ui_meta"]`` key-wise into profile.yaml (None deletes). 64KB cap (rides
-    every roster paint). ``ui_meta_expected_revisions``: per-key CAS, any mismatch rejects the
+    """Merge ``params["ui_meta"]`` key-wise into profile.yaml (None deletes). Bounded by
+    ``UI_META_MAX_BYTES`` (it rides every roster paint); over the cap the write is REFUSED
+    loudly. ``ui_meta_expected_revisions``: per-key CAS, any mismatch rejects the
     whole write; revisions survive deletion so a stale client cannot recreate a removed key."""
     applied["ui_meta"] = False
+    incoming = params["ui_meta"]
     try:
-        incoming = params["ui_meta"]
-        if len(json.dumps(incoming)) > 65536:
-            return
+        size = len(json.dumps(incoming))
+    except (TypeError, ValueError) as e:
+        # Unserialisable payload: same silent-vanish class, so say so.
+        raise UiMetaTooLarge(f"ui_meta is not JSON-serialisable ({e}); nothing was written") from e
+    if size > UI_META_MAX_BYTES:
+        # Loud on purpose. A silent return here looked like a save that worked: the
+        # client kept its stale view and the mirror stopped updating with no error
+        # anywhere (2026-10-24, group-chat rooms over the cap).
+        raise UiMetaTooLarge(
+            f"ui_meta is {size} bytes, over the gateway's {UI_META_MAX_BYTES}-byte limit; "
+            "nothing was written — shrink the payload or split it across keys"
+        )
+    try:
         expected = params.get("ui_meta_expected_revisions")
         if expected is not None and not isinstance(expected, dict):
             raise ValueError("ui_meta_expected_revisions must be an object")
@@ -641,6 +662,9 @@ def _configure_ui_meta(profile_dir, params, applied) -> None:
                     params.get("name") or profile_dir.name, old_title, _bots_title(current),
                     revisions.get("hermes-bots"))
     except Exception:
+        # Never silent: a dropped ui_meta write used to leave no trace at all.
+        logging.getLogger(__name__).exception(
+            "ui_meta write failed for profile %s", params.get("name") or profile_dir.name)
         applied["ui_meta"] = False
 
 

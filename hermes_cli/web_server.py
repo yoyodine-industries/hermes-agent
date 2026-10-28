@@ -1649,7 +1649,7 @@ def start_server(
     # uvicorn's capture_signals() so uvicorn re-raises into them as the
     # "original" handlers — kills outside the serve window are covered too.
     try:
-        from tui_gateway.server import install_exit_flush_signal_handlers
+        from tui_gateway.session_reaper import install_exit_flush_signal_handlers
 
         install_exit_flush_signal_handlers()
     except Exception as exc:

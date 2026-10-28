@@ -196,6 +196,16 @@ class LSPClient:
     def is_running(self) -> bool:
         return self._state == "running" and self._connection_is_open()
 
+    @property
+    def pid(self) -> Optional[int]:
+        """OS pid of the server process (``None`` before spawn / after cleanup).
+
+        The host-wide residency census registers this pid so another profile can evict this very
+        server; it is also the identity psutil checks before signalling it (card t_83304682).
+        """
+        proc = self._proc
+        return proc.pid if proc is not None else None
+
     def _connection_is_open(self) -> bool:
         proc, reader = self._proc, self._reader_task
         return (

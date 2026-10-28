@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import threading
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone, UTC
@@ -519,6 +520,80 @@ def bump_patch(skill_name: str, *, action: str = "patch", task_id: Optional[str]
                      session_id=session_id)
 
 
+def _admission_refusal_file() -> Path:
+    """The admission ledger: append-only, bounded, beside `.usage.json`.
+
+    It lives in the skills dir (not inside `.usage.json`) on purpose: a refused draft is not a
+    skill, and a record in the usage map would make a phantom name show up wherever the ledger
+    is enumerated. This is the audit trail the acceptance criterion asks for — every refusal,
+    with what it collided with — and it is bounded so a leaking pen cannot grow it forever.
+
+    It carries TWO dispositions, not one: a refusal (`fold`/`reject`) and a FAULT
+    (:data:`ADMISSION_FAULT`) — the gate admitting because it could not judge at all. Keeping
+    the fault in the same file is what stops a broken gate from reading as a tidy ledger.
+    """
+    return _skills_dir() / ".admission_refusals.jsonl"
+
+
+JOURNAL_MAX_LINES = 500
+
+#: The disposition a FAULT row carries. A refusal is `fold`/`reject`; a fault is the gate
+#: admitting a draft it never judged, so the ledger separates "nothing collided" from "the
+#: gate was broken".
+ADMISSION_FAULT = "fault"
+
+
+def _append_admission_entry(entry: dict[str, Any]) -> bool:
+    """Append one bounded line to the admission ledger; True when it landed."""
+    path = _admission_refusal_file()
+    try:
+        with skill_file_lock(path.with_suffix(".jsonl.lock")):
+            lines = _read_lines(path, "Failed to read %s: %s")
+            lines.append(json.dumps(entry, sort_keys=True, ensure_ascii=False))
+            atomic_write_text(path, "\n".join(lines[-JOURNAL_MAX_LINES:]) + "\n",
+                             tmp_prefix=".admission_")
+        return True
+    except Exception as e:
+        logger.debug("Failed to append to the admission ledger for %s: %s", entry.get("skill"), e)
+        return False
+
+
+def record_admission_refusal(skill_name: str, *, disposition: str, existing_skill: str = "",
+                             reason: str = "") -> None:
+    """Record one pen-side refusal of a NEW skill (or a new support file) in the ledger.
+
+    Best-effort by contract: a refusal must still be returned when the ledger cannot be
+    written, and the caller DEBUG-logs that. The lifecycle hook is emitted beside the file so
+    the fleet sees refusals in the same stream as creates.
+    """
+    entry = {"at": _now_iso(), "skill": skill_name, "disposition": disposition,
+             "existing_skill": existing_skill, "reason": reason}
+    _append_admission_entry(entry)
+    _emit_skill_lifecycle(skill_name, "create_refused", record={"created_by": None})
+
+
+def record_admission_fault(subject: str, *, detail: str, corpus: str = "") -> None:
+    """Record a FAULT: the gate could not judge, so it admitted the draft (fail open).
+
+    The fail-open is deliberate — a bug in a policy gate must not stop every lane from
+    learning — but an UNRECORDED fail-open makes the ledger read exactly like a gate that
+    judged everything and refused nothing. That is the silent failure this exists to stop: an
+    empty ledger is supposed to mean "no draft collided", and it can only mean that while
+    every admission the gate skipped is a row of its own.
+
+    ``subject`` is the skill (or ``name/file`` for a support file) the gate could not judge;
+    ``detail`` is the fault itself, carried into the row verbatim. Loud on failure by contract:
+    a fault row that cannot be written is the thing this function exists to prevent, so its
+    write error is a WARNING here where a refusal's is a DEBUG.
+    """
+    entry = {"at": _now_iso(), "skill": subject, "disposition": ADMISSION_FAULT,
+             "existing_skill": "", "reason": detail}
+    if corpus:
+        entry["corpus"] = corpus
+    if not _append_admission_entry(entry):
+        logger.warning("admission FAULT could not be recorded for %s: %s", subject, detail)
+
+
 def record_created(skill_name: str, *, agent_created: bool, task_id: Optional[str] = None,
                    session_id: Optional[str] = None) -> None:
     """Persist creation provenance and emit a create fact; the record is reset (a create is a new logical skill).
@@ -582,8 +657,140 @@ def forget(skill_name: str) -> None:
         _locked_update(skill_name, lambda d: (None, d.pop(skill_name, None) is not None), "skill_usage.forget(%s) failed: %s")
 
 
+# --- Git-tracked guard — a version-controlled tree keeps its bytes ---------------------
+# The class defect this guards (card t_4c38630b): the curator archived 8 skills out of
+# `~/.hermes/skills/yoyodine`, a git checkout, in one pure-time pass — an undeclared
+# deletion out of a repo nobody re-reads. The threshold is TRACKED-NESS, not "tracked with
+# a remote": a remote only decides whether the loss is recoverable, and a tracked-but-
+# unpushed repo loses the work identically. The predicate is a property of the BYTES, not
+# of a path, so it holds for a future home, a future clone layout, `curator prune`,
+# `skill_manage delete` and the learning mutations alike — all of which reach
+# `archive_skill()`, the single choke point for every archive in the product.
+
+#: Every refusal from the guard starts with this. Callers classify on the constant, never by
+#: string-matching the rest of the message.
+REFUSED_GIT_TRACKED = "refused: git-tracked"
+
+#: Bound on one git call. The guard runs once per skill that is about to be archived, so a
+#: hung git must cost a refusal-free allow, never a stalled curator pass.
+_GIT_TIMEOUT_SECS = 15
+
+
+def protect_git_tracked_enabled() -> bool:
+    """``curator.protect_git_tracked`` (default True): refuse to archive bytes a repo tracks.
+
+    Read here rather than in ``agent/curator`` because ``archive_skill`` is where every
+    caller arrives — ``curator prune``, ``skill_manage delete``, ``learning_mutations`` and
+    the automatic transition. A gate that lived only in the curator's walk would leave three
+    of those four entry points lethal, which is the whole reason the guard sits on the act.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cur = load_config().get("curator")
+        return bool(cur.get("protect_git_tracked", True)) if isinstance(cur, dict) else True
+    except Exception as e:  # pragma: no cover — best-effort config read
+        logger.debug("Failed to read curator.protect_git_tracked: %s", e, exc_info=True)
+        return True
+
+
+def _git_call(repo: Path, *args: str) -> tuple[int, str]:
+    """``(returncode, stdout)`` for one bounded git call; ``(127, "")`` when git is absent.
+
+    Never raises: a missing/git-less host must fail OPEN (no refusal) rather than make every
+    archive and every curator pass raise.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=_GIT_TIMEOUT_SECS)
+        return proc.returncode, proc.stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("git %s failed in %s: %s", args, repo, e)
+        return 127, ""
+
+
+def _enclosing_git_root(path: Path) -> Optional[Path]:
+    """Nearest ancestor of *path* (inclusive) holding a ``.git`` dir or file; None when there is none."""
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def git_tracked_info(skill_dir: Optional[Path]) -> Optional[dict[str, Any]]:
+    """``{repo, tracked, remote}`` when *skill_dir*'s bytes are TRACKED; None when they are not.
+
+    Structural and cheap: walk up to the nearest ``.git``; if there is none the tree is not
+    version-controlled and archiving is allowed. Inside one, ``git ls-files`` on the dir's
+    own relative path decides — a dir the repo IGNORES (every skill under the host
+    ``~/.hermes/skills/*`` except three devops paths) reports nothing and keeps archiving.
+    Symlinks are resolved FIRST: a lane home's ``skills/yoyodine/<name>`` is a link into that
+    lane's clone, and the clone owns the bytes the guard is about.
+    """
+    if skill_dir is None:
+        return None
+    try:
+        real = Path(skill_dir).resolve()
+    except OSError:
+        return None
+    if not real.is_dir() or (repo := _enclosing_git_root(real)) is None:
+        return None
+    try:
+        rel = real.relative_to(repo).as_posix() or "."
+    except ValueError:  # the repo root is not an ancestor of the real path
+        return None
+    rc, out = _git_call(repo, "ls-files", "-z", "--", rel)
+    if rc != 0:
+        return None
+    if not (tracked := sum(1 for p in out.split("\0") if p)):
+        return None
+    rc, remote = _git_call(repo, "remote", "get-url", "origin")
+    return {"repo": str(repo), "tracked": tracked,
+            "remote": remote.strip() if rc == 0 else ""}
+
+
+def _git_tracked_message(skill_name: str, info: dict[str, Any]) -> str:
+    """The refusal text: the repo, how many tracked files, and BOTH legal remedies."""
+    remote = (f"; origin {info['remote']} still has them (a reset is never the remedy — "
+              f"`git -C {info['repo']} checkout -- <paths>`)" if info.get("remote")
+              else "; the repo has NO remote — the bytes exist only in this worktree")
+    return (f"{REFUSED_GIT_TRACKED}: '{skill_name}' has {info['tracked']} tracked file(s) in "
+            f"the git repo {info['repo']}{remote}. Legal remedies: (1) retire it in that repo "
+            f"as a DECLARED change (`git rm` + commit, landed by PR) so the deletion is "
+            f"reviewable; or (2) set `curator.protect_git_tracked: false` to allow one "
+            f"deliberate archive.")
+
+
+def git_tracked_refusal(skill_name: str, skill_dir: Optional[Path] = None) -> Optional[str]:
+    """THE one predicate: why archiving *skill_name* is refused because its bytes are tracked.
+
+    Both the guard inside :func:`archive_skill` and the count-only walk of
+    ``apply_automatic_transitions(apply=False)`` call this, so a dry run and a real run can
+    never disagree about what was blocked — which is what stops the guard from becoming the
+    silent skip it exists to prevent.
+    """
+    info = git_tracked_info(skill_dir if skill_dir is not None else _find_skill_dir(skill_name))
+    return None if info is None else _git_tracked_message(skill_name, info)
+
+
+def _skills_rel(path: Optional[Path]) -> Optional[str]:
+    """POSIX path of *path* under the skills dir, or None when it sits outside it.
+
+    Deliberately NOT resolved: what restore must reconstruct is the SERVED location
+    (``skills/yoyodine/<name>``), not the clone it links into.
+    """
+    if path is None:
+        return None
+    try:
+        return Path(os.path.normpath(str(path))).relative_to(
+            os.path.normpath(str(_skills_dir()))).as_posix()
+    except (ValueError, TypeError):
+        return None
+
+
 # --- Archive / restore ---
-def _relocate(src: Path, dest: Path, skill_name: str, action: str, **capture_kwargs: Any) -> tuple[bool, str]:
+def _relocate(src: Path, dest: Path, skill_name: str, action: str, evidence: Optional[dict[str, Any]] = None,
+              **capture_kwargs: Any) -> tuple[bool, str]:
     """Move *src* to *dest* for *action* ("archive" | "restore") inside a best-effort audit-ledger entry, then apply
     suppression + state side effects; rename falls back to shutil.move across devices."""
     try:
@@ -610,7 +817,8 @@ def _relocate(src: Path, dest: Path, skill_name: str, action: str, **capture_kwa
     set_state(skill_name, STATE_ARCHIVED if archiving else STATE_ACTIVE)
     with suppress(Exception):
         if _ledger is not None:
-            _ledger.record_mutation(action, skill_name, before=_ledger_before or [], after_root=dest)
+            _ledger.record_mutation(action, skill_name, before=_ledger_before or [], after_root=dest,
+                                    evidence=evidence)
     return True, f"{action}d to {dest}"
 
 
@@ -630,6 +838,12 @@ def archive_skill(skill_name: str) -> tuple[bool, str]:
         return False, f"skill '{skill_name}' not found"
     if is_external_skill_path(skill_dir):
         return False, _external_read_only_message(skill_name)
+    # THE GUARD (card t_4c38630b): a repo's tracked bytes are never this tool's to delete.
+    # Placed on the ACT, not on the curator's scan set, so `curator prune`,
+    # `skill_manage delete` and the learning mutations are covered by the same predicate.
+    tracked = git_tracked_info(skill_dir)
+    if tracked is not None and protect_git_tracked_enabled():
+        return False, _git_tracked_message(skill_name, tracked)
     # Flatten under the skill NAME, not the directory name: `mlops/training/accelerate` is the skill
     # `huggingface-accelerate`, and restore/list/purge all key on the name.
     dest = _archive_dir() / skill_name
@@ -639,14 +853,68 @@ def archive_skill(skill_name: str) -> tuple[bool, str]:
         return False, f"failed to create archive dir: {e}"
     if dest.exists():
         dest = dest.with_name(f"{skill_dir.name}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}")
+    evidence: dict[str, Any] = {"origin_rel": _skills_rel(skill_dir)}
+    if tracked is not None:
+        # protect_git_tracked was off: the deletion happened, so it must stay ATTRIBUTABLE.
+        evidence["git"] = {"repo": tracked["repo"], "tracked_removed": tracked["tracked"],
+                           "remote": tracked["remote"]}
     # complete_package: consolidation may have re-homed support files first, so a disk-only capture can come
     # back hollow; the fill from the newest curator backup keeps rollback restorable.
-    return _relocate(skill_dir, dest, skill_name, "archive", complete_package=True, skill=skill_name)
+    return _relocate(skill_dir, dest, skill_name, "archive", evidence=evidence,
+                     complete_package=True, skill=skill_name)
+
+
+def _valid_origin_rel(rel: Any) -> Optional[Path]:
+    """*rel* as a safe relative path under the skills dir; None when empty, absolute or escaping."""
+    if not isinstance(rel, str) or not rel.strip():
+        return None
+    path = Path(rel.strip())
+    if path.is_absolute() or any(part == ".." for part in path.parts):
+        return None
+    return path
+
+
+def archive_origin_rel(skill_name: str) -> Optional[str]:
+    """Where *skill_name* lived before ``archive_skill`` moved it, or None when that is unknown.
+
+    Recorded by construction (``evidence.origin_rel``). The fallback reads the parent of the
+    newest archive entry's ``before[].SKILL.md`` path — the ledger has always recorded
+    absolute paths, so an archive written before ``origin_rel`` existed still repairs.
+    Validated on the way out: relative, no ``..``, never empty.
+    """
+    try:
+        from tools import skill_ledger
+        entry = next((e for e in skill_ledger.list_entries(skill=skill_name)
+                      if e.get("action") == "archive"), None)
+    except Exception as e:
+        logger.debug("archive origin lookup failed for %s: %s", skill_name, e, exc_info=True)
+        return None
+    if not isinstance(entry, dict):
+        return None
+    if (rel := _valid_origin_rel((entry.get("evidence") or {}).get("origin_rel"))) is not None:
+        return rel.as_posix()
+    for item in entry.get("before") or []:
+        path = Path(str((item or {}).get("path") or ""))
+        if path.name != "SKILL.md":
+            continue
+        if (rel := _valid_origin_rel(_skills_rel(path.parent))) is not None:
+            return rel.as_posix()
+    return None
 
 
 def restore_skill(skill_name: str) -> tuple[bool, str]:
-    """Move an archived skill back to the flat layout (nesting NOT reconstructed). Refuses a name now colliding with
-    a hub skill, or a bundled built-in unless ``curator.prune_builtins`` is on (restoring lifts a prune)."""
+    """Move an archived skill back where it came from — the nesting IS reconstructed.
+
+    ``archive_skill`` flattens under the skill NAME; restoring to the tree root lost the
+    ``yoyodine/<name>`` level of every nested skill, which is what made the 2026-10-15 repair
+    an ops hand-job (card t_4c38630b). The origin now comes from the ledger
+    (:func:`archive_origin_rel`); with no derivable origin — a legacy archive, or a disabled
+    ledger — the flat move is kept, and the returned message SAYS the nesting is unknown
+    rather than reporting a clean restore it cannot vouch for.
+
+    Refuses a name now colliding with a hub skill, or a bundled built-in unless
+    ``curator.prune_builtins`` is on (restoring lifts a prune).
+    """
     if is_hub_installed(skill_name):
         return False, f"skill '{skill_name}' is now hub-installed; restore would shadow the upstream version"
     if is_bundled(skill_name) and not _prune_builtins_enabled():
@@ -666,9 +934,24 @@ def restore_skill(skill_name: str) -> tuple[bool, str]:
         p for p in dirs if (p / "SKILL.md").is_file() and _read_skill_name(p / "SKILL.md", fallback=p.name) == skill_name]
     if not candidates:
         return False, f"skill '{skill_name}' not found in archive"
-    if (dest := _skills_dir() / skill_name).exists():
-        return False, f"destination already exists: {dest}"
-    return _relocate(candidates[0], dest, skill_name, "restore")
+    origin = archive_origin_rel(skill_name)
+    dest = (_skills_dir() / origin) if origin else (_skills_dir() / skill_name)
+    if dest.exists():
+        # The tracked bytes being back is the ordinary case; the archive copy is the thing to
+        # drop, and a checkout is the remedy only when they are NOT back.
+        return False, (f"destination already exists: {dest} — the live bytes are back; drop the "
+                       f"archive copy at {candidates[0]} (or `git -C <repo> checkout -- <path>` "
+                       f"if they are not)")
+    if dest.parent != _skills_dir():
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return False, f"failed to restore: cannot create {dest.parent}: {e}"
+    ok, msg = _relocate(candidates[0], dest, skill_name, "restore")
+    if ok and origin is None:
+        msg += (f" (original nesting unknown: no ledger record for '{skill_name}'; "
+                f"restored to the flat path {dest})")
+    return ok, msg
 
 
 def _match_skill_dir(skill_mds: Iterable[Path], skill_name: str) -> Optional[Path]:

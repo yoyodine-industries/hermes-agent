@@ -8,13 +8,20 @@ import os
 import re
 import sys
 from pathlib import Path, PurePath
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, List, Optional, Set, Tuple
 
 from hermes_constants import (
     get_config_path,
     get_skills_dir,
     get_subprocess_home,
 )
+from hermes_yaml import YamlEngineUnavailable
+
+# An unavailable YAML engine (missing ``ruamel.yaml``) is an ENVIRONMENT fault, never skill
+# content. The broad ``except`` in ``discover_all_skill_config_vars`` would otherwise turn it into
+# "this skill declares no config vars" and silently continue — a different answer, not a lesser
+# one. Re-raise it so the fault reaches a caller that can name the engine.
+_ENGINE_FAULT_ERRORS = (YamlEngineUnavailable, ImportError)
 
 logger = logging.getLogger(__name__)
 
@@ -51,38 +58,74 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
     )
 
 
-_yaml_load_fn = None
+_yaml_backend_pair = None
+
+
+def _yaml_backend():
+    """``(safe_load, YAMLError)`` from ``hermes_yaml``, resolved once per process.
+
+    Imported lazily, and OUTSIDE every recovery handler: an engine that cannot be imported is an
+    environment fault, and no caller may turn it into a parsed-empty answer.
+    """
+    global _yaml_backend_pair
+    if _yaml_backend_pair is None:
+        from hermes_yaml import YAMLError, safe_load
+        _yaml_backend_pair = (safe_load, YAMLError)
+    return _yaml_backend_pair
 
 
 def yaml_load(content: str):
     """Parse YAML with the shared safe loader, imported lazily."""
-    global _yaml_load_fn
-    if _yaml_load_fn is None:
-        from hermes_yaml import safe_load
-        _yaml_load_fn = safe_load
-    return _yaml_load_fn(content)
+    load, _ = _yaml_backend()
+    return load(content)
+
+
+def _flat_frontmatter(yaml_content: str) -> dict[str, Any]:
+    """Recover ``key: value`` pairs from frontmatter that is not valid YAML.
+
+    Top-level lines only, and the first occurrence wins. An indented ``description:`` belongs to
+    the mapping above it: letting it through overwrote the real top-level key with a nested value,
+    and the read is flat only because the document never parsed, so it must not invent structure.
+    """
+    recovered: dict[str, Any] = {}
+    for line in yaml_content.strip().split("\n"):
+        if not line or line[0] in " \t#-":
+            continue
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        key = key.strip()
+        if key and key not in recovered:
+            recovered[key] = value.strip()
+    return recovered
 
 
 def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     """Parse YAML frontmatter from markdown; returns (frontmatter_dict, body).
-    Malformed YAML falls back to key:value line splitting. A leading UTF-8 BOM
-    (Windows editors) is stripped first or it would defeat the ``---`` fence check."""
+
+    Frontmatter that is not valid YAML falls back to :func:`_flat_frontmatter`. A MISSING YAML
+    ENGINE is not that case: it is an environment fault, raised as
+    ``hermes_yaml.YamlEngineUnavailable`` and never recovered from, because a flat read of a
+    nested block reports a nested key as a top-level one — a different answer, not a lesser one.
+
+    A leading UTF-8 BOM (Windows editors) is stripped first or it would defeat the ``---`` fence
+    check.
+    """
     content = content.removeprefix("\ufeff")
     end_match = re.search(r"\n---\s*\n", content[3:]) if content.startswith("---") else None
     if not end_match:
         return {}, content
     yaml_content = content[3 : end_match.start() + 3]
     body = content[end_match.end() + 3 :]
+    load, yaml_error = _yaml_backend()
     frontmatter: dict[str, Any] = {}
     try:
-        parsed = yaml_load(yaml_content)
+        parsed = load(yaml_content)
         if isinstance(parsed, dict):
             frontmatter = parsed
-    except Exception:
-        for line in yaml_content.strip().split("\n"):
-            if ":" in line:
-                key, value = line.split(":", 1)
-                frontmatter[key.strip()] = value.strip()
+    except yaml_error:
+        logger.debug("Frontmatter did not parse as YAML; recovering flat top-level keys")
+        frontmatter = _flat_frontmatter(yaml_content)
     return frontmatter, body
 
 
@@ -378,10 +421,12 @@ def display_skill_create_dir() -> str:
     return create_dir.as_posix() + "/"
 
 
-# Cross-directory precedence, lowest tier wins: trusted project > local profile > skills.create_dir >
-# skills.external_dirs. Inside ONE tier two different skills sharing a name stay ambiguous — refused,
+# Cross-directory precedence, lowest tier wins: local profile > skills.create_dir >
+# skills.external_dirs > trusted project. A trusted project dir is a repo checkout that changes
+# under the fleet with a `git pull`, so it is the LOWEST tier and must never silently shadow
+# curated doctrine. Inside ONE tier two different skills sharing a name stay ambiguous — refused,
 # never guessed (59da8ec4e) — while identical copies under one root resolve to the shallowest.
-TIER_PROJECT, TIER_LOCAL, TIER_CREATE_DIR, TIER_EXTERNAL = range(4)
+TIER_LOCAL, TIER_CREATE_DIR, TIER_EXTERNAL, TIER_PROJECT = range(4)
 # Leading words of every same-tier refusal (skill_view error, preload/cron label) — one spelling.
 AMBIGUOUS_SKILL_PREFIX = "Ambiguous skill name "
 # (shadowed path, *sorted higher-tier paths) already judged: the identity check (it hashes both
@@ -392,20 +437,25 @@ _SHADOW_CHECKED: set[tuple[str, ...]] = set()
 def get_skill_search_roots(local: Optional[Path] = None, *, include_project: bool = True) -> list[tuple[int, Path]]:
     """``(tier, dir)`` for every skill root in precedence order — the ONE ordering the skills list,
     prompt index, slash commands, skill_view, preload and cron share. *local* overrides the profile
-    skills dir (skills_tool passes its live root); that entry is kept even when missing."""
-    roots = [(TIER_PROJECT, d) for d in get_project_skills_dirs()] if include_project else []
-    roots.append((TIER_LOCAL, Path(local) if local is not None else get_skills_dir()))
+    skills dir (skills_tool passes its live root); that entry is kept even when missing.
+
+    Curated tiers come FIRST and a trusted project checkout LAST: a repo checkout changes under the
+    fleet with a `git pull`, so it must never silently shadow curated doctrine.
+    """
+    roots = [(TIER_LOCAL, Path(local) if local is not None else get_skills_dir())]
     create_dir = get_skill_create_dir()
     if create_dir is not None and create_dir.is_dir():
         roots.append((TIER_CREATE_DIR, create_dir))
     roots += [(TIER_EXTERNAL, d) for d in get_external_skills_dirs()]
+    if include_project:
+        roots += [(TIER_PROJECT, d) for d in get_project_skills_dirs()]
     seen: set[Path] = set()
     return [(t, d) for t, d in roots if not (d in seen or seen.add(d))]
 
 
 def get_all_skills_dirs() -> list[Path]:
     """Skill dirs: local ``~/.hermes/skills/`` first, then create_dir, then external.
-    Trusted project dirs are NOT included (higher precedence; see get_project_skills_dirs)."""
+    Trusted project dirs are NOT included (LOWEST precedence; see get_project_skills_dirs)."""
     return [d for _tier, d in get_skill_search_roots(include_project=False)]
 
 
@@ -479,7 +529,7 @@ def resolve_skill_catalog(entries: list[dict[str, Any]]) -> list[dict[str, Any]]
                 _SHADOW_CHECKED.add(key)
                 if not any(provably_same_skill([e["path"], out[j]["path"]]) for j in higher):
                     logger.warning("Skill '%s' at %s is shadowed by a higher-precedence copy "
-                                   "(project > local > create_dir > external_dirs)", name, e["path"])
+                                   "(local > create_dir > external_dirs > project)", name, e["path"])
         elif winner[name] == i:
             e.update(status="unique", load_name=name)
         else:
@@ -489,8 +539,10 @@ def resolve_skill_catalog(entries: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 # Project-local skills (<root>/.hermes/skills, <root>/.agents/skills; root = nearest
 # .git ancestor) are a prompt-injection vector if auto-sourced from any clone, so
-# they load only when the root is in ``skills.trusted_project_dirs``; then they
-# override same-named profile/bundled skills. cwd + trust list are session-fixed
+# they load only when the root is in ``skills.trusted_project_dirs``. The tier ladder is
+# deterministic and curated-first — profile-local > create_dir > external (shared) >
+# project-local — so a repo checkout can never silently shadow fleet doctrine; a same-name project skill
+# only loads when no curated tier indexes that name. cwd + trust list are session-fixed
 # so the skills index stays byte-stable.
 
 PROJECT_SKILLS_SUBDIRS = (os.path.join(".hermes", "skills"), os.path.join(".agents", "skills"))
@@ -609,6 +661,13 @@ def get_untrusted_project_skills_root() -> Optional[tuple[Path, int]]:
 # write artifacts into the user's checkout).
 _PROJECT_SCAN_SOURCE = "project-local"
 _PROJECT_QUARANTINE_CACHE: dict[str, bool] = {}  # skill_dir -> quarantined
+# The scan behind each verdict, kept so a quarantine report can say WHY a skill was excluded
+# without scanning it again (None = the fail-closed scan crash, which has no result).
+_PROJECT_SCAN_RESULTS: dict[str, Any] = {}  # skill_dir -> ScanResult | None
+# What the iteration chokepoint skipped, keyed by the project dir it walked. Rewritten on every
+# walk of a root, so a listing reports the current truth for the dirs it just read — a silently
+# excluded skill is a defect, and re-walking the tree to find it out would pay for a second scan.
+_PROJECT_QUARANTINE_SKIPS: dict[str, list[str]] = {}  # project_dir -> [skill_dir]
 
 
 def is_quarantined_project_skill(skill_md) -> bool:
@@ -622,6 +681,7 @@ def is_quarantined_project_skill(skill_md) -> bool:
         key = str(skill_dir)
     if key in _PROJECT_QUARANTINE_CACHE:
         return _PROJECT_QUARANTINE_CACHE[key]
+    result = None
     try:
         from tools.skills_guard import scan_skill_cached
         from hermes_constants import get_hermes_home
@@ -633,6 +693,7 @@ def is_quarantined_project_skill(skill_md) -> bool:
     except Exception:
         logger.warning("Project skill scan failed — quarantining (fail closed): %s", skill_dir, exc_info=True)
         quarantined = True
+    _PROJECT_SCAN_RESULTS[key] = result
     _PROJECT_QUARANTINE_CACHE[key] = quarantined
     return quarantined
 
@@ -640,8 +701,42 @@ def is_quarantined_project_skill(skill_md) -> bool:
 def iter_project_skill_files(project_dir: Path):
     """Yield non-quarantined SKILL.md files under a trusted project dir — the
     single iteration chokepoint for the project tier, so the quarantine cannot
-    be bypassed by a call site forgetting the check."""
-    yield from (p for p in iter_skill_index_files(project_dir, "SKILL.md") if not is_quarantined_project_skill(p))
+    be bypassed by a call site forgetting the check.
+
+    What it excludes is recorded for this root (``_PROJECT_QUARANTINE_SKIPS``), so a
+    listing can REPORT the quarantine rather than leave the user with a skill that is
+    on disk and simply never loads: ``get_quarantined_project_skills()``."""
+    root_key = str(project_dir)
+    skipped: list[str] = []
+    _PROJECT_QUARANTINE_SKIPS[root_key] = skipped
+    for skill_md in iter_skill_index_files(project_dir, "SKILL.md"):
+        if is_quarantined_project_skill(skill_md):
+            skipped.append(str(_resolved_dir(skill_md)))
+        else:
+            yield skill_md
+
+
+def _resolved_dir(skill_md) -> Path:
+    d = Path(skill_md).parent
+    try:
+        return d.resolve()
+    except OSError:
+        return d
+
+
+def get_quarantined_project_skills(project_dirs=None) -> list[tuple[Path, Any, Path]]:
+    """``(skill_dir, ScanResult|None, project_dir)`` for every project skill the quarantine
+    excluded from the last walk of those roots — no scan, no re-walk: the verdicts and the
+    paths come from the walk that actually decided what loads. Missing dirs are ignored."""
+    wanted = {str(d) for d in project_dirs} if project_dirs is not None else None
+    seen: dict[str, tuple[Path, Any, Path]] = {}
+    for root_key, skill_dirs in _PROJECT_QUARANTINE_SKIPS.items():
+        if wanted is not None and root_key not in wanted:
+            continue
+        for skill_dir in skill_dirs:
+            seen.setdefault(skill_dir, (Path(skill_dir), _PROJECT_SCAN_RESULTS.get(skill_dir),
+                                        Path(root_key)))
+    return list(seen.values())
 
 
 def normalize_skill_lookup_name(identifier: str) -> str:
@@ -758,6 +853,10 @@ def discover_all_skill_config_vars() -> list[dict[str, Any]]:
         for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
             try:
                 frontmatter, _ = parse_frontmatter(skill_file.read_text(encoding="utf-8-sig"))
+            except _ENGINE_FAULT_ERRORS:
+                # Environment fault, not this skill's content: it must reach a caller that can
+                # name the missing engine, not read as "no config vars declared".
+                raise
             except Exception:
                 continue
             skill_name = str(frontmatter.get("name") or skill_file.parent.name)
@@ -819,7 +918,16 @@ def resolve_skill_config_values(config_vars: list[dict[str, Any]]) -> dict[str, 
     return resolved
 
 
-SKILL_PROMPT_DESC_LIMIT = 60
+# DEPRECATED 2026-09-30 — the flat skills index is RETIRED (card t_cc3c6951, operator ruling).
+# This constant is the budget the PROMPT INDEX truncated an index line at. The index itself no
+# longer renders (agent/prompt_builder.py::_render_skills_index is dark by default), so nothing
+# here gates ROUTING any more. It is kept because the same one-line description is still what
+# `skills_list()` and `skill_view()` return and what the create path (tools/skill_manager_tool.py)
+# and tools/skill_linter.py measure — a description is still the skill's own summary, it is just
+# no longer the thing a lane scans to pick a skill.
+# Replacement for routing: the curated hierarchical surface each lane's SOUL carries
+# (`## Skills — your curated surface`, grouped yoyodine / domain / role), loaded BY NAME.
+SKILL_PROMPT_DESC_LIMIT = 60  # legacy index-line budget; no longer a routing gate
 
 
 def _normalize_skill_description(frontmatter: dict[str, Any]) -> str:

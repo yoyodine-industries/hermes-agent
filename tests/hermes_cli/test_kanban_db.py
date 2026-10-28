@@ -469,6 +469,143 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+# ---------------------------------------------------------------------------
+# Storage-lock requeue (card t_ccfb92a1): a worker whose TURN was killed by the
+# profile state store's write lock being held by a peer must be released to
+# ``ready`` WITHOUT counting a failure. Measured 2026-10-05: the exit was read
+# as an ordinary nonzero crash, so >=12 runs on the ops board bumped
+# ``consecutive_failures`` and three cards sat ``blocked`` at the limit of 2
+# while their own work was fine.
+# ---------------------------------------------------------------------------
+
+
+def test_storage_locked_exit_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A state-store lock-stop releases the task to ``ready``, records outcome
+    ``storage_locked``, and leaves ``consecutive_failures`` untouched — even across
+    far more hits than ``DEFAULT_FAILURE_LIMIT``, so the card is never blocked or
+    given up on. The outcome is also visible in the tick summary, never silent."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="sl", assignee="a")
+
+        # FAR more lock-stops than DEFAULT_FAILURE_LIMIT (2): if any counted, the
+        # card would be blocked/given up well before the loop ends.
+        for i in range(6):
+            pid = 72000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+                (pid, 0, tid),
+            )
+            conn.commit()
+            _kbd._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_STORAGE_LOCKED_EXIT_CODE)
+            )
+
+            crashed = kbd.detect_crashed_workers(conn)
+            # A lock-stop is NOT a crash: neither the return value nor the sweep's
+            # crash list may carry it.
+            assert tid not in crashed
+            assert tid in getattr(_kbd.detect_crashed_workers, "_last_storage_locked", [])
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: a lock-stop must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        # The stamped notice is what the respawn guard reads, and it must be free of
+        # every blocker_auth word: the guard has to see the OUTCOME, not the prose.
+        assert task.last_failure_error and "state-store lock" in task.last_failure_error
+        assert not kbd._RESPAWN_BLOCKER_RE.search(task.last_failure_error), (
+            task.last_failure_error
+        )
+
+        # Never blocked, never given up — the give-up budget was not consumed at all.
+        events = [
+            row["kind"] for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "gave_up" not in events, events
+        outcomes = [
+            row["outcome"] for row in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert outcomes and set(outcomes) == {"storage_locked"}, outcomes
+
+        # Visibility surface: the tick summary names the class, never a bare zero.
+        res = kbd.DispatchResult()
+        res.storage_locked.append(tid)
+        assert "storage_locked=1" in kbd.describe_suppression([res])
+
+
+def test_respawn_guard_defers_storage_locked_within_cooldown(
+    kanban_home, monkeypatch,
+):
+    """With the storage-lock cooldown armed (>0), the guard spaces the respawn and
+    names its own reason; after it elapses the guard returns None — NOT via
+    ``blocker_auth``, which must never be the mechanism that lets the card through."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="sl-guard", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='storage_locked', status='storage_locked', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            (
+                "pid 1 exited with code 76: the turn stopped on a transient "
+                "state-store lock; the card was re-queued without counting a failure",
+                tid,
+            ),
+        )
+        conn.commit()
+
+        # Inside the cooldown → defer under the storage-lock reason.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
+        assert kbd.check_respawn_guard(conn, tid) == "storage_locked_cooldown"
+
+        # Past the cooldown → allowed (None), and NOT because blocker_auth matched.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_storage_locked_cooldown_defaults_to_the_next_tick(kanban_home, monkeypatch):
+    """Default 0 is the contract's "immediately" and is what makes the fix cheap: the
+    reclaim pass has already re-queued the card on this tick and the dispatcher's own
+    cadence is the spacing, so nothing is consumed and there is no hot loop."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.delenv("HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", raising=False)
+    assert kbd.DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS == 0
+    assert _kb._resolve_storage_locked_cooldown_seconds() == 0
+    monkeypatch.setenv("HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", "600")
+    assert _kb._resolve_storage_locked_cooldown_seconds() == 600
+
+
 @pytest.mark.parametrize(
     "error_text, expected",
     [
@@ -1586,7 +1723,8 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kbd._resolve_hermes_argv() == kbd._module_hermes_argv()
+    assert kbd._resolve_hermes_argv()[-2:] == ["-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
@@ -1612,11 +1750,57 @@ def test_resolve_hermes_argv_module_actually_runs():
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+    # The dispatcher always pins the install root on a module-form worker's
+    # PYTHONPATH (_propagate_module_import_root), and `-P` deliberately keeps
+    # cwd off sys.path, so the child must be launched the way it really is.
+    import pathlib
+    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(kbd.__file__).resolve().parents[1])}
+    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30, env=env)
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
     )
+
+
+def test_module_worker_ignores_a_worktree_copy_of_the_install_in_cwd(tmp_path):
+    """A worker whose task workspace IS a worktree of this repo must still boot
+    the install's own code.
+
+    Cards that change Hermes are anchored on a worktree of the hermes-agent
+    repo, which carries its own ``hermes_cli/`` + ``pm/``. The module-form
+    child used to put its cwd first on ``sys.path``, import the worktree copy,
+    resolve the project root to the worktree, find no committed dependency
+    environment under that install key and exit 1 at boot — every retry, so
+    the card stayed ``ready`` looking unattended (24 crashed spawns measured
+    2026-10-18). ``-P`` keeps cwd off ``sys.path``; the install root travels on
+    ``PYTHONPATH`` instead (``_propagate_module_import_root``).
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    workspace = tmp_path / "ws"
+    (workspace / "hermes_cli").mkdir(parents=True)
+    (workspace / "hermes_cli" / "__init__.py").write_text(
+        "raise ImportError('imported the worktree copy of the install')\n",
+        encoding="utf-8",
+    )
+    root = str(Path(kbd.__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": root}
+    env.pop("HERMES_BIN", None)
+
+    argv = kbd._module_hermes_argv()
+    r = subprocess.run(
+        argv + ["--version"], cwd=workspace, env=env,
+        capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, (
+        f"`{' '.join(argv)} --version` failed from a worktree cwd "
+        f"(rc={r.returncode}); stderr={r.stderr[:400]!r}"
+    )
+    assert "worktree copy" not in (r.stdout + r.stderr)
 
 
 def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monkeypatch):
@@ -2084,3 +2268,43 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_respawn_guard_active_pr_lifts_on_reopen(kanban_home):
+    """A card carrying an open PR is guarded against a DUPLICATE implementation —
+    until it is reopened. ``reopen_task`` writes the ``reopened`` event, which is a
+    deliberate re-entry by definition: the next worker finishes THAT PR instead of
+    the card being unschedulable forever.
+
+    Regression: before ``reopened`` was in the clearing set, a done→ready reopen
+    left ``active_pr`` engaged with no event that could ever lift it, so a card at
+    the top priority band sat ready and unschedulable until a human remembered to
+    reassign it twice (measured: rank 1 of 2107 ready cards, 96 min idle)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="pr-guard", assignee="a")
+        kb.add_comment(
+            conn, tid, "coder",
+            "Opened https://github.com/o/r/pull/1 for review",
+        )
+        # The PR comment above is exactly what the guard reads. Wait past the
+        # second boundary: the guard compares events STRICTLY after the comment
+        # and fail-closes on a same-second tie, so a fast test would assert the
+        # tie-break instead of the reopen.
+        time.sleep(1.1)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        assert kb.complete_task(
+            conn, tid, summary="phase 1 for review",
+            metadata={"evidence": {"class": "none", "why": "guard-response probe: no run behind it"}},
+        ) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+        ok, err, _info = kb.reopen_task(
+            conn, tid, actor="platform-stl", reason="changes requested",
+        )
+        assert (ok, err) == (True, None)
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # The reopen is the deliberate re-entry: the guard must let the worker back
+        # in to finish the SAME PR.
+        assert kbd.check_respawn_guard(conn, tid) is None

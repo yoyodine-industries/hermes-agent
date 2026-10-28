@@ -10,7 +10,9 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli.kanban_output import _err, _fmt_counts, _json_out
+from hermes_cli.kanban_output import (
+    BOARD_PIN_REMEDY, _err, _fmt_counts, _json_out,
+)
 
 
 def _dispatch_boards(args: argparse.Namespace) -> int:
@@ -23,15 +25,17 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` read from THIS board's OWN store. Safe on an empty/missing DB.
+    """``{status: count}`` for a board's OWN store. Safe to call on an empty DB.
 
-    The store is resolved by SLUG (``kb.board_store_path``), never through the ambient
-    board context. A ``HERMES_KANBAN_DB``-pinned worker — or a scoped ``--board``, or a
-    delegated child — otherwise answers every row with the pinned board's census, so six
-    boards read as one identical store while the counts that differ (``platform``'s
-    10,515 vs an archived ``ops`` 0) are exactly what this surface exists to show (card
-    t_5723473b). The rows are an INVENTORY: the board is the row's own subject, not the
-    caller's routing target, so the pin must not resolve it.
+    The store is resolved from the SLUG (:func:`kanban_db.board_store_path`), never from
+    :func:`kanban_db.kanban_db_path`: under a board pin (``HERMES_KANBAN_DB``) the latter
+    answers the PINNED file for every slug, so counts printed under another board's slug were
+    really the pinned board's — the same numbers on every line of ``boards`` (measured
+    2026-10-27, card t_398313ec).
+
+    The row's own store is also exposed beside these counts as ``db_path``, resolved the same
+    way from the row's slug (card t_5723473b): the pin decides what a process may READ, never
+    what a board's store IS, so an inventory names each row's own directory.
     """
     try:
         path = kb.board_store_path(slug)
@@ -44,6 +48,17 @@ def _board_task_counts(slug: str) -> dict[str, int]:
         return {r["status"]: int(r["n"]) for r in rows}
     except Exception:
         return {}
+
+
+def _pin_note() -> str:
+    """One line explaining which store a pinned ``boards`` listing is allowed to read."""
+    pinned_slug, pin_var = kb.board_env_pin()
+    where = f"board {pinned_slug!r}" if pinned_slug else "a store that names no board"
+    return (
+        f"Counts: this process is pinned to {where} ({pin_var}), so task counts are printed "
+        "only for that board.\n"
+        "Per-board counts: env -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD hermes kanban boards"
+    )
 
 
 def _board_slug_arg(args: argparse.Namespace, cmd: str, *, must_exist: bool) -> tuple[Optional[str], int]:
@@ -63,14 +78,26 @@ def _board_slug_arg(args: argparse.Namespace, cmd: str, *, must_exist: bool) -> 
 def _cmd_boards_list(args: argparse.Namespace) -> int:
     boards = kb.list_boards(include_archived=bool(getattr(args, "all", False)))
     current = kb.get_current_board()
+    fenced = kb._explicit_board_intent_pinned()
+    pinned_slug, pin_var = kb.board_env_pin()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        # Every per-board field of the row is the ROW's board, resolved from its own
-        # directory: an inventory enumerates the home, so the ambient pin must not
-        # relabel all six rows as the caller's board (card t_5723473b).
+        # Where the pin OVERRIDES intent, a pinned process must not READ another board's store
+        # (the pin is that isolation), and must not print this one's counts under another
+        # board's slug either. Blank the counts for every board the process is not pinned to,
+        # so a count is only ever shown beside the store it was taken from (measured
+        # 2026-10-27, card t_398313ec). Where it does not override intent — the operator's own
+        # selected board — every slug still resolves to its own store, so per-slug counts are
+        # exactly right and stay as they were.
+        readable = not (fenced and pin_var) or b["slug"] == pinned_slug
+        counts = _board_task_counts(b["slug"]) if readable else None
+        b["counts"] = counts
+        b["total"] = sum(counts.values()) if counts is not None else None
+        # The ROW's own store, resolved from its own slug (card t_5723473b): the pin decides
+        # what this process may READ, above — it never relabels where a board's store IS, so
+        # an inventory renders each row against its own directory. The row names a path; it
+        # opens nothing, which is why the pin guard above does not gate this field.
         b["db_path"] = str(kb.board_store_path(b["slug"]))
-        b["counts"] = _board_task_counts(b["slug"])
-        b["total"] = sum(b["counts"].values())
     if _json_out(args, boards):
         return 0
     if not boards:
@@ -80,10 +107,14 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     for b in boards:
         marker = "●" if b["is_current"] else " "
         name = (b.get("name") or "") + (" [archived]" if b.get("archived") else "")
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {_fmt_counts(b['counts'] or {}, '(empty)')}")
+        cell = (_fmt_counts(b["counts"] or {}, "(empty)") if b["counts"] is not None
+                else "(not read — pinned)")
+        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {cell}")
     print(f"\nCurrent board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
+    if fenced and pin_var:
+        print(f"\n{_pin_note()}")
     return 0
 
 
@@ -163,10 +194,39 @@ def _cmd_boards_switch(args: argparse.Namespace) -> int:
 
 
 def _cmd_boards_show(args: argparse.Namespace) -> int:
-    current = kb.get_current_board()
-    meta = kb.read_board_metadata(current)
-    counts = _board_task_counts(current)
-    print(f"Current board: {current}\n  Display name: {meta.get('name', '')}")
+    requested = getattr(args, "slug", None)
+    fenced = kb._explicit_board_intent_pinned()
+    pinned_slug, pin_var = kb.board_env_pin()
+    if requested:
+        # Same fence as `--board` (card t_398313ec): this handler ignores `--board` by
+        # construction, but it prints a STORE (`DB path` + task counts) beside a board's
+        # metadata. Under a pin that OVERRIDES intent the store is the pinned one, so
+        # `boards show <other>` used to render <other>'s description and filename over the
+        # pinned board's path and counts. A display that mixes two boards is worse than an
+        # error: refuse instead. (`assert_board_matches_env_pin` is a no-op where the pin
+        # does not override intent, and there the per-slug read below is already right.)
+        try:
+            kb.assert_board_matches_env_pin(requested)
+        except ValueError as exc:
+            return _err(f"kanban boards show: {exc}\n{BOARD_PIN_REMEDY}")
+    elif fenced and pin_var and not pinned_slug:
+        return _err(
+            "kanban boards show: this process is pinned to a store that names no board "
+            f"({pin_var}=…), so there is no board whose metadata matches it; "
+            "run from a top-level session or clear the pin "
+            "(`env -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD hermes kanban boards show <slug>`)"
+        )
+    # No slug named: where the pin OVERRIDES intent, report the board this process is actually
+    # pinned to, not the ambient `current` pointer — those can be different boards, and showing
+    # the pointer's metadata beside the pin's store is the same mixed display. Where it does
+    # not (an operator's own selected board), the pointer is still the answer, as before.
+    slug = requested or (pinned_slug if fenced else None) or kb.get_current_board()
+    meta = kb.read_board_metadata(slug)
+    counts = _board_task_counts(slug)
+    if _json_out(args, meta):
+        return 0
+    label = "Current board" if getattr(args, "slug", None) is None else "Board"
+    print(f"{label}: {slug}\n  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}\n"
@@ -269,6 +329,66 @@ def _cmd_boards_set_dispatch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_set_priority_policy(args: argparse.Namespace) -> int:
+    """Wire (or clear) a board's birth-time priority policy, and sync its storage guard.
+
+    The WRITING half of the birth seam (card t_2187558e, REQUIRED 2). Three things happen
+    here and nowhere else:
+
+    * the module is VALIDATED by LOADING it (``load_callable``) and by READING the board's
+      floor through it (``board_floor``). A policy that cannot be loaded, or whose floor
+      cannot be read, is refused with *nothing written* - the writer stores what it is
+      given, so this verb is the surface that has to refuse, and a refusal must leave no
+      half-wired board behind;
+    * the key is written through ``write_board_metadata(..., priority_policy=...)``, storing
+      the NORMALISED spec so ``board.json`` holds the canonical shape (``{module, function}``);
+    * the storage guard is synced to the key (``sync_priority_tranche_guard``) — armed for a
+      wired board, dropped for an unwired one — so the guard can never drift from the key
+      that turns the domain on. The floor is baked into the DDL at this moment.
+    """
+    from hermes_cli import kanban_priority_policy as kpp
+
+    normed, rc = _board_slug_arg(args, "set-priority-policy", must_exist=True)
+    if rc:
+        return rc
+    module = (getattr(args, "module", None) or "").strip()
+    spec = None
+    if module:
+        try:
+            spec = kpp.normalize_spec({
+                "module": module,
+                "function": (getattr(args, "function", None) or "").strip() or kpp.DEFAULT_FUNCTION,
+            })
+            kpp.load_callable(spec)                      # the callable must LOAD
+            kpp.board_floor(spec, normed)                # and its floor must be READABLE
+        except Exception as exc:
+            return _err(f"kanban boards set-priority-policy: {exc} — nothing written", 2)
+    try:
+        kb.write_board_metadata(normed, priority_policy=spec if module else "")
+        state = kb.sync_priority_tranche_guard(normed)
+    except Exception as exc:
+        return _err(f"kanban boards set-priority-policy: {exc} — nothing written", 2)
+    payload = {
+        "board": normed,
+        "priority_policy": kb.board_priority_policy(normed),
+        "storage_guard": state,
+    }
+    if _json_out(args, payload):
+        return 0
+    if module:
+        print(f"Board {normed!r}: priority policy set to "
+              f"{payload['priority_policy']['module']!r}"
+              f"::{payload['priority_policy']['function']}.\n"
+              f"  Birth priority is that policy's call from now on; the caller's value is "
+              f"the ASK.\n"
+              f"  Storage guard: {state}.")
+    else:
+        print(f"Board {normed!r}: priority policy cleared.\n"
+              f"  Storage guard: {state} — the board behaves exactly as it did before it "
+              f"ever opted in.")
+    return 0
+
+
 def _cmd_boards_export(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
     from hermes_cli.sizefmt import format_bytes
@@ -325,6 +445,7 @@ _BOARD_HANDLERS = {
     "set-default-workdir": _cmd_boards_set_default_workdir,
     "set-project": _cmd_boards_set_project,
     "set-dispatch": _cmd_boards_set_dispatch,
+    "set-priority-policy": _cmd_boards_set_priority_policy,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

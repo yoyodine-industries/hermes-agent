@@ -396,3 +396,90 @@ def test_reassign_cli_params_are_single_id_and_never_bulk():
     empty = kbg.params_from_args("reassign", argparse.Namespace(task_id=None, reclaim=True))
     assert empty == {"ids": [], "reclaim_first": True}
     assert kbg.classify("reassign", empty) is None
+
+
+# --- 11. the ``--ids`` verbs' scope covers the REQUIRED positional task_id (card t_6d0e6cdb) --
+
+def _parsed(*argv):
+    """Parse real CLI argv through the real parser — never a hand-built Namespace."""
+    from hermes_cli.kanban_parser import build_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_parser(parser.add_subparsers(dest="command"))
+    return parser.parse_args(list(argv))
+
+
+def test_bulk_verb_scope_covers_the_positional_task_id():
+    """``promote a --ids b`` moves TWO cards, so it must classify as bulk and name both."""
+    for verb in ("block", "schedule", "promote"):
+        params = kbg.params_from_args(verb, _parsed("kanban", verb, "t_a", "--ids", "t_b"))
+        assert params["ids"] == ["t_a", "t_b"], verb
+        assert kbg.classify(verb, params) == "ids=t_a,t_b", verb
+
+
+def test_three_card_cli_action_binds_every_id():
+    """A 3-card action's scope must name all three — under-binding let one bundle cover 2 of 3."""
+    args = _parsed("kanban", "promote", "t_a", "--ids", "t_b", "t_c")
+    assert kbg.classify("promote", kbg.params_from_args("promote", args)) == "ids=t_a,t_b,t_c"
+
+
+def test_cli_scope_is_the_handlers_effective_set():
+    """ONE definition: the guard's params and the handler's ``_bulk_ids`` cannot disagree."""
+    from hermes_cli import kanban
+
+    args = _parsed("kanban", "block", "t_a", "--ids", "t_b", "t_c")
+    assert kbg.params_from_args("block", args)["ids"] == kanban._bulk_ids(args)
+    assert kbg.bulk_ids_from_args(args) == ["t_a", "t_b", "t_c"]
+
+
+def test_single_card_bulk_verbs_stay_ungated():
+    """Cardinality is the carve-out: the positional alone — or repeated — is ONE card."""
+    for verb in ("block", "schedule", "promote"):
+        alone = kbg.params_from_args(verb, _parsed("kanban", verb, "t_a"))
+        assert alone["ids"] == ["t_a"], verb
+        assert kbg.classify(verb, alone) is None, f"{verb} single card must stay ungated"
+        dup = kbg.params_from_args(verb, _parsed("kanban", verb, "t_a", "--ids", "t_a"))
+        assert dup["ids"] == ["t_a"], verb
+        assert kbg.classify(verb, dup) is None, f"{verb}: a duplicate id is still one card"
+
+
+def test_cli_and_dashboard_scopes_are_identical():
+    """Door parity: the CLI's 2-card scope equals the dashboard's ``{"ids": [...]}`` scope, so one
+    digited approval admits both doors — and a different id set is still a different action."""
+    args = _parsed("kanban", "promote", "t_a", "--ids", "t_b")
+    cli = kbg.classify("promote", kbg.params_from_args("promote", args))
+    assert cli == kbg.classify("promote", {"ids": ["t_a", "t_b"]})
+    assert cli != kbg.classify("promote", {"ids": ["t_a", "t_c"]})
+
+
+def test_the_cli_seam_hands_the_guard_the_positional_task_id(monkeypatch):
+    """The seam itself (``gate_cli``) must pass the full effective set, not ``--ids`` alone."""
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(kbg, "assert_bulk_approved", fake)
+    kbg.gate_cli(_parsed("kanban", "promote", "t_a", "--ids", "t_b"))
+    assert seen["verb"] == "promote"
+    assert seen["params"] == {"ids": ["t_a", "t_b"]}
+
+
+def _scope(verb, *argv):
+    return kbg.classify(verb, kbg.params_from_args(verb, _parsed("kanban", verb, *argv)))
+
+
+def test_the_digest_binds_the_positional_card():
+    """Consequence (b) of the defect: the positional card was OUTSIDE the binding, so
+    ``schedule a --ids b c`` and ``schedule d --ids b c`` shared one digest. They must not."""
+    a = kbg.scope_digest("ops", "schedule", _scope("schedule", "t_a", "why", "--ids", "t_b", "t_c"))
+    d = kbg.scope_digest("ops", "schedule", _scope("schedule", "t_d", "why", "--ids", "t_b", "t_c"))
+    assert a != d
+
+
+def test_the_digest_is_order_insensitive_over_the_id_set():
+    """The scope is a SET: naming the same cards in another order is the same action."""
+    x = _scope("schedule", "t_a", "why", "--ids", "t_b", "t_c")
+    y = _scope("schedule", "t_c", "why", "--ids", "t_a", "t_b")
+    assert x == y == "ids=t_a,t_b,t_c"
+    assert kbg.scope_digest("ops", "schedule", x) == kbg.scope_digest("ops", "schedule", y)

@@ -37,6 +37,11 @@ def band_birth(requested, assignee, board, title, body):
     return {"applied": 800000, "reason": "the board's tier"}
 '''
 
+AMBIENT = '''
+def band_birth(requested, assignee, board, title, body):
+    return {"applied": 600000, "reason": "the ambient board's tier"}
+'''
+
 RAISES = '''
 def band_birth(requested, assignee, board, title, body):
     raise ValueError("policy exploded")
@@ -250,6 +255,39 @@ def test_children_are_banded_by_the_board_their_connection_is_on(home):
         assert kids and len(kids) == 1
         assert _priority(other_conn, kids[0]) == 800000
         assert _created_payload(other_conn, kids[0])["priority_policy"]["applied"] == 800000
+
+
+def test_a_filing_with_no_board_takes_its_policy_from_the_connections_board(home):
+    """``board=`` is a HINT on the filing; the caller's CONNECTION is the destination.
+
+    A worker holding another board's connection may leave ``board=`` off a filing, and the
+    card is still born on that connection's board. So the policy that decides its priority
+    is that board's, never the ambient one. The ambient board here is wired to a DIFFERENT
+    answer, so a resolution that reads it shows up as the WRONG NUMBER rather than as a
+    missing policy - the two failure modes come apart.
+    """
+    kb.create_board("other")
+    _wire(home, FIXED, board="other")
+    ambient = _policy_file(home, AMBIENT, name="ambient_policy.py")
+    kb.write_board_metadata(
+        "default", priority_policy={"module": str(ambient), "function": "band_birth"},
+    )
+    assert kb.get_current_board() == "default"
+    with kbc.connect_closing(board="other") as other_conn:
+        assert kb.board_for_connection(other_conn) == "other"
+        tid = kb.create_task(
+            other_conn, title="filed from elsewhere", assignee="coder", priority=0,
+        )
+        assert _priority(other_conn, tid) == 800000
+        assert _created_payload(other_conn, tid)["priority_policy"]["applied"] == 800000
+        # Negative control on the SAME connection and board: a value the policy does not
+        # move keeps today's event shape (no key at all), so the assertions above are
+        # about WHICH board's policy ran, not about every filing carrying a record.
+        still = kb.create_task(
+            other_conn, title="already there", assignee="coder", priority=800000,
+        )
+        assert _priority(other_conn, still) == 800000
+        assert "priority_policy" not in _created_payload(other_conn, still)
 
 
 def test_a_boards_own_connection_names_its_slug(conn):

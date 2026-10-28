@@ -213,6 +213,7 @@ def record_boot(root: Optional[Path] = None, *, now: Optional[int] = None) -> Op
         "tree": str(resolved),
         "recorded_at": int(time.time() if now is None else now),
     }
+    _persist_boot(_boot_record)
     return _boot_record
 
 
@@ -227,17 +228,137 @@ def reset_boot() -> None:
     _boot_record = None
 
 
+# --- the PERSISTED boot record: readable from OUTSIDE the process ------------------------
+#
+# The in-process record above cannot answer the question the fleet actually needs answered: a
+# carrier in a DIFFERENT (freshly started) process asks "is that long-lived process serving
+# stale code?", and it cannot read the frozen process's memory. On 2026-10-10 that gap is what
+# let a gateway serve ~270h-old gate bytes for 24h while every mtime-based check reported idle:
+# the only detector that could see it lived INSIDE the process it was judging, and that process
+# never re-imported, so it never re-checked. The record is therefore persisted (one tiny JSON
+# per pid, carrying the process IDENTITY so a recycled pid answers "unknown") and read back by
+# ``hermes_cli.code_skew_content``, which owns the comparison.
+
+#: ``<kanban home>/kanban/tree_boot_records/<pid>.json``
+BOOT_RECORD_DIRNAME = "tree_boot_records"
+#: A month is far longer than any identity question a reader asks of a boot record, and the bound
+#: keeps the directory from growing forever behind a host that churns pids.
+BOOT_RECORD_RETENTION_SECONDS = 30 * 24 * 3600
+
+
+def kanban_root() -> Path:
+    """``<hermes root>/kanban`` --- the base ``kanban_db.kanban_home()`` resolves, without the
+    kanban kernel's import weight (this module is imported at the dashboard's boot).
+
+    Shared across profiles BY DESIGN, like the board itself: a carrier resolves it from its own
+    process, so ``HERMES_HOME``'s per-profile fork must not reach it.
+    """
+    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    if override:
+        return Path(override).expanduser() / "kanban"
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "kanban"
+
+
+def boot_records_dir() -> Path:
+    """``<kanban root>/tree_boot_records`` --- one JSON per process, keyed by pid."""
+    return kanban_root() / BOOT_RECORD_DIRNAME
+
+
+def _persist_boot(record: Optional[dict]) -> Optional[Path]:
+    """Write ``record`` for outside readers, best-effort, atomically, and never raising.
+
+    Best-effort on purpose: an unwritable kanban home must not take a process's boot down, and
+    the in-process record (which needs no disk) still answers every self-check. The cost of a
+    write that did not land is a carrier answering ``unknown`` --- fail-loud, never a false green.
+    """
+    import json
+
+    if not isinstance(record, dict) or not record.get("fingerprint"):
+        return None
+    pid = record.get("pid")
+    try:
+        wanted = int(str(pid))
+    except (TypeError, ValueError):
+        return None
+    doc = dict(record)
+    doc["version"] = 1
+    try:
+        from hermes_cli.code_skew_content import process_identity
+
+        doc["identity"] = process_identity(wanted) or ""
+    except Exception:  # pragma: no cover - no identity means "unknown", which is not "clear"
+        doc["identity"] = ""
+    directory = boot_records_dir()
+    target = directory / f"{wanted}.json"
+    tmp = directory / f".{wanted}.json.tmp"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(doc, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, target)
+        _prune_boot_records(directory)
+        return target
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        logging.getLogger(__name__).debug("boot record not persisted to %s", target, exc_info=True)
+        return None
+
+
+def _prune_boot_records(directory: Path) -> None:
+    """Drop records older than :data:`BOOT_RECORD_RETENTION_SECONDS`. Never raises."""
+    cutoff = time.time() - BOOT_RECORD_RETENTION_SECONDS
+    try:
+        for entry in os.scandir(directory):
+            try:
+                if not entry.is_file() or entry.stat().st_mtime >= cutoff:
+                    continue
+                os.unlink(entry.path)
+            except OSError:
+                continue
+    except OSError:  # pragma: no cover - pruning is housekeeping, never load-bearing
+        return
+
+
+def recorded_boot(pid: int) -> Optional[dict]:
+    """The persisted boot record for ``pid``, or ``None`` when nothing is recorded.
+
+    Identity verification belongs to the reader that owns process identity
+    (``hermes_cli.code_skew_content.process_tree_fingerprint``): this door returns what was
+    written, it does not judge whether the pid still names the same process.
+    """
+    import json
+
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    path = boot_records_dir() / f"{pid}.json"
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) and doc.get("fingerprint") else None
+
+
 def detect_skew(root: Optional[Path] = None) -> Optional[tuple[str, str]]:
     """``(boot_fingerprint, disk_fingerprint)`` when the CONTENT moved since boot, else ``None``.
 
     ``None`` covers every fail-open case: no boot record (a process that never adopted the guard),
     an unreadable tree, and a tree whose git ref moved without its content moving (the ref half of
     the pair lives in ``gateway.code_skew`` and is consulted separately, as a fast path only).
+
+    A thin door onto ``hermes_cli.code_skew_content.content_skew`` --- the ONE staleness
+    comparison in the fleet. Kept for the callers that predate that module.
     """
-    record = _boot_record
-    if record is None or not record.get("fingerprint"):
+    from hermes_cli.code_skew_content import VERDICT_SKEWED, measure
+
+    record = _boot_record or {}
+    tree = root if root is not None else (record.get("tree") or default_root())
+    result = measure(os.getpid(), tree)
+    if result["verdict"] != VERDICT_SKEWED:
         return None
-    current = content_fingerprint(root)
-    if current is None or current == record["fingerprint"]:
-        return None
-    return str(record["fingerprint"]), current
+    return str(result["boot"]), str(result["disk"])

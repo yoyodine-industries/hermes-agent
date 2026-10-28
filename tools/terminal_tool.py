@@ -1064,6 +1064,9 @@ class _ExecPlan:
     # Set when a foreground call asked for more than FOREGROUND_MAX_TIMEOUT and was promoted to a
     # tracked background process instead of being refused (the requested seconds, for the note).
     promoted_from_foreground_timeout: Optional[int] = None
+    # Set when the command IS a workflow departure (a yoyoflow carrier invocation): it is spawned
+    # detached -- own session, no turn or shutdown sweep owns it (t_4b9843a4).
+    departure: bool = False
 
 
 _PROMOTED_NOTE = (
@@ -1138,6 +1141,7 @@ def _plan_execution(
     if timeout is not None and timeout <= 0:
         raise _Rejected(tool_error(f"timeout must be a positive number of seconds (got {timeout})."))
     promoted = None
+    departure = False
     if not background:
         # An over-cap foreground timeout is a bounded job the caller wants to wait for (test suites,
         # builds). Refusing it only bought a mechanical retry: 454 refusals in one run, every one
@@ -1151,11 +1155,16 @@ def _plan_execution(
             raise _Rejected(_error_json(guidance, status="error"))
         if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
             promoted = timeout
+    # A production workflow flight must not be a child of this turn (t_4b9843a4) — whether the
+    # caller asked for a foreground tick or backgrounded it itself.
+    from tools.workflow_departure import detach_enabled, is_departure_command
+    if detach_enabled() and is_departure_command(command):
+        departure = True
 
     return _ExecPlan(
         config=config, env_type=env_type, effective_task_id=effective_task_id,
         image=image, cwd=cwd, host_cwd=host_cwd, effective_timeout=timeout or config["timeout"],
-        promoted_from_foreground_timeout=promoted,
+        promoted_from_foreground_timeout=promoted, departure=departure,
     )
 
 
@@ -1178,6 +1187,27 @@ def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
         return result_json
     template = _PROMOTED_NOTE if data.get("notify_on_complete") else _PROMOTED_NOTE_POLL_ONLY
     data["promoted_from_foreground"] = template.format(requested=requested_timeout, cap=FOREGROUND_MAX_TIMEOUT)
+    return json.dumps(data, ensure_ascii=False)
+
+
+_DEPARTURE_NOTE = (
+    "This command is a WORKFLOW DEPARTURE: it was started detached (its own session) so a gateway "
+    "bounce, a turn timeout or a session close cannot reap a live production run. It is NOT waited "
+    "on and no completion notice will arrive. Track it with process(action='poll', session_id=...) "
+    "and rely on the workflow ledger for its verdict — do not re-run it because the call returned."
+)
+
+
+def _with_departure_note(result_json: str) -> str:
+    """Mark a detached-departure spawn result (unchanged on error)."""
+    try:
+        data = json.loads(result_json)
+    except (TypeError, ValueError):
+        return result_json
+    if not isinstance(data, dict) or data.get("error"):
+        return result_json
+    data["departure"] = True
+    data["departure_note"] = _DEPARTURE_NOTE
     return json.dumps(data, ensure_ascii=False)
 
 
@@ -1459,6 +1489,13 @@ def terminal_tool(
             # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
+        if plan.departure:
+            # A workflow departure is spawned DETACHED and never waited on: it is a production
+            # flight that outlives this turn and this gateway (t_4b9843a4). No completion notice
+            # is armed — there may be no turn left to deliver it to — and it is never reaped by
+            # a turn, session or shutdown sweep (process_registry departs on `departure`).
+            background, notify_on_complete, watch_patterns = True, False, None
+            persist_on_release = True
         if background:
             result = spawn_background_process(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
@@ -1470,9 +1507,12 @@ def terminal_tool(
                 completion_output_chars=_completion_output_chars,
                 heartbeat_seconds=heartbeat,
                 persist_on_release=persist_on_release,
+                departure=plan.departure,
             )
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
+            if plan.departure:
+                result = _with_departure_note(result)
             return _metered(None if _host_local else plan, result)
         return _metered(None if _host_local else plan, _run_foreground(
             command, env, plan,

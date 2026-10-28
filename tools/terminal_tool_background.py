@@ -87,13 +87,20 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty, persist_on_release: bool = False):
+           session_key, effective_pty, persist_on_release: bool = False, departure: bool = False):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
-                  persist_on_release=persist_on_release)
+                  persist_on_release=persist_on_release, departure=departure)
     if env_type == "local":
+        # The marker is what lets a sweep or an attribution pass recognise a production flight
+        # without guessing from a pid (tools/workflow_departure.pid_is_departure).
+        env_vars = dict(env.env) if getattr(env, "env", None) else None
+        if departure:
+            from tools.workflow_departure import ENV_MARKER
+            env_vars = dict(env_vars or {})
+            env_vars[ENV_MARKER] = "1"
         return process_registry.spawn_local(
-            env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
+            env_vars=env_vars, use_pty=effective_pty, **common)
     return process_registry.spawn_via_env(env=env, **common)
 
 
@@ -148,6 +155,7 @@ def spawn_background_process(
     heartbeat_seconds: int = 0,
     persist_on_release: bool = False,
     mounted_host: Optional[str] = None,
+    departure: bool = False,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
@@ -169,16 +177,21 @@ def spawn_background_process(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
+            departure=departure,
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
         if persist_on_release:
             result_data["persist_on_release"] = True
+        if departure:
+            result_data["departure"] = True
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:
             result_data["pty_note"] = pty_disabled_reason
-        if not notify_on_complete and not watch_patterns:
+        if not notify_on_complete and not watch_patterns and not departure:
+            # A departure is deliberately silent — there may be no turn left to notify — so the
+            # "re-launch with notify_on_complete" advice would be wrong for it.
             result_data["hint"] = _SILENT_BACKGROUND_HINT
         if command and _looks_like_homebrew_ci_poller(command):
             existing = result_data.get("hint", "")
