@@ -186,22 +186,28 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: {exc}", 2)
         if not normed:
             return _err("kanban: --board requires a slug", 2)
-        # The board pin is a FENCE, and it must be a LOUD one. Under HERMES_KANBAN_DB /
-        # HERMES_KANBAN_BOARD every slug resolves to the pinned store, so `--board <other>`
-        # used to run against <other>'s NAME and the pinned board's DATA: `show` answered
-        # "no such task" for a card that exists, and the write verbs (create/comment/complete/
-        # archive) mutated the pinned board while the operator believed they named <other>
-        # (measured 2026-10-27, card t_398313ec). Compared HERE, at the one seam every
-        # subcommand passes through, before anything is read or written — not per verb.
+        # The board pin is a FENCE, and it must be a LOUD one — but ONLY for a name that
+        # RESOLVES. A fence may allow or deny the object the caller named; it may never
+        # SUBSTITUTE a different object for it (ruling 2026-10-28, t_ecd51c9c). So existence
+        # is settled FIRST: a slug that resolves to no board is no board at all, nothing on
+        # this lineage holds a claim on it, and the honest "board '<x>' does not exist" must
+        # be what the caller sees — not this pin's refusal speaking for a board that is not
+        # there. Provably inert: the existence test reads board.json presence only; no store
+        # is opened and nothing is written before this refusal.
+        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
+            return _err(f"kanban: board {normed!r} does not exist. "
+                        f"Create it with `hermes kanban boards create {normed}`.")
+        # Under HERMES_KANBAN_DB / HERMES_KANBAN_BOARD every slug resolves to the pinned
+        # store, so `--board <other>` used to run against <other>'s NAME and the pinned
+        # board's DATA: `show` answered "no such task" for a card that exists, and the write
+        # verbs (create/comment/complete/archive) mutated the pinned board while the operator
+        # believed they named <other> (measured 2026-10-27, card t_398313ec). Compared HERE,
+        # at the one seam every subcommand passes through, before anything is read or
+        # written — not per verb.
         try:
             kb.assert_board_matches_env_pin(normed)
         except ValueError as exc:
             return _err(f"kanban: {exc}\n{BOARD_PIN_REMEDY}")
-        # Boards other than 'default' must already exist — typoed slugs would otherwise silently
-        # create an empty board.
-        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
-            return _err(f"kanban: board {normed!r} does not exist. "
-                        f"Create it with `hermes kanban boards create {normed}`.")
         board_scope = kb.scoped_current_board(normed)
 
     with board_scope:
