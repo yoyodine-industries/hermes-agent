@@ -230,6 +230,94 @@ def test_pm_generation_dir_around_the_running_venv_is_the_interpreter(tmp_path, 
     # Only a generation venv: a checkout's .venv or a venv elsewhere adds nothing new.
     assert _pm_generation_dirs([tmp_path / "checkout" / ".venv", tmp_path / "other" / "venv"]) == set()
 
+def test_a_linked_worktree_git_dir_is_the_checkouts_own_bookkeeping(tmp_path):
+    """`git worktree add` (the recipe every repair card prescribes: ``.worktrees/<card>``) replaces
+    ``.git`` with a FILE holding ``gitdir: <dir>``, and that dir is
+    ``<main>/.git/worktrees/<name>`` — INSIDE the guarded root in the default in-home layout. It
+    holds this worktree's own HEAD/index/marker files: the operator's config, hooks and objects stay
+    in the common dir one level up, which stays guarded.
+    """
+    from tests import home_io_guard
+
+    checkout = tmp_path / "home" / "hermes-agent"
+    checkout.mkdir(parents=True)
+    assert home_io_guard._linked_worktree_git_dir(checkout) is None  # no .git at all
+    (checkout / ".git").mkdir()
+    assert home_io_guard._linked_worktree_git_dir(checkout) is None  # an ordinary clone
+    (checkout / ".git").rmdir()
+
+    git_dir = tmp_path / "home" / ".git" / "worktrees" / "t_card"
+    git_dir.mkdir(parents=True)
+    (checkout / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+    assert home_io_guard._linked_worktree_git_dir(checkout) == git_dir.resolve()
+
+    # Git writes an absolute pointer for `worktree add`; a relative one is relative to the checkout.
+    (checkout / ".git").write_text("gitdir: ../.git/worktrees/t_card\n", encoding="utf-8")
+    assert home_io_guard._linked_worktree_git_dir(checkout) == git_dir.resolve()
+
+
+def test_the_worktree_git_dir_is_exempt_but_its_common_dir_is_not(tmp_path, monkeypatch):
+    """The exemption is exactly the linked worktree's private dir, whose ``hermes-update-pull``
+    marker the launch path stats. The common dir keeps the operator's config, hooks and objects, and
+    an ANCESTOR of the private dir is not a stand-in for it.
+    """
+    from tests import home_io_guard
+
+    home = tmp_path / "home"
+    git_dir = home / ".git" / "worktrees" / "t_card"
+    git_dir.mkdir(parents=True)
+    (git_dir / "hermes-update-pull").write_text("pre", encoding="utf-8")
+    (home / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    monkeypatch.setattr(home_io_guard, "_CHECKOUT_GIT_PREFIX_STRS",
+                        (home_io_guard._normcase(os.fspath(git_dir.resolve())),))
+    guard = home_io_guard.HomeIOGuard(lambda: [home])
+
+    guard.check(git_dir / "hermes-update-pull", metadata=True)  # the marker probe at launch
+    guard.check(git_dir / "hermes-update-pull")                 # ...and the read that follows
+    for common in (home / ".git" / "config", home / ".git" / "worktrees", home / ".git"):
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            guard.check(common)
+
+
+def test_the_payload_manifest_beside_a_checkout_is_read_but_never_written(tmp_path, monkeypatch):
+    """pm's ``_payload_manifest`` reads ``<checkout>.parent/manifest.json`` at every launch and
+    DISCARDS it unless its ``repo`` names this very tree. A read describes the checkout in hand (the
+    same class as its .venv); a write would let a test corrupt the operator's install record.
+    """
+    from tests import home_io_guard
+
+    home = tmp_path / "home"
+    (home / "hermes-agent").mkdir(parents=True)
+    manifest = home / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(home_io_guard, "_CHECKOUT_PAYLOAD_MANIFESTS",
+                        frozenset({home_io_guard._normcase(os.fspath(manifest.resolve()))}))
+    guard = home_io_guard.HomeIOGuard(lambda: [home])
+
+    guard.check(manifest, metadata=True)
+    guard.check(manifest)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(manifest, destructive=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(home / "sibling.json")
+
+
+def test_running_from_a_linked_worktree_still_guards_the_common_dir():
+    """Inverse of the exemption, on the REAL tree: when this suite runs from a linked worktree, that
+    worktree's private git dir is exempt but the common dir holding the operator's config is not.
+    Skipped when the run is not from a worktree (a plain checkout has no private dir to exempt).
+    """
+    from tests import home_io_guard
+
+    git_dir = home_io_guard._worktree_git_dir
+    if git_dir is None:
+        pytest.skip("this run is not from a linked worktree")
+    common_dir = git_dir.parents[1]
+    guard = home_io_guard.HomeIOGuard(lambda: [common_dir])
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(common_dir / "config")
+
+
 
 def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     """A Hermes-launched shell hands pytest TMPDIR=<home>/cache/scratch (tagged by
