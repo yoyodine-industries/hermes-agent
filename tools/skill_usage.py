@@ -701,7 +701,8 @@ def _git_call(repo: Path, *args: str) -> tuple[int, str]:
     """
     try:
         proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
-                              text=True, timeout=_GIT_TIMEOUT_SECS)
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=_GIT_TIMEOUT_SECS)
         return proc.returncode, proc.stdout
     except (OSError, subprocess.SubprocessError) as e:
         logger.debug("git %s failed in %s: %s", args, repo, e)
