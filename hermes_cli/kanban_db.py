@@ -903,6 +903,18 @@ def assert_board_matches_env_pin(board: Optional[str]) -> Optional[str]:
     return normed
 
 
+def _slug_board_path(slug: str, default_parts: tuple[str, ...], leaf: str) -> Path:
+    """``default`` -> legacy ``<root>/<default_parts>``, else ``board_dir(slug)/leaf``.
+
+    The ONE statement of the on-disk board layout, so the ambient resolution
+    (:func:`_board_path`) and a named board's own store
+    (:func:`board_store_path`) cannot drift apart.
+    """
+    if slug == DEFAULT_BOARD:
+        return kanban_home().joinpath(*default_parts)
+    return board_dir(slug) / leaf
+
+
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
@@ -938,6 +950,25 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
     ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
     return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
+
+
+def board_store_path(board: str) -> Path:
+    """THE store a NAMED board's OWN directory holds — never the ambient pin.
+
+    :func:`_slug_board_path` is the one layout rule (``<root>/kanban.db`` for
+    ``default``, else ``boards/<slug>/kanban.db``), so this answers the same path in
+    every context: a bare shell, a ``HERMES_KANBAN_DB``-pinned worker, a delegated
+    child, the gateway. Ask it where the question is *this named board's own* store —
+    the board INVENTORY surfaces (``hermes kanban boards [list]``, which enumerates
+    boards and must ignore the shared task-routing override) — and never where the
+    question is "the store THIS process is pinned to", which is :func:`kanban_db_path`
+    and keeps honouring the pin.
+
+    This adds no bypass: :func:`hermes_cli.kanban_db_connect.connect` still runs
+    ``kanban_path_is_fenced`` on whatever path it is handed, so a fenced execution
+    gets the same read-only open from here as from any other path.
+    """
+    return _slug_board_path(_slug_or_default(board), ("kanban.db",), "kanban.db")
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:

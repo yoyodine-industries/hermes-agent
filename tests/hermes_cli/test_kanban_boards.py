@@ -701,3 +701,139 @@ class TestBoardResurrection:
         assert meta["name"] == "My Board"
         assert "keepname" in [b["slug"] for b in kb.list_boards(include_archived=True)]
         assert "keepname" not in [b["slug"] for b in kb.list_boards(include_archived=False)]
+
+
+# ---------------------------------------------------------------------------
+# Board inventory: every row carries its OWN board's store (card t_5723473b)
+# ---------------------------------------------------------------------------
+
+class TestBoardsListPerRowCounts:
+    """``hermes kanban boards [list]`` enumerates the HOME, so each row's census and
+    store path is the ROW's own board.
+
+    Measured 2026-10-12: with ``HERMES_KANBAN_DB`` pinning ``defcon``, all six rows
+    rendered defcon's identical census (``done=2653 …``) while ``platform``'s own
+    store held 10,515 tasks — the row's count source resolved through the ambient
+    pin (the very override a worker's env injects) instead of by slug. The rows are
+    an inventory, not a routed task read, so the pin must not relabel them.
+    """
+
+    @staticmethod
+    def _own_store(home: Path, slug: str) -> Path:
+        """The store the documented layout puts on ``slug`` — spelled out HERE, so this
+        module asserts the CLI's rendered contract instead of re-deriving it through the
+        code under test (``default`` keeps the legacy ``<root>/kanban.db``)."""
+        if slug == kb.DEFAULT_BOARD:
+            return home / "kanban.db"
+        return home / "kanban" / "boards" / slug / "kanban.db"
+
+    @classmethod
+    def _seed(cls, home: Path, slug: str, **by_status: int) -> None:
+        """Create ``slug`` with ``status=n`` cards. ``initial_status="running"`` is the
+        create-time admission for a card that ENTERS the flow, so a parentless one lands
+        ``ready`` (``kanban_db.initial_task_state``); ``"blocked"`` parks it blocked."""
+        kb.create_board(slug)
+        with kbc.connect_closing(db_path=cls._own_store(home, slug), board=slug) as conn:
+            for status, n in by_status.items():
+                for i in range(n):
+                    kb.create_task(conn, title=f"{slug}-{status}-{i}", assignee="dev",
+                                   initial_status=status)
+
+    @classmethod
+    def _pin_a_worker_to(cls, home: Path, monkeypatch, slug: str) -> None:
+        """A dispatched worker's env: the store pin AND the marker fencing board intent."""
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fence_probe")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(cls._own_store(home, slug)))
+
+    def test_each_rows_counts_and_store_come_from_its_own_board(self, fresh_home, monkeypatch, capsys):
+        """The row's STORE is its own board in every mode; its COUNTS obey the pin.
+
+        Two contracts meet here and both must hold (the second landed later on the live
+        line, card ``t_398313ec``): an inventory names each row's own directory, and a
+        process pinned by ``HERMES_KANBAN_DB`` may not READ another board's store — so
+        under the pin the non-pinned rows carry ``counts = None`` while still naming
+        their own path. This case asserts the pair rather than one side of it.
+        """
+        import argparse
+
+        from hermes_cli import kanban_boards as kboards
+
+        for slug, seeded in (("default", {"blocked": 1}), ("alpha", {"running": 2}),
+                             ("beta", {"running": 5, "blocked": 1})):
+            self._seed(fresh_home, slug, **seeded)
+        self._pin_a_worker_to(fresh_home, monkeypatch, "beta")
+
+        # The fence is untouched: the ROUTING resolver still honors the pin.
+        assert kb.kanban_db_path(board="alpha") == self._own_store(fresh_home, "beta")
+        assert self._own_store(fresh_home, "alpha") != self._own_store(fresh_home, "beta")
+
+        rc = kboards._cmd_boards_list(argparse.Namespace(json=True, all=False))
+        assert rc == 0
+        pinned_rows = {r["slug"]: r for r in json.loads(capsys.readouterr().out)}
+
+        # PINNED: only the pinned board's store may be read, so only its row carries a census.
+        assert pinned_rows["beta"]["counts"] == {"ready": 5, "blocked": 1}
+        assert pinned_rows["beta"]["total"] == 6
+        assert pinned_rows["alpha"]["counts"] is None and pinned_rows["alpha"]["total"] is None
+        assert pinned_rows["default"]["counts"] is None and pinned_rows["default"]["total"] is None
+        # ... and EVERY row still names its OWN store, pin or no pin.
+        for slug in ("alpha", "beta", "default"):
+            assert pinned_rows[slug]["db_path"] == str(self._own_store(fresh_home, slug))
+
+        # UNPINNED - the operator's own view: every row's census is its own board's.
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        rc = kboards._cmd_boards_list(argparse.Namespace(json=True, all=False))
+        assert rc == 0
+        rows = {r["slug"]: r for r in json.loads(capsys.readouterr().out)}
+
+        assert rows["alpha"]["counts"] == {"ready": 2}
+        assert rows["beta"]["counts"] == {"ready": 5, "blocked": 1}
+        assert rows["default"]["counts"] == {"blocked": 1}
+        assert rows["alpha"]["total"] == 2 and rows["beta"]["total"] == 6
+        assert rows["alpha"]["db_path"] == str(self._own_store(fresh_home, "alpha"))
+        assert rows["beta"]["db_path"] == str(self._own_store(fresh_home, "beta"))
+
+    def test_rendered_rows_differ_and_name_their_own_census(self, fresh_home, monkeypatch, capsys):
+        import argparse
+
+        from hermes_cli import kanban_boards as kboards
+
+        self._seed(fresh_home, "alpha", running=2)
+        self._seed(fresh_home, "beta", running=6)
+        # UNPINNED on purpose: the subject is that two rows RENDER differently because each
+        # counts its own store. Under a board pin the live line withholds every non-pinned
+        # row's census by design (card t_398313ec), so the pin would empty the very difference
+        # this case asserts; that half is pinned in
+        # test_each_rows_counts_and_store_come_from_its_own_board.
+
+        rc = kboards._cmd_boards_list(argparse.Namespace(json=False, all=False))
+        assert rc == 0
+        rendered = {}
+        for line in capsys.readouterr().out.splitlines():
+            fields = line.split()
+            if fields and fields[0] in ("alpha", "beta"):
+                rendered[fields[0]] = line
+        assert set(rendered) == {"alpha", "beta"}
+        assert rendered["alpha"] != rendered["beta"]
+        assert "ready=2" in rendered["alpha"], rendered["alpha"]
+        assert "ready=6" in rendered["beta"], rendered["beta"]
+
+    def test_a_board_with_no_store_reads_as_empty_not_as_the_pinned_board(self, fresh_home, monkeypatch, capsys):
+        import argparse
+
+        from hermes_cli import kanban_boards as kboards
+
+        self._seed(fresh_home, "beta", running=4)
+        kb.create_board("hollow")          # registered, live, but never written to
+        self._own_store(fresh_home, "hollow").unlink()
+        # UNPINNED: the case asks what a missing store READS as, which only an unpinned
+        # process can answer — under the pin the live line withholds hollow's census anyway
+        # (card t_398313ec), so a pinned run would pass for the wrong reason.
+
+        rc = kboards._cmd_boards_list(argparse.Namespace(json=True, all=False))
+        assert rc == 0
+        rows = {r["slug"]: r for r in json.loads(capsys.readouterr().out)}
+        assert rows["hollow"]["counts"] == {}
+        assert rows["hollow"]["total"] == 0
+        assert rows["beta"]["counts"] == {"ready": 4}

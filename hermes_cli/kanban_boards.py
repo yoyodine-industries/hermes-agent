@@ -32,11 +32,17 @@ def _board_task_counts(slug: str) -> dict[str, int]:
     answers the PINNED file for every slug, so counts printed under another board's slug were
     really the pinned board's — the same numbers on every line of ``boards`` (measured
     2026-10-27, card t_398313ec).
+
+    The row's own store is also exposed beside these counts as ``db_path``, resolved the same
+    way from the row's slug (card t_5723473b): the pin decides what a process may READ, never
+    what a board's store IS, so an inventory names each row's own directory.
     """
     try:
         path = kb.board_store_path(slug)
         if not path.exists():
             return {}
+        # `board=slug` rides along for the dead-board guard only; the path is the
+        # resolved one, so the pin cannot retarget the read.
         with kbc.connect_closing(db_path=path, board=slug) as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
@@ -87,6 +93,11 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         counts = _board_task_counts(b["slug"]) if readable else None
         b["counts"] = counts
         b["total"] = sum(counts.values()) if counts is not None else None
+        # The ROW's own store, resolved from its own slug (card t_5723473b): the pin decides
+        # what this process may READ, above — it never relabels where a board's store IS, so
+        # an inventory renders each row against its own directory. The row names a path; it
+        # opens nothing, which is why the pin guard above does not gate this field.
+        b["db_path"] = str(kb.board_store_path(b["slug"]))
     if _json_out(args, boards):
         return 0
     if not boards:
