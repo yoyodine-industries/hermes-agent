@@ -1425,6 +1425,41 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
+#: The CARRIER key namespace: ``landing-carrier:<owner>/<repo>#<N>``. Leg C1
+#: (``hermes_cli/kanban_landing_carrier.py``) judges a close that declares a PR by this
+#: key, and its own remedy tells the lane to file the carrier with exactly this
+#: ``idempotency_key`` -- so THIS door is the path a carrier is filed through.
+_CARRIER_KEY_PREFIX = "landing-carrier:"
+
+
+def _carrier_key_create_kwargs(key: Any) -> dict:
+    """The create kwargs a CARRIER key carries; empty for every other key.
+
+    THE ONE CALLER CONVERTED (ruling on ``t_2bc058fc``, leg B ``t_0f97637f``). A carrier's
+    identity IS its landing, so an ARCHIVED card holding a carrier key is this landing's
+    own carrier -- its requirement is still owed -- and the create door used to mint a
+    second carrier beside the tombstone instead. It now asks the kernel for
+    ``archived_key_policy="reopen"``, with the actor and the reason supplied HERE rather
+    than invented there.
+
+    Only the carrier namespace opts in. Every other key -- and every carrier key whose card
+    is still live, which the kernel answers first -- rides the kernel default untouched.
+    """
+    if not isinstance(key, str):
+        return {}
+    carrier = key.strip()
+    if not carrier.lower().startswith(_CARRIER_KEY_PREFIX):
+        return {}
+    return {
+        "archived_key_policy": "reopen",
+        "archived_key_actor": _persisted_identity(),
+        "archived_key_reason": (
+            "the landing carrier's identity is its key (%s): an archived card holding it "
+            "IS this landing's carrier, so the landing is still owed -- reopened rather "
+            "than twinned (ruling t_2bc058fc)" % carrier),
+    }
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -1473,6 +1508,11 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        # THE CARRIER PATH (ruling t_2bc058fc): a carrier key is filed by THIS door, and an
+        # archived card holding one is this landing's own carrier -- reopened, never twinned.
+        # `_carrier_key_create_kwargs` is empty for every other key, so every other caller
+        # keeps the kernel's default byte-for-byte.
+        carrier_kwargs = _carrier_key_create_kwargs(args.get("idempotency_key"))
         new_tid, outcome = kb.create_task_reported(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
@@ -1484,6 +1524,8 @@ def _handle_create(args: dict, **kw) -> str:
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),
+            # Empty for every non-carrier key: the kernel default then applies unchanged.
+            **carrier_kwargs,
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
@@ -1512,7 +1554,11 @@ def _handle_create(args: dict, **kw) -> str:
         # the SAME receipt the link door reports, so a card filed behind a parent that will
         # never move is visible in the answer that created it, not after a second lookup.
         return _ok(task_id=new_tid, **landed, **kb.receipt_fields(outcome),
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid),
+                   # Visible, never silent: a create that answered with a REOPENED carrier
+                   # says so, instead of looking like a plain re-file of a live card.
+                   **({"archived_key_policy": carrier_kwargs["archived_key_policy"]}
+                      if carrier_kwargs else {}))
 
 
 def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
