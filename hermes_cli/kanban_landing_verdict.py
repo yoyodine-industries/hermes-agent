@@ -145,11 +145,13 @@ def validate_reason(verdict: str, reason: object) -> str:
                 "there too."
             )
         return text
-    if len(text) < clause.MIN_REASON:
+    if not clause.is_named_carrier_deferral(text):
         raise LandingVerdictRefused(
-            f"reason refused: landing_deferred needs >= {clause.MIN_REASON} characters; got "
-            f"{len(text)}. Nothing was written. A deferral is the landing reconciler's input "
-            "class -- it must say enough for the lane that picks it up."
+            f"reason refused: landing_deferred needs >= {clause.MIN_REASON} characters AND must "
+            "name the CARRIER CARD (a t_... id) that carries this landing, and that card must name "
+            f"the PR. Got {len(text)} character(s) naming no card id. Nothing was written. A "
+            "deferral is a pointer to a live carrier, never a waiver: 'owed, not yet carried' is "
+            "the OPEN state, so file the carrier card and name it (tightened 2026-10-28)."
         )
     return text
 

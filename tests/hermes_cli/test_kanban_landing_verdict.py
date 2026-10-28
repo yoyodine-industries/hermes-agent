@@ -123,10 +123,16 @@ def test_the_clause_reads_the_recorded_verdict_as_exempt(board):
     assert verdict.facts["prs"][0]["reason"] == REASON
 
 
-def test_deferred_is_recorded_and_deferred_is_the_clause_class(board):
+def test_deferred_must_name_a_real_carrier_and_the_clause_reads_it_as_carried(board):
+    """Tightened 2026-10-28: a deferral is a POINTER to a carrier card, never a waiver.
+
+    The door still records the declaration; the clause honours it only through the card
+    it names, which must exist and name the same PR.
+    """
     kb, conn = board
     target = _declaring_card(kb, conn)
-    deferred = "the config half must ride the next deploy train, tracked on t_12ab34cd"
+    carrier = kb.create_task(conn, title=f"[land] {PR_URL} for {target}", initial_status="running")
+    deferred = f"the config half must ride the next deploy train, carried by {carrier}"
 
     _record(conn, target, verdict="landing_deferred", reason=deferred)
 
@@ -137,7 +143,20 @@ def test_deferred_is_recorded_and_deferred_is_the_clause_class(board):
         conn=conn, task_id=target, forge=lambda _repo, _num: "OPEN", candidates=[]
     )
     assert verdict is not None and verdict.refused is False
-    assert verdict.facts["prs"][0]["state"] == "deferred"
+    assert verdict.facts["carriers"], "the named card must be the carrier the close rides"
+    assert carrier in " ".join(verdict.facts["carriers"].values())
+
+
+def test_deferred_naming_no_card_is_refused_by_the_door(board):
+    """A deferral that names no carrier card is the silent door the tightening closed."""
+    from hermes_cli.kanban_landing_verdict import LandingVerdictRefused
+
+    kb, conn = board
+    target = _declaring_card(kb, conn)
+
+    with pytest.raises(LandingVerdictRefused):
+        _record(conn, target, verdict="landing_deferred",
+                reason="the config half must ride the next deploy train, later")
 
 
 def test_merge_preserves_every_existing_key_and_leaves_result_alone(board):

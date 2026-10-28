@@ -285,16 +285,83 @@ def test_bodyless_not_owed_does_not_exempt_the_close(conn, forge):
     assert refusal.cause == "landing_carrier_missing"
 
 
-def test_recorded_deferral_passes_without_touching_the_forge(conn, forge):
-    """Escape: the RECORDED deferral -- visible, owned, and the reconciler's input class."""
+def test_bare_recorded_deferral_is_not_an_escape(conn, forge):
+    """Tightened 2026-10-28: "owed, not yet carried" IS the open state.
+
+    A >= 20-character reason used to close a card whose PR was unmerged; three cards
+    closed ``done`` that way in one day while the defects they targeted stayed live.
+    """
+    forge["state"]["value"] = "open"
     task_id = _review_card(conn)
 
-    assert kb.complete_task(
+    refusal = kb.complete_task(
         conn, task_id, summary="landing owed to the reconciler",
         metadata={"published_pr": PR_URL,
                   "landing_deferred": "owed: the reconciler has not filed the carrier yet"},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
+    assert _status(conn, task_id) == "review"
+
+
+def test_deferral_naming_a_real_carrier_card_passes(conn, forge):
+    """The deferral is a POINTER to the carrier, and the carrier does the work."""
+    carrier = kb.create_task(conn, title=f"[land] {PR} for somebody", initial_status="running")
+    task_id = _review_card(conn)
+
+    assert kb.complete_task(
+        conn, task_id, summary="carried",
+        metadata={"published_pr": PR_URL, "landing_deferred": f"owed until {carrier} lands it"},
     ) is True
     assert forge["asked"] == []
+
+
+def test_deferral_naming_a_card_that_does_not_carry_the_pr_is_refused(conn, forge):
+    """A named card that does not name the PR is not a carrier -- it is a typo with a reason."""
+    other = kb.create_task(conn, title="an unrelated card", initial_status="running")
+    forge["state"]["value"] = "open"
+    task_id = _review_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="carried",
+        metadata={"published_pr": PR_URL, "landing_deferred": f"owed until {other} lands it"},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
+
+
+def test_deploy_stamp_that_resolves_in_the_ledger_passes(conn, forge, monkeypatch):
+    """The EVIDENCE leg: a landed revision named by the dest stamp closes the card."""
+    from hermes_cli import kanban_landing_carrier as clause
+
+    monkeypatch.setattr(clause, "ledger_resolves", lambda sha: str(sha).startswith("abc1234"))
+    forge["state"]["value"] = "open"
+    task_id = _review_card(conn)
+
+    assert kb.complete_task(
+        conn, task_id, summary="landed by the train",
+        metadata={"published_pr": PR_URL, "deploy_stamp": "abc1234def"},
+    ) is True
+    assert forge["asked"] == []
+
+
+def test_deploy_stamp_that_does_not_resolve_is_refused(conn, forge, monkeypatch):
+    """An unverifiable stamp is intent, not evidence."""
+    from hermes_cli import kanban_landing_carrier as clause
+
+    monkeypatch.setattr(clause, "ledger_resolves", lambda sha: False)
+    forge["state"]["value"] = "open"
+    task_id = _review_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="landed by the train",
+        metadata={"published_pr": PR_URL, "deploy_stamp": "deadbeef11"},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
 
 
 def test_stub_deferral_is_not_an_escape(conn, forge):
@@ -660,11 +727,13 @@ def test_cli_complete_renders_the_cause_and_its_remedy(conn, forge, capsys, monk
 # --------------------------------------------------------------------------- #
 
 
-def test_missing_clause_module_fails_closed_with_a_declared_way_out(conn, forge, monkeypatch):
-    """A lost override must never silently admit closes NOR deadlock the board.
+def test_missing_clause_module_fails_closed_with_no_deferral_waiver(conn, forge, monkeypatch):
+    """A lost override must never silently admit closes -- including via a deferral.
 
-    Fail-closed on the same refusal channel, but the closing call's own recorded
-    deferral still gets the card out -- so an install defect is loud, not fatal.
+    Fail-closed on the same refusal channel, and the closing call's own recorded
+    deferral is NOT a way out (tightened 2026-10-28: it used to be, which is the one
+    state where nobody could judge the landing at all). The remedy names the carrier
+    metadata the close owes once the clause is loadable again.
     """
     import hermes_cli
 
@@ -677,12 +746,15 @@ def test_missing_clause_module_fails_closed_with_a_declared_way_out(conn, forge,
     assert refusal.cause == "landing_state_unknown"
     assert _status(conn, task_id) == "review"
 
-    assert kb.complete_task(
+    deferred = kb.complete_task(
         conn, task_id, summary="approved",
         metadata={"published_pr": PR_URL,
                   "landing_deferred": "owed: carrier not filed yet, recorded for the reconciler"},
-    ) is True
-    assert _status(conn, task_id) == "done"
+    )
+    assert isinstance(deferred, kb.CompletionRefusal)
+    assert deferred.cause == "landing_state_unknown"
+    assert "metadata.landing_card" in deferred.detail
+    assert _status(conn, task_id) == "review"
 
 
 # --------------------------------------------------------------------------- #
