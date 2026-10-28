@@ -345,3 +345,135 @@ def test_board_override_verdict_is_independent_of_the_current_pointer(home, tmp_
         foreign = _run(script, home, BOARD, "--board", OTHER_BOARD, "create", "x", pin_board=False)
         assert foreign.returncode == 0, f"current={pointed_at}: {foreign.stdout}{foreign.stderr}"
 
+
+# --- A NAMED board that resolves to nothing has NO fence verdict (card t_ecd51c9c) ---------------
+#
+# THREE OUTCOMES, NOT TWO (ruling t_ecd51c9c). The fence may allow or deny the board the caller
+# NAMED; it may never SUBSTITUTE a different one. Before this fix a name that resolved to no board
+# was judged against the AMBIENT/pinned board, so `hermes kanban --board <unregistered> create`
+# from a worker-descended process came back as the fence refusal and MASKED the CLI's own
+# `board '<x>' does not exist`. Measured on the sdlc birth node: run 20261008-0844 (gateway caller)
+# reached the honest error and BIRTHED its item; run 20261008-0958 (worker caller) got the fence
+# message instead; cron 16b8c8db4ed7 carried failure_streak=10.
+#
+# Outcome 3 must also be INERT: the unresolved name mints no store and moves no row on the board
+# the process IS pinned to. That is asserted, not assumed — a hole here would be worse than the
+# over-refusal it replaces.
+
+GHOST = "fence-probe-ghost"  # well formed, resolves to no registered board
+
+
+def _write_audit(root: Path, slug: str) -> tuple[int, bool]:
+    """(row count of the named board's store, whether that store exists at all)."""
+    db = _board_db(root, slug)
+    if not db.exists():
+        return 0, False
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]), True
+    finally:
+        conn.close()
+
+
+def test_named_unregistered_board_reports_the_board_error_from_a_worker_descendant(home, tmp_path):
+    """DEFECT: the provenance-arm shell (marker stripped) must get the honest board error."""
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    before, _ = _write_audit(home, BOARD)
+    res = _run(script, home, BOARD, "--board", GHOST, "create", "x")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert f"board {GHOST!r} does not exist" in res.stderr, res.stdout + res.stderr
+    assert "child contexts cannot mutate" not in res.stderr
+    assert "descends from a LIVE dispatched worker" not in res.stderr
+    # HARD REQUIREMENT: the unresolved name is INERT — no store minted, no row moved.
+    after, pinned_exists = _write_audit(home, BOARD)
+    assert pinned_exists, "the pinned board's own store vanished"
+    assert _write_audit(home, GHOST)[1] is False, "the unresolved --board MINTED a store"
+    assert after == before, f"the pinned board's row count moved: {before} -> {after}"
+
+
+def test_named_unregistered_board_reports_the_board_error_with_the_marker_set(home, tmp_path):
+    """DEFECT: the cooperative marker (value ``1``) must not refuse a board that does not exist."""
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    res = _run(script, home, BOARD, "--board", GHOST, "create", "x",
+               HERMES_DELEGATED_CHILD_CONTEXT="1")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert f"board {GHOST!r} does not exist" in res.stderr, res.stdout + res.stderr
+    assert "child contexts cannot mutate" not in res.stderr
+
+
+def test_named_unregistered_board_reports_the_board_error_with_a_path_marker(home, tmp_path):
+    """DEFECT: the marker carrying the fenced ROOT must not refuse a board that does not exist."""
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    res = _run(script, home, BOARD, "--board", GHOST, "create", "x",
+               HERMES_DELEGATED_CHILD_CONTEXT=str(home))
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert f"board {GHOST!r} does not exist" in res.stderr, res.stdout + res.stderr
+    assert "child contexts cannot mutate" not in res.stderr
+
+
+def test_named_unregistered_board_is_unchanged_from_a_top_level_process(home, tmp_path):
+    """CONTROL: with no claim and no marker the behaviour is the honest error, as before."""
+    _make_foreign_board(home, OTHER_BOARD)
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    res = _run(script, home, BOARD, "--board", GHOST, "create", "x", pin_board=False)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert f"board {GHOST!r} does not exist" in res.stderr, res.stdout + res.stderr
+
+
+def test_named_own_board_is_still_refused_by_the_marker_arm(home, tmp_path):
+    """GUARD (unchanged trust boundary): naming the board the lineage claims is still refused."""
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    res = _run(script, home, BOARD, "--board", BOARD, "create", "x",
+               HERMES_DELEGATED_CHILD_CONTEXT="1")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "child contexts cannot mutate" in res.stderr
+
+
+def test_named_own_board_is_still_refused_by_the_provenance_arm(home, tmp_path):
+    """GUARD (unchanged trust boundary): env-stripped shell, ancestor holds the claim -> refused."""
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+    res = _run(script, home, BOARD, "--board", BOARD, "create", "x")
+    assert res.returncode == 1, f"the claimed board was ADMITTED: {res.stdout}{res.stderr}"
+    assert "child contexts cannot mutate" in res.stderr
+
+
+def test_unregistered_name_is_not_a_pin_violation(home, tmp_path):
+    """THE PIN ARM (ruling t_ecd51c9c): it judges only names that RESOLVE.
+
+    A READ never reaches the fast-fail, so the pin layer decides alone here — which is exactly
+    the layer that used to refuse one step EARLIER than the store resolution and re-mask the
+    honest error. A registered foreign board must still be refused by the same layer: that
+    boundary protects data on boards that EXIST, and it must not move.
+    """
+    _make_board_with_live_claim(home, slug=BOARD, worker_pid=os.getpid(),
+                                fingerprint=_fingerprint_of_this_process())
+    _make_foreign_board(home, OTHER_BOARD)
+    script = _write(tmp_path / "cli.py", PROBE_SRC)
+
+    unresolved = _run(script, home, BOARD, "--board", GHOST, "show", "t_deadbeef",
+                      HERMES_DELEGATED_CHILD_CONTEXT="1")
+    assert unresolved.returncode == 1, unresolved.stdout + unresolved.stderr
+    assert f"board {GHOST!r} does not exist" in unresolved.stderr, unresolved.stderr
+    assert "pinned to" not in unresolved.stderr, (
+        "an unresolved name is not a pin violation — the pin re-masked the honest error: "
+        f"{unresolved.stderr}"
+    )
+
+    foreign = _run(script, home, BOARD, "--board", OTHER_BOARD, "show", "t_deadbeef",
+                   HERMES_DELEGATED_CHILD_CONTEXT="1")
+    assert foreign.returncode == 1, foreign.stdout + foreign.stderr
+    assert "pinned to" in foreign.stderr, (
+        "the pin stopped speaking for a board that DOES exist — the isolation moved: "
+        f"{foreign.stderr}"
+    )
+

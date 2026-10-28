@@ -759,7 +759,7 @@ def _explicit_board_slug(board: Optional[str]) -> Optional[str]:
     return None
 
 
-def _explicit_board_intent_pinned() -> bool:
+def _explicit_board_intent_pinned(board: Optional[str] = None) -> bool:
     """Whether an explicit ``board=`` (or scoped ``--board``) must still resolve
     through the ``HERMES_KANBAN_DB``-style env pins instead of its own board dir.
 
@@ -770,11 +770,18 @@ def _explicit_board_intent_pinned() -> bool:
     physically cannot see other boards" isolation (5ec6baa), and
     ``agent.delegation_context.kanban_path_is_fenced`` checks the pinned path /
     fenced root — an explicit board that resolved elsewhere would also escape
-    that fence."""
+    that fence.
+
+    *board* is the name the caller expressed, when it has one: a name that resolves to NO
+    registered board is not a pin violation (nothing to pin, no data to protect), so it answers
+    ``False`` and the caller's own board resolution produces the honest
+    ``board '<x>' does not exist`` (ruling t_ecd51c9c). The machine-flow pin is judged before
+    the name, because that pin is the flow's own resolution, not an explicit caller's intent.
+    """
     if _PIN_FIRST_BOARD_RESOLUTION.get():
         return True
     from agent.delegation_context import explicit_board_intent_is_pinned
-    return explicit_board_intent_is_pinned()
+    return explicit_board_intent_is_pinned(board)
 
 
 def _slug_board_path(slug: str, default_parts: tuple[str, ...], leaf: str) -> Path:
@@ -880,7 +887,7 @@ def assert_board_matches_env_pin(board: Optional[str]) -> Optional[str]:
     normed = _normalize_board_slug(board) if board else None
     if not normed:
         return None
-    if not _explicit_board_intent_pinned():
+    if not _explicit_board_intent_pinned(normed):
         # Unfenced: ``--board`` outranks the pin (``_board_path``), so no contradiction exists.
         return normed
     pinned_slug, pin_var = board_env_pin()
@@ -915,6 +922,11 @@ def _board_path(
     """
     pin = os.environ.get(env_var, "").strip() if env_var else ""
     slug = _explicit_board_slug(board)
+    # The RESOLVER stays pin-first for every named slug, registered or not: it answers "where
+    # would this board's store be", never "does this board exist" (that question belongs to the
+    # caller's validation, and asking it here would let a fence/refusal look like a path lookup).
+    # The resolution rule of t_ecd51c9c lives one layer up, in the GATE that decides whether a
+    # name CONTRADICTS the pin: :func:`assert_board_matches_env_pin` passes the name through.
     if pin and (slug is None or _explicit_board_intent_pinned()):
         return Path(pin).expanduser()
     if slug is None:

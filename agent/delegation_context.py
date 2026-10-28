@@ -74,7 +74,33 @@ def is_dispatcher_owned_worker_context() -> bool:
     return not (is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get())
 
 
-def explicit_board_intent_is_pinned() -> bool:
+def board_name_resolves(board: str) -> bool:
+    """Whether *board* names a REGISTERED board — the question the CLI's own ``--board``
+    validation asks before it refuses ``board '<x>' does not exist``.
+
+    ``default`` always resolves; any other slug resolves iff a ``board.json`` is registered under
+    it (the registry probe, never the store path — a pin legitimately overrides that), and a
+    malformed slug resolves nowhere. An error that is NOT an answer to the question (the registry
+    cannot be imported at all) answers ``True``, so a caller asking "must this still go through the
+    pin?" keeps its pin: an isolation pin is never dropped blind.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+
+        slug = kb._normalize_board_slug(board)
+    except ValueError:
+        return False
+    except Exception:  # health: allow BLE001 -- an unreadable registry is not an answer to "does this name resolve"; the caller keeps its pin
+        return True
+    if not slug:
+        return False
+    try:
+        return slug == kb.DEFAULT_BOARD or kb.board_exists(slug)
+    except Exception:  # health: allow BLE001 -- same rule: an unreadable registry keeps the pin
+        return True
+
+
+def explicit_board_intent_is_pinned(board: str | None = None) -> bool:
     """Whether an explicit kanban ``board=`` argument must still resolve through
     the dispatcher-injected env pins (``HERMES_KANBAN_DB`` & friends) rather than
     its own board directory.
@@ -86,7 +112,15 @@ def explicit_board_intent_is_pinned() -> bool:
     pinned path / fenced root — an explicit board that resolved elsewhere would
     also escape that fence. Outside these fences an explicit board is the
     caller's own intent and wins.
+
+    A name that resolves to NO board is not a pin violation, so it is not pinned (ruling
+    t_ecd51c9c): there is nothing to pin and no board's data to protect. That boundary protects
+    data on boards that EXIST; refusing an unresolved name here would refuse one layer earlier
+    than the store resolution the pin exists to protect, and re-mask the CLI's honest
+    ``board '<x>' does not exist`` — teaching operators that a typo is a permission problem.
     """
+    if board and not board_name_resolves(board):
+        return False
     if _DELEGATED_CHILD_CONTEXT.get():
         return True
     if os.environ.get(DELEGATED_CHILD_ENV_MARKER):
