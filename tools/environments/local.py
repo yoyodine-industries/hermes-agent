@@ -276,13 +276,20 @@ def _filter_secret_env(
 def _finalize_child_env(env: dict) -> dict:
     """Guards shared by every spawn surface: profile-home propagation, session-context
     bridging, Hermes-owned PYTHONPATH + venv-marker strip, MSYS defaults, delegate_task
-    Kanban scrub. Returns the (possibly new) dict."""
+    Kanban scrub, cron occurrence identity. Returns the (possibly new) dict."""
     _apply_profile_home(env)
     _inject_session_context_env(env)
     _strip_hermes_owned_pythonpath_and_runtime_markers(env)
     _apply_windows_msys_bash_env_defaults(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    env = delegated_child_subprocess_env(env)
+    # The occurrence identity of the cron fire this context runs under, if any. Same posture
+    # as the session bridge above and for the same reason: a ContextVar is authoritative for
+    # this thread's children, where the process env would hand a concurrent fire's children
+    # another fire's row. A delegated child reads no fire (it is not the occurrence), and a
+    # process outside cron has none to report, so both pass through untouched.
+    from cron.execution_identity import cron_identity_child_env
+    return cron_identity_child_env(env)
 
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
@@ -380,7 +387,12 @@ def build_subprocess_env(
     if extra:
         env.update(extra)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    env = delegated_child_subprocess_env(env)
+    # This branch skips ``_finalize_child_env`` (it must stay byte-passing for git credential
+    # flows), so the fire's occurrence identity is overlaid here instead: a hook or git child
+    # of a cron run has the same claim to it as a terminal child.
+    from cron.execution_identity import cron_identity_child_env
+    return cron_identity_child_env(env)
 
 
 def served_profile_child_env(
