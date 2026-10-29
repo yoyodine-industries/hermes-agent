@@ -5600,6 +5600,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
     deferred_children: Optional[Mapping[str, Any]] = None,
+    mint_carrier: bool = False,
 ) -> bool | CompletionRefusal:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -5617,6 +5618,12 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    ``mint_carrier`` is the OPT-IN one-step route past a landing-carrier refusal (leg
+    C2, card ``t_c83a87dd``): the refusal's unsatisfied PR gets the kernel-filed,
+    canonically-keyed carrier and the same close is re-judged. Off by default — a
+    close that does not ask for it is byte-identical to before, and nothing is
+    written when the fence does not refuse for want of a carrier.
     """
     now = int(time.time())
     # WHY a completion was refused, as DATA, never a bare ``False``: a bool cannot tell a
@@ -5741,7 +5748,7 @@ def complete_task(
     # AFTER the acceptance clause -- a PR with red CI is told CI is red, and a close acceptance
     # already refused never costs a forge read -- and still BEFORE the write txn, so a refusal
     # leaves the card byte-untouched and hands the worker the clause that failed.
-    landing_refusal = _gate_landing_carrier(conn, task_id, metadata)
+    landing_refusal = _gate_landing_carrier(conn, task_id, metadata, mint=mint_carrier)
     if landing_refusal is not None:
         return landing_refusal
     # THE DISCHARGE GATE (design record platform-stl t_0608ce6d, card t_9a2aaaea). Both halves
@@ -5960,6 +5967,8 @@ def _gate_landing_carrier(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: Optional[dict],
+    *,
+    mint: bool = False,
 ) -> Optional[CompletionRefusal]:
     """Refuse an APPROVAL close whose DECLARED deliverable PR has no landing leg.
 
@@ -5997,6 +6006,14 @@ def _gate_landing_carrier(
     A missing clause module fails CLOSED (a kernel that cannot judge the landing
     state must not admit the close blind) while keeping a no-network escape open.
 
+    ``mint`` (leg C2, card ``t_c83a87dd``) is the OPT-IN one-step route: when the
+    refusal is a missing CARRIER, the kernel files the keyed carrier itself
+    (``kanban_landing_carrier.mint_carriers``) and re-judges the SAME close through
+    the same pure evaluator. It is off unless the caller asks, so a close that does
+    not pass the flag behaves exactly as before -- same cause, same detail, nothing
+    written. The mint is NOT in the clause's evaluator: a write inside a fence that
+    dry runs, audits and re-evaluations all call would be a side effect of reading.
+
     WHAT TRIGGERS IT is an explicit publication declaration -- ``published_pr`` or an
     exact PR-URL contract -- never a mere mention (``pr`` / ``pr_url`` / ``pr_number``):
     those name the PR a card published as readily as one it only cited, and judging
@@ -6022,12 +6039,55 @@ def _gate_landing_carrier(
     )
     if verdict is None or not verdict.refused:
         return None
+    mint_report = None
+    if mint:
+        # THE MINT, and then the SAME close re-judged: the fence stays the only judge, so a
+        # carrier this call filed is admitted exactly like one a lane filed by hand. The mint
+        # writes (or does not) BEFORE the refusal event, so one event carries both facts.
+        mint_report = _mint_landing_carriers(clause, conn=conn, task_id=task_id, verdict=verdict)
+        with write_txn(conn):
+            _append_event(conn, task_id, "completion_minted_landing_carrier",
+                          mint_report.as_facts())
+        if mint_report.minted or mint_report.present:
+            rejudged = clause.evaluate(
+                conn=conn, task_id=task_id,
+                metadata=metadata if isinstance(metadata, dict) else None,
+            )
+            if rejudged is None or not rejudged.refused:
+                return None
+            verdict = rejudged
     with write_txn(conn):
+        facts = dict(verdict.facts or {})
+        if mint_report is not None:
+            facts["mint"] = mint_report.as_facts()
         _append_event(
             conn, task_id, "completion_blocked_landing_carrier",
-            {"cause": verdict.cause, "detail": verdict.detail, "facts": verdict.facts},
+            {"cause": verdict.cause, "detail": verdict.detail, "facts": facts},
         )
-    return CompletionRefusal(verdict.cause, verdict.detail)
+    return CompletionRefusal(
+        verdict.cause,
+        verdict.detail + (clause.mint_failure_note(mint_report) if mint_report else ""),
+    )
+
+
+def _mint_landing_carriers(clause, *, conn, task_id: str, verdict):
+    """File the carrier a refused close owes, and never take the completion door down with it.
+
+    ``mint_carriers`` is written not to raise; this wrapper keeps that a guarantee rather than a
+    hope, because the failure mode it protects against (a filing bug turning every close on the
+    board into a crash) is far worse than the failure it reports (a refusal that says the mint
+    broke). A crash here becomes a ``filing_failed`` entry, which the refusal then names.
+    """
+    try:
+        return clause.mint_carriers(conn=conn, task_id=task_id, verdict=verdict)
+    except Exception as exc:
+        report = clause.MintReport(task_id=task_id)
+        report.failed.append({
+            "ref": "",
+            "cause": clause.MINT_CAUSE_FILING_FAILED,
+            "detail": f"the mint crashed: {type(exc).__name__}: {exc}",
+        })
+        return report
 
 
 def _gate_empty_completion(

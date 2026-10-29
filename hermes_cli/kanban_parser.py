@@ -386,6 +386,13 @@ _SPECS = [
                   "claim with no measurement) and records the waiver on the card. It does "
                   "NOT bypass PR acceptance, the landing-carrier fence or the deploy "
                   "proof: those still judge the card's own evidence."),
+        _arg("--mint-carrier", action="store_true",
+             help="One-step route past a landing-carrier refusal: when the fence refuses a "
+                  "declared PR for want of its landing carrier, the KERNEL files that carrier "
+                  "(canonical landing-carrier:<owner>/<repo>#<N> key, parented on the card) and "
+                  "re-judges the same close. Off by default: without it the close behaves "
+                  "exactly as before. Writes nothing when the fence does not refuse for want "
+                  "of a carrier (merged PR, named exemption, unjudgeable forge state)."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,

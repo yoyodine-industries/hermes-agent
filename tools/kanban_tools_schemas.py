@@ -164,6 +164,19 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "task in-flight so you can fix the path and retry."
             ),
         },
+        "mint_carrier": _prop("boolean", (
+                "Opt-in one-step route past a landing-carrier refusal. "
+                "When the landing fence refuses this close because a "
+                "declared PR has no landing carrier, the KERNEL files "
+                "that carrier for you — canonical "
+                "landing-carrier:<owner>/<repo>#<N> key, parented on this "
+                "card, lane inherited from it — and re-judges the same "
+                "close, so it is admitted without retyping a "
+                "kanban_create spec. Off by default, and it writes "
+                "nothing unless the fence refuses for want of a carrier "
+                "(a merged PR, a named exemption or an unjudgeable forge "
+                "state is never minted)."
+        )),
     },
     [],
 )
