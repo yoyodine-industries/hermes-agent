@@ -71,6 +71,10 @@ ASSIGNEE_ALIASES_FILE = "assignee_aliases.json"
 RETIRED_IDENTITIES_FILE = "retired_identities"
 #: board.json key: a list of retired identities, same vocabulary as the file above.
 RETIRED_IDENTITIES_KEY = "retired_identities"
+#: The NON-PRODUCTION producer marker a test fixture stamps on the cards it files. The estate
+#: already classifies it as such (``ask_placement_left_behind_nodes.py``, class ``test-fixture``);
+#: Invariant E refuses a filing that carries it onto a LIVE board store.
+FIXTURE_CREATED_BY = "fixture"
 #: ``<kanban_home>/kanban/evidence_gate`` — ``refuse`` (default) or ``measure``.
 EVIDENCE_GATE_FILE = "evidence_gate"
 
@@ -393,6 +397,89 @@ class CreatorRefused(GateRefused):
     """Invariant D: the card's ATTRIBUTION names a retired fleet identity."""
 
     invariant = "creator"
+
+
+def is_fixture_producer(created_by: Optional[str]) -> bool:
+    """Is ``created_by`` the non-production TEST marker (``fixture``)?
+
+    Exactly that word, case-insensitively and stripped: the estate classifies
+    ``created_by='fixture'`` as a test-fixture producer (``ask_placement_left_behind_nodes.py``,
+    class ``test-fixture``), while every production filer stamps a real profile or a named
+    non-profile producer origin. Deliberately NOT widened to "looks like a test" -- a fuzzy
+    match here would start refusing real filings.
+    """
+    return bool(created_by) and str(created_by).strip().lower() == FIXTURE_CREATED_BY
+
+
+def live_board_stores(live_root: Optional[Path] = None) -> set[Path]:
+    """Resolved paths of every store the LIVE install can dispatch from (the deny-list).
+
+    Read through :func:`hermes_cli.kanban_scratch.live_board_stores`, which resolves the live
+    root from the platform default (``HERMES_HOME`` maps to its root) and NEVER from
+    ``HERMES_KANBAN_HOME`` -- the same variable a harness uses to redirect itself, so honouring
+    it here would certify the very override this gate exists to catch.
+    """
+    from hermes_cli import kanban_scratch as ks
+
+    try:
+        return {Path(p).expanduser().resolve() for p in ks.live_board_stores(live_root)}
+    except Exception:  # health: allow BLE001 -- no live set on a resolution fault
+        return set()
+
+
+def store_path_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """The filesystem path of ``conn``'s main database (``None`` for in-memory / unreadable).
+
+    The store a filing will ACTUALLY be written to. A gate that re-derived the path from
+    ``board``/env could describe a different store than the INSERT reaches -- exactly the
+    2026-10-05 leak (``--board ops`` resolved through ``HERMES_KANBAN_HOME`` while the caller
+    believed ``HERMES_KANBAN_DB`` pinned a throwaway) -- so the caller asks the connection.
+    """
+    try:
+        for _seq, name, file in conn.execute("PRAGMA database_list"):
+            if name == "main":
+                return file or None
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def fixture_store_refusal(created_by: Optional[str], store_path: Optional[str], *,
+                          live_root: Optional[Path] = None) -> Optional[str]:
+    """Invariant E: the ONE-LINE refusal when a FIXTURE filing would land on a LIVE board store.
+
+    Measured defect (ops card t_1d61392b, 32 rows): stale copies of a test harness minted
+    ``hermes kanban --board ops create "fixture board" --created-by fixture`` with
+    ``HERMES_KANBAN_DB=<throwaway>`` set but ``HERMES_KANBAN_HOME`` UNSET. Since the board-scope
+    change a named ``--board`` resolves through ``HERMES_KANBAN_HOME``, so the create landed on
+    the operator's LIVE ops board while the harness believed it wrote a throwaway store. Fixing
+    the harness copies cannot close the class; the create door can, because every filer --
+    stale or fixed, CLI or tool -- reaches it.
+
+    ``store_path`` is the store the write will actually land in (the caller passes the OPEN
+    CONNECTION's own file via :func:`store_path_for_connection`, so the check can never describe
+    a different board than the INSERT does). ``None`` (in-memory connection) is never live.
+
+    An ANSWER, never an exception -- the kernel's filing doctrine (``kanban_filing_policy``:
+    "a refusal is an answer, not an exception"): ``create_task`` returns an id to every caller,
+    and a refused filing must leave no row behind it.
+    """
+    if not is_fixture_producer(created_by) or store_path is None:
+        return None
+    try:
+        resolved = Path(str(store_path)).expanduser().resolve()
+    except OSError:  # unresolvable -> cannot be a live store
+        return None
+    if resolved not in live_board_stores(live_root):
+        return None
+    return (
+        f"refused: fixture-on-live-board (created_by={str(created_by).strip()} "
+        f"store={resolved}) -- created_by 'fixture' is the NON-PRODUCTION test marker and this "
+        f"card would be written to the LIVE kanban store, where it pollutes the operator's "
+        f"board with a row no lane owns. Nothing was written. Set HERMES_KANBAN_HOME=<throwaway "
+        f"dir> and mint the board under it before the first write "
+        f"(hermes_cli.kanban_scratch.scratch_env / tests/conftest.py::stage_kanban_board)."
+    )
 
 
 def gate_created_by(created_by: Optional[str], *, board: Optional[str] = None,

@@ -544,7 +544,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 elif record.get("why"):
                     print(f"filing policy: {record['why']}", file=sys.stderr)
                     print(f"filing policy: {record.get('policy', '-')}", file=sys.stderr)
-                return 3
+                return record.get("rc", 3)
             task = kb.get_task(conn, task_id)
     except InboxRefusal as exc:
         # A usage refusal, not a board fault: rc 2 so a shell can tell "the provenance could

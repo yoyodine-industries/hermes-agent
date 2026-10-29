@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -253,5 +254,125 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Invariant E: a FIXTURE filing may never land on the LIVE kanban home
+# (card t_bba20dec -- 32 "fixture board" rows on the live ops board, 2026-10-05)
+# ---------------------------------------------------------------------------
+
+def _run_kanban_argv(argv):
+    """Drive the REAL CLI seam (parser -> ``kanban_command``), not the handler alone."""
+    from hermes_cli.kanban import kanban_command
+    from hermes_cli.kanban_parser import build_parser
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    build_parser(parser.add_subparsers(dest="command"))
+    return kanban_command(parser.parse_args(["kanban", *argv]))
+
+
+@pytest.fixture
+def live_board_home(tmp_path, monkeypatch):
+    """A host whose LIVE kanban root is this test's own temp home (never the operator's).
+
+    ``get_default_hermes_root()`` resolves the live root from ``HERMES_HOME`` (with the
+    platform default as the native fallback), and the fixture guard deliberately does NOT
+    honour ``HERMES_KANBAN_HOME`` -- that variable is what a harness uses to redirect
+    itself. So pointing ``HERMES_HOME`` at a temp home makes the stores minted under it the
+    LIVE stores for the duration of this test, which is exactly the shape of the defect.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in ("HERMES_KANBAN_HOME", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(var, raising=False)
+    kb.create_board("ops")
+    return home
+
+
+def _fixture_rows(store: Path) -> list:
+    """``created_by='fixture'`` rows actually present in ``store`` (read-only).
+
+    A store with no ``tasks`` table (an archived/empty shell) carries no fixture rows.
+    """
+    if not store.exists():
+        return []
+    conn = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
+    try:
+        return conn.execute(
+            "SELECT id, title FROM tasks "
+            "WHERE lower(trim(COALESCE(created_by, ''))) = 'fixture'"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def test_fixture_filing_onto_the_live_home_is_refused(live_board_home, capsys):
+    """POSITIVE (the defect): ``--board ops --created-by fixture`` against the LIVE home.
+
+    The 2026-10-05 leak minted exactly this command from stale harness copies; it must be
+    refused with a non-zero rc and leave no row behind.
+    """
+    from hermes_cli.kanban_scratch import board_store
+
+    rc = _run_kanban_argv(
+        ["--board", "ops", "create", "fixture board", "--created-by", "fixture"]
+    )
+
+    assert rc == 1, f"a fixture filing onto the live home must exit 1, got {rc}"
+    err = capsys.readouterr().err
+    assert "fixture-on-live-board" in err and "LIVE kanban store" in err, err
+    assert "HERMES_KANBAN_HOME" in err, "the refusal must name the remedy"
+    assert len([ln for ln in err.splitlines() if ln.strip()]) == 1, f"one line, got: {err!r}"
+    assert _fixture_rows(board_store(live_board_home, "ops")) == []
+
+
+def test_fixture_filing_still_succeeds_against_a_throwaway_kanban_root(
+    live_board_home, tmp_path, monkeypatch, capsys
+):
+    """NEGATIVE CONTROL: the same create, redirected at a throwaway root, still works.
+
+    Without this the guard could pass by banning the marker outright instead of gating it
+    on the destination store -- which would break every legitimate test harness.
+    """
+    from hermes_cli.kanban_scratch import board_store
+
+    throwaway = tmp_path / "throwaway-kanban"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(throwaway))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.create_board("ops")
+
+    rc = _run_kanban_argv(
+        ["--board", "ops", "create", "fixture board", "--created-by", "fixture"]
+    )
+
+    assert rc == 0, capsys.readouterr().err
+    landed = _fixture_rows(board_store(throwaway, "ops"))
+    assert len(landed) == 1 and landed[0][1] == "fixture board"
+    # ...and the live store stayed clean through the whole exchange.
+    assert _fixture_rows(board_store(live_board_home, "ops")) == []
+
+
+@pytest.mark.allow_real_home_io  # READ-ONLY probe of the live boards -- that is the point
+def test_no_fixture_rows_on_any_live_board_store():
+    """The live-estate invariant: zero ``created_by='fixture'`` rows on ANY live store.
+
+    Read-only, and resolved from the REAL host home (``Path.home()``, which the test suite
+    deliberately does not redirect) rather than the test ``HERMES_HOME``: this is the
+    regression detector for the whole class, so it must look where the operator's boards
+    actually are. Skips cleanly on a host that carries no live board set.
+    """
+    from hermes_cli.kanban_scratch import live_board_stores
+
+    root = Path.home() / ".hermes"
+    stores = [p for p in sorted(live_board_stores(root)) if p.exists()]
+    if not stores:
+        pytest.skip(f"no live kanban board store on this host (looked under {root})")
+
+    offenders = {str(store): rows for store in stores if (rows := _fixture_rows(store))}
+    assert offenders == {}, f"fixture rows on live board stores: {offenders}"
 
 

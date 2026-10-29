@@ -106,6 +106,17 @@ declared identity classes (DATA) → exempt classes (never refused) → the clos
 (a board fact, no instrument needed, and only for a key whose class the policy declares) →
 the pool reading (the only part that can be unmeasurable, and the only part that fails open).
 
+THE DESTINATION IS CHECKED FIRST, AND IT IS THE ONE LEG THAT IS NOT INERT. A filing that
+carries the NON-PRODUCTION test marker ``created_by='fixture'`` may not be written to a LIVE
+board store: stale harness copies re-opened that hole 24+ times (ops card t_1d61392b, 32
+"fixture board" rows on the operator's live ops board — ``--board ops`` resolved through
+``HERMES_KANBAN_HOME`` while the caller believed ``HERMES_KANBAN_DB`` pinned a throwaway).
+Fixing the copies could not close the class, so the decision lives here, at the door every
+filer reaches, and it reads the store the caller's OPEN CONNECTION names — never a path
+re-derived from the flags. Because it must hold on a host with no policy file too, it is the
+ONE check that runs before the inert-host early return; it reads no policy, prints nothing
+unless it refuses, and costs a ``PRAGMA database_list`` plus a few stats per create.
+
 A KNOWN ASYMMETRY, STATED RATHER THAN HIDDEN. :func:`_consumed` attributes existing births by
 THE SURFACE's roster precedence while the decision uses the create's RAISED band, so a
 band-raised create (a defect filed by the design lane) is judged against a pool whose spend
@@ -685,7 +696,22 @@ def apply(conn, *, created_by: Optional[str] = None, title: Optional[str] = None
     create, N for the decompose seam's fan-out): the pool must cover all of them, and the
     refusal says ``batch=N`` so the producer can read what it asked for. The line's format is
     otherwise unchanged — a single create's refusal is byte-identical to the ruling's.
+
+    THE DESTINATION LEG runs before everything else, including the inert-host return: a
+    ``created_by='fixture'`` filing aimed at a LIVE board store is refused here, because that
+    gate must hold whether or not this host is governed by a budget policy.
     """
+    from hermes_cli.kanban_gate_invariants import fixture_store_refusal, store_path_for_connection
+
+    destination_line = fixture_store_refusal(created_by, store_path_for_connection(conn))
+    if destination_line is not None:
+        print(destination_line, file=sys.stderr)
+        log.info("%s", destination_line)
+        # No `why`: the line above IS the refusal, and the CLI's `why` branch would print it a
+        # second time. `rc` is the door's exit code (3 = budget/duplicate, 1 = destination).
+        record = {"status": "refused", "policy": "fixture-store", "line": destination_line,
+                  "rc": 1}
+        return FilingRefusal(destination_line, record), record
     record = evaluate(conn, created_by=created_by, title=title, body=body, root=root, now=now,
                       idempotency_key=idempotency_key, resurrect=resurrect, quantity=quantity)
     if record is None:
