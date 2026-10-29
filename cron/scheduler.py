@@ -2955,6 +2955,18 @@ def _record_fire_ownership_lost(
             error="Fire claim ownership lost; stale result was discarded.")
 
 
+def _failure_ping_alerted(delivery_outcome: str) -> bool:
+    """Whether a failure ping has gone as far as the run can take it.
+
+    ``delivered`` (it left the process), ``not_configured`` (it had a configured target), or
+    ``queued`` — durably admitted to the delivery lane. Queued MUST count: script jobs now hand
+    their alert to the queue (t_e9d06d80), and without this a job failing on every run would
+    re-ping on every run instead of once per ``cron.failure_repeat_alert_hours`` cooldown. The
+    queue's own progress stays visible as ``last_delivery_queued`` and the pending record.
+    """
+    return delivery_outcome in ("delivered", "not_configured", "queued")
+
+
 def _classify_delivery_outcome(
     *, delivery_error, should_deliver: bool, unresolved_origin: bool,
     normalized_deliver: str, incident_acked: bool, success: bool,
@@ -3252,7 +3264,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         incident_acked=d.incident_acked,
         success=d.success,
     )
-    if delivery_outcome in ("delivered", "not_configured") and not d.success:
+    if _failure_ping_alerted(delivery_outcome) and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
     finish_execution(
@@ -3293,7 +3305,7 @@ def _deliver_crash_failure(
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"),
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
-    if delivery_outcome in ("delivered", "not_configured"):
+    if _failure_ping_alerted(delivery_outcome):
         _mark_incident_alerted(failure_incident_id)
     return delivery_error, delivery_outcome
 
