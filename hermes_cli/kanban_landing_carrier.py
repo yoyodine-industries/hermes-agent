@@ -468,10 +468,19 @@ def _rows(path: Path, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
 # question this module asks of a card. ARCHIVED IS INCLUDED on purpose (card
 # ``t_4a87bb75``): a carrier that has served its landing is archived by the board
 # sweep, and a tombstone whose key still names the PR is a RECORD that the landing
-# was carried, not an absence. This filter used to say ``status != 'archived'``
-# while ``_candidate_cards`` applied no status filter at all -- one question
-# answered two ways, so the same archived carrier was ADMITTED through the prose
-# path and REFUSED through the id path. One question, one answer.
+# was carried, not an absence.
+#
+# THIS IS A POLICY REVERSAL, NOT AN ALIGNMENT -- measured at the base commit
+# ``161899e0c8``: ALL THREE existence reads carried ``status != 'archived'``
+# (``_CARRIER_TITLE_FILTER``, ``_card_by_id``, ``_child_cards``) and
+# ``_candidate_cards`` used that same filter, so an archived carrier was refused
+# EVERYWHERE, uniformly. The base never answered this question two ways; it answered
+# it consistently on the wrong premise ("archived" is not evidence that a landing was
+# NOT carried). This change admits archived receivers on all three paths on purpose.
+#
+# BLAST RADIUS, in one sentence: every archived ``[land ...]`` / ``[owner act]``
+# receiver on every board now satisfies this fence, and what still stops a false DONE
+# is the merge/stamp legs and the deploy-ledger admission -- NOT this read.
 _CARRIER_TITLE_FILTER = "(title LIKE '[land%' OR title LIKE '[owner act%')"
 
 
@@ -833,8 +842,9 @@ _CARRIER_ESCAPE_LINES = (
     "any board's card keyed landing-carrier:<owner>/<repo>#<N> (the spec above writes it), "
     "AND ARCHIVED IS ENOUGH: a served carrier is usually archived, and its key still records "
     "the landing. Keyless carriers still pass by prose: the alias "
-    "landing-reconcile:<repo>#<N> naming the full ref, or a live \"[land ...\" / "
-    "\"[owner act]\" card naming it. If the landing is owed but not yet carried, THIS is the "
+    "landing-reconcile:<repo>#<N> naming the full ref, or ANY \"[land ...\" / "
+    "\"[owner act]\" card naming it (archived included — every existence read is "
+    "status-agnostic). If the landing is owed but not yet carried, THIS is the "
     "escape: file that carrier with the key and name it;",
     "  * or if the PR is superseded or re-cut, say what it rides: "
     "metadata.landing_not_owed=\"<the replacement it rides>\" (repo#N, a card id or a URL).",

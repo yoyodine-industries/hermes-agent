@@ -26,6 +26,7 @@ carrier on any board -- plus every worker close that records a publication.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -933,16 +934,16 @@ def test_an_archived_keyed_tombstone_admits_the_close(conn, forge):
     ), described
 
 
-def test_an_archived_carrier_is_admitted_by_the_id_path_and_already_was_by_prose(conn, forge):
-    """Both sides of the inconsistency this card removes, in one test.
+def test_an_archived_carrier_admits_by_the_id_path_and_by_prose(conn, forge):
+    """Both existence paths ADMIT an archived carrier on head -- nothing about "before".
 
-    Arc 1 -- the DECLARED id path (``metadata.landing_card`` -> ``_card_by_id``): the
-    base refused an archived card here, because that read carried
-    ``status != 'archived'``. Arc 2 -- the PROSE path (``_candidate_cards``): the base
-    carried no status filter at all, so the SAME archived card was already admitted.
-    One question ("does a carrier exist for this ref") answered two ways; after the
-    fix both admit, and arc 2 is the control that proves the filter was never a
-    safety property.
+    Arc 1 -- the DECLARED id path (``metadata.landing_card`` -> ``_card_by_id``);
+    arc 2 -- the PROSE path (``_candidate_cards``) alone, with no declaration naming
+    it. At the base commit (``161899e0c8``) NEITHER arc admitted: all three existence
+    reads carried ``status != 'archived'`` and ``_candidate_cards`` used that same
+    filter, so archived carriers were refused uniformly. Head reverses that policy
+    deliberately (card ``t_4a87bb75``); the base-parity assertion lives in
+    ``test_the_carrier_filter_is_status_agnostic``.
     """
     declared = _archived_carrier(conn)  # titled "[land] ..." AND named below
     first = _review_card(conn)
@@ -962,6 +963,20 @@ def test_an_archived_carrier_is_admitted_by_the_id_path_and_already_was_by_prose
     ) is True
 
     assert forge["asked"] == []
+
+
+def test_the_carrier_filter_is_status_agnostic():
+    """BASE PARITY, pinned as a test instead of told in a docstring.
+
+    At the base commit ``161899e0c8`` the constant was
+    ``"status != 'archived' AND (title LIKE '[land%' OR title LIKE '[owner act%')"``
+    and ``_candidate_cards`` -- the prose scan -- queried with that same constant, so
+    every existence read refused archived cards. Head drops the status predicate on
+    purpose (card ``t_4a87bb75``): a served carrier is usually archived, and its
+    existence is evidence the landing WAS carried. This assertion fails on the base.
+    """
+    assert "status" not in klc._CARRIER_TITLE_FILTER
+    assert klc._CARRIER_TITLE_FILTER.startswith("(title LIKE '[land%")
 
 
 def test_an_archived_linked_child_naming_the_pr_still_carries(conn, forge):
@@ -995,7 +1010,13 @@ def test_the_remedy_prints_the_keyed_create_and_says_archived_is_enough(conn, fo
     assert f'idempotency_key="landing-carrier:{PR}"' in detail, detail
     # The doctrine sentence now AGREES with the code: an archived keyed card counts.
     assert "ARCHIVED IS ENOUGH" in detail, detail
-    assert "non-archived card on any board" not in detail, detail
+    # PROPERTY, not a phrase snapshot: the escape must not RESTRICT the prose path to
+    # live cards. A synonym of "live" is what walked past the previous guard, so the
+    # assertion is "no liveness qualifier at all" plus "archived is stated", against
+    # the escape line itself (behaviour is proved by the archived-carrier tests).
+    escape = " ".join(klc._CARRIER_ESCAPE_LINES)
+    assert re.search(r"\blive\b", escape, re.IGNORECASE) is None, escape
+    assert re.search(r"\barchived\b", escape, re.IGNORECASE), escape
     # ... and the legacy alias is named as the read-only fallback, so a lane holding
     # one of the older carriers knows it still counts.
     assert "landing-reconcile:<repo>#<N>" in detail, detail
