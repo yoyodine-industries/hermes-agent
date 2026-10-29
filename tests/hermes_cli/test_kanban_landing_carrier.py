@@ -25,6 +25,7 @@ carrier on any board -- plus every worker close that records a publication.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import sys
@@ -1096,3 +1097,355 @@ def test_the_carrier_key_builders_are_the_one_shape():
     # The legacy alias is OWNER-LESS by construction -- which is why a hit is only
     # accepted when the card also names the full ref.
     assert klc._carrier_key_legacy("example-org/example-repo#7") == "landing-reconcile:example-repo#7"
+
+
+# --------------------------------------------------------------------------- #
+# the ONE-STEP MINT (leg C2, card ``t_c83a87dd``)
+#
+# The fence requires the carrier to EXIST. Telling the lane to hand-build a
+# ``kanban_create`` call is prose a model retypes -- measured: 521 of 801 carrier
+# receipts keyless, 32 of the 33 born in the last 24h, every one compliant with the
+# spec that was printed. So the CLOSE can file the carrier itself:
+# ``--mint-carrier`` / ``mint_carrier=true``, opt-in, and the kernel writes the card
+# with the canonical key applied in code and re-judges the SAME close.
+#
+# Every test here drives the production doors (``kanban_db.complete_task``,
+# ``tools.kanban_tools._handle_complete``, the ``hermes kanban complete`` handler)
+# against a real board store, with only the forge transport stubbed.
+# --------------------------------------------------------------------------- #
+
+_CARRIER_COLUMNS = ("id", "title", "body", "assignee", "status", "idempotency_key")
+
+
+def _carrier_cards(conn, ref: str) -> list[dict]:
+    """Every card carrying the canonical carrier key for ``ref`` -- archived included."""
+    rows = conn.execute(
+        "SELECT id, title, body, assignee, status, idempotency_key FROM tasks "
+        "WHERE idempotency_key = ? ORDER BY created_at",
+        (f"landing-carrier:{ref}",),
+    ).fetchall()
+    return [dict(zip(_CARRIER_COLUMNS, tuple(row)[:len(_CARRIER_COLUMNS)])) for row in rows]
+
+
+def _lane_card(conn, lane="default", title="a dispatched review card") -> str:
+    """A review card owned by a LANE -- the shape a dispatched close actually has.
+
+    The mint inherits the closing card's assignee (the lane that published), so a
+    card with no assignee is the fallback path, tested separately below.
+    """
+    task_id = kb.create_task(conn, title=title, initial_status="running", assignee=lane)
+    assert kb.request_review(conn, task_id, summary="ready for review") is True
+    return task_id
+
+
+def test_mint_carrier_files_the_keyed_carrier_and_admits_the_same_close(conn, forge):
+    """ACCEPTANCE: a refused close that asks for the mint is ADMITTED, one keyed card filed."""
+    task_id = _lane_card(conn)
+    refusal = kb.complete_task(conn, task_id, summary="approved",
+                               metadata={"published_pr": PR_URL})
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert _carrier_cards(conn, PR) == []                 # nothing filed yet
+
+    assert kb.complete_task(conn, task_id, summary="approved",
+                            metadata={"published_pr": PR_URL}, mint_carrier=True) is True
+
+    cards = _carrier_cards(conn, PR)
+    assert len(cards) == 1, cards
+    card = cards[0]
+    assert card["title"] == f"[land] {PR} for {task_id}"
+    assert card["idempotency_key"] == f"landing-carrier:{PR}"   # the canonical identity
+    assert card["assignee"] == "default"                        # inherited from the close
+    # Parented on the closing card, so either card walks to the other, and it can only
+    # start once that close has landed (it was created while the parent was in review).
+    assert card["status"] == "ready"
+    assert PR in card["body"] and task_id in card["body"]
+    assert _status(conn, task_id) == "done"
+    # The mint is AUDITED even when it worked: one event, naming the card it filed.
+    mint_events = _mint_events(conn, task_id)
+    assert len(mint_events) == 1
+    assert mint_events[0]["minted"] == {PR: card["id"]}
+    # TWO forge reads for TWO close attempts -- one each -- and none for the re-judge:
+    # the carrier now answers the fence before any transport is asked.
+    assert forge["asked"] == [("example-org/example-repo", "7")] * 2
+
+
+def _mint_events(conn, task_id) -> list[dict]:
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'completion_minted_landing_carrier' ORDER BY id", (task_id,),
+    ).fetchall()
+    return [json.loads(row[0] or "{}") for row in rows]
+
+
+def test_the_mint_is_opt_in_and_a_plain_close_writes_nothing(conn, forge):
+    """ACCEPTANCE: without the flag the close is exactly what it was -- no card, no event.
+
+    The fence's own event and detail are the control: the flag-off close is refused with
+    the same cause, the card row is byte-unchanged, and the mint leaves no trace at all.
+    """
+    task_id = _lane_card(conn)
+    before = _row_snapshot(conn, task_id)
+
+    refusal = kb.complete_task(conn, task_id, summary="approved",
+                               metadata={"published_pr": PR_URL})
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
+    assert _row_snapshot(conn, task_id) == before
+    assert _status(conn, task_id) == "review"
+    assert _carrier_cards(conn, PR) == []
+    assert _mint_events(conn, task_id) == []
+    assert "MINT DID NOT CLOSE IT" not in refusal.detail
+    # The close attempt left exactly ONE new event -- the fence's own refusal.
+    assert _event_kinds(conn, task_id)[-1] == "completion_blocked_landing_carrier"
+    assert "completion_minted_landing_carrier" not in _event_kinds(conn, task_id)
+
+
+def test_a_second_mint_never_files_a_second_carrier(conn, forge):
+    """The resurrection class: a carrier that already exists is REUSED, never duplicated.
+
+    Exercised as the RACE it protects against -- the fence refuses, a carrier appears
+    before the mint runs (another lane filing it, which is the live case), and the mint
+    must find it rather than file a twin. The tombstone is ARCHIVED on purpose:
+    ``create_task``'s own dedupe filters ``status != 'archived'``, so a mint that leaned
+    on it would resurrect exactly the pair that produced 4 duplicates.
+    """
+    task_id = _lane_card(conn)
+    verdict = klc.evaluate(conn=conn, task_id=task_id, metadata={"published_pr": PR_URL})
+    assert verdict.refused
+    carrier = kb.create_task(conn, title=f"[land] {PR} for t_elsewhere",
+                             initial_status="running",
+                             idempotency_key=f"landing-carrier:{PR}")
+    conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (carrier,))
+    conn.commit()
+
+    report = klc.mint_carriers(conn=conn, task_id=task_id, verdict=verdict)
+
+    assert report.minted == {}
+    assert report.present == {PR: carrier}
+    assert [c["id"] for c in _carrier_cards(conn, PR)] == [carrier]
+    assert _status(conn, task_id) == "review"
+
+
+def test_two_cards_declaring_the_same_pr_mint_one_carrier_between_them(conn, forge):
+    """The same pair, end to end through the door: the SECOND close files nothing."""
+    first = _lane_card(conn, title="first close of the pair")
+    second = _lane_card(conn, title="second close of the pair")
+
+    assert kb.complete_task(conn, first, summary="approved",
+                            metadata={"published_pr": PR_URL}, mint_carrier=True) is True
+    assert kb.complete_task(conn, second, summary="approved",
+                            metadata={"published_pr": PR_URL}, mint_carrier=True) is True
+
+    cards = _carrier_cards(conn, PR)
+    assert len(cards) == 1, cards
+    assert cards[0]["title"] == f"[land] {PR} for {first}"
+
+
+def test_a_merged_pr_is_never_minted(conn, forge):
+    """ACCEPTANCE: a MERGED PR close is untouched by the flag -- no card, one forge read."""
+    forge["per_pr"][("example-org/example-repo", "7")] = "merged"
+    task_id = _lane_card(conn)
+
+    assert kb.complete_task(conn, task_id, summary="already landed",
+                            metadata={"published_pr": PR_URL}, mint_carrier=True) is True
+
+    assert _carrier_cards(conn, PR) == []
+    assert _mint_events(conn, task_id) == []
+    assert forge["asked"] == [("example-org/example-repo", "7")]
+
+
+def test_an_unjudgeable_forge_state_is_never_minted(conn, forge):
+    """``landing_state_unknown`` is not a missing carrier: filing on it would invent evidence."""
+    forge["state"]["value"] = "unreachable"
+    task_id = _lane_card(conn)
+
+    refusal = kb.complete_task(conn, task_id, summary="approved",
+                               metadata={"published_pr": PR_URL}, mint_carrier=True)
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_state_unknown"
+    assert _carrier_cards(conn, PR) == []
+    assert _status(conn, task_id) == "review"
+    # The mint says what it did NOT do, and the refusal still needs no network.
+    events = _mint_events(conn, task_id)
+    assert len(events) == 1
+    assert events[0]["attempted"] == []
+    assert events[0]["skipped"][0]["cause"] == klc.MINT_CAUSE_OUT_OF_SCOPE
+
+
+def test_a_mint_that_cannot_name_a_lane_refuses_and_says_why(conn, forge):
+    """ACCEPTANCE: a failed mint loses NOTHING -- the refusal keeps its reason and names the cause.
+
+    A card with no assignee and no earlier carrier for the repo gives the kernel no
+    dispatchable owner. Filing anyway would be an undispatchable card, i.e. the silent
+    failure this clause exists to prevent, so the mint files nothing and the close stays
+    refused with the full remedy plus the reason the one-step route did not take it.
+    """
+    task_id = _review_card(conn)          # no assignee, and the board has no [land] card
+    refusal = kb.complete_task(conn, task_id, summary="approved",
+                               metadata={"published_pr": PR_URL}, mint_carrier=True)
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
+    assert PR in refusal.detail
+    assert "metadata.landing_deferred" in refusal.detail      # the whole remedy survived
+    assert "MINT DID NOT CLOSE IT" in refusal.detail
+    assert klc.MINT_CAUSE_NO_LANE in refusal.detail
+    assert _carrier_cards(conn, PR) == []
+    assert _status(conn, task_id) == "review"
+
+
+def test_a_broken_filing_keeps_the_close_refused_instead_of_crashing_it(conn, forge, monkeypatch):
+    """A filing that raises must degrade to a named cause, never take the door down."""
+    task_id = _lane_card(conn)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("stubbed: the store refused the insert")
+
+    monkeypatch.setattr(kb, "create_task", _boom)
+    refusal = kb.complete_task(conn, task_id, summary="approved",
+                               metadata={"published_pr": PR_URL}, mint_carrier=True)
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
+    assert "MINT DID NOT CLOSE IT" in refusal.detail
+    assert klc.MINT_CAUSE_FILING_FAILED in refusal.detail
+    assert "stubbed: the store refused the insert" in refusal.detail
+    assert _carrier_cards(conn, PR) == []
+    assert _status(conn, task_id) == "review"
+
+
+def test_the_pure_evaluator_never_files_a_carrier(conn, forge):
+    """The mint is NOT a branch inside the fence: reading a refusal must not write.
+
+    ``evaluate`` is what dry runs, audits and re-evaluations call; a write in there would
+    be a side effect of reading, and a dry run would file cards.
+    """
+    task_id = _lane_card(conn)
+    before = _row_snapshot(conn, task_id)
+
+    verdict = klc.evaluate(conn=conn, task_id=task_id, metadata={"published_pr": PR_URL})
+
+    assert verdict.refused
+    assert _carrier_cards(conn, PR) == []
+    assert _row_snapshot(conn, task_id) == before
+    assert "create_task" not in inspect.getsource(klc.evaluate)
+    assert "mint_carriers" not in inspect.getsource(klc.evaluate)
+
+
+def test_the_remedy_names_the_one_step_route_and_keeps_the_create_spec(conn, forge):
+    """The refusal offers the short route AND the fallback, in the same detail."""
+    task_id = _review_card(conn)
+
+    refusal = kb.complete_task(conn, task_id, summary="approved",
+                               metadata={"published_pr": PR_URL})
+
+    assert "--mint-carrier" in refusal.detail
+    assert "mint_carrier=true" in refusal.detail
+    assert "ONE STEP" in refusal.detail
+    # The paste-ready spec stays: a caller that cannot mint (or a lane reading the
+    # refusal outside a close) still has the exact filing to hand-build.
+    assert f'kanban_create(title="[land] {PR} for {task_id}"' in refusal.detail
+    assert refusal.detail.index("--mint-carrier") > refusal.detail.index("ONE STEP")
+
+
+def test_the_deferral_escape_stays_inside_the_2048_budget(conn, forge):
+    """The deferral remedy must still RENDER inside the first 2048 characters of the detail.
+
+    Measured on the WORST-CASE composition -- the contradiction path (``local-only``
+    contract against a published PR) with a long owner/repo ref -- where the C1 rounds
+    left only tens of characters of headroom. Leg C2's mint block is placed BELOW the
+    deferral line for exactly this reason; a future edit that moves text above it fails
+    here instead of silently pushing the escape out of the reader's view.
+    """
+    declared = "yoyodine-industries/hermes-agent#2306"
+    task_id = kb.create_task(conn, title="contract card", initial_status="running",
+                             completion_contract="local-only")
+    assert kb.request_review(conn, task_id, summary="ready for review") is True
+
+    refusal = kb.complete_task(conn, task_id, summary="approved",
+                               metadata={"published_pr": f"https://github.com/{declared.replace('#', '/pull/')}"})
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert "CONTRADICTION FIRST" in refusal.detail
+    offset = refusal.detail.index("metadata.landing_deferred")
+    assert offset <= 2048, f"the deferral escape starts at {offset}, outside the 2048 budget"
+
+
+def test_the_tool_door_can_mint(conn, forge, monkeypatch):
+    """``kanban_complete(mint_carrier=True)`` -- the worker lane's own door."""
+    from tools import kanban_tools as kt
+
+    task_id = _lane_card(conn)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+
+    out = json.loads(kt._handle_complete({
+        "task_id": task_id, "summary": "approved",
+        "metadata": {"published_pr": PR_URL}, "mint_carrier": True}))
+
+    assert not out.get("error"), out
+    assert _status(conn, task_id) == "done"
+    assert len(_carrier_cards(conn, PR)) == 1
+
+
+def test_the_cli_flag_reaches_the_kernel(conn, forge, monkeypatch):
+    """``hermes kanban complete --mint-carrier`` parses and closes through the real handler."""
+    import argparse
+
+    from hermes_cli import kanban
+    from hermes_cli.kanban_parser import build_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_parser(parser.add_subparsers(dest="command"))
+    task_id = _lane_card(conn)
+    args = parser.parse_args([
+        "kanban", "complete", task_id, "--mint-carrier",
+        "--result", "approved", "--metadata", json.dumps({"published_pr": PR_URL}),
+    ])
+    assert args.mint_carrier is True
+
+    rc = kanban._HANDLERS["complete"](args)
+
+    assert rc == 0
+    assert _status(conn, task_id) == "done"
+    cards = _carrier_cards(conn, PR)
+    assert len(cards) == 1, cards
+    assert cards[0]["assignee"] == "default"
+
+
+def test_every_unsatisfied_ref_gets_its_own_minted_carrier(conn, forge):
+    """A card may declare two PRs (measured); each unlanded one owes its OWN keyed carrier."""
+    other = "other-org/other-repo#12"
+    task_id = _lane_card(conn, title="two declared PRs")
+    _seed_run(conn, task_id,
+              {"published_pr": f"https://github.com/{other.replace('#', '/pull/')}"})
+
+    assert kb.complete_task(conn, task_id, summary="approved",
+                            metadata={"published_pr": PR_URL}, mint_carrier=True) is True
+
+    for ref in (PR, other):
+        cards = _carrier_cards(conn, ref)
+        assert len(cards) == 1, (ref, cards)
+        assert cards[0]["idempotency_key"] == f"landing-carrier:{ref}"
+        assert cards[0]["title"] == f"[land] {ref} for {task_id}"
+
+
+def test_an_unassigned_close_inherits_the_lane_that_carries_its_repo(conn, forge):
+    """The fallback: no closing assignee -> the lane that carried this REPO last, off the board.
+
+    The card below names a DIFFERENT PR of the same repo on purpose -- a card naming this
+    ref would satisfy the fence and no mint would run, so the reachable question is "who
+    lands this repo". The kernel never guesses a lane it cannot see (no OWNERS read here).
+    """
+    kb.create_task(conn, title="[land] example-org/example-repo#99 for t_old",
+                   initial_status="running", assignee="platform-stl")
+    task_id = _review_card(conn)                     # no assignee on the closing card
+
+    assert kb.complete_task(conn, task_id, summary="approved",
+                            metadata={"published_pr": PR_URL}, mint_carrier=True) is True
+
+    cards = _carrier_cards(conn, PR)
+    assert len(cards) == 1, cards
+    assert cards[0]["assignee"] == "platform-stl"

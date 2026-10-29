@@ -74,7 +74,11 @@ beside ``_gate_deploy_proof`` and ``prepare_acceptance``. It never raises and it
 never mutates the card: it returns a :class:`CompletionRefusal` (as DATA) or
 ``None``. The gate records ONE auditable event
 (``completion_blocked_landing_carrier``) and leaves the card byte-untouched, so
-every existing ``if not complete_task(...)`` caller keeps its meaning.
+every existing ``if not complete_task(...)`` caller keeps its meaning. The ONE
+write this module can make is :func:`mint_carriers` -- a separate function the
+close calls when the lane ASKS for it (``--mint-carrier``); it files the missing
+carrier as a NEW card and records ``completion_minted_landing_carrier``, and it
+still never touches the closing card itself.
 
 ONE LANDING SURFACE, NEVER TWO (ruling R3). Upstream ``NousResearch/hermes-agent#123429``
 adds ``hermes_cli/kanban_landing.py`` (a landed-EVIDENCE gate + stranded routing).
@@ -153,8 +157,11 @@ THE RULE. For each declared PR the close must satisfy ONE of:
     their PRs unmerged and the defects they targeted still live.)
 
 Anything else is refused ``landing_carrier_missing`` with the remedy inline: the
-PR, the exact ``kanban_create`` spec for the carrier, both escapes, the doctrine
-reference.
+PR, the exact ``kanban_create`` spec for the carrier, both escapes, the
+ONE-STEP route (``hermes kanban complete --mint-carrier`` / ``mint_carrier=true``,
+which has the kernel file that carrier and re-judge the same close --
+:func:`mint_carriers`, a separate WRITING function; :func:`evaluate` itself stays
+a pure evaluator), and the doctrine reference.
 
 FAIL-CLOSED WITHOUT DEADLOCK. The forge is consulted only when neither a carrier
 nor a deferral is declared; when it cannot be reached the refusal is
@@ -178,15 +185,30 @@ __all__ = [
     "CAUSE_DEFERRED_KEYS",
     "CAUSE_NOT_OWED_KEYS",
     "CAUSE_STATE_UNKNOWN",
+    "MINT_CAUSE_FILING_FAILED",
+    "MINT_CAUSE_NO_LANE",
+    "MINT_CAUSE_OUT_OF_SCOPE",
+    "MintReport",
     "declared_prs",
     "evaluate",
     "is_named_exemption",
     "landing_lane_hint",
+    "mint_carriers",
+    "mint_failure_note",
     "normalize_ref",
 ]
 
 CAUSE_CARRIER_MISSING = "landing_carrier_missing"
 CAUSE_STATE_UNKNOWN = "landing_state_unknown"
+
+# WHY a MINT produced no card (leg C2, card ``t_c83a87dd``). The close's own refusal cause is
+# unchanged -- these name only why the one-step route could not take it, so a reader can tell
+# "the kernel has no lane to file to" from "the filing itself broke" from "minting was never
+# applicable to this refusal". Never folded into the refusal's cause: the fence judged the
+# card's evidence, and the mint is a way of SATISFYING it, not a second verdict.
+MINT_CAUSE_NO_LANE = "no_dispatchable_lane"
+MINT_CAUSE_FILING_FAILED = "filing_failed"
+MINT_CAUSE_OUT_OF_SCOPE = "not_a_missing_carrier"
 
 # The two RECORDED escapes. ``landing_deferred`` says "owed, not yet carried" and
 # only counts when it NAMES the carrier card (see ``is_named_carrier_deferral``);
@@ -832,10 +854,17 @@ def _carrier_create_spec(ref: str, task_id: str) -> str:
 
 
 # The remedy's blocks are SEPARATE STRINGS on purpose (hotspot note on card
-# ``t_4a87bb75``): leg C2 (``t_c83a87dd``) amends the ESCAPE paragraph to name its
-# one-step `--mint-carrier` route, and that has to be a text swap here rather than a
-# second rewrite of ``_render_remedy``. One string per remedy line, no inline
-# conditionals woven through them.
+# ``t_4a87bb75``): leg C2 (``t_c83a87dd``) names its one-step `--mint-carrier` route here,
+# and that has to be its own string rather than a second rewrite of ``_render_remedy``.
+# One string per remedy line, no inline conditionals woven through them.
+#
+# WHERE the mint block sits is a MEASURED decision, not a layout preference. The detail is
+# read with a 2048-character budget (the C1 rounds' number), and the deferral escape
+# (``metadata.landing_deferred``) has to RENDER inside it: at the branch base that offset is
+# already 2002 of 2048 on a long ref in the contradiction composition, so text added ABOVE it
+# spends a margin that is nearly gone. The mint block therefore goes BELOW it, where it costs
+# nothing, and ``test_the_deferral_escape_stays_inside_the_2048_budget`` pins the offset so a
+# later edit cannot quietly push the deferral remedy out of view.
 _CARRIER_ESCAPE_HEADER = "Escapes (recorded in this card's metadata):"
 _CARRIER_ESCAPE_LINES = (
     "  * name the landing carrier: metadata.landing_card=\"t_...\" (or a linked child card) — "
@@ -854,6 +883,12 @@ _CARRIER_NO_DEFERRAL_LINE = (
     "card that names the PR — a bare reason cannot close an unmerged-PR card (2026-10-28). "
     "A close rides EVIDENCE: the forge's MERGED state, or a landed revision "
     "(merged_as / merge_sha / landed_sha / deploy_stamp) matching a deploy-ledger row."
+)
+_CARRIER_MINT_LINE = (
+    "ONE STEP, nothing to retype: `hermes kanban complete --mint-carrier <task>` — or "
+    "mint_carrier=true on the `kanban_complete` tool — has the KERNEL file that keyed carrier "
+    "for you (canonical key, parented on this card, lane inherited from the close) and then "
+    "re-judges this same close. The create above remains the route for a caller that cannot mint."
 )
 _CARRIER_DOCTRINE_LINE = (
     "Doctrine: a close whose declared PR is unmerged must name its landing carrier on EVERY "
@@ -877,12 +912,246 @@ def _render_remedy(task_id: str, entries: list[tuple[str, str]]) -> str:
         + f"\n{_CARRIER_ESCAPE_HEADER}\n"
         + "\n".join(_CARRIER_ESCAPE_LINES)
         + f"\n{_CARRIER_NO_DEFERRAL_LINE}\n"
+        + f"{_CARRIER_MINT_LINE}\n"
         + _CARRIER_DOCTRINE_LINE
     )
 
 
 def _carrier_title(ref: str, task_id: str) -> str:
     return f"[land] {ref} for {task_id}"
+
+
+# --------------------------------------------------------------------------- #
+# the MINT: the close files its own carrier (leg C2, card ``t_c83a87dd``)
+# --------------------------------------------------------------------------- #
+#
+# WHY THIS IS NOT IN :func:`evaluate`. The clause is an EVALUATOR -- "never raises, never
+# writes" -- and that contract is what makes a refusal safe to re-run: dry runs, audits and
+# re-evaluations of the same close all call it, and a write in there would be a side effect of
+# reading. So the mint is a SECOND, SEPARATE function that the completion transition calls
+# before it re-judges (``kanban_db._gate_landing_carrier``), never a branch inside the fence.
+#
+# WHY IT RIDES THE COMPLETION TRANSITION. The fence requires the carrier to EXIST, so routing
+# the lane to "the reconciler will file it" stalls the close for a whole flow window, and
+# telling the lane to hand-build a ``kanban_create`` call is prose a model retypes -- measured
+# before this leg: 521 of 801 carrier receipts keyless, 32 of the 33 born in the last 24h,
+# every one compliant with the spec that was printed. The close is the one door the lane is
+# already standing at, so the kernel files the card itself, with the key applied in code.
+
+def _short(text: Any, limit: int = 160) -> str:
+    """One line, bounded -- an exception message must not bloat a refusal the lane has to read."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def _carrier_body(ref: str, task_id: str) -> str:
+    """The minted carrier's own record of WHY it exists and which close filed it.
+
+    A reader of either card can walk the pair (decision 4 on card ``t_c83a87dd``): the closing
+    card links to this one through ``parents``, and this body names the closing card and the
+    declaring ref. It also states the ONE thing the kernel cannot know -- the fleet's landing
+    lane -- instead of pretending to a routing decision it never made.
+    """
+    return (
+        f"Minted by the close of {task_id}, for the deliverable PR {ref} that close declares.\n\n"
+        f"This card IS the landing leg for {ref}: its idempotency_key is "
+        f"{_carrier_key(ref)}, the identity the landing-carrier fence reads on any board "
+        f"(archived included), and it is parented on {task_id} so either card walks to the "
+        f"other.\n\n"
+        f"The assignee is INHERITED from the closing card. The kernel cannot read this repo's "
+        f"OWNERS file or the fleet lane table, so it does not invent a landing lane: re-home "
+        f"this card if the landing belongs elsewhere.\n\n"
+        f"Close this card when {ref} has landed -- merged at the forge, or a landed revision "
+        f"(merged_as / merge_sha / landed_sha / deploy_stamp) that resolves in the deploy "
+        f"ledger."
+    )
+
+
+@dataclass
+class MintReport:
+    """What ONE ``--mint-carrier`` close did, as data rather than a log line.
+
+    ``minted`` and ``present`` are both SUCCESS (the ref has a carrier now); they are kept
+    apart because "the kernel filed it just now" and "an archived tombstone already recorded
+    this landing" are different facts about the board, and the audit event has to say which.
+    """
+
+    task_id: str
+    attempted: list[str] = field(default_factory=list)
+    minted: dict[str, str] = field(default_factory=dict)
+    present: dict[str, str] = field(default_factory=dict)
+    failed: list[dict] = field(default_factory=list)
+    skipped: list[dict] = field(default_factory=list)
+
+    def as_facts(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "attempted": list(self.attempted),
+            "minted": dict(self.minted),
+            "already_present": dict(self.present),
+            "failed": [dict(entry) for entry in self.failed],
+            "skipped": [dict(entry) for entry in self.skipped],
+        }
+
+
+def _closing_assignee(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The closing card's own assignee -- the lane that published, and the lane to inherit."""
+    try:
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    value = row[0] if not hasattr(row, "keys") else row["assignee"]
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _last_carrier_assignee(conn: sqlite3.Connection, ref: str) -> Optional[str]:
+    """The lane that carried THIS REPO last, as the board itself measures it.
+
+    Only a FALLBACK, for a closing card with no assignee (a human-filed card). It reads the
+    newest ``[land ...]`` / ``[owner act]`` card whose title names this REPO -- any PR number,
+    which is what makes it reachable: a card naming THIS ref would satisfy the fence and no
+    mint would run at all, so the useful question is "who lands this repo". That is a fact on
+    the board rather than a guess about a mapping the kernel cannot see. ``None`` when the
+    board has never carried this repo, and then the mint REFUSES rather than filing a card
+    nobody can be dispatched to -- an undispatchable carrier is the silent-failure shape this
+    whole clause exists to prevent.
+    """
+    repo = ref.partition("#")[0]
+    if not repo:
+        return None
+    pattern = re.compile(re.escape(repo) + r"#\d+")
+    try:
+        rows = conn.execute(
+            "SELECT assignee, title FROM tasks WHERE assignee IS NOT NULL AND assignee != '' "
+            f"AND {_CARRIER_TITLE_FILTER} ORDER BY created_at DESC",
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    for row in rows:
+        assignee, title = (row["assignee"], row["title"]) if hasattr(row, "keys") else (row[0], row[1])
+        if pattern.search(str(title or "")):
+            return assignee
+    return None
+
+
+def mint_carriers(
+    *,
+    conn: sqlite3.Connection,
+    task_id: str,
+    verdict: Optional["Verdict"],
+    assignee: Optional[str] = None,
+    stores: Optional[list[tuple[Path, str]]] = None,
+    create: Optional[Callable[..., str]] = None,
+) -> MintReport:
+    """File the carrier(s) a REFUSED close owes. WRITES; never raises.
+
+    The caller is the completion transition (``kanban_db._gate_landing_carrier``), which then
+    re-judges the SAME close through :func:`evaluate` -- the fence stays the only judge, and a
+    minted card is admitted exactly like a hand-filed one.
+
+    Scope is deliberately the refusal's own ``unsatisfied`` refs: those are the refs the forge
+    actually reported NON-MERGED with no carrier anywhere. Nothing is minted for a ref that is
+    merged, exempt (``landing_not_owed``), landed in the ledger, or merely mentioned.
+    ``landing_state_unknown`` is NOT minted either -- the forge could not say whether the PR is
+    unmerged, so filing on that premise would be an invention; the close keeps its fail-closed
+    refusal and its no-network escape.
+
+    DEDUPE IS HERE, NOT IN ``create_task``, and that is the whole point of the ``_cards_by_key``
+    check below: ``create_task``'s idempotency lookup filters ``status != 'archived'``, so
+    minting over an archived tombstone would file a SECOND carrier for a landing that already
+    has one. That resurrection class is measured on this very pair (4 duplicates), and a
+    carrier is usually archived once it has served.
+    """
+    report = MintReport(task_id=task_id)
+    if verdict is None or not verdict.refused:
+        return report
+    if verdict.cause != CAUSE_CARRIER_MISSING:
+        report.skipped.append({
+            "ref": "",
+            "cause": MINT_CAUSE_OUT_OF_SCOPE,
+            "detail": f"the refusal is {verdict.cause or 'not a refusal'}, not a missing carrier",
+        })
+        return report
+    refs = [ref for ref in (verdict.facts.get("unsatisfied") or []) if isinstance(ref, str) and ref]
+    if not refs:
+        report.skipped.append({
+            "ref": "", "cause": MINT_CAUSE_OUT_OF_SCOPE,
+            "detail": "the refusal names no unsatisfied PR",
+        })
+        return report
+
+    if create is None:
+        from hermes_cli import kanban_db as kb  # local: kanban_db imports THIS module
+
+        create = kb.create_task
+
+    lane_default = assignee or _closing_assignee(conn, task_id)
+    for ref in refs:
+        report.attempted.append(ref)
+        key = _carrier_key(ref)
+        try:
+            existing = _cards_by_key(key, stores)
+        except Exception:  # an unreadable store is a coverage gap, not a filing decision
+            existing = None
+        if existing is not None:
+            report.present[ref] = existing.task_id
+            continue
+        lane = lane_default or _last_carrier_assignee(conn, ref)
+        if not lane:
+            report.failed.append({
+                "ref": ref,
+                "cause": MINT_CAUSE_NO_LANE,
+                "detail": ("no closing assignee to inherit and no earlier carrier for this "
+                           "repo on the board"),
+            })
+            continue
+        try:
+            card = create(
+                conn,
+                title=_carrier_title(ref, task_id),
+                body=_carrier_body(ref, task_id),
+                assignee=lane,
+                parents=[task_id],
+                idempotency_key=key,
+            )
+        except Exception as exc:  # the close must survive a broken filing
+            report.failed.append({
+                "ref": ref,
+                "cause": MINT_CAUSE_FILING_FAILED,
+                "detail": f"{type(exc).__name__}: {_short(exc)}",
+            })
+            continue
+        if isinstance(card, str) and card.strip():
+            report.minted[ref] = card.strip()
+        else:
+            report.failed.append({
+                "ref": ref,
+                "cause": MINT_CAUSE_FILING_FAILED,
+                "detail": f"the filing answered no card id ({_short(card)})",
+            })
+    return report
+
+
+def mint_failure_note(report: Optional[MintReport]) -> str:
+    """The failed mint's cause appended to the refusal, or ``""`` when the mint went fine.
+
+    Decision 3 on card ``t_c83a87dd``: a mint that files nothing must not LOSE the close's
+    information. The refusal keeps its full reason (nothing is re-rendered) and this note adds
+    only why the one-step route could not take it, so the lane is never left retrying a route
+    that will keep failing for a reason nobody wrote down.
+    """
+    if report is None or not report.failed:
+        return ""
+    parts = "; ".join(
+        f"{entry.get('ref') or 'the close'} ({entry.get('cause')}: {entry.get('detail')})"
+        for entry in report.failed
+    )
+    return (
+        f"\nMINT DID NOT CLOSE IT: --mint-carrier filed nothing for {parts}. Nothing on this "
+        f"card was changed and no carrier was written; the remedy above still applies."
+    )
 
 
 def evaluate(
