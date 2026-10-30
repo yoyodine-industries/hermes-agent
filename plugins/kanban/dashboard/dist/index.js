@@ -86,6 +86,60 @@
     return body || raw;
   }
 
+  // --- Archive receipt ------------------------------------------------------
+  // The archive seam refuses an ANONYMOUS archive: a PATCH/POST that flips a
+  // card to 'archived' must carry a machine-readable ``reason`` and, for the
+  // reasons whose whole meaning is "another card inherits this work", a
+  // ``destination`` of '<board>/<card>'. A missing one comes back 400
+  // (reason_missing / reason_invalid / destination_missing) and a destination
+  // that is unusable comes back 409 — both are things the human in front of the
+  // board can fix, so every door that archives collects the receipt BEFORE it
+  // fires. Keep this table EQUAL to kanban_db.ARCHIVE_REASONS; the equality is
+  // enforced by tests/plugins/test_kanban_dashboard_archive_receipt.py.
+  const ARCHIVE_REASONS = [
+    { value: "duplicate", label: "Duplicate", needsDestination: true },
+    { value: "superseded", label: "Superseded", needsDestination: false },
+    { value: "rehomed", label: "Rehomed", needsDestination: true },
+    { value: "generated-moot", label: "Generated (now moot)", needsDestination: false },
+    { value: "never-started", label: "Never started", needsDestination: false },
+    { value: "operator", label: "Operator", needsDestination: false },
+  ];
+
+  // Collects the reason (and the destination when that reason needs one) in one
+  // go. Returns null meaning "the human backed out — do NOT archive"; callers
+  // must treat null as a no-op rather than archiving anonymously.
+  // window.prompt is the documented carve-out in this bundle (see
+  // withCompletionSummary / requestCompletionSummary): the host ConfirmDialog
+  // hardcodes onClick -> unmount, so it cannot survive a validation failure.
+  function requestArchiveReceipt(count) {
+    const target = (count && count > 1) ? (count + " selected tasks") : "this task";
+    const lines = ["Archive " + target + " — why? Type the number:"];
+    for (let i = 0; i < ARCHIVE_REASONS.length; i++) {
+      lines.push("  " + (i + 1) + ") " + ARCHIVE_REASONS[i].label);
+    }
+    const answer = window.prompt(lines.join("\n"), "");
+    if (answer === null) return null;  // cancelled: nothing is archived
+    const idx = parseInt(String(answer).trim(), 10);
+    if (!(idx >= 1 && idx <= ARCHIVE_REASONS.length)) {
+      window.alert("Not one of the archive reasons. Nothing was archived.");
+      return null;
+    }
+    const chosen = ARCHIVE_REASONS[idx - 1];
+    const receipt = { reason: chosen.value };
+    if (chosen.needsDestination) {
+      const entered = window.prompt(
+        "Which card inherits this work? Enter '<board>/<card>'.", "");
+      if (entered === null) return null;
+      const parts = String(entered).trim().split("/");
+      if (parts.length !== 2 || !parts[0].trim() || !parts[1].trim()) {
+        window.alert("Destination must be '<board>/<card>'. Nothing was archived.");
+        return null;
+      }
+      receipt.destination = parts[0].trim() + "/" + parts[1].trim();
+    }
+    return receipt;
+  }
+
   // Board column display order; any backend status not listed here renders after these.
   const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
@@ -846,6 +900,13 @@
     //   summary — completion summary string, or null/undefined to skip
     const performMoveTask = useCallback(function (taskId, newStatus, count, summary) {
       const patch = { status: newStatus };
+      // Archiving carries a receipt (see requestArchiveReceipt). A cancel here
+      // means the move never happened: no optimistic UI, no request.
+      if (newStatus === "archived") {
+        const receipt = requestArchiveReceipt(count);
+        if (!receipt) return;
+        Object.assign(patch, receipt);
+      }
       const finalPatch = summary
         ? Object.assign({}, patch, { result: summary, summary: summary })
         : patch;
@@ -867,10 +928,17 @@
           return Object.assign({}, b, { columns });
         });
         const ids = Array.from(selectedIds);
+        // Archiving is not a status verb server-side (the bulk status map has no
+        // 'archived' handler): the bulk ARCHIVE door is ``archive: true``, which
+        // carries the same receipt. ``status`` rides along harmlessly — the
+        // backend short-circuits the status phase once ``archive`` is set.
+        const bulkBody = newStatus === "archived"
+          ? Object.assign({ ids: ids, archive: true }, finalPatch)
+          : Object.assign({ ids: ids }, finalPatch);
         SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(Object.assign({ ids: ids }, finalPatch)),
+          body: JSON.stringify(bulkBody),
         }).then(function (res) {
           const failed = (res.results || []).filter(function (r) { return !r.ok; });
           if (failed.length > 0) {
@@ -1099,7 +1167,14 @@
       if (selectedIds.size === 0) return;
       const count = selectedIds.size;
       const run = function () {
-        const finalPatch = patch;
+        let finalPatch = patch;
+        // The bulk Archive button arrives as ``{ archive: true }``: collect the
+        // same receipt a single archive carries, and refuse to fire without it.
+        if (patch && patch.archive) {
+          const receipt = requestArchiveReceipt(count);
+          if (!receipt) return;
+          finalPatch = Object.assign({}, patch, receipt);
+        }
         const body = Object.assign({ ids: Array.from(selectedIds) }, finalPatch);
         // Optimistic UI for status moves (same pattern as moveSelected).
         if (finalPatch.status) {
@@ -1139,7 +1214,7 @@
             loadBoard();
           })
           .catch(function (e) {
-            setError(String(e.message || e));
+            setError(tx(t, "bulkFailed", "Bulk: ") + parseApiErrorMessage(e));
             setFailedIds(new Set(selectedIds));
             loadBoard();
           });
@@ -3661,11 +3736,13 @@
       function applyPatch(patch) {
         const finalPatch = withCompletionSummary(patch);
         if (!finalPatch) return Promise.resolve();
+        const receipted = withArchiveReceipt(finalPatch);
+        if (!receipted) return Promise.resolve();
         setPatchErr(null);
         return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(finalPatch),
+          body: JSON.stringify(receipted),
         }).then(function () { load(); props.onRefresh(); })
           .catch(function (e) { setPatchErr(parseApiErrorMessage(e)); });
       }
@@ -3688,6 +3765,15 @@
         return null;
       }
       return Object.assign({}, patch, { result: summary, summary: summary });
+    }
+
+    // Local archive-receipt prompt used only by doPatch above. Documented
+    // carve-out — see the doPatch comment and requestArchiveReceipt.
+    function withArchiveReceipt(patch) {
+      if (!patch || patch.status !== "archived") return patch;
+      const receipt = requestArchiveReceipt(1);
+      if (!receipt) return null;
+      return Object.assign({}, patch, receipt);
     }
 
     // Triage specifier — calls the auxiliary LLM to flesh out a rough
