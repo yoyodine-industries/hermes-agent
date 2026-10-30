@@ -1096,3 +1096,610 @@ def test_the_carrier_key_builders_are_the_one_shape():
     # The legacy alias is OWNER-LESS by construction -- which is why a hit is only
     # accepted when the card also names the full ref.
     assert klc._carrier_key_legacy("example-org/example-repo#7") == "landing-reconcile:example-repo#7"
+
+
+# --------------------------------------------------------------------------- #
+# the CARRIER VERDICT (card t_1e8fe1f9, design t_1746ba2e; amendment 2026-10-29)
+#
+# The clause above verifies a landing at the close door but STAMPS nothing, so the
+# verified fact lived only in run SUMMARY prose: 237 land-shaped ``done`` cards with an
+# empty ``result`` since 10-05, the PR pointer in ``merge_sha``/``merge_commit``/
+# ``merged_sha``/``landing_receipt`` ... -- keys no audit can read. These tests are the
+# stamped contract, driven through the SAME production doors as everything above:
+# ``kanban_db.complete_task`` for the kernel door and ``tools.kanban_tools
+# ._handle_complete`` for the tool door, against a real board store.
+#
+# Two seams are stubbed, and only two: the FORGE READ the verdict is corroborated
+# against (``kanban_landing_carrier._default_pr_facts``), and -- in the ledger-leg test
+# alone -- ``HERMES_PROOF_LEDGER``, the deploy ledger's own override.
+# --------------------------------------------------------------------------- #
+
+MERGE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.fixture
+def pr_facts(monkeypatch):
+    """Stub the verdict's forge read; records every PR it was asked about.
+
+    ``state['value']`` is ``merged`` / ``open`` / ``closed`` for every PR, or
+    ``unreachable`` to make the transport raise exactly as a dead ``gh`` does.
+    """
+    asked: list[tuple[str, str]] = []
+    state = {"value": "merged", "merge_commit_sha": MERGE_SHA}
+
+    def _default_pr_facts(_assignee):
+        def _call(repo, number):
+            if state["value"] == "unreachable":
+                raise klc.ForgeUnreachable("stubbed: gh could not reach the forge")
+            asked.append((repo, number))
+            out = {"state": state["value"]}
+            if state["value"] == "merged":
+                out["merge_commit_sha"] = state["merge_commit_sha"]
+            return out
+
+        return _call
+
+    monkeypatch.setattr(klc, "_default_pr_facts", _default_pr_facts)
+    return {"asked": asked, "state": state}
+
+
+def _carrier_card(conn, title=None, **kw) -> str:
+    """A card that IS a carrier, in the state a worker closes it from."""
+    return _worker_card(conn, title=title or f"[land] {PR} for t_deadbeef", **kw)
+
+
+def _landed(ref=PR, merge_sha=MERGE_SHA) -> dict:
+    return {"landing_verdict": {"state": "landed", "ref": ref, "merge_sha": merge_sha}}
+
+
+def _not_owed(reason=None, ref="card t_1746ba2e") -> dict:
+    return {
+        "landing_verdict": {
+            "state": "not_owed",
+            "ref": ref,
+            "reason": reason or "superseded by card t_1746ba2e, which carries the replacement fix",
+        }
+    }
+
+
+def _deferred(ref=PR, carrier="t_ca11ca11") -> dict:
+    return {"landing_verdict": {"state": "deferred", "ref": ref, "carrier": carrier}}
+
+
+def _last_run_metadata(conn, task_id) -> dict:
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,)
+    ).fetchone()
+    return json.loads(row[0] or "{}") if row and row[0] else {}
+
+
+# --------------------------------------------------------------------------- #
+# scope: WHICH cards owe a verdict
+# --------------------------------------------------------------------------- #
+
+_VERDICT_TITLES = (
+    f"[land] {PR} for t_abc",                    # the doctrine's own carrier
+    f"[land + deploy] {PR} for t_abc",           # the compound tag
+    f"[owner act] Land {PR} for t_abc",          # the owner-act shape
+    f"Land {PR} into main",                      # running text, capitalised
+    f"land {PR} into main",                      # running text, lowercase
+    f"Owner-lane landing step for approved tip {PR}",
+    f"landing carrier for {PR}",                 # tagless carrier-noun shape
+)
+
+_NOT_VERDICT_TITLES = (
+    "a worker card",
+    f"[review] {PR}",
+    f"[deploy] {PR}",
+    f"[fix] {PR}",
+    "[reconcile] files TWIN carriers: a landing carrier whose title spells the ref",
+    "docs: how a landing carrier stamps its verdict",
+    "t_24f43788 reconcile the land-shaped prose",
+)
+
+
+@pytest.mark.parametrize("title", _VERDICT_TITLES)
+def test_the_carrier_title_shapes_owe_a_verdict(title):
+    assert klc.is_carrier_title(title) is True, title
+
+
+@pytest.mark.parametrize("title", _NOT_VERDICT_TITLES)
+def test_a_non_carrier_title_owes_nothing(title):
+    assert klc.is_carrier_title(title) is False, title
+
+
+def test_a_leading_non_carrying_tag_wins_over_the_rest_of_the_title():
+    """The tag DECIDES: a card whose SUBJECT is carriers is not itself a landing."""
+    assert klc.is_carrier_title("[reconcile] Land the landing carrier's verdict") is False
+    assert klc.is_carrier_title("[land] anything at all") is True
+
+
+def test_the_verdict_causes_are_registered_into_the_kernel_tuple():
+    """The causes are legal ``CompletionRefusal`` causes with NO kernel edit (R3)."""
+    assert klc.CAUSES_REGISTERED is True
+    assert klc.VERDICT_CAUSES == (
+        "landing_verdict_missing",
+        "landing_verdict_mismatch",
+        "landing_verdict_unsubstantiated",
+    )
+    for cause in klc.VERDICT_CAUSES:
+        assert cause in kb.COMPLETION_REFUSAL_CAUSES, cause
+
+
+def test_the_kernel_file_is_untouched_by_the_registration():
+    """ONE landing surface: the widening lives in the clause, never in the kernel."""
+    import hermes_cli
+
+    path = Path(hermes_cli.__file__).with_name("kanban_db.py")
+    text = path.read_text(encoding="utf-8")
+    assert "landing_verdict_" not in text, "the kernel must not know the verdict causes"
+
+
+def test_a_kernel_that_cannot_be_widened_is_LOUD(monkeypatch):
+    """A widening that silently did not take must not read as a registered clause.
+
+    The registration's catch is narrow on purpose: a kernel whose cause tuple cannot be
+    widened would make a carrier close RAISE inside a gate that promises never to raise,
+    so the failure is reported instead of swallowed.
+    """
+    import hermes_cli
+
+    class _FrozenKernel:
+        COMPLETION_REFUSAL_CAUSES: tuple = ()
+
+        def __setattr__(self, name, value):
+            raise AttributeError("frozen kernel")
+
+    monkeypatch.setattr(hermes_cli, "kanban_db", _FrozenKernel())
+    with pytest.raises((RuntimeError, AttributeError)):
+        klc._register_completion_causes()
+    assert klc.CAUSES_REGISTERED is False
+    monkeypatch.undo()
+    klc._register_completion_causes()
+    assert klc.CAUSES_REGISTERED is True
+
+
+# --------------------------------------------------------------------------- #
+# the refusal
+# --------------------------------------------------------------------------- #
+
+def test_a_carrier_close_with_no_verdict_is_refused_and_names_all_three_shapes(
+    conn, pr_facts,
+):
+    task_id = _carrier_card(conn)
+    before = _row_snapshot(conn, task_id)
+
+    refusal = kb.complete_task(conn, task_id, summary="shipped it")
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_missing"
+    # Every accepted shape, verbatim and inline: a fence nobody can satisfy is worse
+    # than no fence. All THREE -- including the amended ``deferred`` state.
+    assert '"state": "landed"' in refusal.detail
+    assert '"merge_sha": "<40hex>"' in refusal.detail
+    assert '"state": "not_owed"' in refusal.detail
+    assert '"reason": "<text naming the replacement, at least 20 characters>"' in refusal.detail
+    assert '"state": "deferred"' in refusal.detail
+    assert '"carrier": "t_..."' in refusal.detail
+    # The refusal never touched the forge and never wrote the card.
+    assert pr_facts["asked"] == []
+    assert _row_snapshot(conn, task_id) == before
+
+
+def test_the_refusal_names_the_cards_own_title_ref(conn, pr_facts):
+    """A refused carrier close echoes what the card says it lands -- facts, not a gate."""
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(conn, task_id, summary="shipped it")
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert PR in refusal.detail
+    facts = _blocked_events(conn, task_id)[0]["facts"]
+    assert facts["carrier_scope"] is True
+    assert facts["title_refs"] == [PR]
+
+
+def test_the_refusal_is_recorded_as_one_audit_event(conn, pr_facts):
+    task_id = _carrier_card(conn)
+
+    kb.complete_task(conn, task_id, summary="shipped it")
+
+    events = _blocked_events(conn, task_id)
+    assert len(events) == 1
+    assert events[0]["cause"] == "landing_verdict_missing"
+    assert events[0]["facts"]["carrier_scope"] is True
+
+
+def test_a_retired_prose_verdict_is_not_a_verdict(conn, pr_facts):
+    """The 10-28 rule is unchanged: a sentence is not the stamped contract."""
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="shipped it",
+        metadata={"landing_deferred": "owing, the carrier is t_ca11ca11"},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_missing"
+
+
+# --------------------------------------------------------------------------- #
+# state 1: LANDED -- admitted only when the clause's OWN resolution agrees
+# --------------------------------------------------------------------------- #
+
+def test_a_landed_verdict_agreed_by_the_forge_is_admitted(conn, pr_facts):
+    task_id = _carrier_card(conn)
+
+    assert kb.complete_task(conn, task_id, summary="landed", metadata=_landed()) is True
+    assert _status(conn, task_id) == "done"
+    assert pr_facts["asked"] == [("example-org/example-repo", "7")]
+    # STAMPED and readable back: the whole point of the contract.
+    assert _last_run_metadata(conn, task_id)["landing_verdict"] == _landed()["landing_verdict"]
+
+
+def test_a_short_merge_sha_prefix_that_agrees_is_admitted(conn, pr_facts):
+    """The fleet records 7-8 hex prefixes; a prefix that names the commit agrees."""
+    task_id = _carrier_card(conn)
+
+    assert kb.complete_task(
+        conn, task_id, summary="landed", metadata=_landed(merge_sha=MERGE_SHA[:8]),
+    ) is True
+
+
+def test_a_landed_verdict_at_another_commit_is_refused(conn, pr_facts):
+    """The clause's own resolution disagrees -- so the stamp is refused, not trusted."""
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="landed", metadata=_landed(merge_sha="f" * 40),
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_mismatch"
+    assert MERGE_SHA in refusal.detail
+
+
+def test_a_landed_verdict_on_an_open_pr_is_refused(conn, pr_facts):
+    task_id = _carrier_card(conn)
+    pr_facts["state"]["value"] = "open"
+
+    refusal = kb.complete_task(conn, task_id, summary="landed", metadata=_landed())
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_mismatch"
+
+
+def test_a_landed_verdict_the_forge_cannot_corroborate_fails_closed(conn, pr_facts):
+    """An unreachable forge is the SAME fail-closed channel, not a bypass."""
+    task_id = _carrier_card(conn)
+    pr_facts["state"]["value"] = "unreachable"
+    before = _row_snapshot(conn, task_id)
+
+    refusal = kb.complete_task(conn, task_id, summary="landed", metadata=_landed())
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_state_unknown"
+    assert _row_snapshot(conn, task_id) == before
+
+
+def test_a_landed_verdict_corroborated_by_the_deploy_ledger_is_admitted(
+    conn, pr_facts, tmp_path, monkeypatch,
+):
+    """The ledger leg: an admitted row carrying the commit as ``upstream_pin``."""
+    ledger = tmp_path / "proof-ledger.jsonl"
+    ledger.write_text(
+        json.dumps({"admission": "admitted", "exit": 0, "upstream_pin": MERGE_SHA}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_PROOF_LEDGER", str(ledger))
+    pr_facts["state"]["value"] = "unreachable"
+    task_id = _carrier_card(conn)
+
+    assert kb.complete_task(conn, task_id, summary="landed", metadata=_landed()) is True
+
+
+def test_a_ledger_row_that_is_not_admitted_corroborates_nothing(
+    conn, pr_facts, tmp_path, monkeypatch,
+):
+    ledger = tmp_path / "proof-ledger.jsonl"
+    ledger.write_text(
+        json.dumps({"admission": "refused", "exit": 1, "upstream_pin": MERGE_SHA}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_PROOF_LEDGER", str(ledger))
+    pr_facts["state"]["value"] = "unreachable"
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(conn, task_id, summary="landed", metadata=_landed())
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_state_unknown"
+
+
+@pytest.mark.parametrize("metadata", [
+    {"landing_verdict": {"state": "landed", "ref": "not-a-ref", "merge_sha": MERGE_SHA}},
+    {"landing_verdict": {"state": "landed", "ref": PR, "merge_sha": "not-a-sha"}},
+    {"landing_verdict": {"state": "landed", "ref": PR}},
+])
+def test_a_landed_verdict_that_cannot_resolve_to_pr_plus_commit_is_refused(
+    conn, pr_facts, metadata,
+):
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(conn, task_id, summary="landed", metadata=metadata)
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_mismatch"
+
+
+# --------------------------------------------------------------------------- #
+# state 2: NOT OWED -- the substantive exemption, now stamped
+# --------------------------------------------------------------------------- #
+
+def test_a_substantiated_not_owed_verdict_is_admitted(conn, pr_facts):
+    task_id = _carrier_card(conn)
+
+    assert kb.complete_task(conn, task_id, summary="superseded", metadata=_not_owed()) is True
+    assert _status(conn, task_id) == "done"
+    assert pr_facts["asked"] == []
+    events = _blocked_events(conn, task_id)
+    assert events == []
+
+
+@pytest.mark.parametrize("metadata", [
+    {"landing_verdict": {"state": "not_owed", "ref": "card t_1746ba2e", "reason": "nope"}},
+    {"landing_verdict": {"state": "not_owed", "ref": "card t_1746ba2e", "reason": 17}},
+    {"landing_verdict": {"state": "not_owed", "ref": "card t_1746ba2e",
+                         "reason": "superseded by something nobody can point at"}},
+    {"landing_verdict": {"state": "not_owed", "reason":
+                         "superseded by card t_1746ba2e, which carries the replacement fix"}},
+])
+def test_an_unsubstantiated_not_owed_verdict_is_refused(conn, pr_facts, metadata):
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(conn, task_id, summary="superseded", metadata=metadata)
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_unsubstantiated"
+
+
+# --------------------------------------------------------------------------- #
+# state 3: DEFERRED -- the AMENDMENT (design 2026-10-29): a VERIFIED named carrier
+# is a third terminal state. The card, not the sentence, is the evidence.
+# --------------------------------------------------------------------------- #
+
+def test_a_deferred_verdict_naming_a_real_carrier_is_admitted(conn, pr_facts):
+    """The named card EXISTS and names the same PR -- exactly what prose deferral proves."""
+    successor = kb.create_task(
+        conn, title=f"[land] {PR} for t_f0110w", initial_status="running",
+    )
+    task_id = _carrier_card(conn)
+
+    assert kb.complete_task(
+        conn, task_id, summary="moved to the successor carrier",
+        metadata=_deferred(carrier=successor),
+    ) is True
+    assert _status(conn, task_id) == "done"
+    assert pr_facts["asked"] == []
+    # The transfer is readable back, so an audit can follow the landing to the card.
+    assert _last_run_metadata(conn, task_id)["landing_verdict"]["carrier"] == successor
+
+
+def test_a_deferred_verdict_names_the_ref_in_the_carriers_body_too(conn, pr_facts):
+    successor = kb.create_task(
+        conn, title="successor carrier", body=f"carries {PR}", initial_status="running",
+    )
+    task_id = _carrier_card(conn)
+
+    assert kb.complete_task(
+        conn, task_id, summary="moved", metadata=_deferred(carrier=successor),
+    ) is True
+
+
+def test_a_deferred_verdict_naming_a_nonexistent_card_is_refused(conn, pr_facts):
+    """A deferral to a card nobody can find is the silent door, not evidence."""
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="moved", metadata=_deferred(carrier="t_deadbeefdeadbeef"),
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_unsubstantiated"
+    assert "t_deadbeefdeadbeef" in refusal.detail
+
+
+def test_a_deferred_verdict_naming_a_card_that_does_not_carry_the_pr_is_refused(
+    conn, pr_facts,
+):
+    stranger = kb.create_task(
+        conn, title="an unrelated card", body="nothing to do with any landing",
+        initial_status="running",
+    )
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="moved", metadata=_deferred(carrier=stranger),
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_unsubstantiated"
+    assert PR in refusal.detail
+
+
+def test_a_deferred_verdict_may_not_point_at_a_different_ref_s_card(conn, pr_facts):
+    """Verification is scoped to the NAMED id AND the SAME ref."""
+    other = kb.create_task(
+        conn, title="[land] example-org/example-repo#99 for t_other", initial_status="running",
+    )
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="moved", metadata=_deferred(carrier=other),
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_unsubstantiated"
+
+
+@pytest.mark.parametrize("metadata", [
+    {"landing_verdict": {"state": "deferred", "ref": PR}},
+    {"landing_verdict": {"state": "deferred", "ref": PR, "carrier": "the successor card"}},
+    {"landing_verdict": {"state": "deferred", "ref": "nonsense", "carrier": "t_ca11ca11"}},
+])
+def test_a_deferred_verdict_without_a_card_id_and_ref_is_refused(conn, pr_facts, metadata):
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(conn, task_id, summary="moved", metadata=metadata)
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_unsubstantiated"
+
+
+def test_a_retired_reason_only_deferral_still_does_not_close_a_carrier(conn, pr_facts):
+    """Escape (b) is NAMED or it is nothing -- the 10-28 rule, unchanged by the amendment."""
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="moved", metadata={"landing_deferred": "t_ca11ca11"},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_missing"
+
+
+# --------------------------------------------------------------------------- #
+# the contract's edges
+# --------------------------------------------------------------------------- #
+
+def test_the_latest_verdict_on_the_close_wins(conn, pr_facts):
+    """A retried card is judged by the stamp it closes WITH, not a stale one."""
+    task_id = _carrier_card(conn)
+    _seed_run(conn, task_id, {"landing_verdict": {"state": "deferred", "ref": PR,
+                                                  "carrier": "t_gone00000000"}})
+
+    assert kb.complete_task(conn, task_id, summary="landed", metadata=_landed()) is True
+
+
+def test_a_carrier_that_records_its_landing_by_declaration_is_not_refused(
+    conn, forge, pr_facts,
+):
+    """THE ORDERING, pinned: the record may be a named declaration, not only a stamp.
+
+    A carrier that names its landing (``published_pr`` MERGED at the forge) records the
+    fact in the same keys the populated-record door writes, so it is admitted exactly as
+    today -- the requirement is the EMPTY record, not "a second dialect for every close".
+    """
+    task_id = _carrier_card(conn)
+    forge["state"]["value"] = "merged"
+
+    assert kb.complete_task(
+        conn, task_id, summary="landed", metadata={"published_pr": PR_URL},
+    ) is True
+    assert pr_facts["asked"] == []
+
+
+def test_a_carrier_declaring_an_unlanded_pr_keeps_the_declaration_cause(conn, forge, pr_facts):
+    """The sibling half's own shape (card t_765136ce): the declaration cause is UNCHANGED.
+
+    A ``[land] ...`` card that declares an OPEN PR and stamps no verdict is still refused
+    ``landing_carrier_missing`` -- exactly what live asserts today. Judging the verdict
+    requirement ahead of the declaration would have re-caused this live test. (The title
+    does not name the ref: a card that names it is its OWN carrier, which live admits.)
+    """
+    task_id = _carrier_card(conn, title="[land] the approved tip for t_abc")
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="shipped", metadata={"published_pr": PR_URL},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
+
+
+def test_a_stamped_landed_verdict_is_judged_ahead_of_the_declaration(conn, pr_facts):
+    """A carrier that has PROVED its own landing is not refused for want of a carrier."""
+    task_id = _carrier_card(conn)
+
+    assert kb.complete_task(
+        conn, task_id, summary="landed",
+        metadata={**_landed(), "published_pr": PR_URL},
+    ) is True
+    assert pr_facts["asked"] == [("example-org/example-repo", "7")]
+
+
+@pytest.mark.parametrize("title", _NOT_VERDICT_TITLES)
+def test_a_non_carrier_card_is_untouched(conn, pr_facts, title):
+    """The requirement is scoped to the carrier title shapes and nothing else."""
+    task_id = _worker_card(conn, title=title)
+
+    assert kb.complete_task(conn, task_id, summary="done") is True
+    assert pr_facts["asked"] == []
+
+
+def test_a_non_carrier_card_keeps_the_declaration_path(conn, forge, pr_facts):
+    """Outside the carrier shapes, the existing declaration rule is the only rule."""
+    task_id = _worker_card(conn, title="a worker card")
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="shipped", metadata={"published_pr": PR_URL},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_carrier_missing"
+
+
+def test_a_review_carrier_is_judged_on_approval_too(conn, pr_facts):
+    """Scope is the TITLE, never the transition."""
+    task_id = _review_card(conn, title=f"[land] {PR} for t_abc")
+
+    refusal = kb.complete_task(conn, task_id, summary="approved")
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_missing"
+
+
+def test_the_clause_never_raises_on_a_hostile_verdict(conn, pr_facts):
+    """Whatever the metadata holds, the gate refuses with a cause instead of raising."""
+    task_id = _carrier_card(conn)
+
+    refusal = kb.complete_task(
+        conn, task_id, summary="shipped", metadata={"landing_verdict": ["not", "a", "dict"]},
+    )
+
+    assert isinstance(refusal, kb.CompletionRefusal)
+    assert refusal.cause == "landing_verdict_missing"
+
+
+# --------------------------------------------------------------------------- #
+# the TOOL door (``kanban_complete`` -- the door most carriers actually close through)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "measured gap OUTSIDE this card's scope: tools/kanban_tools.py renders detail "
+        "inline only for the causes its own tuple names, and the three verdict causes are "
+        "not in it yet -- so the door answers a run-ownership sentence. Strict so this "
+        "fails the day the door is widened and has to be turned green."
+    ),
+)
+def test_tool_door_renders_the_verdict_refusal_and_not_a_run_ownership_sentence(
+    conn, pr_facts, monkeypatch,
+):
+    """``_handle_complete`` must render the three shapes, not a run-ownership sentence.
+
+    ``tools/kanban_tools.py`` renders ``detail`` inline for the causes it knows; a cause
+    it does not know falls through to ``live_row_refusal``, which hands the refused
+    worker a run-ownership sentence with no cause and no way out. That is the same
+    defect t_88f6cb12 fixed for the two landing causes, and it is MEASURED here rather
+    than assumed: this is a known gap in a file outside this card's scope, kept strict so
+    it fails the day the door is widened and has to be turned green.
+    """
+    task_id = _carrier_card(conn)
+
+    err = _tool_door_close(conn, monkeypatch, task_id, {})
+
+    assert "landing_verdict_missing" in err, err
+    assert '"state": "deferred"' in err, err
+
