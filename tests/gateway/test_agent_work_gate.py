@@ -101,10 +101,6 @@ def adapter(home, monkeypatch):
 
     a._conversation_history_for_session = _history
     a._run_agent = _run_agent
-    # Lane scoping, not the gate: the real ``_profile_scope`` imports ``gateway.run``, whose
-    # bootstrap reads the INSTALL's manifest.json -- forbidden for a test that must stay
-    # inside its tmp HERMES_HOME (and irrelevant to every assertion in this file).
-    a._profile_scope = lambda profile=None: nullcontext()
     monkeypatch.setattr(q, "receipt_after_seconds", lambda: 0.05)
     monkeypatch.setattr(q, "probe_delay", lambda n, **kw: 0.01)
     yield a
