@@ -48,9 +48,11 @@ STATUS_FILENAME = "substrate_status.json"
 LEDGER_FILENAME = "hook-degradation.jsonl"
 STAMP_FILENAME = "hook-degradation.last"
 
-#: A record older than this is ``unknown``, never ``ok``. The writers are the two
-#: ticks (60 s each) and a recovery; 15 min is ~15 missed ticks, well past "one slow
-#: tick" and far short of "the gate stopped running hours ago".
+#: A record older than this is ``unknown``, never ``ok``. The writers are the two doors'
+#: HEARTBEAT (``substrate_access.HEARTBEAT_EVERY`` = 60 s on every healthy pass, plus the
+#: refusal path, which rewrites every refused tick) and a recovery; 15 min is ~15 missed
+#: heartbeats, well past "one slow tick" and far short of "the gate stopped running hours ago".
+#: After card ``t_253a5e55`` this window means exactly what it says: silence means no door ran.
 STALE_AFTER = 900.0
 
 #: A degradation record this recent means "that body is blind NOW". The launcher
@@ -570,9 +572,9 @@ def _detail(state: str, reason: Optional[str], error: Optional[str], age: Option
         return f"the record is not the JSON document the gate writes ({error})"
     if reason == "record_stale":
         return (
-            f"no denial has been recorded in {age:.0f}s and the substrate has not been measured "
-            "since: a verdict is written only when a denial is observed and when one clears "
-            f"(stale after {stale_after:.0f}s)"
+            f"the last verdict is {age:.0f}s old: a healthy tick rewrites the record at least "
+            "every 60 s, so no door has run since then — the substrate may well be readable, "
+            f"but nothing has measured it (stale after {stale_after:.0f}s)"
         )
     if reason == "record_unstamped":
         return "the record carries no readable timestamp, so its freshness cannot be judged"

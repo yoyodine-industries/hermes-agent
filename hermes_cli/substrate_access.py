@@ -40,6 +40,15 @@ KILL SWITCH. ``HERMES_SUBSTRATE_GATE=off`` turns the guard into a RECORDER: it s
 and still writes ``substrate_status.json``, and it refuses nothing. That is step 1 of the
 rollback in the design, so it must not require a restart of anything else --- the env is
 read per call, not at import.
+
+RESTING STATE (ruling ``t_5411cc41`` §2, card ``t_253a5e55``). A refusal is the exception; the
+record's everyday content is a HEARTBEAT. Both doors write a healthy verdict on their own
+probe, bounded to one write per :data:`HEARTBEAT_EVERY` (60 s), so ``STALE_AFTER`` finally
+means what its own docstring always claimed --- *"no door has run for 15 minutes"*. Before the
+heartbeat ``ok`` was unreachable by construction (nothing but a refusal or a recovery ever
+wrote) and ``hermes doctor`` sat on a permanent YELLOW on a perfectly healthy host, which is
+the no-false-green rule inverted: an always-red row teaches its readers to skip it. A
+heartbeat never overwrites a live episode and never erases a recovery receipt.
 """
 
 from __future__ import annotations
@@ -84,6 +93,17 @@ FRESH_WITHIN = 15.0
 #: verbatim from the skew gate (``TICK_YIELD_ACTOR_THRESHOLD``): one refusal is churn, three
 #: in a row is a stall.
 THRESHOLD = 3
+
+#: How often a healthy pass may rewrite the authority record (ruling §2 C2). Two 60 s doors
+#: share one record: the window is what keeps them at ``<= 1 write/minute`` instead of two
+#: writes every tick, and it is far inside ``substrate_view.STALE_AFTER`` (900 s) so freshness
+#: still means "a door ran" rather than "a door ran 14 minutes ago".
+HEARTBEAT_EVERY = 60.0
+
+#: The reader's own staleness window, used to decide whether a ``yielded: true`` record is a
+#: LIVE episode. Imported lazily (``substrate_view`` is the mirror and must not depend on us)
+#: with the reader's shipped value as the fallback.
+_STALE_AFTER_FALLBACK = 900.0
 
 #: The probe's writable scratch directory, inside each root the map gives ``w``. It is created
 #: once and carries a ``.gitignore`` of ``*`` so a prod tree's ``git status`` stays clean while
@@ -666,6 +686,21 @@ def _iso_epoch(value: Any) -> Optional[float]:
         return None
 
 
+def _age_since(value: Any, now: float) -> Optional[float]:
+    """Seconds since a record's ``recorded_at``, or ``None`` when it cannot be read.
+
+    Accepts the epoch float the record writes AND an ISO string (an older/hand-edited record),
+    because a heartbeat that cannot read the stamp must ask ``record_stale``'s question with a
+    ``None`` rather than guess.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return round(max(0.0, float(now) - float(value)), 1)
+    seconds = _iso_epoch(value)
+    return None if seconds is None else round(max(0.0, float(now) - seconds), 1)
+
+
 def guards_blind(since: Optional[float] = None) -> dict:
     """The fail-open hook degradations, folded into the episode (design §3.5 / §6).
 
@@ -782,6 +817,137 @@ def record_cleared(
 
 
 # ---------------------------------------------------------------------------------------
+# The resting state (a healthy pass)
+# ---------------------------------------------------------------------------------------
+
+
+def _stale_window(override: Optional[float] = None) -> float:
+    """``substrate_view.STALE_AFTER`` --- the reader's window, so writer and mirror agree."""
+    if override is not None:
+        return float(override)
+    try:
+        from hermes_cli.substrate_view import STALE_AFTER
+
+        return float(STALE_AFTER)
+    except Exception:  # noqa: BLE001 - a missing constant must not cost the heartbeat
+        return _STALE_AFTER_FALLBACK
+
+
+#: The episode-scoped keys every record carries, so a reader never has to guess at a missing
+#: one. ``None``/``0``/``[]`` mean "no episode", which is exactly the resting state.
+_EPISODE_DEFAULTS: tuple[tuple[str, Any], ...] = (
+    ("first_tick", None),
+    ("episode", None),
+    ("streak", 0),
+    ("delivery", None),
+    ("held", []),
+    ("cleared_at", None),
+    ("duration_s", None),
+)
+
+
+def heartbeat(
+    report: Optional[ProbeReport],
+    *,
+    door: str,
+    path: Any = None,
+    now: Optional[float] = None,
+    stale_after: Optional[float] = None,
+) -> tuple[str, dict]:
+    """Write the RESTING-STATE verdict: this door probed and nothing denied. ``(path, payload)``.
+
+    Ruling ``t_5411cc41`` §2 C1--C6, card ``t_253a5e55``. A refusal is the exception; this is what
+    a healthy tick contributes, and it is the ONLY thing that makes ``ok`` reachable in
+    ``substrate_view.read()`` (which demands a record, a readable stamp, freshness inside
+    ``STALE_AFTER`` and ``yielded: false``).
+
+    * **C1** the door that took the decision calls this on its own healthy pass, right after the
+      probe --- freshness must mean *"the gate ran"*, so no timer and no separate job may write it;
+    * **C2** bounded cadence: nothing is written while the current record is younger than
+      :data:`HEARTBEAT_EVERY`, and the write itself is :func:`_write_status` (atomic, ``0600``,
+      never raises --- a failed write logs a warning and the tick proceeds);
+    * **C3** a LIVE episode is the denial path's (it rewrites every refused tick): when the record
+      is ``yielded: true`` and still inside ``stale_after``, this is a no-op. A ``yielded: true``
+      record that is OLDER than that window is the opposite finding --- its writer stopped while
+      THIS door just probed healthy --- so the episode is closed with :func:`record_cleared`
+      (receipt, not erasure). Without that leg ``yielded: true`` latches forever, and a healthy
+      host reading red is the same defect as a denied one reading green;
+    * **C4** an existing receipt survives: the refresh touches only ``recorded_at``,
+      ``last_tick``, ``matrix``, ``read_findings`` and the ``guards_*`` block, so ``cleared_at``,
+      ``duration_s``, ``cleared_door``, ``released`` and ``cleared_matrix`` stay byte-identical;
+    * **C5** ``STALE_AFTER`` is untouched: after this lands, 15 silent minutes mean the gate
+      stopped running --- a real alarm;
+    * **C6** the kill switch does not reach here: recorder mode still records the resting state
+      (it is the recorder's whole output) and only ``refusal_for()`` is suppressed.
+
+    It never reports green on nothing: a report with no readings (a broken map, or a tier the map
+    declares empty) or with any denial in it writes NOTHING --- an unmeasured host is ``unknown``,
+    which is the one answer this module is built to protect.
+    """
+    target = status_path(path)
+    stamp = float(now if now is not None else time.time())
+    prior = _read_json(target)
+
+    if report is None or not report.readings or report.denied:
+        # Nothing was measured, or something WAS denied: the refusing door owns the record.
+        # Writing "ok" here would be the false green this whole module exists to prevent --
+        # and an unmeasured pass must not close an episode either, so this sits above ALL the
+        # episode/cadence logic, not just above the write.
+        log.debug(
+            "substrate heartbeat skipped for door %s: no substantiated healthy pass "
+            "(readings=%d denied=%d)",
+            door, 0 if report is None else len(report.readings),
+            0 if report is None else len(report.denied),
+        )
+        return str(target), prior
+
+    age = _age_since(prior.get("recorded_at"), stamp) if prior else None
+    window = _stale_window(stale_after)
+
+    if prior.get("yielded"):
+        if age is not None and age <= window:
+            return str(target), prior
+        try:
+            _, prior = record_cleared(door=door, report=report, path=target, now=stamp)
+        except Exception as exc:  # noqa: BLE001 - a receipt failure must not take a tick down
+            log.warning("substrate: could not close the stale episode in %s: %s", target, exc)
+            return str(target), prior
+
+    elif age is not None and age < HEARTBEAT_EVERY:
+        return str(target), prior
+
+    guards = guards_blind()
+    payload = dict(prior)
+    payload.update(
+        {
+            "version": SCHEMA_VERSION,
+            "yielded": False,
+            "kind": KIND,
+            "door": door,
+            "sig": signature(report) or None,
+            "threshold": THRESHOLD,
+            "last_tick": stamp,
+            "matrix": report.matrix(),
+            "guards_blind": int(guards.get("blind") or 0),
+            "guards_total": guards.get("total"),
+            "guards": list(guards.get("items") or []),
+            "read_findings": list(report.findings),
+            "recorded_at": stamp,
+        }
+    )
+    for key, empty in _EPISODE_DEFAULTS:
+        payload.setdefault(key, empty)
+    if not prior.get("cleared_at"):
+        # No receipt to preserve: the record now describes a running gate with no episode open.
+        # (With a receipt, C4 keeps the previous episode's own keys: they are its history.)
+        payload["first_tick"] = None
+        payload["episode"] = None
+        payload["streak"] = 0
+        payload["delivery"] = None
+    return _write_status(payload, target), payload
+
+
+# ---------------------------------------------------------------------------------------
 # The ONE DM pair per episode (I5: boot-resident, never ``escalate``)
 # ---------------------------------------------------------------------------------------
 
@@ -865,6 +1031,7 @@ def deliver_once(
 __all__ = [
     "DENIED_ERRNOS",
     "FRESH_WITHIN",
+    "HEARTBEAT_EVERY",
     "INDETERMINATE_ERRNOS",
     "KIND",
     "PREFIX",
@@ -879,6 +1046,7 @@ __all__ = [
     "episode_identity",
     "gate_enabled",
     "guards_blind",
+    "heartbeat",
     "hermes_home",
     "map_path",
     "merge_delivery",

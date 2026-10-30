@@ -41,6 +41,12 @@ def _substrate_tick_gate():
     and loses nothing. Fail-open in every direction that is not a real refusal: a probe that
     raises, a broken map, or an indeterminate reading all let the tick through (invariant I4) --
     the gate may never be the reason work stops.
+
+    The DECISION is recorded on every pass (ruling ``t_5411cc41`` §2 C1, card ``t_253a5e55``):
+    a denial writes the episode record (in recorder mode too -- the kill switch suppressed the
+    REFUSAL, not the evidence), and a healthy pass writes the resting-state heartbeat, which is
+    what makes ``ok`` reachable at all. Both writes are fault-isolated: the record is evidence,
+    never the reason a tick stops.
     """
     from hermes_cli import substrate_access as _sa
 
@@ -49,13 +55,19 @@ def _substrate_tick_gate():
     except Exception:  # health: allow BLE001 -- the gate must never decide by crashing
         logger.debug("Cron tick: global substrate probe failed; admitting the tick", exc_info=True)
         return None
-    if not _sa.refusal_for(report, tier="global"):
+    refused = _sa.refusal_for(report, tier="global")
+    denied = bool(report.held_by_tier("global"))
+    if not refused and not denied:
+        try:
+            _sa.heartbeat(report, door="cron")
+        except Exception:  # health: allow BLE001 -- the record is evidence, never the gate
+            logger.warning("Cron tick: could not write the substrate heartbeat", exc_info=True)
         return None
     try:
         _sa.record(report, door="cron")
     except Exception:  # health: allow BLE001 -- the record is evidence, never the refusal itself
         logger.warning("Cron tick: could not record the substrate refusal", exc_info=True)
-    return report
+    return report if refused else None
 
 
 def _job_substrate_roots(_sched, job: dict) -> list:

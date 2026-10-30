@@ -107,8 +107,8 @@ def _check_substrate(should_fix: bool, f: Finding) -> None:
         )
     if reason == "record_stale":
         check_info(
-            "unmeasured is not healthy, and the record cannot say which: a verdict is written "
-            "only when a denial is observed and when one clears, so nothing has looked since. "
+            "unmeasured is not healthy, and the record says so: the two doors rewrite it at least "
+            "every 60 s on a healthy pass, so a record this old means NO door has run since. "
             "Measure it now: python3 -c \"from hermes_cli import substrate_access as s; "
             "print(s.probe_all(use_cache=False).matrix())\""
         )

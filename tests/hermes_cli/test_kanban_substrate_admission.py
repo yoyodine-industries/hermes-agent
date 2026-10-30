@@ -622,3 +622,203 @@ def test_the_acting_body_never_raises_on_a_malformed_record(overrides):
     _write_record(**overrides)
     body = _body()
     assert "Guards blind" in body
+
+
+# ---------------------------------------------------------------------------------------
+# The healthy-verdict writer (ruling t_5411cc41 §2 C1-C8, card t_253a5e55)
+#
+# The defect these cases pin: nothing but a REFUSAL or a RECOVERY ever wrote the authority
+# record, so ``ok`` was unreachable and a healthy host sat on a permanent YELLOW. Every case
+# below is one line of the ruling's C-list; the two that go beyond the letter are marked, and
+# each exists because its absence rebuilds the same class of lie (green on nothing / red
+# forever).
+# ---------------------------------------------------------------------------------------
+
+
+def _healthy(path, *, tier="unit", op="open"):
+    return _report(_mk_reading(path, op=op, ok=True, tier=tier))
+
+
+def test_a_healthy_pass_writes_an_ok_record_the_mirror_reads_ok(tmp_path):
+    """C8.1 — the resting state is a real verdict, not a missing file."""
+    from hermes_cli import substrate_view as sv
+
+    _, payload = sa.heartbeat(_healthy(tmp_path), door="cron", now=100.0)
+
+    assert payload["yielded"] is False
+    assert payload["matrix"][0]["errno"] == "ok"
+    assert payload["first_tick"] is None and payload["episode"] is None
+    assert payload["streak"] == 0
+
+    view = sv.read(record_path=sa.status_path(), now=101.0)
+    assert view["state"] == "ok", view
+    assert view["reason"] is None
+    assert view["roots_denied"] == 0
+
+
+def test_a_second_pass_inside_the_cadence_writes_nothing(tmp_path):
+    """C8.2 — bounded cadence: the record is not rewritten 1 440 times an hour."""
+    sa.heartbeat(_healthy(tmp_path), door="cron", now=100.0)
+    path = sa.status_path()
+    payload_bytes = path.read_bytes()
+    mtime = path.stat().st_mtime_ns
+
+    _, payload = sa.heartbeat(
+        _healthy(tmp_path), door="dispatcher", now=100.0 + sa.HEARTBEAT_EVERY - 1.0,
+    )
+
+    assert path.read_bytes() == payload_bytes
+    assert path.stat().st_mtime_ns == mtime
+    assert payload["door"] == "cron", "the skipped write must leave the record as it was"
+
+
+def test_a_pass_after_the_window_refreshes_recorded_at(tmp_path):
+    """C8.3 — the freshness stamp moves, and no episode key is invented."""
+    sa.heartbeat(_healthy(tmp_path), door="cron", now=100.0)
+
+    _, payload = sa.heartbeat(
+        _healthy(tmp_path), door="dispatcher", now=100.0 + sa.HEARTBEAT_EVERY,
+    )
+
+    assert payload["recorded_at"] == 100.0 + sa.HEARTBEAT_EVERY
+    assert payload["last_tick"] == payload["recorded_at"]
+    assert payload["door"] == "dispatcher"
+    assert payload["first_tick"] is None and payload["episode"] is None
+
+
+def test_an_open_episode_is_untouched_by_a_heartbeat(tmp_path):
+    """C8.4 — C3: a live episode belongs to the denial path, streak and all."""
+    denied = _report(_mk_reading(tmp_path, errno_name="EPERM", tier="global"))
+    _, opened = sa.record(denied, door="dispatcher", now=100.0)
+    path = sa.status_path()
+    payload_bytes = path.read_bytes()
+
+    _, payload = sa.heartbeat(_healthy(tmp_path, tier="global"), door="cron", now=130.0)
+
+    assert path.read_bytes() == payload_bytes, "an open episode is not rewritten by a heartbeat"
+    assert payload["yielded"] is True
+    assert payload["streak"] == opened["streak"] == 1
+    assert payload["episode"] == opened["episode"]
+
+
+def test_a_cleared_receipt_survives_ten_heartbeats(tmp_path):
+    """C8.5 — C4: §7(d)'s receipt is not erased 60 s after it is written."""
+    from hermes_cli import substrate_view as sv
+
+    denied = _report(_mk_reading(tmp_path, errno_name="EPERM", tier="global"))
+    sa.record(denied, door="dispatcher", now=100.0)
+    _, receipt = sa.record_cleared(door="dispatcher", released=["t_card"], now=200.0)
+
+    stamp = 200.0
+    for _ in range(10):
+        stamp += sa.HEARTBEAT_EVERY
+        _, payload = sa.heartbeat(_healthy(tmp_path), door="cron", now=stamp)
+
+    for key in ("cleared_at", "duration_s", "cleared_door", "released", "cleared_matrix"):
+        assert payload[key] == receipt[key], key
+    assert payload["recorded_at"] == stamp
+    assert payload["yielded"] is False
+    assert sv.read(record_path=sa.status_path(), now=stamp + 1.0)["state"] == "ok"
+
+
+def test_silence_for_the_staleness_window_reads_unknown_and_stale(tmp_path):
+    """C8.6 — C5: STALE_AFTER keeps its meaning, so a stopped gate is an alarm."""
+    from hermes_cli import substrate_view as sv
+
+    sa.heartbeat(_healthy(tmp_path), door="cron", now=100.0)
+
+    view = sv.read(record_path=sa.status_path(), now=100.0 + sv.STALE_AFTER + 1.0)
+
+    assert (view["state"], view["reason"]) == ("unknown", "record_stale")
+
+
+def test_an_unwritable_record_never_raises_and_never_blocks_the_tick(tmp_path):
+    """C8.7 — the record is evidence; an unwritable home must not stop a spawn."""
+    (tmp_path / "substrate_status.json").mkdir()  # a directory where the file goes
+
+    path, payload = sa.heartbeat(_healthy(tmp_path), door="cron", now=100.0)
+
+    assert "unwritable" in path
+    assert isinstance(payload, dict)
+    kbd._raise_if_substrate_denied(report=_healthy(tmp_path))  # must simply return
+
+
+def test_both_doors_inside_one_cadence_window_write_once(tmp_path, monkeypatch):
+    """C8.8 — two 60 s doors share one record: one write per window, never a torn file."""
+    report = _healthy(tmp_path, tier="global")
+    monkeypatch.setattr(sa, "probe_all", lambda **kwargs: report)
+
+    kbd._raise_if_substrate_denied(report=report)  # door 1
+    path = sa.status_path()
+    payload_bytes = path.read_bytes()
+
+    assert tick._substrate_tick_gate() is None  # door 2, same window
+    assert path.read_bytes() == payload_bytes
+
+
+def test_a_pass_that_measured_nothing_writes_nothing(tmp_path):
+    """Beyond the letter: a broken map is not a healthy host.
+
+    ``probe_all`` answers ``denied=[]`` when the map cannot be read, so a heartbeat that wrote
+    whatever it was handed would publish ``ok`` off an empty reading list -- the exact false green
+    this module exists to prevent.
+    """
+    from hermes_cli import substrate_view as sv
+
+    _, payload = sa.heartbeat(_report(), door="cron", now=100.0)
+
+    assert payload == {}
+    assert sa.read_status() == {}
+    assert sv.read(record_path=sa.status_path(), now=101.0)["reason"] == "record_absent"
+
+
+def test_a_stale_open_episode_is_closed_with_its_receipt(tmp_path):
+    """Beyond the letter, and required for the DoD: ``yielded: true`` must not latch.
+
+    C3 says a heartbeat never overwrites an OPEN episode, because the denial path rewrites it
+    every refused tick. When the record is older than the reader's staleness window that premise
+    has failed: no door has written for 15 minutes while THIS door just probed healthy, so the
+    episode is over and this door is the one holding the evidence. Closing it with the recovery
+    receipt (rather than overwriting) keeps §7(d) readable AND lets a healthy host read green --
+    otherwise one card-less episode (measured live 2026-10-29: ``yielded: true``, streak 9, no
+    guard card, no sibling marker) would leave the authority record red forever.
+    """
+    from hermes_cli import substrate_view as sv
+
+    denied = _report(_mk_reading(tmp_path, errno_name="ENOSPC", op="write", tier="global"))
+    _, opened = sa.record(denied, door="cron", now=100.0)
+
+    _, payload = sa.heartbeat(
+        _healthy(tmp_path, tier="global"), door="dispatcher", now=100.0 + sv.STALE_AFTER + 1.0,
+    )
+
+    assert payload["yielded"] is False
+    assert payload["cleared_at"] is not None
+    assert payload["duration_s"] == round(sv.STALE_AFTER + 1.0, 3)
+    assert payload["cleared_door"] == "dispatcher"
+    # The receipt carries the matrix that CLEARED the episode (record_cleared's own contract:
+    # given a report, that report is the evidence), so it reads as proof, not as history.
+    assert payload["cleared_matrix"] == _healthy(tmp_path, tier="global").matrix()
+    assert payload["cleared_matrix"][0]["errno"] == "ok"
+    assert opened["matrix"][0]["errno"] == "ENOSPC"
+    # A receipt names the episode it closed: the identity and the start are history, and C4
+    # keeps them (only a PLAIN resting record carries null episode keys).
+    assert payload["episode"] == opened["episode"]
+    assert payload["first_tick"] == opened["first_tick"] == 100.0
+    assert sv.read(record_path=sa.status_path(), now=payload["recorded_at"] + 1.0)["state"] == "ok"
+
+
+def test_recorder_mode_still_records_and_still_writes_the_heartbeat(tmp_path, monkeypatch):
+    """C6 — the kill switch suppresses ``refusal_for()`` and nothing else."""
+    monkeypatch.setenv("HERMES_SUBSTRATE_GATE", "off")
+    denied = _report(_mk_reading(tmp_path, errno_name="EPERM", tier="global"))
+    monkeypatch.setattr(sa, "probe_all", lambda **kwargs: denied)
+
+    assert tick._substrate_tick_gate() is None, "recorder mode refuses nothing"
+    assert sa.read_status()["yielded"] is True, "but the denial is still evidence"
+
+    sa.status_path().unlink()
+    monkeypatch.setattr(sa, "probe_all", lambda **kwargs: _healthy(tmp_path, tier="global"))
+
+    assert tick._substrate_tick_gate() is None
+    assert sa.read_status()["yielded"] is False, "the heartbeat is the recorder's output"

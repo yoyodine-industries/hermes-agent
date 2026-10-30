@@ -5718,8 +5718,11 @@ def _raise_if_substrate_denied(*, report: Any = None, tier: str = "global") -> N
       report attached (the caller writes the record and files the card);
     * denied but NOT refused (the kill switch is off) -> RECORD and admit: rollback step 1 turns
       the guard into a recorder, never into a second outage;
-    * everything else -> return, having written nothing. A healthy tick must not touch the record,
-      or it would erase the recovery receipt written by the tick that cleared the episode.
+    * healthy -> write the RESTING-STATE heartbeat (ruling ``t_5411cc41`` §2 C1, card
+      ``t_253a5e55``). A healthy tick MUST touch the record: without a writer ``ok`` is
+      unreachable and the doctor row is a permanent yellow. The heartbeat bounds itself to one
+      write per ``substrate_access.HEARTBEAT_EVERY`` and preserves a recovery receipt and a live
+      episode, so the receipt the clearing tick wrote is never erased.
 
     I4 lives in ``substrate_access.refusal_for``: an ``indeterminate`` reading can never get here
     as a refusal.
@@ -5733,8 +5736,15 @@ def _raise_if_substrate_denied(*, report: Any = None, tier: str = "global") -> N
             kind=SUBSTRATE_ADMISSION_KIND,
             report=probe,
         )
-    if probe.denied_global:
+    if probe.held_by_tier(tier):
         _sa.record(probe, door="dispatcher")
+        return
+    try:
+        _sa.heartbeat(probe, door="dispatcher")
+    except Exception:  # health: allow BLE001 -- the record is evidence, never the tick's work
+        _kb._log.warning(
+            "kanban dispatcher: could not write the substrate heartbeat", exc_info=True,
+        )
 
 
 def dispatch_once(

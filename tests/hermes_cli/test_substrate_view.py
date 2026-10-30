@@ -154,19 +154,22 @@ def test_a_record_nobody_refreshed_is_unknown_with_its_last_known_state(home):
 
 
 def test_a_stale_record_names_the_true_cause_and_the_way_to_measure_it(home, capsys):
-    """A stale record means UNMEASURED — the hint must not blame a tick that did not run.
+    """A stale record means UNMEASURED — a door stopped running, and the hint must say so.
 
-    ``substrate_access.record`` writes the authority record ONLY on a denial and on a
-    clearing; a healthy tick deliberately leaves it alone ("a healthy tick must not touch the
-    record, or it would erase the recovery receipt"). ``guards_blind`` is folded in at write
-    time, so a denial's record already carries it and needs no live fold. The old hint —
-    "if neither has run since the record was written" — named a cause the record cannot have,
-    and on 2026-10-26 it pointed readers at the scheduler while the substrate was the fault.
+    ``substrate_access.heartbeat`` rewrites the authority record on every healthy pass (bounded
+    to ``HEARTBEAT_EVERY``, card ``t_253a5e55``), so silence past ``STALE_AFTER`` is no longer
+    "nothing was denied lately": it is "no door has run". ``guards_blind`` is folded in at write
+    time, so a record already carries it and needs no live fold. The older hint — "if neither has
+    run since the record was written" — named a cause the record cannot have, and on 2026-10-26
+    it pointed readers at the scheduler while the substrate was the fault.
     """
     _denied_record(home, age_s=sv.STALE_AFTER + 60)
     detail = sv.read()["detail"]
-    assert "only when a denial is observed" in detail, "the detail must state what a stale record means"
-    assert "not been measured" in detail, "unmeasured is the claim, and it must be the one made"
+    assert "no door has run" in detail, "the detail must state what a stale record means"
+    assert "only when a denial is observed" not in detail, (
+        "a healthy tick DOES write the record now; the old string is the lie this test outlives"
+    )
+    assert "not been measured" not in detail
 
     finding = _doctor_row()
     out = capsys.readouterr().out
