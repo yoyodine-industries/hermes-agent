@@ -359,7 +359,7 @@ def test_stub_sibling_board_does_not_block_cleanup(
 def test_archive_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> None:
     with kbc.connect_closing() as conn:
         tid, wt = _worktree_task(conn, repo)
-        assert kb.archive_task(conn, tid)
+        assert kb.archive_task(conn, tid, reason="superseded")
     assert not wt.exists()
 
 
@@ -492,7 +492,7 @@ def test_live_parent_scratch_survives_last_child_archived(
             assert kb.block_task(conn, parent, reason="waiting")
         elif live_status == "review":
             assert kb.request_review(conn, parent, summary="please review", force=True)
-        assert kb.archive_task(conn, child)
+        assert kb.archive_task(conn, child, reason="superseded")
         assert kb.get_task(conn, parent).status == live_status
     assert (ws / "work.txt").is_file()
 
@@ -509,7 +509,7 @@ def test_live_parent_worktree_survives_last_child_archived(
         assert kb.claim_task(conn, parent, claimer="worker") is not None
         child = kb.create_task(conn, title="probe")
         kb.link_tasks(conn, parent, child)
-        assert kb.archive_task(conn, child)
+        assert kb.archive_task(conn, child, reason="superseded")
         assert kb.get_task(conn, parent).status == "running"
     assert parent_wt.is_dir()
 
@@ -527,5 +527,5 @@ def test_terminal_scratch_parent_still_swept_after_last_child(
         kb.link_tasks(conn, parent, child)
         assert kb.complete_task(conn, parent, summary="parent done")
         assert ws.is_dir()  # live child still needs the handoff files
-        assert kb.archive_task(conn, child)
+        assert kb.archive_task(conn, child, reason="superseded")
     assert not ws.exists()

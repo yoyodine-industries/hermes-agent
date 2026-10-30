@@ -501,9 +501,18 @@ _SPECS = [
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
+        _reason("Why the card is being archived — REQUIRED, one of: "
+                "duplicate|superseded|rehomed|generated-moot|never-started|operator. "
+                "A trailing bare token from that set is read as the reason too "
+                "(promote's positional shape); --reason is the unambiguous form."),
+        _arg("--destination",
+             help="The card that INHERITS this one, as <board>/<card>. The rehome key is "
+                  "written on it and read back BEFORE the source is archived. Required for "
+                  "--reason rehomed|duplicate."),
+        _arg("--actor", help="Who is archiving (recorded on the receipt; defaults to the acting profile)"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
-    ], help="Archive one or more tasks"),
+    ], help="Archive one or more tasks (a reason is required; a rehome writes its link first)"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),

@@ -110,7 +110,7 @@ class TestCollectKanbanNotifications:
 
         conn = kbc.connect()
         try:
-            assert kb.archive_task(conn, tid)
+            assert kb.archive_task(conn, tid, reason="superseded")
         finally:
             conn.close()
 

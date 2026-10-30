@@ -1564,8 +1564,40 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
-                           lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+        reason = (getattr(args, "reason", None) or "").strip().lower()
+        if not reason and len(ids) > 1 and ids[-1].strip().lower() in kb.ARCHIVE_REASONS:
+            # ``promote``'s positional shape: ``archive <id>... <reason>``. A task id
+            # is never an archive reason token and the enum is a closed set, so the
+            # trailing token is unambiguous — no id can be misread as a reason.
+            reason, ids = ids[-1].strip().lower(), ids[:-1]
+        choices = "|".join(kb.ARCHIVE_REASONS)
+        # Refused HERE, before any card is touched: a bulk archive with no reason
+        # must not archive "most" of the selection and report the rest.
+        if not reason:
+            return _err(f"kanban archive: reason_missing: refusing to archive {', '.join(ids)} "
+                        f"with no reason — a reason is required and must be one of: {choices}", 2)
+        if reason not in kb.ARCHIVE_REASONS:
+            return _err(f"kanban archive: reason_invalid: {reason!r} is not an archive reason — "
+                        f"use one of: {choices}", 2)
+        destination = getattr(args, "destination", None)
+        actor = getattr(args, "actor", None) or _profile_author()
+        failed = False
+        for tid in ids:
+            try:
+                ok = kb.archive_task(conn, tid, reason=reason, actor=actor, destination=destination)
+            except kb.ArchiveRefused as exc:
+                # The code is the report: a caller branches on it, so it is printed
+                # verbatim rather than paraphrased into a sentence.
+                failed = True
+                print(f"cannot archive {tid}: {exc}", file=sys.stderr)
+                continue
+            if ok:
+                print(f"Archived {tid} ({reason})"
+                      + (f" -> {destination}" if destination else ""))
+            else:
+                failed = True
+                print(f"cannot archive {tid} (unknown id, or already archived)", file=sys.stderr)
+        return 1 if failed else 0
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:

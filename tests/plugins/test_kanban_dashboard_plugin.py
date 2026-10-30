@@ -719,8 +719,9 @@ def test_dashboard_confirm_dispatches_expected_patch_body(client):
 def test_bulk_archive(client):
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+    # ``reason`` is required by the archive seam (no anonymous archive).
     r = client.post("/api/plugins/kanban/tasks/bulk",
-                    json={"ids": [a["id"], b["id"]], "archive": True})
+                    json={"ids": [a["id"], b["id"]], "archive": True, "reason": "superseded"})
     assert r.status_code == 200
     assert all(r["ok"] for r in r.json()["results"])
     # Default board (archived hidden) — both gone.

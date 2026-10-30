@@ -7723,8 +7723,281 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
-    """Archive a task; a *running* task's host-local worker is terminated.
+#: The closed set of reasons an archive may carry. Machine-readable tokens on
+#: purpose: the receipt is read by sweeps, not by a human, so a free-text reason
+#: would be prose every reader has to interpret (and would drift).
+ARCHIVE_REASONS = (
+    "duplicate", "superseded", "rehomed", "generated-moot", "never-started", "operator",
+)
+#: Reasons whose whole meaning is that ANOTHER card inherits the work: a
+#: destination is required and the rehome link is written before the flip.
+ARCHIVE_REASONS_NEEDING_DESTINATION = frozenset({"rehomed", "duplicate"})
+#: The one reason that may overrule the bound-item guard below (the operator's own
+#: authority to close a card whose item is still open). The estate's own doors
+#: never pass it — a door that did would be overruling on the operator's behalf.
+ARCHIVE_REASON_OPERATOR = "operator"
+
+#: The SDLC flow stamps every card it files with this block (``scripts/sdlc_nodes.py``
+#: ``TAG_OPEN`` in yaan-platform). Core cannot read the item store, but it can read
+#: the card, which is the proxy the archive seam refuses on.
+_SDLC_TAG_OPEN = "<!-- sdlc/v1"
+_SDLC_TAG_CLOSE = "-->"
+_SDLC_TAG_FIELDS = (
+    "item", "domain", "role", "board", "lane", "project", "band", "origin", "class", "stage",
+)
+
+
+class ArchiveRefused(ValueError):
+    """A REFUSED archive, carrying the machine-readable ``code`` in its message.
+
+    A ``ValueError`` subclass on purpose: every write door that reaches this
+    primitive already maps ``ValueError`` to a 4xx, so a refusal keeps its shape
+    there. ``code`` (also the message's prefix) is what a deterministic caller
+    branches on — the estate's own archive door must decide from a token, never
+    from prose it has to interpret.
+    """
+
+    def __init__(self, code: str, detail: str = "", *, card: Optional[str] = None,
+                 items: Iterable[str] = ()):
+        self.code = code
+        self.card = card
+        self.detail = detail
+        self.items = tuple(items)
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def _archive_reason_token(reason: Optional[str], task_id: str) -> str:
+    """Validate the archive reason; refuse ``reason_missing`` / ``reason_invalid``.
+
+    An archive with no recorded reason is what let 8,382 of 9,629 ``archived``
+    events on the ``platform`` board sit EMPTY: nobody could later say whether the
+    card was a duplicate, superseded, re-homed or simply moot, so the one signal
+    that would have caught a stranded binding was never written. The reason is
+    therefore required at the primitive — not at one caller — so no door can
+    reintroduce the silence.
+    """
+    token = (reason or "").strip().lower()
+    choices = "|".join(ARCHIVE_REASONS)
+    if not token:
+        raise ArchiveRefused(
+            "reason_missing",
+            f"refusing to archive {task_id} with no reason; a reason is required "
+            f"and must be one of: {choices}", card=task_id)
+    if token not in ARCHIVE_REASONS:
+        raise ArchiveRefused(
+            "reason_invalid",
+            f"{token!r} is not an archive reason; use one of: {choices}", card=task_id)
+    return token
+
+
+def _archive_destination(destination: Any, task_id: str) -> Optional[tuple[str, str]]:
+    """``destination`` -> ``(board, card)``; ``None`` stays ``None``.
+
+    Both accepted spellings are normalised HERE so the CLI (``<board>/<card>``)
+    and the dashboard (a mapping) cannot disagree about the form, and so the key
+    is built from one place.
+    """
+    if destination is None:
+        return None
+    if isinstance(destination, str):
+        board, _sep, card = destination.strip().partition("/")
+        board, card = board.strip(), card.strip()
+    else:
+        try:
+            board = str(destination.get("board") or "").strip()
+            card = str(destination.get("card") or "").strip()
+        except AttributeError:
+            raise ArchiveRefused(
+                "destination_missing",
+                f"destination for {task_id} must be '<board>/<card>' or a mapping with both keys",
+                card=task_id) from None
+    if not board or not card:
+        raise ArchiveRefused(
+            "destination_missing",
+            f"destination for {task_id} must name BOTH a board and a card "
+            f"('<board>/<card>'); got {destination!r}", card=task_id)
+    return board, card
+
+
+def _sdlc_tag_record(body: Optional[str]) -> Optional[dict[str, str]]:
+    """The card body's ``sdlc/v1`` block -> ``{field: value}``; ``None`` when absent.
+
+    The grammar is the writer's own (``render_tags`` in yaan-platform): ``key:
+    value`` columns padded with two or more spaces, with the older glued spelling
+    (``key:value`` tokens separated by single spaces) still readable. Missing
+    fields read as absent rather than defaulted — an unreadable ``stage`` must
+    never be mistaken for a terminal one.
+    """
+    if not body or _SDLC_TAG_OPEN not in body:
+        return None
+    block = body.split(_SDLC_TAG_OPEN, 1)[1].split(_SDLC_TAG_CLOSE, 1)[0]
+    record: dict[str, str] = {}
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        cols = [c.strip() for c in re.split(r"\s{2,}", line) if c.strip()]
+        if len(cols) <= 1:      # glued spelling: one column of `key:value` tokens
+            cols = line.split()
+        for col in cols:
+            key, sep, value = col.partition(":")
+            key = key.strip()
+            if sep and key in _SDLC_TAG_FIELDS and value.strip():
+                record[key] = value.strip()
+    return record
+
+
+def _conn_board_slug(conn: sqlite3.Connection) -> Optional[str]:
+    """The slug of the board ``conn`` is open against, or ``None`` when it cannot be told.
+
+    Read off the open FILE, never off the ambient current board: a caller holding
+    a board override is not on ``get_current_board()``, so the ambient slug would
+    label the receipt (and build the rehome key) with someone else's board.
+    """
+    path = ""
+    for _seq, name, db_file in conn.execute("PRAGMA database_list"):
+        if name == "main" and db_file:
+            path = db_file
+    if not path:
+        return None
+    try:
+        resolved = Path(path).resolve()
+        if resolved == (kanban_home() / "kanban.db").resolve():
+            return DEFAULT_BOARD
+        rel = resolved.relative_to(boards_root().resolve())
+    except (OSError, ValueError):
+        return None
+    return rel.parts[0] if len(rel.parts) > 1 else None
+
+
+def _archive_source_board(conn: sqlite3.Connection) -> str:
+    """The board token the receipt and the rehome key name for THIS archive."""
+    return _conn_board_slug(conn) or get_current_board()
+
+
+def _rehome_key(source_board: Optional[str], source_card: str) -> str:
+    """``rehome-<source_board>-<source_card>`` — the link the estate's resolver reads."""
+    return f"rehome-{source_board}-{source_card}"
+
+
+def _write_rehome_link(conn: sqlite3.Connection, dest: tuple[str, str], key: str,
+                       source_card: str) -> str:
+    """C2 steps 1-2: write ``key`` on the destination, then READ IT BACK.
+
+    The destination can live on ANOTHER board, whose store is a different file, so
+    that half is written and COMMITTED on its own connection — the read-back is
+    then a fact about the file rather than about an open transaction. Nothing here
+    can flip the source: the caller does that only after this returns, which is the
+    whole point of the order (a crash in between leaves a destination naming a
+    still-live source — a link that over-claims — never an archived card whose
+    work nobody inherited).
+
+    Adoption, not minting, is the repeat case: a crash between the write and the
+    flip leaves the key in place, and re-running the SAME archive adopts it.
+    """
+    dest_board, dest_card = dest
+    same_store = _conn_board_slug(conn) == dest_board
+    target = conn
+    if not same_store:
+        # Lazy: ``kanban_db_connect`` imports THIS module at module level, so the
+        # connection helper is imported at call time (same pattern as
+        # ``source_board_for_task``).
+        from hermes_cli.kanban_db_connect import connect
+        try:
+            target = connect(board=dest_board)
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            raise ArchiveRefused(
+                "destination_missing",
+                f"board {dest_board!r} cannot be opened as a destination: {exc}",
+                card=source_card) from None
+    try:
+        with write_txn(target):
+            row = target.execute(
+                "SELECT status, idempotency_key FROM tasks WHERE id = ?", (dest_card,),
+            ).fetchone()
+            if row is None:
+                raise ArchiveRefused(
+                    "destination_missing",
+                    f"no card {dest_card!r} on board {dest_board!r} to inherit {source_card}",
+                    card=source_card)
+            if row["status"] == "archived":
+                raise ArchiveRefused(
+                    "destination_archived",
+                    f"destination {dest_board}/{dest_card} is itself archived; "
+                    f"a link to it inherits nothing — pick a live destination",
+                    card=source_card)
+            held = (row["idempotency_key"] or "").strip()
+            if held and held != key:
+                raise ArchiveRefused(
+                    "destination_bearing_other_key",
+                    f"destination {dest_board}/{dest_card} already carries the key "
+                    f"{held!r}; one card carries one key, so it cannot also carry {key!r} "
+                    f"— pick another destination",
+                    card=source_card)
+            if held != key:
+                target.execute(
+                    "UPDATE tasks SET idempotency_key = ? WHERE id = ? "
+                    "AND (idempotency_key IS NULL OR idempotency_key = '')",
+                    (key, dest_card),
+                )
+        # Committed here: the read-back below must be a fact about the FILE.
+        back = target.execute(
+            "SELECT idempotency_key FROM tasks WHERE id = ?", (dest_card,),
+        ).fetchone()
+        read_back = (back["idempotency_key"] or "").strip() if back else ""
+    finally:
+        if target is not conn:
+            target.close()
+    if read_back != key:
+        raise ArchiveRefused(
+            "link_write_gap",
+            f"wrote {key!r} on {dest_board}/{dest_card} but read back {read_back!r}; "
+            f"the source is NOT archived — re-run once the destination store is healthy",
+            card=source_card)
+    return key
+
+
+def _archive_flip(conn: sqlite3.Connection, task_id: str, receipt: dict) -> Optional[dict]:
+    """C2 step 3: flip the source to ``archived`` and record the receipt.
+
+    Split out of :func:`archive_task` so the ORDER is a testable boundary: a
+    caller that has already written the rehome link must still be able to fail
+    HERE, leaving the source live and the destination keyed.
+
+    Returns the worker snapshot to act on after commit (``None`` when the card is
+    unknown or already archived, i.e. this caller lost the transition).
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        was_running = row["status"] == "running"
+        prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+            "WHERE id = ? AND status != 'archived'", (task_id,),
+        )
+        if cur.rowcount != 1:
+            return None
+        # Archived mid-run (dashboard): close the run so history isn't orphaned.
+        run_id = _end_run(
+            conn, task_id, outcome="reclaimed", status="reclaimed",
+            summary="task archived with run still active",
+        )
+        _append_event(conn, task_id, "archived", receipt, run_id=run_id)
+    return {"run_id": run_id, "was_running": was_running, "prev_pid": prev_pid,
+            "prev_lock": prev_lock, "prev_started": prev_started}
+
+
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    actor: str = "", destination: Any = None, signal_fn=None,
+) -> bool:
+    """Archive a task, RECORDING why, and writing a rehome link BEFORE the flip.
 
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
     own archive — it kept executing (and pushing work) against a task nothing
@@ -7736,33 +8009,74 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     dispatcher can spawn a duplicate worker off the released claim. The
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
+
+    Three clauses ride on top of that, and each is load-bearing:
+
+    * ``reason`` (required, from :data:`ARCHIVE_REASONS`) is written into the
+      ``archived`` event with ``actor``/``board``/``card``/``destination``/``key``.
+      An archive with no receipt is indistinguishable after the fact from one
+      nobody meant to make, so the primitive refuses it rather than trusting every
+      caller to remember (8,382 of 9,629 ``archived`` events on the ``platform``
+      board were empty).
+    * For ``rehomed``/``duplicate`` a ``destination`` is required, and the
+      ``rehome-<source_board>-<source_card>`` key is written on it and READ BACK
+      *before* the source flips (:func:`_write_rehome_link`). The reverse order
+      re-creates the window that stranded 176 items: a card closed while the only
+      record of where its work went did not exist yet.
+    * A card whose body carries an ``sdlc/v1`` block at a non-terminal ``stage``
+      cannot be archived without a destination (``sdlc_bound_needs_destination``):
+      core cannot read the item store, but it can read the card, and this
+      fail-closed proxy covers 133 of the 163 cohort cards. ``reason="operator"``
+      is the single override.
+
+    Returns ``True`` when THIS call archived the card, ``False`` when the card is
+    unknown or was already archived; every refusal raises :class:`ArchiveRefused`
+    with a machine-readable ``code``.
     """
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row:
-            return False
-        was_running = row["status"] == "running"
-        prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
-        cur = conn.execute(
-            "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
-        )
-        if cur.rowcount != 1:
-            return False
-        # Archived mid-run (dashboard): close the run so history isn't orphaned.
-        run_id = _end_run(
-            conn, task_id, outcome="reclaimed", status="reclaimed",
-            summary="task archived with run still active",
-        )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
-    if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+    token = _archive_reason_token(reason, task_id)
+    dest = _archive_destination(destination, task_id)
+    if dest is None and token in ARCHIVE_REASONS_NEEDING_DESTINATION:
+        raise ArchiveRefused(
+            "destination_missing",
+            f"reason {token!r} means another card INHERITS {task_id}; name it as "
+            f"'<board>/<card>' (or use a reason that claims no successor)",
+            card=task_id)
+    task = get_task(conn, task_id)
+    if task is None or task.status == "archived":
+        return False                    # nothing to refuse: this call changes nothing
+    record = _sdlc_tag_record(task.body)
+    if record is not None and dest is None and token != ARCHIVE_REASON_OPERATOR:
+        stage = (record.get("stage") or "").strip()
+        if stage.lower() != "closed":
+            items = [record["item"]] if record.get("item") else []
+            raise ArchiveRefused(
+                "sdlc_bound_needs_destination",
+                f"{task_id} carries an sdlc/v1 block"
+                + (f" for item {', '.join(items)}" if items else "")
+                + f" at stage {stage or '(unreadable)'}; an archive may not orphan a "
+                  f"bound item — name the card that inherits it, or archive as "
+                  f"reason=operator",
+                card=task_id, items=items)
+    board = _archive_source_board(conn)
+    key = _write_rehome_link(conn, dest, _rehome_key(board, task_id), task_id) if dest else None
+    receipt = {
+        "reason": token,
+        "actor": actor or "",
+        "board": board,
+        "card": task_id,
+        "destination": {"board": dest[0], "card": dest[1]} if dest else None,
+        "key": key,
+    }
+    flipped = _archive_flip(conn, task_id, receipt)
+    if flipped is None:
+        return False
+    if flipped["was_running"]:
+        termination = _terminate_reclaimed_worker(
+            flipped["prev_pid"], flipped["prev_lock"], signal_fn=signal_fn,
+            started_at=flipped["prev_started"])
         with write_txn(conn):
-            _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
+            _append_event(conn, task_id, "archive_worker_termination", termination,
+                          run_id=flipped["run_id"])
     # ``archived`` parents no longer block children; promote them now.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
