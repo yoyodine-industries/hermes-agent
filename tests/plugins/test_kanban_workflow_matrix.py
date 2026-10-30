@@ -63,7 +63,7 @@ def _task_in(client, src: str) -> str:
         elif src == "done":
             assert kb.complete_task(conn, tid, summary="s", force=True)
         elif src == kw.ARCHIVED:
-            assert kb.archive_task(conn, tid)
+            assert kb.archive_task(conn, tid, reason="superseded")
         assert kb.get_task(conn, tid).status == src
     return tid
 
@@ -75,8 +75,14 @@ def test_manual_moves_match_server(client, src):
         if dst == src:
             continue
         tid = _task_in(client, src)
-        # ``done`` needs completion evidence; that is a verb gate, not a transition rule.
-        body = {"status": dst, **({"summary": "s"} if dst == "done" else {})}
+        # ``done`` needs completion evidence and ``archived`` needs a reason: those
+        # are verb gates on the payload, not transition rules, so they are supplied
+        # here rather than read as a refusal.
+        body = {
+            "status": dst,
+            **({"summary": "s"} if dst == "done" else {}),
+            **({"reason": "superseded"} if dst == kw.ARCHIVED else {}),
+        }
         r = client.patch(f"/k/tasks/{tid}", json=body)
         with kbc.connect_closing() as conn:
             landed = kb.get_task(conn, tid).status

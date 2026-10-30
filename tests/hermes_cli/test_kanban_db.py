@@ -691,7 +691,7 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         kb.add_comment(conn, tid, "user", "cleanup me")
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, result="done")
-        assert kb.archive_task(conn, tid)
+        assert kb.archive_task(conn, tid, reason="superseded")
         conn.execute(
             "INSERT INTO kanban_notify_subs(task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id) "
             "VALUES (?, 'telegram', '123', '', 'u', 0, 0)",
@@ -1430,7 +1430,7 @@ def test_link_tasks_archived_parent_is_terminal_no_gate(kanban_home):
     parent must not demote a ready child (it would only flap back to ready)."""
     with kbc.connect() as conn:
         parent = kb.create_task(conn, title="archived parent")
-        kb.archive_task(conn, parent)
+        kb.archive_task(conn, parent, reason="superseded")
         child = kb.create_task(conn, title="child")
         assert kb.get_task(conn, child).status == "ready"
 
@@ -2046,8 +2046,7 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
 
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         signalled = []
-        assert kb.archive_task(
-            conn, t, signal_fn=lambda pid, sig: signalled.append((pid, sig)),
+        assert kb.archive_task(conn, t, reason="superseded", signal_fn=lambda pid, sig: signalled.append((pid, sig)),
         ) is True
 
         assert signalled and signalled[0][0] == 54321
@@ -2072,8 +2071,7 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         signalled = []
-        assert kb.archive_task(
-            conn, t, signal_fn=lambda pid, sig: signalled.append((pid, sig)),
+        assert kb.archive_task(conn, t, reason="superseded", signal_fn=lambda pid, sig: signalled.append((pid, sig)),
         ) is True
         assert signalled == []
         row = conn.execute(
