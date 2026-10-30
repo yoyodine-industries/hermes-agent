@@ -549,6 +549,11 @@ class UpdateTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    # -> 'archived': the receipt the archive seam REQUIRES (no anonymous archive).
+    # ``reason`` is one of kanban_db.ARCHIVE_REASONS; ``destination`` is
+    # '<board>/<card>' for the card that inherits this one (rehomed|duplicate).
+    reason: Optional[str] = None
+    destination: Optional[str] = None
 
 
 class BulkTaskBody(BaseModel):
@@ -561,6 +566,9 @@ class BulkTaskBody(BaseModel):
     summary: Optional[str] = None
     metadata: Optional[dict] = None
     reclaim_first: bool = False
+    # Same semantics as UpdateTaskBody (``archive: true`` needs ``reason`` too).
+    reason: Optional[str] = None
+    destination: Optional[str] = None
     # Same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
@@ -574,6 +582,10 @@ class _StatusRejected(Exception):
 
 
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
+
+#: Archive refusals that are the CALLER's payload to fix (400) rather than the
+#: estate's state (409): a missing/invalid reason, or a missing destination.
+_ARCHIVE_PAYLOAD_REFUSALS = frozenset({"reason_missing", "reason_invalid", "destination_missing"})
 
 
 def _drag_to(conn, task_id: str, s: str) -> bool:
@@ -640,7 +652,17 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
     s = payload.status
     if s == "archived":
-        ok = kanban_db.archive_task(conn, task_id)
+        # A refusal from the archive seam is a 400 the human can fix in the request
+        # (missing reason / destination) or a 409 about the estate's state (the
+        # destination is archived / already keyed, the card is bound to an open item).
+        try:
+            ok = kanban_db.archive_task(
+                conn, task_id, reason=payload.reason, actor="dashboard",
+                destination=payload.destination)
+        except kanban_db.ArchiveRefused as exc:
+            if exc.code in _ARCHIVE_PAYLOAD_REFUSALS:
+                raise HTTPException(status_code=400, detail=str(exc))
+            raise _conflict(str(exc))
     else:
         with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
@@ -830,8 +852,16 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
-    if payload.archive and not kanban_db.archive_task(conn, tid):
-        entry.update(ok=False, error="archive refused")
+    if payload.archive:
+        try:
+            archived = kanban_db.archive_task(
+                conn, tid, reason=payload.reason, actor="dashboard",
+                destination=payload.destination)
+        except kanban_db.ArchiveRefused as exc:
+            archived = False
+            entry.update(ok=False, error=str(exc))
+        if not archived and entry.get("ok", True):
+            entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
