@@ -772,40 +772,167 @@ def test_a_pass_that_measured_nothing_writes_nothing(tmp_path):
     assert sv.read(record_path=sa.status_path(), now=101.0)["reason"] == "record_absent"
 
 
-def test_a_stale_open_episode_is_closed_with_its_receipt(tmp_path):
-    """Beyond the letter, and required for the DoD: ``yielded: true`` must not latch.
+def test_a_STALE_open_episode_is_still_untouched_by_a_heartbeat(tmp_path):
+    """C3's LETTER (review round 1, card ``t_253a5e55``): a heartbeat is a no-op on an OPEN
+    episode at ANY age.
 
-    C3 says a heartbeat never overwrites an OPEN episode, because the denial path rewrites it
-    every refused tick. When the record is older than the reader's staleness window that premise
-    has failed: no door has written for 15 minutes while THIS door just probed healthy, so the
-    episode is over and this door is the one holding the evidence. Closing it with the recovery
-    receipt (rather than overwriting) keeps §7(d) readable AND lets a healthy host read green --
-    otherwise one card-less episode (measured live 2026-10-29: ``yielded: true``, streak 9, no
-    guard card, no sibling marker) would leave the authority record red forever.
+    The previous revision closed a ``yielded: true`` record older than ``STALE_AFTER`` HERE, one
+    door EARLIER than the sweep that owns that act. ``_retire_cleared_substrate_cards`` selects on
+    ``record["yielded"]``, so clearing the record in the heartbeat made that sweep unreachable for
+    exactly the shape it exists for: the guard card the episode filed was never closed -- and never
+    could be, because every later heartbeat keeps ``yielded: false`` -- while the receipt claimed
+    ``released: []`` over a live card, and a stale sibling marker was never unlinked.
+
+    Staleness is not a licence for THIS door. The closure is DOOR 3's act, under the same placement
+    proof as the card close it must accompany: see ``..._by_door3_...`` below.
     """
     from hermes_cli import substrate_view as sv
 
     denied = _report(_mk_reading(tmp_path, errno_name="ENOSPC", op="write", tier="global"))
     _, opened = sa.record(denied, door="cron", now=100.0)
+    path = sa.status_path()
+    unrefreshed = path.read_bytes()
+    stamp = 100.0 + sv.STALE_AFTER + 1.0
 
-    _, payload = sa.heartbeat(
-        _healthy(tmp_path, tier="global"), door="dispatcher", now=100.0 + sv.STALE_AFTER + 1.0,
-    )
+    _, payload = sa.heartbeat(_healthy(tmp_path, tier="global"), door="dispatcher", now=stamp)
 
-    assert payload["yielded"] is False
-    assert payload["cleared_at"] is not None
-    assert payload["duration_s"] == round(sv.STALE_AFTER + 1.0, 3)
-    assert payload["cleared_door"] == "dispatcher"
-    # The receipt carries the matrix that CLEARED the episode (record_cleared's own contract:
-    # given a report, that report is the evidence), so it reads as proof, not as history.
-    assert payload["cleared_matrix"] == _healthy(tmp_path, tier="global").matrix()
-    assert payload["cleared_matrix"][0]["errno"] == "ok"
-    assert opened["matrix"][0]["errno"] == "ENOSPC"
-    # A receipt names the episode it closed: the identity and the start are history, and C4
-    # keeps them (only a PLAIN resting record carries null episode keys).
+    assert path.read_bytes() == unrefreshed, "an OPEN episode is not rewritten by a heartbeat"
+    assert payload["yielded"] is True
+    assert payload["cleared_at"] is None
     assert payload["episode"] == opened["episode"]
-    assert payload["first_tick"] == opened["first_tick"] == 100.0
-    assert sv.read(record_path=sa.status_path(), now=payload["recorded_at"] + 1.0)["state"] == "ok"
+    # ... and the record IS stale to the reader, which is exactly what makes the closure DOOR 3's.
+    assert sv.read(record_path=path, now=stamp + 1.0)["reason"] == "record_stale"
+    assert sa.episode_stale(payload, now=stamp + 1.0) is True
+    assert sa.episode_stale(payload, now=100.0 + sa.HEARTBEAT_EVERY) is False
+
+
+# ------------------------------------------------ DOOR 3's retirement: breaking the STALE LATCH
+#
+# The closure the heartbeat used to perform lives here now, NEXT TO the card close it must
+# accompany. Each arm below drives the real entry ``_retire_cleared_substrate_cards`` -- no tick --
+# because that is where the defect lived.
+
+@pytest.fixture
+def door3(tmp_path, monkeypatch):
+    """A scratch OPS board for the acting card, so no test can reach the fleet's board."""
+    monkeypatch.setattr(kbd, "TICK_YIELD_ACTOR_BOARD", "scratch-ops", raising=False)
+    kb.create_board("scratch-ops", dispatch=False)
+    conn = kbc.connect(tmp_path / "kanban.db")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _denied_episode(*, age=0.0):
+    """A ``yielded: true`` substrate episode recorded ``age`` seconds in the past."""
+    denied = _report(_mk_reading("/boot-volume", errno_name="ENOSPC", op="write", tier="global"))
+    return sa.record(denied, door="dispatcher", now=time.time() - age)[1]
+
+
+def _guard_card():
+    """The card ``_file_tick_yield_actor`` files for this kind: our key, ``blocked``."""
+    ops = kbc.connect(board="scratch-ops")
+    try:
+        return kb.create_task(
+            ops,
+            title="[guard] the substrate denied every root",
+            body="seeded by card t_253a5e55's review round 1",
+            assignee=kbd.SUBSTRATE_ADMISSION_ACTOR_ASSIGNEE,
+            created_by="kanban-dispatcher",
+            initial_status="blocked",
+            idempotency_key=(
+                f"{kbd.SUBSTRATE_ADMISSION_ACTOR_IDEMPOTENCY_PREFIX}{'a' * 64}:1792800954"
+            ),
+        )
+    finally:
+        ops.close()
+
+
+def _guard_status(task_id):
+    ops = kbc.connect(board="scratch-ops")
+    try:
+        row = ops.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return row["status"] if row is not None else None
+    finally:
+        ops.close()
+
+
+def _sibling(payload):
+    """The refusal's OWN sibling record (``dispatcher_substrate_yield.json``)."""
+    path = kbd.substrate_admission_status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({**payload, "pid": 999_999}), encoding="utf-8")
+    return path
+
+
+def test_a_STALE_episode_is_closed_by_door3_and_the_sibling_goes_with_it(door3):
+    """Arm A: stale + guard card + sibling ⇒ card done, receipt NAMES it, sibling unlinked."""
+    opened = _denied_episode(age=1000.0)
+    card = _guard_card()
+    sibling = _sibling(opened)
+
+    assert kbd._retire_cleared_substrate_cards(door3) == [card]
+
+    assert _guard_status(card) == "done", "the guard card that episode filed must be closed"
+    record = sa.read_status()
+    assert record["yielded"] is False, "the latch is broken"
+    assert record["released"] == [card], "the receipt must NAME what it released"
+    assert record["cleared_door"] == "dispatcher"
+    assert record["cleared_at"] is not None
+    assert not sibling.exists(), "a stale sibling marker must not be left behind"
+
+
+def test_a_STALE_episode_with_NO_SIBLING_still_clears_the_record(door3):
+    """Arm B -- THE MEASURED LATCH (2026-10-29): ``yielded: true`` with nothing beside it.
+
+    ``_clear_tick_yield_status`` reads ``dispatcher_substrate_yield.json`` FIRST, so with no
+    sibling it answers ``False`` and the receipt is never written -- while DOOR 3 has just closed
+    the guard card. The RECORD is the latch then: it is stale, and this tick passed the substrate
+    door, so the receipt is written here, naming the card this sweep released.
+    """
+    _denied_episode(age=1000.0)
+    card = _guard_card()
+    assert not kbd.substrate_admission_status_path().exists()
+
+    assert kbd._retire_cleared_substrate_cards(door3) == [card]
+
+    assert _guard_status(card) == "done"
+    record = sa.read_status()
+    assert record["yielded"] is False, "no sibling must not mean an immortal latch"
+    assert record["released"] == [card]
+    assert record["cleared_at"] is not None
+
+
+def test_a_STALE_episode_that_filed_NOTHING_breaks_the_latch_with_an_EMPTY_release(door3):
+    """Arm C -- the shape measured live: a stale episode, no card, no sibling."""
+    _denied_episode(age=1000.0)
+
+    assert kbd._retire_cleared_substrate_cards(door3) == []
+
+    record = sa.read_status()
+    assert record["yielded"] is False, "a card-less episode must not latch either"
+    assert record["released"] == [], "and nothing is claimed as released"
+    assert record["cleared_at"] is not None
+
+
+def test_a_FRESH_episode_keeps_its_OPEN_record(door3):
+    """The stale clause is not a licence to clear a live episode (and to invent a green).
+
+    The sweep still retires the guard card -- a tick that reached DOOR 3 is proof the episode is
+    over -- but the RECORD stays open when nothing about it is stale: a fresh episode's receipt is
+    the denial path's to write, and ``cleared_at`` must never be forged here.
+    """
+    opened = _denied_episode(age=30.0)
+    card = _guard_card()
+
+    assert kbd._retire_cleared_substrate_cards(door3) == [card]
+
+    record = sa.read_status()
+    assert record["yielded"] is True, "a fresh open episode is not this door's to close"
+    assert record["episode"] == opened["episode"]
+    assert record["cleared_at"] is None
+    assert sa.episode_stale(record) is False
 
 
 def test_recorder_mode_still_records_and_still_writes_the_heartbeat(tmp_path, monkeypatch):

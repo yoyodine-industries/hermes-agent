@@ -662,12 +662,24 @@ def _retire_cleared_substrate_cards(conn: sqlite3.Connection, *, board: Optional
     what was released; the record is only cleared when something was actually retired (or when the
     record itself is stale), never inferred from the absence of refusals.
 
+    THE STALE CLAUSE (review round 1, card ``t_253a5e55``). A ``yielded: true`` record nobody has
+    rewritten for a whole ``STALE_AFTER`` window is not a live episode: its writer stopped while
+    THIS tick probed healthy. That shape must not latch, and only this door may break it --
+    :func:`substrate_access.heartbeat` is a no-op on ANY open episode precisely so it cannot
+    pre-empt the act below. The sibling marker ``dispatcher_substrate_yield.json`` is ABSENT in the
+    plainest case (an episode that filed no card: measured live 2026-10-29), and
+    ``_clear_tick_yield_status`` reads that sibling FIRST, so it answers ``False`` and no receipt is
+    ever written; the receipt is therefore written here, off the record's own staleness, naming the
+    cards this sweep actually released (``released: []`` when the episode filed none -- the latch is
+    broken, and nothing is claimed as released).
+
     Fault-isolated: a close that raises is logged and the tick carries on.
     """
     f = _facade()
     record = f._sa.read_status()
     if not record.get("yielded"):
         return []
+    stale = f._sa.episode_stale(record)
     attempted: set = set()
     closed: list = []
     ops_conn, ops_board, close_it = f._ops_board_connection(conn)
@@ -695,7 +707,27 @@ def _retire_cleared_substrate_cards(conn: sqlite3.Connection, *, board: Optional
                 "kanban dispatcher: substrate guard close failed on ticking board %s: %s",
                 ticking_board, exc,
             )
-    f._clear_tick_yield_status(kind=f.SUBSTRATE_ADMISSION_KIND, released=closed)
+    retired = f._clear_tick_yield_status(kind=f.SUBSTRATE_ADMISSION_KIND, released=closed)
+    if stale and not retired:
+        # The record IS the latch here: it is flagged and nothing has refreshed it for the reader's
+        # whole window, while this tick just passed the substrate door. Break it with the receipt
+        # (never a bare overwrite), naming what this sweep released.
+        #
+        # ``retired`` is False for two reasons and they are ONE finding: there is no sibling marker
+        # at all (the measured shape), or the sibling names a writer that still looks alive. Either
+        # way the RECORD has not been rewritten for the whole window, so that writer is not ticking,
+        # and this tick's own healthy probe is the proof the episode is over.
+        try:
+            f._sa.record_cleared(door="dispatcher", released=list(closed))
+            _db()._log.info(
+                "kanban dispatcher: closed the STALE substrate episode on %s -- released %d guard "
+                "card(s); nothing had rewritten the record for the reader's staleness window",
+                board, len(closed),
+            )
+        except Exception as exc:  # health: allow BLE001 -- evidence, never a tick's work
+            _db()._log.warning(
+                "kanban dispatcher: could not write the stale episode's recovery receipt: %s", exc,
+            )
     return closed
 
 

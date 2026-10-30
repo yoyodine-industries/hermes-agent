@@ -816,6 +816,35 @@ def record_cleared(
     return _write_status(payload, target), payload
 
 
+def episode_stale(
+    record: Optional[dict] = None,
+    *,
+    now: Optional[float] = None,
+    stale_after: Optional[float] = None,
+) -> bool:
+    """``True`` when a record's OPEN episode is older than the reader's staleness window.
+
+    THE LATCH TEST, and nothing more. ``yielded: true`` with a stamp older than
+    ``substrate_view.STALE_AFTER`` is not a live episode: no door has rewritten it for fifteen
+    minutes, which is exactly what the reader already answers ``unknown/record_stale`` for. A
+    ``yielded: true`` record whose stamp cannot be read at all is the same finding (nothing proves
+    it fresh).
+
+    The writer that ACTS on the finding is DOOR 3
+    (:func:`hermes_cli.kanban_db_dispatch_retire._retire_cleared_substrate_cards`), never
+    :func:`heartbeat`: the same tick must close the guard card the episode filed and write the
+    recovery receipt naming what it released, or the episode's card is orphaned with a receipt
+    that says the opposite of the board (review round 1, card ``t_253a5e55``).
+    """
+    payload = record if record is not None else read_status()
+    if not payload.get("yielded"):
+        return False
+    age = _age_since(
+        payload.get("recorded_at"), float(now if now is not None else time.time()),
+    )
+    return age is None or age > _stale_window(stale_after)
+
+
 # ---------------------------------------------------------------------------------------
 # The resting state (a healthy pass)
 # ---------------------------------------------------------------------------------------
@@ -852,7 +881,6 @@ def heartbeat(
     door: str,
     path: Any = None,
     now: Optional[float] = None,
-    stale_after: Optional[float] = None,
 ) -> tuple[str, dict]:
     """Write the RESTING-STATE verdict: this door probed and nothing denied. ``(path, payload)``.
 
@@ -866,12 +894,14 @@ def heartbeat(
     * **C2** bounded cadence: nothing is written while the current record is younger than
       :data:`HEARTBEAT_EVERY`, and the write itself is :func:`_write_status` (atomic, ``0600``,
       never raises --- a failed write logs a warning and the tick proceeds);
-    * **C3** a LIVE episode is the denial path's (it rewrites every refused tick): when the record
-      is ``yielded: true`` and still inside ``stale_after``, this is a no-op. A ``yielded: true``
-      record that is OLDER than that window is the opposite finding --- its writer stopped while
-      THIS door just probed healthy --- so the episode is closed with :func:`record_cleared`
-      (receipt, not erasure). Without that leg ``yielded: true`` latches forever, and a healthy
-      host reading red is the same defect as a denied one reading green;
+    * **C3** an OPEN episode belongs to the denial path (it rewrites every refused tick): while
+      the record is ``yielded: true`` this is a no-op, at ANY age. Its CLOSURE belongs to the
+      dispatcher's retirement act (:func:`hermes_cli.kanban_db_dispatch_retire.
+      _retire_cleared_substrate_cards`, DOOR 3), because the same tick must also close the guard
+      card the episode filed and write the receipt that names what was released. Closing it here
+      would PRE-EMPT that act --- DOOR 3's precondition is ``yielded``, so one cron heartbeat would
+      leave the guard card orphaned forever and a receipt claiming ``released: []`` over a live
+      card (review round 1, card ``t_253a5e55``);
     * **C4** an existing receipt survives: the refresh touches only ``recorded_at``,
       ``last_tick``, ``matrix``, ``read_findings`` and the ``guards_*`` block, so ``cleared_at``,
       ``duration_s``, ``cleared_door``, ``released`` and ``cleared_matrix`` stay byte-identical;
@@ -902,18 +932,16 @@ def heartbeat(
         return str(target), prior
 
     age = _age_since(prior.get("recorded_at"), stamp) if prior else None
-    window = _stale_window(stale_after)
 
     if prior.get("yielded"):
-        if age is not None and age <= window:
-            return str(target), prior
-        try:
-            _, prior = record_cleared(door=door, report=report, path=target, now=stamp)
-        except Exception as exc:  # noqa: BLE001 - a receipt failure must not take a tick down
-            log.warning("substrate: could not close the stale episode in %s: %s", target, exc)
-            return str(target), prior
+        # C3, at ANY age: an open episode is the denial path's, and its CLOSURE is DOOR 3's act
+        # (``kanban_db_dispatch_retire._retire_cleared_substrate_cards``), which must also close
+        # the guard card the episode filed and write the receipt naming what it released. A
+        # heartbeat that closed the record here would make DOOR 3's own precondition
+        # (``yielded``) false and orphan that card forever.
+        return str(target), prior
 
-    elif age is not None and age < HEARTBEAT_EVERY:
+    if age is not None and age < HEARTBEAT_EVERY:
         return str(target), prior
 
     guards = guards_blind()
@@ -1044,6 +1072,7 @@ __all__ = [
     "clear_cache",
     "deliver_once",
     "episode_identity",
+    "episode_stale",
     "gate_enabled",
     "guards_blind",
     "heartbeat",
