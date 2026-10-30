@@ -170,7 +170,7 @@ def test_an_archived_target_is_refused(board):
     from hermes_cli.kanban_cross_close import CrossCloseRefused, close_sibling
 
     sibling = _card(kb, conn, "already archived")
-    kb.archive_task(conn, sibling)
+    kb.archive_task(conn, sibling, reason="superseded")
     caller, run_id = _caller(kb, conn)
 
     with pytest.raises(CrossCloseRefused) as excinfo:

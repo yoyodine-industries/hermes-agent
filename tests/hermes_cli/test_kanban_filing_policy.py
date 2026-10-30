@@ -318,7 +318,7 @@ DUPLICATE_LINE = re.compile(
 
 
 def _archive(conn, task_id):
-    assert kb.archive_task(conn, task_id) is True
+    assert kb.archive_task(conn, task_id, reason="superseded") is True
 
 
 def _age(conn, task_id, hours):

@@ -206,7 +206,7 @@ def test_assign_task_allows_a_terminal_card_despite_unloadable_skills(kanban_hom
             "the assign on a terminal card is recorded, not silently skipped")
 
         archived_id = kb.create_task(conn, title="shelved", skills=["other-skill"])
-        assert kb.archive_task(conn, archived_id) is True
+        assert kb.archive_task(conn, archived_id, reason="superseded") is True
         assert _task(conn, archived_id).status == "archived"
         assert kb.assign_task(conn, archived_id, "demo") is True
         assert _task(conn, archived_id).assignee == "demo"

@@ -283,7 +283,7 @@ def test_archive_disposes_of_the_park(kanban_home: Path) -> None:
     with kbc.connect_closing() as conn:
         tid = _park_in_triage(conn)
         assert kb.triage_escalation_refusal(conn, tid) is not None
-        assert kb.archive_task(conn, tid) is True
+        assert kb.archive_task(conn, tid, reason="superseded") is True
         assert _status(conn, tid) == "archived"
 
 
