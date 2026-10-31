@@ -83,45 +83,26 @@ def _project_with(folder: Path, name: str = "State Folder Program"):
 # --------------------------------------------------------------------------- birth door
 
 
-def test_create_defaults_a_plain_folder_primary_to_dir(kanban_home, tmp_path):
-    """A.2 (t_e61be4f3): the DEFAULT for a plain-folder project is ``dir:<owner>``, not a worktree.
-
-    This supersedes the t_e5ff985b birth REFUSAL for the default path — refusing was the right
-    instant fix for a card that could never claim, but it also made a legitimate shape (a
-    doc+code project whose primary is a folder, with no repo anywhere) uncreatable unless the
-    caller happened to know ``--workspace dir:<owner>``. Measured before the change:
-    ``--workspace dir:<owner>`` always worked, so only the default and the remedy were wrong.
-    The t_e5ff985b guard itself survives where it applies: a card explicitly anchored at
-    ``<plain folder>/.worktrees/<id>`` still refuses at claim (see the claim-door test below).
-    """
+def test_create_refuses_a_project_whose_primary_is_a_plain_folder(kanban_home, tmp_path):
+    """DoD 2: a misconfigured project refuses at CREATION, and the refusal names the fix."""
     state_dir = _make_plain_folder(tmp_path / "platform" / "state-program")
     proj = _project_with(state_dir)
 
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="lands in the folder", project_id=proj.slug)
-        task = kb.get_task(conn, tid)
+        with pytest.raises(ValueError) as excinfo:
+            kb.create_task(conn, title="lands in the repo", project_id=proj.slug)
 
-    assert task.workspace_kind == "dir"
-    assert task.workspace_path == str(state_dir)        # anchored AT the project, not under it
-    assert not task.branch_name                          # no branch: nothing is checked out
-    assert not (state_dir / ".worktrees").exists()       # nothing minted under a non-repo
-    # And the anchor RESOLVES: a dir-kind card needs no git repo at all.
-    assert Path(kbw.resolve_workspace(task)) == state_dir
+    message = str(excinfo.value)
+    assert message.startswith(f"{MARKER}{state_dir}")
+    assert proj.slug in message                      # names WHICH project is misconfigured
+    assert "hermes project" in message               # names the repair
+    assert "Not retried" in message
+    # The distinct class, so a caller (or the dispatcher) can branch on it without prose.
+    assert isinstance(excinfo.value, kbw.WorktreeAnchorNotRepo)
 
-
-def test_create_keeps_the_deferred_worktree_for_a_primary_that_does_not_exist_yet(
-    kanban_home, tmp_path,
-):
-    """Registering a project BEFORE cloning its repo is a legitimate order — unchanged."""
-    future = tmp_path / "repo-not-cloned-yet"
-    proj = _project_with(future, name="Future Repo")
-
+    # ... and nothing was filed: a refused birth leaves no dead card behind.
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="clone first", project_id=proj.slug)
-        task = kb.get_task(conn, tid)
-
-    assert task.workspace_kind == "worktree"
-    assert task.workspace_path == str(future / ".worktrees" / tid)
+        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 0
 
 
 def test_create_still_works_when_the_primary_is_a_real_repo(kanban_home, tmp_path):
@@ -136,23 +117,6 @@ def test_create_still_works_when_the_primary_is_a_real_repo(kanban_home, tmp_pat
     assert task.workspace_kind == "worktree"
     assert task.workspace_path == str(repo / ".worktrees" / tid)
     assert task.branch_name == f"{proj.slug}/{tid}-add-login"
-
-
-def test_the_refusal_names_the_dir_remedy_before_the_repo_one(tmp_path):
-    """The remedy comes from the door that KNOWS the convention (estate refusal standard).
-
-    A plain folder is a legitimate project primary, so "give the project a real repo" is the
-    WRONG first fix for this class: the message must name ``--workspace dir:<anchor>`` first,
-    and only then the repo-primary / retarget repairs for cards that really need a worktree.
-    """
-    anchor = _make_plain_folder(tmp_path / "platform" / "state-program")
-    msg = kbw.no_repo_refusal(
-        anchor=anchor, task_id="t_deadbeef", project_id="p_x", project_slug="state-program",
-    )
-    assert msg.startswith(f"{MARKER}{anchor}")
-    assert f"--workspace dir:{anchor}" in msg
-    assert msg.index("--workspace dir:") < msg.index("hermes project add-folder")
-    assert "t_deadbeef" in msg and "state-program" in msg
 
 
 # --------------------------------------------------------------------------- claim door

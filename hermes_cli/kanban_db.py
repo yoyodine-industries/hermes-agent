@@ -1640,23 +1640,7 @@ def _resolve_project_link(
     # Canonicalise (a slug may have been passed) and anchor the worktree
     # under the project's primary repo.
     if workspace_kind == "scratch" and project_obj.primary_path:
-        # A.2 (t_e61be4f3): the default for a project whose primary is a PLAIN FOLDER is
-        # ``dir:<primary>`` — never ``worktree:<primary>/.worktrees/<id>``. Until now every
-        # card born on such a project WITHOUT an explicit --workspace was defaulted to a
-        # worktree and then refused at the anchor check below, so the caller had to know a
-        # rule the door already knew: ``--workspace dir:<owner>`` always worked (measured:
-        # t_d03a4a2e was born that way). A repo primary still gets a worktree, and a primary
-        # that does not exist YET keeps the deferred worktree path — registering a project
-        # before cloning its repo is a legitimate order, and that seam is unchanged below.
-        from pathlib import Path as _PathDefault
-
-        from hermes_cli import kanban_db_workspace as _wsm_default
-
-        _default_primary = _PathDefault(str(project_obj.primary_path)).expanduser()
-        if _default_primary.exists() and _wsm_default._git_toplevel(_default_primary) is None:
-            workspace_kind = "dir"
-        else:
-            workspace_kind = "worktree"
+        workspace_kind = "worktree"
     if workspace_kind == "worktree" and workspace_path is None and project_obj.primary_path:
         # A primary that is an EXISTING folder but not a git repo can never anchor a worktree
         # (t_e5ff985b): the card would be born with an impossible
@@ -1678,11 +1662,6 @@ def _resolve_project_link(
             )
         # Concrete path is deferred to the insert loop: a fresh
         # ``<repo>/.worktrees/<task-id>`` keyed on the new task id.
-        project_repo = str(project_obj.primary_path)
-    elif workspace_kind == "dir" and project_obj.primary_path:
-        # A.2 (t_e61be4f3): a dir-kind card is anchored AT the project's primary, which the
-        # insert loop needs as ``project_repo`` — without it the card was born
-        # ``kind=dir, path=None`` and had no anchor at all.
         project_repo = str(project_obj.primary_path)
     return project_obj.id, project_obj, project_repo, workspace_kind
 
@@ -2257,12 +2236,6 @@ def create_task(
                         workspace_path = os.path.join(project_repo, ".worktrees", task_id)
                     if not branch_name:
                         branch_name = _project_branch_name(project_obj, task_id, title)
-                elif project_obj is not None and workspace_kind == "dir" and not workspace_path:
-                    # A.2 (t_e61be4f3): a card on a plain-folder project is anchored IN the
-                    # project — ``dir:<owner dir>`` — so nothing is ever minted under a path
-                    # that is not a git repo, and the card needs no worktree anchor to exist.
-                    if project_repo:
-                        workspace_path = str(project_repo)
 
                 # The stamp rides the INSERT: the card carries its ask from birth, in the
                 # same transaction that creates the row, so no reader ever sees an
