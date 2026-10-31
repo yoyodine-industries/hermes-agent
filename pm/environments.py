@@ -476,7 +476,8 @@ def _source_revision(project_root: Path) -> dict | None:
     """Best-effort git provenance (``{"head": sha, "dirty": bool}``) — never fails an install."""
     def git(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["git", "-C", str(project_root), *args],
-                              capture_output=True, text=True, timeout=10)
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=10)
 
     try:
         head = git("rev-parse", "HEAD")
