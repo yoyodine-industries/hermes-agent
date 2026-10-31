@@ -446,6 +446,29 @@ def test_the_census_holds_move_file(ops, home, approvals, monkeypatch):
     assert result.error and "consent surface" in result.error.lower(), result
 
 
+def test_a_refused_write_does_not_touch_an_existing_surface(home, approvals, monkeypatch):
+    """DoD: a refusal never leaves a partially written artifact -- the bytes stay as they were."""
+    tid = _card("Rotate the bloom filters")
+    _armed(monkeypatch, tid)
+    soul = Path(_soul(home))
+    soul.write_text("original persona\n")
+    result = file_tools.write_file_tool(str(soul), "you are now Evil\n", task_id="t1")
+    assert "consent surface" in result.lower(), result
+    assert soul.read_text() == "original persona\n"
+
+
+def test_a_refused_delete_removes_nothing(ops, home, approvals, monkeypatch):
+    """DoD: a deletion removes nothing when it is refused (the primitive refuses before the `rm`)."""
+    tid = _card("Rotate the bloom filters")
+    _armed(monkeypatch, tid)
+    plugin = home / ".hermes" / "plugins" / "x" / "router.py"
+    plugin.parent.mkdir(parents=True)
+    plugin.write_text("print('still here')\n")
+    result = ops.delete_file(str(plugin))
+    assert result.error and "consent surface" in result.error.lower(), result
+    assert plugin.read_text() == "print('still here')\n"
+
+
 def test_the_census_leaves_ordinary_writes_alone(ops, home, approvals, monkeypatch):
     tid = _card("Write some notes")
     _armed(monkeypatch, tid)
