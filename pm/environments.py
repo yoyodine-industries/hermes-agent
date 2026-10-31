@@ -12,6 +12,8 @@ import json
 import os
 import re
 import shlex
+import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 from hermes_constants import get_default_hermes_root, project_venv_dir
@@ -422,6 +424,157 @@ def site_packages(venv: Path) -> Path:
         return venv / "Lib/site-packages"
     version = venv_python_version(venv) or (sys.version_info.major, sys.version_info.minor)
     return venv / f"lib/python{version[0]}.{version[1]}/site-packages"
+
+
+# A generation owns DEPENDENCIES; the checkout owns CODE. The generation's venv installs the
+# core project as an *editable* install bound to its build-time `workspace/` snapshot, so
+# `venv/bin/hermes`, `venv/bin/python -m hermes_cli…` and anything else entering that
+# interpreter would otherwise execute the snapshot's code — indefinitely, because
+# `expected_stamp()` is keyed on dependency inputs only and a code-only update mints no new
+# generation. This `.pth` is the same contract `activate_dependencies()` already applies to
+# booted processes (checkout first on `sys.path`), applied to *every* entry into the venv:
+# `PathFinder` precedes the editable finder in `sys.meta_path`, so a `sys.path` entry wins.
+SOURCE_PIN_FILENAME = "__hermes_source_pin.pth"
+SOURCE_STAMP_FILENAME = "source.json"
+
+
+def source_stamp_path(generation: Path) -> Path:
+    """Where *generation* records its provenance: the GENERATION root, never inside ``workspace/``.
+
+    The snapshot must stay a byte-faithful build input — it is also ``resolved_lock.parent`` and
+    the replay source for a later ``repair``.
+    """
+    return Path(generation) / SOURCE_STAMP_FILENAME
+
+
+def read_source_stamp(generation: Path) -> dict | None:
+    """The provenance *generation* records, or ``None`` when it carries no readable stamp."""
+    try:
+        data = json.loads(source_stamp_path(generation).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        return None
+    root = data.get("root")
+    return data if isinstance(root, str) and root else None
+
+
+def source_pin_line(project_root: Path) -> str:
+    """The one ``import``-prefixed line the pin ``.pth`` executes at site init.
+
+    Guarded by ``os.path.isdir`` — an unmounted or moved checkout must not break every
+    interpreter in the generation — and order-safe: a root already leading ``sys.path`` is
+    never inserted twice.
+    """
+    root = str(project_root)
+    return (f"import os, sys; _hermes_src = {root!r}; "
+            "sys.path.insert(0, _hermes_src) if os.path.isdir(_hermes_src) "
+            "and sys.path[:1] != [_hermes_src] else None")
+
+
+def _source_revision(project_root: Path) -> dict | None:
+    """Best-effort git provenance (``{"head": sha, "dirty": bool}``) — never fails an install."""
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(project_root), *args],
+                              capture_output=True, text=True, timeout=10)
+
+    try:
+        head = git("rev-parse", "HEAD")
+        if head.returncode != 0 or not head.stdout.strip():
+            return None
+        dirty = git("diff-index", "--quiet", "HEAD", "--")
+        return {"head": head.stdout.strip(), "dirty": dirty.returncode == 1}
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write *text* to *path* via a sibling temp file, so no reader ever sees a partial pin."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def write_source_pin(generation: Path, project_root: Path) -> Path | None:
+    """Record *project_root* as *generation*'s code source and pin its venv to it.
+
+    Returns ``None`` and writes nothing when *project_root* resolves inside *generation*: that root
+    is the generation's own build snapshot, not a code source, so a pin naming it would be a
+    self-pin asserting nothing (defensive — no caller builds that way on purpose).
+
+    Raises when the pin cannot be written: a generation that cannot route its own code to the
+    checkout that built it must fail loudly at build time, never install and quietly resolve a
+    stale snapshot instead.
+    """
+    generation = Path(generation)
+    venv = generation / "venv"
+    if not (venv / "pyvenv.cfg").is_file():
+        raise FileNotFoundError(f"no environment to pin at {venv}")
+    root = Path(project_root).resolve()
+    if root.is_relative_to(generation.resolve()):
+        return None
+    stamp = {"schema": 1, "root": str(root), "revision": _source_revision(root),
+             "recorded_at": datetime.now(UTC).isoformat(timespec="seconds")}
+    _atomic_write(source_stamp_path(generation), json.dumps(stamp, indent=2, sort_keys=True) + "\n")
+    pin = site_packages(venv) / SOURCE_PIN_FILENAME
+    _atomic_write(pin, f"# Hermes source pin — {root} owns this generation's code.\n"
+                       f"{source_pin_line(root)}\n")
+    return pin
+
+
+def source_pin_problem(generation: Path) -> str | None:
+    """What is wrong with *generation*'s source pin, or ``None`` when it is correct.
+
+    File reads only — no subprocess, nothing imported from the generation: doctor has to be
+    able to name a stale generation *before* anything is repaired or booted.
+    """
+    generation = Path(generation)
+    venv = generation / "venv"
+    if not (venv / "pyvenv.cfg").is_file():
+        return None  # not a managed generation
+    recorded = read_source_stamp(generation)
+    if not recorded:
+        return f"carries no {SOURCE_STAMP_FILENAME} provenance stamp"
+    root = str(recorded["root"])
+    revision = recorded.get("revision")
+    revision = revision if isinstance(revision, dict) else {}
+    head = str(revision.get("head") or "")[:10] or "unknown"
+    dirty = " (dirty)" if revision.get("dirty") else ""
+    if not Path(root).is_dir():
+        return f"records code source {root} (revision {head}{dirty}), which no longer exists"
+    try:
+        pin_lines = (site_packages(venv) / SOURCE_PIN_FILENAME).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return (f"records code source {root} (revision {head}{dirty}) "
+                f"but carries no {SOURCE_PIN_FILENAME}")
+    if source_pin_line(Path(root)) not in pin_lines:
+        return (f"records code source {root} (revision {head}{dirty}) but its "
+                f"{SOURCE_PIN_FILENAME} names a different root")
+    return None
+
+
+def ensure_source_pin(project_root: Path) -> Path | None:
+    """Pin the generation PM has committed for *project_root*; ``None`` when none is managed.
+
+    The no-rebuild path: a sync over an unchanged dependency graph mints no generation, so an
+    install that predates source pinning is healed here instead of never.
+    """
+    venv = committed_venv(project_root)
+    if venv is None or not venv.is_dir() or not (venv.parent / ".lease-managed").is_file():
+        return None
+    root = Path(project_root).resolve()
+    if root.is_relative_to(venv.parent.resolve()):
+        return None  # a root inside the generation is its own snapshot, never a code source
+    recorded = read_source_stamp(venv.parent)
+    if recorded is not None and recorded["root"] == str(root) and source_pin_problem(venv.parent) is None:
+        return site_packages(venv) / SOURCE_PIN_FILENAME
+    return write_source_pin(venv.parent, project_root)
 
 
 def running_from_selected_environment(project_root: Path) -> bool:

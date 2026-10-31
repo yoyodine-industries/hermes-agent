@@ -655,3 +655,58 @@ def _check_command_installation(should_fix: bool, f: Finding) -> None:
     if verb == "Created" and str(link_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         check_warn(f"{display} is not on your PATH", "(add it to your shell config: export PATH=\"$HOME/.local/bin:$PATH\")")
         f.manual_issues.append(f"Add {display} to your PATH")
+
+
+@doctor_check()
+def _check_source_pin(should_fix: bool, f: Finding) -> None:
+    """A dependency generation owns DEPENDENCIES; the checkout owns CODE.
+
+    Without its source pin a generation's own entry points (``venv/bin/hermes``,
+    ``venv/bin/python -m hermes_cli…``) resolve ``hermes_*`` from the build snapshot in
+    ``workspace/``, because `expected_stamp()` keys generations on dependency inputs only and a
+    code-only update mints no new one. Naming the generation, its recorded revision and the
+    remedy is the point of this check: it is the one surface where a stale lane can name itself
+    *before* it is repaired.
+    """
+    from hermes_cli.doctor import PROJECT_ROOT
+    from pm.environments import committed_venv, ensure_source_pin, read_source_stamp, source_pin_problem
+
+    try:
+        venv = committed_venv(PROJECT_ROOT)
+    except (OSError, ValueError, RuntimeError) as exc:
+        _section("Dependency Source Pin")
+        check_fail("Cannot resolve the committed dependency generation", str(exc))
+        return f.manual_issues.append(_python_repair_hint())
+    if venv is None:
+        return
+    generation = venv.parent
+    _section("Dependency Source Pin")
+    if not (generation / ".lease-managed").is_file():
+        # A sealed payload ships its own venv beside its tree and owns its own code. Read as a
+        # generation it looks merely unpinned ("carries no source.json provenance stamp"), and the
+        # repair path below would diagnose a defect that is not one and name 'hermes pm repair' for
+        # a payload nothing can pin. Report what was measured instead of a problem that isn't.
+        return check_info(f"{generation}: not a lease-managed generation — source pin not applicable")
+    problem = source_pin_problem(generation)
+    recorded = read_source_stamp(generation) or {}
+    if problem is None and recorded.get("root") and Path(recorded["root"]) != Path(PROJECT_ROOT).resolve():
+        problem = (f"routes this generation's code to {recorded['root']}, "
+                   f"not the install at {PROJECT_ROOT}")
+    if problem is None:
+        return check_ok(f"Committed generation runs this checkout's code ({generation.name})")
+    if not should_fix:
+        check_warn(f"Generation {generation}", problem)
+        return f.issues.append(f"Repin the committed dependency generation {generation} — {problem}. "
+                               "Run 'hermes doctor --fix' or 'hermes pm install'")
+    try:
+        ensure_source_pin(PROJECT_ROOT)
+    except OSError as exc:
+        check_fail("Could not write the source pin", str(exc))
+        return f.manual_issues.append(_python_repair_hint())
+    remaining = source_pin_problem(generation)
+    if remaining is not None:
+        check_warn(f"Generation {generation} is still unpinned", remaining)
+        return f.manual_issues.append(
+            f"Rebuild the dependency environment: 'hermes pm repair' ({generation})")
+    check_ok(f"Pinned generation {generation} to {PROJECT_ROOT}")
+    f.fixed += 1

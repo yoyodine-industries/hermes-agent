@@ -434,7 +434,7 @@ class Venv(StatePackage):
         is left out (the caller reports it) instead of refusing the whole graph.
         """
         import uuid
-        from pm.environments import install_state_dir, runtime_facts_path
+        from pm.environments import install_state_dir, runtime_facts_path, write_source_pin
         from pm.environment import managed_environment
         from pm.lock import Facts
         from pm.native_build import source_build_environment
@@ -480,6 +480,9 @@ class Venv(StatePackage):
                 from pm.recovery import validate_environment
                 validate_environment(venv_command(project, candidate, ("-I",)),
                                      env=dict(environment.env), cwd=resolved_lock.parent)
+            # The generation owns dependencies; the checkout owns code. Pin before this tree can
+            # be selected: an unpinned generation resolves `hermes_*` from its own build snapshot.
+            write_source_pin(generation, project)
         except BaseException:
             shutil.rmtree(generation, ignore_errors=True)
             raise

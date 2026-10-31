@@ -820,3 +820,76 @@ def test_no_config_drops_bridged_index_settings_from_child_env(tmp_path):
     bridged = run()
     assert bridged.returncode == 1, "default path must keep the bridge"
     assert "UV_INDEX_URL" in bridged.stderr, bridged.stderr
+
+
+def test_generation_pins_hermes_code_to_the_checkout_that_built_it(installable_project, tmp_path, monkeypatch):
+    """A generation owns DEPENDENCIES; the checkout owns CODE.
+
+    The venv's editable install is bound to the generation's build snapshot, so an unpinned
+    interpreter resolves the project's own modules out of ``workspace/`` — the stale-code lane
+    that a code-only update never mints a new generation to fix. The pin must win for the
+    generation's *own* entry points: the probe below is a plain child process on the
+    generation's interpreter, cwd neutral, nothing injected.
+    """
+    import pm.paths
+    from pm import environments
+    from pm.packages import Venv
+
+    source, uv, env = installable_project
+    monkeypatch.setattr(pm.paths, "repo_root", lambda: source)
+    monkeypatch.setattr("pm._uv._toolchain", lambda **kwargs: (uv, Path(sys.executable)))
+    prepared = Venv(source).apply([], plugin_dirs=[], explicit=True)
+    generation = prepared["environment"].parent
+    pin = environments.site_packages(prepared["environment"]) / environments.SOURCE_PIN_FILENAME
+
+    # Provenance lives at the generation root, never inside the snapshot a build consumes.
+    stamp = environments.read_source_stamp(generation)
+    assert stamp is not None and stamp["root"] == str(source.resolve())
+    assert not (generation / "workspace" / environments.SOURCE_STAMP_FILENAME).exists()
+    assert environments.source_pin_problem(generation) is None
+    assert pin.is_file()
+
+    probe = tmp_path / "probe_import.py"
+    probe.write_text("import root_app\nprint(root_app.__file__)\n", encoding="utf-8")
+    python = prepared["environment"] / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+    def resolved() -> Path:
+        return Path(_run([str(python), str(probe)], cwd=tmp_path, env=env).strip()).resolve()
+
+    assert resolved().is_relative_to(source.resolve()), "the checkout's code must win"
+    assert not resolved().is_relative_to(generation.resolve() / "workspace")
+
+    # The control that proves the probe discriminates: without the pin the same child lands in
+    # the snapshot.
+    pin.unlink()
+    environments.source_stamp_path(generation).unlink()
+    assert resolved().is_relative_to(generation.resolve() / "workspace")
+
+
+def test_unchanged_sync_retrofits_an_unpinned_generation(locked_project, monkeypatch):
+    """A code-only update mints no generation, so the sync itself must heal an unpinned one."""
+    import importlib
+    import pm.paths
+    from pm import environments
+    from pm.plugin_inputs import Members
+
+    source, uv, _env = locked_project
+    monkeypatch.setattr(pm.paths, "repo_root", lambda: source)
+    monkeypatch.setattr("pm._uv._toolchain", lambda **kwargs: (uv, Path(sys.executable)))
+    engine = importlib.import_module("pm.install")
+    monkeypatch.setattr(engine, "lazy_installs_allowed", lambda: True)
+
+    engine.sync_venv([], plugins=Members([]), explicit=True)
+    venv = environments.selected_venv(source)
+    generation = venv.parent
+    pin = environments.site_packages(venv) / environments.SOURCE_PIN_FILENAME
+    assert pin.is_file()
+    pin.unlink()
+    environments.source_stamp_path(generation).unlink()
+
+    engine.sync_venv([], plugins=Members([]), explicit=True)  # unchanged inputs: no new generation
+    assert environments.selected_venv(source) == venv
+    assert pin.is_file(), "an unchanged sync must retrofit the committed generation"
+    assert environments.source_pin_problem(generation) is None
+    stamp = environments.read_source_stamp(generation)
+    assert stamp is not None and stamp["root"] == str(source.resolve())
