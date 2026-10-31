@@ -16,6 +16,7 @@ once: ``'|<abs-epoch-cs>'``, ``None`` -> ``'unverified'``, and
 ``bootsession:<uuid>|<ref_cs>|<boot-relative start>``.
 """
 
+import json
 import os
 import time
 
@@ -444,6 +445,89 @@ def test_the_alert_is_idempotent_inside_the_hour_bucket(board):
         "SELECT COUNT(*) AS c FROM tasks WHERE idempotency_key LIKE 'mass-crash:%'",
     ).fetchone()
     assert int(rows["c"]) == 1, "a persistent condition pages once per hour, not once per tick"
+
+
+# ---------------------------------------------------------------------------------------------
+# The acting card's dedupe key is the tick-INVARIANT identity of the condition
+#
+# Measured in production 2026-10-30: the refusal actor re-filed on EVERY tick. The dispatcher
+# ticks every ~63 s and the signature it keyed on carried `ended_at`, so each tick minted a new
+# key, the "existing" lookup never hit, and a sustained refusal produced one card per tick rather
+# than one card per hour. These pin the key/signature split that ends it.
+# ---------------------------------------------------------------------------------------------
+
+_TICK_INSTANT = 1791659000  # inside the hour bucket [1791658800, 1791662400)
+_TICK_SECONDS = 63  # the dispatcher's measured tick interval
+_HOUR_SECONDS = guard._ACTOR_WINDOW_SECONDS
+
+
+def _refused_sweep(conn, count, *, now):
+    """File the actor card for a REFUSED sweep of ``count`` crashed rows at ``now``."""
+    task_ids = [kb.create_task(conn, title="job", assignee="worker") for _ in range(count)]
+    assessment = guard.assess_sweep(
+        [_closure(tid) for tid in task_ids],
+        write_shape="epoch-cs/2",
+        now=now,
+    )
+    assert assessment.verdict.abort is True, "the fixture must produce a refusal"
+    actor_id = guard.alert_sweep_guard(conn, assessment, tree="fixture-tree", now=now)
+    assert actor_id is not None
+    return assessment, actor_id
+
+
+def _mass_crash_actors(conn):
+    return conn.execute(
+        "SELECT id, idempotency_key, title, body FROM tasks "
+        "WHERE idempotency_key LIKE 'mass-crash:%' ORDER BY rowid",
+    ).fetchall()
+
+
+def test_the_refusal_actor_files_once_an_hour_though_every_tick_has_its_own_signature(board):
+    conn = board
+    first, first_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
+    later, later_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _TICK_SECONDS)
+
+    # The condition is unchanged but the TICK differs, so the recorded signatures differ ...
+    assert first.verdict.signature != later.verdict.signature
+    assert first.verdict.ended_at != later.verdict.ended_at
+    assert first.verdict.count == later.verdict.count
+
+    # ... and the card must NOT: one condition, one card, inside one hour bucket.
+    assert later_id == first_id
+    actors = _mass_crash_actors(conn)
+    assert len(actors) == 1, "a sustained refusal pages once per hour, not once per 63 s tick"
+    assert "ended_at=" not in actors[0]["idempotency_key"], (
+        "the dedupe key must carry the condition, never the tick instant"
+    )
+
+    # A materially worse condition inside the same hour still pages: 3 -> 5 unexplained deaths.
+    escalated, escalated_id = _refused_sweep(conn, 5, now=_TICK_INSTANT + 2 * _TICK_SECONDS)
+    assert escalated_id != first_id, "an escalated count is a different condition"
+    assert len(_mass_crash_actors(conn)) == 2
+
+    # The NEXT hour bucket pages again for the original condition.
+    next_hour, next_hour_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _HOUR_SECONDS)
+    assert next_hour_id not in {first_id, escalated_id}
+    assert len(_mass_crash_actors(conn)) == 3
+
+
+def test_the_actor_card_still_evidence_the_tick_it_came_from(board):
+    conn = board
+    assessment, actor_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
+
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (actor_id,)).fetchone()
+    assert f"tick instant (`ended_at`): {_TICK_INSTANT}" in row["body"]
+    assert f"signature: `{assessment.verdict.signature}`" in row["body"]
+
+    events = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+        (actor_id, guard.MASS_CRASH_ACTOR_EVENT),
+    ).fetchall()
+    assert len(events) == 1
+    payload = json.loads(events[0]["payload"])
+    assert payload["ended_at"] == _TICK_INSTANT
+    assert payload["signature"] == assessment.verdict.signature
+    assert payload["count"] == 3
 
 
 def test_a_sweep_below_the_threshold_still_reclaims_normally(board):

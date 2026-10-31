@@ -467,19 +467,24 @@ def _file_actor(
     event_payload: dict,
     board: Optional[str] = None,
     now: Optional[int] = None,
+    key_signature: Optional[str] = None,
 ) -> Optional[str]:
-    """File EXACTLY ONE acting card for a signature, idempotently, best-effort.
+    """File EXACTLY ONE acting card for a condition, idempotently, best-effort.
 
-    The idempotency key (``<prefix><signature>:<board>:<hour-bucket>``) is the whole mechanism: N
-    ticks hitting the same condition resolve to one card, and the condition can page again in the
-    NEXT hour. A board that refuses the write is logged with the key it could not file and never
-    takes the tick down.
+    The idempotency key (``<prefix><key_signature>:<board>:<hour-bucket>``) is the whole mechanism:
+    N ticks hitting the same condition resolve to one card, and the condition can page again in the
+    NEXT hour. That holds only when ``key_signature`` names a **tick-invariant** identity of the
+    condition. The default is ``signature``, so a caller whose signature embeds the tick instant
+    (``ended_at``) must pass the invariant part as ``key_signature`` and keep the tick in
+    ``signature`` -- which is what the body and the event payload record as evidence. Otherwise
+    every tick mints a new key and files its own card. A board that refuses the write is logged
+    with the key it could not file and never takes the tick down.
     """
     from hermes_cli import kanban_db as kb
 
     moment = int(time.time() if now is None else now)
     board_key = _board_key(conn, board)
-    key = _actor_key(prefix, signature, board_key, moment)
+    key = _actor_key(prefix, key_signature or signature, board_key, moment)
     try:
         existing = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
@@ -546,10 +551,19 @@ def alert_sweep_guard(
     actor_signature = verdict.signature if verdict.abort else (
         "held:" + ",".join(assessment.held_shapes)
     )
+    # The KEY is the tick-INVARIANT identity of the condition; the signature -- which carries the
+    # tick instant -- stays what the body and the event record as evidence. Without this split a
+    # sustained refusal files one card per tick (~63 s), because every tick mints its own
+    # `ended_at` and therefore its own key. `count` stays IN the key: an escalation 3 -> 5 inside
+    # the same hour is a materially worse condition and must still page.
+    key_signature = (
+        f"{MASS_CRASH_SIGNATURE_PREFIX}count={verdict.count}" if verdict.abort else actor_signature
+    )
     return _file_actor(
         conn,
         prefix=MASS_CRASH_ACTOR_IDEMPOTENCY_PREFIX,
         signature=actor_signature,
+        key_signature=key_signature,
         title=(
             MASS_CRASH_ACTOR_TITLE.format(count=verdict.count, threshold=verdict.threshold)
             if verdict.abort
