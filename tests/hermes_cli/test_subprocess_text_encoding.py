@@ -44,11 +44,17 @@ for their own reasons, and demanding ``encoding=`` from them raises ``TypeError`
 
 | tree | why |
 |---|---|
-| ``tests/`` | the suite itself; a decode failure here is a red test, loud by construction |
+| ``tests/`` (any path component) | the suite itself; a decode failure here is a red test, loud by construction |
 | ``evals/`` | dev probes, run by hand, fail loudly |
 | ``scripts/`` | dev/CI tooling, not shipped runtime; loud in the job that runs it (its 11 sites are pinned by a separate card, t_ae7f7c5b, and are deliberately not scanned here) |
 | ``evidence/``, ``website/``, ``nix/``, ``optional-skills/`` | not shipped runtime: one-off proof harnesses, site/build tooling, opt-in skill assets |
 | ``.venv/``, ``venv/``, ``node_modules/``, ``build/``, ``dist/``, ``.worktrees/``, ``__pycache__/`` | vendored/generated, not ours |
+
+The exclusion is the ``tests/`` **directory** (any path component), never the
+filename: filename heuristics are deliberately **not** used, so a shipped module
+whose *filename* merely contains ``test`` (``hermes_cli/approvals_test.py``,
+``pm/testenv.py``) is scanned like any other. Do not re-introduce a
+``"test" in path.name`` skip — it hides shipped runtime modules from the walk.
 
 ## Residual gaps — review responsibilities, not guard claims
 
@@ -80,6 +86,7 @@ for their own reasons, and demanding ``encoding=`` from them raises ``TypeError`
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 
 import pytest
@@ -225,8 +232,6 @@ def _scanned_files(tree: str) -> list[Path]:
             continue
         if "tests" in path.relative_to(root).parts:
             continue
-        if "test" in path.name:
-            continue
         files.append(path)
     return files
 
@@ -358,4 +363,23 @@ def test_aggregates_every_violation_in_one_source() -> None:
     assert find_violations(source, "<s>") == [
         "<s>:2: subprocess.run(text=...) without encoding=",
         "<s>:3: subprocess.check_output(text=...) without encoding=",
+    ]
+
+
+def test_filename_containing_test_no_longer_exempts_a_shipped_module(tmp_path, monkeypatch) -> None:
+    """The scan root is the DIRECTORY: a ``test``-containing filename is not a skip."""
+    source = "import subprocess\nsubprocess.run(['x'], text=True)\n"
+    probe = tmp_path / "pm" / "testenv_probe.py"
+    probe.parent.mkdir(parents=True)
+    probe.write_text(source, encoding="utf-8")
+    under_tests = tmp_path / "pm" / "tests" / "test_pm.py"
+    under_tests.parent.mkdir(parents=True)
+    under_tests.write_text(source, encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    # scanned purely because it ships in pm/ — its filename does not exempt it ...
+    assert _scanned_files("pm") == [probe]
+    # ... and the reader inside it is reported, while the tests/ directory is still skipped
+    assert find_violations(source, "pm/testenv_probe.py") == [
+        "pm/testenv_probe.py:2: subprocess.run(text=...) without encoding="
     ]
