@@ -656,7 +656,13 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Board has a ``board.json`` on disk; ``default`` always exists."""
+    """A board STORE is on disk at this slug — ``kanban.db`` or its ``board.json``.
+
+    ``default`` always exists. This is the "is anything there?" probe, NOT the registration
+    question (:func:`board_is_registered`) and not discovery (#43243, which now lives in
+    ``list_boards``): a store whose ``board.json`` was deleted still exists, and a directory a
+    teardown emptied — no DB, no marker — does not.
+    """
     slug = _slug_or_default(board)
     if slug == DEFAULT_BOARD:
         return True
@@ -669,11 +675,14 @@ def board_is_registered(board: Optional[str] = None) -> bool:
     ``default`` is always registered. Every other slug is registered iff its directory
     carries ``board.json`` — ``create_board`` always writes that file, while the filing
     path's creating connect() mints only ``kanban.db``. So this is the probe a FILING
-    uses to refuse a slug nobody registered. On this tree :func:`board_exists` already
-    requires ``board.json`` (#43243), so the two agree; the name is kept because the
-    filing path and its tests ask for the registration question by name.
+    uses to refuse a slug nobody registered. :func:`board_exists` is the WIDER probe (a
+    DB-only store answers yes); the two are deliberately not the same question
+    (card t_b1719b4d).
     """
-    return board_exists(board)
+    slug = _slug_or_default(board)
+    if slug == DEFAULT_BOARD:
+        return True
+    return _dir_is_registered(board_dir(slug))
 
 
 class BoardResolutionError(ValueError):
@@ -8807,6 +8816,7 @@ from hermes_cli.kanban_db_boards import (
     board_is_archived_stub,
     list_dispatch_boards,
     _dir_holds_board,
+    _dir_is_registered,
     board_metadata_path,
     create_board,
     list_boards,

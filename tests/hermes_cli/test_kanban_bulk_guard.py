@@ -483,3 +483,71 @@ def test_the_digest_is_order_insensitive_over_the_id_set():
     y = _scope("schedule", "t_c", "why", "--ids", "t_a", "t_b")
     assert x == y == "ids=t_a,t_b,t_c"
     assert kbg.scope_digest("ops", "schedule", x) == kbg.scope_digest("ops", "schedule", y)
+
+
+# --- 12. the DOCUMENTED route, end to end (card t_b1719b4d) ---------------------------------
+
+def test_the_documented_route_files_an_ask_and_archives_in_one_pass(tmp_path, monkeypatch, capsys):
+    """Defect D: every refusal prints a route — `bulk-approvals ask …`, then `--approval <digest>`.
+
+    That route has to actually WORK: the verb has to exist, the scope it files has to be the
+    scope the gate re-derives from the very command line that does the archiving, and one pass
+    has to file the approval and archive the fixture board's cards.
+    """
+    import json
+    import sqlite3
+
+    from hermes_cli import kanban
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    root = tmp_path / "home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
+    monkeypatch.setenv(kbg.LEDGER_DIR_ENV, str(tmp_path / "bulk_actions"))
+    # This test can run inside a worker session; the delegated-child fence is not the thing
+    # under test, and its env vars would refuse the archive before the gate was reached.
+    for var in ("HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_WORKSPACE"):
+        monkeypatch.delenv(var, raising=False)
+    # The snapshot clause is injected; shelling out to the deployed preimage unit is not a test.
+    monkeypatch.setattr(kbg, "snapshot_precondition", lambda *a, **k: {
+        "path": str(tmp_path / "preimage.db"), "sha256": "0" * 64, "quick_check": "ok"})
+
+    kb.create_board("ops", name="ops")
+    # A real, approved APR in a throwaway approvals store: the CLI resolves the APR at FILING
+    # time (an ask IS the operator's decision, not a note), so the fixture carries one instead
+    # of stubbing the resolver out.
+    apr_db = tmp_path / "approvals.db"
+    with sqlite3.connect(str(apr_db)) as aconn:
+        aconn.execute("CREATE TABLE approvals (id INTEGER PRIMARY KEY, status TEXT, "
+                      "decision TEXT, decided_at TEXT, task TEXT)")
+        aconn.execute("INSERT INTO approvals VALUES (1000, 'approved', NULL, "
+                      "'2026-10-31T00:00:00+00:00', 'fixture board archive')")
+        aconn.commit()
+    monkeypatch.setenv("BULK_GUARD_APPROVALS_DB", str(apr_db))
+    with kbc.connect_closing(board="ops") as conn:
+        ids = [kb.create_task(conn, title=f"fixture card {n}", assignee="platform-coder",
+                             initial_status="blocked")
+               for n in (1, 2)]
+
+    # The scope the gate derives from the EXACT command line that does the archiving.
+    archiving = _parsed("kanban", "archive", *ids, "--reason", "generated-moot")
+    scope = kbg.classify("archive", kbg.params_from_args("archive", archiving))
+    assert scope.startswith("archive="), scope
+
+    ask = kanban.kanban_command(_parsed(
+        "kanban", "bulk-approvals", "ask", "--board", "ops",
+        "--verb", "archive", "--scope", scope,
+        "--approach", "the fixture board is archived after the ruling",
+        "--apr", "APR-1000", "--actor", kbg.AUTHORIZED_ASK_PROFILE, "--json"))
+    assert ask == 0
+    digest = json.loads(capsys.readouterr().out)["digest"]
+    assert digest == kbg.scope_digest("ops", "archive", scope)
+
+    rc = kanban.kanban_command(_parsed(
+        "kanban", "--board", "ops", "archive", *ids, "--reason", "generated-moot",
+        "--approval", digest))
+    assert rc == 0, capsys.readouterr()
+    with kbc.connect_closing(board="ops") as conn:
+        statuses = [conn.execute("SELECT status FROM tasks WHERE id = ?", (i,)).fetchone()[0]
+                    for i in ids]
+    assert statuses == ["archived", "archived"], statuses

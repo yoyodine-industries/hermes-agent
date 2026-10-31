@@ -23,12 +23,30 @@ from pathlib import Path
 
 
 def _dir_holds_board(d: Path) -> bool:
-    # ``board.json`` is the identity marker: archive/hard-delete both leave the
-    # directory without it, and a stale ``connect(board=slug)`` used to leave a
-    # ``kanban.db``-only stub that resurfaced in the board list as an empty
-    # active board (#43243). Discovery must therefore require the metadata
-    # file; a DB-only directory is a stub to ignore, never a board.
+    """The directory holds a board STORE — a ``kanban.db`` — or the ``board.json`` naming one.
+
+    Two questions live here and they are NOT the same one (card t_b1719b4d):
+
+    * ``board_exists`` asks "is there a board on disk at this slug?" — a directory holding
+      either file answers yes, so a store whose metadata was deleted is still a board and a
+      teardown that left nothing behind is not.
+    * DISCOVERY asks "did somebody REGISTER this slug?" — :func:`list_boards` uses
+      :func:`_dir_is_registered` (``board.json``), because a ``kanban.db``-only stub minted by
+      a stale ``connect(board=slug)`` used to resurface in the board list as an empty active
+      board (#43243).
+    """
+    return (d / "board.json").exists() or (d / "kanban.db").exists()
+
+
+def _dir_is_registered(d: Path) -> bool:
+    """``board.json`` is on disk: ``create_board`` wrote it, so the slug was REGISTERED.
+
+    This is the discovery/registration probe (``list_boards``, ``board_is_registered``), kept
+    separate from :func:`_dir_holds_board` so a filing-minted DB stub still never becomes a
+    board anyone can enumerate (#43243).
+    """
     return (d / "board.json").exists()
+
 
 
 def board_metadata_path(board: Optional[str] = None) -> Path:
@@ -272,7 +290,7 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 normed = _kb._normalize_board_slug(child.name)  # skip junk dirs, don't raise
             except ValueError:
                 continue
-            if not normed or normed in seen or not _dir_holds_board(child):
+            if not normed or normed in seen or not _dir_is_registered(child):
                 continue
             if board_is_archived_stub(normed):
                 continue
@@ -300,9 +318,13 @@ def list_dispatch_boards() -> list[dict]:
     ]
 
 
-def remove_board(slug: str, *, archive: bool = True) -> dict:
+def remove_board(slug: str, *, archive: bool = True, leave_marker: bool = True) -> dict:
     """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
-    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``.
+
+    ``leave_marker=False`` archives WITHOUT the ``archived`` tombstone: only a declared-estate
+    teardown asks for that, because a torn-down estate must leave its slug free (t_b1719b4d).
+    """
     _kb._assert_not_delegated_child_mutation()
     normed = _kb._require_slug(slug)
     if normed == _kb.DEFAULT_BOARD:
@@ -336,16 +358,21 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         # tabs / gateway pollers can keep calling connect(board=slug) after the
         # archive; without a marker the resurrect-guard cannot tell an archived
         # slug from a brand-new one and an empty board would reappear (#43243).
-        write_board_metadata(
-            normed,
-            name=prior_meta.get("name"),
-            description=prior_meta.get("description"),
-            icon=prior_meta.get("icon"),
-            color=prior_meta.get("color"),
-            default_workdir=prior_meta.get("default_workdir"),
-            project_id=prior_meta.get("project_id"),
-            archived=True,
-        )
+        # An ESTATE teardown (`leave_marker=False`) is the exception: the board is declared
+        # un-dispatchable, the teardown is final, and the slug must be FREE afterwards — a
+        # tombstone would keep `board_exists` answering yes for a board that is gone
+        # (card t_b1719b4d).
+        if leave_marker:
+            write_board_metadata(
+                normed,
+                name=prior_meta.get("name"),
+                description=prior_meta.get("description"),
+                icon=prior_meta.get("icon"),
+                color=prior_meta.get("color"),
+                default_workdir=prior_meta.get("default_workdir"),
+                project_id=prior_meta.get("project_id"),
+                archived=True,
+            )
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     import shutil
     shutil.rmtree(d)
