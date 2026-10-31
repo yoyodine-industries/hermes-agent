@@ -771,6 +771,11 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
     try:
         result = {} if current else (package.apply(enabled, explicit=explicit,
                                                    skip_invalid_secondary=skip_invalid_secondary, **inputs) or {})
+        if current:
+            # No rebuild to carry a pin: retrofit a generation built before source pinning
+            # (`hermes update` / `hermes pm install` over an unchanged dependency graph).
+            from pm.environments import ensure_source_pin
+            ensure_source_pin(package.project_root())
         if not repair and package.expected_stamp(enabled, **inputs) != stamp:
             raise ValueError("Dependency inputs changed while preparing publication; retry.")
         if change is not None:
