@@ -42,6 +42,35 @@ def _reason(help: str):
     return _arg("--reason", help=help)
 
 
+def _quorum_phrase() -> str:
+    """The ACTUAL bulk requirement, in one clause, derived from the guard itself.
+
+    Stated once and reused by every ``--approval`` help so the operator's 2026-10-03 rule
+    (one authorized ask, NO separate bot approvals) plus the ONE waiver (a declared estate
+    board, ruling t_fcf7a321) can never drift between flags. The guard module is imported
+    lazily: the parser stays free of the store, and the numbers come from the decision.
+    """
+    from hermes_cli import kanban_bulk_guard as kbg
+
+    return (
+        f"the authorized ask profile ({kbg.AUTHORIZED_ASK_PROFILE}) files the ask first; "
+        f"no separate bot approvals are required (REQUIRED_APPROVALS={kbg.REQUIRED_APPROVALS}). "
+        "The ONE waiver is a board whose own board.json declares \"dispatch\": false — an "
+        "estate torn down single-actor with `hermes kanban boards rm --estate <slug> "
+        "--reason \"…\"`."
+    )
+
+
+def _approval_flag(what: str):
+    """``--approval`` for a gated verb: the digest the authorized ask was recorded under."""
+    return _arg(
+        "--approval", metavar="DIGEST",
+        help=(f"The digest an authorized ask was recorded under, authorizing {what}. "
+              + _quorum_phrase()),
+    )
+
+
+
 def _nonnegative_int(value: str) -> int:
     """argparse type for retention days: a negative window builds a future cutoff
     that matches every row, so reject it at the CLI boundary before any sweep."""
@@ -70,6 +99,7 @@ def _triage_sweep_args(verb: str, Verb: str, noun: str):
         _arg("--tenant", help="When used with --all, restrict the sweep to this tenant"),
         _arg("--author",
              help=f"Author name recorded on the audit comment (default: $HERMES_PROFILE or '{noun}')"),
+        _approval_flag(f"a `{verb} --all` sweep over more than one card"),
         _json_flag(help="Emit one JSON object per task on stdout"),
     )
 
@@ -119,6 +149,14 @@ _BOARD_SPECS = [
         _arg("--delete", action="store_true",
              help="Hard-delete the board directory instead of archiving it. "
                   "Default is to move it to boards/_archived/ so it's recoverable."),
+        _arg("--estate", action="store_true",
+             help="Declare this board a declared estate (its own board.json carries "
+                  "\"dispatch\": false) and tear it down SINGLE-ACTOR: the ask/APR clause is "
+                  "waived, while the destination claim, the verified preimage and the "
+                  "ledger/audit row are still taken. Requires --reason."),
+        _reason("Why the board is torn down. REQUIRED with --estate: it lands in the ledger "
+                "row and the audit row."),
+        _approval_flag("archiving this board"),
     ], aliases=["remove", "delete"], help="Archive (default) or delete a board"),
     _cmd("switch", [_SLUG], aliases=["use"], help="Set the active board for subsequent CLI calls"),
     _cmd("show", [
@@ -184,6 +222,7 @@ _BOARD_SPECS = [
         _arg("archive", help="Path to the .tar.gz archive"),
         _arg("--as", dest="as_slug", help="Slug for the imported board (default: from the archive)"),
         _arg("--switch", action="store_true", help="Switch to the imported board afterwards"),
+        _approval_flag("importing a whole board"),
         _json_flag(),
     ], help="Import a board archive as a new board", description=(
         "Import a .tar.gz produced by `hermes kanban boards export`. The board always lands as a "
@@ -308,6 +347,7 @@ _SPECS = [
         _PRIORITY,
         _arg("--created-by", help="Creator/anchor profile"),
         _arg("--idempotency-key", help="Dedup key for the root card"),
+        _approval_flag("this swarm fan-out"),
         _json_flag(help="Emit JSON output"),
     ], help="Create a Kanban Swarm v1 graph (parallel workers → verifier → synthesizer)"),
     _cmd("list", [
@@ -343,6 +383,7 @@ _SPECS = [
         _arg("--reclaim", action="store_true",
              help="Release any active claim before reassigning (required if task is running)"),
         _RECLAIM_REASON,
+        _approval_flag("a reclaim-reassign over more than one card"),
     ], help="Reassign a task to a different profile, optionally reclaiming first"),
     _cmd("diagnostics", [
         _arg("--severity", choices=["warning", "error", "critical"],
@@ -438,6 +479,7 @@ _SPECS = [
                   "and has to move around the clock. Needs --due."),
         _arg("--clear-due", action="store_true",
              help="Drop the task's due time (the hold stays, with no clock)."),
+        _approval_flag("a bulk block"),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -456,6 +498,7 @@ _SPECS = [
                   "and has to move around the clock. Needs --due."),
         _arg("--clear-due", action="store_true",
              help="Drop the task's due time (it stays parked until released by hand)."),
+        _approval_flag("a bulk schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
@@ -498,6 +541,7 @@ _SPECS = [
         _bulk_ids("promote"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
+        _approval_flag("a bulk promote"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
@@ -512,6 +556,7 @@ _SPECS = [
         _arg("--actor", help="Who is archiving (recorded on the receipt; defaults to the acting profile)"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
+        _approval_flag("a multi-card archive or a purge"),
     ], help="Archive one or more tasks (a reason is required; a rehome writes its link first)"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
@@ -602,13 +647,56 @@ _SPECS = [
         ], help="Release a designation: annotate the ledger row, restore the card's own "
                 "priority (clamped to what the board allows)"),
     ]), help="The designation door - the ONLY way into the reserved priority tranche"),
+    _cmd("bulk-approvals", children=("bulk_approvals_action", [
+        _cmd("ask", [
+            _arg("--verb", required=True,
+                 help="The gated verb the ask authorizes (gc, repair, archive, board-rm, …)"),
+            _arg("--scope", required=True,
+                 help="The verb's canonical scope EXACTLY as the refusal printed it. The action's "
+                      "digest is derived from it, so a different spelling is a different action."),
+            _arg("--approach", required=True,
+                 help="What is being authorized, in the operator's terms — the plan, not a "
+                      "summary of it."),
+            _arg("--apr", required=True,
+                 help="The approved APR that authorizes it (APR-0747, 'apr 747', or 747)"),
+            _arg("--board", default=argparse.SUPPRESS, metavar="<slug>",
+                 help="Board the action targets (default: the current board)"),
+            _arg("--actor",
+                 help="Profile filing the ask (default: the acting profile). Only the authorized "
+                      "ask profile may file — the guard names it in its refusal."),
+            _json_flag(),
+        ], help="File the authorized ask; prints the digest the action must then carry"),
+        _cmd("approve", [
+            _arg("digest", help="The digest printed by `bulk-approvals ask`"),
+            _arg("--approach", required=True, help="Must be the ask's approach, verbatim"),
+            _arg("--reason", help="Why this approver agrees (recorded on the ledger row)"),
+            _arg("--actor", help="Approving profile (default: the acting profile)"),
+            _json_flag(),
+        ], help="Record one approval against an ask's digest (never the ask's own author)"),
+        _cmd("list", [_json_flag(help="Emit the whole ledger as JSON")],
+             help="List the ledger: one line per ask, approval and estate teardown"),
+        _cmd("show", [
+            _arg("digest", help="The digest to report"),
+            _json_flag(help="Accepted for symmetry; the record is always JSON"),
+        ], help="Show the bundle behind one digest (ask, approvers, quorum)"),
+    ]), help="The authorized-ask ledger behind the bulk-action gate",
+         description=(
+             "A destructive BULK board action is refused unless the authorized ask profile has "
+             "filed the ask that names this EXACT action (board + verb + canonical scope) in the "
+             "guard's ledger, and a verified preimage of the target store exists. This verb is "
+             "that filing door: `ask` records it and prints the digest, which the action then "
+             "passes as `--approval <digest>`. The ledger lives outside every board store, so "
+             "the record survives the destruction it gates."
+         )),
     _cmd("gc", [
         _arg("--event-retention-days", type=_nonnegative_int, default=30,
              help="Delete task_events older than N days for terminal tasks (default: 30; 0 disables)"),
         _arg("--log-retention-days", type=_nonnegative_int, default=30,
              help="Delete worker log files older than N days (default: 30; 0 disables)"),
+        _approval_flag("a gc sweep"),
     ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
-    _cmd("repair", [_json_flag(help="Emit the repair report as JSON")],
+    _cmd("repair", [_json_flag(help="Emit the repair report as JSON"),
+                    _approval_flag("a quarantine + index repair")],
          help="Check kanban.db integrity and auto-repair index-only corruption",
          description=(
              "Runs PRAGMA integrity_check on the board's DB and reports the result. When the "

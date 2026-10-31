@@ -2058,6 +2058,9 @@ _HANDLERS = {
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
     "gc": _cmd_gc, "defcon": _cmd_defcon,
+    # The authorized-ask door behind the bulk gate (decked in kanban_bulk_guard): a bulk action
+    # is refused unless its ask is filed HERE first, and this is how the ask gets filed.
+    "bulk-approvals": _cmd_bulk_approvals,
     # The gate invariant's pass. Read-only `report` stays available to every lane (it is how a
     # lane answers "is the board out of order?"); `reconcile` writes, and is refused to a
     # delegated child inside the handler.
