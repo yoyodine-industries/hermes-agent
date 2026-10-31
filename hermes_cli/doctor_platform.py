@@ -681,6 +681,12 @@ def _check_source_pin(should_fix: bool, f: Finding) -> None:
         return
     generation = venv.parent
     _section("Dependency Source Pin")
+    if not (generation / ".lease-managed").is_file():
+        # A sealed payload ships its own venv beside its tree and owns its own code. Read as a
+        # generation it looks merely unpinned ("carries no source.json provenance stamp"), and the
+        # repair path below would diagnose a defect that is not one and name 'hermes pm repair' for
+        # a payload nothing can pin. Report what was measured instead of a problem that isn't.
+        return check_info(f"{generation}: not a lease-managed generation — source pin not applicable")
     problem = source_pin_problem(generation)
     recorded = read_source_stamp(generation) or {}
     if problem is None and recorded.get("root") and Path(recorded["root"]) != Path(PROJECT_ROOT).resolve():

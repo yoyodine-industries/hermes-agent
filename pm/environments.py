@@ -501,8 +501,12 @@ def _atomic_write(path: Path, text: str) -> None:
             tmp.unlink()
 
 
-def write_source_pin(generation: Path, project_root: Path) -> Path:
+def write_source_pin(generation: Path, project_root: Path) -> Path | None:
     """Record *project_root* as *generation*'s code source and pin its venv to it.
+
+    Returns ``None`` and writes nothing when *project_root* resolves inside *generation*: that root
+    is the generation's own build snapshot, not a code source, so a pin naming it would be a
+    self-pin asserting nothing (defensive — no caller builds that way on purpose).
 
     Raises when the pin cannot be written: a generation that cannot route its own code to the
     checkout that built it must fail loudly at build time, never install and quietly resolve a
@@ -513,6 +517,8 @@ def write_source_pin(generation: Path, project_root: Path) -> Path:
     if not (venv / "pyvenv.cfg").is_file():
         raise FileNotFoundError(f"no environment to pin at {venv}")
     root = Path(project_root).resolve()
+    if root.is_relative_to(generation.resolve()):
+        return None
     stamp = {"schema": 1, "root": str(root), "revision": _source_revision(root),
              "recorded_at": datetime.now(UTC).isoformat(timespec="seconds")}
     _atomic_write(source_stamp_path(generation), json.dumps(stamp, indent=2, sort_keys=True) + "\n")
@@ -562,9 +568,11 @@ def ensure_source_pin(project_root: Path) -> Path | None:
     venv = committed_venv(project_root)
     if venv is None or not venv.is_dir() or not (venv.parent / ".lease-managed").is_file():
         return None
-    root = str(Path(project_root).resolve())
+    root = Path(project_root).resolve()
+    if root.is_relative_to(venv.parent.resolve()):
+        return None  # a root inside the generation is its own snapshot, never a code source
     recorded = read_source_stamp(venv.parent)
-    if recorded is not None and recorded["root"] == root and source_pin_problem(venv.parent) is None:
+    if recorded is not None and recorded["root"] == str(root) and source_pin_problem(venv.parent) is None:
         return site_packages(venv) / SOURCE_PIN_FILENAME
     return write_source_pin(venv.parent, project_root)
 
