@@ -1069,6 +1069,47 @@ def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
     return _user_deny_block(command)
 
 
+def _consent_floor(command: str, ctx: object = None) -> dict | None:
+    """Consent-gated live surfaces: a command that WRITES one needs an approval covering it.
+
+    Design ``t_cb9259fc`` section 3b + D3. Runs with the other floors (immediately after
+    ``_floor_block`` and BEFORE the ``--yolo`` / ``approvals.mode=off`` / permanent-allowlist
+    / unattended short-circuits), so no session-level setting can re-open it. This is the
+    vector the standing order names by name: ``hermes config set approvals.mode off`` was
+    unflagged -- the terminal layer's own patterns cover the in-place edits and redirections
+    into the ROOT ``config.yaml``/``.env`` spellings only, and the profile ``SOUL.md``,
+    ``plugins/**`` and LaunchAgents plists were open outright.
+
+    Returns ``None`` for every command that is not a surface write, and whenever no kanban
+    card owns the session (a human at a console IS the consent authority, D5). The deny dict
+    is the guard's own, so it carries the surface, the target, the owning card, every
+    reference that card cites and the scope token a filer must file under.
+    """
+    try:
+        from hermes_cli import consent_surface_doors as doors
+    except ImportError:  # partial install: inert, like the tool-level clause
+        logger.debug("consent-surface floor unavailable (import failed)", exc_info=True)
+        return None
+    return doors.command_denial(command, ctx=ctx)
+
+
+def _consent_floor_text(code: str, ctx: object = None) -> dict | None:
+    """The EXEC door's consent floor (design ``t_cb9259fc`` section 3c).
+
+    ``execute_code`` runs arbitrary local Python, so ``open()``/``pathlib`` never passes
+    through ``terminal()`` or ``DANGEROUS_PATTERNS``. Best-effort by construction: the scan
+    is a literal read of the script (see ``consent_surface_doors.hit_for_text``), so a path
+    assembled at runtime evades it -- named residual, partially mitigated because any
+    ``terminal()`` the script issues hits ``_consent_floor`` above.
+    """
+    try:
+        from hermes_cli import consent_surface_doors as doors
+    except ImportError:
+        logger.debug("consent-surface exec floor unavailable (import failed)", exc_info=True)
+        return None
+    return doors.text_denial(code, ctx=ctx)
+
+
 def check_dangerous_command(command: str, env_type: str,
                             approval_callback=None,
                             has_host_access: bool = False) -> dict:
@@ -1138,6 +1179,12 @@ def check_all_command_guards(command: str, env_type: str,
     if blocked is not None:
         return blocked
 
+    # The consent-surface floor sits with the other floors: before the prepared batch, the
+    # yolo/off short-circuit, the allowlist and unattended resolution (design t_cb9259fc §6).
+    blocked = _consent_floor(command)
+    if blocked is not None:
+        return blocked
+
     from agent.terminal_approval_batch import consume_prepared_guard
     prepared = consume_prepared_guard(command, env_type, has_host_access)
     if prepared is not None:
@@ -1200,6 +1247,11 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         return _approved()
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _approved()
+    # Before the yolo / mode=off / unattended short-circuits (design t_cb9259fc §3c, §6):
+    # a script that writes a consent-gated live surface needs an approval covering it.
+    blocked = _consent_floor_text(code)
+    if blocked is not None:
+        return blocked
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
         return _approved()
