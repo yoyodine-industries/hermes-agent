@@ -24,9 +24,11 @@ from gateway.restart import (
     effective_stop_watchdog_delay,
     is_gateway_supervisor_process,
     launchd_service_label,
+    launchd_stop_budget_fits,
     read_launchd_exit_timeout_s,
     resolve_launchd_capped_drain,
 )
+from gateway.lifecycle_ledger import record_shutdown_drain_capped
 from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
 
 _CAPPED = 60.0 - LAUNCHD_STOP_CLEANUP_RESERVE_S
@@ -122,3 +124,115 @@ def test_sigterm_handler_marks_stop_as_signal_driven_unless_planned_takeover(mon
     run_mod._start_gateway_make_shutdown_signal_handler(runner, [False])(signal.SIGTERM)
     assert runner._stop_requested_by_signal is (not takeover)
     assert effective_stop_drain_timeout(runner) == (180.0 if takeover else 50.0)
+
+
+# ── the domain the job actually lives in (the 288-unclean-exit root cause) ──────────────────────
+#
+# On this host the gateway is a system-domain LaunchDaemon
+# (/Library/LaunchDaemons/ai.hermes.gateway.plist, UserName=hermes_user, uid 502) with NO
+# ExitTimeOut key, so launchd's live budget is 5s. read_launchd_exit_timeout_s probed only
+# gui/<uid> for a non-root process, found nothing, returned None, and the drain cap failed OPEN —
+# the gateway drained its configured 30s cron budget into a 5s SIGKILL window. These tests drive
+# the reader with that exact fixture, so the pre-fix code fails them.
+
+
+def _system_domain_only(system_stdout: str = "exit timeout = 5\n"):
+    """``launchctl print`` stand-in: only the machine-wide ``system`` domain answers (the
+    LaunchDaemon shape). Every per-user candidate fails, as it does on this host."""
+
+    def fake_run(cmd, **_kwargs):
+        target = cmd[2] if len(cmd) > 2 else ""
+        if target.startswith("system/"):
+            return SimpleNamespace(returncode=0, stdout=system_stdout)
+        return SimpleNamespace(returncode=113, stdout="")
+
+    return fake_run
+
+
+def test_reader_resolves_a_system_domain_daemon_budget_and_caps_the_drain_below_it():
+    """The reader must find the live budget for a system-domain LaunchDaemon, and the resolved
+    drain must fit inside the live kill window (never exceed it)."""
+    env = _direct("ai.hermes.gateway")
+    budget = read_launchd_exit_timeout_s(environ=env, uid=502, run=_system_domain_only(), platform="darwin")
+    assert budget == 5.0, "system-domain LaunchDaemon budget must be found, not fail open"
+    assert budget is not None
+    drain = resolve_launchd_capped_drain(30.0, budget)
+    assert drain == 0.0  # 5s window minus the 10s teardown reserve leaves nothing to drain
+    assert drain <= budget  # the invariant: the resolved drain never exceeds the live kill window
+    assert drain == max(budget - LAUNCHD_STOP_CLEANUP_RESERVE_S, 0.0)
+
+
+def test_reader_prefers_the_first_domain_that_answers():
+    """A per-user (gui) job keeps its budget; the system fallback is only used when no per-user
+    domain answers — the probe must not change today's gui result."""
+    fake_run = lambda *a, **k: SimpleNamespace(returncode=0, stdout="exit timeout = 60\n")  # noqa: E731
+    assert read_launchd_exit_timeout_s(environ=_direct("ai.hermes.gateway"), uid=501, run=fake_run, platform="darwin") == 60.0
+
+
+@pytest.mark.parametrize(
+    "drain, cron, exit_timeout, fits",
+    [
+        (180.0, 30.0, 60.0, False),   # 180 + reserve > 60
+        (30.0, 30.0, 60.0, True),     # 30 + 10 reserve <= 60
+        (0.0, 30.0, 5.0, False),      # the measured host: a 30s cron drain cannot fit a 5s window
+        (0.0, 30.0, 60.0, True),      # the same drain fits a normal window
+        (0.0, 0.0, 5.0, True),        # no stop-path wait at all fits any positive window
+        (180.0, 30.0, None, True),    # not launchd-owned: fail-open, always a fit
+    ],
+    ids=["restart-over", "cron-fits", "measured-host", "fits-normal", "no-wait", "no-budget"],
+)
+def test_named_boundary_launchd_stop_budget_fits(drain, cron, exit_timeout, fits):
+    assert launchd_stop_budget_fits(drain, cron, exit_timeout) is fits
+
+
+def test_boot_loader_warns_when_the_window_cannot_fit_the_configured_cron_drain(monkeypatch, caplog):
+    """Regression for the false green: with restart_drain_timeout=0 the pre-fix code logged
+    'drain 0s fits' over a 30s cron drain and a 5s kill window."""
+    import logging
+
+    import gateway.run_config_loaders as loaders
+
+    monkeypatch.setattr(loaders, "launchd_service_label", lambda *a, **k: "ai.hermes.gateway")
+    monkeypatch.setattr(loaders, "read_launchd_exit_timeout_s", lambda *a, **k: 5.0)
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        budget = loaders.GatewayConfigLoadersMixin._load_launchd_exit_timeout(0.0, 30.0)
+    assert budget == 5.0
+    assert any("cannot fit the configured stop drain" in rec.getMessage() for rec in caplog.records), caplog.text
+    assert not any("fits" in rec.getMessage() and "cannot fit" not in rec.getMessage() for rec in caplog.records)
+
+
+def test_boot_loader_reports_a_fit_without_warning_when_the_window_is_wide(monkeypatch, caplog):
+    import logging
+
+    import gateway.run_config_loaders as loaders
+
+    monkeypatch.setattr(loaders, "launchd_service_label", lambda *a, **k: "ai.hermes.gateway")
+    monkeypatch.setattr(loaders, "read_launchd_exit_timeout_s", lambda *a, **k: 60.0)
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        assert loaders.GatewayConfigLoadersMixin._load_launchd_exit_timeout(0.0, 30.0) == 60.0
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+
+
+def test_capped_drain_is_recorded_durably_in_the_exit_diag_log(tmp_path):
+    """'A drain did not complete before the kill' must be a durable row, not only a log line."""
+    import json
+
+    record_shutdown_drain_capped(
+        configured_drain_s=0.0, effective_drain_s=0.0, cron_drain_s=30.0,
+        launchd_exit_timeout_s=5.0, timed_out=True, active_cron_jobs=10, active_agents=1,
+        home=tmp_path,
+    )
+    log = tmp_path / "logs" / "gateway-exit-diag.log"
+    rows = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+    row = next(r for r in rows if r["tag"] == "gateway.shutdown_drain_capped")
+    assert row["launchd_exit_timeout_s"] == 5.0
+    assert row["cron_drain_s"] == 30.0
+    assert row["timed_out"] is True
+    assert row["active_cron_jobs"] == 10
+    assert row["pid"] > 0
+
+
+def test_capped_drain_record_never_raises_on_a_bad_home(tmp_path):
+    record_shutdown_drain_capped(
+        configured_drain_s=0.0, effective_drain_s=0.0, home=tmp_path / "does" / "not" / "exist",
+    )
