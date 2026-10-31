@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import os
 import sys
 
 from hermes_cli import projects_db as pdb
@@ -87,6 +88,27 @@ def _resolve(conn, ident: str):
     return proj
 
 
+def _require_existing_folder(path, what: str = "folder") -> None:
+    """Refuse a ``path`` that is not an existing directory, naming it.
+
+    A project row pointing at nothing is registry rot: ``show`` prints it, the folder
+    never resolves through ``project_for_path``, and a project-bound kanban task derives
+    a worktree under a directory that does not exist — the failure then surfaces far
+    from the typo that caused it. So the refusal happens at the DOOR (``create`` /
+    ``add-folder`` / ``set-primary``) BEFORE any row is written, which makes a refused
+    verb leave the registry byte-identical.
+
+    Raised as ``ValueError`` so ``_db_command`` reports it as ``project: …`` with exit
+    code 2 — the shape the store's own refusals already use, rather than a second
+    convention for the same class of answer.
+    """
+    if not str(path or "").strip():
+        return
+    norm = os.path.abspath(os.path.expanduser(str(path).strip()))
+    if not os.path.isdir(norm):
+        raise ValueError(f"{what} does not exist on disk: {norm}")
+
+
 def _db_command(fn):
     """Open the DB and run ``fn(args, conn)``; a ``str`` result is printed (rc 0), an ``int`` is the rc;
     a ``ValueError`` prints ``project: …`` and exits 2."""
@@ -132,6 +154,10 @@ def _print_project(proj) -> None:
 
 @_db_command
 def _cmd_create(args, conn) -> int:
+    # The primary is a real folder (or nothing): an explicit ``--primary``, else the
+    # first positional folder, which is what ``create_project`` would mark primary.
+    primary = args.primary or (args.folders[0] if args.folders else None)
+    _require_existing_folder(primary, "primary path")
     pid = pdb.create_project(
         conn, name=args.name, slug=args.slug, folders=args.folders, primary_path=args.primary,
         description=args.description, icon=args.icon, color=args.color, board_slug=args.board,
@@ -167,6 +193,7 @@ def _cmd_show(args, conn, proj) -> int:
 
 @_with_project
 def _cmd_add_folder(args, conn, proj) -> str:
+    _require_existing_folder(args.path)
     path = pdb.add_folder(conn, proj.id, args.path, label=args.label, is_primary=args.primary)
     return f"Added {path} to {proj.slug}"
 
@@ -186,6 +213,9 @@ def _cmd_rename(args, conn, proj) -> str:
 
 @_with_project
 def _cmd_set_primary(args, conn, proj):
+    # Checked before the membership answer, so a folder that has GONE says so instead of
+    # reporting the misleading "is not a folder of <project>".
+    _require_existing_folder(args.path)
     if not pdb.set_primary(conn, proj.id, args.path):
         return _err(f"'{args.path}' is not a folder of {proj.slug}; add it first with `hermes project add-folder`.")
     return f"Set primary of {proj.slug} -> {args.path}"
@@ -208,21 +238,49 @@ def _flag_command(op: str, verb: str):
     return _with_project(lambda args, conn, proj: (getattr(pdb, op)(conn, proj.id), f"{verb} {proj.slug}")[1])
 
 
+def _board_store(board: str):
+    """``(slug, write_board_metadata)`` for a board that EXISTS, else ``ValueError``.
+
+    ``bind-board`` is the one project verb that names a second store, and an
+    unresolvable slug used to be swallowed: the project row took ``board_slug``, the
+    ``default_workdir`` write was skipped, and the command still printed ``Bound …`` —
+    a false green, since nothing was bound and nothing said so. So the slug is resolved
+    and PROBED up front (the caller writes nothing before this returns), and a slug
+    with no store is refused by name.
+
+    ``default`` always exists; any other board exists when its ``board.json`` does,
+    which is the same probe the filing path uses. The wording matches the estate's
+    canonical refusal for this class (``kanban_db_connect``), so a caller meeting it
+    from a project verb and from a kanban verb reads the same sentence.
+    """
+    from hermes_cli import kanban_db as kb
+
+    slug = kb._normalize_board_slug(board)  # a malformed slug raises ValueError too
+    if not slug:
+        raise ValueError(f"invalid board slug: {board!r}")
+    if slug != kb.DEFAULT_BOARD and not kb.board_exists(slug):
+        raise ValueError(
+            f"kanban board {slug!r} does not exist under {kb.boards_root()}; "
+            f"create it with `hermes kanban boards create {slug}`"
+        )
+    return slug, kb.write_board_metadata
+
+
 @_with_project
 def _cmd_bind_board(args, conn, proj) -> str:
+    board = (args.board or "").strip()
+    # Resolve FIRST: a refused slug must leave the project row untouched.
+    resolved = _board_store(board) if board else None
     pdb.update_project(conn, proj.id, board_slug=args.board)
-    if not args.board.strip():
+    if resolved is None:
         return f"Unbound board from {proj.slug}"
-    if proj.primary_path:  # best-effort: point the bound board's default_workdir at the primary repo
+    slug, write = resolved
+    if proj.primary_path:  # point the bound board's default_workdir at the primary repo
         try:
-            from hermes_cli import kanban_db as kb
-
-            slug = kb._normalize_board_slug(args.board)
-            if slug and (slug == kb.DEFAULT_BOARD or kb.board_exists(slug)):
-                kb.write_board_metadata(slug, default_workdir=proj.primary_path)
-        except Exception:
-            pass
-    return f"Bound {proj.slug} -> board {args.board}"
+            write(slug, default_workdir=proj.primary_path)
+        except Exception as exc:  # the bind stands; say the metadata did not, never swallow it
+            print(f"project: board {slug!r} metadata not written: {exc}", file=sys.stderr)
+    return f"Bound {proj.slug} -> board {slug}"
 
 
 _HANDLERS = {

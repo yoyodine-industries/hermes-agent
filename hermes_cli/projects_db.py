@@ -217,6 +217,34 @@ def find_by_primary_path(conn: sqlite3.Connection, path: str, *, include_archive
     return None
 
 
+def find_claiming_project(
+    conn: sqlite3.Connection, path: str, *, exclude_project_id: Optional[str] = None,
+) -> Optional[Project]:
+    """The first (oldest, unarchived) project that already holds ``path`` as a FOLDER.
+
+    ``create_project`` refuses a primary path another project owns, but a non-primary
+    folder had no such check: ``add_folder`` wrote the row, and the same directory then
+    belonged to two projects — so ``project_for_path`` (which resolves the longest
+    folder and otherwise takes what it meets first) answered arbitrarily, and a
+    project-bound kanban task could derive a worktree under a folder two projects
+    claimed. Archived projects do not block: the store's settled rule is that an
+    archived row frees its paths, which is also what ``create_project`` does
+    (``test_create_dedup_ignores_archived_and_other_paths``).
+
+    Comparison is by :func:`_primary_path_key`, so a trailing separator or a different
+    case on a case-insensitive filesystem is the same folder, not a new one.
+    """
+    key = _primary_path_key(path) if path else ""
+    if not key:
+        return None
+    for proj in list_projects(conn):
+        if proj.id == exclude_project_id:
+            continue
+        if any(_primary_path_key(f.path) == key for f in proj.folders):
+            return proj
+    return None
+
+
 def create_project(
     conn: sqlite3.Connection, *, name: str, slug: Optional[str] = None, folders: Optional[Iterable[str]] = None,
     primary_path: Optional[str] = None, description: Optional[str] = None, icon: Optional[str] = None,
@@ -303,12 +331,29 @@ def _execute_rowcount(conn: sqlite3.Connection, sql: str, params) -> int:
 
 
 def add_folder(conn: sqlite3.Connection, project_id: str, path: str, *, label: Optional[str] = None, is_primary: bool = False) -> str:
-    """Add a folder to a project. Returns the normalized path."""
+    """Add a folder to a project. Returns the normalized path.
+
+    Refuses a folder another project already holds (``find_claiming_project``): one
+    directory, one owner. Re-adding a folder this project already has stays a no-op,
+    which is what makes ``add-folder`` idempotent for the caller who just cannot
+    remember what it typed.
+
+    What this does NOT do is require the directory to exist — the store is a registry,
+    and a legitimate caller can describe a folder before it is mounted. The doors that
+    write it on a user's behalf (``hermes project create`` / ``add-folder`` /
+    ``set-primary``) carry that check, so a typo never becomes a row.
+    """
     norm = _normalize_path(path)
     if not norm:
         raise ValueError("folder path must not be empty")
     if get_project(conn, project_id) is None:
         raise ValueError(f"no such project: {project_id}")
+    owner = find_claiming_project(conn, norm, exclude_project_id=project_id)
+    if owner is not None:
+        raise ValueError(
+            f"folder already belongs to project '{owner.slug}' ({owner.id}); "
+            "switch to it instead of creating a duplicate"
+        )
     with write_txn(conn):
         conn.execute(
             "INSERT OR IGNORE INTO project_folders (project_id, path, label, is_primary, added_at) VALUES (?, ?, ?, 0, ?)",
