@@ -11,6 +11,7 @@ whole-file overwrite of content this task never saw or that changed since.
 """
 
 import fnmatch
+import logging
 import os
 from pathlib import Path
 
@@ -26,6 +27,8 @@ from tools.file_tools_paths import (
     _expand_tilde, _resolve_path_for_task, _ssh_path_escapes_home, _terminal_env_type_for_task)
 from tools.file_tools_read_tracking import _has_full_write_baseline, _is_own_blind_patch, _read_mtime_drifted
 import itertools
+
+logger = logging.getLogger(__name__)
 
 # Prefixes matched after realpath. macOS: /private/var mirrors /var — block the
 # sensitive subtrees only; a blanket "/private/var/" refuses every temp-file
@@ -172,6 +175,39 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.")
     return None
+
+
+# ── The consent-gated live surface (design t_cb9259fc, section 3a) ────────────
+# A write landing on a consent-gated live surface -- the root or a profile
+# `config.yaml`, `.env`, a live `SOUL.md`, the plugin trees, a launchd plist -- needs an
+# APPROVED approval whose scope COVERS that surface, cited by the kanban card that owns
+# the session. This is a STANDALONE clause, same tier as
+# `_check_protected_instruction_write`: --yolo, approvals.mode=off, an allowlist and the
+# approval prompt cannot re-open it (a ref never re-opens a hard deny; only the operator
+# or the terminal door with its own consent floor can). Ordering is design section 6:
+# this runs AFTER the hard denies above (they win), and BEFORE the always-ask and
+# approval gates (both still run where they ran -- the clause is additive).
+def _check_consent_surface(paths: list[str], task_id: str = "default",
+                           ctx: object = None) -> str | None:
+    """Refuse a write to a consent-gated live surface the owning card is not licensed for.
+
+    INERT when no kanban card owns the session (``HERMES_KANBAN_TASK`` unset -- a human at
+    the console IS the consent authority) and for every non-surface path. The refusal
+    names the surface, the target, the owning card, the references it cites and the scope
+    token a filer must file under, records ONE deduped receipt on the card and parks it
+    ``blocked``/``needs_input``. ``task_id`` is the TOOL's task key (path resolution); the
+    owning card comes from the guard's own resolution, never from here.
+    """
+    if not paths:
+        return None
+    try:
+        from hermes_cli import consent_surface_doors as doors
+    except ImportError:  # vendored / partial install: post the same inert answer as the siblings
+        logger.warning("consent-surface clause unavailable (import failed): %s",
+                       "hermes_cli.consent_surface_doors", exc_info=True)
+        return None
+    return doors.file_denial([_resolved_or_raw(p, task_id) for p in paths],
+                             ctx=ctx, verb="write")
 
 
 # ── Protected agent-instruction files (always-ask approval gate) ─────────

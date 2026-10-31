@@ -33,6 +33,34 @@ from tools.file_operations_search import SearchMixin
 
 logger = logging.getLogger(__name__)
 
+
+def _consent_surface_error(path: str, verb: str) -> Optional[str]:
+    """The consent-surface clause for the primitive write operations (design t_cb9259fc §9).
+
+    The tool-level chain (``tools/file_tools.py``) refuses a consent-gated live surface
+    before it ever gets here, but these primitives are also reachable WITHOUT that chain --
+    a plugin tool, a new tool added later, anything that holds a ``FileOperations``. So the
+    clause runs at the primitive too, which is what closes the census gap rather than only
+    the two tool call sites: ``write_file``, ``patch_replace``, ``delete_file`` and
+    ``move_file`` all pass through it.
+
+    Ordered AFTER ``get_write_denied_error`` at every call site, so a hard deny keeps
+    winning over an approval ref (a ref never re-opens ``.env`` or the active profile's
+    ``config.yaml``). INERT without an owning kanban card, and for every non-surface path:
+    a store outage can never wedge an ordinary write, only a surface one.
+    """
+    try:
+        from hermes_cli import consent_surface_doors as doors
+    except ImportError:  # partial/vendored install: inert, like the tool-level clause
+        logger.debug("consent-surface clause unavailable on the %s primitive", verb, exc_info=True)
+        return None
+    try:
+        return doors.file_denial([path], verb=verb)
+    except Exception:  # a guard must never take a write down
+        logger.debug("consent-surface clause failed on the %s primitive", verb, exc_info=True)
+        return None
+
+
 # Controller home; SearchMixin reads it (tests monkeypatch it here).
 _HOME = str(Path.home())
 
@@ -1300,6 +1328,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         denied = get_write_denied_error(path, verb="Delete", entry=True)
         if denied:
             return WriteResult(error=denied)
+        denied = _consent_surface_error(path, "Delete")
+        if denied:
+            return WriteResult(error=denied)
         # Path baked in via repr() for shell-independent quoting; no
         # ``unlink(missing_ok=True)`` (a 3.7 remote interpreter lacks it).
         snippet = (
@@ -1337,6 +1368,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         # Entry-level op like delete_file: vet both entries, not just their targets.
         for p in (src, dst):
             denied = get_write_denied_error(p, verb="Move", entry=True)
+            if denied:
+                return WriteResult(error=denied)
+            denied = _consent_surface_error(p, "Move")
             if denied:
                 return WriteResult(error=denied)
         result = self._exec(f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}")
@@ -1507,6 +1541,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         denied = get_write_denied_error(path)
         if denied:
             return WriteResult(error=denied)
+        denied = _consent_surface_error(path, "Write")
+        if denied:
+            return WriteResult(error=denied)
         refused = self._reject_unencodable(path, content)
         if refused is not None:
             return refused
@@ -1606,6 +1643,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         unique unless ``replace_all``). Returns a PatchResult with diff + lint."""
         path = self._expand_path(path)
         denied = get_write_denied_error(path)
+        if denied:
+            return PatchResult(error=denied)
+        denied = _consent_surface_error(path, "Patch")
         if denied:
             return PatchResult(error=denied)
         data, failed = self._read_exact_bytes(path)
