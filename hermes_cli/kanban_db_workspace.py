@@ -775,7 +775,11 @@ def no_repo_refusal(
     return (
         f"{SPAWN_FAILED_NO_REPO_PREFIX}{anchor}; a worktree card materialises "
         f"<repo>/.worktrees/{card}, so its anchor must be inside a git repository and this "
-        f"path is a plain folder.{who} Fix: either {fix_project}, or re-anchor this one card "
+        f"path is a plain folder.{who} Fix, in the order that usually applies: if this "
+        f"project's cards live IN that folder (doc + code projects: no worktree, no clone), "
+        f"anchor the card there instead (hermes kanban create ... --project {slug} "
+        f"--workspace dir:{anchor}) - a plain folder is a legitimate project primary. Only if "
+        f"the cards must carry a worktree: either {fix_project}, or re-anchor this one card "
         f"(hermes kanban retarget {card} --workspace worktree:<git-repo>). A project whose "
         "cards land in SEVERAL repos must name the repo per card rather than declare a "
         "primary folder. Not retried: no retry turns a folder into a repo."
