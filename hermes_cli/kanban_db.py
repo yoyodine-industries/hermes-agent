@@ -261,11 +261,23 @@ def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None
     user and board-metadata mutator fails closed before touching durable state.
     *path* is the board DB / metadata root being mutated; ``None`` means the
     lineage's own board (``kanban_home()``).
-    """
-    from agent.delegation_context import kanban_path_is_fenced
 
-    if kanban_path_is_fenced(kanban_home() if path is None else path):
+    Three arms, all additive (ruling t_fcf7a321, Decision 1): the ContextVar and the
+    ``HERMES_DELEGATED_CHILD_CONTEXT`` marker (both inside :func:`kanban_path_is_fenced`), plus
+    the PROVENANCE arm — a process descended from a LIVE dispatched worker is refused even when
+    the cooperatively-clearable marker has been stripped. Reads never call this.
+    """
+    from agent.delegation_context import (
+        PROVENANCE_REFUSAL_MESSAGE,
+        ancestor_owns_live_kanban_claim,
+        kanban_path_is_fenced,
+    )
+
+    target = kanban_home() if path is None else path
+    if kanban_path_is_fenced(target):
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
+    if ancestor_owns_live_kanban_claim(target):
+        raise PermissionError(PROVENANCE_REFUSAL_MESSAGE)
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:

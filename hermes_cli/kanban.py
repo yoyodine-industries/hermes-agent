@@ -640,7 +640,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
         assignee = _profile_author()
     with kbc.connect_closing() as conn:
         # Cheap mini-dispatch so list reflects dependencies cleared since the last tick.
-        kb.recompute_ready(conn)
+        # A FENCED caller (delegated child, or a shell descended from a LIVE dispatched worker —
+        # ruling t_fcf7a321) lists READ-ONLY: ``recompute_ready`` is housekeeping the board's
+        # OWNER performs every tick, and letting it refuse would fence a read verb, which the
+        # fence must never do. ``connect`` already hands such a caller a read-only connection.
+        try:
+            kb.recompute_ready(conn)
+        except PermissionError:
+            pass
         tasks = kb.list_tasks(
             conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
             include_archived=args.archived, order_by=getattr(args, "sort", None),
