@@ -271,10 +271,19 @@ def _rows_for_card(path: Path, card_id: str) -> list[dict]:
       in the un-checkpointed tail. That is the unsafe direction, so it is never taken.
     * genuinely unreadable (corrupt, absent, not readable by this user): every arm raises and
       the caller reports ``store_unreadable`` exactly as before.
+
+    The fallbacks are gated on the store EXISTING. ``?immutable=1`` opens a path that is not
+    there by creating it -- a write, into the operator's directory, performed by a guard whose
+    whole contract is that it never touches the consent store. So an absent store is not a
+    shape to read around: it re-raises the original ``OperationalError`` and the caller refuses.
+    The handlers below also see a corrupt store, where the failure lands on the query rather
+    than the connect, so "no store" is decided on the path, never on which call raised.
     """
     try:
         return _fetch_rows(path, card_id)
     except sqlite3.OperationalError:
+        if not path.is_file():
+            raise
         if _wal_bytes(path):
             with _snapshot(path) as copy:
                 return _fetch_rows(copy, card_id)

@@ -270,6 +270,42 @@ def test_an_unreadable_store_fails_closed(tmp_path):
     assert (verdict.licensed, verdict.cause) == (False, "store_unreadable")
 
 
+def test_an_absent_store_is_refused_and_never_created(tmp_path, monkeypatch):
+    """RC (round 3): the fallback arms must never touch a store that is not there.
+
+    Measured on the interpreter Hermes runs on (python 3.14.7 / sqlite 3.53.1): the
+    ``?immutable=1`` retry does not fail on an absent path -- sqlite CREATES it. The reader
+    then refused with ``store_unreadable`` and left a 0-byte ``approvals.db`` behind: a new,
+    empty consent store in the operator's directory, made by the one component whose
+    contract forbids touching it. (sqlite 3.54.1 refuses the missing path instead, so the
+    on-disk half of this test alone is build-dependent -- the arm check below is not.)
+
+    The directory is WRITABLE on purpose, so creation would have SUCCEEDED: this asserts
+    what the guard CHOSE to do, not that a permission wall stopped it.
+    """
+    repo = _repo(tmp_path)
+    ops = tmp_path / "ops"
+    ops.mkdir()
+    absent = ops / "approvals.db"
+    monkeypatch.setenv("KANBAN_APPROVALS_DB", str(absent))
+
+    real = lic._fetch_rows
+    arms: list[bool] = []
+
+    def recording(store, card_id, *, immutable=False):
+        arms.append(immutable)
+        return real(store, card_id, immutable=immutable)
+
+    monkeypatch.setattr(lic, "_fetch_rows", recording)
+
+    verdict = lic.license_for([repo / "AGENTS.md"])
+
+    assert (verdict.licensed, verdict.cause) == (False, "store_unreadable")
+    assert arms == [False], "an absent store fell through to a creating open, not refused"
+    assert not absent.exists(), "the reader CREATED the operator's consent store"
+    assert list(ops.iterdir()) == [], "the reader left files behind in the approvals directory"
+
+
 # --- the store's shapes -----------------------------------------------------
 #
 # THE STORE IS A WAL STORE, so "readable" has three shapes and only two of them are the
