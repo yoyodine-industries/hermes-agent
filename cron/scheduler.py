@@ -395,13 +395,19 @@ def _upsert_incident_for_failure(
     already went out) -> suppress the per-run ping. Store errors log at debug; the caller delivers
     as if none existed."""
     try:
-        from cron.incidents import get_incident, upsert_incident
+        from cron.incidents import UNREACHABLE_PATH, get_incident, upsert_incident
 
-        incident_id, _is_new = upsert_incident(
+        incident_id, is_new = upsert_incident(
             job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file)
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
+        # A failure whose incident is NEW (first sighting, or a recurrence after a resolved one)
+        # ACTS: the classes that cannot run file one card routed to the lane that owns the fix.
+        # A repeat tick of a signature already open does not - the card is already there, and a
+        # comment per tick would bury it.
+        if is_new and (incident or {}).get("failure_type") == UNREACHABLE_PATH:
+            _act_on_unreachable_path_failure(job, error, incident_id=incident_id)
         return withheld, incident_id
     except Exception as exc:
         logger.debug(
@@ -410,15 +416,47 @@ def _upsert_incident_for_failure(
         return False, None
 
 
+def _act_on_unreachable_path_failure(
+    job: dict, error: str, *, incident_id: Optional[str] = None
+) -> None:
+    """Best-effort: the ``unreachable_path`` class files its ONE card (``cron/unreachable_path``).
+
+    The act is the terminal failure node for a job that CANNOT run: it routes the card to the
+    lane that owns the missing path and closes it on the job's next success. Every failure in
+    here is already recorded on the incident row by the act itself, so nothing is swallowed;
+    the scheduler's own delivery must not depend on the board being reachable.
+    """
+    try:
+        from cron.unreachable_path import act_on_failure
+
+        act_on_failure(
+            job["id"], str(error or ""), job_name=job.get("name"), incident_id=incident_id)
+    except Exception as exc:
+        logger.debug("unreachable_path act failed for job %s: %s", job["id"], exc)
+
+
 def _resolve_incidents_for_recovered_job(job: dict) -> None:
     """Best-effort: a successful run marks the job's open incidents ``resolved`` (never touches an
     operator ``closed`` ack). Store errors log at debug; delivery is unaffected."""
+    # Close the cards first, while the rows still point at them: the close clears each row's card
+    # stamp, so the incident resolution that follows cannot cost a stale board read.
+    _close_unreachable_path_cards(job)
     try:
         from cron.incidents import close_incidents_for_recovered_job
 
         close_incidents_for_recovered_job(job["id"])
     except Exception as exc:
         logger.debug("Incident store unavailable for job %s (delivery unaffected): %s", job["id"], exc)
+
+
+def _close_unreachable_path_cards(job: dict) -> None:
+    """Best-effort: the job ran OK, so the cards its unreachable-path failures filed are done."""
+    try:
+        from cron.unreachable_path import close_cards_for_recovered_job
+
+        close_cards_for_recovered_job(job["id"])
+    except Exception as exc:
+        logger.debug("unreachable_path recovery failed for job %s: %s", job["id"], exc)
 
 
 def _mark_incident_alerted(incident_id: Optional[str]) -> None:
