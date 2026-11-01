@@ -352,26 +352,79 @@ _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavail
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
 
 
-def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
+def _durable_instruction_license(paths: list[str] | None, task_id: str = "default"):
+    """``(licensed, hint)`` from the DURABLE license (t_28bbf346), or ``(False, "")``.
+
+    The license is an APPROVED approvals row found by ``card_id`` -- the card this write is
+    being done under -- whose scope covers ``project-instruction-file:<repo>``. It is what
+    makes an operator's already-granted consent take effect on an unattended run, where no
+    prompt can ever be answered.
+
+    Never raises, and never decides "allow" on a doubt: whether the module is missing, a git
+    lookup fails or the store cannot be read, the answer is "not licensed" and the caller
+    falls through to the one-operation prompt exactly as before.
+    """
+    if not paths:
+        # No target path means no repo, so no scope token can be named -- never licensed.
+        return False, ""
+    try:
+        from hermes_cli import protected_instruction_license as lic
+    except Exception:  # vendored / partial install: the prompt path is still the door
+        logger.debug("protected-instruction license unavailable (import failed)", exc_info=True)
+        return False, ""
+    try:
+        verdict = lic.license_for(paths, card_id=task_id)
+    except Exception:  # a guard must never take a tool call down
+        logger.exception("protected-instruction license: evaluation failed; failing closed")
+        return False, ""
+    if verdict.licensed:
+        logger.info(lic.format_receipt(verdict, task_id))
+        return True, ""
+    return False, verdict.hint(task_id)
+
+
+def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default",
+                                            *, paths: list[str] | None = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
-    Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
-    allowlists): this gate is one-operation approval EVERY time, no persisted
-    scope, fail-closed without a human channel.
+    TWO ways to be approved, checked in this order:
+
+    1. The DURABLE license (``_durable_instruction_license``, t_28bbf346): an APPROVED
+       approvals row filed under this card whose scope covers
+       ``project-instruction-file:<repo>``. One row licenses one file class in one repo. This
+       is the only road an unattended run has, and it is checked BEFORE any prompt because a
+       prompt it cannot answer would fail the run closed.
+    2. The live one-operation prompt below, for an operator who prefers to answer at the
+       keyboard. Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
+       allowlists): no tapped scope is ever persisted, and the gate fails closed without a
+       human channel.
+
+    When neither applies the refusal names the row shape to file (card_id, status, scope), so
+    the ask can be filed from the refusal instead of from a diagnosis.
     """
+    licensed, license_hint = _durable_instruction_license(paths, task_id)
+    if licensed:
+        return None
+
     targets = ", ".join(dict.fromkeys(reasons))
     description = (
         f"Write to protected agent-instruction file(s): {targets}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve).")
     display = f"<write to {targets}>"
-    blocked = (
+    base = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
         "attempt the same edit via another path (terminal, execute_code, "
         "etc.).")
-    timed_out = blocked.format(why="approval prompt timed out without a user response. Silence is not consent.")
-    denied = blocked.format(why="was denied by the user.")
+
+    def _blocked(why: str) -> str:
+        # Format FIRST, then append the license hint: the hint is operator-facing prose and
+        # must never be read as a format template.
+        return base.format(why=why) + (f"\n{license_hint}" if license_hint else "")
+
+    timed_out = _blocked("approval prompt timed out without a user response. Silence is not consent.")
+    denied = _blocked("was denied by the user.")
 
     try:
         import tools.approval as _approval
@@ -379,7 +432,7 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         from tools.approval_gateway_wait import _await_gateway_decision
         from tools.approval_prompt import prompt_dangerous_approval
     except Exception:
-        return blocked.format(why=_APPROVAL_UNAVAILABLE)
+        return _blocked(_APPROVAL_UNAVAILABLE)
 
     # Gateway surface: block on the button round-trip when a notify callback
     # is registered for this session. One-operation only — no scope buttons.
@@ -400,9 +453,9 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
             "allow_session": False}
         decision = _await_gateway_decision(session_key, notify_cb, approval_data, surface="gateway")
         if decision.get("notify_failed"):
-            return blocked.format(why="requires approval but the approval request could not be delivered.")
+            return _blocked("requires approval but the approval request could not be delivered.")
         if decision.get("cancelled"):
-            return blocked.format(why=f"approval was withdrawn before the user answered ({decision['cancelled']}).")
+            return _blocked(f"approval was withdrawn before the user answered ({decision['cancelled']}).")
         choice, timed = decision.get("choice"), not decision.get("resolved")
     else:
         # CLI surface: per-thread approval callback (prompt_toolkit panel).
@@ -414,12 +467,12 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         if callback is None:
             # No human channel (script, cron, background thread): fail closed —
             # auto-approving here would recreate the persistence vector.
-            return blocked.format(why=_NO_HUMAN)
+            return _blocked(_NO_HUMAN)
         # -q (every kanban worker), cron and unattended platforms can have a callback registered that nobody
         # answers: fail closed now, and never auto-approve, whatever approvals.<context>_mode says.
         from tools.approval_context import _no_user_can_answer
         if _no_user_can_answer():
-            return blocked.format(why=_NO_HUMAN)
+            return _blocked(_NO_HUMAN)
         # Same observer payload as the gateway branch (#131876), fired like the
         # dangerous-command CLI prompt in tools/approval.py.
         hook_kwargs = dict(command=display, description=description, pattern_key="protected_instruction_file",
@@ -429,8 +482,8 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
             display, description, allow_permanent=False, allow_session=False, approval_callback=callback)
         _fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
         if choice == "cancelled":
-            return blocked.format(why="approval prompt could not be delivered or was not answered "
-                                      f"({getattr(choice, 'cause', 'no answer')}).")
+            return _blocked("approval prompt could not be delivered or was not answered "
+                            f"({getattr(choice, 'cause', 'no answer')}).")
         timed = choice == "timeout"
     # Any tapped scope is a one-operation grant; nothing is persisted.
     if not timed and choice in {"once", "session", "always"}:
@@ -440,17 +493,24 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
 
 def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
-    the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
+    the ENTIRE multi-file patch (one prompt, all-or-nothing).
+
+    The MATCHED paths travel with the reasons: the durable license (t_28bbf346) keys on the
+    repository each file lives in, so a reason string (a bare basename) is not enough to ask
+    "is this write licensed?" -- and a path that did not match the gate must never contribute
+    a scope token to the question.
+    """
     enabled, extra, allowlist_dirs = _protected_instruction_config()
     if not enabled:
         return None
-    reasons = [r for r in (_protected_instruction_reason(
-                               p, task_id, enabled=enabled, extra_patterns=extra,
-                               allowlist_dirs=allowlist_dirs)
-                           for p in paths) if r]
-    if not reasons:
+    matched = [(reason, path) for path, reason in (
+        (p, _protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra,
+                                         allowlist_dirs=allowlist_dirs))
+        for p in paths) if reason]
+    if not matched:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    return _request_protected_instruction_approval(
+        [reason for reason, _ in matched], task_id, paths=[path for _, path in matched])
 
 
 def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:
