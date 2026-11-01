@@ -93,6 +93,41 @@ def test_the_missing_path_class_is_judged_before_the_keyword_table():
     assert incidents._classify_failure_type("Script exited with code 1 | stderr: boom") == "script"
 
 
+# The two stderr shapes MEASURED on the live line before this change (card t_fb94d105): the
+# wrapper's own line, a `| stderr: |` double pipe, then the shell's message.
+MEASURED_TIP_GUARD = (
+    "Script exited with code 127 | stderr: | bash: "
+    "/opt/hermes_prod/yaan-platform/cron/tip-guard.sh: No such file or directory"
+)
+MEASURED_VENV_EXEC = (
+    "Script exited with code 127 | stderr: | bash: line 50: exec "
+    "/opt/hermes_prod/shared-venv/bin/python3: No such file or directory"
+)
+
+
+@pytest.mark.parametrize(
+    "error,path",
+    [
+        (MEASURED_TIP_GUARD, "/opt/hermes_prod/yaan-platform/cron/tip-guard.sh"),
+        # The `exec <venv python>` shape carries a `bash: line 50: ` prefix the literal regex
+        # did not cover; the class must not depend on the prefix being absent.
+        (MEASURED_VENV_EXEC, "/opt/hermes_prod/shared-venv/bin/python3"),
+    ],
+)
+def test_the_exact_measured_stderr_shapes_are_this_class(error, path):
+    assert incidents._classify_failure_type(error) == incidents.UNREACHABLE_PATH
+    assert incidents.captured_path(error) == path
+
+
+def test_a_genuine_script_bug_and_a_genuine_config_error_keep_their_own_class():
+    assert incidents._classify_failure_type(
+        "Script exited with code 1 | stderr: Traceback (most recent call last): KeyError: 'x'"
+    ) == "script"
+    assert incidents._classify_failure_type(
+        "Missing credential: OPENROUTER_API_KEY not configured"
+    ) == "config"
+
+
 def test_the_127_exit_alone_is_the_same_class():
     assert incidents.is_unreachable_path("exited 127 after 3s")
     assert incidents.is_unreachable_path("exit code 127")
@@ -207,6 +242,48 @@ def test_other_failure_classes_are_left_to_their_own_owners(monkeypatch, tmp_pat
     sched._upsert_incident_for_failure(_job(), "Script exited with code 1 | stderr: boom")
 
     assert sink.filed == []
+
+
+# The estate's own number: 132 failures across 16 jobs. Sixteen jobs, one broken path each, with
+# the failure count unevenly spread - the card count must be 16, and every card must name the
+# lane that owns that tree.
+_SCALE_PATHS = (
+    ["/opt/hermes_prod/yaan-platform/cron/guard-%d.sh" % i for i in range(5)]
+    + ["/opt/hermes_prod/yaan-cross-markets-research/cron/x-%d.sh" % i for i in range(3)]
+    + ["/opt/hermes_prod/yaan-trading-strategy/scripts/y-%d.py" % i for i in range(2)]
+    + ["/opt/hermes_prod/financially/scripts/z-%d.py" % i for i in range(6)]
+)
+
+
+def test_132_failures_across_16_jobs_file_at_most_16_cards(monkeypatch, tmp_path):
+    assert len(_SCALE_PATHS) == 16
+    _point_db(monkeypatch, tmp_path)
+    sink = RecordingSink()
+    _drive_scheduler_with(sink, monkeypatch)
+
+    jobs = [{"id": "scale-job-%02d" % i, "name": "scale job %d" % i} for i in range(16)]
+    # 132 failures: 8 each (128) plus one extra on the first four jobs.
+    counts = [9, 9, 9, 9] + [8] * 12
+    assert sum(counts) == 132
+
+    for job, path, n in zip(jobs, _SCALE_PATHS, counts):
+        error = (
+            "Script exited with code 127 | stderr: | bash: %s: No such file or directory" % path
+        )
+        for _ in range(n):
+            sched._upsert_incident_for_failure(job, error)
+
+    assert len(sink.filed) == 16, len(sink.filed)
+    assert len({call["idempotency_key"] for call in sink.filed}) == 16
+    owners = sorted(call["assignee"] for call in sink.filed)
+    assert owners.count("platform-stl") == 5
+    assert owners.count("research-stl") == 5
+    assert owners.count("financially-stl") == 6
+    boards = sorted(call["board"] for call in sink.filed)
+    assert boards.count("platform") == 5
+    assert boards.count("research") == 5
+    assert boards.count("financially") == 6
+
 
 
 # ── Recovery ────────────────────────────────────────────────────────────────────────────────
