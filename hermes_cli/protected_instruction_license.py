@@ -46,8 +46,11 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -249,11 +252,39 @@ def _approvals_path(explicit: object = None) -> Path:
 def _rows_for_card(path: Path, card_id: str) -> list[dict]:
     """Read-only: every approvals row filed under ``card_id``, newest id last.
 
-    Read-only on purpose (``mode=ro``): a guard must never create, migrate or groom the
-    operator's consent store. An unreadable store RAISES -- "cannot tell" is not "no row",
-    and the caller's fail-closed direction is the refusal.
+    Read-only on purpose: a guard must never create, migrate or groom the operator's consent
+    store. An unreadable store RAISES -- "cannot tell" is not "no row", and the caller's
+    fail-closed direction is the refusal.
+
+    A store that is merely IDLE is readable, and that is what the fallbacks are for. The
+    approvals store is a WAL store: its ``-wal``/``-shm`` sidecars come and go with its
+    writers, and a read-only open of a sidecar-less store has to BUILD the ``-shm`` -- which
+    sqlite refuses where the store's directory is not writable by us, and on some builds
+    refuses outright (``unable to open database file`` and ``attempt to write a readonly
+    database``, both measured against the live store's shape). That refusal used to be
+    reported as ``store_unreadable``, refusing a write the operator HAD licensed. The order
+    below is the whole rule:
+
+    * sidecars absent (idle): retry ``?immutable=1``, which needs no sidecar and no write access.
+    * a NON-EMPTY ``-wal``: read a COPY of the store and its sidecars. ``immutable=1`` here
+      would answer from the last checkpoint -- missing, and for a license still LICENSING, rows
+      in the un-checkpointed tail. That is the unsafe direction, so it is never taken.
+    * genuinely unreadable (corrupt, absent, not readable by this user): every arm raises and
+      the caller reports ``store_unreadable`` exactly as before.
     """
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+    try:
+        return _fetch_rows(path, card_id)
+    except sqlite3.OperationalError:
+        if _wal_bytes(path):
+            with _snapshot(path) as copy:
+                return _fetch_rows(copy, card_id)
+        return _fetch_rows(path, card_id, immutable=True)
+
+
+def _fetch_rows(store: Path, card_id: str, *, immutable: bool = False) -> list[dict]:
+    """One read-only connect on ``store``; the query is what fails on a bad store."""
+    uri = Path(store).resolve().as_uri() + ("?immutable=1" if immutable else "?mode=ro")
+    con = sqlite3.connect(uri, uri=True, timeout=2.0)
     try:
         con.row_factory = sqlite3.Row
         con.text_factory = lambda b: b.decode("utf-8", "replace")
@@ -265,6 +296,35 @@ def _rows_for_card(path: Path, card_id: str) -> list[dict]:
         return [dict(row) for row in rows]
     finally:
         con.close()
+
+
+def _wal_bytes(path: Path) -> int:
+    """Size of the ``-wal`` sidecar, ``0`` when there is none (or it is empty)."""
+    try:
+        return Path(f"{path}-wal").stat().st_size
+    except OSError:
+        return 0
+
+
+@contextmanager
+def _snapshot(path: Path):
+    """Copy the store and its live sidecars into a private temp dir; yields the copy.
+
+    Pages, then the write-ahead log, then the index: the copy is then a store sqlite can
+    recover normally. ``mkdtemp`` is 0700 and the ``finally`` below removes it -- the consent
+    store is the operator's, so even a transient copy is private and short-lived.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="approvals-read-"))
+    try:
+        copy = workdir / path.name
+        shutil.copy2(path, copy)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{path}{suffix}")
+            if sidecar.exists():
+                shutil.copy2(sidecar, f"{copy}{suffix}")
+        yield copy
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _scope_of_row(row: dict) -> str:

@@ -13,8 +13,10 @@ none of them can license a write by naming a card in an argument -- see
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -69,24 +71,76 @@ def _repo(tmp_path: Path, name: str = REPO, *, origin: str | None = None,
     return root
 
 
-def _store(tmp_path: Path, rows: list[tuple]) -> str:
-    """``rows`` are ``(id, status, idempotency_key, card_id)``; returns the store path."""
+_SCHEMA = (
+    "CREATE TABLE approvals (id INTEGER PRIMARY KEY, project TEXT DEFAULT '', "
+    "status TEXT, decision TEXT, reason TEXT, task TEXT DEFAULT '', "
+    "context TEXT DEFAULT '', idempotency_key TEXT, card_id TEXT, board TEXT, "
+    "superseded_by TEXT)"
+)
+_INSERT = (
+    "INSERT INTO approvals (id, status, decision, reason, task, context, "
+    "idempotency_key, card_id) VALUES (?, ?, ?, '', '', '', ?, ?)"
+)
+
+
+def _store(tmp_path: Path, rows: list[tuple], *, wal: bool = False) -> str:
+    """``rows`` are ``(id, status, idempotency_key, card_id)``; returns the store path.
+
+    ``wal=True`` builds the store in the PRODUCTION shape: the approvals store runs in WAL
+    mode, and a cleanly closed WAL store carries no ``-wal``/``-shm`` sidecars.
+    """
     path = tmp_path / "approvals.db"
     con = sqlite3.connect(path)
-    con.execute(
-        "CREATE TABLE approvals (id INTEGER PRIMARY KEY, project TEXT DEFAULT '', "
-        "status TEXT, decision TEXT, reason TEXT, task TEXT DEFAULT '', "
-        "context TEXT DEFAULT '', idempotency_key TEXT, card_id TEXT, board TEXT, "
-        "superseded_by TEXT)"
-    )
-    con.executemany(
-        "INSERT INTO approvals (id, status, decision, reason, task, context, "
-        "idempotency_key, card_id) VALUES (?, ?, ?, '', '', '', ?, ?)",
-        [(rid, status, status, key, card) for rid, status, key, card in rows],
-    )
+    if wal:
+        assert con.execute("PRAGMA journal_mode=wal").fetchone()[0] == "wal"
+    con.execute(_SCHEMA)
+    con.executemany(_INSERT, [(rid, status, status, key, card) for rid, status, key, card in rows])
     con.commit()
     con.close()
+    if wal:
+        for suffix in ("-wal", "-shm"):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
     return str(path)
+
+
+@contextmanager
+def _write_protected(directory: Path):
+    """Readable and traversable, NOT writable -- the shape of the ops directory.
+
+    The store lives in ``/opt/hermes_prod/yoyodine-web-services/``, which the agent's user does
+    not own. A read-only WAL open has to build the ``-shm`` index, so against such a directory
+    sqlite REFUSES ("unable to open database file" / "attempt to write a readonly database",
+    both measured) -- the live ``store_unreadable``.
+    """
+    os.chmod(directory, 0o555)
+    try:
+        yield directory
+    finally:
+        os.chmod(directory, 0o755)
+
+
+def _log_only_store(tmp_path: Path, rows: list[tuple]) -> Path:
+    """A store whose rows exist ONLY in a non-empty ``-wal``, as a restore leaves it.
+
+    Pages and log are copied while the writer still holds the connection, and the ``-shm`` is
+    not copied: sqlite rebuilds it, but only where it may write.
+    """
+    live = tmp_path / "live" / "approvals.db"
+    live.parent.mkdir()
+    writer = sqlite3.connect(live)
+    assert writer.execute("PRAGMA journal_mode=wal").fetchone()[0] == "wal"
+    writer.execute(_SCHEMA)
+    writer.executemany(_INSERT, [(rid, status, status, key, card) for rid, status, key, card in rows])
+    writer.commit()
+    restored = tmp_path / "restored" / "approvals.db"
+    restored.parent.mkdir()
+    try:
+        assert Path(f"{live}-wal").stat().st_size > 0, "the fixture must keep the log non-empty"
+        shutil.copy2(live, restored)
+        shutil.copy2(f"{live}-wal", f"{restored}-wal")
+    finally:
+        writer.close()
+    return restored
 
 
 def _approved(card: str = CARD, scope: str = TOKEN, rid: int = 756) -> list[tuple]:
@@ -214,6 +268,48 @@ def test_an_unreadable_store_fails_closed(tmp_path):
     (tmp_path / "approvals.db").write_bytes(b"not a database")
     verdict = lic.license_for([repo / "AGENTS.md"])
     assert (verdict.licensed, verdict.cause) == (False, "store_unreadable")
+
+
+# --- the store's shapes -----------------------------------------------------
+#
+# THE STORE IS A WAL STORE, so "readable" has three shapes and only two of them are the
+# opened-with-sidecars case a naive ``mode=ro`` handles. Both production shapes are below.
+
+
+def test_an_idle_wal_store_licenses_the_write(tmp_path, monkeypatch):
+    """(a) THE PRODUCTION SHAPE. WAL mode, cleanly closed, no ``-wal``/``-shm`` sidecars, in a
+    directory the reader cannot write -- exactly the ops store.
+
+    A bare ``mode=ro`` open of this shape cannot build the ``-shm`` and REFUSES (both spellings
+    measured on this host), so a write the operator HAD licensed was reported
+    ``store_unreadable`` and refused. The ``?immutable=1`` arm is what reads it.
+    """
+    ops = tmp_path / "ops"
+    ops.mkdir()
+    path = _store(ops, _approved(), wal=True)
+    assert not Path(f"{path}-wal").exists(), "the fixture must be the idle shape"
+    monkeypatch.setenv("KANBAN_APPROVALS_DB", path)
+    repo = _repo(tmp_path)
+    with _write_protected(ops):
+        assert lic.license_for([repo / "AGENTS.md"]).licensed is True
+        assert guards._check_protected_instruction_write([str(repo / "AGENTS.md")], CARD) is None
+
+
+def test_a_store_whose_rows_live_only_in_a_wal_licenses_the_write(tmp_path, monkeypatch):
+    """(b) THE RESTORED SHAPE: the row exists ONLY in a non-empty ``-wal``, not in the pages.
+
+    ``?immutable=1`` here answers from the last checkpoint -- "no such table", or worse, a row
+    the operator RETIRED in the un-checkpointed tail still licensing. So the store is copied
+    with its log and the COPY is read (the copy sits where sqlite may build its ``-shm``).
+    This test pins that arm: a blind immutable retry goes red on it.
+    """
+    restored = _log_only_store(tmp_path, _approved())
+    monkeypatch.setenv("KANBAN_APPROVALS_DB", str(restored))
+    repo = _repo(tmp_path)
+    with _write_protected(restored.parent):
+        verdict = lic.license_for([repo / "AGENTS.md"])
+        assert verdict.licensed is True, verdict
+        assert guards._check_protected_instruction_write([str(repo / "AGENTS.md")], CARD) is None
 
 
 # --- the gate, at the site the card names -----------------------------------
