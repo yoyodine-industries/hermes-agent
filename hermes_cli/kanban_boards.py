@@ -147,7 +147,8 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
         except Exception:  # health: allow BLE001 -- fail-open (t_fcf7a321): an unreadable estate declaration reports no estate record; the teardown is unchanged
             estate_declared = False
     try:
-        res = kb.remove_board(args.slug, archive=not force_delete)
+        res = kb.remove_board(args.slug, archive=not force_delete,
+                              leave_marker=not estate_declared)
     except ValueError as exc:
         return _err(f"kanban boards rm: {exc}")
     if res["action"] == "archived":
@@ -157,6 +158,7 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
         if estate_declared:
             from hermes_cli import kanban_bulk_guard as kbg
 
+            print("Estate teardown: slug left FREE (no tombstone — the declaration is final).")
             print(f"Estate teardown recorded (actor + reason + verified preimage): "
                   f"{kbg.ledger_path()} · {kbg.audit_path()}")
     else:
