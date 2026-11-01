@@ -276,10 +276,13 @@ lsp:
   # bare path also matches everything beneath it). Use it for the one
   # huge monorepo whose server cannot finish in budget while every other
   # workspace keeps its diagnostics — unlike servers.<id>.disabled,
-  # which switches the server off everywhere. Must be a list; any other
-  # shape logs a warning and skips LSP for every workspace until fixed.
+  # which switches the server off everywhere. A "="-prefixed entry
+  # matches that root EXACTLY and nothing beneath it: the form for a
+  # meta-repo whose tree contains other checkouts that must keep their
+  # own servers. Must be a list; any other shape logs a warning and
+  # skips LSP for every workspace until fixed.
   exclude_roots: []
-  # exclude_roots: ["~/work/huge-monorepo", "/srv/checkouts/*/vendor"]
+  # exclude_roots: ["~/work/huge-monorepo", "/srv/checkouts/*/vendor", "=~/.hermes"]
 
   # Directories whose projects a language server may load code from
   # (see "Workspace trust" above). ~ expanded; everything under an
