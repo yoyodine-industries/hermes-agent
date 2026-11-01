@@ -13,6 +13,11 @@ THE RULING (platform-stl, design authority, carried by ``t_28bbf346``):
    ``card_id`` -- the id of the card the write is being done under. Never by a reference
    appearing in card prose: ``_card_text`` reads a card's title and body only, so a
    consent recorded in a COMMENT never licenses (measured on the live failure).
+   **And the card id is the SESSION's, never the caller's**: it is resolved here from the
+   live context (``HERMES_KANBAN_TASK``, the same reader the consent-surface clause uses),
+   so no argument, and therefore no tool call, can name a card that carries a broad approved
+   row. A caller that names a different card REFUSES (``card_mismatch``): the parameter can
+   only demote a write, never license one. Without a live card there is no license at all.
 3. A row's scope is read as ``project-instruction-file:<repo>``, where the repo is the one
    the file lives in (the trading patch is ``project-instruction-file:yaan-trading-strategy``).
    The broad ``project-instruction-file`` scope covers every repo.
@@ -54,7 +59,10 @@ __all__ = [
     "SURFACE",
     "LicenseVerdict",
     "DEFAULT_APPROVALS_DB",
+    "assess",
+    "format_receipt",
     "license_for",
+    "live_card_id",
     "normalise_repo",
     "repo_identity",
     "scope_token",
@@ -315,13 +323,47 @@ def _statuses(rows: Sequence[dict]) -> str:
 # --- the license -------------------------------------------------------------
 
 
+def live_card_id() -> str:
+    """The card this session is being done under, from the LIVE context -- never an argument.
+
+    ``HERMES_KANBAN_TASK`` is set by the dispatcher when it spawns a worker, and it is the one
+    value a tool call cannot choose: the tool layer resolves it from the session, so an agent
+    calling ``write_file`` has no field to name a card with. The consent-surface clause reads
+    the same context through ``GuardContext.from_env``, and this resolves it the same way so
+    the two doors can never disagree about who owns a write.
+
+    ``""`` when no card owns the session (a console operator IS the consent authority) -- the
+    caller reads that as "no license", never as "no gate".
+    """
+    try:
+        from hermes_cli.consent_surface_guard import GuardContext
+
+        card = getattr(GuardContext.from_env(), "task_id", None)
+    except Exception:  # larger surface unavailable: the env var IS the context
+        card = None
+    return str(card or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+
+
+def _usable_card(card: str) -> bool:
+    """A real card id: not empty, not the guards' ``default`` sentinel, not junk."""
+    return bool(card) and card.lower() != "default" and bool(_CARD_ID.match(card))
+
+
 def license_for(
     paths: Iterable[object],
     *,
-    card_id: object = None,
+    card: object = None,
+    declared: object = None,
     approvals_db: object = None,
 ) -> LicenseVerdict:
     """Is there a durable license covering EVERY one of ``paths``? Never raises.
+
+    THE CARD IS THE SESSION'S, NOT THE CALLER'S. ``card`` is a stand-in for the live context
+    and exists for tests and diagnostics only; production reads :func:`live_card_id`. A caller
+    that names a card cannot license anything: whatever it passes is checked against the live
+    context in ``declared`` and a disagreement REFUSES (``card_mismatch``), so the parameter
+    can only ever demote a write, never license one. Without a live card there is no license
+    at all -- an argument cannot manufacture one.
 
     ONE approval licenses ONE file class in ONE repo, so a multi-file patch needs a covering
     row for each protected file it names -- a patch cannot slip a second repo's instruction
@@ -342,15 +384,25 @@ def license_for(
     if not tokens_t:
         return LicenseVerdict(False, "no_paths")
 
-    card = str(card_id or "").strip()
-    if not card or card.lower() == "default" or not _CARD_ID.match(card):
+    live = str(card if card is not None else live_card_id()).strip()
+    if not _usable_card(live):
         # ``default`` is the guards' "no kanban card owns this session" spelling. A console
         # operator IS the consent authority and is never gated; the license keys on a real
         # card id, and inventing one would license a run nobody filed for.
         return LicenseVerdict(False, "no_card", tokens=tokens_t)
 
+    asked = str(declared or "").strip()
+    if _usable_card(asked) and asked != live:
+        # A caller raised a card id that is not the one this session runs under. The live
+        # context wins and the write is refused -- this is the forge check, and its message
+        # names the card that was ASKED FOR so the mismatch is visible, never silently
+        # substituted.
+        return LicenseVerdict(
+            False, "card_mismatch", tokens=tokens_t,
+            detail=f"the write is being done under {live}; the caller named {asked}")
+
     try:
-        rows = _rows_for_card(_approvals_path(approvals_db), card)
+        rows = _rows_for_card(_approvals_path(approvals_db), live)
     except Exception as exc:  # unreadable store -> fail closed, named cause
         return LicenseVerdict(False, "store_unreadable", tokens=tokens_t,
                               detail=f"{_approvals_path(approvals_db)}: {type(exc).__name__}: {exc}")
@@ -373,17 +425,21 @@ def license_for(
     return LicenseVerdict(True, "licensed", tokens=tokens_t, rows=covering)
 
 
-def refusal_hint(paths: Iterable[object], *, card_id: object = None,
-                 approvals_db: object = None) -> tuple[bool, str]:
-    """``(licensed, hint)`` -- the one call the gate needs; never raises."""
+def assess(paths: Iterable[object], *, declared: object = None,
+           approvals_db: object = None) -> tuple[LicenseVerdict, str]:
+    """``(verdict, live card)`` -- the one call the gate needs; never raises.
+
+    Takes NO card argument on purpose: the card is resolved here, from the live context, so
+    nothing that calls this can name one. ``declared`` is the tool layer's own idea of the
+    card, and it may only ever demote (``card_mismatch``).
+    """
+    card = live_card_id()
     try:
-        verdict = license_for(paths, card_id=card_id, approvals_db=approvals_db)
+        return license_for(paths, declared=declared, approvals_db=approvals_db), card
     except Exception as exc:  # a guard must never take a tool call down
         logger.exception("protected-instruction license: evaluation failed; failing closed")
-        verdict = LicenseVerdict(False, "store_unreadable", detail=f"{type(exc).__name__}: {exc}")
-    if verdict.licensed:
-        return True, ""
-    return False, verdict.hint(card_id)
+        return LicenseVerdict(False, "store_unreadable",
+                              detail=f"{type(exc).__name__}: {exc}"), card
 
 
 def format_receipt(verdict: LicenseVerdict, card_id: object = "") -> str:

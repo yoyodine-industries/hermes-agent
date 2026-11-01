@@ -373,14 +373,14 @@ def _durable_instruction_license(paths: list[str] | None, task_id: str = "defaul
         logger.debug("protected-instruction license unavailable (import failed)", exc_info=True)
         return False, ""
     try:
-        verdict = lic.license_for(paths, card_id=task_id)
+        verdict, card = lic.assess(paths, declared=task_id)
     except Exception:  # a guard must never take a tool call down
         logger.exception("protected-instruction license: evaluation failed; failing closed")
         return False, ""
     if verdict.licensed:
-        logger.info(lic.format_receipt(verdict, task_id))
+        logger.info(lic.format_receipt(verdict, card))
         return True, ""
-    return False, verdict.hint(task_id)
+    return False, verdict.hint(card)
 
 
 def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default",

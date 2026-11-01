@@ -1,8 +1,13 @@
 """The DURABLE consent license for the protected-instruction-file class (t_28bbf346).
 
-The card's acceptance is a LIVE one (the AGENTS.md patch applies under APR-0756 with no
-human at a keyboard); these are its unit-level preconditions. Each test names which of the
+The card's acceptance is a LIVE one (the AGENTS.md patch applies under an approved row with
+no human at a keyboard); these are its unit-level preconditions. Each test names which of the
 card's (a)-(e) it is.
+
+PROVENANCE IS THE POINT. The license keys on the card the SESSION runs under, so the gate
+tests below put this process where the dispatcher puts a worker (``HERMES_KANBAN_TASK``) and
+none of them can license a write by naming a card in an argument -- see
+``test_a_caller_named_card_can_only_demote_never_license``.
 """
 
 from __future__ import annotations
@@ -29,15 +34,19 @@ TOKEN = f"project-instruction-file:{REPO}"
 
 @pytest.fixture(autouse=True)
 def _isolated_store(tmp_path, monkeypatch):
-    """A throwaway home, an empty approvals path and no ambient card/env leakage."""
-    for name in ("KANBAN_APPROVALS_DB", "HERMES_KANBAN_TASK", "HERMES_KANBAN_DB"):
+    """A throwaway home, an empty approvals path, and this process under the correction card.
+
+    Setting ``HERMES_KANBAN_TASK`` here IS the mechanism: it is what the dispatcher sets when
+    it spawns a worker, and it is the only way any test in this file can be licensed.
+    """
+    for name in ("KANBAN_APPROVALS_DB", "HERMES_KANBAN_DB", "HERMES_KANBAN_TASK"):
         monkeypatch.delenv(name, raising=False)
     home = tmp_path / "home"
     (home / ".hermes").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
     monkeypatch.setenv("KANBAN_APPROVALS_DB", str(tmp_path / "approvals.db"))
-    guards.logger.disabled = False
+    monkeypatch.setenv("HERMES_KANBAN_TASK", CARD)
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -122,20 +131,60 @@ def test_a_path_outside_any_repository_has_no_identity(tmp_path):
     assert lic.repo_identity(loose / "AGENTS.md") is None
 
 
+# --- the card's provenance --------------------------------------------------
+
+
+def test_the_live_card_is_read_from_the_session_not_an_argument(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", CARD)
+    assert lic.live_card_id() == CARD
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    assert lic.live_card_id() == ""
+
+
+def test_a_session_with_no_card_cannot_be_licensed_by_an_argument(tmp_path, monkeypatch):
+    """No live card at all: an approved row plus a card argument still licenses nothing."""
+    _store(tmp_path, _approved(card=CARD))
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    repo = _repo(tmp_path)
+    verdict, card = lic.assess([repo / "AGENTS.md"], declared=CARD)
+    assert (verdict.licensed, verdict.cause, card) == (False, "no_card", "")
+
+
+def test_a_caller_named_card_can_only_demote_never_license(tmp_path):
+    """THE PROVENANCE CHECK. The license keys on the session's card, not on an argument.
+
+    The approved row is filed under ``OTHER_CARD`` while this process runs under ``CARD``: a
+    caller that hands the gate ``OTHER_CARD`` must not be licensed by it, and must not reach
+    the prompt either -- it is REFUSED, and the refusal names both cards.
+    """
+    _store(tmp_path, _approved(card=OTHER_CARD))
+    repo = _repo(tmp_path)
+    refusal = guards._request_protected_instruction_approval(
+        ["AGENTS.md"], OTHER_CARD, paths=[str(repo / "AGENTS.md")])
+    assert refusal and "BLOCKED" in refusal
+    assert "the caller named" in refusal
+    assert f"the write is being done under {CARD}" in refusal
+    # the inverse: ``default`` (what the tool layer passes for a session with no claim) neither
+    # licenses nor breaks anything -- this write has no approved row, so it still refuses.
+    assert guards._request_protected_instruction_approval(
+        ["AGENTS.md"], "default", paths=[str(repo / "AGENTS.md")]) is not None
+
+
 # --- the license, unit level ------------------------------------------------
 
 
-def test_card_no_means_no_license(tmp_path):
+def test_card_no_means_no_license(tmp_path, monkeypatch):
     _store(tmp_path, _approved())
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
     repo = _repo(tmp_path)
-    verdict = lic.license_for([repo / "AGENTS.md"], card_id="default")
+    verdict = lic.license_for([repo / "AGENTS.md"])
     assert (verdict.licensed, verdict.cause) == (False, "no_card")
 
 
 def test_a_pending_row_never_licenses(tmp_path):
     _store(tmp_path, [(756, "pending", f"platform\x1f{TOKEN}", CARD)])
     repo = _repo(tmp_path)
-    verdict = lic.license_for([repo / "AGENTS.md"], card_id=CARD)
+    verdict = lic.license_for([repo / "AGENTS.md"])
     assert (verdict.licensed, verdict.cause) == (False, "no_approved_row")
 
 
@@ -146,7 +195,7 @@ def test_a_superseded_approved_row_does_not_license(tmp_path):
     con.commit()
     con.close()
     repo = _repo(tmp_path)
-    verdict = lic.license_for([repo / "AGENTS.md"], card_id=CARD)
+    verdict = lic.license_for([repo / "AGENTS.md"])
     assert verdict.licensed is False
 
 
@@ -155,7 +204,7 @@ def test_one_license_does_not_cover_a_second_repo_in_the_same_patch(tmp_path):
     _store(tmp_path, _approved())
     first = _repo(tmp_path)
     second = _repo(tmp_path, name=OTHER_REPO)
-    verdict = lic.license_for([first / "AGENTS.md", second / "AGENTS.md"], card_id=CARD)
+    verdict = lic.license_for([first / "AGENTS.md", second / "AGENTS.md"])
     assert verdict.licensed is False
     assert verdict.tokens == (f"project-instruction-file:{OTHER_REPO}",)
 
@@ -163,7 +212,7 @@ def test_one_license_does_not_cover_a_second_repo_in_the_same_patch(tmp_path):
 def test_an_unreadable_store_fails_closed(tmp_path):
     repo = _repo(tmp_path)
     (tmp_path / "approvals.db").write_bytes(b"not a database")
-    verdict = lic.license_for([repo / "AGENTS.md"], card_id=CARD)
+    verdict = lic.license_for([repo / "AGENTS.md"])
     assert (verdict.licensed, verdict.cause) == (False, "store_unreadable")
 
 
@@ -238,7 +287,7 @@ def test_a_row_with_no_key_licenses_only_the_full_token_in_its_text(tmp_path):
     """A pre-vocabulary row declares its scope in prose; the FULL token, never the bare one."""
     path = _store(tmp_path, [(756, "approved", "", CARD)])
     repo = _repo(tmp_path)
-    verdict = lic.license_for([repo / "AGENTS.md"], card_id=CARD)
+    verdict = lic.license_for([repo / "AGENTS.md"])
     assert (verdict.licensed, verdict.cause) == (False, "scope_not_covered")
 
     con = sqlite3.connect(path)
@@ -246,17 +295,11 @@ def test_a_row_with_no_key_licenses_only_the_full_token_in_its_text(tmp_path):
                 (f"operator consented to one write under {TOKEN}",))
     con.commit()
     con.close()
-    assert lic.license_for([repo / "AGENTS.md"], card_id=CARD).licensed is True
+    assert lic.license_for([repo / "AGENTS.md"]).licensed is True
 
 
-def test_the_license_never_prompts_and_never_asks_for_a_channel(tmp_path, monkeypatch):
+def test_the_license_never_prompts_and_never_asks_for_a_channel(tmp_path):
     """The licensed road returns before the prompt machinery is even imported."""
     _store(tmp_path, _approved())
     repo = _repo(tmp_path)
-
-    def _explode(*_a, **_k):  # pragma: no cover - only fires on a regression
-        raise AssertionError("the licensed write reached the approval prompt")
-
-    monkeypatch.setattr(guards, "_NO_HUMAN", "sentinel")
     assert guards._check_protected_instruction_write([str(repo / "AGENTS.md")], CARD) is None
-    assert _explode is not None
