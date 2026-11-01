@@ -1990,6 +1990,11 @@ def create_job(
     # Reject gateway-lifecycle commands (respawn loops) here, not just in the CLI: covers the tool.
     from cron.lifecycle_guard import check_gateway_lifecycle
     check_gateway_lifecycle(prompt_text, f["script"])
+    # A row's script is a registration: judge the file the scheduler will run before it is
+    # persisted (card t_a38b4a2f; docs/CARRIER-CONTRACT.md call site (a)). Refuses a shadow
+    # launcher at the door; records what it could not measure rather than passing silently.
+    from cron.carrier_gate import enforce_carrier_contract
+    enforce_carrier_contract(job_id, "cron.create", f["script"], f["monitor_script"])
 
     label_source = (
         prompt_text
@@ -2252,6 +2257,17 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
                 _normalize_job_optional_text(updated.get("script")))
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
+        # The carrier gate judges a write that SETS a script value (card t_a38b4a2f; the merged
+        # record is checked before `save_jobs` below, so a refusal persists nothing). It is
+        # deliberately NOT reached by a bookkeeping update: the FIRE path calls update_job for
+        # delivery and monitor state (cron/scheduler.py:3058,3072, cron/scheduler_delivery.py:1296,
+        # cron/monitor.py:176) and a row that predates the gate must still fire.
+        if "script" in updates or "monitor_script" in updates:
+            from cron.carrier_gate import enforce_carrier_contract
+            enforce_carrier_contract(
+                job_id, "cron.update",
+                _normalize_job_optional_text(updated.get("script")),
+                _normalize_job_optional_text(updated.get("monitor_script")))
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
             # next_run_at now follows the new schedule; a stale quota_hold_until would only shield
