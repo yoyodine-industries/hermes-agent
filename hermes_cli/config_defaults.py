@@ -2451,8 +2451,10 @@ DEFAULT_CONFIG = {
         "broken_retry_seconds": 0.0,
         # Workspace roots (glob patterns, ~ expanded; a bare path also matches everything under
         # it) where no language server runs at all, e.g. one huge monorepo whose server cannot
-        # finish in budget, while every other workspace keeps its diagnostics. Must be a list —
-        # any other shape logs a warning and skips LSP for every workspace until fixed.
+        # finish in budget, while every other workspace keeps its diagnostics. Prefix an entry
+        # with "=" to match that root EXACTLY and nothing beneath it — for a meta-repo whose tree
+        # contains other checkouts (e.g. "=~/.hermes") that must keep their own servers. Must be a
+        # list — any other shape logs a warning and skips LSP for every workspace until fixed.
         "exclude_roots": [],
         # Directories (~ expanded; everything under an entry counts) whose projects a language
         # server may load code from: the project's own .venv/venv interpreter, node_modules
