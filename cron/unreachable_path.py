@@ -62,7 +62,7 @@ PROD_ROOT = PurePosixPath("/opt/hermes_prod")
 #: First component under the prod root -> the lane that owns it.  Everything not named here is
 #: ``DEFAULT_OWNER``: the platform domain owns the substrate every lane runs on, so an unknown
 #: broken path is platform's to diagnose (a wrong owner is recoverable, an unowned card is not).
-OWNER_BY_ROOT = {
+PATH_OWNERS = {
     "yaan-cross-markets-research": "research-stl",
     "yaan-trading-strategy": "research-stl",
 }
@@ -164,7 +164,7 @@ def owner_for_path(path: str) -> str:
     top = rel[0]
     if top.startswith(FINANCIALLY_PREFIX):
         return "financially-stl"
-    return OWNER_BY_ROOT.get(top, DEFAULT_OWNER)
+    return PATH_OWNERS.get(top, DEFAULT_OWNER)
 
 
 def board_for_owner(owner: str) -> str:
