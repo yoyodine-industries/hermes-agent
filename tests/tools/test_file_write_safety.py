@@ -1299,3 +1299,124 @@ def ft_reason(path):
     import tools.file_tools_write_guards as ft
     return ft._protected_instruction_reason(str(path))
 
+
+class TestProtectedInstructionAllowlistIsManagedScopeAware:
+    """The allowlist must decide the SAME in a lane profile and in the root home (t_0f96022e v2).
+
+    The exemption is delivered by the OPERATOR as a managed-scope key, so the guard has to read the
+    EFFECTIVE config (``hermes_cli.config.load_config``), which folds the managed overlay in. Every
+    case in ``TestProtectedInstructionAllowlistDirs`` stubs ``load_config``, so none of them can see
+    that fold: a guard that read the LANE's own ``config.yaml`` directly would pass that whole class
+    and still prompt on every edit in the sanctioned work tree, because no lane profile carries the
+    key. These cases drive the REAL resolver, with ``HERMES_MANAGED_DIR`` pointing at a scratch scope
+    (never ``/etc/hermes``), and assert the identity the design names as the acceptance: root home
+    and lane home reach the same decisions, and a lane with NO managed scope still gates.
+    """
+
+    @pytest.fixture
+    def scope(self, tmp_path, monkeypatch):
+        import hermes_yaml as yaml
+        import hermes_cli.config as cfgmod
+        import hermes_cli.managed_scope as managed_scope
+        import tools.file_tools_write_guards as ft
+
+        sandbox = tmp_path / "hermes_sandbox"
+        prod = tmp_path / "hermes_prod"
+        (sandbox / "platform" / "work" / "platform-coder").mkdir(parents=True)
+        prod.mkdir()
+
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        (managed / "config.yaml").write_text(yaml.safe_dump({"security": {
+            "protected_instruction_files": True,
+            "protected_instruction_allowlist_dirs": [str(sandbox), str(prod)]}}))
+
+        home = tmp_path / "home"
+        root_home = home / ".hermes"
+        lane_home = root_home / "profiles" / "platform-coder"
+        for h in (root_home, lane_home):
+            h.mkdir(parents=True, exist_ok=True)
+            # Neither the root config nor the lane profile carries the key: the managed scope is
+            # the ONLY source of the exemption, which is the shape the operator ships.
+            (h / "config.yaml").write_text(yaml.safe_dump({"security": {
+                "protected_instruction_files": True}}))
+
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        managed_scope.invalidate_managed_cache()
+
+        def decisions(home_dir):
+            """Give every case the same three decisions, resolved from a REAL config read."""
+            monkeypatch.setenv("HERMES_HOME", str(home_dir))
+            managed_scope.invalidate_managed_cache()
+            cfgmod.invalidate_env_cache()
+            return {
+                "config": ft._protected_instruction_config(),
+                "sandbox": ft._protected_instruction_reason(
+                    str(sandbox / "platform" / "work" / "platform-coder" / "AGENTS.md")),
+                "prod": ft._protected_instruction_reason(str(prod / "AGENTS.md")),
+                # the operator's own instruction file is NOT covered by either entry
+                "home": ft._protected_instruction_reason(str(home / "AGENTS.md")),
+                "outside": ft._protected_instruction_reason(str(tmp_path / "elsewhere" / "CLAUDE.md")),
+            }
+
+        return {"root_home": root_home, "lane_home": lane_home, "managed": managed,
+                "sandbox": sandbox, "prod": prod, "home": home,
+                "decisions": decisions, "ft": ft, "managed_scope": managed_scope}
+
+    def test_lane_profile_process_reads_the_managed_allowlist(self, scope):
+        """A lane seat (``HERMES_HOME=<root>/profiles/<name>``) gets the exemption from the admin."""
+        out = scope["decisions"](scope["lane_home"])
+        assert out["config"] == (True, [], [os.path.realpath(str(scope["sandbox"])),
+                                           os.path.realpath(str(scope["prod"]))])
+        assert out["sandbox"] is None
+        assert out["prod"] is None
+        assert out["home"] == "AGENTS.md"
+        assert out["outside"] == "CLAUDE.md"
+
+    def test_root_home_and_lane_home_reach_the_same_decisions(self, scope):
+        """THE acceptance: the guard decides identically whatever home the process resolved."""
+        as_root = scope["decisions"](scope["root_home"])
+        as_lane = scope["decisions"](scope["lane_home"])
+        assert as_root == as_lane
+        # and the identity is not vacuous — every lane of the matrix is exercised
+        assert as_lane["sandbox"] is None and as_lane["prod"] is None
+        assert as_lane["home"] == "AGENTS.md"
+
+    def test_lane_without_a_managed_scope_still_gates(self, scope, monkeypatch):
+        """Control: the exemption is the OPERATOR's, never the lane's own config."""
+        monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+        out = scope["decisions"](scope["lane_home"])
+        assert out["config"] == (True, [], [])
+        assert out["sandbox"] == "AGENTS.md"
+        assert out["prod"] == "AGENTS.md"
+
+    def test_managed_scoped_lane_still_honours_the_extra_patterns(self, monkeypatch, tmp_path):
+        """The managed allowlist widens nothing: a project's ``*-soul.md`` rule is absolute."""
+        import hermes_yaml as yaml
+        import hermes_cli.config as cfgmod
+        import hermes_cli.managed_scope as managed_scope
+        import tools.file_tools_write_guards as ft
+
+        sandbox = tmp_path / "hermes_sandbox"
+        (sandbox / "x").mkdir(parents=True)
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        (managed / "config.yaml").write_text(yaml.safe_dump({"security": {
+            "protected_instruction_files": True,
+            "protected_instruction_extra_patterns": ["*-soul.md"],
+            "protected_instruction_allowlist_dirs": [str(sandbox)]}}))
+        # The tree must live OUTSIDE the root home: ``_hermes_exempt_homes`` exempts the profile's
+        # root (issue #60) before any pattern runs, and a tree under it would prove nothing.
+        lane_home = tmp_path / "home" / ".hermes" / "profiles" / "platform-coder"
+        lane_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(lane_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        managed_scope.invalidate_managed_cache()
+        cfgmod.invalidate_env_cache()
+
+        assert ft._protected_instruction_reason(str(sandbox / "x" / "platform-stl-soul.md")) \
+            == "platform-stl-soul.md"
+        # the built-in basenames in the same tree stay exempt
+        assert ft._protected_instruction_reason(str(sandbox / "x" / "AGENTS.md")) is None
+
