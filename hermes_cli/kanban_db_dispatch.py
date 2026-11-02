@@ -4095,11 +4095,40 @@ TICK_YIELD_ESCALATION_EVENT = "tree_skew_escalated"
 #: (2026-10-11): ~3 minutes at the dispatcher's one-refusal-per-minute cadence.
 TICK_YIELD_ACTOR_THRESHOLD = 3
 
-#: The ops board the acting card is filed on. The dispatcher may be ticking ANY board, but the ops
-#: seat's carrier board is ONE, and filing on the ticked board would mint one card per board for a
+#: The board the tree-skew acting card rides. The dispatcher may be ticking ANY board, but the
+#: fleet's guard cards ride ONE, and filing on the ticked board would mint one card per board for a
 #: single fleet-wide stall (different boards are different DBs, so the idempotency key cannot span
-#: them). Overridable so an acceptance surface can exercise the path without touching the fleet.
-TICK_YIELD_ACTOR_BOARD = os.environ.get("HERMES_KANBAN_TICK_YIELD_BOARD", "migrations")
+#: them).
+#:
+#: AN OVERRIDE SLOT, not the value (card t_5cf2d9fd). It used to BE the value, read ONCE at import
+#: from ``$HERMES_KANBAN_TICK_YIELD_BOARD`` with a hard-coded ``migrations`` fallback -- so the
+#: destination was a property of one process's launch environment, the fallback was a board the
+#: one-board cutover had husked (``dispatch: false``), and the guard card landed where no worker
+#: would claim it. The destination is now RESOLVED on every use by :func:`resolve_actor_board`:
+#: override -> env -> ``kanban.actor_board`` -> :data:`TICK_YIELD_ACTOR_BOARD_DEFAULT`.
+#:
+#: The slot stays a REAL seam because the gate tests and the acceptance surface patch it; it starts
+#: EMPTY so nothing is decided by a constant again.
+TICK_YIELD_ACTOR_BOARD: Optional[str] = None
+
+#: The board assumed when nothing above declares one. ``platform`` is the cutover survivor, the only
+#: board carrying the ``priority_policy`` ladder and the only ``dispatch: true`` board on this
+#: estate -- a husk or an archived board is not a legal target for a guard card.
+TICK_YIELD_ACTOR_BOARD_DEFAULT = "platform"
+
+#: The FIRST hop of the resolution order. Kept, not retired: the gateway plist carries no value, so
+#: the code default is what runs in production, while an acceptance surface can still point the seam
+#: at a scratch board.
+TICK_YIELD_ACTOR_BOARD_ENV = "HERMES_KANBAN_TICK_YIELD_BOARD"
+
+#: ``kanban.actor_board``: the durable spelling of the destination, read the same tolerant way
+#: :func:`_escalation_ledger_source` reads its key.
+TICK_YIELD_ACTOR_BOARD_CONFIG_KEY = "actor_board"
+
+#: The key inside the tick-yield status record carrying the actor-board escalation. That record is
+#: the EXISTING carrier (no new store): its ref is what stops a later reload re-paging the same
+#: invalid episode.
+TICK_YIELD_ACTOR_BOARD_ESCALATION_KEY = "actor_board"
 
 #: --- DEC-2: the freeze-proof DOOR, and DEC-3: retirement --------------------------------
 #: The actor card is the RECORD, not the door. ``dispatch_once`` is the one entry every dispatch
@@ -4435,6 +4464,11 @@ def _record_tick_yield(
         # without opening anything else. The skew record is left byte-identical.
         payload["kind"] = SUBSTRATE_ADMISSION_KIND
         payload["matrix"] = yielded.matrix
+    elif prior.get(TICK_YIELD_ACTOR_BOARD_ESCALATION_KEY):
+        # The actor-board half (card t_5cf2d9fd): carried forward UNCONDITIONALLY, because it belongs
+        # to the DECLARATION, not to a skew episode. Rebuilding the payload without it would drop the
+        # ref on the very next refusal -- and the next escalation would page again.
+        payload[TICK_YIELD_ACTOR_BOARD_ESCALATION_KEY] = prior[TICK_YIELD_ACTOR_BOARD_ESCALATION_KEY]
     return _write_tick_yield_status(payload, path), payload
 
 
@@ -4684,20 +4718,345 @@ def _tick_yield_actor_priority(
         return 0, f"(the ladder could not be read: {exc.__class__.__name__}: {exc})"
 
 
+#: --- The acting-card board: RESOLVED on every use (card t_5cf2d9fd) ------------------------
+#: The destination is a DECISION, not a constant: it is derived from the declaration in force
+#: (override slot -> env -> config -> default) and VALIDATED against the board inventory every time
+#: it is used. Nothing here is cached into correctness -- a board archived, husked or deleted
+#: mid-flight is caught at the next filing, not at the next gateway reload.
+@dataclass(frozen=True)
+class ActorBoard:
+    """Where the fleet's guard cards ride, and how that was decided.
+
+    ``slug`` is the board to USE -- the declared one when it validates, else the fallback.
+    ``declared`` keeps what the source named, so a reader never has to infer from ``verdict``
+    whether the fleet is on the board it declared or on a fallback it did not.
+    """
+
+    slug: str
+    declared: str
+    source: str  # override | env | config | default
+    dispatch: bool  # does the USED board dispatch?
+    verdict: str  # ok | fallback
+    conditions: tuple = ()  # why the DECLARED board was refused, each named separately
+
+
+#: Exactly ONE ``ACTOR BOARD INVALID`` ERROR per process (the 112-line warning pile is the defect
+#: this replaces), and one INFO per (board, source) for a dispatch=false board that is nonetheless
+#: HONOURED. Both are process-local by design; the durable half of an invalid actor board is the
+#: escalation row plus the status record's ref.
+_ACTOR_BOARD_INVALID_LOGGED = False
+_ACTOR_BOARD_DISPATCH_OFF_LOGGED: set = set()
+_ACTOR_BOARD_ANNOUNCED = False
+
+
+def _actor_board_config_declared() -> str:
+    """``kanban.actor_board``, or ``""``. Any failure reads as "not declared", as the ledger does."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = (load_config_readonly() or {}).get("kanban") or {}
+    except Exception:
+        return ""
+    if not isinstance(cfg, dict):
+        return ""
+    value = cfg.get(TICK_YIELD_ACTOR_BOARD_CONFIG_KEY)
+    return str(value).strip() if value else ""
+
+
+def _actor_board_declared() -> tuple[str, str]:
+    """``(slug, source)``: the FIRST declaration in the card's order.
+
+    The override comes first because the gate tests and the acceptance surface patch it, and a
+    resolver that ignored it would silently file those tests' cards on the live default -- a test
+    writing to fleet state. ``source`` is carried into the boot line so a reader sees which rule
+    decided.
+    """
+    override = str(TICK_YIELD_ACTOR_BOARD or "").strip()
+    if override:
+        return override, "override"
+    env = str(os.environ.get(TICK_YIELD_ACTOR_BOARD_ENV) or "").strip()
+    if env:
+        return env, "env"
+    configured = _actor_board_config_declared()
+    if configured:
+        return configured, "config"
+    return TICK_YIELD_ACTOR_BOARD_DEFAULT, "default"
+
+
+def _actor_board_dispatch_enabled(slug: str) -> bool:
+    """``board_dispatch_enabled``, failing OPEN: an unreadable board.json is not evidence of a husk."""
+    try:
+        return bool(_kb.board_dispatch_enabled(slug))
+    except Exception:
+        return True
+
+
+def _actor_board_faults(slug: str, source: str) -> tuple[list, bool]:
+    """Why the DECLARED board may not carry the fleet's cards -- each condition named separately.
+
+    * ``board.json`` absent: the slug is not a registered board (the live ``migrations`` husk has a
+      ``kanban.db`` and no metadata, which is exactly the "exists but nobody serves it" shape);
+    * archived: an archived board is a retired board, whatever its metadata says about dispatch;
+    * ``dispatch: false``: refused for the CONFIG and DEFAULT sources -- a durable declaration must
+      point at a board the dispatcher actually serves. It is HONOURED for the override and env
+      sources, because those are how an acceptance surface (and the gate tests) point the seam at a
+      scratch board; the first use says so at INFO rather than refusing.
+    """
+    faults: list = []
+    try:
+        exists = bool(_kb.board_exists(slug))
+    except Exception:
+        exists = True
+    if not exists:
+        faults.append(f"no board.json: {slug!r} is not a registered board")
+    try:
+        archived = bool(_kb.read_board_metadata(slug).get("archived"))
+    except Exception:
+        archived = False
+    if archived:
+        faults.append(f"board {slug!r} is ARCHIVED")
+    dispatch = _actor_board_dispatch_enabled(slug)
+    if not dispatch and source in ("config", "default"):
+        faults.append(f"board {slug!r} declares dispatch=false (the dispatcher never serves it)")
+    return faults, dispatch
+
+
+def _actor_board_fallback(conn: Optional[sqlite3.Connection] = None) -> str:
+    """THE fallback board, chosen once and deterministically: current board, else the ticked one.
+
+    Deliberately not "the next declaration in the chain": a chain-fallback would make the
+    destination depend on which declarations happen to be present, and it is the destination
+    (not the order) that two dispatcher processes must agree on. Two dispatchers ticking different
+    boards therefore agree on ONE fallback whenever ``current`` is dispatch-enabled -- one stall,
+    one card -- which is the regression t_630f19ad and t_35f10525 recorded.
+    """
+    try:
+        current = str(_kb.get_current_board() or "")
+    except Exception:
+        current = ""
+    if current and _actor_board_dispatch_enabled(current):
+        return current
+    try:
+        ticking = str(_kb.board_for_connection(conn) or "") if conn is not None else ""
+    except Exception:
+        ticking = ""
+    return ticking or current or getattr(_kb, "DEFAULT_BOARD", "default")
+
+
+def _log_actor_board_invalid(
+    declared: str, source: str, faults: list, fallback: str,
+) -> None:
+    """The ONE loud line per process. Later ticks are silent -- a pile of warnings is not a signal."""
+    global _ACTOR_BOARD_INVALID_LOGGED
+    if _ACTOR_BOARD_INVALID_LOGGED:
+        return
+    _ACTOR_BOARD_INVALID_LOGGED = True
+    _kb._log.error(
+        "kanban dispatcher: ACTOR BOARD INVALID -- %r declared by source=%s fails: %s. The fleet's "
+        "tree-skew cards ride the FALLBACK board %r instead. Said once per process; later ticks "
+        "are silent about it.",
+        declared, source, "; ".join(faults), fallback,
+    )
+
+
+def _log_actor_board_dispatch_off(slug: str, source: str) -> None:
+    """A dispatch=false board is HONOURED for override/env, but never silently."""
+    key = (str(slug), str(source))
+    if key in _ACTOR_BOARD_DISPATCH_OFF_LOGGED:
+        return
+    _ACTOR_BOARD_DISPATCH_OFF_LOGGED.add(key)
+    _kb._log.info(
+        "kanban dispatcher: acting-card board %r (source=%s) declares dispatch=false; honoured, "
+        "because an override/env declaration is how an acceptance surface points this seam",
+        slug, source,
+    )
+
+
+def resolve_actor_board(conn: Optional[sqlite3.Connection] = None) -> ActorBoard:
+    """Where the acting cards ride, validated NOW. The verdict is never cached; the slug derives
+    from reads that are already cheap (a config dict, a ``board.json`` per candidate).
+
+    A declaration that fails validation does NOT silently slide to the next one: it falls back to
+    the single deterministic fallback and says so once, because "some other board" is exactly how
+    the guard card ended up on a husk.
+    """
+    declared, source = _actor_board_declared()
+    faults, dispatch = _actor_board_faults(declared, source)
+    if not faults:
+        if not dispatch:
+            _log_actor_board_dispatch_off(declared, source)
+        return ActorBoard(
+            slug=declared, declared=declared, source=source, dispatch=dispatch, verdict="ok",
+        )
+    fallback = _actor_board_fallback(conn)
+    _log_actor_board_invalid(declared, source, faults, fallback)
+    return ActorBoard(
+        slug=fallback, declared=declared, source=source,
+        dispatch=_actor_board_dispatch_enabled(fallback), verdict="fallback",
+        conditions=tuple(faults),
+    )
+
+
+def effective_actor_board(conn: Optional[sqlite3.Connection] = None) -> str:
+    """The slug the acting cards ACTUALLY ride (the fallback when the declaration is invalid)."""
+    return resolve_actor_board(conn).slug
+
+
+#: Back-compat alias for callers written against the old constant's NAME: the value is resolved,
+#: never a module constant. Kept deliberately thin so every caller goes through the resolver.
+def actor_board_slug(conn: Optional[sqlite3.Connection] = None) -> str:
+    return effective_actor_board(conn)
+
+
+def announce_actor_board(conn: Optional[sqlite3.Connection] = None) -> ActorBoard:
+    """The BOOT LINE, exactly one per process -- and the validation that goes with it.
+
+    ``dispatch_once`` calls this: it is the one entry the CLI verb, ``run_daemon`` and the gateway's
+    embedded dispatcher all share, so the line prints on every path rather than on the one launcher
+    somebody remembered to wire. Greppable shape (card t_5cf2d9fd):
+
+    ``kanban dispatcher: ops actor board=<slug> source=<override|env|config|default> dispatch=<yes|no> verdict=<ok|fallback>``
+    """
+    global _ACTOR_BOARD_ANNOUNCED
+    resolved = resolve_actor_board(conn)
+    if not _ACTOR_BOARD_ANNOUNCED:
+        _ACTOR_BOARD_ANNOUNCED = True
+        _kb._log.info(
+            "kanban dispatcher: ops actor board=%s source=%s dispatch=%s verdict=%s",
+            resolved.slug, resolved.source,
+            "yes" if resolved.dispatch else "no", resolved.verdict,
+        )
+    return resolved
+
+
+def _actor_board_episode(resolved: ActorBoard) -> str:
+    """The invalid-episode identity: stable across a reload, so the door is knocked on ONCE."""
+    import hashlib
+
+    digest = hashlib.sha1("; ".join(resolved.conditions).encode("utf-8")).hexdigest()[:10]
+    return f"actor-board:{resolved.declared}:{resolved.source}:{digest}"
+
+
+def _actor_board_escalation_line(resolved: ActorBoard, status_path) -> str:
+    return (
+        f"{TICK_YIELD_PREFIX} kanban dispatcher ACTOR BOARD INVALID: {resolved.declared!r} declared "
+        f"by source={resolved.source} fails ({'; '.join(resolved.conditions)}); the tree-skew "
+        f"acting cards ride the fallback board {resolved.slug!r}. Fix the declaration "
+        f"(kanban.{TICK_YIELD_ACTOR_BOARD_CONFIG_KEY} or {TICK_YIELD_ACTOR_BOARD_ENV}) or restore "
+        f"the board; status record {status_path}"
+    )
+
+
+def _store_actor_board_delivery(delivery: dict, path=None) -> None:
+    """Carry the escalation ref on the tick-yield status record -- deliberately WITHOUT inventing a
+    refusal record when none is open (a record claiming ``yielded`` would read as a skew refusal)."""
+    target = tick_yield_status_path(path)
+    record = _read_tick_yield_status(target)
+    if not record.get("yielded"):
+        _kb._log.info(
+            "kanban dispatcher: actor-board escalation %s has no open status record to ride; the "
+            "registry row is the durable half",
+            delivery.get("ref") or delivery.get("episode"),
+        )
+        return
+    record[TICK_YIELD_ACTOR_BOARD_ESCALATION_KEY] = delivery
+    _write_tick_yield_status(record, target)
+
+
+def _deliver_actor_board_escalation(
+    resolved: ActorBoard, *, status_path=None,
+) -> dict:
+    """The SAME door the tick-yield refusal uses, ONCE per invalid episode, leg order untouched.
+
+    Registry first (``_load_escalation_ledger`` → ``register`` → ``notify``), the peer nudge as leg
+    2 -- exactly :func:`_deliver_tree_skew_escalation`'s shape, with the actor board in the reason
+    and its slug + source in the submission. The ref is then carried on the status record so a later
+    reload does not re-page; the registry's own ``source_id`` (the episode) is the second bound.
+    """
+    at = int(time.time())
+    path = tick_yield_status_path(status_path)
+    episode = _actor_board_episode(resolved)
+    prior = _read_tick_yield_status(path).get(TICK_YIELD_ACTOR_BOARD_ESCALATION_KEY)
+    if isinstance(prior, dict) and prior.get("episode") == episode and prior.get("state") == "sent":
+        return prior
+    line = _actor_board_escalation_line(resolved, path)
+    module, error = _load_escalation_ledger()
+    delivery: dict = {
+        "episode": episode, "at": at, "leg": "peer", "ref": None, "state": "unavailable",
+        "error": error,
+    }
+    if module is not None:
+        try:
+            row = module.register(
+                source_kind=TICK_YIELD_ESCALATION_SOURCE_KIND,
+                source_id=episode,
+                board=resolved.slug,
+                owner_lane=TICK_YIELD_ESCALATION_ASSIGNEE,
+                reason=line,
+                raised_by=TICK_YIELD_ESCALATION_RAISED_BY,
+                issue_class=TICK_YIELD_ESCALATION_ISSUE_CLASS,
+                submission={
+                    "actor_board": resolved.declared,
+                    "source": resolved.source,
+                    "conditions": list(resolved.conditions),
+                    "fallback": resolved.slug,
+                },
+            ) or {}
+            delivery["ref"] = row.get("ref")
+        except Exception as exc:
+            delivery["error"] = f"register: {exc.__class__.__name__}: {exc}"
+        if delivery["ref"]:
+            try:
+                module.notify(delivery["ref"], TICK_YIELD_ESCALATION_ASSIGNEE, line)
+                delivery.update(leg="ledger", state="sent", error=None)
+            except Exception as exc:
+                delivery.update(
+                    leg="ledger", state="failed",
+                    error=f"notify: {exc.__class__.__name__}: {exc}",
+                )
+            _store_actor_board_delivery(delivery, path)
+            return delivery
+    state, peer_error = _peer_run_tree_skew(line, episode)
+    delivery.update(
+        state=state,
+        error="; ".join(part for part in (delivery.get("error"), peer_error) if part) or None,
+    )
+    if state != "sent":
+        _kb._log.warning(
+            "kanban dispatcher: the actor-board door delivered NOTHING for episode %s (leg 2 "
+            "state=%s): %s", episode, state, delivery["error"],
+        )
+    _store_actor_board_delivery(delivery, path)
+    return delivery
+
+
 def _ops_board_connection(fallback_conn: sqlite3.Connection):
     """(conn, board, close_it) for the board the acting card rides.
 
-    The ops board when it can be opened, else the board that was ticking -- and the caller SAYS
+    The RESOLVED board when it can be opened, else the board that was ticking -- and the caller SAYS
     which, in the card, so a fallback is visible rather than silent. The fallback's slug is read
     back off the connection (never assumed) so the card cannot name a board it is not on.
+
+    This is also where an INVALID declaration reaches the door: the actor board is only needed to
+    FILE a guard, so this is the one place where the escalation is both meaningful and carries the
+    open status record the ref rides.
     """
+    resolved = resolve_actor_board(fallback_conn)
+    if resolved.verdict != "ok":
+        try:
+            _deliver_actor_board_escalation(resolved)
+        except Exception:  # health: allow BLE001 -- a door that raises is not a door
+            _kb._log.warning(
+                "kanban dispatcher: the actor-board door raised; carrying on with the fallback "
+                "board %r", resolved.slug, exc_info=True,
+            )
     try:
-        conn = _kbc.connect(board=TICK_YIELD_ACTOR_BOARD)
-        return conn, TICK_YIELD_ACTOR_BOARD, True
+        conn = _kbc.connect(board=resolved.slug)
+        return conn, resolved.slug, True
     except Exception as exc:
         _kb._log.warning(
-            "kanban dispatcher: cannot open the ops board %s for the tree-skew actor (%s); "
-            "filing on the board that ticked", TICK_YIELD_ACTOR_BOARD, exc,
+            "kanban dispatcher: cannot open the acting-card board %s (%s); filing on the board "
+            "that ticked", resolved.slug, exc,
         )
         try:
             fallback_board = _kb.board_for_connection(fallback_conn)
@@ -5277,7 +5636,7 @@ def _deliver_tree_skew_escalation(
             row = module.register(
                 source_kind=TICK_YIELD_ESCALATION_SOURCE_KIND,
                 source_id=episode,
-                board=TICK_YIELD_ACTOR_BOARD,
+                board=actor_board_slug(),
                 owner_lane=TICK_YIELD_ACTOR_ASSIGNEE,
                 reason=line,
                 raised_by=TICK_YIELD_ESCALATION_RAISED_BY,
@@ -5781,6 +6140,19 @@ def dispatch_once(
     this function, so none of them is a hole. The check is once per tick and bounded
     (``hermes_cli.tree_fingerprint``: a stat walk on the steady state), never per card.
     """
+    # WHERE the fleet's guard cards land is said ONCE per process, HERE, because every dispatch
+    # entry point (the CLI verb, ``run_daemon``, the gateway's embedded dispatcher) comes through
+    # this function (card t_5cf2d9fd). Before this the destination was a launcher's environment
+    # variable read at import, so a dispatcher wired without it ran on a husked fallback board and
+    # filed the guard where no worker would claim it. The call also VALIDATES the declaration and
+    # escalates an invalid one once per episode.
+    try:
+        announce_actor_board(conn)
+    except Exception:  # health: allow BLE001 -- the announcement never takes a tick down
+        _kb._log.warning(
+            "kanban dispatcher: could not resolve the acting-card board for the boot line",
+            exc_info=True,
+        )
     # Resolve the board this tick is actually against. The pin/name may be absent
     # (the CLI passes no board=), so read it off the open store — the same mapping
     # ``board_for_connection`` gives, never the ambient current board.

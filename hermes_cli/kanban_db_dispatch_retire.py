@@ -374,13 +374,14 @@ def _retire_tree_skew_actors(
     both doors hands the same set in, so a card both of them can see is attempted once, not twice.
     """
     f = _facade()
+    target = f.actor_board_slug(conn)
     actor_conn, filed_on, close_it = f._ops_board_connection(conn)
-    if filed_on != f.TICK_YIELD_ACTOR_BOARD:
+    if filed_on != target:
         # The actor board could not be opened. Retiring on the board that merely ticked would be a
         # different claim (those cards are not ours to close), so say so and serve the tick.
         _db()._log.warning(
             "kanban dispatcher: tree-skew actor retirement skipped -- the actor board %s is "
-            "unavailable (fell back to %s)", f.TICK_YIELD_ACTOR_BOARD, filed_on,
+            "unavailable (fell back to %s)", target, filed_on,
         )
         if close_it:
             try:
@@ -760,7 +761,7 @@ def _retire_cleared_tree_skew_cards(conn: sqlite3.Connection, *, board: Optional
             "kanban dispatcher: tree-skew guard close failed on %s: %s", board, exc, exc_info=True,
         )
         closed = []
-    if board == f.TICK_YIELD_ACTOR_BOARD or cleared:
+    if board == f.actor_board_slug(conn) or cleared:
         try:
             _retire_tree_skew_actors(conn, board=board, attempted=attempted)
         except Exception as exc:  # health: allow BLE001 -- retirement never breaks a tick
