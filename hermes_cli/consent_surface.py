@@ -9,7 +9,7 @@ park a card, and does not import the guard modules: the FILE door (task 2), the
 TERMINAL/EXEC doors (task 3) and the census (task 4) wire it in and own the
 decision / refusal / receipt half (``surface_decision`` and friends, task 1).
 
-D1 -- the class is CLOSED at six surfaces (``SURFACES``):
+D1 -- the class is CLOSED at seven surfaces (``SURFACES``):
 
     hermes-config        $HERMES_HOME/config.yaml, profiles/*/config.yaml
     hermes-env           $HERMES_HOME/.env, profiles/*/.env
@@ -17,8 +17,24 @@ D1 -- the class is CLOSED at six surfaces (``SURFACES``):
     hermes-plugin        $HERMES_HOME/plugins/**, <install>/plugins/**
     launchd-plist        ~/Library/LaunchAgents/*.plist
     hermes-cli-config    argv ``hermes config set|unset|edit``
+    project-instruction-file  a project's own AGENTS.md/CLAUDE.md/SOUL.md/.cursorrules
 
-Adding a surface is a design change, not a patch.
+Adding a surface is a design change, not a patch.  The seventh was added by the
+ruling on card ``t_cd80bb5a`` (D1): a project instruction file is a prompt-
+persistence surface with no non-interactive exit, so it joins the class that has
+one.  It is the FALLBACK surface -- a target already classified as one of the six
+keeps that token (one target, one token).
+
+The MATCH SET of ``project-instruction-file`` is deliberately NOT defined here.
+It is ``tools.file_tools_write_guards._protected_instruction_reason`` -- the one
+matcher the always-ask gate has always used -- injected by the doors through
+``protected_write=``.  This module stays pure (that matcher reads config and
+resolves symlinks, which is the CALLER's job, see below) and there can never be a
+second matcher to drift from the first.  The refused alternative is named in the
+matcher's own docstring: a ``security.protected_instruction_allowlist_dirs``
+exemption was implemented and then RETIRED by ruling ``t_cd80bb5a`` D2, because a
+directory allowlist answers "can this tree ever be written" when the question is
+"is this one change consented, by this one card, once".
 
 D2 -- scope tokens (what ``SurfaceHit.scope_token`` carries, and what a covering
 APPROVED row must carry; coverage is the decision half's job, not this module's):
@@ -32,6 +48,13 @@ APPROVED row must carry; coverage is the decision half's job, not this module's)
     hermes-plugin        hermes-plugin:<plugin-name>
     launchd-plist        launchd-plist:<basename>
     hermes-cli-config    hermes-config:<dotted.key>   (``hermes-config`` for ``edit``)
+    project-instruction-file  project-instruction-file:<repo-slug>
+
+The last one is always NARROW: the guard tests ``:<repo-slug>`` so a broad
+``project-instruction-file`` row covers it by the prefix rule and a row narrowed
+to one repository is honoured exactly.  A target whose repository cannot be named
+carries ``:unknown`` rather than the bare token -- a missing slug must not turn a
+narrow licence request into a class-wide one.
 
 Root-home files carry ``:root``, never a bare token.  The bare tokens
 (``hermes-config``, ``hermes-env``, ``hermes-soul``) are the whole-domain COVERAGE
@@ -85,10 +108,20 @@ import re
 import shlex
 from dataclasses import dataclass
 
-__all__ = ["SURFACES", "SurfaceHit", "classify_command", "classify_path"]
+__all__ = [
+    "PROJECT_INSTRUCTION",
+    "SURFACES",
+    "SurfaceHit",
+    "classify_command",
+    "classify_path",
+]
 
 
 # --- D1: the closed class ---------------------------------------------------
+
+#: The seventh surface, added by the ruling on card ``t_cd80bb5a`` (D1). Named here
+#: because the guard, the doors and the file door's own clause all spell it.
+PROJECT_INSTRUCTION = "project-instruction-file"
 
 SURFACES: frozenset[str] = frozenset(
     {
@@ -98,6 +131,8 @@ SURFACES: frozenset[str] = frozenset(
         "hermes-plugin",
         "launchd-plist",
         "hermes-cli-config",
+        # t_cd80bb5a D1 -- the class gains the protected-instruction surface.
+        PROJECT_INSTRUCTION,
     }
 )
 
@@ -309,6 +344,43 @@ def _launchd_hit(segs: tuple[str, ...], path_text: str) -> SurfaceHit | None:
     )
 
 
+# --- the protected-instruction fallback (t_cd80bb5a D1) ---------------------
+
+
+def _protected_hit(path_text: str, protected_write) -> SurfaceHit | None:
+    """The ``project-instruction-file`` hit for ``path_text``, or ``None``.
+
+    ``protected_write`` is the CALLER's matcher: it returns the matched label (the
+    basename / pattern that matched) and the repository slug, or ``None`` for a
+    path that is not a protected instruction file. It is injected -- not imported
+    and not re-implemented -- so the class and the always-ask gate keep ONE match
+    set between them, and this module keeps its purity.
+
+    A matcher that raises is treated as "not this surface": classification is total,
+    and a bug in the matcher must not turn every write into a classifier error.
+    """
+    try:
+        found = protected_write(path_text)
+    except Exception:  # noqa: BLE001 -- see the docstring
+        return None
+    if not found:
+        return None
+    if isinstance(found, str):
+        label, slug = found, ""
+    else:
+        try:
+            label, slug = found
+        except (TypeError, ValueError):
+            label, slug = str(found), ""
+    token = f"{PROJECT_INSTRUCTION}:{slug or 'unknown'}"
+    return SurfaceHit(
+        surface=PROJECT_INSTRUCTION,
+        scope_token=token,
+        path=path_text,
+        reason=f"write to the protected instruction file {str(label)!r} ({slug or 'unknown'})",
+    )
+
+
 # --- the path classifier ----------------------------------------------------
 
 
@@ -317,6 +389,7 @@ def classify_path(
     *,
     hermes_home: str | None = None,
     install_root: str | None = None,
+    protected_write=None,
 ) -> SurfaceHit | None:
     """Return the surface a write to ``path`` would touch, or ``None``.
 
@@ -350,6 +423,11 @@ def classify_path(
         hit = _plugin_hit(rel, path_text)
         if hit is not None:
             return hit
+
+    # The seventh surface is the FALLBACK: everything above wins, so a plugin tree's
+    # SOUL.md is a plugin surface, not this one (one target, one token).
+    if protected_write is not None:
+        return _protected_hit(path_text, protected_write)
     return None
 
 
@@ -551,6 +629,7 @@ def classify_command(
     *,
     hermes_home: str | None = None,
     install_root: str | None = None,
+    protected_write=None,
 ) -> SurfaceHit | None:
     """Return the surface a command would write, or ``None``.
 
@@ -559,6 +638,11 @@ def classify_command(
     redirect / tee targets live.  Reads return ``None``: the write SHAPE has to be
     present before any path in the command is treated as a destination, which is
     what keeps ``cat ~/.hermes/.env`` and ``grep config.yaml`` out of the class.
+
+    ``protected_write`` is forwarded to :func:`classify_path` for each write target,
+    which is how the TERMINAL and EXEC doors inherit the seventh surface without a
+    second matcher: ``echo x >> <repo>/AGENTS.md`` is a redirect target like any
+    other, and a read of the same file names no target at all.
     """
     tokens = _tokens(argv if text is None else text)
     command_text = " ".join(tokens) if text is None else str(text)
@@ -575,14 +659,16 @@ def classify_command(
         # ``sed -i``/``perl -i`` name their target as the last positional.
         targets += _positionals(tokens)[-1:]
     for target in targets:
-        hit = classify_path(target, hermes_home=hermes_home, install_root=install_root)
+        hit = classify_path(target, hermes_home=hermes_home, install_root=install_root,
+                            protected_write=protected_write)
         if hit is not None:
             return hit
 
     destination = _copy_destination(tokens)
     if destination is not None:
         hit = classify_path(
-            destination, hermes_home=hermes_home, install_root=install_root
+            destination, hermes_home=hermes_home, install_root=install_root,
+            protected_write=protected_write,
         )
         if hit is not None:
             return hit

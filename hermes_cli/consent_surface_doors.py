@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli import consent_surface as cs
@@ -55,13 +56,21 @@ from hermes_cli import consent_surface_guard as guard
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "PROTECTED_SURFACE",
     "command_denial",
     "file_denial",
     "hit_for_command",
     "hit_for_paths",
     "hit_for_text",
+    "protected_write_target",
     "text_denial",
 ]
+
+#: The seventh surface (ruling ``t_cd80bb5a`` D1). Its coverage is CARD-BOUND, and the
+#: FILE door's own protected-instruction clause owns it: ``_check_consent_surface``
+#: passes ``exclude=(PROTECTED_SURFACE,)`` so the class is refused once, by the clause
+#: that also carries the always-ask gate's own message shape and cause.
+PROTECTED_SURFACE = cs.PROJECT_INSTRUCTION
 
 _TOKEN_RE = re.compile(r"""(['"])(?P<path>[^'"\n]{3,}?)\1""")
 
@@ -131,6 +140,89 @@ def _active(ctx: Any) -> bool:
         return False
 
 
+# --- the protected-instruction matcher (ruling t_cd80bb5a D1) -----------------
+
+#: Where a repository boundary is looked for, walking up from the file. A git
+#: WORKTREE carries a ``.git`` FILE (``gitdir: ...``) and a normal checkout a
+#: directory; both name the tree the lane works in, which is the scope the operator
+#: narrows a licence to.
+_REPO_MARKERS = (".git",)
+#: Segments that never name a repository: the immediate parent of a project-local
+#: ``.hermes/`` target is ``.hermes`` itself, and ``src``/``docs`` are containers.
+_SLUG_FALLBACKS = ("unknown",)
+
+
+def _repo_slug(target: str) -> str:
+    """The repository a protected instruction file belongs to, as a scope slug.
+
+    Nearest ancestor carrying a ``.git`` marker (directory or file -- a worktree has
+    the file form), else the file's own parent directory, else ``unknown``. Sanitised
+    to ``[a-z0-9._-]`` so the slug is one shell-safe token, because it travels in the
+    refusal text and in a filer's ``scope=`` argument.
+
+    Deterministic and cheap on purpose: a slug that moved between calls would make a
+    licence the operator filed stop covering the write it was filed for.
+    """
+    try:
+        path = Path(os.path.realpath(os.path.expanduser(str(target))))
+    except (OSError, ValueError):
+        return _SLUG_FALLBACKS[0]
+    parent = path if path.is_dir() else path.parent
+    slug = ""
+    for candidate in (parent, *parent.parents):
+        try:
+            if any((candidate / marker).exists() for marker in _REPO_MARKERS):
+                slug = candidate.name
+                break
+        except OSError:  # unreadable ancestor: keep walking
+            continue
+    if not slug:
+        slug = parent.name
+    slug = re.sub(r"[^a-z0-9._-]+", "-", slug.strip().lower()).strip("-.")
+    return slug or _SLUG_FALLBACKS[0]
+
+
+def _protected_matcher():
+    """The always-ask gate's OWN matcher, or ``None`` when it is not importable.
+
+    Imported lazily and guarded, exactly like the shared dangerous-command detector,
+    so ``hermes_cli`` keeps working without ``tools`` (vendored use, a partial
+    install) and there is ONE match set for this class rather than a copy that drifts.
+    """
+    try:
+        from tools.file_tools_write_guards import _protected_instruction_reason
+    except Exception:  # noqa: BLE001 -- see the docstring
+        logger.debug("consent-surface doors: protected-instruction matcher unavailable",
+                     exc_info=True)
+        return None
+    return _protected_instruction_reason
+
+
+def protected_write_target(target: Any) -> "tuple[str, str] | None":
+    """``(matched label, repo slug)`` when ``target`` is a protected instruction file.
+
+    The classifier's ``protected_write`` hook for the seventh surface. It adds NO
+    matching of its own: the label comes from ``_protected_instruction_reason``, the
+    one matcher, so ``AGENTS.md`` here and ``AGENTS.md`` at the always-ask gate are
+    the same decision. ``None`` means "not this surface", which is also what an
+    unavailable matcher answers -- the six published surfaces are unaffected.
+    """
+    text = str(target or "").strip()
+    if not text:
+        return None
+    matcher = _protected_matcher()
+    if matcher is None:
+        return None
+    try:
+        label = matcher(text)
+    except Exception:  # noqa: BLE001 -- classification is total
+        logger.debug("consent-surface doors: matcher failed for %r", text, exc_info=True)
+        return None
+    if not label:
+        return None
+    return str(label), _repo_slug(text)
+
+
 # --- the three target readers -------------------------------------------------
 
 def hit_for_paths(
@@ -138,10 +230,20 @@ def hit_for_paths(
     *,
     hermes_home: Optional[str] = None,
     install_root: Optional[str] = None,
+    exclude: Iterable[str] = (),
+    protected_write=protected_write_target,
 ) -> "cs.SurfaceHit | None":
     """The FIRST surface among ``paths``, or ``None``. The first hit wins, so a
-    multi-file patch is refused on the surface it names first."""
+    multi-file patch is refused on the surface it names first.
+
+    ``exclude`` skips surfaces another clause owns: the FILE door passes the
+    protected-instruction surface, because its always-ask clause is the one that
+    consults that surface's CARD-BOUND coverage (D1) and must be the only refusal
+    for it. Scanning continues past an excluded hit, so a patch carrying both a
+    ``config.yaml`` and a project ``AGENTS.md`` is still refused on the former.
+    """
     home, install = _roots(hermes_home, install_root)
+    skip = set(exclude or ())
     for target in paths or ():
         if target is None:
             continue
@@ -149,9 +251,12 @@ def hit_for_paths(
         if not text:
             continue
         try:
-            hit = cs.classify_path(_resolved(text), hermes_home=home, install_root=install)
+            hit = cs.classify_path(_resolved(text), hermes_home=home, install_root=install,
+                                   protected_write=protected_write)
         except Exception:  # classification is total; a bug must not wedge a write
             logger.debug("consent-surface doors: classification failed for %r", text, exc_info=True)
+            continue
+        if hit is not None and getattr(hit, "surface", None) in skip:
             continue
         if hit is not None:
             return hit
@@ -163,15 +268,18 @@ def hit_for_command(
     *,
     hermes_home: Optional[str] = None,
     install_root: Optional[str] = None,
+    protected_write=protected_write_target,
 ) -> "cs.SurfaceHit | None":
     """The surface a shell command would WRITE, or ``None``. Reads return ``None``:
-    the write shape has to be present before a path in the command is a destination."""
+    the write shape has to be present before a path in the command is a destination.
+    ``echo x >> <repo>/AGENTS.md`` is a destination (ruling ``t_cd80bb5a`` D4)."""
     text = str(command or "")
     if not text.strip():
         return None
     home, install = _roots(hermes_home, install_root)
     try:
-        return cs.classify_command(text, text, hermes_home=home, install_root=install)
+        return cs.classify_command(text, text, hermes_home=home, install_root=install,
+                                   protected_write=protected_write)
     except Exception:
         logger.debug("consent-surface doors: command classification failed", exc_info=True)
         return None
@@ -182,6 +290,7 @@ def hit_for_text(
     *,
     hermes_home: Optional[str] = None,
     install_root: Optional[str] = None,
+    protected_write=protected_write_target,
 ) -> "cs.SurfaceHit | None":
     """Best-effort scan of a Python script for a surface write (the EXEC door, section 3c).
 
@@ -207,7 +316,8 @@ def hit_for_text(
     #    cannot see. Reads return None at this layer.
     for candidate in _shell_candidates(text):
         try:
-            hit = cs.classify_command(candidate, candidate, hermes_home=home, install_root=install)
+            hit = cs.classify_command(candidate, candidate, hermes_home=home, install_root=install,
+                                      protected_write=protected_write)
         except Exception:
             hit = None
         if hit is not None:
@@ -218,7 +328,7 @@ def hit_for_text(
         mode = match.group("mode")
         if not any(flag in mode for flag in ("w", "a", "x", "+")):
             continue
-        hit = _classify_path(match.group("path"), home, install)
+        hit = _classify_path(match.group("path"), home, install, protected_write)
         if hit is not None:
             return hit
 
@@ -228,7 +338,7 @@ def hit_for_text(
         literal = match.group("p1") or match.group("p2")
         if not literal:
             continue
-        hit = _classify_path(literal, home, install)
+        hit = _classify_path(literal, home, install, protected_write)
         if hit is not None:
             return hit
 
@@ -238,7 +348,7 @@ def hit_for_text(
         writes = re.search(_PY_WRITE_VIA_NAME_RE.format(*([re.escape(name)] * 4)), text)
         if writes is None:
             continue
-        hit = _classify_path(match.group("path"), home, install)
+        hit = _classify_path(match.group("path"), home, install, protected_write)
         if hit is not None:
             return hit
     return None
@@ -259,9 +369,11 @@ def _shell_candidates(text: str):
             yield literal
 
 
-def _classify_path(literal: str, home: Optional[str], install: Optional[str]) -> "cs.SurfaceHit | None":
+def _classify_path(literal: str, home: Optional[str], install: Optional[str],
+                   protected_write=protected_write_target) -> "cs.SurfaceHit | None":
     try:
-        return cs.classify_path(_resolved(literal), hermes_home=home, install_root=install)
+        return cs.classify_path(_resolved(literal), hermes_home=home, install_root=install,
+                                protected_write=protected_write)
     except Exception:
         logger.debug("consent-surface doors: literal classification failed for %r", literal, exc_info=True)
         return None
@@ -304,15 +416,22 @@ def file_denial(
     verb: str = "Write",
     hermes_home: Optional[str] = None,
     install_root: Optional[str] = None,
+    exclude: Iterable[str] = (),
 ) -> Optional[str]:
     """The FILE door's clause: the refusal string for a surface write, else ``None``.
 
     ``verb`` only labels the door in the log line; the message itself is the guard's
     (surface, target, owning card, its references, the scope token to file).
+
+    ``exclude`` names surfaces whose coverage another clause consults. The FILE door
+    passes ``(PROTECTED_SURFACE,)``: ``_check_protected_instruction_write`` owns that
+    surface, because its licence is CARD-BOUND and it must be refused (or allowed) by
+    exactly one clause, with the always-ask gate's own message and cause.
     """
     if not _active(ctx):
         return None
-    hit = hit_for_paths(paths, hermes_home=hermes_home, install_root=install_root)
+    hit = hit_for_paths(paths, hermes_home=hermes_home, install_root=install_root,
+                        exclude=exclude)
     if hit is None:
         return None
     approved, result = _refusal(hit, ctx)
