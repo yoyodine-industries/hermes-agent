@@ -219,9 +219,14 @@ class HostedRoomService:
                 "This Group Chat is managed by another gateway.")
         return gateway_id, epoch
 
-    def _turn_lock(self, profile: str) -> contextlib.AbstractContextManager[Path]:
+    def _turn_lock(self, profile: str, session: str | None = None) -> contextlib.AbstractContextManager[Path]:
+        """The turn lock for ONE transcript of ``profile`` (``t_47082c1d``).
+
+        ``session`` is a transcript handle (``bot_relay.room_session_key(room_id)``), never the
+        profile: a Group Chat room's turn must not exclude the seat's DM/Desktop turns.
+        """
         from tools.bot_relay import acquire_turn_lock
-        return acquire_turn_lock(self.root, profile)
+        return acquire_turn_lock(self.root, profile, session=session)
 
     def start(self) -> None:
         self.runtime.start()
@@ -564,13 +569,14 @@ class HostedRoomService:
         self.runtime.wakeup()
         return room
 
-    def send(self, *, room_id: str, event_id: str, payload: Any) -> dict[str, Any]:
+    def send(self, *, room_id: str, event_id: str, payload: Any,
+             actor_id: str = "desktop") -> dict[str, Any]:
         normalized = discussion.validate_user_payload(payload)
         gateway_id, epoch = self._owned_authority(room_id)
         from gateway.session_hosted_attachments import append_user_event
         event = append_user_event(
             self, room_id=room_id, event_id=event_id, payload=normalized,
-            gateway_id=gateway_id, epoch=epoch)
+            gateway_id=gateway_id, epoch=epoch, actor_id=actor_id)
         # The committed event is the Send's result: a failure from here on is the room driver's,
         # which runs the same preparation on its next passes and, if it keeps failing, says so in
         # the room once. Raising would tell the client a message it can already see in the room was
