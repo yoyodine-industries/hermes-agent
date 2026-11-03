@@ -257,17 +257,28 @@ def _base_url(peer: dict, profile: str | None) -> str:
     return url
 
 
-def _peer_lacks_profile(exc: Exception) -> bool:
-    """True only for the peer's own "no such profile" verdict: the 404 its /p/<profile>/ prefix
-    middleware returns before any handler runs. A handler's 404 (unknown run or session) carries
-    ``{"error": {"message": ...}}`` and a transport failure is no verdict at all."""
+def _profile_404_message(exc: Exception) -> str | None:
+    """The message a peer's /p/<profile>/ prefix 404 carries, or None when this is not one.
+
+    The prefix middleware answers BEFORE any handler runs, so its body is the peer's own verdict
+    on the address: ``"Unknown or unconfigured profile"`` for a profile it does not have, and a
+    distinct message for one it HAS but does not serve (parked, standalone). A handler's 404
+    (unknown run or session) carries ``{"error": {"message": ...}}`` too, so callers that must
+    separate retention from a refusal read the message, not the shape.
+
+    One read only: an ``HTTPError`` body is a stream, and a second ``read()`` returns empty.
+    """
     if not isinstance(exc, urllib.error.HTTPError) or exc.code != 404:
-        return False
+        return None
     try:
         body = json.loads(exc.read().decode("utf-8", "replace"))
     except (OSError, ValueError):
-        return False
-    return isinstance(body, dict) and body.get("error") == _UNKNOWN_PROFILE_ERROR
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = body.get("error")
+    message = detail.get("message") if isinstance(detail, dict) else detail
+    return message if isinstance(message, str) and message.strip() else None
 
 
 def _resolve_base(peer: dict, profile: str | None, key: str, peer_name: str = "") -> str:
@@ -284,13 +295,21 @@ def _resolve_base(peer: dict, profile: str | None, key: str, peer_name: str = ""
     try:
         _request(f"{base}/health", key)
     except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
-        if _peer_lacks_profile(exc):
+        # The prefix's own verdict, read ONCE (a stream cannot be read twice): the generic
+        # no-such-profile answer is ambiguous and never a reroute, while a distinct refusal means
+        # the peer HAS the profile and will not serve it here — a cold failure, not a delivery.
+        verdict = _profile_404_message(exc)
+        if verdict is not None:
             name = peer_name or "<peer>"
+            if verdict == _UNKNOWN_PROFILE_ERROR:
+                raise LookupError(
+                    f"Peer '{name}' answered that it serves no '{DEFAULT_PROFILE_HANDLE}' profile. That "
+                    f"answer is ambiguous: an up-to-date gateway gives it when it does not serve its "
+                    f"default profile, and an older one also when it has a '{DEFAULT_PROFILE_HANDLE}' "
+                    f"profile it does not serve. If the peer serves its default profile, address that "
+                    f"bot as {name}/default.") from exc
             raise LookupError(
-                f"Peer '{name}' answered that it serves no '{DEFAULT_PROFILE_HANDLE}' profile. That answer "
-                f"is ambiguous: an up-to-date gateway gives it when it does not serve its default profile, "
-                f"and an older one also when it has a '{DEFAULT_PROFILE_HANDLE}' profile it does not serve. "
-                f"If the peer serves its default profile, address that bot as {name}/default.") from exc
+                f"Peer '{name}' does not serve its '{DEFAULT_PROFILE_HANDLE}' profile: {verdict}") from exc
     return base
 
 
