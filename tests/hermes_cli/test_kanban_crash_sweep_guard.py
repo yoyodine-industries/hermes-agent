@@ -448,17 +448,21 @@ def test_the_alert_is_idempotent_inside_the_hour_bucket(board):
 
 
 # ---------------------------------------------------------------------------------------------
-# The acting card's dedupe key is the tick-INVARIANT identity of the condition
+# The acting card's dedupe key is the tick-INVARIANT SHAPE of the condition
 #
 # Measured in production 2026-10-30: the refusal actor re-filed on EVERY tick. The dispatcher
 # ticks every ~63 s and the signature it keyed on carried `ended_at`, so each tick minted a new
 # key, the "existing" lookup never hit, and a sustained refusal produced one card per tick rather
-# than one card per hour. These pin the key/signature split that ends it.
+# than one per hour. The first fix dropped `ended_at` but KEPT `count`, which re-minted the key the
+# moment the held count moved inside one episode (measured 2026-11-02: 14 cards in 13 minutes for a
+# single episode, each one spawning a platform-stl worker). These pin the key to the shape, and pin
+# the repeat trail to the one card the episode owns.
 # ---------------------------------------------------------------------------------------------
 
 _TICK_INSTANT = 1791659000  # inside the hour bucket [1791658800, 1791662400)
 _TICK_SECONDS = 63  # the dispatcher's measured tick interval
 _HOUR_SECONDS = guard._ACTOR_WINDOW_SECONDS
+_BUCKET = _TICK_INSTANT // _HOUR_SECONDS * _HOUR_SECONDS
 
 
 def _refused_sweep(conn, count, *, now):
@@ -482,33 +486,106 @@ def _mass_crash_actors(conn):
     ).fetchall()
 
 
-def test_the_refusal_actor_files_once_an_hour_though_every_tick_has_its_own_signature(board):
+def _repeat_payloads(conn, task_id):
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY rowid",
+        (task_id, guard.MASS_CRASH_SWEEP_REFUSED_AGAIN_EVENT),
+    ).fetchall()
+    return [json.loads(row["payload"]) for row in rows]
+
+
+def test_one_episode_files_one_card_however_the_count_and_clock_move(board):
+    """11 -> 5 -> 3 inside one hour is ONE episode: one card, keyed on the shape alone."""
     conn = board
-    first, first_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
-    later, later_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _TICK_SECONDS)
+    first, first_id = _refused_sweep(conn, 11, now=_TICK_INSTANT)
+    second, second_id = _refused_sweep(conn, 5, now=_TICK_INSTANT + _TICK_SECONDS)
+    third, third_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + 2 * _TICK_SECONDS)
 
-    # The condition is unchanged but the TICK differs, so the recorded signatures differ ...
-    assert first.verdict.signature != later.verdict.signature
-    assert first.verdict.ended_at != later.verdict.ended_at
-    assert first.verdict.count == later.verdict.count
+    # The ticks differ in both the clock and the count, so the recorded signatures all differ ...
+    assert len({first.verdict.signature, second.verdict.signature, third.verdict.signature}) == 3
+    assert first.verdict.ended_at != third.verdict.ended_at
+    assert (first.verdict.count, second.verdict.count, third.verdict.count) == (11, 5, 3)
 
-    # ... and the card must NOT: one condition, one card, inside one hour bucket.
-    assert later_id == first_id
+    # ... and the card must NOT: one episode, one card, inside one hour bucket.
+    assert {second_id, third_id} == {first_id}
     actors = _mass_crash_actors(conn)
     assert len(actors) == 1, "a sustained refusal pages once per hour, not once per 63 s tick"
-    assert "ended_at=" not in actors[0]["idempotency_key"], (
-        "the dedupe key must carry the condition, never the tick instant"
+    key = actors[0]["idempotency_key"]
+    assert "ended_at=" not in key, "the dedupe key must never carry the tick instant"
+    assert "count=" not in key, "the dedupe key must never carry a count that moves inside an episode"
+    assert key == f"mass-crash:mass-crash-sweep:default:{_BUCKET}"
+
+    # The first tick filed the card, so THAT is the tick the card's own words report.
+    assert "REFUSED: >= 11 runs" in actors[0]["title"]
+    assert ">= 5 runs" not in actors[0]["title"]
+
+    # The later ticks cost no cards but are not lost: each appends its own facts to that one card,
+    # so the operator still sees 11 -> 5 -> 3 and the tick instants behind them.
+    repeats = _repeat_payloads(conn, first_id)
+    assert [p["count"] for p in repeats] == [5, 3]
+    assert [p["ended_at"] for p in repeats] == [
+        _TICK_INSTANT + _TICK_SECONDS, _TICK_INSTANT + 2 * _TICK_SECONDS,
+    ]
+    assert all("held" in p and "held_shapes" in p for p in repeats)
+
+
+def test_a_repeat_leaves_the_existing_card_in_whatever_state_it_holds(board):
+    """The repeat trail is evidence, never a status change: a claimed card keeps its claim."""
+    conn = board
+    _, first_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
+    conn.execute(
+        "UPDATE tasks SET status = 'running', worker_pid = 4242, claim_lock = 'held' "
+        "WHERE id = ?",
+        (first_id,),
+    )
+    conn.commit()
+
+    _, repeat_id = _refused_sweep(conn, 5, now=_TICK_INSTANT + _TICK_SECONDS)
+
+    assert repeat_id == first_id
+    row = conn.execute(
+        "SELECT status, worker_pid, claim_lock FROM tasks WHERE id = ?", (first_id,),
+    ).fetchone()
+    assert (row["status"], row["worker_pid"], row["claim_lock"]) == ("running", 4242, "held")
+    assert [p["count"] for p in _repeat_payloads(conn, first_id)] == [5]
+
+
+def test_the_next_hour_bucket_files_a_second_card(board):
+    """The episode expires with its bucket: the next hour pages again, on a new key."""
+    conn = board
+    _, first_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
+    _, next_hour_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _HOUR_SECONDS)
+
+    assert next_hour_id != first_id
+    actors = _mass_crash_actors(conn)
+    assert len(actors) == 2
+    assert actors[0]["idempotency_key"] != actors[1]["idempotency_key"]
+    # A card in a NEW bucket has no repeat trail of its own -- nothing was deduped into it.
+    assert _repeat_payloads(conn, next_hour_id) == []
+    assert _repeat_payloads(conn, first_id) == []
+
+
+def test_a_second_board_gets_its_own_card(board):
+    """One card per board: a refusal on two boards is two conditions, not one."""
+    conn = board
+    task_ids = [kb.create_task(conn, title="job", assignee="worker") for _ in range(3)]
+    assessment = guard.assess_sweep(
+        [_closure(tid) for tid in task_ids], write_shape="epoch-cs/2", now=_TICK_INSTANT,
+    )
+    assert assessment.verdict.abort is True
+    first_id = guard.alert_sweep_guard(
+        conn, assessment, tree="fixture-tree", board="platform", now=_TICK_INSTANT,
+    )
+    second_id = guard.alert_sweep_guard(
+        conn, assessment, tree="fixture-tree", board="other", now=_TICK_INSTANT,
     )
 
-    # A materially worse condition inside the same hour still pages: 3 -> 5 unexplained deaths.
-    escalated, escalated_id = _refused_sweep(conn, 5, now=_TICK_INSTANT + 2 * _TICK_SECONDS)
-    assert escalated_id != first_id, "an escalated count is a different condition"
-    assert len(_mass_crash_actors(conn)) == 2
-
-    # The NEXT hour bucket pages again for the original condition.
-    next_hour, next_hour_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _HOUR_SECONDS)
-    assert next_hour_id not in {first_id, escalated_id}
-    assert len(_mass_crash_actors(conn)) == 3
+    assert first_id and second_id and first_id != second_id
+    keys = {row["idempotency_key"] for row in _mass_crash_actors(conn)}
+    assert keys == {
+        f"mass-crash:mass-crash-sweep:platform:{_BUCKET}",
+        f"mass-crash:mass-crash-sweep:other:{_BUCKET}",
+    }
 
 
 def test_the_actor_card_still_evidence_the_tick_it_came_from(board):

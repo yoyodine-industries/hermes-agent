@@ -208,6 +208,18 @@ MASS_CRASH_HELD_ACTOR_TITLE = (
 MASS_CRASH_ACTOR_EVENT = "mass_crash_sweep_actor_filed"
 MASS_CRASH_ACTOR_IDEMPOTENCY_PREFIX = "mass-crash:"
 
+#: Appended to the EXISTING actor card when a LATER tick refuses inside the same hour bucket on the
+#: same board. The episode is the same one, so it costs zero extra cards -- but the newer tick's
+#: facts (count, ended_at, held rows) are still recorded, because the held count moves inside one
+#: episode (11 -> 5 -> 3) and the operator needs to see it.
+MASS_CRASH_SWEEP_REFUSED_AGAIN_EVENT = "sweep_refused_again"
+
+#: The tick-INVARIANT part of the refusal actor's idempotency key: the condition's SHAPE only.
+#: Neither `ended_at` (the tick instant, ~63 s apart) nor `count` (which moves inside one episode)
+#: belongs in it -- either one re-mints the key on every dispatcher tick and turns one episode into
+#: one card per tick. Measured 2026-10-24: 14 cards in 13 minutes for a single episode.
+MASS_CRASH_ACTOR_KEY_SIGNATURE = MASS_CRASH_SIGNATURE_PREFIX.rstrip(":")
+
 #: The verdicts that mean "the process is gone" WITHOUT evidence of their own -- the only class a
 #: broken liveness witness can forge. See the module docstring.
 UNEXPLAINED_DEATH_KINDS = frozenset({"unknown", "nonzero_exit", "signaled"})
@@ -456,6 +468,25 @@ def _actor_key(prefix: str, signature: str, board_key: str, now: int) -> str:
     return f"{prefix}{signature}:{board_key}:{bucket}"
 
 
+def _append_repeat_evidence(
+    conn: Any, task_id: str, event: str, payload: dict, board_key: str,
+) -> None:
+    """Record a repeated tick's facts on the card that already carries the episode.
+
+    Evidence only: like :func:`record_refusal_evidence` this never mutates status, claim or run
+    rows, and a board that refuses the write is logged rather than allowed to take the tick down.
+    """
+    from hermes_cli import kanban_db as kb
+
+    try:
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, event, dict(payload, board=board_key))
+    except Exception as exc:
+        logger.warning(
+            "kanban crash-sweep guard: could not append %s evidence to %s: %s", event, task_id, exc,
+        )
+
+
 def _file_actor(
     conn: Any,
     *,
@@ -468,17 +499,22 @@ def _file_actor(
     board: Optional[str] = None,
     now: Optional[int] = None,
     key_signature: Optional[str] = None,
+    repeat_event: Optional[str] = None,
 ) -> Optional[str]:
     """File EXACTLY ONE acting card for a condition, idempotently, best-effort.
 
     The idempotency key (``<prefix><key_signature>:<board>:<hour-bucket>``) is the whole mechanism:
     N ticks hitting the same condition resolve to one card, and the condition can page again in the
     NEXT hour. That holds only when ``key_signature`` names a **tick-invariant** identity of the
-    condition. The default is ``signature``, so a caller whose signature embeds the tick instant
-    (``ended_at``) must pass the invariant part as ``key_signature`` and keep the tick in
-    ``signature`` -- which is what the body and the event payload record as evidence. Otherwise
-    every tick mints a new key and files its own card. A board that refuses the write is logged
-    with the key it could not file and never takes the tick down.
+    condition -- neither the tick instant (``ended_at``) nor a value that moves inside one episode
+    (``count``) may appear in it; those stay in ``signature``, which the body and the event payload
+    record as evidence. Otherwise every tick mints a new key and files its own card.
+
+    A key that ALREADY has a card is the same episode: no second card is filed. Its newer facts are
+    appended to that card as ``repeat_event`` (a board event, never a status change), so a refusal
+    that repeats inside the bucket still leaves a countable trail and costs zero extra cards. A
+    board that refuses the write is logged with the key it could not file and never takes the tick
+    down.
     """
     from hermes_cli import kanban_db as kb
 
@@ -492,7 +528,10 @@ def _file_actor(
             (key,),
         ).fetchone()
         if existing is not None:
-            return existing["id"]
+            existing_id = existing["id"]
+            if repeat_event:
+                _append_repeat_evidence(conn, existing_id, repeat_event, event_payload, board_key)
+            return existing_id
         actor_id = kb.create_task(
             conn,
             title=title,
@@ -552,18 +591,19 @@ def alert_sweep_guard(
         "held:" + ",".join(assessment.held_shapes)
     )
     # The KEY is the tick-INVARIANT identity of the condition; the signature -- which carries the
-    # tick instant -- stays what the body and the event record as evidence. Without this split a
-    # sustained refusal files one card per tick (~63 s), because every tick mints its own
-    # `ended_at` and therefore its own key. `count` stays IN the key: an escalation 3 -> 5 inside
-    # the same hour is a materially worse condition and must still page.
-    key_signature = (
-        f"{MASS_CRASH_SIGNATURE_PREFIX}count={verdict.count}" if verdict.abort else actor_signature
-    )
+    # tick instant -- stays what the body and the event record as evidence. The key carries NEITHER
+    # `ended_at` (a new value every ~63 s tick) NOR `count` (which moves inside one episode, 11 -> 5
+    # -> 3): either one re-mints the key per tick and turns one mass-crash episode into one guard
+    # card per tick -- measured 2026-10-24 as 14 cards in 13 minutes for a single episode, and each
+    # card spawned a full platform-stl worker. One episode is one board, one hour bucket, one shape.
+    # The newer tick's count/ended_at/held-rows are appended to that one card instead.
+    key_signature = MASS_CRASH_ACTOR_KEY_SIGNATURE if verdict.abort else actor_signature
     return _file_actor(
         conn,
         prefix=MASS_CRASH_ACTOR_IDEMPOTENCY_PREFIX,
         signature=actor_signature,
         key_signature=key_signature,
+        repeat_event=MASS_CRASH_SWEEP_REFUSED_AGAIN_EVENT if verdict.abort else None,
         title=(
             MASS_CRASH_ACTOR_TITLE.format(count=verdict.count, threshold=verdict.threshold)
             if verdict.abort
