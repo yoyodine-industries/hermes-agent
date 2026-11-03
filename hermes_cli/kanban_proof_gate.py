@@ -281,6 +281,28 @@ _PHANTOM_SHAPE = (
 #: How many measured paths a refusal message prints before it elides the rest.
 _PATH_LIST_CAP = 12
 
+#: The THIRD landing class (card t_c0cd1aba): bytes that ARE on the line and live, but whose
+#: merge wrote no ledger receipt. It is never a default — a proof that declares a ``landing``
+#: block never takes it, and every fact it stands on is measured by the gate itself.
+_ALREADY_LIVE = "already-live"
+
+#: The class label recorded in ``facts["landing_class"]`` for the OTHER routes, so a census can
+#: count how often the fallback fires against the ordinary ones. Keyed by ``landing_source``.
+_LANDING_CLASSES = {
+    "ledger": "landed",
+    "live-tree": "live-tree",
+    "deploy-stamp": "deploy-stamp",
+    "mtime": "mtime",
+}
+
+#: The already-live class's own clauses, for the refusal RENDERER's remedy text.
+_ALREADY_LIVE_CAUSES = frozenset({
+    "already_live_unverifiable",
+    "already_live_receipt_refused",
+    "already_live_not_landed",
+    "already_live_unproven",
+})
+
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _CARD_TOKEN = re.compile(r"t_[0-9a-f]{4,}")
 
@@ -332,6 +354,14 @@ _CAUSES = (
     "proof_predates_landing",
     "run_not_green",
     "live_tree_unproven",
+    # The already-live class's own clauses (card t_c0cd1aba). They are reported only by that
+    # class, and only where it is the class's own deficit that failed: a missing or red or
+    # predating probe keeps the ordinary run/probe clause, and bytes that are not the commit's
+    # keep ``artifact_hash_mismatch``.
+    "already_live_unverifiable",
+    "already_live_receipt_refused",
+    "already_live_not_landed",
+    "already_live_unproven",
     # The fan-out-phantom arm's clauses (card t_e7f27489). They are an ALTERNATIVE door, not a
     # landed clause: a phantom verdict returns before any artifact/landing/run judgment, so
     # these can never be reported beside the clauses above.
@@ -354,6 +384,13 @@ _CAUSE_PRECEDENCE = (
     "landing_unresolved",
     "landing_not_admitted",
     "landing_live_tree_denied",
+    # The already-live class's clauses rank with the landing group: they answer the same
+    # question (did these bytes land, and when), and the fix for each is the same kind of
+    # act — pin the commit that IS on the line, repair the receipt, or probe the bytes.
+    "already_live_not_landed",
+    "already_live_receipt_refused",
+    "already_live_unverifiable",
+    "already_live_unproven",
     # A store OUTAGE (``run_store_unavailable``) outranks ``run_unknown``: the first says the
     # instrument could not answer AND no receipt stood, the second says the store DID answer
     # and holds no such run. Both rank below the timing clause, as before -- when a receipt
@@ -403,6 +440,14 @@ PROOF_SHAPE = (
     '"<merged commit>:<path in repo>", "repo": "<abs work tree, only when the '
     'deployed path is not itself inside a checkout>"} instead of the hash: the live '
     'file must BE the blob at that commit) '
+    '(for bytes whose merge wrote NO receipt at all — a direct push, a force move, or a '
+    'receipt the ledger refused — declare NO "landing" block, give EVERY artifact a "blob" '
+    'pin, and a probe dated after the commit\'s committer date carrying "observations": the '
+    'gate then MEASURES that the commit is an ancestor of the line this checkout deploys '
+    'from, that the live file is that commit\'s blob, and that the probe postdates it — '
+    'the already-live class, recorded as facts.landing_class="already-live" and dating the '
+    'landing from the commit itself. A refused landing receipt for the same commit DENIES '
+    'it, and an admitted one wins the landing instant) '
     '(EVERY artifact must also name a DURABLE REFERENT the gate can re-resolve, or it is '
     'refused "artifact_unpinned": a "blob" above, or an ADMITTED ledger landing ref for the '
     'bytes, or for the ledger-less live-tree class a "record": '
@@ -1228,7 +1273,244 @@ def _artifact_refusals(entries: list, facts: dict, *, ledger_bound: bool = False
     return refusals
 
 
-# -- run records --------------------------------------------------------------
+# -- the already-live class (card t_c0cd1aba) ---------------------------------
+#
+# WHY THIS CLASS EXISTS. The gate knew two ways a deployed artifact could prove itself: an
+# ADMITTED landing row in the deploy ledger, or a deploy row whose dest owns the path and whose
+# sha is the ref. Both are claims about the PAPERWORK. When a merge reaches the line without a
+# landing receipt — a direct push, a force move, a cherry-pick, or a receipt the ledger refused —
+# neither exists, and every substantive fact about the bytes can still be provable: the commit is
+# on the line, the live file IS the commit's blob, and a probe exercised it afterwards. Such a
+# card used to be unclosable by construction (card t_207bf024: merge c30c78a0, live bytes equal to
+# the commit's blob, a per-DAG deploy stamp naming it, 144 refused ``review-admission`` rows and
+# zero landing rows). The gate was right to refuse a CLAIM. It was wrong to have no way to
+# certify a FACT.
+#
+# THE CLASS IS MEASURED, NEVER TAKEN FROM THE PAYLOAD. Three facts, all resolved by the gate:
+#
+#   1. ``artifacts[].blob`` = ``<commit>:<repo-relative path>``, and that commit is an ANCESTOR of
+#      the repo's LINE — ``origin/HEAD`` (the remote default), else the branch the checkout's HEAD
+#      tracks (the live install tracks ``overrides/live``, which IS its line), else
+#      ``origin/main``/``origin/master`` when the repo carries no remote head at all. This is the
+#      load-bearing clause: a commit that never landed cannot pass it, and the ref that admitted
+#      the commit is recorded in the facts.
+#   2. the live file's sha256 equals the blob's sha256 at that commit (the same comparison the
+#      artifact pass makes);
+#   3. a ``probe`` at an instant LATER than the commit's committer date, green, carrying the
+#      ``observations`` it exercised — the same obligation the ledger-less live-tree class owes,
+#      for the same reason: an unnamed probe is a claim, and a claim is not a probe.
+#
+# On admission ``landing_at`` is the commit's committer date, so ``proof_predates_landing`` still
+# bites unchanged: a probe older than the commit proves the PREVIOUS bytes.
+#
+# THE RAILS. (a) A proof that declares a ``landing`` block never takes this class — the
+# landing/arrival routes stay first, and one that RESOLVES wins. (b) A refused ``kind: landing``
+# row naming the commit DENIES the class: a refused receipt is a finding, not an absence, so the
+# fallback cannot be used to step around it. (c) An ADMITTED row naming the commit is stronger
+# evidence than the commit date, so it wins the landing instant (``already_live_landing_basis``).
+# (d) An artifact with no ``blob`` cannot take the class: a bare path + sha256 stays refused
+# exactly as it is today. (e) Every entry must be blob-pinned, so the class certifies ALL the
+# declared bytes or none of them. (f) The class is recorded in the verdict
+# (``landing_class: "already-live"``) so the census can count how often the fallback fires — if it
+# fires more than a handful of times a day that is a signal about the SHIP PATH, not a reason to
+# widen the door.
+
+
+def _landing_declared(proof: dict) -> bool:
+    landing = proof.get("landing")
+    return isinstance(landing, dict) and bool(landing)
+
+
+def _already_live_applies(proof: dict, entries: list) -> bool:
+    """The class's own shape: NO landing block, and EVERY artifact pinned to a blob.
+
+    All-or-nothing on purpose: the class certifies the declared bytes, so a proof that pins only
+    some of them keeps the ordinary routes rather than certifying half a card.
+    """
+    if _landing_declared(proof):
+        return False
+    return bool(entries) and all(blob for _path, _declared, _commit, blob, _repo, _rec
+                                 in entries)
+
+
+def _line_refs(work_tree: str) -> list:
+    """``[(ref, sha)]`` the refs that ARE the line in *work_tree*, best first.
+
+    ``origin/HEAD`` is the remote default; the tracked upstream of HEAD is the branch this
+    checkout deploys FROM (the live install tracks ``overrides/live``, not the fork's ``main``,
+    and demanding ``main`` would refuse every override the install actually runs). The
+    ``origin/main``/``origin/master`` fallbacks keep a freshly-fetched clone usable when it
+    carries no remote head.
+
+    A CARD BRANCH IS NEVER A LINE: the fleet names its work branches after the card
+    (``fix/t_1a28deba-...``), so a ref whose name carries a card id is dropped. Without that,
+    "the commit is on origin/fix/t_xxxx" would read as "the commit landed", and the
+    load-bearing clause would certify an unmerged branch's own bytes.
+    """
+    candidates: list = []
+    code, out, _err = _git_out("-C", work_tree, "symbolic-ref", "--short",
+                               "refs/remotes/origin/HEAD")
+    if code == 0 and out.strip():
+        candidates.append(out.strip())
+    code, out, _err = _git_out("-C", work_tree, "rev-parse", "--abbrev-ref",
+                               "--symbolic-full-name", "@{u}")
+    if code == 0 and out.strip() and out.strip() != "HEAD":
+        candidates.append(out.strip())
+    candidates.extend(["origin/main", "origin/master"])
+    # This host's hermes-agent line: the live install DEPLOYS ``overrides/live`` while the fork's
+    # ``main`` is an upstream mirror nobody may merge fork-internal work into. Named explicitly so
+    # a clone that carries the line without a tracking config can still be judged.
+    candidates.append("origin/overrides/live")
+    refs: list = []
+    for ref in dict.fromkeys(candidates):
+        if _CARD_TOKEN.search(ref):
+            continue                     # a card branch is a workspace, not a line
+        code, out, _err = _git_out("-C", work_tree, "rev-parse", "--verify",
+                                   f"{ref}^{{commit}}")
+        sha = out.strip().lower() if code == 0 else ""
+        if sha:
+            refs.append((ref, sha))
+    return refs
+
+
+def _commit_committer_at(work_tree: str, commit: str) -> tuple:
+    """``(epoch | None, why)`` — the commit's OWN committer date, read from the commit."""
+    code, out, err = _git_out("-C", work_tree, "show", "-s", "--format=%ct", commit)
+    if code != 0:
+        lines = (err or "").strip().splitlines()
+        return None, (lines[-1] if lines else f"git show exited {code}")
+    try:
+        return float(out.strip()), None
+    except ValueError:
+        return None, "git reported no committer date"
+
+
+def _already_live(entries: list, record: Optional[dict], observations: list,
+                  rows: list, proof_kind: str = "probe") -> tuple:
+    """Judge the already-live class -> ``(landing_at | None, facts, refusals)``.
+
+    ``landing_at`` is the instant the proof must postdate: the admitted receipt's own time when
+    the ledger holds one for the commit, else the latest committer date among the pinned commits.
+    It is ``None`` only where the class cannot date the bytes at all, and in that case the
+    refusal says which fact could not be established (never a pass by absence).
+    """
+    facts: dict = {"landing_class": _ALREADY_LIVE, "already_live": True}
+    refusals: list = []
+    pins: list = []
+    for path, _declared, _commit, blob, repo, _rec in entries:
+        blob_hash, blob_facts, detail = _blob_bytes(blob, path, repo)
+        if blob_hash is None:
+            refusals.append(dict(clause="already_live_unverifiable", detail=(
+                f"the already-live class stands on a resolvable blob pin, and {path} has "
+                f"none: {detail}")))
+            continue
+        work_tree = blob_facts["blob_repo"]
+        commit = blob_facts["blob_commit"]
+        committer_at, why = _commit_committer_at(work_tree, commit)
+        if committer_at is None:
+            refusals.append(dict(clause="already_live_unverifiable", detail=(
+                f"the commit {commit[:16]} pinned for {path} carries no readable committer "
+                f"date in {work_tree}: {why}")))
+            continue
+        pins.append({"path": path, "work_tree": work_tree, "commit": commit,
+                     "blob_path": blob_facts["blob_path"], "blob_sha256": blob_hash,
+                     "committer_at": committer_at})
+    if refusals:
+        return None, facts, refusals
+
+    # (b)/(c) THE RECEIPT RAIL. A refused landing row naming the commit is a finding about these
+    # bytes, so the class is not selectable while one stands; an admitted one is the strongest
+    # landing record the estate has, so it wins the instant.
+    receipt_at: Optional[float] = None
+    for pin in pins:
+        receipt_rows = [
+            row for row in rows
+            if row.get("kind") == "landing"
+            and _ref_names(pin["commit"], row.get("landed_sha"), row.get("sha"),
+                           row.get("card"), row.get("pr"))
+        ]
+        pin["receipt_rows"] = len(receipt_rows)
+        refused = [row for row in receipt_rows if not _is_admitted(row)]
+        if refused:
+            facts["already_live_receipts"] = [
+                {"commit": pin["commit"], "admission": row.get("admission"),
+                 "exit": row.get("exit"), "at": row.get("at")} for row in refused]
+            return None, facts, [dict(clause="already_live_receipt_refused", detail=(
+                f"the deploy ledger holds a landing row for {pin['commit'][:16]} that was "
+                f"NOT admitted (admission={refused[0].get('admission')!r}, "
+                f"exit={refused[0].get('exit')!r}): a refused receipt is a finding about "
+                f"these bytes, not an absence, so the already-live class may not certify "
+                f"around it. Repair the receipt (or land the merge again) — or, when the "
+                f"bytes really came from another commit, pin that commit instead"))]
+        for row in receipt_rows:
+            at = _row_at(row)
+            if at is not None:
+                receipt_at = at if receipt_at is None else min(receipt_at, at)
+
+    # (1) THE LINE. The commit must be an ancestor of the branch this repo deploys from.
+    for pin in pins:
+        refs = _line_refs(pin["work_tree"])
+        if not refs:
+            return None, facts, [dict(clause="already_live_unverifiable", detail=(
+                f"{pin['work_tree']} names no line ref (no origin/HEAD, no tracked upstream, "
+                f"no origin/main): the already-live class cannot ask whether "
+                f"{pin['commit'][:16]} ever landed, so it will not certify it"))]
+        on_line = None
+        for ref, _sha in refs:
+            code, _out, _err = _git_out("-C", pin["work_tree"], "merge-base",
+                                        "--is-ancestor", pin["commit"], ref)
+            if code == 0:
+                on_line = ref
+                break
+        pin["line_ref"] = on_line
+        if on_line is None:
+            return None, facts, [dict(clause="already_live_not_landed", detail=(
+                f"the commit {pin['commit'][:16]} pinned for {pin['path']} is NOT an ancestor "
+                f"of {', '.join(ref for ref, _sha in refs)} in {pin['work_tree']}: a commit "
+                f"that never landed on the line cannot certify these bytes, whatever the "
+                f"live file looks like. If the live bytes came from a commit that IS on the "
+                f"line, pin that commit"))]
+
+    # (2) THE BYTES. The live file must BE the blob at that commit. Where it is not, the
+    # artifact pass names the same fact as ``artifact_hash_mismatch``; the class simply cannot
+    # date bytes that are not the commit's, so it reports no instant and no second clause.
+    for pin in pins:
+        actual = _hash_file(pin["path"])
+        pin["live_sha256"] = actual
+        if actual != pin["blob_sha256"]:
+            facts["already_live_bytes_differ"] = {
+                "artifact": pin["path"], "live": actual, "blob": pin["blob_sha256"],
+                "commit": pin["commit"], "blob_path": pin["blob_path"]}
+            return None, facts, []
+
+    landing_at = receipt_at if receipt_at is not None else max(
+        pin["committer_at"] for pin in pins)
+    facts.update({
+        "landing_source": "already-live",
+        "landing_class": _ALREADY_LIVE,
+        "already_live_landing_basis": ("ledger-receipt" if receipt_at is not None
+                                       else "commit-committer-date"),
+        "already_live_landing_at": _iso(landing_at),
+        "already_live_pins": [
+            {"artifact": pin["path"], "commit": pin["commit"], "blob_path": pin["blob_path"],
+             "blob_sha256": pin["blob_sha256"], "line_ref": pin["line_ref"],
+             "committer_at": _iso(pin["committer_at"]),
+             "receipt_rows": pin["receipt_rows"]} for pin in pins],
+    })
+
+    # (3) THE PROBE. A missing, red or predating probe is named by the ORDINARY clauses
+    # (``no_run_or_probe`` / ``run_not_green`` / ``proof_predates_landing``) — the class only
+    # adds the obligation those clauses do not carry: a PROBE must SAY what it exercised (a
+    # posted run carries its own record, so it owes no such naming).
+    if record is None or not record["green"] or record["at"] <= landing_at:
+        return landing_at, facts, []
+    if proof_kind == "probe" and not observations:
+        return landing_at, facts, [dict(clause="already_live_unproven", detail=(
+            f"the already-live class dates these bytes from the commit {pins[0]['commit'][:16]} "
+            f"and pays for that with a probe that names what it exercised: add "
+            f"\"observations\": [\"<behaviour 1>\", \"<behaviour 2>\", ...] to the probe. An "
+            f"unnamed probe is a claim, and a claim is not a probe"))]
+    return landing_at, facts, []
 
 
 def _card_run(conn: Optional[sqlite3.Connection], spec: dict) -> tuple:
@@ -1866,13 +2148,30 @@ def evaluate(
 
     # 1. LANDING — the DoD clause itself, and the instant the run below must postdate. It is
     #    resolved FIRST: an artifact complaint (a wrong path, a stale pin) must never be
-    #    reported while the timestamps went unconsidered.
+    #    reported while the timestamps went unconsidered. One exception in ORDER, not in
+    #    substance: the already-live class (card t_c0cd1aba) judges itself against the probe's
+    #    own shape, so the proof record is resolved first and handed to it. A proof that
+    #    DECLARES a landing never reaches the class — the ledger/arrival routes stay first.
     rows = list(_ledger_rows(_ledger_path(ledger_path)))
-    landing_at, landing_facts, refusal = _landing_time(
-        proof, paths, rows, artifacts_readable=bool(readable))
-    facts.update(landing_facts)
-    if refusal is not None:
-        verdict.fail(refusal["clause"], refusal["detail"])
+    record, record_facts, record_refusal = _proof_record(
+        proof, conn, _run_store_path(run_store_path))
+    if _already_live_applies(proof, entries):
+        landing_at, live_facts, live_refusals = _already_live(
+            entries, record, (record_facts or {}).get("probe_observations") or [], rows,
+            proof_kind="run" if proof.get("run") else "probe")
+        facts.update(live_facts)
+        for item in live_refusals:
+            verdict.fail(item["clause"], item["detail"])
+    else:
+        landing_at, landing_facts, refusal = _landing_time(
+            proof, paths, rows, artifacts_readable=bool(readable))
+        facts.update(landing_facts)
+        if refusal is not None:
+            verdict.fail(refusal["clause"], refusal["detail"])
+        facts.setdefault("landing_class", _LANDING_CLASSES.get(
+            str(facts.get("landing_source") or ""), "none"))
+    if record_refusal is not None:
+        verdict.fail(record_refusal["clause"], record_refusal["detail"])
     if landing_at is not None:
         facts["landed_at"] = _iso(landing_at)
     landing = proof.get("landing")
@@ -1882,10 +2181,6 @@ def evaluate(
 
     # 2. RUN / PROBE — the evidence the contract is about: after the landing, green, and (for
     #    a ledger-less landing) carrying the named observations that class owes.
-    record, record_facts, refusal = _proof_record(
-        proof, conn, _run_store_path(run_store_path))
-    if refusal is not None:
-        verdict.fail(refusal["clause"], refusal["detail"])
     if record is not None:
         facts.update(record_facts)
         facts["proof_at"] = _iso(record["at"])
@@ -1929,6 +2224,13 @@ def evaluate(
         verdict.detail = (
             f"{record['label']} at {_iso(record['at'])} is after the landing at "
             f"{_iso(landing_at)} and covers the deployed artifact")
+        if facts.get("landing_class") == _ALREADY_LIVE:
+            pins = facts.get("already_live_pins") or []
+            verdict.detail += (
+                " — certified by the already-live class: "
+                + ", ".join(f"{str(pin.get('commit'))[:12]} on {pin.get('line_ref')}"
+                            for pin in pins)
+                + f", landing dated from the {facts.get('already_live_landing_basis')}")
         if facts.get("run_store_state") == "unavailable":
             # Never a silent pass: a degraded resolution is SAID, not just recorded, so an
             # operator reading a green close sees the outage that forced the fallback.
@@ -1970,6 +2272,15 @@ def render(task_id: str, verdict: Verdict) -> str:
             "card's deployed bytes was judged. Repair the store (integrity-check it and restore "
             "it, or restore the run's own run.log receipt) and re-run this completion. "
             "Re-pinning the artifact hash cannot help, and neither can re-running the unit.")
+    elif verdict.cause in _ALREADY_LIVE_CAUSES:
+        parts.append(
+            "The already-live class certifies bytes from their COMMIT, so its clauses are "
+            "answered in the repository, not in the proof: the pinned commit must be an "
+            "ancestor of the line this checkout deploys from, the live file must BE that "
+            "commit's blob, no refused landing receipt may exist for it, and the probe must "
+            "postdate the commit and name what it exercised (the refusal above says which of "
+            "these failed). An artifact with no \"blob\" pin cannot take this class at all — "
+            "a bare path + sha256 stays refused exactly as it was.")
     else:
         parts.append(
             "Re-pinning the artifact hash cannot clear a timing failure: a stale pin beside a "
