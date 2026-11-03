@@ -3,7 +3,9 @@
 ``hermes peer dm`` (``POST /api/sessions/{id}/chat``) and ``hermes peer run`` (``POST /v1/runs``)
 each make NEW agent work on the receiving gateway, but neither consulted ``agent.estop``: the
 inbound messaging path was gated (``gateway/run_inbound.py::_hm_estop_gate``) while the peer path
-ran the turn — or admitted it to a live Bot Chat owner — with the fleet paused.
+ran the turn — or admitted it to a live Bot Chat owner — with the fleet paused. The
+OpenAI-compatible agent-serving doors (``POST /v1/chat/completions``, ``POST /v1/responses``)
+start the same kind of NEW turn, so they pay the same gate.
 
 These tests drive the REAL routes over a real aiohttp app (the ``hermes peer dm`` client's own
 transport, identity middleware included) against a REAL armed sentinel in a throwaway
@@ -15,14 +17,14 @@ predicate, the stance the inbound gate takes too — which
 ``test_paused_fleet_refuses_without_the_predicate`` pins.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter, _api_request_profile
+from gateway.platforms.api_server import ESTOP_UNREADABLE_NOTICE, APIServerAdapter, _api_request_profile
 from hermes_state import SessionDB
 
 SESSION_ID = "peer_dm_estop"
@@ -43,6 +45,8 @@ def _app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post(
         "/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/responses", adapter._handle_responses)
     return app
 
 
@@ -74,7 +78,7 @@ def _paused(tmp_path, monkeypatch, *, home=None):
     """Arm the REAL sentinel in a throwaway HERMES_HOME and hand back the real estop module."""
     monkeypatch.setenv("HERMES_HOME", str(home if home is not None else tmp_path))
     from agent import estop
-    estop.engage(reason="estop window probe")
+    estop.engage(reason="estop window probe", mode=estop.MODE_LOCKDOWN)
     return estop
 
 
@@ -107,8 +111,8 @@ async def test_peer_dm_is_refused_while_paused_and_the_turn_never_runs(tmp_path,
 
     assert resp.status == 503, "a paused fleet must refuse the peer DM, not run it"
     assert body["error"]["message"] == estop.paused_reply()
-    assert "Hermes is paused" in body["error"]["message"], (
-        "the peer client prints error.message, so the pause notice must BE that message")
+    assert "⏸️ hold " in body["error"]["message"], (
+        "the refusal names the HOLD's scope, never a fleet-wide pause (ruling 2026-10-10 §5)")
     assert body["error"]["code"] == "estop_paused"
     assert not create_agent.called, "no agent turn may run for a refused peer DM"
     assert calls == [_identity(adapter)], (
@@ -127,7 +131,7 @@ async def test_peer_run_is_refused_while_paused_and_no_run_is_recorded(tmp_path,
         body = await resp.json()
 
     assert resp.status == 503
-    assert "Hermes is paused" in body["error"]["message"]
+    assert "⏸️ hold " in body["error"]["message"]
     assert body["error"]["code"] == "estop_paused"
     assert not adapter._run_owners, "a refused run leaves no run record behind"
     assert calls == [_identity(adapter)]
@@ -146,7 +150,7 @@ async def test_streamed_peer_dm_is_refused_while_paused(tmp_path, monkeypatch):
             body = await resp.json()
 
     assert resp.status == 503
-    assert "Hermes is paused" in body["error"]["message"]
+    assert "⏸️ hold " in body["error"]["message"]
     assert not create_agent.called
 
 
@@ -188,7 +192,7 @@ async def test_body_author_cannot_allowlist_itself(tmp_path, monkeypatch):
             body = await resp.json()
 
     assert resp.status == 503, "a body-supplied id cannot admit a turn the fleet paused"
-    assert "Hermes is paused" in body["error"]["message"]
+    assert "⏸️ hold " in body["error"]["message"]
     assert calls == [_identity(adapter)], "the body's author never reaches the predicate"
     assert not create_agent.called
 
@@ -226,7 +230,7 @@ async def test_paused_fleet_refuses_without_the_predicate(tmp_path, monkeypatch)
             body = await resp.json()
 
     assert resp.status == 503
-    assert "Hermes is paused" in body["error"]["message"]
+    assert "⏸️ hold " in body["error"]["message"]
     assert not create_agent.called
 
 
@@ -261,3 +265,120 @@ def test_gate_names_the_profile_the_process_serves_not_the_literal_default(tmp_p
 
     assert adapter._estop_peer_pause_notice() is None, "the lane's own profile is allowlisted"
     assert calls == [(None, MAINTENANCE_PROFILE)]
+
+
+# -- the OpenAI-compatible agent-serving doors ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_is_refused_while_paused_and_no_turn_runs(tmp_path, monkeypatch):
+    """``POST /v1/chat/completions`` starts a NEW agent turn, so a scoped lockdown holds it too:
+    the ungated door was a way straight past the pause."""
+    estop = _paused(tmp_path, monkeypatch)
+    calls: list = []
+    _install_predicate(estop, monkeypatch, calls=calls)
+    adapter, _sid = _adapter(tmp_path)
+
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+        async with TestClient(TestServer(_app(adapter))) as cli:
+            resp = await cli.post("/v1/chat/completions", json={
+                "model": "hermes-agent", "messages": [{"role": "user", "content": DM}]})
+            body = await resp.json()
+
+    assert resp.status == 503, "a paused fleet must refuse the OpenAI-compatible door"
+    assert body["error"]["message"] == estop.paused_reply()
+    assert "⏸️ hold " in body["error"]["message"], "the refusal names the hold's scope"
+    assert body["error"]["code"] == "estop_paused"
+    assert not run_agent.called, "no agent turn may run behind a held door"
+    assert calls == [_identity(adapter)]
+
+
+@pytest.mark.asyncio
+async def test_responses_is_refused_while_paused_and_no_turn_runs(tmp_path, monkeypatch):
+    """``POST /v1/responses`` is the same kind of door and pays the same gate."""
+    estop = _paused(tmp_path, monkeypatch)
+    calls: list = []
+    _install_predicate(estop, monkeypatch, calls=calls)
+    adapter, _sid = _adapter(tmp_path)
+
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+        async with TestClient(TestServer(_app(adapter))) as cli:
+            resp = await cli.post("/v1/responses", json={"model": "hermes-agent", "input": DM})
+            body = await resp.json()
+
+    assert resp.status == 503
+    assert body["error"]["message"] == estop.paused_reply()
+    assert "⏸️ hold " in body["error"]["message"]
+    assert body["error"]["code"] == "estop_paused"
+    assert not run_agent.called
+    assert calls == [_identity(adapter)]
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_identity_is_served_through_chat_completions(tmp_path, monkeypatch):
+    """The gate must not break the door for the lane the hold names: an allowlisted identity
+    keeps its OpenAI-compatible turns while every other lane is refused."""
+    estop = _paused(tmp_path, monkeypatch)
+    adapter, _sid = _adapter(tmp_path)
+    principal, _profile = _identity(adapter)
+    _install_predicate(estop, monkeypatch, user_ids=(principal,))
+
+    async def _fake_run_agent(**kw):
+        return _ok("pong"), {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+
+    with patch.object(adapter, "_run_agent", side_effect=_fake_run_agent) as run_agent:
+        async with TestClient(TestServer(_app(adapter))) as cli:
+            resp = await cli.post("/v1/chat/completions", json={
+                "model": "hermes-agent", "messages": [{"role": "user", "content": DM}]})
+            body = await resp.json()
+
+    assert resp.status == 200, "an allowlisted identity keeps working through the pause"
+    assert body["choices"][0]["message"]["content"] == "pong"
+    assert run_agent.call_count == 1, "the allowlisted turn actually ran"
+
+
+# -- the fail-closed arms ----------------------------------------------------------------------
+
+
+def _raise(*_a, **_kw):
+    raise OSError("sentinel unreadable")
+
+
+def test_unreadable_hold_state_refuses_and_never_admits(tmp_path, monkeypatch):
+    """If the hold state cannot be EVALUATED, the turn is refused — an unreadable pause is never
+    read as "no pause" (the old outer ``suppress(Exception)`` admitted on this arm)."""
+    estop = _paused(tmp_path, monkeypatch)
+    monkeypatch.setattr(estop, "is_engaged", _raise, raising=False)
+    adapter, _sid = _adapter(tmp_path)
+
+    assert adapter._estop_peer_pause_notice() == ESTOP_UNREADABLE_NOTICE
+    refusal = adapter._estop_peer_refusal()
+    assert refusal is not None and refusal.status == 503
+
+
+def test_a_raising_allowlist_predicate_refuses_the_turn(tmp_path, monkeypatch):
+    """A predicate that raises is not an allowlist that names the caller: refuse, do not admit."""
+    estop = _paused(tmp_path, monkeypatch)
+    monkeypatch.setattr(estop, "is_allowed", _raise, raising=False)
+    adapter, _sid = _adapter(tmp_path)
+
+    assert adapter._estop_peer_pause_notice() == estop.paused_reply()
+
+
+@pytest.mark.asyncio
+async def test_a_broken_sentinel_refuses_the_route_instead_of_admitting_it(tmp_path, monkeypatch):
+    """End-to-end on the arm that used to admit: an unevaluable hold state 503s the door and
+    still runs no agent."""
+    estop = _paused(tmp_path, monkeypatch)
+    monkeypatch.setattr(estop, "is_engaged", _raise, raising=False)
+    adapter, _sid = _adapter(tmp_path)
+
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+        async with TestClient(TestServer(_app(adapter))) as cli:
+            resp = await cli.post("/v1/chat/completions", json={
+                "model": "hermes-agent", "messages": [{"role": "user", "content": DM}]})
+            body = await resp.json()
+
+    assert resp.status == 503
+    assert body["error"]["message"] == ESTOP_UNREADABLE_NOTICE
+    assert not run_agent.called

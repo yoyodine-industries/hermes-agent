@@ -1107,6 +1107,30 @@ def work_admitted(profile: Optional[str], board: Optional[str] = None, state: Op
     """
     if state is None:
         state = read_state()
+    # One implementation of the rule: ``is_lane_allowed`` is the seam every dispatch surface
+    # calls, and this alias keeps the historical name honest rather than a second copy of it.
+    return is_lane_allowed(profile, state)
+
+
+def is_lane_allowed(profile: Optional[str], state: Optional["EstopState"] = None) -> bool:
+    """Lockdown admission for ONE lane: may this profile start NEW work right now?
+
+    This is the per-ITEM gate the dispatch surfaces owe (cron job, kanban card, goal
+    wakeup, webhook fire). ``check_paused`` is the TOTAL-halt gate only: under a scoped
+    lockdown the tick RUNS and this predicate holds every item whose lane is not named.
+
+    Fail-closed in every direction:
+
+    * no live hold -> True (nothing is scoped, nothing is held);
+    * a live TOTAL hold -> False (a total halt names no exemptions, whatever its allowlist);
+    * a lockdown -> the lane must be on the union allowlist, trimmed and case-folded;
+      an unknown or EMPTY lane (an unassigned card/job) is not a lane and grants nothing.
+
+    ``state`` is the tick's single :func:`read_state` read — a tick that gates many items
+    must read the ledger ONCE and pass it down, so one tick can never see two modes.
+    """
+    if state is None:
+        state = read_state()
     if not state.engaged:
         return True
     if state.total:
@@ -1816,6 +1840,11 @@ def is_allowed(
     if state is None:
         state = read_state()
     if isinstance(state, EstopState):
+        if state.total:
+            # A TOTAL halt names NO exemptions (``mode: estop`` = panic). A legacy hold may
+            # still carry an ``allow`` block from pre-ruling bytes; it must not license a turn
+            # while the fleet is halted.
+            return False
         allow_users = {str(entry) for entry in state.allow_user_ids}
         allow_profiles = {str(entry) for entry in state.allow_profiles}
     else:

@@ -977,6 +977,14 @@ class DispatchResult:
     (invariant I1) -- the card simply was not admitted, and the next tick re-probes. Siblings on
     the same board carry on (invariant I2). Counted on the tick's suppression line, because a
     silent hold is how a starved board reads as an idle one."""
+    skipped_lockdown: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, assignee)`` for every READY/review card the emergency stop's LANE gate
+    refused this tick (``agent.estop.is_lane_allowed``): the lane is not on a lockdown's
+    allowlist, or a TOTAL hold is live. The card was NOT claimed -- its status is still
+    ``ready``/``review`` and it spawns on the first tick after the hold is lifted. Keyed on the
+    card's ASSIGNEE (the lane), never on the board it sits on: filing work on an exempt board
+    grants nothing. The refusal is also recorded ON the card as one ``skipped_lockdown`` event
+    per engagement, so a starved lane is visible instead of reading as an idle board."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -6712,6 +6720,157 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
 # lock hold and stall a sibling dispatcher's tick.
+
+
+def _tick_board_slug(conn: sqlite3.Connection, board: Optional[str]) -> str:
+    """The slug of the board THIS tick is running against — never ``None``.
+
+    Read once, per tick, and only for the refusal record. An explicit ``board=`` wins; otherwise
+    the slug comes off the OPEN STORE (``board_for_connection``), which is the only fact a tick
+    holding a scoped/CLI connection can trust. Every fallback ends at the string ``"default"``:
+    the 2026-09 defect this prevents wrote ``"board": null`` on every row of a
+    ``hermes kanban --board <slug> dispatch`` tick, because the CLI scopes the board on the
+    connection and calls ``dispatch_once`` with NO ``board=`` argument (card t_7ecf084a).
+    """
+    if board:
+        try:
+            explicit = _kb._normalize_board_slug(board)
+        except Exception:
+            explicit = None
+        if explicit:
+            return explicit
+    try:
+        scoped = _kb.board_for_connection(conn)
+    except Exception:
+        scoped = None
+    if scoped:
+        return scoped
+    # Last resort: the module's own layout heuristic (parent dir of the open DB), which itself
+    # ends at ``DEFAULT_BOARD``. A tick must still name a board when the store is unreadable.
+    return _board_key(conn, board)
+
+
+def _record_skipped_lockdown(
+    conn: sqlite3.Connection, task_id: str, payload: dict, *, engagement: str,
+) -> None:
+    """Write ONE ``skipped_lockdown`` event per ``(card, engagement)``.
+
+    A card held for hours is refused on every tick, and one row per tick would bury
+    ``hermes kanban tail`` in exactly the noise that makes a starved board read as an idle one.
+    The dedupe key is the ESTOP ENGAGEMENT (``estop.engagement_key``), not the payload: a
+    RE-ARM is a new operator decision and earns a fresh row, while a tick that merely re-reads
+    the same hold adds nothing.
+
+    The store refusing the write never takes the tick down (the card is still held in memory and
+    still not claimed) — the refusal is logged instead.
+    """
+    try:
+        with _kb.write_txn(conn):
+            prior_rows = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'skipped_lockdown'",
+                (task_id,),
+            ).fetchall()
+            for prior in prior_rows:
+                try:
+                    recorded = json.loads(prior["payload"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if str((recorded or {}).get("engagement") or "") == engagement:
+                    return
+            _kb._append_event(conn, task_id, "skipped_lockdown", payload)
+    except Exception:  # health: allow BLE001 -- evidence, never the hold itself
+        _kb._log.warning(
+            "kanban dispatch: could not record the lockdown hold for %s", task_id, exc_info=True,
+        )
+
+
+def _sweep_lockdown(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    *,
+    rows: list[sqlite3.Row],
+    dry_run: bool,
+    board: Optional[str],
+) -> set[str]:
+    """Hold every candidate whose LANE the emergency stop does not admit; return their ids.
+
+    THE GATE IS THE LANE, NEVER THE BOARD. Admission for one card is
+    :func:`agent.estop.is_lane_allowed`, applied to the card's ASSIGNEE: a lockdown's allowlist
+    names the lanes that may start NEW work, and a card filed on an exempt board buys its lane
+    nothing (previously throughput was granted per board, so any card on the "critical" board
+    ran whatever lane it needed — and the 03:3x incident held the very lane the typo'd allowlist
+    meant to admit). ``is_lane_allowed`` is fail-closed on purpose: an unassigned card has no
+    lane and is therefore HELD. A TOTAL hold refuses every lane through this same call.
+
+    THIS RUNS BEFORE THE BUDGET, and that placement is the requirement (design §6.10): the cap,
+    memory pressure, the review reservation pinning ``ready_budget`` to 0 and a higher-ranked
+    admitted card eating the slot all return/break the tick before the spawn loop ever reaches a
+    held card. A scan that records only the candidates it VISITS therefore left the held card
+    unrecorded on exactly the tick the operator looked at, and a silent starve read as an idle
+    board.
+
+    Nothing is claimed, failed or counted here: the card keeps its status and spawns normally on
+    the first tick after the hold is lifted. ``dry_run`` reports the same refusals and writes NO
+    event row. A state read that raises is logged and gates nothing — ``read_state`` is built to
+    report defects rather than raise, so reaching that branch means the sentinel path helper
+    itself is broken, and taking the fleet's dispatch down over it is the worse defect.
+    """
+    if not rows:
+        return set()
+    try:
+        from agent import estop
+    except ImportError:  # pragma: no cover -- estop ships with this tree
+        return set()
+    try:
+        state = estop.read_state()
+    except Exception:  # health: allow BLE001 -- a broken ledger must not stop the tick
+        _kb._log.error(
+            "kanban dispatch: could not read the emergency-stop ledger; this tick is UNGATED",
+            exc_info=True,
+        )
+        return set()
+    if not state.engaged:
+        return set()
+    # ONE read of each ledger fact for the whole sweep: a tick that gates many cards must never
+    # see two modes, and the payload of every refusal that tick must agree.
+    engagement = estop.engagement_key()
+    owners = list(state.owners)
+    allow_profiles = sorted(state.allow_profiles)
+    mode = state.mode or estop.MODE_ESTOP
+    board_slug = _tick_board_slug(conn, board)
+    held: set[str] = set()
+    for row in rows:
+        task_id = row["id"]
+        assignee = row["assignee"] or ""
+        try:
+            admitted = estop.is_lane_allowed(assignee, state)
+        except Exception:  # health: allow BLE001 -- anything but a proven admission holds
+            _kb._log.warning(
+                "kanban dispatch: lane admission failed for %s (%s); holding it",
+                task_id, assignee, exc_info=True,
+            )
+            admitted = False
+        if admitted:
+            continue
+        held.add(task_id)
+        result.skipped_lockdown.append((task_id, assignee))
+        if dry_run:
+            continue
+        _record_skipped_lockdown(
+            conn, task_id,
+            {
+                "profile": assignee,
+                "mode": mode,
+                "engagement": engagement,
+                "owners": owners,
+                "allow_profiles": allow_profiles,
+                "board": board_slug,
+            },
+            engagement=engagement,
+        )
+    return held
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -6747,17 +6906,30 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    # LANE-SCOPED STOP, SWEPT BEFORE THE BUDGET (estop ``lockdown``; design §6.10). The gate is
+    # keyed on each card's ASSIGNEE, never on the board it sits on, and it runs HERE — ahead of
+    # every budget/cap/reservation gate — because each of those returns or breaks the tick before
+    # the spawn loop reaches the card it is holding: a tick capped at 0 running slots, one under
+    # memory pressure, one whose ready lane was pinned to 0 by the review reservation and one
+    # whose single slot went to a higher-ranked admitted card all starve a held lane WITHOUT
+    # visiting it. Held cards are then dropped from both lane lists, so they are never claimed:
+    # they stay ``ready``/``review`` and spawn on the first tick after the hold is lifted.
+    ready_rows = _lane_rows(conn, "ready")
+    # Review rows are enumerated up front so the budget split can see whether
+    # review work exists at all.
+    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    lockdown_held = _sweep_lockdown(
+        conn, result, rows=[*ready_rows, *review_rows], dry_run=dry_run, board=board,
+    )
+    if lockdown_held:
+        ready_rows = [row for row in ready_rows if row["id"] not in lockdown_held]
+        review_rows = [row for row in review_rows if row["id"] not in lockdown_held]
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
         host_budget_share=host_budget_share,
     )
     if not may_spawn:
         return result
-
-    ready_rows = _lane_rows(conn, "ready")
-    # Review rows are enumerated up front so the budget split can see whether
-    # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which

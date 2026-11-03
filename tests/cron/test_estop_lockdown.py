@@ -56,8 +56,44 @@ def hermes_home(tmp_path, monkeypatch):
 # ── the registry: several holds, independent lifetime ───────────────────────
 
 
+def _pre_ruling_total_hold(reason: str = "runaway cron fan-out", owner: str = "operator",
+                           allow: dict | None = None) -> str:
+    """Seed a PRE-RULING ``mode: estop`` hold and return its handle.
+
+    No verb may arm a fleet-wide halt any more (operator ruling 2026-10-10, card t_e04b4c81):
+    ``arm``/``acquire``/``engage`` all raise ``EstopTotalHaltRetired``. The total-halt algebra
+    these tests pin is therefore set up the way a pre-ruling install left it — a registry entry
+    signed with this home's key — because the gate still has to READ that state, and refuse to
+    grant an exemption under it.
+    """
+    from datetime import UTC, datetime
+
+    entry = {
+        "handle": f"{owner}#{int(datetime.now(UTC).timestamp() * 1_000_000)}",
+        "owner": owner,
+        "actor": "operator",
+        "mode": estop.MODE_ESTOP,
+        "engaged_at": datetime.now(UTC).isoformat(),
+        "expires_at": None,
+        "allow": dict(allow or {}),
+        "reason": reason,
+    }
+    entry["sig"] = estop._sign_fields(estop._canonical_fields(entry), estop.sentinel_path())
+    path = estop.sentinel_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        existing = [dict(hold) for hold in (raw.get("holds") or [])]
+    except Exception:
+        existing = []
+    path.write_text(
+        json.dumps({"schema": estop.SCHEMA_VERSION, "holds": existing + [entry]}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return entry["handle"]
+
+
 def test_two_holds_of_different_modes_coexist_and_release_independently(hermes_home):
-    total = estop.acquire(owner="operator", mode=estop.MODE_ESTOP, reason="runaway cron fan-out")
+    total = _pre_ruling_total_hold()
     scoped = estop.acquire(
         owner="ops-head", mode=estop.MODE_LOCKDOWN, reason="ops update window",
         allow={"profiles": ["default", "platform-stl"]})
@@ -83,7 +119,8 @@ def test_release_by_owner_leaves_a_co_holders_entry_untouched(hermes_home):
     other = estop.acquire(
         owner="yoyoflow:critical-section", mode=estop.MODE_LOCKDOWN, reason="train window",
         allow={"profiles": ["platform-stl"]})
-    estop.engage(reason="operator stop")
+    estop.engage(reason="operator stop", mode=estop.MODE_LOCKDOWN,
+                 allow={"profiles": ["default"]})
 
     result = estop.release()  # the operator's own hold
     assert result.released is True
@@ -98,7 +135,7 @@ def test_release_by_owner_leaves_a_co_holders_entry_untouched(hermes_home):
 def test_expiry_of_one_hold_leaves_the_other_intact(hermes_home):
     estop.acquire(owner="window-job", mode=estop.MODE_LOCKDOWN, ttl="1s",
                   expires_at="2000-01-01T00:00:00+00:00", allow={"profiles": ["default"]})
-    live = estop.acquire(owner="operator", mode=estop.MODE_ESTOP, reason="operator stop")
+    live = _pre_ruling_total_hold(reason="operator stop")
 
     state = estop.read_state()
     assert [hold["owner"] for hold in state.expired] == ["window-job"]
@@ -120,13 +157,22 @@ def test_a_stale_handle_is_refused_by_name_and_releases_nothing(hermes_home):
 
 
 def test_engage_replaces_only_the_same_owners_previous_hold(hermes_home):
+    """A repeated arm by ONE holder stays ONE hold and does not disturb a co-holder.
+
+    Production arms a SCOPED hold now (ruling 2026-10-10: `mode: estop` is retired), so the
+    operator's repeated `hermes pause --lockdown` is the case under test: two lockdowns from two
+    holders, and the operator's second arm replaces its own rather than adding a third.
+    """
     estop.acquire(owner="ops-head", mode=estop.MODE_LOCKDOWN, allow={"profiles": ["default"]})
-    estop.engage(reason="operator stop")   # owner=operator
-    estop.engage(reason="operator stop again")
+    estop.engage(reason="operator stop", mode=estop.MODE_LOCKDOWN,
+                 allow={"profiles": ["default"]})   # owner=operator
+    estop.engage(reason="operator stop again", mode=estop.MODE_LOCKDOWN,
+                 allow={"profiles": ["default"]})
 
     state = estop.read_state()
-    assert state.counts[estop.MODE_ESTOP] == 1, "a repeated operator pause stays ONE hold"
-    assert state.counts[estop.MODE_LOCKDOWN] == 1, "and does not disturb the co-holder"
+    assert [hold["owner"] for hold in state.holds].count("operator") == 1, (
+        "a repeated operator pause stays ONE hold")
+    assert state.counts[estop.MODE_LOCKDOWN] == 2, "and does not disturb the co-holder"
 
 
 # ── fail-safe reads ─────────────────────────────────────────────────────────
@@ -160,12 +206,13 @@ def test_a_stat_error_is_fail_safe_engaged_and_total(hermes_home, monkeypatch):
 
 def test_the_body_keeps_the_pre_registry_top_level_fields(hermes_home):
     """Legacy readers (and the shipped body contract) still see the pause they expect."""
-    estop.engage(reason="update window", ttl="45m", allow={"user_ids": ["u1"]})
+    estop.engage(reason="update window", mode=estop.MODE_LOCKDOWN, ttl="45m",
+                 allow={"user_ids": ["u1"]})
 
     raw = json.loads((hermes_home / "ESTOP").read_text(encoding="utf-8"))
     assert raw["holds"], "the registry is the real body"
     assert raw["reason"] == "update window"
-    assert raw["expires_at"] and raw["mode"] == estop.MODE_ESTOP
+    assert raw["expires_at"] and raw["mode"] == estop.MODE_LOCKDOWN
     assert raw["allow"]["user_ids"] == ["u1"]
 
 
@@ -189,8 +236,7 @@ def test_the_lane_decides_and_no_board_placement_ever_does(hermes_home):
 
 
 def test_a_total_hold_ignores_every_lane_named_in_it(hermes_home):
-    estop.acquire(owner="operator", mode=estop.MODE_ESTOP, reason="total",
-                  allow={"profiles": ["default", "platform-stl"]})
+    _pre_ruling_total_hold(reason="total", allow={"profiles": ["default", "platform-stl"]})
     state = estop.read_state()
 
     assert estop.work_admitted("default", board="defcon", state=state) is False
@@ -257,12 +303,18 @@ def test_cli_pause_lockdown_arms_the_named_lanes(hermes_home, capsys):
     assert "scope" in out
 
 
-def test_cli_pause_without_lockdown_is_still_a_total_halt(hermes_home):
+def test_cli_pause_without_lockdown_is_still_a_total_halt(hermes_home, capsys):
+    """A bare `hermes pause` no longer ARMS a fleet-wide halt (ruling 2026-10-10) — it refuses
+    and names the scoped controls — while a PRE-RULING total body still reads as a total halt,
+    which is the algebra the rest of the fleet must keep honouring."""
     from hermes_cli.subcommands.pause import cmd_pause
 
     assert cmd_pause(argparse.Namespace(
-        reason=None, lockdown=False, allow_profile=None, allow_user=None, ttl=None)) == 0
+        reason=None, lockdown=False, allow_profile=None, allow_user=None, ttl=None)) == 2
+    assert estop.is_engaged() is False, "a refused bare pause arms nothing"
+    assert "set-dispatch" in capsys.readouterr().out
 
+    _pre_ruling_total_hold(reason="legacy halt")
     state = estop.read_state()
     assert state.total is True and state.counts[estop.MODE_ESTOP] == 1
     assert estop.work_admitted("default", board="defcon", state=state) is False
@@ -277,7 +329,7 @@ def test_cli_refuses_to_arm_or_lift_from_a_dispatched_worker(hermes_home, monkey
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_deadbeef")
 
     rc = cmd_pause(argparse.Namespace(
-        reason=None, lockdown=False, allow_profile=None, allow_user=None, ttl=None))
+        reason=None, lockdown=True, allow_profile=["default"], allow_user=None, ttl=None))
     assert rc == 3 and estop.is_engaged() is False
     assert "kanban task t_deadbeef" in capsys.readouterr().out
 
@@ -290,7 +342,8 @@ def test_cli_resume_reports_a_co_holders_remaining_scope(hermes_home, capsys):
 
     estop.acquire(owner="ops-head", mode=estop.MODE_LOCKDOWN, reason="ops window",
                   allow={"profiles": ["default"]})
-    estop.engage(reason="operator stop")
+    estop.engage(reason="operator stop", mode=estop.MODE_LOCKDOWN,
+                 allow={"profiles": ["default"]})
 
     assert cmd_resume(argparse.Namespace()) == 0
     out = capsys.readouterr().out
@@ -305,7 +358,8 @@ def test_cli_resume_refuses_a_stale_handle(hermes_home, capsys):
     handle = estop.acquire(owner="ops-head", mode=estop.MODE_LOCKDOWN,
                            allow={"profiles": ["default"]})
     assert cmd_resume(argparse.Namespace(handle=handle)) == 0
-    estop.engage(reason="operator stop")   # a co-holder arms again
+    estop.engage(reason="operator stop", mode=estop.MODE_LOCKDOWN,
+                 allow={"profiles": ["default"]})   # a co-holder arms again
 
     assert cmd_resume(argparse.Namespace(handle=handle)) == 2
     assert handle in capsys.readouterr().out

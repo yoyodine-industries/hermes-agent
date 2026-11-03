@@ -112,8 +112,12 @@ def _estop_status_line():
     if state.total:
         return f"⏸️  HOLD {handle} — LEGACY fleet-wide halt{reason}; lift it by handle: {lift}"
     lanes = ", ".join(sorted(state.allow_profiles)) or "(no lane named — every lane is held)"
+    users = ", ".join(sorted(state.allow_user_ids))
+    scope = f"lanes=[{lanes}]" + (f" users=[{users}]" if users else "")
     until = f" until {hold['expires_at']}" if hold.get("expires_at") else ""
-    return f"⏸️  HOLD {handle} lanes=[{lanes}]{until}{reason}; lift it with {lift}"
+    deadman = "deadman armed" if hold.get("expires_at") else "no deadman"
+    mode = hold.get("mode") or "lockdown"
+    return f"⏸️  HOLD {handle} {mode} {scope}{until} ({deadman}){reason}; lift it with {lift}"
 
 
 # --- Data tables driving the per-section renderers -------------------------

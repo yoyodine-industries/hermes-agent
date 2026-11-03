@@ -264,7 +264,20 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         """Whether a turn may bypass the global emergency stop: pause blocks NEW agent turns, never
         running work or control traffic — recognized slash commands (incl. /pause off, the in-band
         resume) and replies owned by in-flight work (pending update prompt, running session,
-        pending slash-confirm, dangerous-command approval) all pass through."""
+        pending slash-confirm, dangerous-command approval) all pass through.
+
+        An ALLOWLISTED identity passes too, and the identity check comes FIRST: under a scoped
+        ``lockdown`` the whole point is that the operator and the maintenance lane keep being
+        served while every other lane is held (ruling 2026-10-10 §5). Identity is primary
+        (``source.user_id``), the serving profile secondary. A live TOTAL hold names no
+        exemptions, so ``is_allowed`` refuses it (fail-closed).
+        """
+        with suppress(Exception):
+            from agent.estop import is_allowed as _estop_is_allowed
+            if _estop_is_allowed(
+                getattr(source, "user_id", None), getattr(source, "profile", None)
+            ):
+                return True
         with suppress(Exception):
             _estop_cmd = event.get_command()
             if _estop_cmd:

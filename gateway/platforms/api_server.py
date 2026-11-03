@@ -1010,6 +1010,11 @@ def _gate_holders_summary(snapshot: dict[str, Any], limit: int = 4) -> list[str]
     return summary
 
 
+ESTOP_UNREADABLE_NOTICE = (
+    "⏸️ The emergency-stop state could not be read, so this turn was refused: an unevaluable "
+    "pause is never treated as no pause. Check the hold with `hermes status`, then retry.")
+
+
 def _admit_api_agent_request(handler):
     """Reserve an authenticated API turn before its handler first awaits: drain check +
     reservation in one non-awaiting block so a request admitted just before shutdown can't go
@@ -3044,6 +3049,86 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception:
             return False
 
+    def _serving_profile_name(self) -> str:
+        """The LANE this server's request is being served as.
+
+        A ``/p/<profile>/…`` request names it in the context var; otherwise it is the profile
+        THIS PROCESS serves — read off ``HERMES_HOME`` (``…/profiles/<name>``), never the literal
+        string ``default``. Naming ``default`` for a per-profile gateway would make the lane
+        un-allow-listable: the ops seat could name the profile and the gate would still refuse
+        its own work (card t_7f6ccfc6).
+        """
+        bound = _api_request_profile.get()
+        if bound:
+            return str(bound)
+        with suppress(Exception):
+            from hermes_constants import get_hermes_home
+            home = Path(get_hermes_home()).resolve()
+            if home.parent.name == "profiles" and home.name:
+                return home.name
+        return "default"
+
+    def _estop_peer_pause_notice(self) -> Optional[str]:
+        """``None`` when a peer turn may run, else the pause notice to refuse it with.
+
+        ``hermes peer dm``/``peer run`` each start NEW agent work on the receiving gateway, so
+        they owe the same per-identity gate the inbound messaging path pays
+        (``gateway/run_inbound.py::_hm_estop_turn_allowed``): under a scoped lockdown the
+        allowlisted operator/lane keeps being served and every other caller is refused. The
+        agent-serving doors (``/v1/chat/completions``, ``/v1/responses``) pay it too — they start
+        the same kind of turn, so none of them may be the way past a pause.
+
+        Fail-closed in EVERY arm; the ONLY admitting outcome is a successful check of an
+        identity against a live hold's allowlist:
+
+        * no live hold -> ``None`` (nothing is paused, so nothing is refused);
+        * a live hold and an allowlisted identity -> ``None``;
+        * a live hold and no readable ``is_allowed`` predicate (a tree from before the
+          allowlist existed) -> the pause notice — the same stance the inbound gate takes;
+        * the hold state cannot be EVALUATED at all (the module will not import, the sentinel
+          cannot be read, ``paused_reply`` itself raises) -> :data:`ESTOP_UNREADABLE_NOTICE`.
+          An unevaluable pause is never read as "no pause".
+
+        Identity is taken from the authenticated request context ONLY; the request body is
+        never read, so a caller cannot enrol itself by naming its own id in ``author``.
+        """
+        try:
+            from agent import estop as _estop
+            if not _estop.is_engaged():
+                return None
+            profile = self._serving_profile_name()
+            # The authenticated identity, as the profile-prefix middleware bound it for THIS
+            # request. Empty ("") outside a request (a direct call) reads as an unnamed caller,
+            # never as an admitted one.
+            principal = _api_request_browser_control_principal.get() or None
+            predicate = getattr(_estop, "is_allowed", None)
+            if predicate is None:
+                return _estop.paused_reply()
+            try:
+                if predicate(principal, profile):
+                    return None
+            except Exception:
+                # A predicate that raises admits nobody: an unreadable allowlist is not an
+                # allowlist that names this caller.
+                logger.warning(
+                    "estop: the allowlist predicate failed for this turn; refusing it "
+                    "(fail-closed)", exc_info=True)
+            return _estop.paused_reply()
+        except Exception:
+            # Import failure, unreadable sentinel, a pause-notice builder that raises: the hold
+            # state is unknowable here, and refusing is the only honest answer.
+            logger.warning(
+                "estop: the hold state could not be evaluated for this turn; refusing it "
+                "(fail-closed)", exc_info=True)
+            return ESTOP_UNREADABLE_NOTICE
+
+    def _estop_peer_refusal(self) -> Optional[web.Response]:
+        """The 503 a held (or unevaluable) turn is refused with, or ``None`` when admitted."""
+        notice = self._estop_peer_pause_notice()
+        if notice is None:
+            return None
+        return _error_response(notice, 503, code="estop_paused")
+
     def _derive_browser_control_principal(self, profile: str) -> str:
         """Non-reversible principal digest bound to the profile's expected API key, so a client
         cannot impersonate another controller by echoing an id."""
@@ -4325,6 +4410,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
         one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""
         from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
+        # A held fleet refuses the turn BEFORE it spends an agent slot: this transport starts NEW
+        # agent work, so it owes the inbound path's per-identity ESTOP gate (t_7f6ccfc6). An
+        # allowlisted operator/lane is served through the pause; everyone else gets the notice.
+        held = self._estop_peer_refusal()
+        if held is not None:
+            return held
         # A peer delivery is an ACCEPTANCE, not agent work (t_376b3fbd). The two delivery
         # headers are therefore read BEFORE the cap: a saturated gateway still writes the
         # durable, idempotent queue record and answers with its receipt, because refusing a
@@ -4379,6 +4470,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: web.Request) -> web.StreamResponse:
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
+        # The streamed form runs the SAME kind of new turn, so it pays the same ESTOP gate — it
+        # must never be the way past a pause (t_7f6ccfc6).
+        held = self._estop_peer_refusal()
+        if held is not None:
+            return held
         # The invariant is route-independent (t_376b3fbd): a request carrying the two
         # delivery headers is never refused by the AGENT-WORK cap. The delivery lane is
         # non-streaming by contract, so such a request is served as its queued JSON receipt
@@ -4815,6 +4911,26 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         status=503,
                         headers={"Retry-After": str(60)},
                     )
+            # ESTOP lockdown, the WEBHOOK door (card t_7f6ccfc6): a scoped hold is decided by the
+            # LANE, so this fire is refused only when the job's own lane is held — and refused the
+            # same retryable way, so the fire is rescheduled rather than silently dropped.
+            with suppress(Exception):
+                from agent.estop import engagement_key, is_lane_allowed, read_state
+                from cron.jobs import job_lane
+                _estop_state = read_state()
+                if _estop_state.engaged:
+                    _estop_job = _cron_get(job_id) if _CRON_AVAILABLE else None
+                    _estop_lane = job_lane(_estop_job or {"profile": ""})
+                    if not is_lane_allowed(_estop_lane, state=_estop_state):
+                        logger.info(
+                            "cron fire %s held: lane %r is not admitted by ESTOP hold %s",
+                            job_id, _estop_lane, engagement_key())
+                        return web.json_response(
+                            {"error": "this lane is held by an ESTOP lockdown", "job_id": job_id,
+                             "profile": _estop_lane},
+                            status=503,
+                            headers={"Retry-After": str(60)},
+                        )
             from cron.scheduler_provider import provider_supports_split_fire, resolve_cron_scheduler
             provider = resolve_cron_scheduler()
             loop = asyncio.get_running_loop()
@@ -5222,6 +5338,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: web.Request) -> web.Response:
+        # `hermes peer run` starts NEW agent work on this gateway: it pays the per-identity ESTOP
+        # gate, like the peer DM transport beside it (t_7f6ccfc6). A refused run leaves no record.
+        held = self._estop_peer_refusal()
+        if held is not None:
+            return held
         return await _api_runs._handle_runs(self, request, _api_server=sys.modules[__name__])
 
     def _request_owns_run(self, request: web.Request, run_id: str) -> bool:

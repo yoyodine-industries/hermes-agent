@@ -182,6 +182,37 @@ def _current_cron_store() -> _CronStorePaths:
     return _CronStorePaths.for_dir(home / "cron")
 
 
+def store_lane() -> str:
+    """The LANE (profile id) whose cron store THIS context is reading.
+
+    A cron job carries no lane field: it belongs to the profile store that holds it, which is
+    the lane a scoped ``lockdown`` names. Derived from the store path — ``…/profiles/<name>``
+    is that profile, anything else is the ``default`` home — so the answer never depends on the
+    ambient ``HERMES_PROFILE`` of whoever happens to be ticking.
+    """
+    jobs_file = Path(_current_cron_store().jobs_file)
+    home = jobs_file.parent.parent
+    if home.parent.name == "profiles" and home.name:
+        return home.name
+    return "default"
+
+
+def job_lane(job: dict[str, Any]) -> str:
+    """The lane ONE due job fires for: its own explicit scope, else the store's lane.
+
+    An explicit ``profile``/``lane`` wins (a job authored for another lane). Everything else is
+    the store's owner. Never returns a fabricated lane — a job with no resolvable lane reads as
+    ``""``, which the ESTOP gate holds (fail-closed).
+    """
+    explicit = str(job.get("profile") or job.get("lane") or "").strip()
+    if explicit:
+        return explicit
+    try:
+        return store_lane()
+    except Exception:
+        return ""
+
+
 @contextlib.contextmanager
 def use_cron_store(home: str | Path):
     """Route cron storage to ``home`` without mutating process globals."""

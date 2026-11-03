@@ -93,7 +93,8 @@ def test_engage_from_a_delegated_child_is_refused(hermes_home, monkeypatch):
 
 def test_release_from_a_delegated_child_is_refused_and_the_hold_stands(hermes_home, monkeypatch):
     """A fenced caller cannot LIFT either — and a raw refusal leaves the live hold in force."""
-    handle = estop.acquire(reason="ops")
+    handle = estop.acquire(reason="ops", mode=estop.MODE_LOCKDOWN,
+                           allow={"profiles": ["default"]})
     assert estop.is_engaged() is True
 
     _fence(monkeypatch, delegated=True)
@@ -110,7 +111,7 @@ def test_an_admitted_caller_arms_and_the_hold_carries_its_venue(hermes_home, mon
     _fence(monkeypatch, delegated=False, task="")
 
     assert estop.arm_admission("arm") == (True, "interactive", None)
-    estop.engage(reason="ops")
+    estop.engage(reason="ops", mode=estop.MODE_LOCKDOWN, allow={"profiles": ["default"]})
 
     holds = estop.read_state().holds
     assert len(holds) == 1
@@ -122,7 +123,8 @@ def test_the_real_test_environment_is_an_admitted_venue(hermes_home):
     """No patch at all: an ordinary shell (no delegation/kanban env) is admitted and stamped."""
     assert estop.arm_admission() == (True, "interactive", None)
 
-    handle = estop.acquire(reason="ops")
+    handle = estop.acquire(reason="ops", mode=estop.MODE_LOCKDOWN,
+                           allow={"profiles": ["default"]})
     assert estop.read_state().holds[0]["venue"] == "interactive"
     assert estop.release(handle=handle).released is True
 
@@ -158,7 +160,8 @@ def test_a_failed_registry_write_still_arms_with_an_attributed_body(hermes_home,
     file is not a hold), so a failed registry write must land an ATTRIBUTED minimal body."""
     monkeypatch.setattr(estop, "_write_registry", lambda path, holds: False)
 
-    handle = estop.acquire(reason="probe")
+    handle = estop.acquire(reason="probe", mode=estop.MODE_LOCKDOWN,
+                           allow={"profiles": ["default"]})
 
     assert estop.is_engaged() is True, "a failed registry write must never leave the fleet running"
     body = json.loads((hermes_home / "ESTOP").read_text(encoding="utf-8"))
@@ -185,7 +188,7 @@ def test_cli_pause_reports_a_hold_layer_refusal_as_rc3(hermes_home, monkeypatch,
 
     monkeypatch.setattr(estop, "arm", _refuse)
 
-    assert cmd_pause(_pause_args()) == 3
+    assert cmd_pause(_pause_args(lockdown=True, allow_profile=["default"])) == 3
     assert capsys.readouterr().out.startswith("⛔ Refusing to arm the emergency stop:")
     assert not (hermes_home / "ESTOP").exists()
 
@@ -194,7 +197,7 @@ def test_cli_resume_reports_a_hold_layer_refusal_as_rc3(hermes_home, monkeypatch
     """Backstop: a refused LIFT is rc=3 and the armed hold stays in force."""
     from hermes_cli.subcommands.pause import cmd_resume
 
-    estop.engage(reason="ops")
+    estop.engage(reason="ops", mode=estop.MODE_LOCKDOWN, allow={"profiles": ["default"]})
 
     def _refuse(*args, **kwargs):
         raise estop.EstopRefusal("Refusing to lift a hold: this is a delegated child context.")

@@ -659,6 +659,12 @@ class OpenAICompatRoutesMixin:
             _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
             _multimodal_validation_error, _normalize_chat_content, _normalize_multimodal_content,
             _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
+        # An agent-serving door starts NEW agent work exactly like the peer transports do, so it
+        # owes the same per-identity ESTOP gate (t_7f6ccfc6): a scoped lockdown that leaves this
+        # route ungated is a way straight past the pause. Refused BEFORE any agent slot is spent.
+        held = self._estop_peer_refusal()
+        if held is not None:
+            return held
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -1063,6 +1069,12 @@ class OpenAICompatRoutesMixin:
             _content_has_visible_payload, _error_response, _invalid_request,
             _multimodal_validation_error, _normalize_multimodal_content, _redact_api_error_text,
             _resolve_media_to_data_urls, _responses_usage_payload)
+        # Same door class as /v1/chat/completions: NEW agent work, so the same ESTOP gate — the
+        # allowlisted identity is served, every other lane is refused while the hold is live
+        # (t_7f6ccfc6). Paid before the request spends an agent slot.
+        held = self._estop_peer_refusal()
+        if held is not None:
+            return held
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:

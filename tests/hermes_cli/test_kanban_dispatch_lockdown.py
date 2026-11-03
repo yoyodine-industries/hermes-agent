@@ -17,6 +17,7 @@ non-spawn is the silent failure that let three consecutive train failures go uns
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -140,11 +141,22 @@ def test_the_typo_lane_is_held_even_on_the_board_it_was_meant_for(
 # ── a total pause is a total halt, and still says so per card ───────────────
 
 
+def _arm_legacy_total(reason: str = "total halt") -> None:
+    """Seed a PRE-RULING total body (what older bytes left behind).
+
+    No verb may arm ``mode: estop`` any more (operator ruling 2026-10-10, card t_e04b4c81), so a
+    total halt can only be READ now — and the dispatcher still has to refuse the legacy alarm it
+    reads, which is what this writes.
+    """
+    body = {"reason": reason, "engaged_at": datetime.now(UTC).isoformat()}
+    estop.sentinel_path().write_text(json.dumps(body) + "\n", encoding="utf-8")
+
+
 def test_a_total_pause_spawns_nothing_on_any_board(kanban_home, all_assignees_spawnable):
     from gateway.kanban_watchers_common import _kanban_dispatch_allowed
 
     kb.create_board("ops")
-    estop.acquire(owner="operator", mode=estop.MODE_ESTOP, reason="total halt")
+    _arm_legacy_total()
     assert _kanban_dispatch_allowed() is False, "a total halt stops the whole tick"
 
     with kbc.connect() as conn:
