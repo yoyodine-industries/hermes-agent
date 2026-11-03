@@ -21,7 +21,7 @@ def _pin_config(monkeypatch):
 
 
 def _did(n: int) -> str:
-    return "%032x" % n
+    return format(n, "032x")
 
 
 class _LogCapture:
@@ -310,12 +310,18 @@ def test_sweep_expires_an_unoffered_record_as_never_offered(tmp_path):
 
 
 def test_sweep_expires_an_offered_record_as_queued_expired(tmp_path):
-    """The other classification: a turn WAS offered it and it still went unread."""
+    """The other classification: a turn WAS offered it and it still went unread.
+
+    Since the A1/A6 evidence protocol, "offered" means the claim recorded the START of a
+    turn -- not merely that an attempt was taken (a claim that never started one was never
+    offered the payload, and classifies ``never_offered``).
+    """
     old = time.time_ns() - int(2 * 3600 * 1e9)
     _admit(tmp_path, 1, now_ns=old)
     claimed = q.claim_next(tmp_path, target_profile="bravo", lease_ok=True)
     assert claimed["attempts"] == 1
-    # Offered, then handed back to the queue (a contended lease): attempts stays 1
+    # Offered to a turn that started, then handed back to the queue: attempts stays 1
+    assert q.note_turn_start(tmp_path, _did(1)) is not None
     q.requeue(tmp_path, _did(1))
     assert q.sweep_delivery_queue(tmp_path) == 1
     record = q.read_record(tmp_path, _did(1))

@@ -31,7 +31,7 @@ import logging
 import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, ContextManager, Dict, Iterator, Optional, Tuple, cast
+from typing import Any, ContextManager, Iterator, Optional, cast
 
 from tools import bot_delivery_queue as delivery_queue
 from tools import bot_delivery_strand_alert as strand_alert
@@ -50,15 +50,42 @@ IN_CALL_DRAIN_MIN_SECONDS = 1.0
 SWEEP_DRAIN_BUDGET_SECONDS = 60.0
 
 
-def delivery_run_kwargs(record: dict[str, Any]) -> Dict[str, Any]:
+def delivery_run_kwargs(record: dict[str, Any]) -> dict[str, Any]:
     """Run kwargs for a delivery with no live request behind it (§2.5).
 
     A drained record carries its own message and target session, so the turn is
     replayed into that session with the session's stored runtime selection --
     there is no sender body to re-read and no request-scoped model lock to honour.
+
+    A delivery that was RECOVERED spends one replay, and the announcer tells the
+    reader WHY in exactly one line prefixed to the payload (ruling A7), on the
+    attempt that actually runs -- a per-tick note anywhere else would be either
+    invisible or repeated. The wording follows the evidence, because the two doors
+    that spend that budget leave different histories (review round 1, finding 2):
+
+    * the sweep recovered a claim that provably never started a turn -- the payload
+      was never read, and the line says so;
+    * ``reoffer_ambiguous`` resent a delivery whose earlier attempt DID start a turn
+      and was interrupted before it settled -- the sender has just been told that
+      attempt MAY have been read, so the announcement must not claim otherwise.
     """
+    message = record.get("message") or ""
+    if delivery_queue.recovery_replays(record) >= 1:
+        created_ns = int(record.get("created_at") or 0)
+        minutes = round(max(0.0, (time.time_ns() - created_ns) / 60_000_000_000))
+        if delivery_queue.never_started_a_turn(record):
+            announcement = (
+                f"[delayed {minutes}m: this delivery's claim was orphaned before any turn "
+                f"started; the queue re-offered it once]"
+            )
+        else:
+            announcement = (
+                f"[delayed {minutes}m: this delivery was re-offered once after its "
+                f"earlier attempt was interrupted; that attempt may have been read]"
+            )
+        message = f"{announcement}\n{message}"
     return {
-        "user_message": record.get("message") or "",
+        "user_message": message,
         "ephemeral_system_prompt": None,
         "session_id": record.get("target_session_id"),
         "gateway_session_key": None,
@@ -137,9 +164,9 @@ async def run_record(
     home: Path,
     record: dict[str, Any],
     *,
-    ctx: Optional[Dict[str, Any]] = None,
+    ctx: Optional[dict[str, Any]] = None,
     waited: float = 0.0,
-) -> Tuple[dict[str, Any], Optional[str]]:
+) -> tuple[dict[str, Any], Optional[str]]:
     """Run one CLAIMED record's turn and settle it. Returns ``(record, reply)``.
 
     ``ctx`` is the live request's context when the record belongs to the caller
@@ -163,6 +190,12 @@ async def run_record(
         scope = nullcontext()
     started = time.monotonic()
     log_delivery_event("turn_start", record, drained=ctx is None)
+    # The queue's own evidence that this claim actually reached a turn (ruling A1). It
+    # goes immediately before the turn has any effect, and it is one direct call -- no
+    # try/except that could skip it, and the call itself never raises. Without it a claim
+    # torn by an unclean exit is indistinguishable from one that never ran, and the
+    # payload would be re-offered after it may already have been read.
+    delivery_queue.note_turn_start(home, delivery_id)
     try:
         with scope:
             history = await adapter._conversation_history_for_session(session_id)
@@ -218,7 +251,7 @@ async def drain_under_lock(
     home: Path,
     target_profile: str,
     delivery_id: str,
-    ctx: Dict[str, Any],
+    ctx: dict[str, Any],
     waited: float,
 ) -> Any:
     """Triggers 1-2: drain the queue under the turn lock this caller just took.
