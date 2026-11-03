@@ -11,7 +11,40 @@ edge cases — call ``monkeypatch.delenv("HERMES_MODEL", raising=False)``
 inside the test, which overrides this fixture's value for that scope.
 """
 
+from pathlib import Path
+
 import pytest
+
+#: Production's lifecycle-guard refusal ledger. Every lane reads it; no test may write it.
+_PROD_REFUSAL_LEDGER = Path("/opt/hermes_prod/run_details/lifecycle-guard-refusals.jsonl")
+
+
+def _prod_refusal_ledger_fingerprint() -> tuple[int, int] | None:
+    """Size + mtime of the production refusal ledger, or None where it does not exist (CI)."""
+    try:
+        stat = _PROD_REFUSAL_LEDGER.stat()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime_ns)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _the_cron_suite_never_writes_the_production_refusal_ledger():
+    """Measure, across the whole suite run, that PRODUCTION's refusal ledger never moved.
+
+    The per-test pin above is the mechanism; this is the assertion that says the mechanism
+    holds for every module in the tree, including ones that build the guard themselves instead
+    of going through a shared fixture. Size + mtime rather than a line count, so a truncation
+    or a rewrite fails here too.
+    """
+    before = _prod_refusal_ledger_fingerprint()
+    yield
+    after = _prod_refusal_ledger_fingerprint()
+    assert after == before, (
+        f"this suite wrote to the PRODUCTION refusal ledger {_PROD_REFUSAL_LEDGER} "
+        f"(before={before}, after={after}); an arm is building the guard without the "
+        "LIFECYCLE_GUARD_REFUSAL_LEDGER pin"
+    )
 
 
 @pytest.fixture()
@@ -56,6 +89,23 @@ def _no_managed_store(tmp_path, monkeypatch):
 def _default_cron_test_model(monkeypatch):
     """Pin a default HERMES_MODEL so cron run_job tests have a resolvable model."""
     monkeypatch.setenv("HERMES_MODEL", "test-cron-default-model")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _refusal_ledger_never_reaches_production(tmp_path, monkeypatch):
+    """No arm in this tree may append to PRODUCTION's lifecycle-guard refusal ledger.
+
+    ``cron.lifecycle_guard`` defaults its refusal ledger to
+    /opt/hermes_prod/run_details/lifecycle-guard-refusals.jsonl, so every arm that makes the
+    guard refuse writes a row into the LIVE audit trail unless something pins the env. That is
+    not hypothetical: runs of the guard suites left 86 fixture rows in the production ledger
+    (2026-10-25T07:06-07:09Z and 2026-11-03T07:34-07:36Z, pids 28464/34409/35058/35572/47802/
+    47921/48343, every command a pytest tmp path) - half the evidence "a refusal leaves a row"
+    is meant to provide. A module-level pin only protects the module that remembers to use it;
+    this one protects every arm, including arms added later.
+    """
+    monkeypatch.setenv("LIFECYCLE_GUARD_REFUSAL_LEDGER", str(tmp_path / "refusals.jsonl"))
     yield
 
 
