@@ -14,6 +14,7 @@ import fnmatch
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from agent.file_safety import get_nt_namespace_error
 from tools import file_state
@@ -207,7 +208,12 @@ def _check_consent_surface(paths: list[str], task_id: str = "default",
                        "hermes_cli.consent_surface_doors", exc_info=True)
         return None
     return doors.file_denial([_resolved_or_raw(p, task_id) for p in paths],
-                             ctx=ctx, verb="write")
+                             ctx=ctx, verb="write",
+                             # The protected-instruction surface is refused by
+                             # `_check_protected_instruction_write`, whose licence is
+                             # CARD-BOUND (ruling t_cd80bb5a D1): one clause, one cause,
+                             # one receipt for that class.
+                             exclude=(doors.PROTECTED_SURFACE,))
 
 
 # ── Protected agent-instruction files (always-ask approval gate) ─────────
@@ -226,69 +232,41 @@ _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
     "agents.md", "claude.md", "soul.md", ".cursorrules"})
 
 
-def _protected_instruction_config() -> tuple[bool, list[str], list[str]]:
-    """Return ``(enabled, extra_patterns, allowlist_dirs)`` from
-    ``security.protected_instruction_files`` /
-    ``security.protected_instruction_extra_patterns`` (fnmatch on basename) /
-    ``security.protected_instruction_allowlist_dirs`` (realpaths of the trees that may hold these
-    files WITHOUT the always-ask prompt — a checkout being worked on, never a live surface).
-    Config read failures keep the gate ON and the allowlist EMPTY — fail-safe for a security
-    boundary.
+def _protected_instruction_config() -> tuple[bool, list[str]]:
+    """Return ``(enabled, extra_patterns)`` from
+    ``security.protected_instruction_files`` and
+    ``security.protected_instruction_extra_patterns`` (fnmatch on basename).
+    Config read failures keep the gate ON — fail-safe for a security boundary.
 
-    An allowlist entry survives only as a real DIRECTORY name: non-strings, empty strings and
-    anything that is not absolute (after ``~`` expansion, exactly the treatment
-    ``_hermes_exempt_homes()`` gives the Hermes root) are dropped, so a typo can never be read as
-    a relative prefix. Each survivor is realpath'd once, HERE, so the comparison downstream is
-    resolved-path against resolved-path and a symlinked entry cannot smuggle a different tree in.
+    There is deliberately NO allowlist here. ``security.protected_instruction_allowlist_dirs``
+    existed once -- it exempted whole directory trees from the always-ask prompt -- and was
+    RETIRED by the ruling on card ``t_cd80bb5a`` (D2). Do not re-add it. A directory
+    allowlist answers "can this TREE ever be written", which is not the question this gate
+    asks ("is this one change consented, by this one card, once"): the sanctioned way to
+    work in a checkout was to make every project ``AGENTS.md`` in
+    ``/opt/hermes_sandbox`` and ``/opt/hermes_prod`` silently writable, which is the
+    prompt-persistence vector the gate exists to stop, and it left the four cards that
+    were actually blocked by this gate -- correct behaviour -- still blocked. The consent
+    surface's ``project-instruction-file`` clause (``_check_protected_instruction_write``)
+    is the sanctioned exit: a CARD-BOUND approved approval, per write.
     """
     try:
         from hermes_cli.config import load_config, cfg_get
         cfg = load_config()
         enabled = cfg_get(cfg, "security", "protected_instruction_files", default=True)
         extra = cfg_get(cfg, "security", "protected_instruction_extra_patterns", default=[])
-        allow = cfg_get(cfg, "security", "protected_instruction_allowlist_dirs", default=[])
     except Exception:
-        return True, [], []
+        return True, []
     if not isinstance(enabled, bool):
         enabled = True
     if not isinstance(extra, list):
         extra = []
-    if not isinstance(allow, list):
-        allow = []
-    allowlist_dirs: list[str] = []
-    for entry in allow:
-        if not isinstance(entry, str) or not entry:
-            continue
-        try:
-            expanded = os.path.expanduser(entry)
-        except (OSError, ValueError, RuntimeError):
-            continue
-        if not os.path.isabs(expanded):
-            continue
-        try:
-            allowlist_dirs.append(os.path.realpath(expanded))
-        except (OSError, ValueError):
-            continue
-    return enabled, [str(p) for p in extra if p], allowlist_dirs
-
-
-def _in_allowlisted_dir(resolved: str, allowlist_dirs: list[str]) -> bool:
-    """True when ``resolved`` IS an allowlisted directory or lives inside one.
-
-    Same boundary rule as the Hermes-home exemption above: compare against ``root + os.sep``, so a
-    sibling that merely shares a STRING prefix (``/opt/hermes_prod_evil`` beside
-    ``/opt/hermes_prod``) is not inside it. Both sides are already realpaths.
-    """
-    for root in allowlist_dirs:
-        if resolved == root or resolved.startswith(root + os.sep):
-            return True
-    return False
+    return enabled, [str(p) for p in extra if p]
 
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
-                                  extra_patterns: list[str] | None = None,
-                                  allowlist_dirs: list[str] | None = None) -> str | None:
+                                  extra_patterns: list[str] | None = None) -> str | None:
     """Return a short label when ``filepath`` targets a protected instruction file, else ``None``.
     Matches BOTH the normalized input and its realpath so no symlink direction escapes.
 
@@ -296,19 +274,19 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     protected file (#41351) nor a protected name that is itself a symlink escapes the gate. ``..`` traversal
     is neutralized by normpath/realpath before the basename compare.
 
-    TWO narrow exemptions run before the match: the Hermes home tree(s)
-    (``_hermes_exempt_homes`` — the agent's own store), and every directory named in
-    ``security.protected_instruction_allowlist_dirs`` — a checkout being WORKED ON (the sanctioned flow:
-    edit in /opt/hermes_sandbox/<domain>/work/<lane>/..., reach the live line through the update
-    routine), never a live surface. The allowlist exemption is scoped to the four BUILT-IN basenames and
-    is decided on the RESOLVED path only, so:
-      * an extra pattern still gates inside an allowlisted tree (a project's own rule is absolute);
-      * a ``.hermes`` component directory still gates inside an allowlisted tree;
-      * a symlink inside the tree that points OUT of it stays gated (resolved is outside);
-      * a symlink outside pointing INTO the tree is exempt, which is the whole point.
+    ONE narrow exemption runs before the match: the Hermes home tree(s)
+    (``_hermes_exempt_homes`` — the agent's own store, which has its own config hard-block
+    and mirror guard). Project-local files have NO tree exemption, because the tree
+    exemption is the bypass ruling ``t_cd80bb5a`` D2 retired (see
+    ``_protected_instruction_config``).
+
+    This is also the ONE match set of the consent surface's ``project-instruction-file``
+    class: ``hermes_cli.consent_surface_doors.protected_write_target`` calls this function
+    rather than defining a second matcher, so the always-ask prompt and the consent
+    surface can never disagree about what a protected instruction file is.
     """
-    if enabled is None or extra_patterns is None or allowlist_dirs is None:
-        enabled, extra_patterns, allowlist_dirs = _protected_instruction_config()
+    if enabled is None or extra_patterns is None:
+        enabled, extra_patterns = _protected_instruction_config()
     if not enabled:
         return None
 
@@ -327,21 +305,16 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
-    allowlisted = _in_allowlisted_dir(resolved, allowlist_dirs)
-
     for candidate in (normalized, resolved):
         base = os.path.basename(candidate)
         base_lower = base.lower()
-        # An extra pattern is the project's OWN rule for this tree; the allowlist never overrides it.
         if any(fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
             return base
-        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES and not allowlisted:
+        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES:
             return base
         # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
         # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
         # would gate every write inside a checkout living under ~/.hermes.
-        # NOT exempted by the allowlist: an allowlisted tree may hold a checkout whose
-        # .hermes/config.yaml is still a live steering surface.
         parts = candidate.replace("\\", "/").rstrip("/").split("/")
         if len(parts) >= 2 and parts[-2] == ".hermes":
             return candidate
@@ -438,19 +411,76 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
+#: Sentinel: the consent clause does not own this session (no owning card), so the
+#: always-ask prompt still answers. A licensed write returns ``None`` and a refusal a
+#: ``str`` -- which is why the clause needs a third value of its own.
+_CONSENT_NOT_OURS: Any = object()
+
+
 def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
-    the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
-    enabled, extra, allowlist_dirs = _protected_instruction_config()
+    the ENTIRE multi-file patch (one prompt, all-or-nothing).
+
+    THREE OUTCOMES since the ruling on card ``t_cd80bb5a`` (D1):
+
+    1. the session has an owning kanban card and that card holds a CARD-BOUND approved
+       approval covering ``project-instruction-file:<repo-slug>`` -- the write proceeds
+       with ZERO prompts and no human channel;
+    2. the session has an owning card and no such approval -- a deterministic refusal
+       (surface, target, card, the token, and a copy-paste filer), a ``consent_refused``
+       receipt and a park. NO prompt: the ask is the operator's, and a worker has no
+       authority to answer it for them;
+    3. no owning card (a human at a console, cron, the operator) -- the pre-existing
+       always-ask prompt below, unchanged, headless answer included.
+
+    This clause is a FLOOR: it runs before the prompt, so ``--yolo``,
+    ``approvals.mode=off``, an allowlist and unattended mode cannot re-open it, and the
+    coverage consult is what gives the class a non-interactive exit that is not a prompt.
+    """
+    enabled, extra = _protected_instruction_config()
     if not enabled:
         return None
     reasons = [r for r in (_protected_instruction_reason(
-                               p, task_id, enabled=enabled, extra_patterns=extra,
-                               allowlist_dirs=allowlist_dirs)
+                               p, task_id, enabled=enabled, extra_patterns=extra)
                            for p in paths) if r]
     if not reasons:
         return None
+    gated = _protected_write_consent(paths, reasons, task_id)
+    if gated is not _CONSENT_NOT_OURS:
+        return gated
     return _request_protected_instruction_approval(reasons, task_id)
+
+
+def _protected_write_consent(paths: list[str], reasons: list[str], task_id: str) -> Any:
+    """The ``project-instruction-file`` consent clause for the FILE door (D1).
+
+    Returns ``_CONSENT_NOT_OURS`` when the clause does not apply (no owning card, or the
+    doors are not importable), ``None`` when the write is LICENSED (proceed silently), or
+    the refusal string. Decision, receipt and park all come from the guard, so the file
+    door and the terminal/exec doors refuse this class with one voice.
+    """
+    try:
+        from hermes_cli import consent_surface_doors as doors
+        from hermes_cli import consent_surface_guard as guard
+    except ImportError:  # vendored / partial install: the prompt path still stands
+        logger.debug("consent-surface clause unavailable (import failed); prompting", exc_info=True)
+        return _CONSENT_NOT_OURS
+    try:
+        if not guard.consent_gate_active():
+            return _CONSENT_NOT_OURS
+        hit = doors.hit_for_paths(paths)
+    except Exception:  # a clause must never take a write path down
+        logger.warning("protected-instruction consent clause could not classify; "
+                       "falling back to the prompt", exc_info=True)
+        return _CONSENT_NOT_OURS
+    if hit is None or getattr(hit, "surface", None) != doors.PROTECTED_SURFACE:
+        return _CONSENT_NOT_OURS
+    result = guard.refuse_surface_write(hit)
+    if result.get("approved"):
+        return None
+    return str(result.get("message") or (
+        f"BLOCKED (consent surface): {getattr(hit, 'surface', '?')} needs an approved, "
+        "card-bound approval. See the card's consent_refused receipt."))
 
 
 def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:

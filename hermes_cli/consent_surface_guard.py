@@ -54,6 +54,9 @@ __all__ = [
     "COMMENT_AUTHOR",
     "DISARM_ENV",
     "GuardContext",
+    "PROTECTED_CAUSE",
+    "PROTECTED_SURFACE",
+    "cause_for",
     "consent_gate_active",
     "emit_surface_refusal_receipt",
     "refusal_message",
@@ -71,6 +74,20 @@ _OFF_VALUES = frozenset({"off", "0", "false", "no", "disabled"})
 CAUSE = "surface_write_without_consent"
 RECEIPT_KIND = "consent_refused"
 COMMENT_AUTHOR = "consent-surface-guard"
+
+#: The seventh surface (ruling ``t_cd80bb5a`` D1) and ITS OWN cause. A protected
+#: instruction write has a distinct exit from the six live surfaces -- "file a licence
+#: bound to this card" -- so its receipt names its own cause and a reader can tell the
+#: two classes apart without reading the message body.
+PROTECTED_SURFACE = "project-instruction-file"
+PROTECTED_CAUSE = "protected_write_without_consent"
+#: The cause for "a covering approval exists, but not on THIS card".
+PROTECTED_CARD_NOT_LICENSED = "card_not_licensed"
+
+
+def cause_for(surface: str) -> str:
+    """The receipt/park cause for a surface: the protected class has its own."""
+    return PROTECTED_CAUSE if str(surface or "") == PROTECTED_SURFACE else CAUSE
 
 #: Per-session latch: (session key, surface) -> the cause that refused it. Bounded so a
 #: long-lived gateway process cannot grow it without limit; clearing it only ever
@@ -96,12 +113,16 @@ class GuardContext:
     session_id: Optional[str] = None
     board_db: Optional[Path] = None
     approvals_db: Optional[Path] = None
+    #: The board the owning card sits on (``HERMES_KANBAN_BOARD``), carried so the
+    #: refusal can hand a filer every argument it needs, including ``board=``.
+    board: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> GuardContext:
         return cls(
             task_id=_env("HERMES_KANBAN_TASK"),
             session_id=_env("HERMES_SESSION_ID"),
+            board=_env("HERMES_KANBAN_BOARD"),
         )
 
 
@@ -113,6 +134,10 @@ class SurfaceVerdict:
     detail: str = ""
     refs: tuple = ()
     approved_refs: tuple = ()       # licensed refs that DO cover the token
+    #: Rows whose ``card_id`` IS the owning card (ruling ``t_cd80bb5a`` D1): the
+    #: card-bound route. They are not "cited on the card", so they render on their own
+    #: line -- and a pending row among them is what an operator is being asked for.
+    bound: tuple = ()
 
     @property
     def licensed(self) -> bool:
@@ -133,14 +158,15 @@ def _ctx(ctx: Any) -> GuardContext:
     if isinstance(ctx, GuardContext):
         return ctx
     if isinstance(ctx, Mapping):
-        fields = {k: ctx.get(k) for k in ("task_id", "session_id", "board_db", "approvals_db")}
+        fields = {k: ctx.get(k) for k in
+                  ("task_id", "session_id", "board_db", "approvals_db", "board")}
     else:
         fields = {k: getattr(ctx, k, None) for k in
-                  ("task_id", "session_id", "board_db", "approvals_db")}
+                  ("task_id", "session_id", "board_db", "approvals_db", "board")}
     for key in ("board_db", "approvals_db"):
         if fields.get(key):
             fields[key] = Path(str(fields[key]))
-    for key in ("task_id", "session_id"):
+    for key in ("task_id", "session_id", "board"):
         if fields.get(key) is not None:
             fields[key] = str(fields[key]).strip() or None
     return GuardContext(**fields)
@@ -373,6 +399,143 @@ def _assess(card: Mapping[str, Any], ctx: GuardContext, token: str,
     return SurfaceVerdict(cause="scope_not_covered", refs=refs, approved_refs=licensed)
 
 
+# --- the card-bound route (ruling t_cd80bb5a D1) ------------------------------
+#
+# The seventh surface's licence is the CARD, not a citation: "this card may write this
+# project's instruction file, once". A prose reference cannot carry that--the reader
+# cannot tell whether the row was written FOR this card, and a card that copies a
+# reference off another card has not been licensed for anything. So coverage is read
+# from the store's own ``card_id`` column, and the prose-ref path above stays only as
+# the optional convenience the ruling keeps.
+
+_COVERAGE_FIELDS = "id, status, decision, reason, task, context, idempotency_key, card_id"
+
+
+def _read_card_rows(path: Path, card_id: str) -> list[dict]:
+    """Every approvals row BOUND to ``card_id`` (any status), newest first."""
+    if not card_id:
+        return []
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+    try:
+        con.row_factory = sqlite3.Row
+        con.text_factory = lambda b: b.decode("utf-8", "replace")
+        rows = con.execute(
+            f"SELECT {_COVERAGE_FIELDS} FROM approvals WHERE card_id = ? ORDER BY id DESC",
+            (str(card_id),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        con.close()
+
+
+def _read_approved_rows(path: Path) -> list[dict]:
+    """Every APPROVED row, whatever its card: only to name *why* a card is unlicensed.
+
+    A card-bound lookup cannot see a row bound to another card, and "no row on this
+    card" and "the row you are thinking of is on someone else's card" need different
+    repairs. This read never licenses anything.
+    """
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+    try:
+        con.row_factory = sqlite3.Row
+        con.text_factory = lambda b: b.decode("utf-8", "replace")
+        rows = con.execute(
+            f"SELECT {_COVERAGE_FIELDS} FROM approvals WHERE status = 'approved'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        con.close()
+
+
+def _row_state(row: Mapping[str, Any]):
+    """One approvals row as the guard's own ``RefState`` (so messages render alike)."""
+    from hermes_cli import kanban_consent_gate as cg
+
+    return cg.RefState(
+        ref=f"APR-{int(row.get('id') or 0):04d}",
+        resolved=True,
+        status=str(row.get("status") or ""),
+        card_id=str(row.get("card_id") or ""),
+        note=str(row.get("decision") or row.get("reason") or ""),
+    )
+
+
+def _approved(row: Mapping[str, Any]) -> bool:
+    from hermes_cli import kanban_consent_gate as cg
+
+    return str(row.get("status") or "").strip().lower() in cg.LICENSING_STATUSES
+
+
+def _assess_card_bound(ctx: GuardContext, token: str, surface: str) -> SurfaceVerdict:
+    """The D1 card-bound assessment: ``(a)`` covers the token AND ``(b)`` is this card."""
+    path = _approvals_path(ctx)
+    try:
+        rows = _read_card_rows(path, ctx.task_id or "")
+        approved_anywhere = _read_approved_rows(path)
+    except (sqlite3.Error, OSError) as exc:
+        return _unreadable("approvals_store_unreadable", f"{path}: {type(exc).__name__}: {exc}")
+
+    bound = tuple(_row_state(row) for row in rows)
+    licensed = tuple(_row_state(row) for row in rows
+                     if _approved(row) and _covers(row, token, surface))
+    if licensed:
+        return SurfaceVerdict(bound=bound, approved_refs=licensed)
+
+    # A covering approval exists, but it is not this card's. Named, because the repair
+    # ("file it WITH the card id") differs from "file it at all".
+    elsewhere = [
+        row for row in approved_anywhere
+        if _covers(row, token, surface)
+        and str(row.get("card_id") or "").strip() != str(ctx.task_id or "").strip()
+    ]
+    if elsewhere:
+        other_cards = sorted({str(row.get("card_id") or "(unbound)") for row in elsewhere})
+        detail = (
+            f"an approved approval covers {token!r} but is bound to "
+            f"{', '.join(other_cards)}; coverage for {surface!r} is card-bound"
+        )
+        return SurfaceVerdict(cause=PROTECTED_CARD_NOT_LICENSED, detail=detail, bound=bound)
+
+    approved = tuple(_row_state(row) for row in rows if _approved(row))
+    if approved:
+        return SurfaceVerdict(cause="scope_not_covered", bound=bound, approved_refs=approved)
+    if rows:
+        # A pending/routed row on this card: the ask is filed, the operator has not
+        # answered. Saying so is the whole difference between "nobody asked" and
+        # "somebody asked and is still waiting".
+        return SurfaceVerdict(cause="ref_not_approved", bound=bound)
+    return SurfaceVerdict(cause="no_ref", bound=bound)
+
+
+#: Most specific first. The combined assessment reports the most actionable cause, so
+#: the message can name the one thing that would unblock the write.
+_CAUSE_ORDER = (
+    PROTECTED_CARD_NOT_LICENSED,
+    "scope_not_covered",
+    "ref_not_approved",
+    "no_approved_ref",
+    "no_ref",
+)
+
+
+def _assess_surface(card: Mapping[str, Any], ctx: GuardContext, token: str,
+                    surface: str) -> SurfaceVerdict:
+    """The coverage rule for one surface: the six live ones keep the D2 ref rule, the
+    seventh takes the card-bound route with the ref path kept as a convenience."""
+    verdict = _assess(card, ctx, token, surface)
+    if surface != PROTECTED_SURFACE or verdict.licensed:
+        return verdict
+    if verdict.cause.endswith("_store_unreadable"):
+        return verdict
+    bound = _assess_card_bound(ctx, token, surface)
+    if bound.licensed:
+        return bound
+    if bound.cause.endswith("_store_unreadable"):
+        return bound
+    rank = {cause: index for index, cause in enumerate(_CAUSE_ORDER)}
+    return bound if rank.get(bound.cause, 99) <= rank.get(verdict.cause, 99) else verdict
+
+
 # --- the public contract -----------------------------------------------------
 
 def consent_gate_active(ctx: Any = None) -> bool:
@@ -433,7 +596,7 @@ def _decide(hit: Any, ctx: GuardContext) -> tuple[str, str]:
     elif card is None:  # gate was active on an unreadable store; keep failing closed
         verdict = _unreadable("board_store_unreadable", str(_board_db_path(ctx)))
     else:
-        verdict = _assess(card, ctx, token, surface)
+        verdict = _assess_surface(card, ctx, token, surface)
 
     if verdict.licensed:
         return "allow", ""
@@ -474,6 +637,15 @@ def refusal_message(hit: Any, verdict: SurfaceVerdict, ctx: Any = None) -> str:
         lines.append("  references on the card: not read (store error)")
     else:
         lines.append("  references on the card: none")
+    if verdict.bound:
+        bound = "; ".join(f"{r.ref} -> {r.status or 'unresolved'}" for r in verdict.bound)
+        lines.append(f"  approvals bound to this card: {bound}")
+    if surface == PROTECTED_SURFACE:
+        lines.append(
+            "  licence for this surface is CARD-BOUND: an APPROVED approval in "
+            "the approvals store whose scope covers the token AND whose card_id is "
+            f"{ctx.task_id or '(none)'}. A prose reference is accepted as a "
+            "convenience, never as a requirement.")
     if verdict.cause == "latched":
         lines.insert(3, f"  refused earlier in this session for: {verdict.detail or 'unknown'} "
                         "(one refusal per surface per run)")
@@ -482,17 +654,73 @@ def refusal_message(hit: Any, verdict: SurfaceVerdict, ctx: Any = None) -> str:
             "  the approved reference(s) do not cover this scope: "
             + ", ".join(r.ref for r in verdict.approved_refs)
             + " declare a narrower or different scope than the required token.")
+    if verdict.cause == PROTECTED_CARD_NOT_LICENSED:
+        lines.append(f"  {verdict.detail or 'a covering approval exists, but not on this card'}.")
+        lines.append(
+            "  a covering approval on another card is NOT a licence for this card: the "
+            "operator licensed that card's write, not this one's.")
+    if verdict.cause == "ref_not_approved" and verdict.bound:
+        lines.append(
+            "  " + ", ".join(f"{r.ref} ({r.status or 'unknown'})" for r in verdict.bound)
+            + " is bound to this card and is awaiting the operator: the ask is filed, "
+            "not answered.")
     if verdict.cause in ("approvals_store_unreadable", "board_store_unreadable"):
         lines.append(f"  store error ({verdict.cause}): {verdict.detail}")
-    lines += [
-        "TO PROCEED: file an approval whose scope token is "
-        f"{token!r} (or a covering scope such as {token.split(':')[0]!r}), get it "
-        "APPROVED, cite its APR-NNNN in this card, then retry. The card has been parked "
-        "blocked/needs_input for a human to release.",
+    if surface == PROTECTED_SURFACE:
+        lines += _protected_proceed_lines(token, ctx)
+    else:
+        lines.append(
+            "TO PROCEED: file an approval whose scope token is "
+            f"{token!r} (or a covering scope such as {token.split(':')[0]!r}), get it "
+            "APPROVED, cite its APR-NNNN in this card, then retry. The card has been "
+            "parked blocked/needs_input for a human to release.")
+    lines.append(
         "This refusal is a FLOOR: --yolo, approvals.mode=off, an allowlist, and "
-        "unattended mode cannot bypass it.",
-    ]
+        "unattended mode cannot bypass it.")
     return "\n".join(lines)
+
+
+def _ops_api_origin() -> str:
+    """The ops API that files approvals on this host (``POST /api/approvals``).
+
+    Read from the same environment variable the fleet's own filers use, so a lane that
+    relocates the service does not get a refusal pointing at a dead port.
+    """
+    return (os.environ.get("OPS_API") or "http://127.0.0.1:9501").rstrip("/")
+
+
+def _protected_proceed_lines(token: str, ctx: GuardContext) -> list[str]:
+    """The exit for a protected-instruction write: a COPY-PASTE filer, card-bound.
+
+    The whole point of D1 is that this refusal has a route out that needs no judgement
+    from the worker: file the row, with the card id on it, and stop. So the message
+    carries the exact call, with the arguments the reader would otherwise have to
+    guess -- scope, card id, board -- already filled in.
+
+    It is a ``curl`` and not ``python3 -c`` on purpose: ``-c`` is exactly the shape the
+    unattended-approval floor treats as arbitrary code execution, which is why a worker
+    could not paste it. ``kind: ask`` is required by the service and graded by the
+    operator-ask gate; a licence is an ask, so a bounce is the gate doing its job.
+    """
+    card = ctx.task_id or "<card-id>"
+    board = ctx.board or "<board>"
+    payload = (
+        '{"project":"platform","task":"protected-instruction write",'
+        '"origin_bot":"<your lane>","context":"<why this project file must change>",'
+        f'"card_id":"{card}","board":"{board}","scope":"{token}","kind":"ask"}}'
+    )
+    return [
+        "TO PROCEED (this surface is licensed by a CARD-BOUND approval, not a citation):",
+        "  1. file the approval WITH this card's id, so the row is bound to it:",
+        f"     curl -sS -X POST {_ops_api_origin()}/api/approvals "
+        "-H 'Content-Type: application/json' \\",
+        f"       -d '{payload}'",
+        "  2. an operator approves it out of band. The ask is the operator's, not "
+        "yours: do not decide it, and do not re-file it as a narrower question.",
+        "  3. retry the write. While the row is pending the write stays refused and this "
+        "card stays parked blocked/needs_input.",
+        "Do not retry through another door: the refusal latches once per surface per run.",
+    ]
 
 
 def refuse_surface_write(hit: Any, ctx: Any = None) -> dict:
@@ -531,7 +759,8 @@ def emit_surface_refusal_receipt(hit: Any, ctx: Any = None) -> bool:
     if not ctx.task_id:
         return False
     surface, token, target = _hit(hit)
-    payload = {"cause": CAUSE, "surface": surface, "scope_token": token, "target": target}
+    cause = cause_for(surface)
+    payload = {"cause": cause, "surface": surface, "scope_token": token, "target": target}
     body = (
         "CONSENT REFUSED at the write boundary (write not performed).\n\n"
         + refusal_message(hit, SurfaceVerdict(cause="receipt"), ctx)
@@ -561,7 +790,7 @@ def emit_surface_refusal_receipt(hit: Any, ctx: Any = None) -> bool:
         return False
     try:
         with kbc.connect_closing(db_path=_board_db_path(ctx)) as conn:
-            kb.block_task(conn, ctx.task_id, reason=f"consent: {CAUSE} ({surface})",
+            kb.block_task(conn, ctx.task_id, reason=f"consent: {cause} ({surface})",
                           kind="needs_input")
     except Exception:
         # Already parked (or the CAS moved the card on): the receipt is the record.
