@@ -54,6 +54,10 @@ content the batch itself reaches, and records it here.
 
 ## Files whose row-side content the branch dropped, and what was done
 
+(One row, `tests/conftest.py`, is the inverse — a file the row never touched where
+the branch dropped **upstream's** content. It is marked as such and resolved in the
+round-3 addendum.)
+
 Carried (all verified NOT conflicted and NOT a B1/B3 path). `MERGE` = three-way
 `git merge-file` (BASE=cut, OURS=carrier) which is what git does on a clean path;
 `TAKE` = upstream never touched the file, so the merge result is the carrier blob.
@@ -69,7 +73,7 @@ Carried (all verified NOT conflicted and NOT a B1/B3 path). `MERGE` = three-way
 | `hermes_cli/kanban_db_workspace.py`, `hermes_cli/kanban_pr_acceptance.py`, `hermes_cli/kanban_pr_acceptance_store.py` | `WorkspaceVolumeUnavailable`, `WorktreeAnchorNotRepo`, `needs_repository_checks`, `_COMPLETABLE` | present, symbols absent | MERGE |
 | `hermes_cli/code_skew_content.py`, `hermes_cli/tree_fingerprint.py`, `hermes_cli/kanban_gate_invariants.py`, `hermes_cli/kanban_proof_gate.py`, `hermes_cli/kanban_landing_carrier.py`, `hermes_cli/kanban_filing_policy.py`, `hermes_cli/kanban_priority_policy.py`, `hermes_cli/kanban_protected_trees.py`, `hermes_cli/kanban_contract_resolve.py`, `hermes_cli/kanban_crash_sweep_guard.py`, `hermes_cli/kanban_consent_gate.py`, `hermes_cli/kanban_top_level_gate.py`, `hermes_cli/kanban_register.py`, `hermes_cli/substrate_access.py` | the batch's `from hermes_cli import …` targets | mixed | MERGE/ADD |
 | `hermes_cli/delivery_keys.py`, `hermes_cli/kanban_completion_refs.py`, `hermes_cli/kanban_db_dispatch_retire.py`, `hermes_cli/kanban_db_links.py`, `hermes_cli/kanban_exits.py`, `hermes_cli/kanban_inbox.py`, `hermes_cli/kanban_adjudicate.py`, `hermes_cli/kanban_parent_state.py`, `hermes_cli/substrate_view.py`, `hermes_cli/subcommands/groups.py`, `tools/bot_delivery_queue.py`, `tools/bot_delivery_lease.py`, `tools/bot_delivery_notices.py`, `tools/process_registry_output.py` | carrier-only modules the batch imports (a missing module is invisible to a name audit: it resolves to no file at all) | absent | ADD |
-| `tests/conftest.py` | the row's fixtures (233 lines) — without them the worktree/kanban fixtures are half-built | unchanged | TAKE |
+| `tests/conftest.py` | **NOT row content — the inverse case.** Row vs cut: `git diff dce1e9b37581..origin/overrides/live -- tests/conftest.py` is **empty** (the row never touched this file). Upstream vs cut: `+233/-0` — upstream ADDED 233 lines after the cut | **changed, +233/-0** | **TAKE upstream's blob** (`git checkout origin/main -- tests/conftest.py`, blob `07259c6c`). The round-2 branch carried the *carrier* blob `025f7a88` (== the cut's content) and thereby dropped upstream's 233 lines — an R0 regression. Upstream's conftest is a strict superset of the cut's, so reverting removes no carrier fixture. See the round-3 addendum. |
 
 **Not carried, deliberately:** the remaining row paths in the batch's import
 closure (measured at 106 row-changed paths before these carries). Carrying them
@@ -91,7 +95,10 @@ is carried here and what it must supply.
   `PYTHONPATH=.:<testlibs>` against the harness venv.
 - `tests/hermes_state/test_bounded_reclaim.py` — **8 passed**.
 - `tests/hermes_state/test_hermes_state_readonly_preflight.py` — **12 passed**.
-- Broader row-oracle run (boards, peer, yaml, diagnostics): **83 passed, 0 failed**.
+- Broader row-oracle run on exactly those four files (boards, peer, yaml,
+  diagnostics): **63 passed, 0 failed** (round 2 wrote 83 here; 83 counted the two
+  `hermes_state` suites above as well — measured 63 for the four alone, round 3,
+  and the reviewer measured 63 independently).
 - `hermes_state_repair.py` against `test_state_db_repair_{non_destructive,live_writer_guard}.py`:
   this resolution fails **15** tests where the row's own file fails **17** — and the
   baseline is red on BOTH sides independently (the row's file and upstream's each
@@ -115,4 +122,61 @@ is carried here and what it must supply.
   `tools/mcp_tool.py`, `tui_gateway/methods_bot_relay.py`,
   `tests/gateway/test_lifecycle_state_db_check.py`,
   `tests/tools/test_bot_mode_refusal_contract.py`. Reported to platform-stl.
+
+## Round-3 addendum — the inverse-R0 defect on `tests/conftest.py`
+
+Round 2's record row for `tests/conftest.py` was **wrong**, and the resolution it
+justified was wrong with it. Corrected measurements (all reproducible):
+
+```
+git diff dce1e9b37581..origin/overrides/live -- tests/conftest.py   -> EMPTY
+git diff --stat dce1e9b37581..origin/main -- tests/conftest.py      -> +233 / -0
+git rev-parse  origin/overrides/live:tests/conftest.py              -> 025f7a88  (== cut blob)
+git rev-parse  origin/main:tests/conftest.py                        -> 07259c6c
+```
+
+So the row never touched this file; **upstream** added 233 lines to it after the
+cut. Round 2 carried the carrier blob `025f7a88` on the path and thereby dropped all
+233 upstream lines — an **R0 regression on a file the row does not own**, which is
+the opposite of the "row content the branch dropped" framing the table uses, and
+why the row read `unchanged | TAKE` (both wrong: upstream *had* changed it, and the
+branch did not take upstream's version).
+
+Fix: `git checkout origin/main -- tests/conftest.py` → blob `07259c6c`, identical to
+`origin/main`. Upstream's conftest is a strict superset of the cut's (`+233/-0`), so
+this removes nothing the carrier needed — no row fixture is lost. In particular
+`scratch_prune_spawns` (conftest.py:716) is present and resolves.
+
+**The class was audited, not just the instance.** Across all 63 paths this branch
+changes vs `origin/main`, the inverse-R0 pattern — row-untouched file (`carrier blob
+== cut blob`) AND upstream changed it AND the branch kept the carrier blob — has
+**0 hits**. `tests/conftest.py` was the only member.
+
+Round-3 measurements (harness venv + `testlibs` on `PYTHONPATH`), on the committed
+tree `e236bb0c5e`:
+
+- `tests/hermes_state/test_bounded_reclaim.py` + `test_hermes_state_readonly_preflight.py`
+  — **20 passed** (reclaim stays 8/8).
+- `tests/test_scratch_dir.py` — before: `29 passed, 3 skipped, 1 ERROR`
+  (`fixture 'scratch_prune_spawns' not found`); after: **30 passed, 3 skipped,
+  0 failed, 0 errors**. The two tests the reviewer saw failing at `origin/main`
+  also pass here, so the fix is strictly better than the baseline.
+- import-smoke over every changed `.py` — **62/62 imported** (63 in round 2; the
+  63rd was `tests/conftest.py`, which no longer differs from `origin/main`).
+- row-oracle selection (boards, peer, yaml, diagnostics) — **63 passed**.
+- `tests/hermes_cli` **in full** was not run to completion — it is a multi-hour suite
+  (~2h extrapolated) and rounds 1–2 already established that its baseline is red on
+  both sides independently for reasons outside this batch. Two facts worth recording:
+  1. The suite's collection aborts on a missing `keyring` module; `keyring` is an
+     *optional extra* in `pyproject.toml` (`keychain = ["keyring==25.7.0"]`) and is
+     absent from the host harness venv — environmental. Run with
+     `--ignore=tests/hermes_cli/test_vault_key_cli.py` to get a signal.
+  2. A bounded slice of the first six files (the region where the killed full run
+     first went red): **119 passed, 1 failed**. The single failure is
+     `test_agent_import_left_core.py::test_a_scheduled_sync_on_a_home_nothing_migrated_installs_the_plugin_and_runs`,
+     which dies on `hermes: 'import-agent' is not a hermes command` because the
+     optional `agent-importers` plugin is not installed in this venv — environmental,
+     and not a path-guard or fixture effect. The batch's own four oracle files
+     (63 passed) and `tests/test_scratch_dir.py` (0 errors) are green under the
+     upstream guard fixtures, which is the specific risk this change introduced.
 
