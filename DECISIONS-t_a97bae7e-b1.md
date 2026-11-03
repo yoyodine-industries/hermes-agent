@@ -167,3 +167,34 @@ Two of those are worth carrying forward as integration notes rather than batch d
 carrier's fleet-estop retirement and the per-job `script_timeout_seconds` signature both landed
 in clean-merged files whose upstream tests still describe the old behaviour, so the assembled
 merge will show those failures until the corresponding tests are updated.
+
+Gateway subset — the twelve files that cover this batch's gateway surface
+(`test_api_server_runs{,_hosted_room,_import_isolation,_room_policy_grant}.py`,
+`test_api_notification_outcomes.py`, `test_clean_shutdown_marker.py`, `test_gateway_shutdown.py`,
+`test_cron_shutdown_drain.py`, `test_cron_delivery_housekeeping.py`,
+`test_checkpoint_prune_housekeeping.py`, `test_media_cache_cleanup_signature.py`,
+`test_bootstrap_deferred_integrity_scan.py`) → **143 passed, 0 failed (60 s)**.
+
+### Two rig facts the assembler needs
+
+1. **`PYTHONPATH=.` alone cannot run pytest here.** The Hermes venv carries no `pytest`; the
+   rehearsal run needs
+   `PYTHONPATH=.:/opt/homebrew/lib/python3.14/site-packages:/opt/hermes_sandbox/platform/work/platform-stl/t_a97bae7e/testlibs`
+   (the brew `python3.14` site-packages supplies `aiohttp` for the `gateway/platforms/api_server*`
+   imports, `testlibs` supplies pytest). Without them every `api_server*` test errors on
+   `ModuleNotFoundError: No module named 'aiohttp'` before it asserts anything.
+2. **B1's branch alone does not import.** `agent/skill_utils.py` takes the carrier's
+   `from hermes_yaml import YamlEngineUnavailable`, and `hermes_yaml.py` is a **conflicted path
+   owned by another batch** (1 conflict), so `YamlEngineUnavailable` is absent on this branch
+   until that sibling lands. All measurements above were therefore taken in a rehearsal tree
+   that merges the carrier across *every* path (`git merge --no-commit`, conflicted paths left at
+   upstream) — the tree the assembled merge will approximate. On the bare branch, importing
+   `agent.skill_utils` raises `ImportError: cannot import name 'YamlEngineUnavailable'`.
+
+### Scope of the full-suite claim
+
+`pytest tests/agent tests/gateway tests/tools` as written in the card was **not** completable in
+the rehearsal tree: `tests/tools` is dominated by sibling-batch rows (a single file produced 40+
+failures at 3% of the run) and none of this batch's 21 changed files live under `tools/`. The
+number that is meaningful for B1 is the targeted set above; the assembled merge must carry the
+full triple.
