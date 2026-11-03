@@ -456,9 +456,9 @@ def test_the_alert_is_idempotent_inside_the_hour_bucket(board):
 # than one card per hour. These pin the key/signature split that ends it.
 # ---------------------------------------------------------------------------------------------
 
-_TICK_INSTANT = 1791659000  # inside the hour bucket [1791658800, 1791662400)
+_TICK_INSTANT = 1791659000  # inside an arbitrary tick hour
 _TICK_SECONDS = 63  # the dispatcher's measured tick interval
-_HOUR_SECONDS = guard._ACTOR_WINDOW_SECONDS
+_HOUR_SECONDS = 3600
 
 
 def _refused_sweep(conn, count, *, now):
@@ -482,7 +482,15 @@ def _mass_crash_actors(conn):
     ).fetchall()
 
 
-def test_the_refusal_actor_files_once_an_hour_though_every_tick_has_its_own_signature(board):
+def test_the_refusal_actor_is_ONE_card_per_board_however_often_it_ticks(board):
+    """CARD t_e217fc62, crash family: the key is `mass-crash:<board>`, the readings are the body.
+
+    Measured on the board before the fix: one unchanged condition held
+    `mass-crash:mass-crash-sweep:count=49:platform:1793509200` and its neighbours - a card per
+    tick-hour, with the count and the tick instant inside the key. The pre-fix repair (PR #182)
+    only stopped the per-TICK filing; a new hour, or a count 3 -> 5, still minted a new card for
+    the same standing condition.
+    """
     conn = board
     first, first_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
     later, later_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _TICK_SECONDS)
@@ -490,25 +498,46 @@ def test_the_refusal_actor_files_once_an_hour_though_every_tick_has_its_own_sign
     # The condition is unchanged but the TICK differs, so the recorded signatures differ ...
     assert first.verdict.signature != later.verdict.signature
     assert first.verdict.ended_at != later.verdict.ended_at
-    assert first.verdict.count == later.verdict.count
 
-    # ... and the card must NOT: one condition, one card, inside one hour bucket.
+    # ... and the card must NOT: ONE card, keyed on the condition.
     assert later_id == first_id
     actors = _mass_crash_actors(conn)
-    assert len(actors) == 1, "a sustained refusal pages once per hour, not once per 63 s tick"
-    assert "ended_at=" not in actors[0]["idempotency_key"], (
-        "the dedupe key must carry the condition, never the tick instant"
-    )
+    assert len(actors) == 1, "a sustained refusal is ONE card, not one per tick or per hour"
+    key = actors[0]["idempotency_key"]
+    assert key.startswith("mass-crash:") and "ended_at=" not in key and "count=" not in key, key
 
-    # A materially worse condition inside the same hour still pages: 3 -> 5 unexplained deaths.
+    # A worse reading (3 -> 5) is still the SAME condition: one card, and the count moves onto
+    # the thread once - never a second card, and never a comment per tick.
     escalated, escalated_id = _refused_sweep(conn, 5, now=_TICK_INSTANT + 2 * _TICK_SECONDS)
-    assert escalated_id != first_id, "an escalated count is a different condition"
-    assert len(_mass_crash_actors(conn)) == 2
+    assert escalated_id == first_id
+    assert len(_mass_crash_actors(conn)) == 1
+    readings = [c for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at, id", (first_id,)
+    ).fetchall() if guard._READING_MARKER in str(c["body"])]
+    assert [guard._READING_MARKER in str(r["body"]) for r in readings]
+    counts = [str(r["body"]).split(guard._READING_MARKER, 1)[1].split()[0] for r in readings]
+    assert counts == ["count=3", "count=5"], counts
 
-    # The NEXT hour bucket pages again for the original condition.
+    # A tick in the NEXT hour is not a new condition either.
     next_hour, next_hour_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _HOUR_SECONDS)
-    assert next_hour_id not in {first_id, escalated_id}
-    assert len(_mass_crash_actors(conn)) == 3
+    assert next_hour_id == first_id
+    assert len(_mass_crash_actors(conn)) == 1
+
+
+def test_a_DONE_actor_card_is_reopened_when_the_condition_recurs(board):
+    """A resolved escalation is re-armed, not duplicated and not silently swallowed."""
+    conn = board
+    _assessment, actor_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                     (_TICK_INSTANT, actor_id))
+
+    _assessment, again_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _TICK_SECONDS)
+
+    assert again_id == actor_id, "the SAME card carries the recurring condition"
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (actor_id,)).fetchone()
+    assert str(row["status"]) not in guard._TERMINAL_ACTOR_STATUSES, row["status"]
+    assert len(_mass_crash_actors(conn)) == 1
 
 
 def test_the_actor_card_still_evidence_the_tick_it_came_from(board):
