@@ -2854,40 +2854,110 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 # --- Priority + age-aware dispatch ordering --------------------------------
 #
-# ``priority`` is claimed-first-ordered by DESC: 3 = P0 (top), 2 = P1, 1 = P2,
-# 0 = P3 (bottom). Declared priority alone starves low-priority work: on a
-# loaded board a P3 never overtakes the steady arrival of P0-P1 cards, so it
-# can sit ready indefinitely. Every order site therefore sorts on the
-# EFFECTIVE priority, which credits waiting time:
+# The ladder is measured in RUNGS, not in "priority levels": one rung is
+# ``PRIORITY_AGE_CREDIT_RUNG_POINTS`` = 10 000 points, the distance between a
+# band's top sub-band and the band beneath it (890000 -> 900000), and the lane
+# tiers themselves sit ten rungs apart (900000 / 800000 / ... / 490000).
 #
-#     effective = priority + MIN(CAP, MAX(0, floor(wait_seconds / STEP)))
+# Declared priority alone starves low-priority work: on a loaded board a
+# bottom-band card never overtakes the steady arrival of top-band cards, so it
+# can sit ready indefinitely. The previous credit was capped at SIX POINTS
+# against a ladder spaced 10 000 apart, so waiting time could never move a card
+# across a tier — a no-op between tiers, with the top tier preempting every
+# lower one forever (measured live 2026-10-25: the oldest ready card ranked
+# 4146 of 4777, 87 % deep).
 #
-# With STEP = 1h a bottom-rung card gains a rung an hour and overtakes a fresh
-# top-rung card after 3h; once CAP = 6 is reached priority differences are
-# erased and the tie falls through to ``created_at ASC`` (plain FIFO). Wait
+# Every order site therefore sorts on the EFFECTIVE priority: the declared
+# priority plus a waiting-time credit of ONE RUNG PER HOUR, capped PER CARD at
+# the ordinary domain's edge (``kanban_priority_policy.ORDINARY_MAX`` — read
+# through :func:`_ordinary_edge`, never spelled here again):
+#
+#     credit(p, created_at) = MIN(MAX(0, CEILING - p),
+#                                 RUNG_POINTS * MAX(0, floor(wait / RUNG_SECONDS)))
+#     effective             = p + credit(p, created_at)
+#
+# The cap is PER CARD, not a flat 10 000, and that is load-bearing twice over:
+# an admission (a SEV1 990000 or operator-ask 999999 card) and a card on a
+# floored stratum sit at or above the ceiling already, so they get credit 0 and
+# no credit can ever lift a row into the reserved tranche; and a card that
+# reaches the ceiling simply stops banking credit it could not spend.
+#
+# A declared band therefore buys its holders a head start of
+# ``(900000 - p) / 10000`` hours:
+#
+#     890000 ->  1 h     790000 -> 11 h     690000 -> 21 h
+#     590000 -> 31 h     490000 -> 41 h     -1000  -> 91 h (90.1, rounded up)
+#
+# i.e. a bottom-band card climbs the whole ladder in 90.1 h of waiting. Wait
 # time is measured from ``created_at``, so the order is stable while a card
-# waits and identical across processes and boards.
-PRIORITY_AGE_BONUS_STEP_SECONDS = 3600
-PRIORITY_AGE_BONUS_CAP = 6
+# waits and identical across processes and boards. Ties fall through to
+# ``created_at ASC`` and then ``id ASC``: the ceiling makes one large cohort of
+# equal effective values, and a total order is what keeps the dispatcher and
+# every listing agreeing on who is first.
+PRIORITY_AGE_CREDIT_RUNG_SECONDS = 3600
+PRIORITY_AGE_CREDIT_RUNG_POINTS = 10_000
 
 
 def priority_age_bonus(created_at: Optional[float], *, now: Optional[float] = None) -> int:
-    """Waiting-time credit for one card: ``floor(wait / STEP)`` clamped to ``[0, CAP]``."""
+    """Waiting-time credit in POINTS, before the per-card ceiling applies.
+
+    ``RUNG_POINTS * floor(wait / RUNG_SECONDS)``, never negative. The ceiling is
+    per card (see :func:`priority_age_credit`), so this is deliberately the one
+    place a raw, unclamped credit lives.
+    """
     if created_at is None:
         return 0
     at = time.time() if now is None else float(now)
     waited = at - float(created_at)
     if waited <= 0:
         return 0
-    return int(min(PRIORITY_AGE_BONUS_CAP, waited // PRIORITY_AGE_BONUS_STEP_SECONDS))
+    rungs = int(waited // PRIORITY_AGE_CREDIT_RUNG_SECONDS)
+    return rungs * int(PRIORITY_AGE_CREDIT_RUNG_POINTS)
+
+
+def priority_age_credit(
+    priority: Optional[int], created_at: Optional[float], *, now: Optional[float] = None,
+) -> int:
+    """This card's waiting-time credit, capped at the ordinary domain's edge.
+
+    ``min(max(0, CEILING - priority), priority_age_bonus(created_at))`` — the
+    Python mirror of the credit in :func:`effective_priority_expression`, and the
+    reason an admission above the ladder gets 0 rather than 10 000.
+    """
+    ceiling = _ordinary_edge()
+    room = max(0, ceiling - int(priority or 0))
+    return int(min(room, priority_age_bonus(created_at, now=now)))
 
 
 def effective_priority(
     priority: Optional[int], created_at: Optional[float], *, now: Optional[float] = None,
 ) -> int:
-    """``priority`` plus :func:`priority_age_bonus` — Python mirror of
-    :func:`effective_priority_order_sql`, for tests and single-row reasoning."""
-    return int(priority or 0) + priority_age_bonus(created_at, now=now)
+    """``priority`` plus :func:`priority_age_credit` — Python mirror of
+    :func:`effective_priority_expression`, for tests and single-row reasoning."""
+    return int(priority or 0) + priority_age_credit(priority, created_at, now=now)
+
+
+def effective_priority_expression(now: Optional[float] = None) -> tuple[str, list[Any]]:
+    """``(effective_priority_expr, params)`` — the credit, as a SELECT/ORDER BY column.
+
+    One expression, usable verbatim both as an ``ORDER BY`` term (through
+    :func:`effective_priority_order_sql`) and as a SELECT column (the
+    cross-board allocator ranks on the value each row was actually ordered by).
+    No index, no migration, and it is READ-ONLY: no write path may persist an
+    effective value, because ``priority + credit`` can exceed ``ORDINARY_MAX``
+    and the domain doors would rightly refuse it.
+    """
+    at = time.time() if now is None else float(now)
+    ceiling = int(_ordinary_edge())
+    rung_points = int(PRIORITY_AGE_CREDIT_RUNG_POINTS)
+    rung_seconds = int(PRIORITY_AGE_CREDIT_RUNG_SECONDS)
+    expr = (
+        "(COALESCE(priority, 0) + MIN("
+        f"MAX(0, {ceiling} - COALESCE(priority, 0)), "
+        f"{rung_points} * MAX(0, CAST((? - created_at) / {rung_seconds} AS INTEGER))"
+        "))"
+    )
+    return expr, [at]
 
 
 def effective_priority_order_sql(now: Optional[float] = None) -> tuple[str, list[Any]]:
@@ -2895,15 +2965,14 @@ def effective_priority_order_sql(now: Optional[float] = None) -> tuple[str, list
 
     The dispatcher lane order (``kanban_db_dispatch._lane_rows``) and
     :func:`list_tasks` both call this one helper so the two can never drift.
+    ``id ASC`` is the last tie-break on purpose: the per-card ceiling collapses
+    a whole cohort onto one effective value, so ``created_at`` alone is not a
+    total order and SQLite would be free to order the rest arbitrarily.
     ``now`` defaults to ``time.time()``; pass it explicitly for deterministic
     tests.
     """
-    at = time.time() if now is None else float(now)
-    expr = (
-        f"(priority + MIN({int(PRIORITY_AGE_BONUS_CAP)}, "
-        f"MAX(0, CAST((? - created_at) / {int(PRIORITY_AGE_BONUS_STEP_SECONDS)} AS INTEGER))))"
-    )
-    return f"{expr} DESC, created_at ASC", [at]
+    expr, params = effective_priority_expression(now)
+    return f"{expr} DESC, created_at ASC, id ASC", params
 
 
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -8550,6 +8619,106 @@ def zero_run_ready(
     }
 
 
+#: Band-level starvation bound — DECLARED, not derived: a priority band whose
+#: OLDEST ready card has waited longer than this is reported as starved by
+#: :func:`starvation_block` (surfaced through ``board_stats`` / ``hermes kanban
+#: stats`` / the dashboard plugin API). 7 days. It is a bound on the TIER, not on
+#: the board: a board whose single oldest card is 3 days old can still be
+#: starving a whole band that has not been served in three weeks, and nothing
+#: that reads only the board-wide oldest age can say so (card t_af1008bb §5).
+STARVATION_TIER_BOUND_SECONDS = 168 * 3600
+
+
+def starvation_block(conn: sqlite3.Connection, *, now: Optional[float] = None) -> dict:
+    """Per-tier starvation census for one board — the guardrail on the age credit.
+
+    Age alone cannot tell a DEEP queue from a STARVED one: ``zero_run_ready``
+    reports one board-wide "oldest waiting N min" and is silent on ordering, so a
+    band that is never served looks like a board that is merely busy. This block
+    adds the discriminator — the oldest card's RANK in the board's own dispatch
+    order — and the per-band census that names WHICH tier is not draining.
+
+    Returns::
+
+        {"ready": N,
+         "oldest": {"task_id", "priority", "wait_seconds", "rank"},
+         "rank_fraction": rank / ready,      # 1.0 = last in dispatch order
+         "tiers": [{"band", "ready", "oldest_wait_seconds",
+                    "oldest_task_id", "oldest_rank"}, ...],
+         "starved_tiers": [band, ...]}
+
+    ``rank`` is 1-based over the ready lane in dispatch order (the same order
+    ``kanban_db_dispatch._lane_rows`` produces: effective priority, then
+    ``created_at``, then ``id``). ``band`` is the DECLARED priority value itself —
+    the kernel holds no band table (``kanban_priority_policy``: "the domain is
+    the kernel's, the bands are the fleet's"), so the census groups by value and
+    labels from it. Tiers and ``starved_tiers`` are ordered highest band first.
+    An empty board returns the block with ``ready: 0`` and ``None`` scalars, never
+    a partial dict.
+    """
+    at = time.time() if now is None else float(now)
+    order_body, order_params = effective_priority_order_sql(at)
+    rows = conn.execute(
+        "SELECT id, priority, created_at FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NULL "
+        f"ORDER BY {order_body}",
+        order_params,
+    ).fetchall()
+    ready = len(rows)
+    if not rows:
+        return {
+            "ready": 0,
+            "oldest": {
+                "task_id": None, "priority": None, "wait_seconds": None, "rank": None,
+            },
+            "rank_fraction": None,
+            "tiers": [],
+            "starved_tiers": [],
+        }
+
+    rank_of = {row["id"]: index + 1 for index, row in enumerate(rows)}
+    oldest_row = min(rows, key=lambda row: (int(row["created_at"]), row["id"]))
+    oldest_rank = rank_of[oldest_row["id"]]
+
+    def _wait(row) -> int:
+        return max(int(at - float(row["created_at"])), 0)
+
+    tiers: dict[int, dict] = {}
+    oldest_per_band: dict[int, sqlite3.Row] = {}
+    for row in rows:
+        band = int(row["priority"] or 0)
+        tiers[band] = tiers.get(band, {"band": band, "ready": 0})
+        tiers[band]["ready"] += 1
+        current = oldest_per_band.get(band)
+        if current is None or (int(row["created_at"]), row["id"]) < (
+            int(current["created_at"]), current["id"]
+        ):
+            oldest_per_band[band] = row
+
+    for band, row in oldest_per_band.items():
+        tiers[band]["oldest_wait_seconds"] = _wait(row)
+        tiers[band]["oldest_task_id"] = row["id"]
+        tiers[band]["oldest_rank"] = rank_of[row["id"]]
+
+    by_band = [tiers[band] for band in sorted(tiers, reverse=True)]
+    return {
+        "ready": ready,
+        "oldest": {
+            "task_id": oldest_row["id"],
+            "priority": int(oldest_row["priority"] or 0),
+            "wait_seconds": _wait(oldest_row),
+            "rank": oldest_rank,
+        },
+        "rank_fraction": round(oldest_rank / ready, 4),
+        "tiers": by_band,
+        "starved_tiers": [
+            tier["band"]
+            for tier in by_band
+            if int(tier["oldest_wait_seconds"]) > STARVATION_TIER_BOUND_SECONDS
+        ],
+    }
+
+
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, the oldest ``ready`` age, and the
     stuck-ready probe (see :func:`zero_run_ready`) — the board-health surface
@@ -8577,6 +8746,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
         "zero_run_ready": zero_run_ready(conn, now=now),
+        "starvation": starvation_block(conn, now=now),
         "now": now,
     }
 
