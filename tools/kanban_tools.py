@@ -1037,7 +1037,9 @@ def _handle_complete(args: dict, **kw) -> str:
             # reviewer a run-ownership sentence with no cause, no PR and no way out -- a fence
             # nobody can read is a fence nobody can satisfy (t_88f6cb12).
             if isinstance(ok, kb.CompletionRefusal) and ok.cause in (
-                    "landing_carrier_missing", "landing_state_unknown"):
+                    "landing_carrier_missing", "landing_state_unknown",
+                    "landing_verdict_missing", "landing_verdict_mismatch",
+                    "landing_verdict_unsubstantiated"):
                 raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
             # The dirty-unit-checkout fence names the checkout, the paths and the remedy in
             # ``detail`` (t_b151a247). A card that cannot see WHY it is refused is re-run
