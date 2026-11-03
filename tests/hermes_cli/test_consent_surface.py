@@ -24,13 +24,17 @@ import pytest
 
 from hermes_cli import consent_surface as cs
 
-SIX_SURFACES = {
+SEVEN_SURFACES = {
     "hermes-config",
     "hermes-env",
     "hermes-soul",
     "hermes-plugin",
     "launchd-plist",
     "hermes-cli-config",
+    # Added by the ruling on card t_cd80bb5a (D1): a project's own instruction file
+    # is a prompt-persistence surface, and the class is the set of surfaces that have
+    # a non-interactive exit (a card-bound approval) rather than a prompt.
+    "project-instruction-file",
 }
 
 CONFIG = "hermes-config"
@@ -39,14 +43,71 @@ SOUL = "hermes-soul"
 PLUGIN = "hermes-plugin"
 PLIST = "launchd-plist"
 CLI_CONFIG = "hermes-cli-config"
+PROJECT = "project-instruction-file"
 
 
 # --- D1: the closed set -----------------------------------------------------
 
 
-def test_the_class_is_closed_at_six_surfaces():
-    assert cs.SURFACES == frozenset(SIX_SURFACES)
+def test_the_class_is_closed_at_seven_surfaces():
+    assert cs.SURFACES == frozenset(SEVEN_SURFACES)
     assert isinstance(cs.SURFACES, frozenset)
+
+
+# --- D1 (t_cd80bb5a): the project-instruction FALLBACK ----------------------
+
+
+def _protected(target):
+    """A stand-in matcher: the door's real one is ``doors.protected_write_target``."""
+    name = str(target).rsplit("/", 1)[-1].lower()
+    if name in {"agents.md", "claude.md", "soul.md", ".cursorrules"}:
+        return name, "yaan-demo"
+    return None
+
+
+def test_the_protected_surface_is_narrow():
+    hit = cs.classify_path("/opt/hermes_sandbox/yaan-demo/AGENTS.md",
+                           protected_write=_protected)
+    assert hit is not None
+    assert hit.surface == PROJECT
+    assert hit.scope_token == "project-instruction-file:yaan-demo"
+
+
+def test_the_protected_surface_needs_an_injected_matcher():
+    """The classifier never matches this surface on its own: the door supplies the one
+    matcher, so a caller that cannot reach ``tools`` (vendored use) is not silently
+    opening the class and cannot invent a second match set."""
+    assert cs.classify_path("/opt/hermes_sandbox/yaan-demo/AGENTS.md") is None
+
+
+def test_a_matcher_that_raises_is_not_this_surface():
+    def boom(_target):
+        raise RuntimeError("matcher exploded")
+
+    assert cs.classify_path("/x/AGENTS.md", protected_write=boom) is None
+
+
+def test_a_missing_slug_does_not_widen_to_the_class():
+    """``unknown`` rather than the bare token: a licence request must stay narrow."""
+    hit = cs.classify_path("/x/AGENTS.md", protected_write=lambda _t: "AGENTS.md")
+    assert hit is not None
+    assert hit.scope_token == "project-instruction-file:unknown"
+
+
+def test_the_published_surfaces_win_the_fallback():
+    """One target, one token: a plugin tree's SOUL.md stays a plugin surface."""
+    hit = cs.classify_path("~/.hermes/plugins/acme/SOUL.md", hermes_home="/opt/none",
+                           protected_write=_protected)
+    assert hit is not None
+    assert hit.surface == PLUGIN
+
+
+def test_a_write_shape_carries_the_protected_surface_through_a_command():
+    hit = cs.classify_command("echo x >> /opt/hermes_sandbox/yaan-demo/AGENTS.md",
+                              protected_write=_protected)
+    assert hit is not None and hit.surface == PROJECT
+    assert cs.classify_command("cat /opt/hermes_sandbox/yaan-demo/AGENTS.md",
+                               protected_write=_protected) is None
 
 
 def test_a_surface_outside_the_class_is_refused():
