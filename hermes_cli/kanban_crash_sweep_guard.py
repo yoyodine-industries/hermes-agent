@@ -206,27 +206,39 @@ MASS_CRASH_HELD_ACTOR_TITLE = (
     "[guard] reclaim sweep HOLDING {held} row(s): identity generations not comparable"
 )
 MASS_CRASH_ACTOR_EVENT = "mass_crash_sweep_actor_filed"
+#: The FAMILY prefix every crash-sweep acting card shares -- what the board's own lookups scan.
 MASS_CRASH_ACTOR_IDEMPOTENCY_PREFIX = "mass-crash:"
+#: The condition KINDS inside the family. A refusal (too many unexplained deaths) and a hold (the
+#: sweep cannot compare identities) are DIFFERENT conditions on the same board, so they own
+#: different standing cards -- naming the kind in the key is what keeps the fix from collapsing two
+#: escalations into one card whose title only ever describes the first of them.
+MASS_CRASH_REFUSED_CONDITION = "refused"
+MASS_CRASH_HELD_CONDITION = "held"
 
-#: Appended to the EXISTING actor card when a LATER tick refuses inside the same hour bucket on the
-#: same board. The episode is the same one, so it costs zero extra cards -- but the newer tick's
-#: facts (count, ended_at, held rows) are still recorded, because the held count moves inside one
-#: episode (11 -> 5 -> 3) and the operator needs to see it.
+#: Appended to the EXISTING actor card when a LATER tick refuses on the same board. The condition
+#: is the same one, so it costs zero extra cards -- but the newer tick's facts (count, ended_at,
+#: held rows) are still recorded, because the held count moves inside one condition (11 -> 5 -> 3)
+#: and the operator needs to see it.
 MASS_CRASH_SWEEP_REFUSED_AGAIN_EVENT = "sweep_refused_again"
-
-#: The tick-INVARIANT part of the refusal actor's idempotency key: the condition's SHAPE only.
-#: Neither `ended_at` (the tick instant, ~63 s apart) nor `count` (which moves inside one episode)
-#: belongs in it -- either one re-mints the key on every dispatcher tick and turns one episode into
-#: one card per tick. Measured 2026-10-24: 14 cards in 13 minutes for a single episode.
-MASS_CRASH_ACTOR_KEY_SIGNATURE = MASS_CRASH_SIGNATURE_PREFIX.rstrip(":")
 
 #: The verdicts that mean "the process is gone" WITHOUT evidence of their own -- the only class a
 #: broken liveness witness can forge. See the module docstring.
 UNEXPLAINED_DEATH_KINDS = frozenset({"unknown", "nonzero_exit", "signaled"})
 
-#: One acting card per signature per hour per board, so a persistent condition pages once, not once
-#: per tick.
-_ACTOR_WINDOW_SECONDS = 3600
+#: A card that still HOLDS its idempotency key but holds no live filing. The kernel's dedupe fence
+#: is ``status != 'archived'``, so a card in any of these states answers the "does this key already
+#: have a card" lookup while nobody is working it -- the condition is live again and the card has to
+#: be RE-ARMED, never silently counted as "already paged".
+_TERMINAL_ACTOR_STATUSES = frozenset({"done", "archived", "failed", "cancelled"})
+
+#: The statuses :func:`hermes_cli.kanban_db.reopen_task` is the door out of (it refuses any other).
+_REOPENABLE_ACTOR_STATUSES = frozenset({"done"})
+
+#: The line a re-assertion appends to the card's thread. It carries the tick-INVARIANT part of the
+#: condition (the count, and the held shapes when the tick held rows), never the tick instant: a
+#: sustained refusal ticks about once a minute, and a comment per tick is the noise this change
+#: removes. Delivered once per CHANGED reading, not once per tick.
+_READING_MARKER = "crash-sweep reading:"
 
 
 @dataclass(frozen=True)
@@ -463,9 +475,123 @@ def _board_key(conn: Any, board: Optional[str]) -> str:
         return "default"
 
 
-def _actor_key(prefix: str, signature: str, board_key: str, now: int) -> str:
-    bucket = int(now) // _ACTOR_WINDOW_SECONDS * _ACTOR_WINDOW_SECONDS
-    return f"{prefix}{signature}:{board_key}:{bucket}"
+def _actor_key(prefix: str, board_key: str) -> str:
+    """The STANDING CONDITION: `<prefix><board>` - one acting card per board, full stop.
+
+    It used to be ``<prefix><key_signature>:<board>:<hour-bucket>``, and everything after the board
+    was a READING: the condition's shape, the count, and the hour it happened in. Measured on the
+    board (card t_e217fc62), that minted a fresh escalation per tick-hour for one unchanged
+    condition - ``mass-crash:mass-crash-sweep:count=49:platform:1793509200`` and its neighbours are
+    the same condition wearing a clock, one card per hour and a second card the moment the count
+    moved 3 -> 5. The readings belong in the BODY, the per-tick event payload and the thread line
+    (`_append_reading`), which is where they now live; the card is the condition, and it is re-armed
+    (reopened + read) rather than duplicated when the condition recurs.
+    """
+    return f"{prefix}{board_key}"
+
+
+def _reading(payload: dict) -> str:
+    """The tick-INVARIANT reading a repeat tick adds to the one card (`""` when it carries none).
+
+    The count moves inside one condition (11 -> 5 -> 3) and the held shape set is what a HOLD is
+    about; the tick instant is not a reading anyone acts on, so it is deliberately absent.
+    """
+    parts = []
+    if "count" in (payload or {}):
+        try:
+            parts.append(f"count={int(payload.get('count') or 0)}")
+        except (TypeError, ValueError):
+            parts.append("count=?")
+    held = [str(shape) for shape in (payload or {}).get("held_shapes") or [] if str(shape)]
+    if held:
+        parts.append("held_shapes=" + ",".join(held))
+    return " ".join(parts)
+
+
+def _last_reading(conn: Any, task_id: str) -> str:
+    """The last reading line this guard appended to ``task_id`` (`""` when there is none)."""
+    try:
+        row = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (task_id, f"%{_READING_MARKER}%"),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - a thread that cannot be read is not a filing failure
+        return ""
+    if row is None:
+        return ""
+    for line in str(row["body"] or "").splitlines():
+        if _READING_MARKER in line:
+            # The reading is everything before the parenthetical facts, so a change in the tick
+            # instant or the threshold is NOT a changed reading.
+            return line.split(_READING_MARKER, 1)[1].split(" (", 1)[0].strip()
+    return ""
+
+
+def _append_reading(
+    conn: Any, task_id: str, event_payload: dict, board_key: str, *, filed: bool = False,
+) -> None:
+    """Thread ONE reading line onto the card that carries the condition.
+
+    ``filed`` marks the line as the reading the card was FILED on; otherwise it is a MOVED reading
+    on a card that already existed. Skipped when the reading has not moved (including the
+    re-assertion of the filing reading), so a sustained condition stays quiet. Best-effort - a
+    thread write that fails is logged, never raised.
+    """
+    reading = _reading(event_payload)
+    if not reading or _last_reading(conn, task_id) == reading:
+        return
+    from hermes_cli import kanban_db as kb
+
+    payload = event_payload or {}
+    note = (
+        f"{_READING_MARKER} {reading} (threshold {int(payload.get('threshold') or 0)}, "
+        f"tick {int(payload.get('ended_at') or 0)}, board `{board_key}`). "
+        + ("The card was filed on this reading." if filed
+           else "The condition is the SAME card; only the reading moved.")
+    )
+    try:
+        kb.add_comment(conn, task_id, "kanban-dispatcher", note)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "kanban crash-sweep guard: could not append the reading to %s: %s", task_id, exc,
+        )
+
+
+def _reopen_actor(
+    conn: Any, actor_id: str, status: str, *, prefix: str, signature: str,
+) -> None:
+    """RE-ARM a finished actor card for a recurring condition - never duplicate, never skip.
+
+    The kernel hands a card back for a spent idempotency key whatever its status, so a `done` card
+    would otherwise read as "already paged" for the life of the key: the condition recurs, no
+    worker is spawned, and nothing on the board moves. `reopen_task` is the door out of `done`
+    (audited, and it re-gates descendants); `failed`/`cancelled` have no such door, so the state is
+    named in the log instead of being papered over.
+    """
+    if not actor_id:
+        return
+    if str(status or "") not in _REOPENABLE_ACTOR_STATUSES:
+        logger.warning(
+            "kanban crash-sweep guard: %s carries the recurring %s condition but is %r, which "
+            "`reopen` does not cover; the card needs a human to re-arm it",
+            actor_id, prefix, status,
+        )
+        return
+    from hermes_cli import kanban_db as kb
+
+    try:
+        ok, why, _info = kb.reopen_task(
+            conn, actor_id, actor="kanban-dispatcher",
+            reason=f"{prefix} condition recurred: {signature}",
+        )
+        if not ok:
+            logger.warning(
+                "kanban crash-sweep guard: %s could not be reopened (%s); the condition is live "
+                "again and the card is read-only", actor_id, why or "refused",
+            )
+    except Exception as exc:  # noqa: BLE001 - a refused reopen is DATA, never a crash
+        logger.warning("kanban crash-sweep guard: reopening %s failed: %s", actor_id, exc)
 
 
 def _append_repeat_evidence(
@@ -497,40 +623,41 @@ def _file_actor(
     event: str,
     event_payload: dict,
     board: Optional[str] = None,
-    now: Optional[int] = None,
-    key_signature: Optional[str] = None,
     repeat_event: Optional[str] = None,
 ) -> Optional[str]:
-    """File EXACTLY ONE acting card for a condition, idempotently, best-effort.
+    """File EXACTLY ONE acting card per board for a condition, idempotently, best-effort.
 
-    The idempotency key (``<prefix><key_signature>:<board>:<hour-bucket>``) is the whole mechanism:
-    N ticks hitting the same condition resolve to one card, and the condition can page again in the
-    NEXT hour. That holds only when ``key_signature`` names a **tick-invariant** identity of the
-    condition -- neither the tick instant (``ended_at``) nor a value that moves inside one episode
-    (``count``) may appear in it; those stay in ``signature``, which the body and the event payload
-    record as evidence. Otherwise every tick mints a new key and files its own card.
+    The idempotency key (``<prefix><board>``) is the whole mechanism, and it names the STANDING
+    CONDITION - not the tick, not the count, not the hour: N ticks, in ANY hour, at ANY count or
+    shape, resolve to one card. Every earlier shape of this key carried a reading (``ended_at``,
+    then ``count``, then ``signature``+hour bucket), and every one of them restocked the board for
+    a condition that had not changed -- measured 2026-10-24 as 14 cards in 13 minutes, and again
+    2026-11-01 as one card per tick-hour (card t_e217fc62).
 
-    A key that ALREADY has a card is the same episode: no second card is filed. Its newer facts are
-    appended to that card as ``repeat_event`` (a board event, never a status change), so a refusal
-    that repeats inside the bucket still leaves a countable trail and costs zero extra cards. A
-    board that refuses the write is logged with the key it could not file and never takes the tick
-    down.
+    A key that ALREADY has a card is the same condition, and the card is RE-ARMED rather than
+    duplicated: a finished card is reopened through the kernel's own door (`_reopen_actor`), the
+    newer tick's facts are appended as ``repeat_event`` (a board event, never a status change), and
+    a reading that MOVED is threaded onto the card once (`_append_reading`). A board that refuses
+    the write is logged with the key it could not file and never takes the tick down.
     """
     from hermes_cli import kanban_db as kb
 
-    moment = int(time.time() if now is None else now)
     board_key = _board_key(conn, board)
-    key = _actor_key(prefix, key_signature or signature, board_key, moment)
+    key = _actor_key(prefix, board_key)
     try:
         existing = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (key,),
         ).fetchone()
         if existing is not None:
             existing_id = existing["id"]
+            status = str(existing["status"] or "")
+            if status in _TERMINAL_ACTOR_STATUSES:
+                _reopen_actor(conn, existing_id, status, prefix=prefix, signature=signature)
             if repeat_event:
                 _append_repeat_evidence(conn, existing_id, repeat_event, event_payload, board_key)
+            _append_reading(conn, existing_id, event_payload, board_key)
             return existing_id
         actor_id = kb.create_task(
             conn,
@@ -542,6 +669,10 @@ def _file_actor(
         )
         with kb.write_txn(conn):
             kb._append_event(conn, actor_id, event, dict(event_payload, board=board_key))
+        # The reading the card was FILED on also goes on the thread, so the "append only when it
+        # moved" rule has a baseline that survives a restart: the first repeat tick after a
+        # restart compares against the card's own last line, not against nothing.
+        _append_reading(conn, actor_id, event_payload, board_key, filed=True)
         return actor_id
     except Exception as exc:
         logger.warning(
@@ -579,7 +710,12 @@ def alert_sweep_guard(
     tree: Any = None,
     now: Optional[int] = None,
 ) -> Optional[str]:
-    """The whole loud path for a refused sweep or a held row: log, per-card evidence, one card."""
+    """The whole loud path for a refused sweep or a held row: log, per-card evidence, one card.
+
+    ``now`` is the caller's clock and is still accepted for it; nothing in the filing path keys on
+    time any more -- the card is the CONDITION, so a tick in the next hour lands on the same card
+    (that is the fix for card t_e217fc62).
+    """
     if not assessment.alerting:
         return None
     for line in refusal_lines(assessment):
@@ -590,19 +726,19 @@ def alert_sweep_guard(
     actor_signature = verdict.signature if verdict.abort else (
         "held:" + ",".join(assessment.held_shapes)
     )
-    # The KEY is the tick-INVARIANT identity of the condition; the signature -- which carries the
-    # tick instant -- stays what the body and the event record as evidence. The key carries NEITHER
-    # `ended_at` (a new value every ~63 s tick) NOR `count` (which moves inside one episode, 11 -> 5
-    # -> 3): either one re-mints the key per tick and turns one mass-crash episode into one guard
-    # card per tick -- measured 2026-10-24 as 14 cards in 13 minutes for a single episode, and each
-    # card spawned a full platform-stl worker. One episode is one board, one hour bucket, one shape.
-    # The newer tick's count/ended_at/held-rows are appended to that one card instead.
-    key_signature = MASS_CRASH_ACTOR_KEY_SIGNATURE if verdict.abort else actor_signature
+    # The KEY is the condition: the KIND and the board, and nothing else. Everything that used to
+    # follow the board was a reading -- the tick instant (~63 s), the count (which moves inside one
+    # episode, 11 -> 5 -> 3), the shape signature, the hour bucket -- and each one re-minted the
+    # key, so one unchanged condition restocked the board (measured 2026-10-24: 14 cards in 13
+    # minutes; measured 2026-11-01: one card per tick-hour, card t_e217fc62). The signature still
+    # carries every one of those facts into the title, the body and the event payload, and a moved
+    # reading is threaded onto the one card; the card itself is the condition. The KIND stays in the
+    # key because a refusal and a hold are two conditions, not one.
+    condition = (MASS_CRASH_REFUSED_CONDITION if verdict.abort else MASS_CRASH_HELD_CONDITION)
     return _file_actor(
         conn,
-        prefix=MASS_CRASH_ACTOR_IDEMPOTENCY_PREFIX,
+        prefix=f"{MASS_CRASH_ACTOR_IDEMPOTENCY_PREFIX}{condition}:",
         signature=actor_signature,
-        key_signature=key_signature,
         repeat_event=MASS_CRASH_SWEEP_REFUSED_AGAIN_EVENT if verdict.abort else None,
         title=(
             MASS_CRASH_ACTOR_TITLE.format(count=verdict.count, threshold=verdict.threshold)
@@ -621,7 +757,6 @@ def alert_sweep_guard(
             "held_shapes": list(assessment.held_shapes),
         },
         board=board,
-        now=now,
     )
 
 
@@ -899,7 +1034,11 @@ def alert_generation_divergence(
     tree: Any = None,
     now: Optional[int] = None,
 ) -> Optional[str]:
-    """The whole loud path for a divergence: log, per-card evidence, one acting card."""
+    """The whole loud path for a divergence: log, per-card evidence, one acting card.
+
+    ``now`` is the caller's clock and is still accepted for it; the filing path does not key on
+    time (one card per condition, card t_e217fc62).
+    """
     if not tick.alerting:
         return None
     signature = hashlib.sha256(tick.signature.encode("utf-8")).hexdigest()[:12]
@@ -922,5 +1061,4 @@ def alert_generation_divergence(
             "current": tick.stamp,
         },
         board=board,
-        now=now,
     )

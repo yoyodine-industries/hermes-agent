@@ -448,21 +448,23 @@ def test_the_alert_is_idempotent_inside_the_hour_bucket(board):
 
 
 # ---------------------------------------------------------------------------------------------
-# The acting card's dedupe key is the tick-INVARIANT SHAPE of the condition
+# The acting card's dedupe key is the CONDITION: `<prefix><board>`
 #
-# Measured in production 2026-10-30: the refusal actor re-filed on EVERY tick. The dispatcher
-# ticks every ~63 s and the signature it keyed on carried `ended_at`, so each tick minted a new
-# key, the "existing" lookup never hit, and a sustained refusal produced one card per tick rather
-# than one per hour. The first fix dropped `ended_at` but KEPT `count`, which re-minted the key the
-# moment the held count moved inside one episode (measured 2026-11-02: 14 cards in 13 minutes for a
-# single episode, each one spawning a platform-stl worker). These pin the key to the shape, and pin
-# the repeat trail to the one card the episode owns.
+# Three generations of this key carried a READING. #182's predecessor keyed on `ended_at` (the
+# dispatcher ticks every ~63 s, so every tick minted a key: one card per tick). #182 dropped
+# `ended_at` but kept `count`, which moves inside one episode (measured 2026-11-02: 14 cards in 13
+# minutes). 713e1e18 keyed on the episode's SHAPE inside an hour bucket, which restocks one card per
+# tick-HOUR for a condition that never changed (measured on the board, card t_e217fc62).
+#
+# The operator ruling (2026-11-01) is that a standing card is keyed on the CONDITION and everything
+# that varies per pass is the READING. So the key is the board alone, and the readings -- count,
+# shape, tick instant -- live in the body, the per-tick event payload and ONE thread line per
+# CHANGED reading. A card that finished is REOPENED, never duplicated and never silently swallowed.
 # ---------------------------------------------------------------------------------------------
 
-_TICK_INSTANT = 1791659000  # inside the hour bucket [1791658800, 1791662400)
+_TICK_INSTANT = 1791659000  # an arbitrary tick instant; the clock is not part of any key
 _TICK_SECONDS = 63  # the dispatcher's measured tick interval
-_HOUR_SECONDS = guard._ACTOR_WINDOW_SECONDS
-_BUCKET = _TICK_INSTANT // _HOUR_SECONDS * _HOUR_SECONDS
+_HOUR_SECONDS = 3600
 
 
 def _refused_sweep(conn, count, *, now):
@@ -494,26 +496,39 @@ def _repeat_payloads(conn, task_id):
     return [json.loads(row["payload"]) for row in rows]
 
 
+def _reading_lines(conn, task_id):
+    """The reading lines this guard threaded onto a card, in order (the marker, then the reading)."""
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at, id", (task_id,),
+    ).fetchall()
+    readings = []
+    for row in rows:
+        for line in str(row["body"] or "").splitlines():
+            if guard._READING_MARKER in line:
+                readings.append(line.split(guard._READING_MARKER, 1)[1].strip().split()[0])
+    return readings
+
+
 def test_one_episode_files_one_card_however_the_count_and_clock_move(board):
-    """11 -> 5 -> 3 inside one hour is ONE episode: one card, keyed on the shape alone."""
+    """11 -> 5 -> 3 across two hours is ONE condition: one card, keyed on the board alone."""
     conn = board
     first, first_id = _refused_sweep(conn, 11, now=_TICK_INSTANT)
     second, second_id = _refused_sweep(conn, 5, now=_TICK_INSTANT + _TICK_SECONDS)
-    third, third_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + 2 * _TICK_SECONDS)
+    third, third_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _HOUR_SECONDS)
 
     # The ticks differ in both the clock and the count, so the recorded signatures all differ ...
     assert len({first.verdict.signature, second.verdict.signature, third.verdict.signature}) == 3
     assert first.verdict.ended_at != third.verdict.ended_at
     assert (first.verdict.count, second.verdict.count, third.verdict.count) == (11, 5, 3)
 
-    # ... and the card must NOT: one episode, one card, inside one hour bucket.
+    # ... and the card must NOT: one condition, one card, across the hour boundary too.
     assert {second_id, third_id} == {first_id}
     actors = _mass_crash_actors(conn)
-    assert len(actors) == 1, "a sustained refusal pages once per hour, not once per 63 s tick"
+    assert len(actors) == 1, "a sustained refusal is ONE card, not one per tick or per hour"
     key = actors[0]["idempotency_key"]
     assert "ended_at=" not in key, "the dedupe key must never carry the tick instant"
-    assert "count=" not in key, "the dedupe key must never carry a count that moves inside an episode"
-    assert key == f"mass-crash:mass-crash-sweep:default:{_BUCKET}"
+    assert "count=" not in key, "the dedupe key must never carry a count that moves inside a condition"
+    assert key == "mass-crash:refused:default", key
 
     # The first tick filed the card, so THAT is the tick the card's own words report.
     assert "REFUSED: >= 11 runs" in actors[0]["title"]
@@ -524,9 +539,13 @@ def test_one_episode_files_one_card_however_the_count_and_clock_move(board):
     repeats = _repeat_payloads(conn, first_id)
     assert [p["count"] for p in repeats] == [5, 3]
     assert [p["ended_at"] for p in repeats] == [
-        _TICK_INSTANT + _TICK_SECONDS, _TICK_INSTANT + 2 * _TICK_SECONDS,
+        _TICK_INSTANT + _TICK_SECONDS, _TICK_INSTANT + _HOUR_SECONDS,
     ]
     assert all("held" in p and "held_shapes" in p for p in repeats)
+
+    # And the THREAD carries the readings -- the one the card was filed on, then one line per
+    # CHANGED count, never per tick.
+    assert _reading_lines(conn, first_id) == ["count=11", "count=5", "count=3"]
 
 
 def test_a_repeat_leaves_the_existing_card_in_whatever_state_it_holds(board):
@@ -550,19 +569,30 @@ def test_a_repeat_leaves_the_existing_card_in_whatever_state_it_holds(board):
     assert [p["count"] for p in _repeat_payloads(conn, first_id)] == [5]
 
 
-def test_the_next_hour_bucket_files_a_second_card(board):
-    """The episode expires with its bucket: the next hour pages again, on a new key."""
+def test_the_next_hour_does_NOT_file_a_second_card(board):
+    """DELIBERATE INVERSION of the old hour-bucket rule (card t_e217fc62).
+
+    This test used to assert that a tick in the NEXT hour filed a second card, because the hour
+    bucket was part of the key. That rule is what restocked the board: one unchanged condition held
+    ``mass-crash:mass-crash-sweep:count=49:platform:1793509200`` and its neighbours for as long as
+    it lasted. The clock is not the condition, so the same refusal an hour later lands on the SAME
+    card, with nothing deduped into it (the reading did not move), and there is still exactly ONE
+    mass-crash card on the board.
+    """
     conn = board
     _, first_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
     _, next_hour_id = _refused_sweep(conn, 3, now=_TICK_INSTANT + _HOUR_SECONDS)
 
-    assert next_hour_id != first_id
+    assert next_hour_id == first_id, "the hour is a reading, never part of the key"
     actors = _mass_crash_actors(conn)
-    assert len(actors) == 2
-    assert actors[0]["idempotency_key"] != actors[1]["idempotency_key"]
-    # A card in a NEW bucket has no repeat trail of its own -- nothing was deduped into it.
-    assert _repeat_payloads(conn, next_hour_id) == []
-    assert _repeat_payloads(conn, first_id) == []
+    assert len(actors) == 1, "one condition, one card, however many hours it spans"
+    assert actors[0]["idempotency_key"] == "mass-crash:refused:default"
+    # The tick is still evidence: it lands in the event trail (payload.ended_at), not in a card.
+    assert [p["ended_at"] for p in _repeat_payloads(conn, first_id)] == [
+        _TICK_INSTANT + _HOUR_SECONDS,
+    ]
+    # An unchanged reading adds NO thread line: a sustained condition stays quiet.
+    assert _reading_lines(conn, first_id) == ["count=3"]
 
 
 def test_a_second_board_gets_its_own_card(board):
@@ -582,10 +612,54 @@ def test_a_second_board_gets_its_own_card(board):
 
     assert first_id and second_id and first_id != second_id
     keys = {row["idempotency_key"] for row in _mass_crash_actors(conn)}
-    assert keys == {
-        f"mass-crash:mass-crash-sweep:platform:{_BUCKET}",
-        f"mass-crash:mass-crash-sweep:other:{_BUCKET}",
-    }
+    assert keys == {"mass-crash:refused:platform", "mass-crash:refused:other"}
+
+
+def test_a_HOLD_and_a_REFUSAL_on_one_board_are_two_conditions(board):
+    """The key names the condition's KIND: a hold must not hide behind a refusal's card.
+
+    Both are crash-sweep escalations on the same board, but they ask for different work (a hold
+    says the liveness witness cannot be compared; a refusal says too many runs died at once). If
+    they shared a key, whichever filed first would own the only card and the other condition's
+    title, count and threshold would never reach the board.
+    """
+    conn = board
+    dead = _dead_pid()
+    _claimed_running(conn, pid=dead, started_at=_incomparable_fingerprint())
+    kbd.detect_crashed_workers(conn)                       # files the HOLD actor
+    _, refused_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
+
+    keys = {row["idempotency_key"] for row in _mass_crash_actors(conn)}
+    assert keys == {"mass-crash:held:default", "mass-crash:refused:default"}, keys
+    hold_id = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = 'mass-crash:held:default'",
+    ).fetchone()["id"]
+    assert hold_id != refused_id
+
+
+def test_a_DONE_actor_card_is_reopened_when_the_condition_recurs(board):
+    """A finished card still HOLDS its key, so a recurrence must re-arm it, not be swallowed.
+
+    The kernel's dedupe fence is ``status != 'archived'``: a `done` card answers the existing-card
+    lookup, so without this the condition pages ONCE in its life, a later escalation resolves to a
+    card nobody is working, and the board looks served (card t_e217fc62).
+    """
+    conn = board
+    _, actor_id = _refused_sweep(conn, 3, now=_TICK_INSTANT)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            (_TICK_INSTANT, actor_id),
+        )
+
+    _, again_id = _refused_sweep(conn, 9, now=_TICK_INSTANT + _HOUR_SECONDS)
+
+    assert again_id == actor_id, "the SAME card carries the recurring condition"
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (actor_id,)).fetchone()
+    assert str(row["status"]) not in guard._TERMINAL_ACTOR_STATUSES, row["status"]
+    assert len(_mass_crash_actors(conn)) == 1
+    # The new reading is on the thread, so the reader sees 3 -> 9 on the card that was reopened.
+    assert _reading_lines(conn, actor_id) == ["count=3", "count=9"]
 
 
 def test_the_actor_card_still_evidence_the_tick_it_came_from(board):
