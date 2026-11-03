@@ -46,6 +46,13 @@ DEFAULT_MAX_RESIDENT_SERVERS = 4
 _DELTA_BASELINE_CAP = 256  # per-file pre-write snapshots; paths never written again would otherwise live forever (#62950)
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
 
+# ``lsp.exclude_roots`` entry prefix meaning "this root EXACTLY, nothing beneath it".  A bare pattern
+# historically covers the root and every root under it, which is right for a container directory whose
+# projects should all be skipped — and wrong for a meta-repo, whose tree CONTAINS other checkouts that
+# must keep their own servers (a fleet state root holding every card workspace, a workspace container
+# holding throwaway worktrees).  Prefixing with ``=`` is that second reading; see :meth:`LSPService._root_excluded`.
+EXACT_ROOT_PREFIX = "="
+
 _Key = tuple[str, str]
 _Diags = list[dict[str, Any]]
 
@@ -81,13 +88,33 @@ def _path_list(value: Any) -> Optional[list[str]]:
     return [os.path.expanduser(p) for p in value if p]
 
 
+def _exclude_pattern(entry: str) -> Optional[str]:
+    """One ``lsp.exclude_roots`` entry, ``~``-expanded, with the exact-root marker preserved.
+
+    ``None`` for an entry that names nothing (``""``, or a bare marker) — an exclusion that matches
+    no root is a config typo, and keeping it would render in ``hermes lsp status`` as if it worked.
+    """
+    text = entry.strip()
+    exact = text.startswith(EXACT_ROOT_PREFIX)
+    body = os.path.expanduser((text[1:] if exact else text).strip())
+    if not body:
+        return None
+    return (EXACT_ROOT_PREFIX if exact else "") + body
+
+
 def _parse_exclude_roots(value: Any) -> Optional[list[str]]:
-    """``lsp.exclude_roots``; ``None`` (fail closed: every root excluded) for a malformed value."""
-    if (roots := _path_list(value)) is None:
+    """``lsp.exclude_roots``; ``None`` (fail closed: every root excluded) for a malformed value.
+
+    A ``=``-prefixed entry matches that root exactly and nothing beneath it (a meta-repo whose
+    descendants must keep their own servers); every other entry matches the root and everything
+    under it.  The marker survives parsing so ``hermes lsp status`` shows the policy as configured.
+    """
+    if (raw := _path_list(value)) is None:
         eventlog.event_log.warning(
             "lsp.exclude_roots must be a list of glob patterns, e.g. ['~/big-monorepo', '/srv/*/vendor'] "
             "(got %s); LSP is skipped for every workspace until the key is fixed", type(value).__name__)
-    return roots
+        return None
+    return [pattern for entry in raw if (pattern := _exclude_pattern(entry))]
 
 
 def parse_trusted_workspaces(value: Any) -> list[str]:
@@ -360,11 +387,25 @@ class LSPService:
         return True
 
     def _root_excluded(self, root: str) -> bool:
-        """True iff ``root`` matches an ``lsp.exclude_roots`` glob (or the key is misconfigured)."""
+        """True iff ``root`` matches an ``lsp.exclude_roots`` pattern (or the key is misconfigured).
+
+        A ``=``-prefixed pattern matches ``root`` only.  Any other pattern matches the root and
+        every root under it — the container reading, which is what makes excluding a parent
+        directory cover the projects inside it.  Both readings are needed: the container form for a
+        directory of throwaway checkouts, the exact form for a META-repo whose tree contains other
+        repositories (a state root holding every card workspace) where the descendants must keep
+        their own servers.
+        """
         if self._exclude_roots is None:
             return True
-        return any(fnmatch.fnmatchcase(root, pat) or fnmatch.fnmatchcase(root, pat.rstrip(os.sep) + os.sep + "*")
-                   for pat in self._exclude_roots)
+        for pat in self._exclude_roots:
+            exact = pat.startswith(EXACT_ROOT_PREFIX)
+            pattern = pat[len(EXACT_ROOT_PREFIX):] if exact else pat
+            if fnmatch.fnmatchcase(root, pattern):
+                return True
+            if not exact and fnmatch.fnmatchcase(root, pattern.rstrip(os.sep) + os.sep + "*"):
+                return True
+        return False
 
     def _is_broken(self, key: _Key) -> bool:
         """Broken-set membership; an entry whose retry deadline passed is dropped so the pair gets one more try."""

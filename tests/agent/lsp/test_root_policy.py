@@ -119,3 +119,60 @@ def test_warmup_timeout_applies_to_cold_root_only(tmp_path, monkeypatch):
     finally:
         svc.shutdown()
     assert budgets == [30.0, 1.0]
+
+
+def test_exact_entry_excludes_a_meta_repo_but_not_the_checkouts_inside_it(tmp_path, monkeypatch):
+    """``=root`` matches that root ALONE: a repo whose TREE contains other repositories (a state root
+    holding every card workspace, a container of checkouts) loses its own server while each checkout
+    inside keeps one — the case a bare pattern cannot express, since it covers every root beneath it.
+    """
+    meta = _git_repo(tmp_path, "meta")
+    inside = meta / "checkout"
+    inside.mkdir()
+    (inside / ".git").mkdir()
+    (inside / "pyproject.toml").write_text("[project]\nname='inner'\n", encoding="utf-8")
+    (inside / "y.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(str(tmp_path))
+
+    exact = _service_from({"wait_timeout": 1.0, "install_strategy": "manual",
+                           "exclude_roots": ["=" + str(meta)]})
+    try:
+        assert exact.enabled_for(str(meta / "x.py")) is False
+        assert exact.enabled_for(str(inside / "y.py")) is True
+    finally:
+        exact.shutdown()
+
+    container = _service_from({"wait_timeout": 1.0, "install_strategy": "manual",
+                               "exclude_roots": [str(meta)]})
+    try:  # the historical reading is unchanged: the root and everything under it
+        assert container.enabled_for(str(meta / "x.py")) is False
+        assert container.enabled_for(str(inside / "y.py")) is False
+    finally:
+        container.shutdown()
+
+
+def test_exact_entry_keeps_globs_and_tilde_and_drops_entries_that_name_nothing(tmp_path, monkeypatch):
+    """The marker is a prefix, not a path: ``=~/work/*`` still expands and still globs, ``hermes lsp
+    status`` shows the policy with the marker intact, and an entry that names no root (``""``, a bare
+    ``=``) is dropped rather than kept as an exclusion that silently matches nothing."""
+    a = _git_repo(tmp_path, "a")
+    b = _git_repo(tmp_path, "bb")
+    monkeypatch.chdir(str(tmp_path))
+
+    svc = _service_from({"wait_timeout": 1.0, "install_strategy": "manual",
+                         "exclude_roots": ["", "  ", "=", "=" + str(tmp_path / "*")]})
+    try:
+        assert svc.enabled_for(str(a / "x.py")) is False
+        assert svc.enabled_for(str(b / "x.py")) is False
+        assert svc.get_status()["exclude_roots"] == ["=" + str(tmp_path / "*")]
+    finally:
+        svc.shutdown()
+
+    tilde = _service_from({"wait_timeout": 1.0, "install_strategy": "manual",
+                           "exclude_roots": ["=~/nowhere-xyz"]})
+    try:
+        assert tilde.get_status()["exclude_roots"] == ["=" + str(Path.home() / "nowhere-xyz")]
+        assert tilde.enabled_for(str(a / "x.py")) is True  # the exact form did not widen to the parent
+    finally:
+        tilde.shutdown()
+
