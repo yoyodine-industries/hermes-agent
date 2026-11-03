@@ -697,14 +697,16 @@ class _KanbanDispatcher:
 
         The host-wide budget is SHARED and allocated in GLOBAL PRIORITY ORDER.
         Every startable card on every dispatchable board is ranked by the same
-        ``priority`` column the dispatcher already orders one board by, and the
-        free host slots are handed out down that ONE list — with a FLOOR of one
-        slot per board holding work — bounded by each board's remaining
-        ``kanban.max_spawn_by_board`` / ``kanban.max_spawn`` capacity and still by
+        EFFECTIVE priority (declared priority plus the age credit) the dispatcher
+        already orders one board by, and the free host slots are handed out down
+        that ONE list — with a FLOOR of one slot per board holding work — bounded
+        by each board's remaining ``kanban.max_spawn_by_board`` /
+        ``kanban.max_spawn`` capacity and still by
         ``kanban.max_in_progress_per_profile`` inside the board's own pass. So a
-        999999 card anywhere runs before any 999000 card anywhere. A board is
-        still visited for reclaim, promotion, decomposition and health whether or
-        not it won a slot; only the SPAWN allocation moves.
+        999999 card anywhere runs before any 999000 card anywhere, and an aged
+        card that has climbed past a fresher higher band runs first too. A board
+        is still visited for reclaim, promotion, decomposition and health whether
+        or not it won a slot; only the SPAWN allocation moves.
 
         Rotation survives only as the tie-break INSIDE one priority band
         (``board_visit_order``), so equal-priority work still round-robins. A
@@ -718,7 +720,11 @@ class _KanbanDispatcher:
         priorities: dict = {}
         for slug, work in snapshot.items():
             rows = work[0] if work is not None else []
-            priorities[slug] = int(rows[0]["priority"]) if rows else None
+            # ``eff_priority`` — the key the board's own dispatch order ranked
+            # this row by (``kanban_db_dispatch.spawnable_rows``). Ranking on the
+            # declared ``priority`` re-demoted an aged card that the lane order
+            # had just promoted (card t_a0678a13).
+            priorities[slug] = int(rows[0]["eff_priority"]) if rows else None
         order = self.board_visit_order(priorities)
         with_work: list = [slug for slug in order if priorities.get(slug) is not None]
         free = self.free_host_budget(snapshot)
@@ -735,7 +741,7 @@ class _KanbanDispatcher:
                 capacities[slug] = (
                     None if ceiling is None else max(int(ceiling) - int(running), 0)
                 )
-                cards.extend((int(row["priority"]), slug) for row in rows)
+                cards.extend((int(row["eff_priority"]), slug) for row in rows)
             shares = host_budget_shares_by_priority(free, cards, capacities)
         results: list[tuple[str, Optional[object]]] = []
         for slug in order:

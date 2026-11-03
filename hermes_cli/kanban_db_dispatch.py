@@ -6548,25 +6548,38 @@ def zero_run_ready(
     return _kb.zero_run_ready(conn, now=now, min_age_seconds=min_age_seconds)
 
 
-def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order.
+def _lane_rows(
+    conn: sqlite3.Connection, status: str, *, now: Optional[float] = None
+) -> list[sqlite3.Row]:
+    """Unclaimed rows of one lane in dispatch order, carrying their effective priority.
 
     Ordering is the shared age-aware effective priority
     (``kanban_db.effective_priority_order_sql``): a card that has waited long
     enough outranks fresher higher-priority work, so a low-priority lane can
-    never be starved indefinitely by a steady trickle of P0/P1 cards. Both lane
-    orders (ready and review) call the one helper so they cannot drift.
+    never be starved indefinitely by a steady trickle of higher-band cards. Both
+    lane orders (ready and review) call the one helper so they cannot drift.
+
+    ``eff_priority`` is the SAME expression the ORDER BY uses, selected as a
+    column, because the cross-board host-budget allocator ranks on the value a
+    row was actually ordered by. Labelling an aged row with its DECLARED
+    priority there would re-demote exactly the card the order had just promoted,
+    which is the second half of the cross-tier starvation defect (card
+    t_a0678a13). Read-only; the value is never persisted.
     """
-    order_body, order_params = _kb.effective_priority_order_sql()
+    at = time.time() if now is None else float(now)
+    expr, expr_params = _kb.effective_priority_expression(at)
+    order_body, order_params = _kb.effective_priority_order_sql(at)
     return conn.execute(
-        "SELECT id, assignee, priority FROM tasks "
+        f"SELECT id, assignee, priority, {expr} AS eff_priority FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         f"ORDER BY {order_body}",
-        order_params,
+        [*expr_params, *order_params],
     ).fetchall()
 
 
-def _spawnable_lane_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+def _spawnable_lane_rows(
+    conn: sqlite3.Connection, *, now: Optional[float] = None
+) -> list[sqlite3.Row]:
     """Ready (and, when enabled, review) rows a worker could start, head first.
 
     "Spawnable" is the dispatcher's own gate as far as a read-only pass can
@@ -6574,43 +6587,51 @@ def _spawnable_lane_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     without an assignee or assigned to a profile this host cannot spawn — those
     wait for ROUTING, not for a free slot.
     """
-    rows = _lane_rows(conn, "ready")
+    rows = _lane_rows(conn, "ready", now=now)
     if review_dispatch_enabled():
-        rows = rows + _lane_rows(conn, "review")
+        rows = rows + _lane_rows(conn, "review", now=now)
     profile_exists = _profile_exists_fn()
     if profile_exists is None:
         return [row for row in rows if row["assignee"]]
     return [row for row in rows if row["assignee"] and profile_exists(row["assignee"])]
 
 
-def spawnable_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """This board's spawnable cards (``id``/``assignee``/``priority``), head first.
+def spawnable_rows(
+    conn: sqlite3.Connection, *, now: Optional[float] = None
+) -> list[sqlite3.Row]:
+    """This board's spawnable cards (``id``/``assignee``/``priority``/``eff_priority``).
 
-    The gateway dispatcher allocates the host budget by ranking EVERY card on
-    EVERY board (``gateway.kanban_watchers_dispatcher.host_budget_shares_by_priority``),
-    so it needs the board's own dispatch-order rows — the same order
-    :func:`_spawnable_lane_rows` produces. Read-only.
+    Head first, in the board's own dispatch order. The gateway dispatcher
+    allocates the host budget by ranking EVERY card on EVERY board
+    (``gateway.kanban_watchers_dispatcher.host_budget_shares_by_priority``), so it
+    needs the board's own dispatch-order rows — and it ranks on ``eff_priority``,
+    the value those rows were ordered by, not the declared ``priority``. Read-only.
     """
-    return _spawnable_lane_rows(conn)
+    return _spawnable_lane_rows(conn, now=now)
 
 
-def head_of_line_priority(conn: sqlite3.Connection) -> Optional[int]:
-    """Priority of the card this board would spawn next, or ``None``.
+def head_of_line_priority(
+    conn: sqlite3.Connection, *, now: Optional[float] = None
+) -> Optional[int]:
+    """Effective priority of the card this board would spawn next, or ``None``.
 
-    ``_lane_rows`` orders a lane by the shared effective priority, so the head
-    card's own ``priority`` is the priority of the work this board would start
-    next — ranking boards by it ranks them by exactly the order their own cards
-    will be spawned in.
+    ``_lane_rows`` orders a lane by the shared effective priority and returns it
+    as ``eff_priority``, so the head card's ``eff_priority`` is the key the order
+    itself used — ranking boards by it ranks them by exactly the order their own
+    cards will be spawned in. Returning the head card's DECLARED ``priority``
+    instead (what this did before card t_a0678a13) made that docstring false: an
+    aged lower-band head carried its old band into the allocator and lost to a
+    fresh top-band card on another board.
 
     ``None`` means nothing on this board could be started by a worker. A caller
     allocating a SHARED budget must still visit such a board (reclaim,
     promotion, decomposition and health work is board-local); it just cannot
     rank it.
     """
-    rows = _spawnable_lane_rows(conn)
+    rows = _spawnable_lane_rows(conn, now=now)
     if not rows:
         return None
-    return int(rows[0]["priority"])
+    return int(rows[0]["eff_priority"])
 
 
 def total_running_all_boards() -> Optional[int]:
