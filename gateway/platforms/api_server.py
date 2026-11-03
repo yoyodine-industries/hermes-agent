@@ -1010,6 +1010,11 @@ def _gate_holders_summary(snapshot: dict[str, Any], limit: int = 4) -> list[str]
     return summary
 
 
+ESTOP_UNREADABLE_NOTICE = (
+    "⏸️ The emergency-stop state could not be read, so this turn was refused: an unevaluable "
+    "pause is never treated as no pause. Check the hold with `hermes status`, then retry.")
+
+
 def _admit_api_agent_request(handler):
     """Reserve an authenticated API turn before its handler first awaits: drain check +
     reservation in one non-awaiting block so a request admitted just before shutdown can't go
@@ -3069,15 +3074,25 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``hermes peer dm``/``peer run`` each start NEW agent work on the receiving gateway, so
         they owe the same per-identity gate the inbound messaging path pays
         (``gateway/run_inbound.py::_hm_estop_turn_allowed``): under a scoped lockdown the
-        allowlisted operator/lane keeps being served and every other caller is refused.
+        allowlisted operator/lane keeps being served and every other caller is refused. The
+        agent-serving doors (``/v1/chat/completions``, ``/v1/responses``) pay it too — they start
+        the same kind of turn, so none of them may be the way past a pause.
 
-        Fail-closed on purpose: with a hold in force and no readable ``is_allowed`` predicate
-        (a tree from before the allowlist existed) the turn is refused, never run — the same
-        stance the inbound gate takes. Identity is taken from the authenticated request
-        context ONLY; the request body is never read, so a caller cannot enrol itself by
-        naming its own id in ``author``.
+        Fail-closed in EVERY arm; the ONLY admitting outcome is a successful check of an
+        identity against a live hold's allowlist:
+
+        * no live hold -> ``None`` (nothing is paused, so nothing is refused);
+        * a live hold and an allowlisted identity -> ``None``;
+        * a live hold and no readable ``is_allowed`` predicate (a tree from before the
+          allowlist existed) -> the pause notice — the same stance the inbound gate takes;
+        * the hold state cannot be EVALUATED at all (the module will not import, the sentinel
+          cannot be read, ``paused_reply`` itself raises) -> :data:`ESTOP_UNREADABLE_NOTICE`.
+          An unevaluable pause is never read as "no pause".
+
+        Identity is taken from the authenticated request context ONLY; the request body is
+        never read, so a caller cannot enrol itself by naming its own id in ``author``.
         """
-        with suppress(Exception):
+        try:
             from agent import estop as _estop
             if not _estop.is_engaged():
                 return None
@@ -3089,14 +3104,26 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             predicate = getattr(_estop, "is_allowed", None)
             if predicate is None:
                 return _estop.paused_reply()
-            with suppress(Exception):
+            try:
                 if predicate(principal, profile):
                     return None
+            except Exception:
+                # A predicate that raises admits nobody: an unreadable allowlist is not an
+                # allowlist that names this caller.
+                logger.warning(
+                    "estop: the allowlist predicate failed for this turn; refusing it "
+                    "(fail-closed)", exc_info=True)
             return _estop.paused_reply()
-        return None
+        except Exception:
+            # Import failure, unreadable sentinel, a pause-notice builder that raises: the hold
+            # state is unknowable here, and refusing is the only honest answer.
+            logger.warning(
+                "estop: the hold state could not be evaluated for this turn; refusing it "
+                "(fail-closed)", exc_info=True)
+            return ESTOP_UNREADABLE_NOTICE
 
     def _estop_peer_refusal(self) -> Optional[web.Response]:
-        """The 503 the peer transports answer a held turn with, or ``None`` when admitted."""
+        """The 503 a held (or unevaluable) turn is refused with, or ``None`` when admitted."""
         notice = self._estop_peer_pause_notice()
         if notice is None:
             return None
