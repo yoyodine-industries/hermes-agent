@@ -32,3 +32,87 @@ Rules applied, in priority order:
 - `scripts/write_install_stamp.py` — merged. vs up: 1+/1- vs row: 1+/1-
 - `tests/hermes_state/test_bounded_reclaim.py` — merged. vs row: 12+/4- Row's file, one helper adapted: `_grow()` now uses a fresh session id per call, because `prune_sessions` RETIRES what it removes (upstream `retire_prunable`, adopted by hermes_state_maintenance.py) and a retired id may not be re-created. 8/8 green.
 - `tests/hermes_state/test_hermes_state_readonly_preflight.py` — row-identical (upstream's side was superseded by the row's own rewrite). vs up: 97+/42- ROW WINS. The clean merge kept three upstream tests asserting that the preflight POLICES sidecars, which the row deliberately removed; the merged file could not pass against its own preflight. The row's version is 12/12 green on the merged source.
+
+---
+
+# Addendum — review round 2 (t_b0e62cf7): row content on NON-conflicted paths
+
+## R5 (new rule) — a row path is not safe because git did not mark it conflicted
+
+A batch branch is `origin/main` plus that batch's resolutions, so a row path
+**_outside_** the assigned list sits at UPSTREAM content on the branch even
+though the assembly (a merge **on the carrier**) keeps the row's side of it.
+Binding measurement: `git merge-tree --write-tree origin/overrides/live origin/main`
+reports exactly **57** conflicted paths; every other path auto-merges with the
+carrier's blob intact. 53 of the 57 are batch-owned (B1 18, B2 21, B3 14);
+**4 are owned by no batch** and are reported to platform-stl below.
+
+Consequence, and the reason this addendum exists: a batch can be "conflict-clean"
+and still not import, because its modules carry the row's imports and the target
+module is upstream-only on the branch. The resolution therefore carries the row
+content the batch itself reaches, and records it here.
+
+## Files whose row-side content the branch dropped, and what was done
+
+Carried (all verified NOT conflicted and NOT a B1/B3 path). `MERGE` = three-way
+`git merge-file` (BASE=cut, OURS=carrier) which is what git does on a clean path;
+`TAKE` = upstream never touched the file, so the merge result is the carrier blob.
+
+| path | row-only content the batch needs | upstream | resolution |
+|---|---|---|---|
+| `hermes_state_common.py` | `RECLAIM_CHUNK_PAGES`, `RECLAIM_MAX_PAGES_PER_PASS`, `RECLAIM_MAX_SECONDS_PER_PASS`, `RECLAIM_MIN_FREELIST_PAGES`, `RECLAIM_CHUNK_YIELD_MS`, `RECLAIM_MIGRATE_MIN_FREELIST_RATIO` — imported by `hermes_state_maintenance` | absent | MERGE, +30 |
+| `hermes_state.py` | `SessionDB.MESSAGE_RETENTION_SOURCES` — read by `prune_archived_messages` | absent | MERGE, +12 |
+| `hermes_cli/kanban_db_boards.py` | `board_dispatch_enabled` et al. — imported by `kanban_db` / `kanban_db_dispatch` | absent | MERGE, +141/-5 |
+| `hermes_cli/projects_db.py` | `sanitize_branch_name` — imported by `kanban_db_workspace` | unchanged | TAKE |
+| `agent/delegation_context.py` | `PROVENANCE_REFUSAL_MESSAGE`, `ancestor_owns_live_kanban_claim`, `child_kanban_write_allowance`, `board_name_resolves` | absent | MERGE, +238 |
+| `agent/estop.py`, `agent/skill_commands.py`, `gateway/status.py` | `preload_skill_problems`, `get_process_uptime_fingerprint`, `host_boot_witness`, estop surface | present, row-only symbols absent | MERGE |
+| `hermes_cli/kanban_db_workspace.py`, `hermes_cli/kanban_pr_acceptance.py`, `hermes_cli/kanban_pr_acceptance_store.py` | `WorkspaceVolumeUnavailable`, `WorktreeAnchorNotRepo`, `needs_repository_checks`, `_COMPLETABLE` | present, symbols absent | MERGE |
+| `hermes_cli/code_skew_content.py`, `hermes_cli/tree_fingerprint.py`, `hermes_cli/kanban_gate_invariants.py`, `hermes_cli/kanban_proof_gate.py`, `hermes_cli/kanban_landing_carrier.py`, `hermes_cli/kanban_filing_policy.py`, `hermes_cli/kanban_priority_policy.py`, `hermes_cli/kanban_protected_trees.py`, `hermes_cli/kanban_contract_resolve.py`, `hermes_cli/kanban_crash_sweep_guard.py`, `hermes_cli/kanban_consent_gate.py`, `hermes_cli/kanban_top_level_gate.py`, `hermes_cli/kanban_register.py`, `hermes_cli/substrate_access.py` | the batch's `from hermes_cli import …` targets | mixed | MERGE/ADD |
+| `hermes_cli/delivery_keys.py`, `hermes_cli/kanban_completion_refs.py`, `hermes_cli/kanban_db_dispatch_retire.py`, `hermes_cli/kanban_db_links.py`, `hermes_cli/kanban_exits.py`, `hermes_cli/kanban_inbox.py`, `hermes_cli/kanban_adjudicate.py`, `hermes_cli/kanban_parent_state.py`, `hermes_cli/substrate_view.py`, `hermes_cli/subcommands/groups.py`, `tools/bot_delivery_queue.py`, `tools/bot_delivery_lease.py`, `tools/bot_delivery_notices.py`, `tools/process_registry_output.py` | carrier-only modules the batch imports (a missing module is invisible to a name audit: it resolves to no file at all) | absent | ADD |
+| `tests/conftest.py` | the row's fixtures (233 lines) — without them the worktree/kanban fixtures are half-built | unchanged | TAKE |
+
+**Not carried, deliberately:** the remaining row paths in the batch's import
+closure (measured at 106 row-changed paths before these carries). Carrying them
+would be performing the assembly merge inside a batch branch, which the design
+forbids; they are guaranteed by the carrier-based merge measured above. This
+addendum names the class and the boundary, so the assembler knows exactly what
+is carried here and what it must supply.
+
+## Acceptance (batch protocol)
+
+- **Every module the row owns must still IMPORT in the merged tree — checked by
+  import-smoke of the batch's modules *and* of the row paths they import, or by
+  the row's test files COLLECTING. Never by `python -m compileall`:** a vanished
+  cross-module NAME compiles green and only raises at import.
+
+## Verification this round (all commands run on the branch)
+
+- **import-smoke: 43/43 modules** imported (19 assigned + 24 carried row paths),
+  `PYTHONPATH=.:<testlibs>` against the harness venv.
+- `tests/hermes_state/test_bounded_reclaim.py` — **8 passed**.
+- `tests/hermes_state/test_hermes_state_readonly_preflight.py` — **12 passed**.
+- Broader row-oracle run (boards, peer, yaml, diagnostics): **83 passed, 0 failed**.
+- `hermes_state_repair.py` against `test_state_db_repair_{non_destructive,live_writer_guard}.py`:
+  this resolution fails **15** tests where the row's own file fails **17** — and the
+  baseline is red on BOTH sides independently (the row's file and upstream's each
+  fail the same 14 in `test_state_db_repair_non_destructive.py`), so the failures
+  are environmental, not resolution defects. This resolution fixes two the row's
+  version does not (`test_repair_checks_foreign_holders_before_opening_sqlite`,
+  `test_repair_refuses_while_another_connection_holds_the_db`).
+- Worktree teardown, with the ROW's own test file (the assembled oracle) and
+  `HERMES_KANBAN_EVIDENCE_GATE=measure`: **26 passed** — the row's evidence gate
+  defaults to `refuse` by design, so a bare `kb.complete_task()` in a temp home is
+  refused; that is the gate working, not a resolution defect.
+
+## Cross-batch dependencies (about the MERGED tree, not this branch)
+
+- `hermes_cli/cron.py` / `subcommands/cron.py` pass `script_timeout_seconds=` to
+  `tools/cronjob_tools.cronjob`; the kwarg is row-only. `cron/jobs.py` (B1) and
+  `tools/cronjob_tools.py` (B3) must keep it — measured: B1's branch carries 9
+  hits of `script_timeout_seconds` in `cron/jobs.py`. On this patchset branch the
+  call is unexercisable (`TypeError`), which is expected.
+- **Four conflicted paths belong to no batch** and still need an owner:
+  `tools/mcp_tool.py`, `tui_gateway/methods_bot_relay.py`,
+  `tests/gateway/test_lifecycle_state_db_check.py`,
+  `tests/tools/test_bot_mode_refusal_contract.py`. Reported to platform-stl.
+
