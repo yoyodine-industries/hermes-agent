@@ -445,7 +445,8 @@ PROOF_SHAPE = (
     'pin, and a probe dated after the commit\'s committer date carrying "observations": the '
     'gate then MEASURES that the commit is an ancestor of the line this checkout deploys '
     'from, that the live file is that commit\'s blob, and that the probe postdates it — '
-    'the already-live class, recorded as facts.landing_class="already-live" and dating the '
+    'the already-live class, recorded as facts.landing_class="already-live" (and its probe must '
+    'ALSO postdate any .deployed-from stamp the dest carries) and dating the '
     'landing from the commit itself. A refused landing receipt for the same commit DENIES '
     'it, and an admitted one wins the landing instant) '
     '(EVERY artifact must also name a DURABLE REFERENT the gate can re-resolve, or it is '
@@ -1289,19 +1290,22 @@ def _artifact_refusals(entries: list, facts: dict, *, ledger_bound: bool = False
 # THE CLASS IS MEASURED, NEVER TAKEN FROM THE PAYLOAD. Three facts, all resolved by the gate:
 #
 #   1. ``artifacts[].blob`` = ``<commit>:<repo-relative path>``, and that commit is an ANCESTOR of
-#      the repo's LINE — ``origin/HEAD`` (the remote default), else the branch the checkout's HEAD
-#      tracks (the live install tracks ``overrides/live``, which IS its line), else
-#      ``origin/main``/``origin/master`` when the repo carries no remote head at all. This is the
-#      load-bearing clause: a commit that never landed cannot pass it, and the ref that admitted
-#      the commit is recorded in the facts.
+#      the repo's LINE — ``origin/HEAD`` (the remote default), ``origin/main``/``origin/master``
+#      when the repo carries no remote head at all, or this host's own deploy line
+#      ``origin/overrides/live``. NOT the checkout's tracked upstream: a published work branch with
+#      ``--set-upstream-to`` would otherwise certify a commit that never landed (review round 1).
+#      This is the load-bearing clause: a commit that never landed cannot pass it, and the ref
+#      that admitted the commit is recorded in the facts.
 #   2. the live file's sha256 equals the blob's sha256 at that commit (the same comparison the
 #      artifact pass makes);
-#   3. a ``probe`` at an instant LATER than the commit's committer date, green, carrying the
-#      ``observations`` it exercised — the same obligation the ledger-less live-tree class owes,
-#      for the same reason: an unnamed probe is a claim, and a claim is not a probe.
+#   3. a ``probe`` at an instant LATER than the commit's committer date AND later than the dest's
+#      ``.deployed-from`` stamp where one exists, green, carrying the ``observations`` it
+#      exercised — the same obligation the ledger-less live-tree class owes, for the same reason:
+#      an unnamed probe is a claim, and a claim is not a probe.
 #
-# On admission ``landing_at`` is the commit's committer date, so ``proof_predates_landing`` still
-# bites unchanged: a probe older than the commit proves the PREVIOUS bytes.
+# On admission ``landing_at`` is the commit's committer date (or the stamp, if later), so
+# ``proof_predates_landing`` still bites unchanged: a probe older than the commit — or older than
+# the arrival the stamp records — proves the PREVIOUS bytes.
 #
 # THE RAILS. (a) A proof that declares a ``landing`` block never takes this class — the
 # landing/arrival routes stay first, and one that RESOLVES wins. (b) A refused ``kind: landing``
@@ -1313,7 +1317,9 @@ def _artifact_refusals(entries: list, facts: dict, *, ledger_bound: bool = False
 # declared bytes or none of them. (f) The class is recorded in the verdict
 # (``landing_class: "already-live"``) so the census can count how often the fallback fires — if it
 # fires more than a handful of times a day that is a signal about the SHIP PATH, not a reason to
-# widen the door.
+# widen the door. (g) A dest ``.deployed-from`` stamp LATER than the commit raises the instant, so
+# the class can never certify a probe taken before the bytes arrived (review round 1). (h) The
+# checkout's tracked upstream is NOT a line, and a ref naming a card is not a line either.
 
 
 def _landing_declared(proof: dict) -> bool:
@@ -1336,25 +1342,26 @@ def _already_live_applies(proof: dict, entries: list) -> bool:
 def _line_refs(work_tree: str) -> list:
     """``[(ref, sha)]`` the refs that ARE the line in *work_tree*, best first.
 
-    ``origin/HEAD`` is the remote default; the tracked upstream of HEAD is the branch this
-    checkout deploys FROM (the live install tracks ``overrides/live``, not the fork's ``main``,
-    and demanding ``main`` would refuse every override the install actually runs). The
-    ``origin/main``/``origin/master`` fallbacks keep a freshly-fetched clone usable when it
-    carries no remote head.
+    ``origin/HEAD`` is the remote default, and ``origin/main``/``origin/master`` keep a
+    freshly-fetched clone usable when it carries no remote head; the live install's own line
+    ``origin/overrides/live`` is named explicitly (the install DEPLOYS ``overrides/live``, not the
+    fork's ``main``, and demanding ``main`` would refuse every override the install actually runs).
 
-    A CARD BRANCH IS NEVER A LINE: the fleet names its work branches after the card
+    A CHECKOUT'S TRACKED UPSTREAM IS NOT A LINE. It was a candidate in the first cut of this
+    class, and a work branch published as ``origin/wip`` with HEAD tracking it then certified a
+    commit that had never landed -- the load-bearing clause bypassed by a ``git checkout -b`` plus
+    ``--set-upstream-to`` (measured on card t_c0cd1aba, review round 1: ``line_ref: origin/wip``,
+    ok=true for a commit absent from ``origin/main``). The line is a fact about the REMOTE DEFAULT
+    and this host's deploy branch, never about what the working copy happens to track.
+
+    A CARD BRANCH IS NEVER A LINE either: the fleet names its work branches after the card
     (``fix/t_1a28deba-...``), so a ref whose name carries a card id is dropped. Without that,
-    "the commit is on origin/fix/t_xxxx" would read as "the commit landed", and the
-    load-bearing clause would certify an unmerged branch's own bytes.
+    "the commit is on origin/fix/t_xxxx" would read as "the commit landed".
     """
     candidates: list = []
     code, out, _err = _git_out("-C", work_tree, "symbolic-ref", "--short",
                                "refs/remotes/origin/HEAD")
     if code == 0 and out.strip():
-        candidates.append(out.strip())
-    code, out, _err = _git_out("-C", work_tree, "rev-parse", "--abbrev-ref",
-                               "--symbolic-full-name", "@{u}")
-    if code == 0 and out.strip() and out.strip() != "HEAD":
         candidates.append(out.strip())
     candidates.extend(["origin/main", "origin/master"])
     # This host's hermes-agent line: the live install DEPLOYS ``overrides/live`` while the fork's
@@ -1390,7 +1397,9 @@ def _already_live(entries: list, record: Optional[dict], observations: list,
     """Judge the already-live class -> ``(landing_at | None, facts, refusals)``.
 
     ``landing_at`` is the instant the proof must postdate: the admitted receipt's own time when
-    the ledger holds one for the commit, else the latest committer date among the pinned commits.
+    the ledger holds one for the commit, else the latest committer date among the pinned commits
+    — raised to the dest's ``.deployed-from`` stamp where one dates the artifact, because a
+    commit date is when the bytes were WRITTEN and the stamp is when they ARRIVED.
     It is ``None`` only where the class cannot date the bytes at all, and in that case the
     refusal says which fact could not be established (never a pass by absence).
     """
@@ -1483,14 +1492,36 @@ def _already_live(entries: list, record: Optional[dict], observations: list,
                 "commit": pin["commit"], "blob_path": pin["blob_path"]}
             return None, facts, []
 
-    landing_at = receipt_at if receipt_at is not None else max(
+    # THE ARRIVAL RAIL. The class dates the bytes from the COMMIT, but a commit date is not an
+    # arrival: when the dest carries a ``.deployed-from`` stamp (the estate's own arrival record,
+    # and the instant the ordinary deploy-stamp route would have used), those bytes reached the
+    # dest no earlier than the stamp, so the late one wins. Without this the class could certify
+    # a probe taken BEFORE the deploy -- measured on this card's review round 1: base refused
+    # ``proof_predates_landing`` at the stamp's 2026-09-27T00:00Z, while the first cut admitted a
+    # 2026-09-26T23:00Z probe off the 22:00Z commit. ``max`` only ever moves the instant LATER,
+    # so the class can never be looser than the route it replaced. mtime deliberately does NOT
+    # vote: it is whoever last touched the file, not a departure.
+    instant = receipt_at if receipt_at is not None else max(
         pin["committer_at"] for pin in pins)
+    basis = "ledger-receipt" if receipt_at is not None else "commit-committer-date"
+    stamp_at, stamp_facts = None, {}
+    for pin in pins:
+        found, stamp = _stamp_for(pin["path"])
+        if not stamp:
+            continue
+        at = parse_ts(stamp.get("deployed")) or parse_ts(stamp.get("at"))
+        if at is not None and (stamp_at is None or at > stamp_at):
+            stamp_at, stamp_facts = at, {
+                "stamp": found, "stamp_at": _iso(at), "stamp_commit": stamp.get("commit")}
+    if stamp_at is not None and stamp_at > instant:
+        instant, basis = stamp_at, "deploy-stamp"
+    landing_at = instant
     facts.update({
         "landing_source": "already-live",
         "landing_class": _ALREADY_LIVE,
-        "already_live_landing_basis": ("ledger-receipt" if receipt_at is not None
-                                       else "commit-committer-date"),
+        "already_live_landing_basis": basis,
         "already_live_landing_at": _iso(landing_at),
+        "already_live_stamp": stamp_facts or None,
         "already_live_pins": [
             {"artifact": pin["path"], "commit": pin["commit"], "blob_path": pin["blob_path"],
              "blob_sha256": pin["blob_sha256"], "line_ref": pin["line_ref"],
@@ -2278,7 +2309,8 @@ def render(task_id: str, verdict: Verdict) -> str:
             "answered in the repository, not in the proof: the pinned commit must be an "
             "ancestor of the line this checkout deploys from, the live file must BE that "
             "commit's blob, no refused landing receipt may exist for it, and the probe must "
-            "postdate the commit and name what it exercised (the refusal above says which of "
+            "postdate the commit (and any .deployed-from stamp the dest carries) and name what "
+            "it exercised (the refusal above says which of "
             "these failed). An artifact with no \"blob\" pin cannot take this class at all — "
             "a bare path + sha256 stays refused exactly as it was.")
     else:

@@ -2002,3 +2002,92 @@ def test_the_verdict_records_which_landing_class_certified_it(tmp_path):
     verdict = judge({"path": str(_path), "blob": f"{_commit}:{_rel}", "repo": str(_repo)})
     assert verdict.ok is True, verdict.detail
     assert verdict.facts["landing_class"] == "landed"
+
+
+def test_a_commit_reachable_only_from_the_tracked_work_branch_is_refused(tmp_path):
+    """DEFECT 1 (review round 1): the checkout's tracked upstream is NOT a line.
+
+    A work branch published as ``origin/wip`` and tracked by HEAD made the first cut certify a
+    commit absent from ``origin/main`` (``line_ref: origin/wip``, ``ok=true``) — the load-bearing
+    clause bypassed by ``git checkout -b`` plus ``--set-upstream-to``. The line is the remote
+    default and this host's deploy branch, never what the working copy happens to track.
+    """
+    repo, _on_line, rel, _blob = _on_the_line_repo(tmp_path)
+    commit, side_blob = _commit_off_the_line(repo, rel, "bytes from an unmerged line\n")
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                    "https://example.invalid/unit.git"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/origin/wip", commit],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "branch", "--set-upstream-to=origin/wip"],
+                   check=True, capture_output=True)
+    tracking = subprocess.run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref",
+                               "--symbolic-full-name", "@{u}"], check=True, capture_output=True,
+                              text=True).stdout.strip()
+    assert tracking == "origin/wip"                 # the checkout really does track the work branch
+    _dest, path = _deployed_copy(tmp_path, rel, side_blob)
+    ledger = _ledger_with(tmp_path, [])
+
+    verdict = gate.evaluate({"artifacts": [{"path": str(path), "blob": f"{commit}:{rel}",
+                                            "repo": str(repo)}],
+                             "probe": _probe(PROBE_AFTER, NAMED_OBSERVATIONS)},
+                            ledger_path=str(ledger))
+    assert verdict.ok is False
+    assert verdict.cause == "already_live_not_landed"
+    assert commit[:16] in verdict.detail
+    assert "origin/main" in verdict.detail
+    assert "origin/wip" not in verdict.detail      # the tracked upstream never admits any bytes
+
+
+def _stamped_unreceipted_merge(tmp_path: Path, deployed: str):
+    """The already-live fixture plus a dest ``.deployed-from`` stamp at *deployed*."""
+    fixture = _unreceipted_merge(tmp_path)
+    _repo, commit, _rel, _blob, dest, _path, _pin, _judge = fixture
+    _write_stamp(dest, commit, deployed=deployed)
+    return fixture
+
+
+def test_a_deploy_stamp_after_the_commit_dates_the_landing(tmp_path):
+    """DEFECT 2 (review round 1): a commit date is when bytes were WRITTEN, not when they ARRIVED.
+
+    The first cut dated the class from the commit alone and so admitted a probe taken between the
+    merge and the deploy. The dest's ``.deployed-from`` stamp is the estate's own arrival record —
+    the instant the route this class replaced would have used — so the later one wins, and ``max``
+    can only ever move the instant LATER.
+    """
+    _repo, commit, _rel, _blob, _dest, _path, _pin, judge = _stamped_unreceipted_merge(
+        tmp_path, "2026-09-27T00:00:00+00:00")
+
+    between = judge(probe=_probe("2026-09-26T23:00:00+00:00", NAMED_OBSERVATIONS))
+    assert between.ok is False
+    assert between.cause == "proof_predates_landing"
+    assert "2026-09-27T00:00:00Z" in between.detail
+
+    after = judge(probe=_probe("2026-09-27T09:00:00+00:00", NAMED_OBSERVATIONS))
+    assert after.ok is True, after.detail
+    assert after.facts["landed_at"] == "2026-09-27T00:00:00Z"
+    assert after.facts["already_live_landing_basis"] == "deploy-stamp"
+    assert after.facts["already_live_stamp"]["stamp_commit"] == commit
+
+
+def test_a_stamped_blob_pin_with_an_unnamed_probe_is_refused(tmp_path):
+    """DEFECT 3 (review round 1): the blast radius' OTHER direction, pinned.
+
+    No landing block + every artifact blob-pinned + a dest stamp + an UNNAMED probe is a shape the
+    ordinary route ADMITTED, dated from the stamp alone (base ``a9c0e45f78``: ``ok=true``,
+    ``landing_source="deploy-stamp"``, measured by the reviewer). It is now judged by the
+    already-live class, which demands the observations it is paid with — so a previously-passing
+    proof is refused, and the only refused fact is the naming. A real delta, stated rather than
+    discovered.
+    """
+    _repo, _commit, _rel, _blob, _dest, _path, _pin, judge = _stamped_unreceipted_merge(
+        tmp_path, "2026-09-27T00:00:00+00:00")
+
+    unnamed = judge(probe=_probe("2026-09-27T09:00:00+00:00", ()))
+    assert unnamed.ok is False
+    assert unnamed.cause == "already_live_unproven"
+    assert unnamed.facts["landing_class"] == "already-live"
+    assert unnamed.facts["landed_at"] == "2026-09-27T00:00:00Z"
+
+    # same bytes, same stamp, same instant: only the naming differs
+    named = judge(probe=_probe("2026-09-27T09:00:00+00:00", NAMED_OBSERVATIONS))
+    assert named.ok is True, named.detail
