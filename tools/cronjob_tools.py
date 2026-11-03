@@ -732,6 +732,9 @@ def _action_create(a: dict[str, Any]) -> str:
             reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
             timezone=_normalize_optional_job_value(a["timezone"]),
             grace_minutes=a["grace_minutes"],
+            # CLI-only lane, same reasoning: a model must not extend its own script budget. The
+            # value is validated by cron.jobs._normalize_job_script_timeout before storing.
+            script_timeout_seconds=a["script_timeout_seconds"],
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             catch_up=a["catch_up"],
@@ -740,6 +743,10 @@ def _action_create(a: dict[str, Any]) -> str:
     except CronSchedulerRegistrationError as exc:
         _partial = exc.to_dict()
         return tool_error(_partial.pop("error"), success=False, **_partial)
+    except ValueError as exc:
+        # create_job refuses a pinned job whose model cannot be resolved (dead-pin guard, card
+        # t_92b4a684) — surface the refusal instead of creating an inert job silently.
+        return tool_error(str(exc), success=False)
     _create_message = " ".join(filter(None, (f"Cron job '{job['name']}' created.",
         "Created PAUSED — resume to schedule, or explicitly run now." if not job.get("enabled", True) else None,
         _local_delivery_notice(job, deliver))))
@@ -904,7 +911,8 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
 
 
 def _update_script_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
-    """script / monitor_script / monitor_url (empty string clears); returns an error string or None."""
+    """script / monitor_script / monitor_url (empty string clears) + the per-job script timeout;
+    returns an error string or None."""
     monitor_script, monitor_url = a["monitor_script"], a["monitor_url"]
     for field, value in (("script", a["script"]), ("monitor_script", monitor_script)):
         if value is not None:
@@ -913,6 +921,10 @@ def _update_script_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[
                 if path_error:
                     return path_error
             updates[field] = _normalize_optional_job_value(value) if value else None
+    if a["script_timeout_seconds"] is not None:
+        # CLI-only lane; update_job validates, empty string clears the override. Grouped with the
+        # script knobs because it bounds only the job's `script`.
+        updates["script_timeout_seconds"] = a["script_timeout_seconds"]
     if monitor_url is not None:
         updates["monitor_url"] = _normalize_optional_job_value(monitor_url) if monitor_url else None
     if (monitor_script is not None or monitor_url is not None) and (
@@ -1072,6 +1084,7 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str | list[str]] = None,
     catch_up: Optional[bool] = None,
+    script_timeout_seconds: Optional[int | str] = None,
     task_id: str | None = None,
     session_id: Optional[str] = None,
     paused: bool = False,
