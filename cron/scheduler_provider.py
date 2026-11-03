@@ -329,9 +329,29 @@ def fire_overdue_jobs(
         now = _hermes_now()
 
     fired = 0
+    # ESTOP lockdown, the misfire door (card t_7f6ccfc6): a scoped hold does not stop the sweep,
+    # it holds only the jobs whose LANE it does not admit. A held job stays overdue — its
+    # next_run_at is untouched — and the first sweep after the hold lifts catches it up.
+    try:
+        from agent.estop import engagement_key, is_lane_allowed, read_state
+        from cron.jobs import job_lane
+        _estop_state = read_state()
+        if not _estop_state.engaged:
+            _estop_state = None
+    except Exception:
+        _estop_state = None
     for job in load_jobs():
         if not is_job_runnable(job):
             continue
+        if _estop_state is not None:
+            _lane = job_lane(job)
+            if not is_lane_allowed(_lane, state=_estop_state):
+                logger.info(
+                    "Misfire catch-up: job %s (%s) held — lane %r is not admitted by hold %s; "
+                    "left overdue, it fires when the hold lifts.",
+                    job.get("id"), job.get("name") or "unnamed", _lane, engagement_key(),
+                )
+                continue
         next_run_at = job.get("next_run_at")
         if not next_run_at:
             continue

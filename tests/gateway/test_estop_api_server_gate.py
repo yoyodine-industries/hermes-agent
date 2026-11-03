@@ -74,7 +74,7 @@ def _paused(tmp_path, monkeypatch, *, home=None):
     """Arm the REAL sentinel in a throwaway HERMES_HOME and hand back the real estop module."""
     monkeypatch.setenv("HERMES_HOME", str(home if home is not None else tmp_path))
     from agent import estop
-    estop.engage(reason="estop window probe")
+    estop.engage(reason="estop window probe", mode=estop.MODE_LOCKDOWN)
     return estop
 
 
@@ -107,8 +107,8 @@ async def test_peer_dm_is_refused_while_paused_and_the_turn_never_runs(tmp_path,
 
     assert resp.status == 503, "a paused fleet must refuse the peer DM, not run it"
     assert body["error"]["message"] == estop.paused_reply()
-    assert "Hermes is paused" in body["error"]["message"], (
-        "the peer client prints error.message, so the pause notice must BE that message")
+    assert "⏸️ hold " in body["error"]["message"], (
+        "the refusal names the HOLD's scope, never a fleet-wide pause (ruling 2026-10-10 §5)")
     assert body["error"]["code"] == "estop_paused"
     assert not create_agent.called, "no agent turn may run for a refused peer DM"
     assert calls == [_identity(adapter)], (
@@ -127,7 +127,7 @@ async def test_peer_run_is_refused_while_paused_and_no_run_is_recorded(tmp_path,
         body = await resp.json()
 
     assert resp.status == 503
-    assert "Hermes is paused" in body["error"]["message"]
+    assert "⏸️ hold " in body["error"]["message"]
     assert body["error"]["code"] == "estop_paused"
     assert not adapter._run_owners, "a refused run leaves no run record behind"
     assert calls == [_identity(adapter)]
@@ -146,7 +146,7 @@ async def test_streamed_peer_dm_is_refused_while_paused(tmp_path, monkeypatch):
             body = await resp.json()
 
     assert resp.status == 503
-    assert "Hermes is paused" in body["error"]["message"]
+    assert "⏸️ hold " in body["error"]["message"]
     assert not create_agent.called
 
 
@@ -188,7 +188,7 @@ async def test_body_author_cannot_allowlist_itself(tmp_path, monkeypatch):
             body = await resp.json()
 
     assert resp.status == 503, "a body-supplied id cannot admit a turn the fleet paused"
-    assert "Hermes is paused" in body["error"]["message"]
+    assert "⏸️ hold " in body["error"]["message"]
     assert calls == [_identity(adapter)], "the body's author never reaches the predicate"
     assert not create_agent.called
 
@@ -226,7 +226,7 @@ async def test_paused_fleet_refuses_without_the_predicate(tmp_path, monkeypatch)
             body = await resp.json()
 
     assert resp.status == 503
-    assert "Hermes is paused" in body["error"]["message"]
+    assert "⏸️ hold " in body["error"]["message"]
     assert not create_agent.called
 
 

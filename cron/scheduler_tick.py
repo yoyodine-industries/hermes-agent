@@ -10,6 +10,10 @@ from cron.constants import is_recurring
 
 logger = logging.getLogger("cron.scheduler")
 
+# (engagement_key, job_id) pairs already reported as held by an ESTOP lane scope: the log line is
+# worth having once per engagement, not once per tick.
+_ESTOP_HELD_LOGGED: set[tuple[str, str]] = set()
+
 # Log the yield at most once per episode (reset when the skew changes) to avoid per-interval spam.
 _YIELD_LOG_INTERVAL_SECONDS = 3600.0
 _last_yield_log: dict[str, object] = {}
@@ -233,6 +237,49 @@ def _acquire_tick_lock_or_degrade(_sched):
         return None
 
 
+def _split_jobs_by_estop_lane(_sched, due_jobs: list) -> tuple[list, list]:
+    """Hold the due jobs whose LANE the live hold does not admit — before the advance.
+
+    ``check_paused`` above is the TOTAL-halt gate: it stops the whole tick. A scoped
+    ``lockdown`` is NOT that — the tick must run, and admission is decided PER JOB by lane
+    (operator ruling 2026-10-10 §5, card t_7f6ccfc6). The hold has to land BEFORE
+    ``_advance_or_drop_recurring`` or the job's slot is consumed by a fire that never happened
+    and its catch-up is lost; a held job is simply left due and fires on the first tick after
+    the hold lifts.
+
+    Returns ``(kept, held)`` where ``held`` entries are ``(job, lane)``. Reading the state ONCE
+    means one tick can never gate two jobs against two different modes.
+    """
+    if not due_jobs:
+        return due_jobs, []
+    try:
+        from agent.estop import engagement_key, is_lane_allowed, read_state
+        from cron.jobs import job_lane
+    except ImportError:
+        return due_jobs, []
+    state = read_state()
+    if not state.engaged:
+        return due_jobs, []
+    key = engagement_key()
+    kept: list = []
+    held: list = []
+    for job in due_jobs:
+        lane = job_lane(job)
+        if is_lane_allowed(lane, state=state):
+            kept.append(job)
+        else:
+            held.append((job, lane))
+            # Visibility, not silence: the starved job names itself and the lane that holds it,
+            # once per (engagement, job) so a long window does not spam the log.
+            marker = (key, str(job.get("id") or ""))
+            if marker not in _ESTOP_HELD_LOGGED:
+                _ESTOP_HELD_LOGGED.add(marker)
+                _sched.logger.info(
+                    "ESTOP lockdown holds cron job %s (%s): lane %r is not admitted by hold %s",
+                    job.get("id"), job.get("name") or "unnamed", lane, key)
+    return kept, held
+
+
 def _advance_or_drop_recurring(_sched, due_jobs: list) -> list:
     """Persist the recurring jobs' advance before any runs; when the store refuses it, drop them
     (no durable advance -> a crash mid-run would re-fire them, so skipping is the at-most-once
@@ -309,6 +356,15 @@ def _tick_admitted(
         due_jobs, _substrate_held, _substrate_overdue = _split_jobs_by_substrate(_sched, due_jobs)
         if _substrate_held or _substrate_overdue:
             _note_substrate_units(_substrate_held + _substrate_overdue)
+
+        # ESTOP lockdown, DOOR for cron (card t_7f6ccfc6): the hold is scoped by LANE, so it is
+        # decided per job and lands BEFORE the advance — a held job stays due and fires as soon
+        # as its lane is admitted, and nothing is silently skipped.
+        due_jobs, _estop_held = _split_jobs_by_estop_lane(_sched, due_jobs)
+        if _estop_held and verbose:
+            _sched.logger.info(
+                "%s - %d due job(s) held by the ESTOP lockdown's lane scope",
+                _sched._hermes_now().strftime('%H:%M:%S'), len(_estop_held))
 
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.

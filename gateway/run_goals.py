@@ -152,6 +152,17 @@ class GatewayGoalsMixin:
 
         if check_paused("heartbeat", logger):
             return  # `hermes pause`: leave the tick unclaimed so it fires after `hermes resume`
+        # ESTOP lockdown, the HEARTBEAT door (card t_7f6ccfc6): a heartbeat is NEW agent work for
+        # the lane this watch is serving, so a scoped hold admits or holds it by lane. Leaving the
+        # tick unclaimed keeps it due: it fires once its lane is admitted.
+        from agent.estop import is_lane_allowed
+
+        _hb_lane = str(getattr(source, "profile", None) or "default")
+        if not is_lane_allowed(_hb_lane):
+            logger.info(
+                "heartbeat for %s held: lane %r is not admitted by the live ESTOP scope",
+                quick_key, _hb_lane)
+            return
         from hermes_cli.heartbeat import HeartbeatManager
 
         mgr = HeartbeatManager(session_id=session_id)
@@ -393,6 +404,16 @@ class GatewayGoalsMixin:
         if not platform_name or not chat_id:
             return  # CLI / TUI-owned loop — their own schedulers drive it.
         profile = route.get("profile") or profile
+        # ESTOP lockdown, the LOOP door (card t_7f6ccfc6): a wakeup is NEW agent work for ONE
+        # lane, so a scoped hold admits or holds it by that lane — the tick stays due and fires
+        # when the lane is admitted (`check_paused` above only covers a total halt).
+        from agent.estop import is_lane_allowed
+
+        if not is_lane_allowed(profile or "default"):
+            logger.info(
+                "loop wakeup %s held: lane %r is not admitted by the live ESTOP scope",
+                sid, profile or "default")
+            return
         # The loop's OWN profile's adapter map, fail closed: ``self.adapters`` is the default profile's,
         # so a secondary session's wakeup would inject via the default bot on a bare chat_id (a
         # Telegram DM lands in the user's chat with the other bot).
