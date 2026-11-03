@@ -56,9 +56,23 @@ def delivery_run_kwargs(record: dict[str, Any]) -> Dict[str, Any]:
     A drained record carries its own message and target session, so the turn is
     replayed into that session with the session's stored runtime selection --
     there is no sender body to re-read and no request-scoped model lock to honour.
+
+    A delivery that was RECOVERED (its earlier claim was orphaned before any turn
+    started) is announced as delayed, in exactly one line prefixed to the payload
+    (ruling A7): the reader is told why a message it is seeing now was sent earlier,
+    once, on the attempt that actually runs -- a per-tick note anywhere else would be
+    either invisible or repeated, and a recovered turn is the only case that needs it.
     """
+    message = record.get("message") or ""
+    if delivery_queue.recovery_replays(record) >= 1:
+        created_ns = int(record.get("created_at") or 0)
+        minutes = round(max(0.0, (time.time_ns() - created_ns) / 60_000_000_000))
+        message = (
+            f"[delayed {minutes}m: this delivery's claim was orphaned before any turn "
+            f"started; the queue re-offered it once]\n{message}"
+        )
     return {
-        "user_message": record.get("message") or "",
+        "user_message": message,
         "ephemeral_system_prompt": None,
         "session_id": record.get("target_session_id"),
         "gateway_session_key": None,
@@ -163,6 +177,12 @@ async def run_record(
         scope = nullcontext()
     started = time.monotonic()
     log_delivery_event("turn_start", record, drained=ctx is None)
+    # The queue's own evidence that this claim actually reached a turn (ruling A1). It
+    # goes immediately before the turn has any effect, and it is one direct call -- no
+    # try/except that could skip it, and the call itself never raises. Without it a claim
+    # torn by an unclean exit is indistinguishable from one that never ran, and the
+    # payload would be re-offered after it may already have been read.
+    delivery_queue.note_turn_start(home, delivery_id)
     try:
         with scope:
             history = await adapter._conversation_history_for_session(session_id)

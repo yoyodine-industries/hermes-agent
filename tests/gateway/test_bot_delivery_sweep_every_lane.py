@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import subprocess
+import sys
 import time
 from typing import Callable
 
@@ -21,6 +24,7 @@ import pytest
 from gateway.platforms import api_server as api
 from gateway.platforms import api_server_bot_delivery as drain
 from tools import bot_delivery_queue as q
+from tools import bot_relay
 
 DEFAULTS = dict(q._DEFAULTS)
 
@@ -176,13 +180,17 @@ def test_a_never_attempted_record_is_drained_before_it_can_expire(home):
 # ── (3) an expiry that DOES happen goes back to the sender as a FAILURE ───────
 
 def _offered(lane_home, target="platform-stl"):
-    """An OFFERED record: claimed by a turn, then handed back to the queue contended.
+    """An OFFERED record: claimed by a turn that STARTED, then handed back contended.
 
     This is the ONLY shape that still files a failure notice -- a record a turn was
-    actually offered and left unread (t_43f11055 c).
+    actually offered and left unread (t_43f11055 c). Since the A1/A6 evidence protocol,
+    "offered" is the claim's own ``turn_started_at``, not the bare attempt counter: a
+    claim that never started a turn was never offered the payload and classifies
+    ``never_offered``.
     """
     record = q.claim_next(lane_home, target_profile=target, lease_ok=True)
     assert record is not None and record["attempts"] == 1
+    assert q.note_turn_start(lane_home, record["delivery_id"]) is not None
     requeued = q.requeue(lane_home, record["delivery_id"])
     assert requeued["attempts"] == 1 and requeued["status"] == q.STATUS_QUEUED
     return requeued
@@ -346,3 +354,105 @@ def test_the_notice_loop_cannot_form(home):
     assert q._list(q.delivery_root(sender), q.SETTLED_DIR) == [], (
         "a notice about a notice is how the loop used to feed itself")
     assert len(q._list(q.delivery_root(target), q.SETTLED_DIR)) == 1
+
+
+# ── the orphaned-claim recovery (t_6e43ae0a), end to end ────────────────────────
+def _dead_pid() -> int:
+    """A pid that has EXITED and been reaped: the shape an unclean gateway exit leaves."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+    assert bot_relay._pid_alive(proc.pid) is False
+    return proc.pid
+
+
+def _orphaned(lane, *, target, message="orphan probe", n=1, turn_started=False,
+              age_seconds=60):
+    """A claim taken by a process that is now GONE and that never closed its attempt."""
+    record = _admit(lane, target=target, message=message, n=n)
+    assert q.claim_next(lane, target_profile=target, lease_ok=True) is not None
+    path = q.delivery_root(lane) / q.CLAIMED_DIR / f"{record['delivery_id']}.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    claimed_at = time.time_ns() - int(age_seconds * 1_000_000_000)
+    raw["created_at"] = claimed_at
+    raw["claimed_at"] = claimed_at
+    for entry in raw["attempts_log"]:
+        if entry.get("ended_at") is None:
+            entry["started_at"] = claimed_at
+            entry["pid"] = _dead_pid()
+            if turn_started:
+                entry["turn_started_at"] = claimed_at + 1
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    return record
+
+
+def test_the_sweep_recovers_an_orphaned_claim_and_delivers_it(home):
+    """The live shape: a payload that never reached a turn is delivered, not destroyed.
+
+    One tick: the claim is recovered in pass 1 and the drain in pass 2 delivers it. The
+    reader gets the body intact, behind exactly ONE line saying why it is late.
+    """
+    target = _lane(home, "platform-stl")
+    _lane(home, "platform-coder")
+    record = _orphaned(target, target="platform-stl")
+    adapter = _Adapter()
+
+    assert asyncio.run(drain.sweep_once(adapter, home)) == 1
+
+    assert len(adapter.calls) == 1, "the recovered payload must actually be delivered"
+    body = adapter.calls[0]["user_message"]
+    assert body.count("orphan probe") == 1, "no duplicate payload"
+    assert body.endswith("\norphan probe")
+    announcement, _sep, message = body.partition("\n")
+    assert announcement.startswith("[delayed 1m: ")
+    assert "orphaned before any turn started" in announcement
+    assert "re-offered it once" in announcement
+    assert message == "orphan probe"
+
+    settled = q.read_record(target, record["delivery_id"])
+    assert settled["status"] == q.STATUS_DELIVERED
+    assert settled["attempts"] == 2, "the recovered claim, then the delivered one"
+    assert q.recovery_replays(settled) == 1
+
+
+def test_a_drained_turn_records_that_its_turn_started(home):
+    """The A1 call site: a real turn leaves the evidence the sweep dispatches on."""
+    target = _lane(home, "platform-stl")
+    _lane(home, "platform-coder")
+    record = _admit(target, target="platform-stl", message="the DM nobody read")
+
+    assert asyncio.run(drain.sweep_once(_Adapter(), home)) == 1
+
+    settled = q.read_record(target, record["delivery_id"])
+    assert settled["status"] == q.STATUS_DELIVERED
+    assert settled["attempts_log"][-1]["turn_started_at"] > 0
+    assert settled["attempts_log"][-1]["marker"] == q.CLAIM_MARKER_VERSION
+
+
+def test_the_sweep_settles_an_orphaned_started_turn_as_ambiguous_and_never_reruns_it(home):
+    """A turn that STARTED may have been read: ambiguous + notice, never a second run."""
+    target = _lane(home, "platform-stl")
+    sender = _lane(home, "platform-coder")
+    record = _orphaned(target, target="platform-stl", turn_started=True)
+
+    assert q.sweep_delivery_queue(target) == 1
+
+    settled = q.read_record(target, record["delivery_id"])
+    assert settled["status"] == q.STATUS_AMBIGUOUS
+    assert settled["reason"] == q.REASON_LEASE_LOST
+    notice = q._list(q.delivery_root(sender), q.QUEUE_DIR)
+    assert len(notice) == 1
+    assert "MAY have been read" in notice[0]["message"]
+    assert "NEVER delivered" not in notice[0]["message"]
+
+    # the drain hands the sender its notice, and the payload to nobody
+    adapter = _Adapter()
+    assert asyncio.run(drain.sweep_once(adapter, home)) == 1
+    assert [call["user_message"] for call in adapter.calls] == [notice[0]["message"]]
+
+    # the ONE replay goes to the reader, wearing its delayed banner -- nothing else does
+    assert q.reoffer_ambiguous(target, record["delivery_id"]) is not None
+    replay = _Adapter()
+    assert asyncio.run(drain.sweep_once(replay, home)) == 1
+    assert len(replay.calls) == 1
+    assert replay.calls[0]["user_message"].startswith("[delayed 1m: ")
+    assert "orphan probe" in replay.calls[0]["user_message"]
