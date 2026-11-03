@@ -37,6 +37,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from hermes_cli.active_sessions import _FileLock
+from tools.bot_delivery_lease import (
+    recover_unstarted_claim as _recover_unstarted_claim,
+    settle_ambiguous_lease as _settle_ambiguous_lease,
+    settle_lost_lease as _settle_lost_lease,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,10 +165,11 @@ DETAIL_HELD_LIVE = (
 STATUS_DETAIL_TARGET_BUSY = "target_busy: turn slot held by another turn; delivery queued"
 STATUS_DETAIL_LIVE_OWNER = "live_owner_present"
 STATUS_DETAIL_LEASE_CONTENDED = "lease_contended"
-#: A claim recovered as a LOST LEASE, dead-lettered: the turn that took the claim
+#: A claim recovered as a LOST LEASE and dead-lettered: the turn that took the claim
 #: never ended it, ``2 x`` the queue TTL has passed with no live process holding the
 #: seat, and by then the record's own delivery deadline is gone too -- so it is
-#: settled ``failed`` and its sender told, never re-offered.
+#: settled ``failed`` and its sender told. This is the LACK-OF-EVIDENCE arm now: a
+#: claim that provably never started a turn is re-offered instead (ruling A3).
 STATUS_DETAIL_LEASE_DEAD_LETTER = (
     "lease_lost: the claim outlived 2x the queue TTL with no live holder; not delivered"
 )
@@ -181,6 +187,18 @@ STATUS_DETAIL_ADMISSION_CAP = (
     "admission_cap: gateway agent-work concurrency cap reached; "
     "delivery queued for the drainer"
 )
+#: An orphaned claim that PROVABLY never started a turn was re-offered (A3). It is a
+#: live queued record, not a failure: the sender's receipt is still true, so it files
+#: no notice and the reader is told exactly once, on the attempt that closed.
+STATUS_DETAIL_RECOVERED = (
+    "recovered: the earlier claim was orphaned before any turn started; re-offered once"
+)
+#: A lost lease whose turn DID start: the payload may have been read, so the honest
+#: terminal state is the ``ambiguous`` one the sender replay path already consumes (A5).
+STATUS_DETAIL_AMBIGUOUS_LEASE = (
+    "lease_lost: the turn started and never settled; the payload MAY have been "
+    "read — outcome unknown"
+)
 
 #: Which cap :func:`check_capacity`/:func:`admit` refused on (VERIFICATION D6).
 LIMIT_PER_PROFILE = "per_profile"
@@ -188,12 +206,14 @@ LIMIT_PER_SENDER = "per_sender"
 
 REASON_QUEUED_EXPIRED = "queued_expired"
 #: A claim whose lease ran out: the turn it was taken for never
-#: settled it and no live process holds the seat. Terminal only -- a lost lease is
-#: past its delivery deadline by construction, so it is dead-lettered under this
-#: reason, never re-offered.
+#: settled it and no live process holds the seat. Terminal only where the claim's own
+#: evidence cannot clear it -- a claim that provably never started a turn is re-offered
+#: once under a different detail (ruling A3); one whose turn started, or one that carries
+#: no evidence at all, is dead-lettered under this reason.
 REASON_LEASE_LOST = "lease_lost"
 
-#: An over-age record whose expiry found it NEVER OFFERED to a turn (``attempts == 0``).
+#: An over-age record whose expiry found it NEVER OFFERED to a turn (no attempt ever
+#: recorded the start of a turn -- see :func:`never_started_a_turn`).
 #: t_43f11055 (b): such a record was dead-lettered by the expiry gate while the DRAIN
 #: gate was deferring it -- 112 of the fleet's 116 expired records carry attempts=0.
 #: Calling that ``queued_expired`` blames the lane's queue for the drain's own
@@ -408,15 +428,39 @@ def agent_cap_has_room(probe: Any = None) -> bool:
 #: A claim is a lease with an EXPIRY: ``2 x`` the queue TTL. Past it, with no live
 #: holder naming the seat, the claim is unauthorised -- the freeze it bought is void
 #: (``queued_seconds``), the census counts it as ``claimed_stuck``, and the sweep
-#: recovers it: dead-lettered and its sender told (never re-offered, since a lost
-#: lease is past its delivery deadline by construction). Not a config key: the
+#: recovers it. WHAT IT DID then decides (ruling A2): a claim that provably never started
+#: a turn is re-offered once; one whose turn started settles ``ambiguous``; one with no
+#: evidence at all is dead-lettered and its sender told. A provably DEAD claimer (A8)
+#: makes the lease lost at once instead of after the full hour. Not a config key: the
 #: ruling derives it from the TTL so the two can never drift apart.
 LEASE_TTL_MULTIPLIER = 2.0
+
+#: The attempt-entry EVIDENCE VERSION (ruling A1). An entry written by this code carries
+#: ``marker: 2``; an entry without it is a LEGACY claim -- no evidence of anything, and it
+#: keeps the shipped lost-lease treatment unchanged (:data:`LEGACY_CLAIM`).
+CLAIM_MARKER_VERSION = 2
+
+#: The three cases of a lost lease (ruling A2). The lease PREDICATE (``lease_lost``) is
+#: unchanged and answers "is this claim unauthorised?"; ``lost_lease_kind`` answers the
+#: separate question "what did that claim actually do?", which decides the outcome.
+CLAIM_NEVER_STARTED = "claim_never_started"
+TURN_STARTED_UNKNOWN = "turn_started_unknown"
+LEGACY_CLAIM = "legacy_claim"
+
+#: How old a never-started claim may be and still be worth re-offering (ruling A7).
+#: Derived from the TTL like the lease itself -- never a config key -- so the two cannot
+#: drift and no knob can be set to resurrect arbitrarily old peer work.
+RECOVERY_MAX_AGE_MULTIPLIER = 4.0
 
 
 def lease_expiry_seconds() -> float:
     """A claim's own expiry: ``LEASE_TTL_MULTIPLIER x`` the queue TTL (3600s at 1800s)."""
     return LEASE_TTL_MULTIPLIER * queue_ttl_seconds()
+
+
+def recovery_max_age_seconds() -> float:
+    """The oldest never-started claim still worth re-offering: ``4 x`` the TTL (7200s)."""
+    return RECOVERY_MAX_AGE_MULTIPLIER * queue_ttl_seconds()
 
 
 def claim_age_seconds(record: dict[str, Any], *, now_ns: int | None = None) -> float | None:
@@ -472,24 +516,107 @@ def lease_holder_alive(home: str | os.PathLike[str], profile: str) -> bool:
     return bool(holder) and holder.get("alive") is True
 
 
+def _claimer_alive(entry: dict[str, Any]) -> bool | None:
+    """Whether the pid that took ``entry``'s claim is still running: True/False/None.
+
+    ``None`` (unknown -- no pid, a torn value, an OS that refuses the probe) is NOT
+    evidence of a dead claimer: it falls back to the lease rule exactly as before, so a
+    recycled pid costs latency and can never buy a wrong recovery (ruling A8). Imported
+    lazily because :mod:`tools.bot_relay` imports this module at module level.
+    """
+    try:
+        from tools.bot_relay import _pid_alive
+
+        return _pid_alive(entry.get("pid"))
+    except (ImportError, OSError, TypeError, ValueError):  # pragma: no cover - unknown, not dead
+        return None
+
+
 def lease_lost(record: dict[str, Any], *, home: str | os.PathLike[str],
                now_ns: int | None = None) -> bool:
     """Whether an open attempt is an UNAUTHORISED claim (a lost lease).
 
-    All three must hold: the record is not terminal, it carries an attempt with no
-    ``ended_at`` (a claim nobody closed), that claim is older than
-    :func:`lease_expiry_seconds`, and no live process holds the target's turn. A live
-    holder keeps the record exactly as it is, however old (ruling (c)); an attempt
-    under the expiry is never touched either.
+    All of these must hold: the record is not terminal, it carries an attempt with no
+    ``ended_at`` (a claim nobody closed), that claim is past
+    :func:`lease_probe_seconds` (never race a fresh claim) and no live process holds the
+    target's turn, and EITHER the claim is older than :func:`lease_expiry_seconds` (the
+    fallback rule) OR the pid that took it is provably dead (the guardrail, ruling A8 --
+    an unclean gateway exit is repaired on the next 30s tick, not after 60 minutes).
+
+    A live holder keeps the record exactly as it is, however old (ruling (c)); an attempt
+    under the probe window is never touched either. A claimer pid that cannot be probed
+    (``None``) falls back to the lease rule.
     """
     if record.get("status") in TERMINAL_STATUSES:
         return False
-    if _open_attempt(record) is None:
+    entry = _open_attempt(record)
+    if entry is None:
         return False
     age = claim_age_seconds(record, now_ns=now_ns)
-    if age is None or age <= lease_expiry_seconds():
+    if age is None or age < lease_probe_seconds():
+        return False
+    if not (age > lease_expiry_seconds() or _claimer_alive(entry) is False):
         return False
     return not lease_holder_alive(home, record.get("target_profile") or "")
+
+
+def recovery_replays(record: dict[str, Any]) -> int:
+    """Attempts closed as :data:`CLAIM_NEVER_STARTED`: recoveries this delivery has spent.
+
+    The replay budget is DERIVED from recovery events, never from ``reoffer_count`` --
+    that counter also carries lease contention (measured: 9 of 20 live lost-lease records
+    sat at 12..216), so reading the budget off it would refuse the one replay to exactly
+    the records that need it (ruling A4/F2).
+    """
+    return sum(
+        1
+        for entry in (record.get("attempts_log") or [])
+        if entry.get("reason") == CLAIM_NEVER_STARTED
+    )
+
+
+def never_started_a_turn(record: dict[str, Any]) -> bool:
+    """Whether NO attempt on this record ever recorded the start of a turn.
+
+    Replaces the ``attempts <= 0`` proxy in :func:`expiry_classification` (ruling A6): a
+    claim that was recovered before it started a turn and then expired was still never
+    read, and ``attempts`` alone cannot say that. ``attempts == 0`` is the no-attempt case
+    of this predicate, so every existing reading is preserved.
+    """
+    return not any(
+        entry.get("turn_started_at") for entry in (record.get("attempts_log") or [])
+    )
+
+
+def lost_lease_kind(record: dict[str, Any], *, home: str | os.PathLike[str],
+                    now_ns: int | None = None) -> str | None:
+    """Which CASE a lost lease is, or ``None`` when it is not a lost lease at all.
+
+    * :data:`LEGACY_CLAIM` -- an entry with no ``marker`` (written before this change),
+      a never-started claim whose replay budget is spent (a second orphan is not a
+      recovery, it is evidence the lane's drain keeps dying with this record in hand),
+      or a never-started claim older than :func:`recovery_max_age_seconds`. Today's
+      terminal treatment, unchanged.
+    * :data:`CLAIM_NEVER_STARTED` -- marker present, ``turn_started_at`` absent, budget
+      available, within the age bound: the payload provably never reached a turn, so it
+      is re-offered once (:func:`_recover_unstarted_claim`).
+    * :data:`TURN_STARTED_UNKNOWN` -- marker present AND ``turn_started_at`` set: the turn
+      began, so the payload may have been read; terminal ``ambiguous``
+      (:func:`_settle_ambiguous_lease`).
+    """
+    if not lease_lost(record, home=home, now_ns=now_ns):
+        return None
+    entry = _open_attempt(record) or {}
+    if entry.get("marker") != CLAIM_MARKER_VERSION:
+        return LEGACY_CLAIM
+    if entry.get("turn_started_at"):
+        return TURN_STARTED_UNKNOWN
+    if recovery_replays(record) >= 1:
+        return LEGACY_CLAIM
+    age = claim_age_seconds(record, now_ns=now_ns)
+    if age is None or age > recovery_max_age_seconds():
+        return LEGACY_CLAIM
+    return CLAIM_NEVER_STARTED
 
 
 # --------------------------------------------------------------------------
@@ -515,10 +642,12 @@ def expiry_classification(
     """The ONE classifier for an over-age record: ``(reason, status_detail)``.
 
     Both expiry paths ask this -- :func:`mark_expired` and the sweep -- so a record
-    that was accepted and never OFFERED to a turn (``attempts == 0``) is
-    ``never_offered`` on either path, never ``queued_expired`` (t_43f11055 b).
+    that was accepted and never OFFERED to a turn is ``never_offered`` on either path,
+    never ``queued_expired`` (t_43f11055 b). "Offered" is the record's own evidence
+    (:func:`never_started_a_turn`), not the ``attempts`` counter: a claim that was
+    recovered before it started a turn charged an attempt and was still never read.
     """
-    if int(record.get("attempts") or 0) <= 0:
+    if never_started_a_turn(record):
         return REASON_NEVER_OFFERED, never_offered_detail(ttl_seconds)
     return REASON_QUEUED_EXPIRED, expired_detail(ttl_seconds)
 
@@ -937,6 +1066,11 @@ def claim_next(
                 "ended_at": None,
                 "status": STATUS_RUNNING,
                 "reason": None,
+                # The queue's OWN evidence of what this claim is (ruling A1/A8): the
+                # marker says "this entry can prove whether a turn started", the pid says
+                # which process took it -- so a dead claimer is a lost lease at once.
+                "marker": CLAIM_MARKER_VERSION,
+                "pid": os.getpid(),
             }
         )
         updated["attempts_log"] = log
@@ -1032,6 +1166,44 @@ def requeue_unstarted(
         _fsync_dir(root / CLAIMED_DIR)
         _log("requeued", updated, reoffer_count=updated["reoffer_count"])
         return dict(updated)
+
+
+def note_turn_start(
+    home: str | os.PathLike[str], delivery_id: str, *, now_ns: int | None = None
+) -> dict[str, Any] | None:
+    """Record, ON THE OPEN ATTEMPT, that this claim actually started a turn (ruling A1).
+
+    This is the only evidence that separates "the claim was orphaned before anything ran"
+    (re-offer it: nothing consumed the payload) from "the turn began and died" (the
+    payload may have been read: ``ambiguous``). It is not derivable from ``attempts_log``
+    as it stood -- a claim's ``started_at`` is stamped at CLAIM time, so both cases left
+    an identical record -- and it must not live in a log file, whose retention the record
+    cannot depend on.
+
+    Called by the gateway's ``run_record`` immediately before the turn runs. Returns the
+    stored record; ``None`` when there is nothing to stamp (a missing or already-terminal
+    record), and never raises.
+    """
+    key_id = validate_delivery_id(delivery_id)
+    now_ns = time.time_ns() if now_ns is None else int(now_ns)
+    try:
+        with _locked(home) as root:
+            path = root / CLAIMED_DIR / f"{key_id}.json"
+            record = _read(path)
+            if record is None or record.get("status") in TERMINAL_STATUSES:
+                return None
+            entry = _open_attempt(record)
+            if entry is None:
+                return None
+            entry["turn_started_at"] = now_ns
+            entry["pid"] = os.getpid()
+            record["updated_at"] = now_ns
+            _write(path, record)
+            _log("turn_start_noted", record, attempt=entry.get("attempt"))
+            return dict(record)
+    except Exception:  # a note must never break the turn it annotates
+        logger.debug("bot_delivery turn-start note failed: %s", key_id, exc_info=True)
+        return None
 
 
 def settle(
@@ -1154,9 +1326,14 @@ def reoffer_ambiguous(
 
     The crash-mid-turn rule permits exactly ONE recovery replay, only under the
     same idempotency key, and never a second one. Returns the re-queued record, or
-    ``None`` when the delivery is not re-offerable (already re-offered once, not
+    ``None`` when the delivery is not re-offerable (already recovered once, not
     ``ambiguous``, or unknown). ``attempts`` is incremented by the claim that
     follows, never by the re-offer itself.
+
+    The budget is :func:`recovery_replays` -- the recoveries this delivery actually
+    spent -- NOT ``reoffer_count``, which also counts lease contention (ruling A4): the
+    same budget, and the same ``claim_never_started`` close, is shared with the sweep's
+    orphaned-claim recovery so one record can never be recovered twice, once per door.
     """
     key_id = validate_delivery_id(delivery_id)
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
@@ -1165,18 +1342,23 @@ def reoffer_ambiguous(
         record = _read(settled_path)
         if record is None or record.get("status") != STATUS_AMBIGUOUS:
             return None
-        if int(record.get("reoffer_count", 0)) >= 1:
+        if recovery_replays(record) >= 1:
             return None
         updated = dict(record)
         updated["status"] = STATUS_QUEUED
         updated["reoffer_count"] = int(record.get("reoffer_count", 0)) + 1
         updated["status_detail"] = STATUS_DETAIL_TARGET_BUSY
         updated["updated_at"] = now_ns
-        entry = _open_attempt(updated)
+        # The recovery is recorded ON the attempt it recovers: a settled ``ambiguous``
+        # record's last entry is already closed, so that entry IS the recovery -- closing
+        # it again with ``claim_never_started`` is what makes ``recovery_replays`` (the
+        # budget both doors read) count this replay. An entry still open is closed here.
+        log = updated.get("attempts_log") or []
+        entry = _open_attempt(updated) or (log[-1] if log else None)
         if entry is not None:
-            entry["ended_at"] = now_ns
+            entry["ended_at"] = entry.get("ended_at") or now_ns
             entry["status"] = STATUS_QUEUED
-            entry["reason"] = "recovery_replay"
+            entry["reason"] = CLAIM_NEVER_STARTED
         updated["queue_position"] = 0
         queued_path = root / QUEUE_DIR / f"{key_id}.json"
         _write(queued_path, updated)
@@ -1219,31 +1401,6 @@ def cleanup_bot_delivery_queue(max_age_hours: float | None = None) -> int:
     except Exception:  # pragma: no cover - housekeeping must not raise
         logger.debug("bot_delivery sweep failed", exc_info=True)
         return 0
-
-
-def _settle_lost_lease(root: Path, record: dict[str, Any], *, now_ns: int) -> dict[str, Any]:
-    """Dead-letter a leaked claim as ``failed`` / ``lease_lost`` (caller holds the lock).
-
-    The open attempt is CLOSED with the same reason: an attempt left open is the thing
-    the census cannot see, so this recovery must not leave the very shape it repairs.
-    """
-    updated = dict(record)
-    delivery_id = updated["delivery_id"]
-    updated["status"] = STATUS_FAILED
-    updated["reason"] = REASON_LEASE_LOST
-    updated["status_detail"] = STATUS_DETAIL_LEASE_DEAD_LETTER
-    updated["updated_at"] = now_ns
-    updated["queue_position"] = None
-    entry = _open_attempt(updated)
-    if entry is not None:
-        entry["ended_at"] = now_ns
-        entry["status"] = STATUS_FAILED
-        entry["reason"] = REASON_LEASE_LOST
-    settled_path = root / SETTLED_DIR / f"{delivery_id}.json"
-    os.replace(root / CLAIMED_DIR / f"{delivery_id}.json", settled_path)
-    _write(settled_path, updated)
-    _fsync_dir(root / CLAIMED_DIR)
-    return dict(updated)
 
 
 #: Sentinel for ``on_lease_lost``: by default the sweep FILES the sender's notice. A
@@ -1295,16 +1452,22 @@ def sweep_delivery_queue(
 
     A CLAIM IS A LEASE WITH AN EXPIRY: a record in ``claimed/``
     whose attempt never ended, whose claim is older than
-    :func:`lease_expiry_seconds` (= ``2 x`` the queue TTL), and whose seat has no
-    LIVE holder is a lost lease. It is dead-lettered ``failed`` / ``lease_lost``,
-    its open attempt is closed, and its sender is told.
+    :func:`lease_expiry_seconds` (= ``2 x`` the queue TTL) -- or whose claiming pid is
+    provably dead (ruling A8) -- and whose seat has no LIVE holder is a lost lease. WHAT
+    IT DID then decides (ruling A2/A3/A5):
 
-    A lost lease is PAST ITS OWN DELIVERY DEADLINE BY CONSTRUCTION: the lease is
-    only lost once the claim is older than ``2 x`` TTL, so the waiting has accrued
-    past the TTL (see :func:`queued_seconds`, which voids the freeze past the
-    lease) and pass 2 would reap the record in this same tick anyway. So it is
-    NEVER re-offered -- resurrecting it would deliver hours- or days-old peer work,
-    and the truthful outcome is the terminal one.
+    * :data:`CLAIM_NEVER_STARTED` -- the claim carries evidence (``marker``) that no turn
+      ever started, the replay budget is unspent and it is younger than
+      :func:`recovery_max_age_seconds`: the payload was never read, so the record is
+      RE-OFFERED once, closed ``claim_never_started``, with no notice (the sender's
+      receipt is still true). This is the ONE arm where the old "never re-offered" rule
+      is superseded, and only for a claim that provably never started a turn.
+    * :data:`TURN_STARTED_UNKNOWN` -- the turn started and never settled: the payload MAY
+      have been read, so it settles ``ambiguous`` (the status the sender's replay path
+      already consumes) and its sender is told so, truthfully.
+    * :data:`LEGACY_CLAIM` -- no marker, a spent budget, or an over-age never-started
+      claim: the shipped terminal arm, unchanged -- dead-lettered ``failed`` /
+      ``lease_lost``, attempt closed, sender told.
 
     A record with a live holder, or a young claim, is untouched: a turn that is
     genuinely running keeps its record exactly as it is.
@@ -1322,6 +1485,7 @@ def sweep_delivery_queue(
     actions = 0
     expired: list[dict[str, Any]] = []
     lost: list[dict[str, Any]] = []
+    recovered: list[dict[str, Any]] = []
     with _locked(home) as root:
         # 1. a claim renamed the file but crashed before rewriting it
         for record in _list(root, CLAIMED_DIR):
@@ -1337,17 +1501,41 @@ def sweep_delivery_queue(
 
         # 1b. a claim whose LEASE ran out: no lived attempt, no live holder.
         # Read AFTER pass 1, so a torn claim recovered above is never judged twice.
+        # WHICH case it is decides the outcome (ruling A2): a claim that provably never
+        # started a turn is RE-OFFERED once (nothing read the payload); a claim whose turn
+        # started is settled ``ambiguous`` (the payload may have been read); a legacy or
+        # over-age or already-recovered claim keeps the terminal lost-lease treatment.
         for record in _list(root, CLAIMED_DIR):
-            if not lease_lost(record, home=home, now_ns=now_ns):
+            kind = lost_lease_kind(record, home=home, now_ns=now_ns)
+            if kind is None:
                 continue
-            # A lost lease is PAST ITS OWN DEADLINE BY CONSTRUCTION (lease = 2 x TTL,
-            # and the lease is only lost once the waiting has accrued past the TTL),
-            # so resurrection is never on the table: delivering hours-old peer work,
-            # or re-offering it for pass 2 to reap in this same tick with a notice
-            # saying it was never read, are both wrong. Dead-letter it, and tell the
-            # sender -- the terminal reason is the truthful one.
+            if kind == CLAIM_NEVER_STARTED:
+                # The claim never reached a turn, so the payload was never read: put it
+                # back in line (same delivery_id, same sequence) and tell nobody -- the
+                # sender's receipt is still true. No notice is owed, and none is filed.
+                updated = _recover_unstarted_claim(root, record, now_ns=now_ns)
+                _log("claim_recovered", updated, action="reoffered",
+                     reason=CLAIM_NEVER_STARTED,
+                     claim_age_seconds=round(claim_age_seconds(record, now_ns=now_ns) or 0, 1),
+                     recovery_replays=recovery_replays(updated))
+                recovered.append(updated)
+                actions += 1
+                continue
+            if kind == TURN_STARTED_UNKNOWN:
+                # The turn began and never settled: the payload MAY have been read, so the
+                # truthful terminal state is ``ambiguous`` -- which the sender's replay path
+                # already consumes, giving that case exactly one deterministic recovery.
+                updated = _settle_ambiguous_lease(root, record, now_ns=now_ns)
+                _log("lease_lost", updated, action="ambiguous",
+                     reason=REASON_LEASE_LOST, kind=kind,
+                     claim_age_seconds=round(claim_age_seconds(record, now_ns=now_ns) or 0, 1))
+                lost.append(updated)
+                actions += 1
+                continue
+            # LEGACY_CLAIM: no evidence either way, so today's terminal arm stands
+            # unchanged -- dead-letter, close the attempt, and tell the sender.
             updated = _settle_lost_lease(root, record, now_ns=now_ns)
-            _log("lease_lost", updated, action="failed", reason=REASON_LEASE_LOST,
+            _log("lease_lost", updated, action="failed", reason=REASON_LEASE_LOST, kind=kind,
                  reoffer_count=int(record.get("reoffer_count", 0)),
                  claim_age_seconds=round(claim_age_seconds(record, now_ns=now_ns) or 0, 1))
             lost.append(updated)
@@ -1609,225 +1797,25 @@ def queue_depth(home: str | os.PathLike[str], target_profile: str | None = None)
 #: to it, and the drainer never files a notice about a notice.
 EXPIRED_NOTICE_SENDER = "bot-delivery-drainer"
 
-#: Why the notice itself was queued -- it is a fresh delivery, not a backlog one.
-STATUS_DETAIL_UNDELIVERED_NOTICE = (
-    "undelivered: the peer delivery this notice reports expired before any turn read it"
-)
 
+def notice_expired_to_sender(record, **kwargs):
+    """The ONE failure notice owed to a sender for an expired record.
 
-def expired_notice_key(delivery_id: str) -> str:
-    """The idempotency key of the ONE failure notice owed for ``delivery_id``."""
-    return f"expired-notice:{delivery_id}"
-
-
-def _profile_home(profile: str) -> Path | None:
-    """The home of ``profile`` on this install, or None when it is not a profile."""
-    try:
-        from hermes_cli.profiles import get_profile_dir
-
-        return Path(get_profile_dir(profile))
-    except Exception:  # an unknown sender is not a sweep failure
-        return None
-
-
-def _never_offered_failure_message(
-    record: dict[str, Any], delivery_id: str, target: str, now_ns: int | None
-) -> str:
-    """What the sender is told when its delivery expired without ever being offered."""
-    waited = int(queued_seconds(record, now_ns=now_ns))
-    return (
-        f"[peer-delivery FAILED] your delivery {delivery_id} to {target} was NEVER read: "
-        f"it waited {waited}s queued and expired without ever being offered to a turn "
-        f"(the drain never offered it). The earlier 'queued' receipt is NOT a pending "
-        f"promise and nothing is still in flight. Escalate (the escalate tool) or resend "
-        f"if this still matters."
-    )
-
-
-def _deliver_into_live_context(
-    home: str | os.PathLike[str], message: str, *, record: dict[str, Any]
-) -> bool:
-    """Hand a failure notice to the sender's live session -- its next turn context.
-
-    Deliberately NOT a queued turn (t_43f11055 c): a live-mailbox delivery is claimed by
-    the session that is already running, so it can never grow the queue it reports on and
-    can never itself expire. Returns False -- never raises -- when the sender has no
-    advertised live consumer; the caller then keeps the failure in the log.
+    Filed by :mod:`tools.bot_delivery_notices`, which owns the message text, the
+    idempotency key and the live-context fallback. The name stays HERE as a thin seam:
+    the gateway's expiry hook and the tests resolve -- and monkeypatch -- it on this
+    module, and the notices module keeps this one inside its line cap.
     """
-    try:
-        from tools.bot_live_delivery import (
-            deliver_to_live_owner,
-            find_canonical_live_owner,
-        )
+    from tools import bot_delivery_notices
 
-        owner = find_canonical_live_owner(Path(home))
-        if owner is None:
-            return False
-        raw = str(record.get("delivery_id") or "")
-        notice_id = hashlib.sha256(f"{raw}:never-offered".encode()).hexdigest()
-        deliver_to_live_owner(
-            Path(home), owner, message, delivery_id=notice_id,
-            notification_category="diagnostic",
-        )
-        return True
-    except Exception:  # a notice must never break the sweep
-        logger.debug("bot_delivery never-offered live delivery failed", exc_info=True)
-        return False
+    return bot_delivery_notices.notice_expired_to_sender(record, **kwargs)
 
 
-def notice_expired_to_sender(
-    record: dict[str, Any],
-    *,
-    home: str | os.PathLike[str] | None = None,
-    now_ns: int | None = None,
-) -> dict[str, Any] | None:
-    """File a FAILURE notice in the SENDER's own spool for an expired record.
+def notice_lease_lost_to_sender(record, **kwargs):
+    """The ONE truth-telling notice owed to a sender for a lost lease (ruling A5)."""
+    from tools import bot_delivery_notices
 
-    Card t_8a7a47d7 (b): a sender's receipt said "queued -- the receiver re-offers
-    it". When the record expires unread that promise was false and the sender had
-    no way to learn it; the receipt is long gone, so the text sat invisible until a
-    human read the queue by hand. File ONE delivery into the sender's own lane so
-    the failure is READ by that lane's turn -- deterministically, with no LLM in
-    the loop -- which is the sender's cue to escalate.
-
-    ``home`` is the sender's own home. Resolve it by profile only when omitted, and
-    only from outside any lane's runtime scope (``get_profile_dir`` resolves against
-    the ambient default home). Idempotent on the expired record: one notice per
-    delivery. Returns the admitted record, or None when no notice is owed -- no
-    sender, a notice about a notice, an unknown profile, or a full sender queue.
-
-    An expiry of a record that was NEVER OFFERED to a turn files NO queued notice
-    (t_43f11055 c): that failure is the drain's, and queueing a fresh turn behind the
-    same busy lane is how a notice-of-a-notice loop forms -- 5 such notice records sat
-    in platform-stl's settled set. The failure is logged here with the sender, the
-    target and the delivery id, and the record itself settles as ``never_offered``,
-    which is the reason the strand census counts and escalates from the board. No new
-    queue record is ever created on that path, so the loop cannot form.
-    """
-    delivery_id = str(record.get("delivery_id") or "")
-    sender = str(record.get("sender_profile") or "")
-    target = str(record.get("target_profile") or "")
-    if not delivery_id or not sender or sender == EXPIRED_NOTICE_SENDER:
-        return None
-    if int(record.get("attempts") or 0) <= 0 or record.get("reason") == REASON_NEVER_OFFERED:
-        # (c) An UNOFFERED expiry owes no queued turn: queueing one behind the same busy
-        # lane is how the notice-of-a-notice loop formed. The sender still learns the
-        # delivery died -- in its NEXT TURN CONTEXT if it has a live session, otherwise
-        # in the gateway log where the failure is searchable by sender and id. Either
-        # way nothing new can be queued, so nothing new can expire.
-        failure_home = Path(home) if home is not None else _profile_home(sender)
-        message = _never_offered_failure_message(record, delivery_id, target, now_ns)
-        delivered = (
-            failure_home is not None
-            and _deliver_into_live_context(failure_home, message, record=record)
-        )
-        _log(
-            "expired_never_offered_failure",
-            record,
-            sender=sender,
-            target=target,
-            waited_seconds=int(queued_seconds(record, now_ns=now_ns)),
-            delivered_to="live_context" if delivered else "log",
-            notice="none",
-        )
-        return None
-    if home is None:
-        home = _profile_home(sender)
-        if home is None:
-            _log("expired_notice_skipped", record, reason="unknown_sender_profile")
-            return None
-    waited = int(queued_seconds(record, now_ns=now_ns))
-    message = (
-        f"[peer-delivery FAILED] your delivery {delivery_id} to {target} was NEVER read: "
-        f"it waited {waited}s queued and expired still unread after "
-        f"{int(record.get('attempts') or 0)} turn attempt(s). "
-        f"The earlier 'queued' receipt is NOT a pending promise. Escalate (the escalate "
-        f"tool) or resend if this still matters."
-    )
-    key = expired_notice_key(delivery_id)
-    # A deterministic id keeps the notice single-writer: a re-run of the sweep
-    # re-admits nothing.
-    notice_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
-    try:
-        admitted = admit(
-            home,
-            sender_profile=EXPIRED_NOTICE_SENDER,
-            target_profile=sender,
-            target_session_id=None,
-            idempotency_key=key,
-            fingerprint=hashlib.sha256(message.encode("utf-8")).hexdigest(),
-            delivery_id=notice_id,
-            message=message,
-            status_detail=STATUS_DETAIL_UNDELIVERED_NOTICE,
-        )
-    except QueueFullError:
-        _log("expired_notice_refused", record, reason=STATUS_DETAIL_QUEUE_FULL, target=sender)
-        return None
-    _log("expired_notice", record, notice_id=admitted.get("delivery_id"), target=sender)
-    return admitted
-
-
-def lease_lost_notice_key(delivery_id: str) -> str:
-    """The idempotency key of the ONE failure notice owed for a lost lease."""
-    return f"lease-lost-notice:{delivery_id}"
-
-
-def notice_lease_lost_to_sender(
-    record: dict[str, Any],
-    *,
-    home: str | os.PathLike[str] | None = None,
-    now_ns: int | None = None,
-) -> dict[str, Any] | None:
-    """File a FAILURE notice in the SENDER's own spool for a dead-lettered claim.
-
-    A claim whose lease ran out is a delivery that was accepted and
-    never made -- eleven of them sat for up to 181h with nobody told. The receipt the
-    sender holds said "queued -- the receiver re-offers it", which stopped being true
-    when the lease was lost, and a ``settled/failed`` file nobody reads is a silent
-    failure. So the repair tells the SENDER, deterministically and with no LLM in the
-    loop, through the same door the expiry notice uses: ONE delivery into the sender's
-    own lane, read by that lane's next turn, which is the sender's cue to resend.
-
-    Idempotent on the delivery (one notice per lost lease). Returns the admitted
-    record, or ``None`` when no notice is owed -- no sender, a notice about a notice,
-    an unknown profile, or a full sender queue.
-    """
-    delivery_id = str(record.get("delivery_id") or "")
-    sender = str(record.get("sender_profile") or "")
-    target = str(record.get("target_profile") or "")
-    if not delivery_id or not sender or sender == EXPIRED_NOTICE_SENDER:
-        return None
-    if home is None:
-        home = _profile_home(sender)
-        if home is None:
-            _log("lease_lost_notice_skipped", record, reason="unknown_sender_profile")
-            return None
-    claimed = int(claim_age_seconds(record, now_ns=now_ns) or 0)
-    message = (
-        f"[peer-delivery FAILED] your delivery {delivery_id} to {target} was NEVER delivered: "
-        f"it was claimed for {claimed}s, the claim's lease was lost (no live holder) and the "
-        f"record was dead-lettered as lease_lost. The earlier 'queued' receipt is NOT a "
-        f"pending promise. Resend if this still matters."
-    )
-    key = lease_lost_notice_key(delivery_id)
-    notice_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
-    try:
-        admitted = admit(
-            home,
-            sender_profile=EXPIRED_NOTICE_SENDER,
-            target_profile=sender,
-            target_session_id=None,
-            idempotency_key=key,
-            fingerprint=hashlib.sha256(message.encode("utf-8")).hexdigest(),
-            delivery_id=notice_id,
-            message=message,
-            status_detail=STATUS_DETAIL_UNDELIVERED_NOTICE,
-        )
-    except QueueFullError:
-        _log("lease_lost_notice_refused", record, reason=STATUS_DETAIL_QUEUE_FULL, target=sender)
-        return None
-    _log("lease_lost_notice", record, notice_id=admitted.get("delivery_id"), target=sender)
-    return admitted
+    return bot_delivery_notices.notice_lease_lost_to_sender(record, **kwargs)
 
 
 # --------------------------------------------------------------------------
