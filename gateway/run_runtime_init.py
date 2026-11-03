@@ -23,13 +23,17 @@ class GatewayRuntimeInitMixin:
         self._human_delay = self._human_delay_from_config(_load_gateway_config())
         self._human_delay_by_profile: Dict[str, Optional[tuple[int, int]]] = {}
         self._restart_drain_timeout = self._load_restart_drain_timeout()
+        self._cron_drain_timeout = self._load_cron_drain_timeout()
         # Live launchd ``ExitTimeOut`` for this job (None when not launchd-owned). Read once at
         # boot — launchd fixes it at load — and applied only to signal-driven stops, which are the
-        # only stops launchd times. See _load_launchd_exit_timeout().
+        # only stops launchd times. See _load_launchd_exit_timeout(). Pass the cron drain too: the
+        # stop path may wait up to max(restart, cron) before force-interrupting, so the fit check
+        # must weigh the larger budget against the live kill window.
         self._stop_requested_by_signal = False
-        self._launchd_exit_timeout_s = self._load_launchd_exit_timeout(self._restart_drain_timeout)
+        self._launchd_exit_timeout_s = self._load_launchd_exit_timeout(
+            self._restart_drain_timeout, self._cron_drain_timeout
+        )
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
-        self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
@@ -124,6 +128,8 @@ class GatewayRuntimeInitMixin:
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: OrderedDict[tuple[str, str, object], None] = OrderedDict()
         self._completion_delivery_retention = 2048
+        # Consecutive retryable drain results per completion identity, for the bounded requeue cap.
+        self._completion_delivery_requeues: Dict[tuple[str, str, object], int] = {}
         # Agent-triggered terminal completions from one conversation often land in the same scheduler
         # tick; hold them briefly so the agent gets one synthetic turn instead of one per process.
         # See #70300.
