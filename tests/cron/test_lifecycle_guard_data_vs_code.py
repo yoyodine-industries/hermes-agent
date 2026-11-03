@@ -41,6 +41,44 @@ def _small_cap_and_private_ledger(monkeypatch, tmp_path):
     return tmp_path
 
 
+#: The refusal ledger EVERY lane reads. Nothing this module does may touch it (STL finding 1).
+_PROD_REFUSAL_LEDGER = Path("/opt/hermes_prod/run_details/lifecycle-guard-refusals.jsonl")
+
+
+def _prod_refusal_ledger_fingerprint() -> tuple[int, int] | None:
+    try:
+        stat = _PROD_REFUSAL_LEDGER.stat()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime_ns)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _the_suite_never_writes_the_production_refusal_ledger():
+    """STL finding (1), measured across a whole suite run: PROD's ledger is byte-identical after.
+
+    The per-test fixture above pins the env, but a pin is only as good as every arm using it, and
+    the incident this pins against was real: a run of this module left 60 fixture rows in PROD's
+    refusal ledger (pid 48343, `xxxxxxxxx`, 2026-10-25T07:06-07:09Z), which is half the evidence
+    the "a refusal leaves a row" arm was supposed to provide. The assertion is on size+mtime and
+    not on line count, because a truncation or a rewrite must fail here too.
+    """
+    before = _prod_refusal_ledger_fingerprint()
+    yield
+    after = _prod_refusal_ledger_fingerprint()
+    assert after == before, (
+        "this module wrote to the PRODUCTION refusal ledger "
+        f"{_PROD_REFUSAL_LEDGER} (before={before}, after={after}); every arm must pin "
+        "LIFECYCLE_GUARD_REFUSAL_LEDGER via _small_cap_and_private_ledger"
+    )
+
+
+def test_the_module_pins_its_refusal_ledger_away_from_production():
+    """The pin is in force for THIS process, so the module-scope guarantee has something to hold."""
+    assert lifecycle_guard.refusal_ledger_path() != _PROD_REFUSAL_LEDGER
+    assert lifecycle_guard.refusal_ledger_path().name == "refusals.jsonl"
+
+
 def _data_file(path: Path, size: int = 4096, first: bytes = b'{"at": ') -> Path:
     path.write_bytes(first + b"x" * (size - len(first)))
     return path
@@ -195,3 +233,79 @@ def test_an_allowed_command_writes_no_row(tmp_path):
     _runner(tmp_path, [str(_data_file(tmp_path / "deploy-ledger.jsonl", 8192))])
     assert guard("./runner.sh", cwd=str(tmp_path)) is False
     assert not (tmp_path / "refusals.jsonl").exists()
+
+
+# --- a refusal row never persists a credential (STL finding 2) ---------------------------------
+#
+# The refusal ledger is group-readable by every lane on the host (mode 664). A command carrying a
+# token would publish it to every lane and into the audit permanently, so the row is scrubbed
+# BEFORE truncation - truncating first can cut a token in half, and a half-token still identifies
+# the secret while matching no pattern ever again.
+
+GH_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+PAT_TOKEN = "github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz0123456789"
+API_KEY = "sk-live-0123456789abcdef0123456789abcdef"
+BEARER = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload"
+
+
+def _refuse_with(tmp_path: Path, extra_args: str) -> dict:
+    """Trigger a real refusal whose root command carries *extra_args*, and read the row back."""
+    big = tmp_path / "huge.sh"
+    big.write_text("#!/bin/sh\n" + "# pad\n" * 1200, encoding="utf-8")
+    big.chmod(0o755)
+    _runner(tmp_path, [str(big)])
+
+    assert guard("./runner.sh " + extra_args, cwd=str(tmp_path)) is True
+
+    ledger = Path(tmp_path / "refusals.jsonl")
+    rows = [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+def test_a_github_token_never_reaches_the_refusal_ledger(tmp_path):
+    row = _refuse_with(tmp_path, f"--token {GH_TOKEN}")
+    assert GH_TOKEN not in row["command"]
+    assert "<redacted>" in row["command"]
+    assert row["command_redacted"] is True
+    assert row["path"].endswith("huge.sh")
+
+
+def test_a_fine_grained_pat_and_an_api_key_are_redacted(tmp_path):
+    row = _refuse_with(tmp_path, f"--api-key={API_KEY} --header {PAT_TOKEN}")
+    assert API_KEY not in row["command"]
+    assert PAT_TOKEN not in row["command"]
+
+
+def test_an_authorization_header_and_a_bearer_value_are_redacted(tmp_path):
+    row = _refuse_with(tmp_path, f'-H "Authorization: Bearer {BEARER}"')
+    assert BEARER not in row["command"]
+    assert "Authorization:" in row["command"]
+
+
+def test_a_secret_named_env_assignment_is_redacted(tmp_path):
+    row = _refuse_with(tmp_path, f"GITHUB_TOKEN={GH_TOKEN} ./runner.sh")
+    assert GH_TOKEN not in row["command"]
+
+
+def test_redaction_never_mangles_an_ordinary_command():
+    """Redaction may only remove credentials: a plain command is byte-identical, and the
+    function is idempotent so a second pass cannot corrupt the row."""
+    plain = (
+        "cd /Users/hermes_user/yaan-catalog-runtime-deploy/yaan-repo-control && "
+        "./gate.py --admit-rev 74af4ef3ffc0 --repo /opt/hermes_sandbox/yaan-platform "
+        "--ledger /opt/hermes_prod/deploy-ledger.jsonl"
+    )
+    assert lifecycle_guard.redact_command(plain) == plain
+    once = lifecycle_guard.redact_command(f"./run.sh --token {GH_TOKEN}")
+    assert lifecycle_guard.redact_command(once) == once
+
+
+def test_redaction_runs_BEFORE_truncation():
+    """A token is scrubbed even when it sits past the 400-char cut, and even when the cut would
+    land inside it: the row is truncated AFTER redaction, never before."""
+    padding = "x" * 380
+    text = f"./run.sh {padding} --token {GH_TOKEN}"
+    redacted = lifecycle_guard.redact_command(text)
+    assert GH_TOKEN not in redacted[:400]
+    assert len(redacted[:400]) == 400

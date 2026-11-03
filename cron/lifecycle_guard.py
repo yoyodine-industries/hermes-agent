@@ -581,18 +581,66 @@ def refusal_ledger_path() -> Path:
     return Path(os.environ.get(_REFUSAL_LEDGER_ENV) or _REFUSAL_LEDGER_DEFAULT)
 
 
+_REDACTION = "<redacted>"
+
+#: Credential shapes scrubbed from a refusal row's command before it is persisted. The refusal
+#: ledger sits at mode 664 beside every other lane's state, so an unredacted command publishes a
+#: token to the whole host - and to the audit, forever. Narrow on purpose: each pattern is a
+#: shape a real credential arrives in, never a guess at what "looks secret".
+_REDACTION_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
+    # GitHub tokens (classic ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained github_pat_).
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"), _REDACTION),
+    # Authorization headers, bearer/basic/token.
+    (
+        re.compile(r"(?i)\b(authorization:\s*)(?:bearer|basic|token)\s+\S+"),
+        r"\1" + _REDACTION,
+    ),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}"), "Bearer " + _REDACTION),
+    # --token / --api-key / --password and friends, both `--flag value` and `--flag=value`.
+    (
+        re.compile(
+            r"(?i)\b(--(?:token|api[-_]?key|password|passwd|secret|auth[-_]?token"
+            r"|access[-_]?token)(?:=|\s+))(\S+)"
+        ),
+        r"\1" + _REDACTION,
+    ),
+    # An env assignment whose NAME declares a secret.
+    (
+        re.compile(
+            r"(?i)\b([A-Z0-9_]*(?:token|secret|password|passwd|api[-_]?key|credential)"
+            r"[A-Z0-9_]*=)(\S+)"
+        ),
+        r"\1" + _REDACTION,
+    ),
+)
+
+
+def redact_command(text: str) -> str:
+    """Scrub credential shapes out of a command before it is written to the refusal ledger.
+
+    Runs BEFORE truncation, and that order is the point: truncating first can cut a token in
+    half, leaving a prefix that no longer matches a pattern while still being a secret.
+    """
+    for pattern, replacement in _REDACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def _record_refusal(budget: _LifecycleScanBudget, path: Optional[Path], reason: str) -> None:
     """Append ONE JSONL row naming *reason* for *path*. Best-effort by contract.
 
     Never raises and never changes the verdict: a guard that cannot write its row must still
     answer its question (#76762 - a guard crash breaks every terminal command).
     """
+    root_command = budget.root_command or ""
+    redacted = redact_command(root_command)
     row = {
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "kind": "lifecycle-guard-refusal",
         "path": str(path) if path is not None else "",
         "reason": reason,
-        "command": (budget.root_command or "")[:400],
+        "command": redacted[:400],
+        "command_redacted": redacted != root_command,
         "pid": os.getpid(),
     }
     try:
