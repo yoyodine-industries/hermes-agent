@@ -352,6 +352,108 @@ class TestGatewayRuntimeStatus:
         assert status.read_runtime_status()["platforms"] == {}
 
 
+    def test_platform_verdict_does_not_survive_a_life_boundary(self, tmp_path, monkeypatch):
+        """t_bca1c81e B1 (writer, negative control).
+
+        The first write of a NEW gateway life (gateway/run_startup.py: ``gateway_state="starting"``,
+        ``clear_profile_platforms=True``, ``reload_existing=True``) used to keep every key WITHOUT a
+        colon — the default profile's OWN adapters, ``api_server`` included — while restamping
+        ``pid``/``start_time``/``updated_at`` for the new process. The file then certified a dead API
+        server as ``connected`` beside a live pid and a fresh timestamp. Every inherited entry that
+        cannot prove it was written by THIS life must be re-stamped ``starting`` (not healthy), its old
+        verdict parked under ``stale_*``.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({
+                "pid": 4001, "start_time": 1000, "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {
+                    "api_server": {"state": "connected", "writer_pid": 4001,
+                                   "writer_start_time": 1000},
+                    # Colon-keyed entries keep their existing meaning: clear_profile_platforms
+                    # still drops them (the new rule is additive, not a replacement).
+                    "reviewer:discord": {"state": "connected", "writer_pid": 4001,
+                                         "writer_start_time": 1000},
+                    # Legacy entry, no writer stamps — fail closed at a life boundary.
+                    "legacy_flat": {"state": "connected"},
+                    # Flat key from a previous life with a non-healthy verdict.
+                    "reviewer_fatal": {"state": "fatal", "error_code": "missing_credentials",
+                                       "writer_pid": 4001, "writer_start_time": 1000},
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(
+            gateway_state="starting", clear_profile_platforms=True, reload_existing=True)
+
+        payload = status.read_runtime_status()
+        assert payload["pid"] == os.getpid(), "the new life's pid must be stamped"
+        # clear_profile_platforms keeps its current meaning.
+        assert "reviewer:discord" not in payload["platforms"]
+        for key in ("api_server", "legacy_flat", "reviewer_fatal"):
+            entry = payload["platforms"][key]
+            assert entry["state"] == "starting", key
+            # The old verdict is retained for diagnosis, never as current state.
+            assert entry["needs_attention"] is False, key
+            assert entry["error_code"] is None, key
+            assert entry["error_message"] is None, key
+        assert payload["platforms"]["api_server"]["stale_state"] == "connected"
+        assert payload["platforms"]["reviewer_fatal"]["stale_state"] == "fatal"
+        assert payload["platforms"]["api_server"]["stale_writer_pid"] == 4001
+        assert payload["platforms"]["api_server"]["stale_writer_start_time"] == 1000
+        # The downgraded entry now belongs to the CURRENT life (so it is not re-downgraded and
+        # readers serve it as ``starting``) — the old identity lives only under ``stale_*``.
+        assert payload["platforms"]["api_server"]["writer_pid"] == os.getpid()
+
+    def test_colon_and_flat_platform_keys_are_downgraded_identically(self, tmp_path, monkeypatch):
+        """The new rule is key-agnostic: a ``<profile>:`` entry crosses the life boundary too."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({
+                "pid": 4001, "start_time": 1000, "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {
+                    "api_server": {"state": "connected", "writer_pid": 4001,
+                                   "writer_start_time": 1000},
+                    "reviewer:discord": {"state": "connected", "writer_pid": 4001,
+                                         "writer_start_time": 1000},
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(gateway_state="starting", reload_existing=True)
+
+        platforms = status.read_runtime_status()["platforms"]
+        assert platforms["api_server"]["state"] == "starting"
+        assert platforms["reviewer:discord"]["state"] == "starting"
+        assert platforms["reviewer:discord"]["stale_state"] == "connected"
+
+    def test_platform_entry_stamped_by_the_current_life_is_untouched(self, tmp_path, monkeypatch):
+        """t_bca1c81e B1 (writer, no regression): the rule only fires across a life boundary."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        start = status._get_process_start_time(os.getpid())
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({
+                "pid": os.getpid(), "start_time": start, "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {
+                    "api_server": {"state": "connected", "writer_pid": os.getpid(),
+                                   "writer_start_time": start},
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(gateway_state="running", reload_existing=True)
+
+        entry = status.read_runtime_status()["platforms"]["api_server"]
+        assert entry["state"] == "connected"
+        assert "stale_state" not in entry
+
+
     def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):
         """Regression: setdefault() preserved stale PID from previous process (#1631)."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1832,3 +1934,82 @@ def test_retained_gateway_state_keeps_watchdog_degraded_like_startup_failed():
     assert status.retained_gateway_state({**watchdog, "desired_state": "stopped"}) == "stopped"
     assert status.retained_gateway_state({"gateway_state": "degraded", "exit_reason": None}) == "stopped"
     assert status.retained_gateway_state({"gateway_state": "startup_failed", "exit_reason": "x"}) == "startup_failed"
+
+
+# A REAL gateway life: the child stamps the runtime record with its own (pid, start_time) and a
+# healthy api_server verdict, then holds the life open until the parent kills it. No fixtures, no
+# synthetic pid — this is the production write path from an actual process.
+_LIFE_WRITER = r"""
+import json, os, sys
+repo, home = sys.argv[1], sys.argv[2]
+sys.path.insert(0, repo)
+from gateway.status import _get_process_start_time
+pid = os.getpid()
+start = _get_process_start_time(pid)
+os.makedirs(home, exist_ok=True)
+payload = {
+    "pid": pid, "start_time": start, "kind": "hermes-gateway",
+    "gateway_state": "running",
+    "platforms": {"api_server": {"state": "connected",
+                                 "writer_pid": pid, "writer_start_time": start}},
+}
+with open(os.path.join(home, "gateway_state.json"), "w", encoding="utf-8") as fh:
+    json.dump(payload, fh)
+print("%s %s" % (pid, start), flush=True)
+sys.stdin.read()
+"""
+
+
+class TestGatewayLifeBoundaryLifecycle:
+    """t_bca1c81e: a platform verdict may not survive a REAL gateway life boundary.
+
+    The STL's acceptance is behavioural, not a fixture: one gateway life writes a platform verdict,
+    that life is killed, a new life boots, and the stale platform must not read ``connected`` to any
+    reader afterwards.
+    """
+
+    @pytest.mark.spawns_gateway_lookalike
+    def test_killed_life_platform_verdict_is_not_connected_after_the_next_boot(
+            self, tmp_path, monkeypatch):
+        import subprocess
+
+        home = tmp_path / "home"
+        repo = str(Path(status.__file__).resolve().parents[1])
+        env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": repo}
+        life1 = subprocess.Popen(
+            [sys.executable, "-c", _LIFE_WRITER, repo, str(home)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
+        assert life1.stdout is not None
+        assert life1.stdin is not None
+        try:
+            pid_text, start_text = life1.stdout.readline().split()
+            life1_pid = int(pid_text)
+            # The life really wrote a healthy verdict for a platform it served.
+            record = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
+            assert record["pid"] == life1_pid
+            assert record["platforms"]["api_server"]["state"] == "connected"
+        finally:
+            life1.kill()          # the life DIES; its api_server no longer exists
+            life1.wait(timeout=10)
+            life1.stdin.close()
+
+        # The next life boots exactly as gateway/run_startup.py does: first write of the new
+        # process, clear_profile_platforms=True, reload_existing=True.
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        status.write_runtime_status(
+            gateway_state="starting", clear_profile_platforms=True,
+            reload_existing=True, wait_timeout=5)
+
+        after = status.read_runtime_status()
+        assert after["pid"] == os.getpid(), "the new life owns the record"
+        entry = after["platforms"]["api_server"]
+        assert entry["state"] == "starting", (
+            "the killed life's platform verdict survived the boot write")
+        assert entry["stale_state"] == "connected"
+        assert entry["stale_writer_pid"] == life1_pid
+        # ...and no reader counts it healthy: the own-profile predicate (used by /api/status and
+        # /api/messaging/platforms) sees a non-healthy state, never the dead life's "connected".
+        owned = status.own_profile_platforms_owned_by(after, os.getpid())
+        assert owned["api_server"]["state"] != "connected"
+        assert owned["api_server"]["state"] == "starting"
+
