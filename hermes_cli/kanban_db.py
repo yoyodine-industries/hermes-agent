@@ -34,7 +34,6 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
-from utils import unlink_files_older_than
 
 _log = logging.getLogger(__name__)
 
@@ -473,6 +472,36 @@ def _resolve_storage_locked_cooldown_seconds() -> int:
     return _env_int(
         "HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS,
     )
+
+
+# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
+_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
+_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
+_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
+_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+
+
+def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
+    """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
+    reads a bare absolute timestamp as current fact — the relative age is what
+    prompts a worker to re-verify stale sibling work."""
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        return ""
+    if now is None:
+        now = int(time.time())
+    delta = now - ts
+    if delta < 60:  # includes negative = clock skew across machines; never claim "in the future"
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
 # --- Paths ---
 
 DEFAULT_BOARD = "default"
@@ -639,13 +668,7 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """A board STORE is on disk at this slug — ``kanban.db`` or its ``board.json``.
-
-    ``default`` always exists. This is the "is anything there?" probe, NOT the registration
-    question (:func:`board_is_registered`) and not discovery (#43243, which now lives in
-    ``list_boards``): a store whose ``board.json`` was deleted still exists, and a directory a
-    teardown emptied — no DB, no marker — does not.
-    """
+    """Board has a ``board.json`` on disk; ``default`` always exists."""
     slug = _slug_or_default(board)
     if slug == DEFAULT_BOARD:
         return True
@@ -658,14 +681,11 @@ def board_is_registered(board: Optional[str] = None) -> bool:
     ``default`` is always registered. Every other slug is registered iff its directory
     carries ``board.json`` — ``create_board`` always writes that file, while the filing
     path's creating connect() mints only ``kanban.db``. So this is the probe a FILING
-    uses to refuse a slug nobody registered. :func:`board_exists` is the WIDER probe (a
-    DB-only store answers yes); the two are deliberately not the same question
-    (card t_b1719b4d).
+    uses to refuse a slug nobody registered. On this tree :func:`board_exists` already
+    requires ``board.json`` (#43243), so the two agree; the name is kept because the
+    filing path and its tests ask for the registration question by name.
     """
-    slug = _slug_or_default(board)
-    if slug == DEFAULT_BOARD:
-        return True
-    return _dir_is_registered(board_dir(slug))
+    return board_exists(board)
 
 
 class BoardResolutionError(ValueError):
@@ -1101,7 +1121,7 @@ class Task:
     status: str
     priority: int
     created_by: Optional[str]
-    created_at: Optional[int]  # None only for an unparseable stamp
+    created_at: int
     started_at: Optional[int]
     completed_at: Optional[int]
     workspace_kind: str
@@ -1154,7 +1174,6 @@ class Task:
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
         return cls(
             **{col: _lossy_text(row[col]) for col in _TASK_REQUIRED_COLUMNS},
-            **{col: _to_epoch(g(col)) for col in _TASK_EPOCH_COLUMNS},  # outside writers may store text: epoch or None
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
             **{col: g(col) or None for col in _TASK_EMPTY_IS_NULL_COLUMNS},
             # Pre-migration fallbacks (spawn_failures / last_spawn_error) are only
@@ -1169,14 +1188,13 @@ class Task:
 
 # Columns every schema version has (KeyError if the SELECT omitted them).
 _TASK_REQUIRED_COLUMNS = (
-    "id", "title", "body", "assignee", "status", "priority", "created_by",
-    "workspace_kind", "workspace_path", "claim_lock",
+    "id", "title", "body", "assignee", "status", "priority", "created_by", "created_at",
+    "started_at", "completed_at", "workspace_kind", "workspace_path", "claim_lock", "claim_expires",
 )
-_TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at")
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
-    "max_runtime_seconds", "current_run_id", "workflow_template_id",
+    "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract", "due_at",
 )
 # Text columns where "" is stored/read as "not set".
@@ -1213,12 +1231,13 @@ class Run:
         return cls(
             **{
                 col: _lossy_text(row[col]) for col in (
-                    "task_id", "profile", "step_key", "status", "claim_lock",
-                    "worker_pid", "max_runtime_seconds", "outcome", "summary", "error",
+                    "task_id", "profile", "step_key", "status", "claim_lock", "claim_expires",
+                    "worker_pid", "max_runtime_seconds", "last_heartbeat_at", "outcome", "summary", "error",
                 )
             },
-            **{col: _to_epoch(row[col]) for col in ("claim_expires", "last_heartbeat_at", "ended_at")},
-            id=int(row["id"]), started_at=_to_epoch(row["started_at"]) or 0,
+            id=int(row["id"]),
+            started_at=int(row["started_at"]),
+            ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(_lossy_text(row["metadata"])),
         )
 
@@ -1235,7 +1254,7 @@ class Comment:
     def from_row(cls, r: sqlite3.Row) -> Comment:
         return cls(
             id=r["id"], task_id=r["task_id"], author=_lossy_text(r["author"]),
-            body=_lossy_text(r["body"]), created_at=_to_epoch(r["created_at"]) or 0,
+            body=_lossy_text(r["body"]), created_at=r["created_at"],
         )
 
 
@@ -1257,7 +1276,7 @@ class Attachment:
         return cls(
             id=r["id"], task_id=r["task_id"], filename=r["filename"],
             stored_path=r["stored_path"], content_type=r["content_type"],
-            size=r["size"] or 0, uploaded_by=r["uploaded_by"], created_at=_to_epoch(r["created_at"]) or 0,
+            size=r["size"] or 0, uploaded_by=r["uploaded_by"], created_at=r["created_at"],
         )
 
 
@@ -1275,8 +1294,7 @@ class Event:
         run_id = _row_get(row, "run_id")
         return cls(
             id=row["id"], task_id=row["task_id"], kind=_lossy_text(row["kind"]),
-            payload=_json_or(_lossy_text(row["payload"])), created_at=_to_epoch(row["created_at"]) or 0,
-            run_id=_opt_int(run_id),
+            payload=_json_or(_lossy_text(row["payload"])), created_at=row["created_at"], run_id=_opt_int(run_id),
         )
 
 
@@ -1634,23 +1652,7 @@ def _resolve_project_link(
     # Canonicalise (a slug may have been passed) and anchor the worktree
     # under the project's primary repo.
     if workspace_kind == "scratch" and project_obj.primary_path:
-        # A.2 (t_e61be4f3): the default for a project whose primary is a PLAIN FOLDER is
-        # ``dir:<primary>`` — never ``worktree:<primary>/.worktrees/<id>``. Until now every
-        # card born on such a project WITHOUT an explicit --workspace was defaulted to a
-        # worktree and then refused at the anchor check below, so the caller had to know a
-        # rule the door already knew: ``--workspace dir:<owner>`` always worked (measured:
-        # t_d03a4a2e was born that way). A repo primary still gets a worktree, and a primary
-        # that does not exist YET keeps the deferred worktree path — registering a project
-        # before cloning its repo is a legitimate order, and that seam is unchanged below.
-        from pathlib import Path as _PathDefault
-
-        from hermes_cli import kanban_db_workspace as _wsm_default
-
-        _default_primary = _PathDefault(str(project_obj.primary_path)).expanduser()
-        if _default_primary.exists() and _wsm_default._git_toplevel(_default_primary) is None:
-            workspace_kind = "dir"
-        else:
-            workspace_kind = "worktree"
+        workspace_kind = "worktree"
     if workspace_kind == "worktree" and workspace_path is None and project_obj.primary_path:
         # A primary that is an EXISTING folder but not a git repo can never anchor a worktree
         # (t_e5ff985b): the card would be born with an impossible
@@ -1672,11 +1674,6 @@ def _resolve_project_link(
             )
         # Concrete path is deferred to the insert loop: a fresh
         # ``<repo>/.worktrees/<task-id>`` keyed on the new task id.
-        project_repo = str(project_obj.primary_path)
-    elif workspace_kind == "dir" and project_obj.primary_path:
-        # A.2 (t_e61be4f3): a dir-kind card is anchored AT the project's primary, which the
-        # insert loop needs as ``project_repo`` — without it the card was born
-        # ``kind=dir, path=None`` and had no anchor at all.
         project_repo = str(project_obj.primary_path)
     return project_obj.id, project_obj, project_repo, workspace_kind
 
@@ -2251,12 +2248,6 @@ def create_task(
                         workspace_path = os.path.join(project_repo, ".worktrees", task_id)
                     if not branch_name:
                         branch_name = _project_branch_name(project_obj, task_id, title)
-                elif project_obj is not None and workspace_kind == "dir" and not workspace_path:
-                    # A.2 (t_e61be4f3): a card on a plain-folder project is anchored IN the
-                    # project — ``dir:<owner dir>`` — so nothing is ever minted under a path
-                    # that is not a git repo, and the card needs no worktree anchor to exist.
-                    if project_repo:
-                        workspace_path = str(project_repo)
 
                 # The stamp rides the INSERT: the card carries its ask from birth, in the
                 # same transaction that creates the row, so no reader ever sees an
@@ -4783,15 +4774,12 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
     for row in stale:
-        if owner_reclaim_blocked(conn, row["id"]):
-            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
-        hb = _to_epoch(row["last_heartbeat_at"])
+        hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
         # ``not_dead``, not ``alive``: an unprovable worker must HOLD its claim too. Releasing it
         # beside a process that may still be running is how a duplicate is spawned next to it
@@ -4812,11 +4800,7 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
-            # Again under the write lock: an interpreter that bound since the check above
-            # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
-            if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
-                continue
-            retry_status, error = _retry_status_for_run(conn, row["id"]), reclaim_error(conn, row["id"], row["claim_lock"])
+            retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -4830,12 +4814,12 @@ def release_stale_claims(
                 continue
             run_id = _record_reclaim(
                 conn, row["id"], termination,
-                error=error,
+                error=f"stale_lock={row['claim_lock']}",
                 payload={
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
-                    "claim_expires": _to_epoch(row["claim_expires"]),
-                    "last_heartbeat_at": hb,
+                    "claim_expires": int(row["claim_expires"]),
+                    "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
                     "now": now,
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
@@ -4847,7 +4831,7 @@ def release_stale_claims(
         # the run ended without a verdict, so it counts toward the breaker and a
         # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
         _record_task_failure(
-            conn, row["id"], error,
+            conn, row["id"], f"stale_lock={row['claim_lock']}",
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
@@ -4897,9 +4881,9 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
                 "reason": "pid_alive",
                 "worker_pid": int(row["worker_pid"]),
                 "claim_lock": row["claim_lock"],
-                "claim_expires_was": _to_epoch(row["claim_expires"]),
+                "claim_expires_was": int(row["claim_expires"]),
                 "claim_expires_now": new_expires,
-                "last_heartbeat_at": _to_epoch(row["last_heartbeat_at"]),
+                "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
             },
             run_id=run_id,
         )
@@ -8249,10 +8233,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
-    from hermes_cli.kanban_db_context import (
-        _ctx_attachments, _ctx_comments, _ctx_parent_results, _ctx_prior_attempts,
-        _ctx_role_history,
-    )
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
@@ -8263,6 +8243,43 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+    """Truncate to ``limit`` chars with a visible ellipsis."""
+    if not s:
+        return ""
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
+def _ctx_stamp(ts: int, now: int) -> str:
+    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
+    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    age = _relative_age(ts, now)
+    return f"{disp}, {age}" if age else disp
+
+
+def _ctx_metadata_line(metadata: Any) -> Optional[str]:
+    if not metadata:
+        return None
+    try:
+        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
+    except Exception:
+        return None
+
+
+def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
+    """Keep the newest ``cap`` items; describe the omitted head, if any."""
+    omitted = max(0, len(items) - cap)
+    if not omitted:
+        return items, None
+    return items[-cap:], (
+        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
+        f"omitted; showing most recent {cap})_"
+    )
 
 
 def _runtime_cap_was_defaulted(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -8285,20 +8302,165 @@ def _runtime_cap_was_defaulted(conn: sqlite3.Connection, task_id: str) -> bool:
         return False
     return row is not None
 
+
 def _ctx_header(lines: list[str], task: Task, *, cap_defaulted: bool = False) -> None:
-    """The shared worker-context header, plus the row's rule that a cap the SCHEDULER stamped
-    claims no terminal timeout (ruling ``t_b2865b89`` §4).
+    lines.append(f"# Kanban task {task.id}: {task.title}")
+    lines.append("")
+    lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
+    lines.append(f"Status:   {task.status}")
+    if task.tenant:
+        lines.append(f"Tenant:   {task.tenant}")
+    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if task.max_runtime_seconds is not None:
+        # The cap itself is always worth showing (a defaulted card really IS reaped at it), but the
+        # TERMINAL TIMEOUT is a property of the author's budget, not the scheduler's: a cap nobody
+        # authored widens nothing (``_dispatch_lane_task`` pins the explicit value back onto the
+        # Task it spawns), so claiming a terminal timeout here would be a lie.
+        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
+        if not cap_defaulted:
+            terminal_timeout = _worker_terminal_timeout_env(
+                task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
+            )
+            effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+            if effective_terminal_timeout:
+                lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+    if task.branch_name:
+        lines.append(f"Branch:   {task.branch_name}")
+    lines.append("")
+    if task.body and task.body.strip():
+        lines.append("## Body")
+        lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
 
-    ``kanban_db_context._ctx_header`` has no flag for it, and the rule travels with
-    ``_runtime_cap_was_defaulted`` (its only reader, in this module), so it is applied here: the
-    line the shared header appends for the "author's budget" is dropped when nobody authored it.
-    """
-    from hermes_cli.kanban_db_context import _ctx_header as _shared_header
 
-    start = len(lines)
-    _shared_header(lines, task)
-    if cap_defaulted:
-        lines[start:] = [ln for ln in lines[start:] if not ln.startswith("Terminal timeout: ")]
+def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
+    """Absolute on-disk paths so the worker's file tools read them directly
+    (remote terminal backends need the attachments dir mounted)."""
+    if not attachments:
+        return
+    lines.append("## Attachments")
+    lines.append(
+        "Files attached to this task. Read them with the file/terminal "
+        "tools at the absolute paths below:"
+    )
+    for att in attachments:
+        size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
+        size_str = f", {size_kb} KB" if size_kb else ""
+        ctype = f", {att.content_type}" if att.content_type else ""
+        lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+    lines.append("")
+
+
+def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Closed runs on this task (the active run is this worker), newest
+    ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
+    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
+    if not shown:
+        return
+    first_shown_idx = len(all_prior) - len(shown) + 1
+    lines.append("## Prior attempts on this task")
+    if omitted_note:
+        lines.append(omitted_note)
+    for offset, run in enumerate(shown):
+        profile = run.profile or "(unknown)"
+        outcome = run.outcome or run.status
+        lines.append(
+            f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
+        )
+        if run.summary and run.summary.strip():
+            lines.append(_ctx_cap(run.summary))
+        if run.error and run.error.strip():
+            lines.append(f"_error_: {_ctx_cap(run.error)}")
+        meta_line = _ctx_metadata_line(run.metadata)
+        if meta_line:
+            lines.append(meta_line)
+        lines.append("")
+
+
+def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
+    falling back to ``task.result`` for pre-runs-table data. Stamped with a
+    relative age so the worker re-verifies stale upstream results."""
+    parent_rows = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
+    ).fetchall()
+    wrote_header = False
+    for pid in (r["parent_id"] for r in parent_rows):
+        pt = get_task(conn, pid)
+        if not pt or pt.status != "done":
+            continue
+        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
+        runs.sort(key=lambda r: r.started_at, reverse=True)
+        run = runs[0] if runs else None
+        if not wrote_header:
+            lines.append("## Parent task results")
+            lines.append(
+                "_Handoffs from upstream tasks, captured when each parent "
+                "completed (see age below). These are point-in-time "
+                "snapshots, not live state — if a result drives your "
+                "current work and it's not recent, re-verify against the "
+                "source before acting on it as current._"
+            )
+            wrote_header = True
+        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
+        age = _relative_age(done_ts, now)
+        lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
+        if run is not None and run.summary and run.summary.strip():
+            lines.append(_ctx_cap(run.summary))
+        elif pt.result:
+            lines.append(_ctx_cap(pt.result))
+        else:
+            lines.append("(no result recorded)")
+        meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
+        if meta_line:
+            lines.append(meta_line)
+        lines.append("")
+
+
+def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, now: int) -> None:
+    """The assignee's 5 most recent completed runs on OTHER tasks — implicit
+    role continuity without wiring anything into SOUL.md / MEMORY.md."""
+    if not task.assignee:
+        return
+    role_rows = conn.execute(
+        "SELECT t.id, t.title, r.summary, r.ended_at "
+        "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+        "WHERE r.profile = ? AND r.task_id != ? "
+        "  AND r.outcome = 'completed' "
+        "ORDER BY r.ended_at DESC LIMIT 5", (task.assignee, task.id),
+    ).fetchall()
+    if not role_rows:
+        return
+    lines.append(f"## Recent work by @{task.assignee}")
+    for row in role_rows:
+        first = _first_line(row["summary"], 200) or "(no summary)"
+        lines.append(
+            f"- {row['id']} — {row['title']} ({_ctx_stamp(int(row['ended_at']), now)}): {first}"
+        )
+    lines.append("")
+
+
+def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
+    """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
+    worker" framing stops an operator-controlled HERMES_PROFILE like
+    "hermes-system" being read as a system directive above an
+    attacker-influenceable body (defense-in-depth)."""
+    shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
+    if not shown:
+        return
+    lines.append("## Comment thread")
+    if omitted_note:
+        lines.append(omitted_note)
+    for c in shown:
+        # Render author with explicit "comment from worker" framing so operator-controlled HERMES_PROFILE
+        # values like "hermes-system" or "operator" can't be misread by the next worker as a system
+        # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
+        # author-forgery surface was already closed in #22435. See #22452.
+        safe_author = (c.author or "").replace("`", "")
+        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
+        lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+        lines.append("")
 
 
 # --- Stats + SLA helpers ---
@@ -8420,7 +8582,9 @@ def _to_epoch(val) -> Optional[int]:
 def task_age(task: Task) -> dict:
     """Return age metrics for a single task. All values are seconds or None."""
     now = int(time.time())
-    _c, _s, _co = task.created_at, task.started_at, task.completed_at  # from_row coerced
+    _c = _to_epoch(task.created_at)
+    _s = _to_epoch(task.started_at)
+    _co = _to_epoch(task.completed_at)
     return {
         "created_age_seconds": now - _c if _c is not None else None,
         "started_age_seconds": now - _s if _s is not None else None,
@@ -8471,7 +8635,14 @@ def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[
     log_dir = worker_logs_dir(board=board)
     if not log_dir.exists():
         return 0
-    return unlink_files_older_than(log_dir, "*", older_than_seconds)
+    cutoff = time.time() - older_than_seconds
+    removed = 0
+    for p in log_dir.iterdir():
+        with contextlib.suppress(OSError):
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+    return removed
 
 
 # --- Worker log accessor ---
@@ -8523,7 +8694,7 @@ def list_profiles_on_disk() -> list[str]:
         names.add("default")
     if profiles_dir.is_dir():
         try:
-            names.update(e.name for e in profiles_dir.iterdir() if e.is_dir() and (e / "config.yaml").is_file())  # config-reader: ok — profile directory discovery marker
+            names.update(e.name for e in profiles_dir.iterdir() if e.is_dir() and (e / "config.yaml").is_file())
         except OSError:
             pass
     return sorted(names)
@@ -8648,7 +8819,6 @@ from hermes_cli.kanban_db_boards import (
     board_is_archived_stub,
     list_dispatch_boards,
     _dir_holds_board,
-    _dir_is_registered,
     board_metadata_path,
     create_board,
     list_boards,
