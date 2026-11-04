@@ -50,7 +50,14 @@ def _collect_workspaces(profile: Optional[str], scan: bool) -> dict:
     from tui_gateway import methods_projects as gateway_projects
     from tui_gateway import session_workdir as gateway_workdir
 
-    db = _open_session_db_for_profile(profile, read_only=True)
+    # Browsing never bootstraps the owner's session store: a profile whose gateway has not
+    # yet initialized state.db simply contributes no session-derived roots (``db=None``).
+    try:
+        db = _open_session_db_for_profile(profile, read_only=True)
+    except HTTPException as exc:
+        if exc.status_code != 503:
+            raise
+        db = None
     try:
         with pdb.connect_closing() as conn:
             policy = gateway_projects._repo_discovery_policy()
@@ -60,7 +67,8 @@ def _collect_workspaces(profile: Optional[str], scan: bool) -> dict:
             repos = gateway_projects._discover_repos_payload(
                 db, conn=conn, backfill=False, include_cached=policy["enabled"])
     finally:
-        db.close()
+        if db is not None:
+            db.close()
     default_cwd = gateway_workdir._completion_cwd({"profile": profile} if profile else {})
     return {
         "projects": projects, "repos": repos, "default_cwd": default_cwd,

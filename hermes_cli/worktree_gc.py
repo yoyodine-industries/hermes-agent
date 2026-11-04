@@ -58,7 +58,7 @@ class BranchRecord:
 def _run(cmd: list, timeout: int, cwd: Optional[str] = None,
          env: Optional[dict] = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          timeout=timeout, cwd=cwd, env=env, stdin=subprocess.DEVNULL)
+                          timeout=timeout, cwd=cwd, env=env, stdin=subprocess.DEVNULL, check=False)
 
 
 @dataclass
@@ -91,10 +91,14 @@ def _git(args: list, cwd: str, timeout: int = 15) -> subprocess.CompletedProcess
 
 
 def _tree_size_mb(path: Path, timeout: int = 30) -> Optional[int]:
-    """Cheap directory size via ``du -sm`` — best-effort, None on failure."""
+    """Cheap directory size via ``du -sm`` — best-effort, None on failure or timeout. Not
+    ``subprocess.run``: its post-kill ``wait()`` never returns for a ``du`` stuck in uninterruptible
+    disk I/O, so the caller (a ``hermes -w`` launch, the cron prune thread) would hang with it."""
+    from hermes_cli._subprocess_compat import bounded_probe_run
+
     try:
-        result = _run(["du", "-sm", str(path)], timeout)
-        return int(result.stdout.split()[0]) if result.returncode == 0 and result.stdout.strip() else None
+        result = bounded_probe_run(["du", "-sm", str(path)], timeout=timeout)
+        return int(result.stdout.split()[0]) if result and result.returncode == 0 and result.stdout.strip() else None
     except Exception:
         return None
 
@@ -131,6 +135,10 @@ def _dirty_split(path: str) -> tuple[bool, list[str]]:
                 untracked.append(name)
             else:
                 tracked += 1
+        if not tracked:
+            from hermes_cli.worktree_retention import hidden_index_edits
+            if hidden_index_edits(path):  # skip-worktree / assume-unchanged edits
+                return True, []
         return tracked > 0, untracked
     except Exception:
         return True, []
@@ -349,9 +357,15 @@ def _classify_reapable(_ops, repo_root: str, entry: Path, merge_cache, remote_he
         # as unpushed forever. A head EXACTLY matching the remote branch has nothing origin lacks.
         if not _ops._worktree_branch_pushed_exact(path, remote_heads, timeout=10):
             return "keep", "unpushed commits not found upstream", []
+        blocked = _ops.removal_blocked(path)
+        if blocked:
+            return "keep", blocked[1], []
         if untracked:
             return "reap-keep-branch", f"pushed to origin (open-PR lane); branch kept; {archive_note}", untracked
         return "reap-keep-branch", "pushed to origin (open-PR lane); branch kept", []
+    blocked = _ops.removal_blocked(path)
+    if blocked:
+        return "keep", blocked[1], []
     if untracked:
         return "reap-archive", f"merged/pushed; {archive_note}", untracked
     return "reap", "clean and fully merged/pushed", []
@@ -616,8 +630,10 @@ def reclaim_branches(
     return actions
 
 
-def worktrees_summary(repo_root: str) -> tuple[int, Optional[int]]:
-    """(tree_count, total_size_mb) for the escalation notice; size is best-effort with a timeout."""
+def worktrees_summary(repo_root: str, *, size_below_count: Optional[int] = None) -> tuple[int, Optional[int]]:
+    """(tree_count, total_size_mb) for the escalation notice; size is best-effort with a timeout,
+    and skipped (None) once the count reaches *size_below_count*: sizing walks every file of every
+    tree, node_modules included."""
     worktrees_dir = Path(repo_root) / ".worktrees"
     if not worktrees_dir.exists():
         return 0, None
@@ -625,4 +641,6 @@ def worktrees_summary(repo_root: str) -> tuple[int, Optional[int]]:
         count = sum(1 for e in worktrees_dir.iterdir() if e.is_dir())
     except Exception:
         return 0, None
+    if size_below_count is not None and count >= size_below_count:
+        return count, None
     return count, _tree_size_mb(worktrees_dir, timeout=20)

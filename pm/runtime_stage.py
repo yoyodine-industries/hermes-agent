@@ -46,6 +46,7 @@ def stage_runtime(uv: Path, python: Path, destination: Path, *,
          "import packaging, tomli_w, truststore; from ruamel.yaml import YAML"],
         env=env, capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=30,
+        check=False,
     )
     if checked.returncode:
         raise InstallError("pm-runtime", f"dependency validation failed: {checked.stderr.strip()}")

@@ -37,6 +37,12 @@ BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
+# The @handle Bot Mode shows for a host's default profile, and the body of the 404 a peer returns for
+# a /p/<profile>/ prefix naming no profile it has (UNKNOWN_PROFILE_ERROR in
+# gateway/platforms/api_server_profile_prefix.py; a 'hermes' profile it has but does not serve differs).
+DEFAULT_PROFILE_HANDLE = "hermes"
+_UNKNOWN_PROFILE_ERROR = "Unknown or unconfigured profile"
+
 # One synchronous agent turn can legitimately take minutes. This stays the SERVER-budget
 # default: it is the wait budget the client ASKS THE PEER FOR (``X-Hermes-Wait-Seconds``),
 # and the peer runs the turn to completion whatever this client does. It is NOT this
@@ -251,6 +257,62 @@ def _base_url(peer: dict, profile: str | None) -> str:
     return url
 
 
+def _profile_404_message(exc: Exception) -> str | None:
+    """The message a peer's /p/<profile>/ prefix 404 carries, or None when this is not one.
+
+    The prefix middleware answers BEFORE any handler runs, so its body is the peer's own verdict
+    on the address: ``"Unknown or unconfigured profile"`` for a profile it does not have, and a
+    distinct message for one it HAS but does not serve (parked, standalone). A handler's 404
+    (unknown run or session) carries ``{"error": {"message": ...}}`` too, so callers that must
+    separate retention from a refusal read the message, not the shape.
+
+    One read only: an ``HTTPError`` body is a stream, and a second ``read()`` returns empty.
+    """
+    if not isinstance(exc, urllib.error.HTTPError) or exc.code != 404:
+        return None
+    try:
+        body = json.loads(exc.read().decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = body.get("error")
+    message = detail.get("message") if isinstance(detail, dict) else detail
+    return message if isinstance(message, str) and message.strip() else None
+
+
+def _resolve_base(peer: dict, profile: str | None, key: str, peer_name: str = "") -> str:
+    """The mirror a target addresses. Bot Mode shows a peer's default profile as @hermes
+    (#118076); an upgraded peer aliases ``/p/hermes`` to its default itself, unless it has a real
+    pre-reservation profile named ``hermes``, which keeps the handle. The client never reroutes on
+    its own: an older peer answers the same generic 404 for "no such profile" and for a real
+    ``hermes`` profile it does not serve (parked, standalone), so guessing ``/p/default`` there
+    delivers into the wrong agent. That ambiguous answer becomes an error naming the explicit
+    ``<peer>/default`` address instead."""
+    base = _base_url(peer, profile)
+    if profile != DEFAULT_PROFILE_HANDLE:
+        return base
+    try:
+        _request(f"{base}/health", key)
+    except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+        # The prefix's own verdict, read ONCE (a stream cannot be read twice): the generic
+        # no-such-profile answer is ambiguous and never a reroute, while a distinct refusal means
+        # the peer HAS the profile and will not serve it here — a cold failure, not a delivery.
+        verdict = _profile_404_message(exc)
+        if verdict is not None:
+            name = peer_name or "<peer>"
+            if verdict == _UNKNOWN_PROFILE_ERROR:
+                raise LookupError(
+                    f"Peer '{name}' answered that it serves no '{DEFAULT_PROFILE_HANDLE}' profile. That "
+                    f"answer is ambiguous: an up-to-date gateway gives it when it does not serve its "
+                    f"default profile, and an older one also when it has a '{DEFAULT_PROFILE_HANDLE}' "
+                    f"profile it does not serve. If the peer serves its default profile, address that "
+                    f"bot as {name}/default.") from exc
+            raise LookupError(
+                f"Peer '{name}' does not serve its '{DEFAULT_PROFILE_HANDLE}' profile: {verdict}") from exc
+    return base
+
+
 def _find_bot_chat(base: str, key: str) -> str | None:
     """The remote canonical Bot Chat's session id, or None.
 
@@ -308,6 +370,11 @@ def _parse_target(target: str) -> tuple[str, str | None]:
         raise ValueError("Peer name required (hermes peer dm <peer>[/<agent>] ...)")
     if profile and not _PROFILE_RE.match(profile):
         raise ValueError(f"Invalid agent/profile name: {profile!r}")
+    if profile:
+        # Profile ids are lowercase (normalize_profile_name); 'box/Hermes' must address the
+        # peer's real 'hermes' profile on every peer, including those that compare prefixes exactly.
+        from hermes_cli.profiles import normalize_profile_name
+        profile = normalize_profile_name(profile)
     return peer, profile
 
 
@@ -1469,9 +1536,8 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
     # Bot Chat completion, the Desktop bot_relay.deliver RPC and the one-shot
     # local `hermes chat -Q` transport (tools/bot_mode_dm.py) — this is the
     # 4th Bot Mode delivery door and was missing the same check.
-    from gateway.response_filters import is_intentional_silence_response
-    if is_intentional_silence_response(reply):
-        reply = ""
+    from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
+    reply = "" if is_intentional_silence_response(reply) else strip_trailing_silence_marker(reply)
     payload = {"peer": peer_name, "profile": profile,
                "session_id": result.get("session_id") or session_id, "reply": reply,
                "idempotency_key": idempotency_key, "waited_seconds": float(wait_seconds)}
@@ -1505,7 +1571,11 @@ def cmd_peer(args) -> int:
         # swallow. It goes on the board under the peer the caller named.
         _report_refusal(_target_peer(args.target), _refusal_class(exc), str(exc))
         return 1
-    base = _base_url(peer, profile)
+    try:
+        base = _resolve_base(peer, profile, key, peer_name)
+    except LookupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     if action in {"status", "stop"}:
         return _peer_run_ctl(args, action, peer_name, profile, base, key)
     if action == "reply":

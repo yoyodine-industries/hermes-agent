@@ -104,6 +104,7 @@ def _validate(python: Path, env: dict[str, str]) -> str:
              "import packaging, tomli_w, truststore; from ruamel.yaml import YAML"],
             env=env, capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=30,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return str(exc)
@@ -273,5 +274,5 @@ def runtime_command(script: Path, args: tuple[str, ...] | list[str] = (), *,
 
 def run_cli(argv: list[str]) -> int:
     result = subprocess.run(runtime_command(Path(__file__).with_name("launch.py"), argv),
-                            env=runtime_environment())
+                            env=runtime_environment(), check=False)
     return result.returncode

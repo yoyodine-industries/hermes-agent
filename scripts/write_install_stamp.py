@@ -67,7 +67,7 @@ def _run_git(*args: str, cwd: str | Path = _REPO_ROOT) -> str | None:
     try:
         result = subprocess.run(
             ["git", *args], capture_output=True, text=True, timeout=5, cwd=str(cwd),
-            encoding="utf-8", errors="replace",
+            check=False, encoding="utf-8", errors="replace",
         )
     except (OSError, subprocess.SubprocessError):
         return None

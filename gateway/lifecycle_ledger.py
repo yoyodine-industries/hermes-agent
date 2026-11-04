@@ -197,6 +197,8 @@ _INTEGRITY_CHECK_LEASE_S = 900.0
 # monotonic-clock compare, renewing at most every _INTEGRITY_CHECK_LEASE_RENEW_S.
 _INTEGRITY_CHECK_PROGRESS_OPS = 100_000
 _INTEGRITY_CHECK_LEASE_RENEW_S = 60.0
+# Bound on the deferred post-connect scan: a pathological store cannot pin its thread forever.
+STATE_DB_INTEGRITY_DEADLINE_S = 1800.0
 
 
 def _install_integrity_check_lease(conn: sqlite3.Connection, *, deadline_at: Optional[float] = None) -> None:
@@ -263,6 +265,19 @@ def check_state_db_integrity(home: Optional[Path] = None, *, deadline_s: Optiona
             return f"check-incomplete: exceeded {limit:g}s"
         return f"check-failed: {exc}"
     return "check-failed: no result" if not row or row[0] is None else str(row[0])
+
+
+def _state_db_journal_mode(path: Path) -> Optional[str]:
+    """On-disk journal mode of ``path`` via one ``PRAGMA journal_mode`` read on a short-lived
+    connection (no lock outlives it); ``None`` when undeterminable.  Never raises."""
+    try:
+        from hermes_state_wal import _on_disk_journal_mode
+
+        with closing(sqlite3.connect(str(path), timeout=1.0)) as conn:
+            return _on_disk_journal_mode(conn) or None
+    except Exception:
+        logger.debug("Could not read state.db journal mode", exc_info=True)
+        return None
 
 
 def _report_unclean_exit(evidence: dict[str, Any], home: Optional[Path], *, defer_integrity_check: bool = False) -> None:
@@ -333,7 +348,8 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
 
 
 def run_deferred_integrity_check(
-    evidence: Optional[Dict[str, Any]], *, home: Optional[Path] = None, deadline_s: float = 1800.0
+    evidence: Optional[dict[str, Any]], *, home: Optional[Path] = None,
+    deadline_s: float = STATE_DB_INTEGRITY_DEADLINE_S,
 ) -> str:
     """Run the deferred post-connect state.db scan and append a second diag record.
 
@@ -347,16 +363,33 @@ def run_deferred_integrity_check(
     <verdict>, "prior_pid": ...}`` and logs the existing ERROR text on a bad verdict.  NEVER
     raises -- a forensic scan must not disturb a running gateway (the alerting path is the
     bounded per-poll readiness probe ``gateway/readiness.py::_probe_state_db``).
+
+    Only a WAL store is scanned: in rollback-journal mode (``database.journal_mode: delete``,
+    or a silent WAL fallback) the scan's SHARED lock would block every live commit for its
+    whole run, so the scan is skipped with a ``skipped: ...`` verdict and one WARNING.  The
+    on-disk mode decides, not config; an undeterminable mode is skipped too.
     """
     try:
-        verdict = check_state_db_integrity(home=home, deadline_s=deadline_s)
-        if verdict not in ("ok", "absent"):
+        path = _home_path(home, "state.db")
+        mode = _state_db_journal_mode(path) if path.exists() else "wal"
+        if mode != "wal":
+            verdict = (f"skipped: rollback-journal store (journal_mode={mode or 'unknown'}), "
+                       "scan would block live writes")
+            logger.warning(
+                "Previous gateway exit was unclean, but the state.db integrity check was skipped: %s is a "
+                "rollback-journal store (journal_mode=%s) and a background scan would block live writes. "
+                "To check it, stop the gateway and run: sqlite3 %s 'PRAGMA quick_check'",
+                path, mode or "unknown", path,
+            )
+        else:
+            verdict = check_state_db_integrity(home=home, deadline_s=deadline_s)
+        if verdict not in ("ok", "absent") and not verdict.startswith("skipped:"):
             logger.error(
                 "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
                 "missing until it is repaired. Run `hermes doctor`.",
                 verdict,
             )
-        record: Dict[str, Any] = {
+        record: dict[str, Any] = {
             "ts": _now_iso(),
             "tag": "gateway.state_db_integrity",
             "deferred": True,

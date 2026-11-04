@@ -39,6 +39,7 @@ def _git(args, cwd, env=None):
         e.update(env)
     result = subprocess.run(
         ["git", *args], capture_output=True, text=True, cwd=str(cwd), env=e,
+        check=False,
     )
     assert result.returncode == 0, f"git {args} failed: {result.stderr}"
     return result.stdout.strip()
@@ -244,6 +245,7 @@ class TestReclaim:
         probe = subprocess.run(
             ["git", "rev-parse", "--verify", "--quiet", branch],
             capture_output=True, text=True, cwd=str(repo),
+            check=False,
         )
         assert probe.returncode != 0, "branch should be gone with its tree"
 
@@ -569,6 +571,16 @@ class TestCmdWorktreeJson:
             branches_only=kw.get("branches_only", False),
         )
 
+    @pytest.fixture(autouse=True)
+    def _no_host_process_table(self, monkeypatch):
+        # The sweep keeps a tree that a live process sits in. Reading the HOST's process table makes
+        # these tests machine-dependent -- and trips the home-I/O guard on any box where a lane's
+        # shell sits under the real hermes home -- while the contract under test is the report's
+        # shape. Pin the scan to empty (t_a97bae7e: upstream's sweep engine reached the carrier's
+        # report tests through the merge).
+        from hermes_cli import worktree_sweep
+        monkeypatch.setattr(worktree_sweep, "live_process_pids", lambda paths, exclude=(): {})
+
     def test_list_json_shape(self, repo, capsys):
         import json
 
@@ -577,7 +589,7 @@ class TestCmdWorktreeJson:
         _add_worktree(repo, "hermes-json")
         assert cmd_worktree(self._ns(repo, "list")) == 0
         payload = json.loads(capsys.readouterr().out)
-        assert set(payload) == {"repo", "trees", "external_trees", "branches"}
+        assert set(payload) == {"repo", "trees", "external_trees", "branches", "archives"}
         names = [t["name"] for t in payload["trees"]]
         assert "hermes-json" in names
         tree = next(t for t in payload["trees"] if t["name"] == "hermes-json")

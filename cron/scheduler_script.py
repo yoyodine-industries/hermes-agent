@@ -28,7 +28,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 if TYPE_CHECKING:
-    from cron.scheduler import _CancelEventLike
+    from cron.cancellation import _CancelEventLike
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -499,7 +499,10 @@ def _run_job_script(
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
-    script_timeout = _get_script_timeout(job)
+    # Upstream's call shape is ``_get_script_timeout()`` and its stubs are 0-arg; the row's
+    # per-job rung takes an OPTIONAL job. Pass the job only when there is one, so a no-job run
+    # keeps the upstream call shape and both stub signatures hold (t_a97bae7e).
+    script_timeout = _get_script_timeout(job) if job is not None else _get_script_timeout()
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
@@ -514,6 +517,7 @@ def _run_job_script(
         # the reader thread and fails the whole run, discarding the output (#105582; the
         # Windows branch decodes as lossy UTF-8 per #45099).
         popen_kwargs: dict[str, Any] = {
+            # detached-spawn: ok — awaited; cancel and timeout tree-kill the group
             "start_new_session": True,
         }
         if sys.platform == "win32":
@@ -552,7 +556,8 @@ def _run_job_script(
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
-                return False, "Script cancelled because cron fire ownership was lost"
+                from cron.cancellation import cancel_reason
+                return False, f"Script cancelled: {cancel_reason(cancel_event)}"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_cron_script_tree(proc)

@@ -534,26 +534,38 @@ def _backup_db_file(db_path: Path) -> tuple[Optional[Path], Optional[str]]:
         return None, f"backup copy failed: {exc}"
 
 
-def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> None:
+def _rw_or_vanished(p: Path) -> bool:
+    """True when *p* is read-write for this user OR no longer exists.
+
+    The preflight lists the files first and checks them after, and a live sibling connection's last ``close()``
+    unlinks ``-wal``/``-shm`` in between (a concurrent quarantine can rename ``state.db`` aside the same way).
+    ``os.access`` on the vanished path returns False, which is "gone", not "read-only". The final re-check covers
+    a sidecar that vanished and was recreated by the next opener before ``exists()`` ran.
+    """
+    mode = os.R_OK | os.W_OK
+    return os.access(p, mode) or not p.exists() or os.access(p, mode)
+
+
+def preflight_db_writability(db_path: Path, *, db_label: str = "state.db", directory_only: bool = False) -> None:
     """Refuse-or-repair read-only DB paths BEFORE the first connection opens.
 
-    A stray read-only ``state.db`` (sudo run, restored backup, copied dotfiles) otherwise surfaces as an opaque
-    "attempt to write a readonly database" inside ``_init_schema``, and the obvious wrong "fix" (deleting the
-    ``-wal``) loses committed transactions. ``chmod u+rw`` repair only inside the Hermes home tree (Hermes owns
-    those files; ``chmod`` fails on files the user doesn't own, bounding the repair exactly); otherwise fail fast
-    naming the file and command.
+    A stray read-only ``state.db`` (sudo run, restored backup, copied dotfiles) otherwise surfaces as an
+    opaque "attempt to write a readonly database" inside ``_init_schema``, and the obvious wrong "fix"
+    (deleting the ``-wal``) loses committed transactions. ``chmod u+rw`` repair only inside the Hermes home
+    tree (Hermes owns those files; ``chmod`` fails on files the user doesn't own, bounding the repair
+    exactly); otherwise fail fast naming the file and command.
 
-    Only paths that MUST exist are judged: the directory and the main database file. SQLite's own bookkeeping is
-    not ours to police — ``-wal``/``-shm``/``-journal`` are created, truncated and UNLINKED by every connection at
-    checkpoint, so their *absence* is the normal state, not a permission fault. A sidecar is therefore never
-    tested, never repaired from here and never reported: a check made from this function cannot tell "checkpointed
-    away a microsecond ago" from "owned by another user", and reading it as a permissions problem invented
-    "state.db is not writable" on healthy stores — pointing the operator at the one action that destroys committed
-    data. If the store is genuinely unwritable the first connection raises the real error, and that is the correct
-    signal.
+    Only paths that MUST exist are judged: the directory and the main database file. SQLite's own
+    bookkeeping is not ours to police — ``-wal``/``-shm``/``-journal`` are created, truncated and UNLINKED
+    by every connection at checkpoint, so their *absence* is the normal state, not a permission fault. A
+    sidecar is therefore never tested, never repaired from here and never reported: a check made here
+    cannot tell "checkpointed away a microsecond ago" from "owned by another user", and reading it as a
+    permissions problem invented "state.db is not writable" on healthy stores — pointing the operator at
+    the one action that destroys committed data. If the store is genuinely unwritable the first connection
+    raises the real error, and that is the correct signal.
 
-    Never deletes/truncates a WAL sidecar — once the directory and the main file are writable, the normal open
-    checkpoints it. ``:memory:``/``file:`` skipped. Shared with ``kanban_db``.
+    Never deletes/truncates a WAL sidecar — once the directory and the main file are writable, the normal
+    open checkpoints it. ``:memory:``/``file:`` skipped. Shared with ``kanban_db``.
 
     Port of Kilo-Org/kilocode#12508's startup preflight. This preflight:
     """
@@ -562,15 +574,14 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
     home: Optional[Path] = None
     with contextlib.suppress(Exception):  # pragma: no cover - defensive
         home = Path(get_hermes_home()).resolve()
-    # Only the paths that must exist for SQLite to open the store: the directory (every journal mode needs a
-    # writable one) and the main DB file. Sidecars are SQLite's bookkeeping and are deliberately NOT inspected:
-    # they are created, truncated and UNLINKED at checkpoint, so absence is the normal state, not a permission
-    # fault — a snapshot here cannot tell the two apart, and reporting the first as the second points the operator
-    # at deleting the one file that holds committed data. If the store is genuinely unwritable the first
-    # connection raises the real error, and that is the correct signal.
-    files = ((db_path, False),) if db_path.is_file() else ()
+    # Only the paths that must exist for SQLite to open the store: the directory (every journal mode
+    # needs a writable one) and the main DB file. Sidecars are SQLite's bookkeeping and are deliberately
+    # NOT inspected: they are created, truncated and UNLINKED at checkpoint, so absence is the normal
+    # state, not a permission fault — a snapshot here cannot tell the two apart, and reporting the first
+    # as the second points the operator at deleting the one file that holds committed data.
+    files = ((db_path, False),) if db_path.is_file() and not directory_only else ()
     for p, is_dir in [(db_path.parent, True), *files]:
-        if (is_dir and not p.is_dir()) or os.access(p, os.R_OK | os.W_OK):
+        if (is_dir and not p.is_dir()) or _rw_or_vanished(p):
             continue
         x = "x" if is_dir else ""
         in_scope = False
