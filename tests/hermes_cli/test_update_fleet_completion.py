@@ -51,8 +51,13 @@ def test_fleet_completion_preserves_runtime_verdict_and_restart_obligation(
         )
 
     receipt = json.loads((get_hermes_home() / "logs/update_receipts/latest.json").read_text())
-    # Was "partial" when not healthy: the run is a success; an owed fleet restart is a follow-up.
-    assert receipt["outcome"] == "success"
+    # Was "partial" when not healthy: the run COMMITTED and an owed fleet restart is a follow-up.
+    # But only a fleet PROVEN current may call the run a success (t_81e506a1): a stale/down row
+    # downgrades the outcome while keeping the very same follow-up.
+    assert receipt["outcome"] == (
+        update_receipt.STALE_SERVICE_OUTCOME if state in ("stale", "down") else "success")
+    assert [row["service"] for row in receipt["served_code"]["stale_services"]] == (
+        ["default"] if state in ("stale", "down") else [])
     assert [f["step"] for f in receipt.get("followups", [])] == ([] if state == "current" else ["gateway_restart"])
     assert receipt["fleet"] == snapshot
     # The two verdicts stay independent: only the fleet keeps the restart obligation armed.

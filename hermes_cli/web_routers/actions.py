@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from hermes_cli.config import format_docker_update_message, recommended_update_command_for_method
 from hermes_cli.update_contract import COMMIT_BUILD_UPDATE_MESSAGE, is_commit_build
+from hermes_cli.update_receipt import is_committed_outcome, outcome_exit_code
 from hermes_cli.version_info import get_version_info
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_gateway import _ACTION_LOG_FILES
@@ -374,11 +375,12 @@ def _completed_exit_code(
         return result.get("exit_code")
     if durable_action_id:
         return 0
-    if receipt is not None and receipt.get("outcome") in ("success", "partial"):
+    if receipt is not None and is_committed_outcome(receipt.get("outcome")):
         # No in-memory result and no log marker (e.g. log rotated), but THIS
         # action's receipt proves a completed run: report its outcome rather than
-        # a null clients time out on. ``partial`` maps to exit 1 like the CLI.
-        return 0 if receipt["outcome"] == "success" else 1
+        # a null clients time out on. ``partial`` maps to exit 1 like the CLI;
+        # ``success_with_stale_service`` maps to 0 (the code landed -- contract C3).
+        return outcome_exit_code(receipt.get("outcome"))
     return None
 
 

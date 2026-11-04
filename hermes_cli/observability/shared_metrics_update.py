@@ -40,7 +40,11 @@ RECORDED_DIRNAME = "recorded_updates"
 _RECORDED_KEEP = 64
 _UPDATE_ID = re.compile(r"[0-9a-f]{8,64}")
 # Receipt pm/Desktop outcome words → hermes.update.run outcome; anything else failed.
-_RUN_OUTCOMES = {"success": "success", "refused": "refused", "noop": "noop"}
+_RUN_OUTCOMES = {"success": "success", "refused": "refused", "noop": "noop",
+                 # A committed update whose owed service restart did not land (t_81e506a1): the
+                 # telemetry vocabulary calls that ``partial`` and the failure class below turns the
+                 # stale fleet rows into ``fleet_stale`` -- never a silent success.
+                 "success_with_stale_service": "partial"}
 _FLEET_BAD_STATES = frozenset({"stale", "down"})
 # Desktop mechanism (updater strategy kind) → apply_mode.
 _DESKTOP_APPLY_MODES = {

@@ -478,11 +478,39 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
         # Credited units changed the restart result; save it with the final verdict so it agrees with
         # the follow-up above.
         restart.record_receipt()
+    # THE SERVED-CODE POST-CONDITION (t_81e506a1): a receipt may say ``success`` only when every
+    # service this run restarted is PROVEN to be serving the tree it installed. The evidence is the
+    # fleet snapshot above -- the same rows the matrix printed -- so the verdict CONSUMES the check
+    # the updater already ran instead of assuming its own restart worked. A stale or down service
+    # downgrades ``success`` to ``success_with_stale_service``, which names the service and both
+    # shas; it never fails the update (the code is committed, contract C3).
+    _installed_sha = ""
+    _stale_services: list = []
+    with _best_effort('Served-code post-condition failed: %s'):
+        from hermes_cli.update_receipt import served_code_failures
+
+        _installed_sha = fleet._current_checkout_sha() or ""
+        _stale_services = served_code_failures(_fleet_snapshot, installed_sha=_installed_sha)
+    if _stale_services:
+        print()
+        print(f"⚠ Update committed, but {len(_stale_services)} service(s) are NOT serving it:")
+        for _row in _stale_services:
+            print(
+                f"    {_row.get('service')}: serving {str(_row.get('running_sha') or 'unknown')[:8]}"
+                f" ({_row.get('running_version') or 'unknown'}),"
+                f" installed {( _installed_sha or 'unknown')[:8]}"
+            )
+        print("    The receipt records `success_with_stale_service`."
+              " Restart them with `hermes gateway restart`.")
     with _best_effort('Update receipt finalize failed: %s'):
-        from hermes_cli.update_receipt import finalize_update_receipt
+        from hermes_cli.update_receipt import (
+            STALE_SERVICE_OUTCOME, finalize_update_receipt, record_served_code,
+        )
         # A False ``update_complete`` (unsafe SQLite runtime, owed tail work) never fails the
         # run: maintenance already reported it as a follow-up. It only vetoes migration below.
-        _receipt_path = finalize_update_receipt("success", fleet=_fleet_snapshot)
+        record_served_code(_stale_services, installed_sha=_installed_sha)
+        _receipt_path = finalize_update_receipt(
+            STALE_SERVICE_OUTCOME if _stale_services else "success", fleet=_fleet_snapshot)
         if _receipt_path is not None:
             logger.info("Update receipt written: %s", _receipt_path)
 

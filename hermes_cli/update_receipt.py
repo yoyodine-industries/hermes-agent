@@ -51,6 +51,38 @@ _RECEIPT_KEEP = 20  # keep the last N receipts in the root home's receipt direct
 _FINALIZED: dict[str, dict[str, Any]] = {}
 COMMAND_BOUNDARY_STOP_REASON = "completed at command boundary"
 
+# The update's served-code POST-CONDITION and the outcome that names its failure (t_81e506a1).
+#
+# ``success`` means the whole post-condition held: the code is on disk AND every declared service is
+# PROVEN to be serving the tree that was just installed. ``success_with_stale_service`` is the run
+# where the code landed but that proof FAILED -- a live service still answering on the previous sha,
+# or one the restart stopped and never replaced. It is never ``success`` (the false green that let a
+# "successful" update leave the messaging fleet refusing every DM for 46 minutes) and never ``failed``
+# (contract C3: the pull and rebuild landed, so a stale gateway is owed work, not a rollback).
+STALE_SERVICE_OUTCOME = "success_with_stale_service"
+
+#: Outcomes whose run COMMITTED the checkout (the code is in place, never rolled back). ``partial``
+#: is committed too -- the user still has a parked change to settle -- but it exits 1, so it lives
+#: only in the committed set and never in :data:`_EXIT_ZERO_OUTCOMES`.
+_COMMITTED_OUTCOMES = frozenset({"success", STALE_SERVICE_OUTCOME, "partial"})
+_EXIT_ZERO_OUTCOMES = frozenset({"success", STALE_SERVICE_OUTCOME})
+
+
+def is_committed_outcome(outcome: Any) -> bool:
+    """Whether a terminal ``outcome`` describes a run whose code is IN PLACE (never rolled back)."""
+    return str(outcome or "") in _COMMITTED_OUTCOMES
+
+
+def outcome_exit_code(outcome: Any) -> int:
+    """The process exit code a terminal ``outcome`` stands for: 0 when the pipeline finished.
+
+    ``success_with_stale_service`` exits 0 exactly like ``success``: the code was installed and the
+    owed service restart is a follow-up (contract C3), so a shell or launchd caller must never read
+    it as a failed update. Only the receipt's ``outcome`` -- and the services it names -- carries
+    the stale-service verdict.
+    """
+    return 0 if str(outcome or "") in _EXIT_ZERO_OUTCOMES else 1
+
 # Receipt state is per-CONTEXT, not a module global: a nested
 # ``hermes update`` receipt (or one in another thread) must never clobber
 # the outer one, and the boundary finalize must see exactly its own
@@ -86,13 +118,15 @@ def adopt_terminal_receipt(data: Any) -> None:
 
 
 def committed_success() -> bool:
-    """True when this command's run is closed and its receipt says ``success`` (C3).
+    """True when this command's run is closed and exited 0 (C3).
 
     The gateway ``/update`` status written at the command boundary follows the receipt: an
     interrupt or error that escapes after the run closed as a success never reports it failed.
+    ``success_with_stale_service`` counts here too -- the code landed and the owed service restart
+    is a follow-up, so the boundary must not rewrite it as a failed update (t_81e506a1).
     """
     cell = _scope_terminal.get()
-    return _current.get() is None and bool(cell) and cell.get("outcome") == "success"
+    return _current.get() is None and bool(cell) and outcome_exit_code(cell.get("outcome")) == 0
 
 
 def current_correlation_id() -> Optional[str]:
@@ -513,6 +547,19 @@ def record_fact(key: str, value: Any) -> None:
     _record("fact", f"update fact {key}", key, value)
 
 
+def record_served_code(failures: list[dict[str, Any]], *, installed_sha: Optional[str] = None) -> None:
+    """Record the served-code post-condition's verdict on the open receipt (t_81e506a1).
+
+    ``proven`` is True only when nothing failed the post-condition; ``stale_services`` names every
+    service that is not on ``installed_sha`` (empty when the proof held). No-op with no open receipt.
+    """
+    _record("fact", "update served-code verdict", "served_code", {
+        "installed_sha": installed_sha,
+        "proven": not failures,
+        "stale_services": list(failures),
+    })
+
+
 def record_gateway_restart(**kwargs: Any) -> None:
     """Record the gateway restart phase outcome (see UpdateReceipt)."""
     _record("gateway_restart_result", "gateway restart result", **kwargs)
@@ -622,7 +669,11 @@ def record_stop_without_receipt(reason: str, outcome: str) -> None:
 
 
 def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason: str = "") -> Optional[Path]:
-    """Finalize + persist the receipt (``success``/``partial``/``failed``/``refused``); path or None.
+    """Finalize + persist the receipt (``success``/``success_with_stale_service``/``partial``/``failed``/``refused``); path or None.
+
+    ``success`` is reserved for a run whose served-code post-condition HELD (see
+    :func:`served_code_failures`): ``success_with_stale_service`` is the committed update that left a
+    service on the previous sha (t_81e506a1), and :func:`outcome_exit_code` keeps it a exit-0 run.
 
     Exactly-once by construction: the context's receipt is popped first, so a second call (e.g. the
     command-boundary safety net after an inner path already finalized) is a no-op returning None.
@@ -1113,6 +1164,45 @@ RESTART_PENDING_STATE = "restart_pending"
 def row_is_external(row: Any) -> bool:
     """Whether a fleet row serves a checkout this update did not touch."""
     return isinstance(row, dict) and row.get("state") == EXTERNAL_STATE
+
+
+#: Fleet-row states that PROVE a declared service is not serving this update's code.
+_SERVED_CODE_FAILURE_STATES = frozenset({"stale", "down"})
+
+
+def served_code_failures(fleet: Any, *, installed_sha: Optional[str] = None) -> list[dict[str, Any]]:
+    """The update's served-code POST-CONDITION: rows proving a service is NOT on the new code.
+
+    A row fails it when it is ``stale`` (a live service answering on a different sha) or ``down``
+    (the restart stopped it and nothing came back) AND it serves THIS updater's checkout -- a
+    profile running another checkout is updated separately, so it can never fail this run's
+    post-condition (see :func:`row_is_external`). ``unknown`` is NOT a failure: an unstamped
+    service is no proof of a stale one. ``restart_pending`` is not one either: it is the gateway
+    this updater runs inside, which can only restart after we exit.
+
+    Each failure NAMES the service and both shas -- the running one and the one this update
+    installed -- because the receipt is what an operator reads at 22:00, and "success" next to a
+    fleet answering 503 is exactly the false green this post-condition exists to kill (t_81e506a1).
+    """
+    if not isinstance(fleet, (list, tuple)):
+        return []
+    failures: list[dict[str, Any]] = []
+    for row in fleet:
+        if not isinstance(row, dict) or row_is_external(row):
+            continue
+        state = row.get("state")
+        if state not in _SERVED_CODE_FAILURE_STATES:
+            continue
+        failures.append({
+            "service": row.get("profile") or f"pid:{row.get('pid')}",
+            "profile": row.get("profile"),
+            "pid": row.get("pid"),
+            "state": state,
+            "running_sha": row.get("code_sha"),
+            "running_version": row.get("code_version"),
+            "installed_sha": installed_sha,
+        })
+    return failures
 
 
 def _fleet_row(

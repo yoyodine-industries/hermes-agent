@@ -172,7 +172,7 @@ def main(context: Path, result: Path) -> int:
             from hermes_cli.runtime_state import _atomic_bytes
 
             _atomic_bytes(get_hermes_home() / ".update_exit_code",
-                          b"0" if terminal.get("outcome") == "success" else b"1")
+                          b"0" if update_receipt.outcome_exit_code(terminal.get("outcome")) == 0 else b"1")
         if restarting and not cli_started:
             # Startup failed before the replacement command could own a
             # receipt. Preserve the original handoff, just like preparation.

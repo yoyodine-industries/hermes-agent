@@ -26,6 +26,18 @@ def _exit_status(code: int) -> int:
     return code if code >= 0 else 128 - code
 
 
+#: Terminal receipt outcomes that stand for exit 0 (t_81e506a1). Deliberately LOCAL: this transport
+#: runs from the tree that STARTED the update and must never import the replacement checkout's
+#: helpers. ``success_with_stale_service`` is a committed update whose owed service restart is a
+#: follow-up (contract C3), so it exits 0 exactly like ``success``.
+_EXIT_ZERO_OUTCOMES = frozenset({"success", "success_with_stale_service"})
+
+
+def _outcome_exit_code(outcome: object) -> int:
+    """The process exit code a terminal ``outcome`` stands for."""
+    return 0 if str(outcome or "") in _EXIT_ZERO_OUTCOMES else 1
+
+
 def _write_bootstrap_result(request: dict, result_path: Path, code: int, receipt: dict | None) -> int:
     """The bootstrap child's answer; windows_resume stays the parent's token (and its atexit net)."""
     _write_json(result_path, {
@@ -144,7 +156,7 @@ def run_completion(request: dict) -> dict:
             if receipt is not None and (
                 receipt.get("update_id") != request["receipt"]["update_id"]
                 or not receipt.get("finished_at")
-                or (code == 0) != (receipt.get("outcome") == "success")
+                or code != _outcome_exit_code(receipt.get("outcome"))
             ):
                 raise ValueError("completion receipt does not attest this outcome")
             if code == 0 and receipt is None:
@@ -312,7 +324,7 @@ def _settle_after_commit(request: dict, result_path: Path, step: str, reason: st
             print(_owed_user_action(request))  # the completion child that would print it never ran
         update_receipt.finalize_pending_update_receipt(0, f"{step} owed after the code was updated")
         receipt = _read_terminal_receipt(request)
-    code = 0 if receipt is not None and receipt.get("outcome") == "success" else 1
+    code = _outcome_exit_code(receipt.get("outcome")) if receipt is not None else 1
     if code == 0:
         _publish_gateway_success(request)
     return _write_bootstrap_result(request, result_path, code, receipt)
@@ -532,7 +544,7 @@ def _finish(request: dict, result_path: Path) -> int:
                                         f"Windows gateway recovery failed: {exc}")
         update_receipt.finalize_pending_update_receipt(code, reason)
         terminal_receipt = _read_terminal_receipt(request)
-        if terminal_receipt and terminal_receipt.get("outcome") == "success":
+        if terminal_receipt and update_receipt.outcome_exit_code(terminal_receipt.get("outcome")) == 0:
             code = 0  # an interrupt that landed after verification closed the run (review regression 3)
         if code and request["gateway_mode"]:
             from hermes_cli.update_cmd import _write_gateway_update_exit_code
