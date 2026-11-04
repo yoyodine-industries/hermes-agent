@@ -18,6 +18,19 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+def _is_card_tree(name: str) -> bool:
+    """True for a ``t_<8 hex>`` scratch entry — a tree named for the card that owns it.
+
+    Imported lazily: ``hermes_constants`` imports this module inside its own functions, so a
+    module-level import here would close a cycle. The pattern is the ONE shape the fleet's
+    board-aware reaper will adopt, and this pruner must not decide such a tree by age.
+    """
+    from hermes_constants import CARD_SCRATCH_NAME_RE
+
+    return bool(CARD_SCRATCH_NAME_RE.match(name))
+
+
 # How long a TERMed process gets before KILL; browsers exit well within this.
 _REAP_GRACE_SECONDS = 3.0
 # ``.git`` files (linked worktrees) are looked for this deep; lanes nest repo/tree/subtree.
@@ -264,6 +277,16 @@ def _prune_idle_entries(
         entries = [e for e in root.iterdir() if e.name not in skip_names]
     except OSError:
         return 0
+    # A CARD-KEYED tree (``t_<cardid>``) is not this pruner's to decide (card t_a47cec75).
+    # Age is the wrong predicate for it: an OPEN card's tree is its working set however old
+    # the files in it look, and a DONE card's tree should go the moment the card is closed,
+    # not 24 h later. The fleet's board-aware reaper holds that rule; here the tree is left
+    # alone, and left alone loudly enough that a store nobody reaps is visible in the log.
+    card_trees = [e for e in entries if _is_card_tree(e.name)]
+    entries = [e for e in entries if not _is_card_tree(e.name)]
+    if card_trees:
+        audit.info("scratch prune: left %d card-keyed tree(s) to the board-aware reaper: %s",
+                   len(card_trees), ", ".join(sorted(e.name for e in card_trees)))
     doomed = [e for e in entries if not subtree_touched_since(e, cutoff)]
     # Runs even with nothing to delete: orphans whose cwd was removed by an earlier pass
     # (or by hand) are found by the deleted-cwd rule, not by membership in ``doomed``.

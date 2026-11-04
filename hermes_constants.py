@@ -742,6 +742,17 @@ def apply_subprocess_home_env(env: MutableMapping[str, str]) -> None:
 SCRATCH_TMP_ENV_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_DIR_MARKER_ENV = "HERMES_SCRATCH_DIR"
 SCRATCH_MAX_IDLE_HOURS = 24
+#: The card a process is working FOR, and the marker file a card-keyed scratch tree carries
+#: (card t_a47cec75). The reaper that can read a board decides a tree by its card's row, so
+#: the name has to survive the process that made it: a rule nobody can point at is a rule
+#: that drifts, which is how the fleet's scratch stores filled (28.74 GiB in 1,512 entries on
+#: one lane, 61 of the 80 largest trees carrying no attributable card at all).
+KANBAN_CARD_ENV = "HERMES_KANBAN_TASK"
+KANBAN_CARD_MARKER = "KANBAN_CARD"
+#: The ONLY shape a scratch entry may use to be adopted by the board-aware reaper: a bare
+#: ``t_<8 hex>`` card id. Kept exact on purpose — a looser match would let the reaper guess
+#: an owner out of a hand-written name, and a guessed owner is worse than a kept tree.
+CARD_SCRATCH_NAME_RE = re.compile(r"^t_[0-9a-f]{8}$")
 _SCRATCH_PRUNE_STAMP = ".last_prune"
 _SCRATCH_PRUNE_INTERVAL_SECONDS = 3600
 _scratch_pruned_once = False
@@ -915,6 +926,73 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     return scratch
 
 
+def scratch_owner_card(env: MutableMapping[str, str] | None = None) -> str | None:
+    """The card this process is working FOR, as ``t_<8 hex>``, or ``None``.
+
+    Read from ``HERMES_KANBAN_TASK`` (what the dispatcher exports for a card's worker), then
+    from the marker of an enclosing card-keyed tree, so a grandchild that inherited only
+    ``TMPDIR`` still knows which card it belongs to. Anything that is not the exact id shape
+    is ignored rather than guessed at: a wrong owner would let the reaper delete a LIVE
+    card's working set, which is the one mistake this whole convention exists to prevent.
+    """
+    source = os.environ if env is None else env
+    for key in (KANBAN_CARD_ENV, "KANBAN_CARD"):
+        value = (source.get(key) or "").strip()
+        if CARD_SCRATCH_NAME_RE.match(value):
+            return value
+    tmp = (source.get("TMPDIR") or "").strip()
+    if tmp:
+        candidate = Path(tmp).name
+        if CARD_SCRATCH_NAME_RE.match(candidate):
+            return candidate
+    return None
+
+
+def card_scratch_dir(home: str | Path | None = None, card: str | None = None) -> Path | None:
+    """``<home>/cache/scratch/t_<cardid>`` — the tree a card's processes work in.
+
+    Created on demand with the home's permission policy, carrying a ``KANBAN_CARD`` marker
+    that names the card and the creating pid. ``None`` when the process is not working for a
+    card, which is the ordinary case for an interactive session: those keep the shared
+    ``cache/scratch`` root (see :func:`get_scratch_dir`).
+
+    This is the WRITER side of the same contract the fleet's reaper reads (card t_a47cec75):
+    a tree named for its card can be reclaimed the moment that card is terminal, because the
+    row it names is evidence a guessed name never is.
+    """
+    card = card if card is not None else scratch_owner_card()
+    if not card or not CARD_SCRATCH_NAME_RE.match(card):
+        return None
+    root = get_scratch_dir(home, prune=False)
+    tree = root / card
+    try:
+        import time
+
+        tree.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            base = Path(home) if home is not None else get_hermes_home()
+            apply_secure_dir_policy(tree, home=base)
+        marker = tree / KANBAN_CARD_MARKER
+        if not marker.exists():
+            marker.write_text(
+                f"card: {card}\npid: {os.getpid()}\ncreated: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n",
+                encoding="utf-8")
+    except OSError:
+        return None
+    return tree
+
+
+def process_scratch_dir(home: str | Path | None = None,
+                        env: MutableMapping[str, str] | None = None) -> Path:
+    """The scratch dir THIS process should hand its children: the card's tree, else the root.
+
+    One line at the writer's side is what makes every child's ``tempfile`` output card-keyed
+    without a single call site knowing — the naming is a property of the process tree, not a
+    habit an agent is asked to remember.
+    """
+    return card_scratch_dir(home, scratch_owner_card(env)) or get_scratch_dir(home)
+
+
 def prune_scratch_dir(scratch: Path | None = None, max_idle_hours: float = SCRATCH_MAX_IDLE_HOURS) -> int:
     """Delete top-level scratch entries with no write anywhere in their subtree for
     *max_idle_hours*, reaping processes and git worktree registrations rooted in them
@@ -971,7 +1049,11 @@ def apply_scratch_tmp_env(env: MutableMapping[str, str]) -> bool:
             return False
     home = env.get("HERMES_HOME", "").strip()
     try:
-        scratch = str(get_scratch_dir(_expand_hermes_home(home) if home else get_process_hermes_home()))
+        # A card's worker gets the CARD's tree, so every child's tempfiles are named for the
+        # card that authorised them (card t_a47cec75) — the writer's half of the reaper's
+        # contract. Everything else keeps the shared root.
+        scratch = str(process_scratch_dir(
+            _expand_hermes_home(home) if home else get_process_hermes_home(), env))
     except (RuntimeError, OSError):
         # No HERMES_HOME and no resolvable user home (a child env built from nothing on
         # Windows): there is no scratch dir to point at; the child keeps the OS default.
