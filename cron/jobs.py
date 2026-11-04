@@ -3334,7 +3334,96 @@ def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str
     return slot
 
 
-def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float) -> bool:
+# --------------------------------------------------------------------------- #
+# THE CRON SEAM OF THE FLEET HOLD (card t_2f60a701)
+#
+# ``agent.estop.work_admitted`` is the ONE predicate for "may new work start in this lane", and
+# the kanban dispatch seam already gates on it. CRON DID NOT, and that gap is why a maintenance
+# window could not produce a lull: every job in every home kept firing straight through the
+# window's own hold, so a gate that parked the fleet and then measured for quiet only ever
+# measured its own cadence. (Measured 2026-11-03: fourteen consecutive departures died at
+# ``drain_gate`` classified ``cadence``.)
+#
+# The rule is deliberately stronger than "do not dispatch": a slot that elapses under a hold is
+# COLLAPSED to the next live slot -- never fired late, never replayed on release. A hold lifted
+# after nine jobs missed an occurrence must not fire those nine at one instant.
+# --------------------------------------------------------------------------- #
+
+_HOLD_LOG_INTERVAL_S = 600.0
+_hold_logged: Dict[Tuple[str, str], float] = {}
+
+
+def cron_store_lane(store: "_CronStorePaths | None" = None) -> str:
+    """The lane a cron store belongs to: ``default`` at a hermes home, else ``profiles/<lane>``.
+
+    Read from the STORE'S OWN PATH -- the same rule the fleet's hold scoping uses -- so a job is
+    attributed to the home it lives in and never to whichever profile happens to be scheduling.
+    """
+    try:
+        home = Path((store or _current_cron_store()).cron_dir).parent
+    except Exception:
+        return ""
+    if home.parent.name == "profiles":
+        return home.name
+    return "default"
+
+
+def hold_admission():
+    """``(work_admitted, state, lane)`` while a hold is live for this home, else ``None``.
+
+    Read ONCE per scan so a single tick can never see two different modes. FAIL-OPEN on purpose:
+    a scheduler that stops because the estop helper could not be read is a fleet-wide silent stop
+    with no owner, which is worse than one late job. An unreadable hold therefore changes nothing.
+    """
+    try:
+        from agent import estop
+
+        state = estop.read_state()
+    except Exception:  # noqa: BLE001 - see fail-open above
+        logger.debug("cron: estop state unreadable; no hold applied", exc_info=True)
+        return None
+    if not getattr(state, "engaged", False):
+        return None
+    lane = cron_store_lane()
+    if not lane:
+        return None
+    return (estop.work_admitted, state, lane)
+
+
+def _defer_under_hold(d: "_DueJob", recurring: bool, admission) -> bool:
+    """True when this job's slot must be COLLAPSED instead of dispatched: its lane is held."""
+    if admission is None:
+        return False
+    admitted, state, lane = admission
+    try:
+        if admitted(lane, state=state):
+            return False
+    except Exception:  # noqa: BLE001 - fail open, exactly as hold_admission() does
+        return False
+    key = (lane, str(d.job.get("id") or ""))
+    now_mono = time.monotonic()
+    last = _hold_logged.get(key)
+    if last is None or now_mono - last >= _HOLD_LOG_INTERVAL_S:
+        if len(_hold_logged) > 512:
+            _hold_logged.clear()
+        _hold_logged[key] = now_mono
+        logger.info(
+            "cron: job '%s' is due but lane '%s' is HELD by an estop hold - slot %s is "
+            "collapsed to the next live slot, never fired late",
+            d.label, lane, d.next_run)
+    if recurring:
+        new_next = d.recompute_next()
+        if new_next:
+            d.scan.persist(d.job["id"], next_run_at=new_next)
+    else:
+        # A one-shot is an INTENT, not a cadence: it keeps its place, slid forward to now so the
+        # ordinary grace gate cannot retire it while the hold is up, and fires once on release.
+        d.scan.persist(d.job["id"], next_run_at=d.scan.now.isoformat())
+    return True
+
+
+def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float,
+                      admission=None) -> bool:
     """Decide whether one enabled, non-terminal job fires this tick, persisting any repairs.
     Ordering matters: recover missing next_run_at, repair timezone shifts, re-arm stale-error
     recurring jobs; then once due: re-anchor stale cron instants, fast-forward missed recurring
@@ -3378,6 +3467,12 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         return False
     d.next_run_dt = _rearm_stale_error_recurring(d)
     if _instant_after(d.next_run_dt, now):
+        return False
+
+    # THE HOLD GATE (card t_2f60a701). A due job whose lane is held never dispatches, and its slot
+    # collapses: the maintenance window parks the fleet BEFORE it measures, so the lull it waits
+    # for is one it can actually reach. A manual trigger is a direct operator act and is not held.
+    if not manual_run and _defer_under_hold(d, recurring, admission):
         return False
 
     # Only the dispatch snapshot carries this field; never infer it from a later stamp.
@@ -3434,6 +3529,9 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
     jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
     # One-shot run-claim TTL, resolved once per scan (see _oneshot_run_claim_ttl_seconds).
     run_claim_ttl = _oneshot_run_claim_ttl_seconds()
+    # THE FLEET HOLD, read ONCE for the whole tick (card t_2f60a701): every job in this store is
+    # judged against the same state, so one tick can never see two different modes.
+    admission = hold_admission()
 
     # Retention sweep: completed one-shots are kept for inspection but must not accumulate forever.
     if _sweep_completed_oneshots(raw_jobs, scan.now, removed_ids=scan.removed):
@@ -3453,7 +3551,7 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
             if _has_pause_marker(job):
                 _self_disable_half_paused(job, scan)
                 continue
-            if _evaluate_due_job(job, scan, run_claim_ttl):
+            if _evaluate_due_job(job, scan, run_claim_ttl, admission):
                 due.append(job)
         except Exception:
             logger.exception(
