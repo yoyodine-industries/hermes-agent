@@ -202,12 +202,30 @@ def _live_profile_names() -> list[str]:
         return []
 
 
+def _declared_roster_home() -> str:
+    """The home whose ``profiles/`` roster a lane name must be judged against, if declared.
+
+    An arm can be pointed at a home that is NOT the home that serves the lanes: the update
+    flow rehearses its window against a sandbox ``HERMES_HOME`` precisely so the hold cannot
+    strand the fleet, and it names the REAL lanes it would admit. Judged against the sandbox
+    -- which carries no ``profiles/`` at all -- every lane read as UNKNOWN and the gate
+    refused every rehearsal arm (measured 2026-11-03: 18 consecutive hermes-update runs died
+    in ``drain_gate``; card t_53aeba04). The caller that knows where the roster lives declares
+    it here; with nothing declared the gate answers exactly as it always has, from
+    ``HERMES_HOME``.
+    """
+    return (os.environ.get("HERMES_ESTOP_ROSTER_HOME") or "").strip()
+
+
 def _profile_is_real(name: str) -> bool:
     try:
         from hermes_cli.profiles import profile_exists
     except ImportError:  # pragma: no cover - defensive
         return True
+    roster = _declared_roster_home()
     try:
+        if roster:
+            return bool(profile_exists(name, home=os.path.expanduser(roster)))
         return bool(profile_exists(name))
     except Exception:  # pragma: no cover - defensive
         return True
@@ -291,6 +309,10 @@ def cmd_pause(args: argparse.Namespace) -> int:
         print(f"⛔ Unknown profile(s) in --allow-profile: {', '.join(unknown)} — refusing to arm.")
         print("   The lane gate fails CLOSED on an unknown id (unknown ids grant nothing), so")
         print("   this lockdown would hold the very lane it meant to admit.")
+        roster = _declared_roster_home()
+        if roster:
+            print(f"   Roster judged: {os.path.expanduser(roster)}/profiles "
+                  "(HERMES_ESTOP_ROSTER_HOME)")
         live = _live_profile_names()
         if live:
             print(f"   Live profiles: {', '.join(live)}")
