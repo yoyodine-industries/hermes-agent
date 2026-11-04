@@ -6722,6 +6722,87 @@ def retarget_task(
     return {"task_id": task_id, "old": old, "new": new, "changed": changed}
 
 
+#: Event kinds that PLACE a card in a block. ``dependency_wait`` routes the card to
+#: ``todo`` instead of ``blocked`` and ``block_loop_detected`` routes it to ``triage``,
+#: so a reader that only knows ``blocked`` misses two of the four kinds (card t_67ed1645).
+BLOCK_EVENT_KINDS = ("blocked", "block_loop_detected", "dependency_wait")
+
+
+def block_state(
+    conn: sqlite3.Connection, task_id: str, task: Optional[Task] = None,
+) -> Optional[dict]:
+    """The card's LIVE block as the store records it, or ``None`` when it is not blocked.
+
+    A block is written in TWO places and a reader needs both halves: the ``tasks`` row
+    carries *status* and *kind*, while the block EVENT carries the block's own WORDS -
+    the reason a human wrote or a worker handed in. A view that reads only the row
+    reports "blocked" with no reason, which is how a card carrying a full sentence got
+    escalated twice as "blocked: no reason recorded" (card t_67ed1645).
+
+    ``{kind, reason, recurrences, since, event, waits_on}``:
+
+    * ``kind``        ``tasks.block_kind`` (``None`` on the failure breaker's untyped park);
+    * ``reason``      the block event's ``reason``, falling back to ``last_failure_error``
+                      - the one block shape that writes no ``blocked`` event but does
+                      record why it gave up;
+    * ``recurrences`` ``block_recurrences``: the same-cause repeat count, which is what
+                      ``triage`` at ``BLOCK_RECURRENCE_LIMIT`` is decided on;
+    * ``since``       epoch seconds the block was written (``None`` if no event survives);
+    * ``event``       which of ``BLOCK_EVENT_KINDS`` placed it;
+    * ``waits_on``    the parent card(s) a ``dependency`` wait named, when the payload did.
+
+    "LIVE" is a status gate, not a column read: ``block_kind`` deliberately SURVIVES an
+    unblock so a re-block of the same cause reads as a loop, so the column can never
+    answer "is it blocked now". A block is live while the card sits in a state only a
+    block puts it in - ``blocked`` (typed, or untyped from the breaker), ``triage`` (the
+    loop breaker's destination) or ``todo`` with ``block_kind='dependency'`` (waits in
+    the pool for its parent).
+    """
+    t = task if task is not None else get_task(conn, task_id)
+    if t is None:
+        return None
+    kind = t.block_kind
+    live = (
+        t.status == "blocked"
+        or (t.status == "triage" and kind is not None)
+        or (t.status == "todo" and kind == "dependency")
+    )
+    if not live:
+        return None
+    event = next(
+        (ev for ev in reversed(list_events(conn, task_id)) if ev.kind in BLOCK_EVENT_KINDS),
+        None,
+    )
+    payload = event.payload if event is not None and isinstance(event.payload, dict) else {}
+    reason = _lossy_text(payload.get("reason")) or None
+    if reason is None and t.status == "blocked":
+        reason = t.last_failure_error or None
+    raw_recurrences = payload.get("recurrences")
+    if raw_recurrences is None:
+        # A dependency park writes the kind only, so a stale count from an earlier park
+        # of another kind must not be presented as this wait's recurrence.
+        raw_recurrences = 0 if kind == "dependency" else t.block_recurrences
+    waits_on: list[str] = []
+    if isinstance(payload.get("parents"), list):
+        waits_on = [str(p) for p in payload["parents"] if p]
+    elif payload.get("parent"):
+        waits_on = [str(payload["parent"])]
+    if kind == "dependency":
+        # ``block_task(kind='dependency')`` records the wait as task_links EDGES, not in
+        # the event payload, so the truthful "waiting on" is the card's OPEN parents.
+        for ref in parent_ids(conn, task_id):
+            if ref not in waits_on and _task_status(conn, ref) not in ("done", "archived"):
+                waits_on.append(ref)
+    return {
+        "kind": kind,
+        "reason": reason,
+        "recurrences": int(raw_recurrences or 0),
+        "since": event.created_at if event is not None else None,
+        "event": event.kind if event is not None else None,
+        "waits_on": waits_on,
+    }
+
+
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,

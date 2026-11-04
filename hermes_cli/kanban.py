@@ -26,9 +26,9 @@ from hermes_cli import kanban_bulk_guard as kbg
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_filing_policy import is_refusal as kb_is_filing_refusal
 from hermes_cli.kanban_output import (
-    _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, BOARD_PIN_REMEDY, _bulk_apply, _err,
-    _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
-    _task_to_dict,
+    _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, BOARD_PIN_REMEDY, _block_headline,
+    _bulk_apply, _err, _fmt_age, _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict,
+    _print_json, _task_to_dict,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
@@ -696,6 +696,29 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
+def _print_block_state(block: dict) -> None:
+    """The ``show`` BLOCK block: kind, how long, how often, and the reason in words.
+
+    A bare ``status: blocked`` is the whole defect this renders away (card t_67ed1645):
+    the kind says WHO the card is waiting on (a person, a parent card, an account, luck),
+    the age and recurrence count answer the escalation filer's next two questions, and
+    the reason is the sentence the block actually carried - never the title.
+    """
+    indent = " " * 13          # under the field value column ("  block:       ")
+    print(f"  {'block:':<11}{_block_headline(block)}")
+    stamp = block.get("since")
+    bits = []
+    if stamp:
+        bits.append(f"since {_fmt_ts(stamp)} ({_fmt_age(int(time.time()) - int(stamp))} ago)")
+    bits.append(f"recurrences {block.get('recurrences') or 0}")
+    waits_on = block.get("waits_on") or []
+    if waits_on:
+        bits.append(f"waits on {', '.join(waits_on)}")
+    print(f"{indent}{' - '.join(bits)}")
+    reason = (block.get("reason") or "").strip()
+    print(f"{indent}reason: {reason or 'NONE RECORDED - the block wrote no reason'}")
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
@@ -713,12 +736,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        # WHY the card is parked: the row carries the kind, the block event carries the
+        # reason. Both renderings read this one object, so text and --json cannot drift.
+        block = kb.block_state(conn, args.task_id, task)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
         _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "task": _task_to_dict(task), "block": block, "latest_summary": latest_summary,
+            "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -730,6 +757,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
+    if block:
+        _print_block_state(block)
     if task.due_at:
         policy = task.due_window_policy or kb.DEFAULT_DUE_WINDOW_POLICY
         field("due", f"{_fmt_ts(task.due_at)} ({policy})")
