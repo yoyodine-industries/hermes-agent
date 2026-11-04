@@ -20,6 +20,10 @@ from aiohttp import web
 # this handler still runs the job, and the retry would run it twice.
 FIRE_STARTUP_WAIT_SECONDS = 7.0
 _POLL_SECONDS = 0.1
+# Stable code for the still-starting half of this refusal. A drain says ``gateway_draining``
+# (gateway.drain_control.DRAIN_REFUSAL_CODE, with the declared window's end); this one must not
+# borrow that code, because nothing is draining and there is no window end to name.
+GATEWAY_STARTING_CODE = "gateway_starting"
 
 
 def runner_is_draining(runner: Any) -> bool:
@@ -31,7 +35,10 @@ async def refuse_until_started(runner: Any, job_id: str, *, received_at: float) 
     """None once ``runner`` has finished starting (``_running``: every platform connect attempted and its
     adapters published), or when there is no runner to ask (a self-hosted api_server, a test double).
     Otherwise the retryable 503, worded like the dashboard's own "gateway unreachable" so NAS classifies
-    it the same, with the dashboard's 60s Retry-After (``_CRON_FIRE_RETRY_AFTER_SECONDS``).
+    it the same, carrying the drain refusal contract the api_server's own drain 503 carries
+    (``gateway.drain_control.drain_refusal``): the stable code, and the expected end of the window when
+    the drain declared one. ``Retry-After`` is that helper's — the window's remaining seconds, capped at
+    the dashboard's 60s (``_CRON_FIRE_RETRY_AFTER_SECONDS``).
 
     ``received_at`` is the loop time the handler was entered: time already spent verifying the token
     counts against the budget."""
@@ -47,8 +54,14 @@ async def refuse_until_started(runner: Any, job_id: str, *, received_at: float) 
         if not draining and getattr(runner, "_running", True):
             return None
         if draining or loop.time() >= deadline:
+            from gateway.drain_control import DRAIN_RETRY_AFTER_MAX_SECONDS, drain_refusal
+            if draining:
+                fields, retry_after = drain_refusal()
+            else:
+                fields, retry_after = {"code": GATEWAY_STARTING_CODE}, int(DRAIN_RETRY_AFTER_MAX_SECONDS)
             return web.json_response(
-                {"error": "gateway unreachable; retry", "job_id": job_id}, status=503, headers={"Retry-After": "60"})
+                {"error": "gateway unreachable; retry", "job_id": job_id, **fields},
+                status=503, headers={"Retry-After": str(retry_after)})
         await asyncio.sleep(_POLL_SECONDS)
 
 

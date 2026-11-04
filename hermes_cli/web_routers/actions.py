@@ -194,7 +194,10 @@ async def gateway_drain(request: Request):
     without that plugin the cookie gate covers a gated bind and the legacy
     session-token gate a loopback bind — never unauthenticated on a network bind.
 
-    Body ``{"action": "drain"|"cancel"}``. Only the ``.drain_request.json`` marker is
+    Body ``{"action": "drain"|"cancel", "window_seconds": <budget>}``. ``window_seconds`` is the
+    drain's declared budget: the marker then carries ``expected_end_at``, which every drain refusal
+    echoes so the caller knows when the gateway is back (omit it when the drain has no declared end).
+    Only the ``.drain_request.json`` marker is
     written/removed here — the gateway's ``_drain_control_watcher`` owns the state
     transition (the marker IS the control channel). Idempotent on both sides;
     ``POST /api/gateway/restart`` is the force-override that supersedes a drain.
@@ -216,19 +219,35 @@ async def gateway_drain(request: Request):
         return {"ok": True, "action": "cancel", "was_draining": existed}
     if action != "drain":
         raise HTTPException(status_code=400, detail=f"Unknown drain action {action!r}; expected 'drain' or 'cancel'")
+    window_seconds = body.get("window_seconds")
+    if window_seconds is not None:
+        try:
+            window_seconds = float(window_seconds)
+        except (TypeError, ValueError):
+            window_seconds = 0.0
+        if window_seconds <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"window_seconds must be a positive number of seconds, got {body.get('window_seconds')!r}")
 
     payload = write_drain_request(
         principal=str(principal), suppress_notification=bool(body.get("suppress_notification", False)),
+        window_seconds=window_seconds,
     )
     _log.info(
-        "Gateway drain BEGIN requested by %s (suppress_notification=%s)", principal, payload["suppress_notification"],
+        "Gateway drain BEGIN requested by %s (suppress_notification=%s, expected_end_at=%s)",
+        principal, payload["suppress_notification"], payload.get("expected_end_at"),
     )
-    return {
+    response = {
         "ok": True, "action": "drain", "requested_at": payload["requested_at"],
         # Echo so a caller polling /api/status knows the marker is now set;
         # the gateway watcher flips gateway_state -> draining within ~1s.
         "draining": drain_requested(), "suppress_notification": payload["suppress_notification"],
     }
+    if "expected_end_at" in payload:
+        # The window the refusals will quote back; absent when the caller declared none.
+        response["expected_end_at"] = payload["expected_end_at"]
+    return response
 
 
 def _update_refused(error: str, message: str, update_command: str) -> dict[str, Any]:

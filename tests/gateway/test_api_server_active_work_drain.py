@@ -237,8 +237,11 @@ class TestDrainAdmission:
                     payload = await response.json()
 
                     assert response.status == 503
-                    assert response.headers["Retry-After"] == "1"
+                    # The drain refusal contract (t_81e506a1): the house 60s cap when the drain
+                    # declared no window, and the stable code in the body.
+                    assert response.headers["Retry-After"] == "60"
                     assert payload["error"]["code"] == "gateway_draining"
+                    assert payload["code"] == "gateway_draining"
 
 
 # ---------------------------------------------------------------------------

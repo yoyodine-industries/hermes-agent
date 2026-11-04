@@ -16,8 +16,9 @@ import contextlib
 import functools
 import json
 import logging
+import math
 import re
-from datetime import datetime, timezone, UTC
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Any, Optional
 
@@ -95,6 +96,14 @@ _DRAIN_REQUEST_FILENAME = ".drain_request.json"
 # Max-age fallback for a same-epoch orphaned marker (#85433). Long-running drains refresh the marker via
 # write_drain_request() (idempotent re-write bumps ``requested_at``) rather than raising this bound.
 DRAIN_REQUEST_MAX_AGE_SECONDS = 3600.0
+
+# The refusal contract every draining path shares: one stable code and, when the drain DECLARED a
+# window, its expected end — so a caller backs off correctly instead of retrying blind (t_81e506a1).
+DRAIN_REFUSAL_CODE = "gateway_draining"
+# Ceiling on the refusal's Retry-After: the house retry hint for a gateway that is merely away
+# (``_CRON_FIRE_RETRY_AFTER_SECONDS`` in hermes_cli/web_routers/cron.py). A caller that needs the
+# exact end reads ``expected_end_at`` from the body; the header only paces the next attempt.
+DRAIN_RETRY_AFTER_MAX_SECONDS = 60.0
 # Dedup for the expired-marker warning (the watcher re-reads every second); keyed by
 # ``requested_at`` so a keep-alive re-write that later expires logs again.
 _expiry_logged_for: Optional[str] = None
@@ -124,8 +133,23 @@ def drain_request_path(home: Optional[Path] = None) -> Path:
     return Path(home if home is not None else get_hermes_home()) / _DRAIN_REQUEST_FILENAME
 
 
+def _iso_utc(moment: datetime) -> str:
+    """ISO-8601 UTC with a ``Z`` suffix — the machine-readable form the refusals publish."""
+    return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _declared_window_seconds(window_seconds: Any) -> Optional[float]:
+    """A usable positive window in seconds, or None for absent/garbage/non-positive input."""
+    try:
+        seconds = float(window_seconds)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
 def write_drain_request(
-    *, principal: str = "drain-control", suppress_notification: bool = False, home: Optional[Path] = None
+    *, principal: str = "drain-control", suppress_notification: bool = False,
+    window_seconds: Any = None, home: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Write the begin-drain marker atomically; returns the payload.
 
@@ -134,11 +158,21 @@ def write_drain_request(
     broadcast (the per-session interrupt ping is never suppressed); which drains
     are quiet is the caller's policy.  Stamped with the instantiation epoch so a
     copy surviving a machine restart on the durable volume reads as stale.
+
+    ``window_seconds`` is the drain's OWN declared budget: the marker then carries
+    ``expected_end_at``, which every drain refusal echoes so the caller knows when
+    the gateway is back.  Absent (or non-positive) records no end at all — a refusal
+    must never invent one.  Bounded by the max-age, since the marker itself stops
+    being honoured there; a longer drain keep-alives the marker instead.
     """
+    now = datetime.now(UTC)
     payload = {
-        "action": "drain", "requested_at": datetime.now(UTC).isoformat(), "principal": principal,
+        "action": "drain", "requested_at": now.isoformat(), "principal": principal,
         "epoch": current_instantiation_epoch(), "suppress_notification": bool(suppress_notification),
     }
+    window = _declared_window_seconds(window_seconds)
+    if window is not None:
+        payload["expected_end_at"] = _iso_utc(now + timedelta(seconds=min(window, DRAIN_REQUEST_MAX_AGE_SECONDS)))
     atomic_json_write(drain_request_path(home), payload)
     return payload
 
@@ -221,6 +255,38 @@ def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
     """
     body = _active_drain_body(home)
     return bool(body and body.get("suppress_notification"))
+
+
+def drain_window_end(*, home: Optional[Path] = None) -> Optional[datetime]:
+    """The ACTIVE marker's declared window end, or None when this drain declared none.
+
+    Only a marker written with ``window_seconds`` carries one; an in-process restart drain has no
+    marker at all, so both read None. A refusal over such a drain must omit the time rather than
+    invent one. Never raises.
+    """
+    body = _active_drain_body(home)
+    return _parse_iso(body.get("expected_end_at")) if body else None
+
+
+def drain_refusal(
+    *, home: Optional[Path] = None, now: Optional[datetime] = None,
+) -> tuple[dict[str, Any], int]:
+    """``(body fields, Retry-After seconds)`` for EVERY refusal caused by a drain.
+
+    One source of truth, so no path can word a drain 503 differently: ``code`` is always
+    :data:`DRAIN_REFUSAL_CODE`, and ``expected_end_at`` / ``seconds_remaining`` appear only when the
+    drain declared a window (:func:`write_drain_request`). ``Retry-After`` paces the next attempt:
+    the remaining whole seconds (never below 1, so a window that already passed means retry now),
+    capped at :data:`DRAIN_RETRY_AFTER_MAX_SECONDS`, and that cap when nothing was declared.
+    """
+    end = drain_window_end(home=home)
+    fields: dict[str, Any] = {"code": DRAIN_REFUSAL_CODE}
+    if end is None:
+        return fields, int(DRAIN_RETRY_AFTER_MAX_SECONDS)
+    remaining = (end - (now or datetime.now(UTC))).total_seconds()
+    fields["expected_end_at"] = _iso_utc(end)
+    fields["seconds_remaining"] = max(0, math.ceil(remaining))
+    return fields, int(min(max(1, fields["seconds_remaining"]), DRAIN_RETRY_AFTER_MAX_SECONDS))
 
 
 def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any]]:

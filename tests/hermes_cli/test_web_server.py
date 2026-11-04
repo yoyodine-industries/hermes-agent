@@ -577,6 +577,25 @@ class TestWebServerEndpoints:
         resp = self.client.post("/api/gateway/drain", json={"action": "explode"})
         assert resp.status_code == 400
 
+    def test_gateway_drain_declares_its_window(self):
+        """A declared budget lands in the marker as the end every drain refusal quotes back."""
+        from gateway import drain_control as dc
+
+        resp = self.client.post("/api/gateway/drain", json={"action": "drain", "window_seconds": 210})
+
+        assert resp.status_code == 200
+        expected_end_at = resp.json()["expected_end_at"]
+        assert dc.read_drain_request()["expected_end_at"] == expected_end_at
+        assert dc.drain_window_end() is not None
+
+    def test_gateway_drain_rejects_an_undeclarable_window(self):
+        from gateway import drain_control as dc
+
+        resp = self.client.post("/api/gateway/drain", json={"action": "drain", "window_seconds": -5})
+
+        assert resp.status_code == 400
+        assert dc.read_drain_request() is None  # no half-written drain from a rejected declaration
+
 
     @staticmethod
     def _provider_field_map(payload):

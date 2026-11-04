@@ -746,9 +746,16 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
 def _error_response(
     message: str, status: int, *, err_type: str = "invalid_request_error",
     param: str | None = None, code: str | None = None, headers: Optional[dict[str, str]] = None,
+    extra: Optional[dict[str, Any]] = None,
 ) -> web.Response:
-    """``web.json_response(_openai_error(...), status=...)`` in one call."""
-    return web.json_response(_openai_error(message, err_type, param, code), status=status, headers=headers)
+    """``web.json_response(_openai_error(...), status=...)`` in one call.
+
+    ``extra`` adds sibling machine-readable fields beside ``error`` (the drain window), never
+    inside it: they are contract, not prose."""
+    body = _openai_error(message, err_type, param, code)
+    if extra:
+        body.update(extra)
+    return web.json_response(body, status=status, headers=headers)
 
 
 def _invalid_request(message: str) -> web.Response:
@@ -1165,12 +1172,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return False
 
     def _draining_response(self) -> Optional[web.Response]:
-        """Return a retryable response while the gateway drains existing work."""
+        """Return a retryable response while the gateway drains existing work.
+
+        Emits the shared drain refusal contract (``drain_control.drain_refusal``): the stable
+        ``gateway_draining`` code, plus the declared window's expected end when the drain declared
+        one — so a caller backs off to the end instead of guessing (t_81e506a1). The same fields,
+        from the same helper, as the cron-fire gate's refusal.
+        """
         if not self._gateway_is_draining():
             return None
+        from gateway.drain_control import drain_refusal
+        fields, retry_after = drain_refusal()
         return _error_response(
-            "Gateway is draining existing work; retry shortly.", 503, code="gateway_draining",
-            headers={"Retry-After": "1"})
+            "Gateway is draining existing work; retry shortly.", 503, code=fields["code"],
+            headers={"Retry-After": str(retry_after)}, extra=fields)
 
     def _activate_admitted_request(self) -> None:
         """Transfer this request's drain reservation to agent bookkeeping."""
