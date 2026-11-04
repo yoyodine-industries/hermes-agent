@@ -449,11 +449,37 @@ def get_profile_dir(name: str) -> Path:
     return _get_profiles_root() / canon
 
 
-def profile_exists(name: str) -> bool:
-    """Check whether a live (non-tombstoned) profile directory exists."""
+def profiles_root_of(home: str | Path) -> Path:
+    """The named-profiles root that belongs to *home*.
+
+    A LANE home (``<fleet>/profiles/<lane>``) steps up ONE level to the fleet's roster; any
+    other home owns ``<home>/profiles`` directly. Same rule as the fleet's own roster resolver
+    (``yaan-platform`` ``fleet_roster.hermes_root``): a lane never has a roster of its own, and
+    the roster a lane name must be judged against is the FLEET's.
+    """
+    path = Path(home)
+    if path.parent.name == "profiles":
+        return path.parent
+    return path / "profiles"
+
+
+def profile_exists(name: str, home: str | Path | None = None) -> bool:
+    """Check whether a live (non-tombstoned) profile directory exists.
+
+    *home* asks the question against a DECLARED roster home instead of this process's own
+    ``HERMES_HOME``. A hold armed into a sandbox still names lanes of the fleet that SERVES
+    them: ``hermes pause --lockdown`` is pointed at the sandbox home by design (so the hold
+    can never strand the fleet), and the lane gate must judge names against the roster that
+    would serve them, not against the sandbox's (empty) one -- card t_53aeba04.
+    """
     try:
         canon = normalize_profile_name(name)
-        profile_dir = get_profile_dir(canon)
+        if home is None:
+            profile_dir = get_profile_dir(canon)
+        else:
+            if not _PROFILE_ID_RE.match(canon):
+                return False
+            profile_dir = profiles_root_of(home) / canon
     except ValueError:
         return False
     if canon == "default":
