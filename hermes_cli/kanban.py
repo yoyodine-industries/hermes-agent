@@ -23,6 +23,7 @@ from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_bulk_guard as kbg
+from hermes_cli import kanban_operator_ask as koa
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_filing_policy import is_refusal as kb_is_filing_refusal
 from hermes_cli.kanban_output import (
@@ -150,9 +151,20 @@ def kanban_command(args: argparse.Namespace) -> int:
                   "Run 'hermes kanban --help' for the full list of actions.", file=sys.stderr)
         return 0
 
+    # THE ONE OPERATOR-ASK EXEMPTION (card t_af03b766). Built here, from the explicit
+    # --operator-ask-* options, with the door's own card bind verified against the provenance the
+    # create wrote onto it. This is the SOLE construction site of an exemption in the tree (a test
+    # asserts it), so a second tool cannot inherit the exemption by copying the flags. The
+    # operator ask is a RAISE, not a self-dealing board mutation: it is born at the board's floor,
+    # designated through the kernel's designation door and lifted by the kernel's own re-rank.
+    try:
+        grant = koa.grant_for(args)
+    except koa.RaiseGrantRefused as exc:
+        return _err(f"kanban: operator-ask exemption refused: {exc}", 2)
+
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
-    if _is_delegated_child_cli_mutation(args):
+    if _is_delegated_child_cli_mutation(args, grant):
         return _err(_DELEGATED_CHILD_CLI_REFUSAL)
 
     # One seam for the operator's 2026-09-27 bulk-action rule (card t_bf9605f8): a destructive BULK
@@ -205,7 +217,7 @@ def kanban_command(args: argparse.Namespace) -> int:
                         f"Create it with `hermes kanban boards create {normed}`.")
         board_scope = kb.scoped_current_board(normed)
 
-    with board_scope:
+    with board_scope, koa.scoped(grant):
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
@@ -312,7 +324,8 @@ def _fence_target_store(args: argparse.Namespace) -> Optional[Path]:
     return kb.kanban_db_path()
 
 
-def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
+def _is_delegated_child_cli_mutation(args: argparse.Namespace,
+                                     grant: Optional[koa.RaiseGrant] = None) -> bool:
     """Fence a mutating CLI verb from a non-top-level session.
 
     Two cooperative arms (the ContextVar and the ``HERMES_DELEGATED_CHILD_CONTEXT`` marker,
@@ -320,6 +333,14 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     Decision 1): a process descended from a LIVE dispatched worker is refused even after the
     marker has been stripped. Reads never reach this helper — the caller checks the action
     vocabulary first.
+
+    *grant* is the ONE exemption (card t_af03b766): a validated operator-ask raise
+    (:mod:`hermes_cli.kanban_operator_ask`) for THIS invocation, admitted only when it targets
+    the same store the fence would judge. The operator ask is a RAISE addressed to the operator —
+    born at the board's floor, designated through the kernel's designation door and lifted by the
+    kernel's own re-rank — not a self-dealing board mutation, which is why it is the sole
+    exemption and why it is bound to the card its own door just created. Every other action keeps
+    the fence exactly as it is.
 
     Both arms are judged against the board the invocation TARGETS (:func:`_fence_target_store`),
     never the host-global ambient board: a mutation aimed at another board is not this lineage's
@@ -342,6 +363,10 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
         # claim on, and there is nothing here to mutate. Answer "no fence verdict" — the CLI
         # refuses the invocation itself, naming the board, instead of this fast-fail speaking for
         # (and masking) a board the caller never touched.
+        return False
+    if koa.admits_target(grant, target):
+        # The exemption admits THIS board's store and nothing else; the grant itself was
+        # validated against that store (act, door and the card its own create just bound).
         return False
     if kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(target):
         return True
@@ -466,6 +491,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8-sig")
         except OSError as exc:
             return _err(f"kanban: --body-file: {exc}", 2)
+
+    # The operator-ask create carries its provenance ONTO THE CARD (card t_af03b766): filed-by
+    # lane, the dispatched task id whose claim would otherwise fence the call, and the door that
+    # filed it. Raise acts are then auditable by reading the card, not by reconstructing shell
+    # lineage. Written HERE, at the one create seam, so the kernel writes what it measured.
+    create_grant = koa.active_grant()
+    if create_grant is not None and create_grant.act == "create":
+        body = koa.stamp_body(body, create_grant)
 
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
