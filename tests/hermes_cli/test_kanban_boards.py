@@ -702,3 +702,120 @@ class TestBoardResurrection:
         assert meta["name"] == "My Board"
         assert "keepname" in [b["slug"] for b in kb.list_boards(include_archived=True)]
         assert "keepname" not in [b["slug"] for b in kb.list_boards(include_archived=False)]
+
+
+# ---------------------------------------------------------------------------
+# A stray store is not a board (card t_881d4c5a)
+# ---------------------------------------------------------------------------
+
+def _tree(home: Path) -> dict[str, tuple]:
+    """Byte-for-byte census of a home: (kind, size, mtime_ns) per path.
+
+    mtime is in the census on purpose: the defect under test is not only "a file
+    appeared", it is "something WROTE the dead board's name into the tree", so a
+    touched-but-unchanged file must fail the comparison too.
+    """
+    out: dict[str, tuple] = {}
+    for p in sorted(home.rglob("*")):
+        rel = str(p.relative_to(home))
+        st = p.stat()
+        out[rel] = ("dir" if p.is_dir() else "file", st.st_size, st.st_mtime_ns)
+    return out
+
+
+class TestStrayStoreIsNotABoard:
+    """A store in a dead board's slot must never make the board live (#43243, t_881d4c5a).
+
+    ``path.exists()`` used to end the resurrection guard early, so a zero-byte
+    ``kanban.db`` left in a reaped board's directory was ADOPTED: the open inherited
+    the slug and ``init_db()`` minted a complete board nobody registered. Board
+    identity is ``board.json``; a DB-only slot is a stray.
+    """
+
+    def test_connect_refuses_to_adopt_a_zero_byte_stub(self, fresh_home):
+        stub = kb.board_dir("ghost")
+        stub.mkdir(parents=True)
+        store = stub / "kanban.db"
+        store.touch()
+        assert not kb.board_metadata_path("ghost").exists()
+
+        with pytest.raises(ValueError, match="does not exist"):
+            kbc.connect(board="ghost")
+        with pytest.raises(ValueError, match="does not exist"):
+            kb.init_db(board="ghost")
+
+        # Still a stray: no schema, no sidecars, still not a board.
+        assert store.exists() and store.stat().st_size == 0
+        for sidecar in ("kanban.db-init.lock", "kanban.db.health.json",
+                        "kanban.db-wal", "kanban.db-shm"):
+            assert not (stub / sidecar).exists(), sidecar
+        assert "ghost" not in [b["slug"] for b in kb.list_boards(include_archived=True)]
+        # Registration, not presence, is the question this card answers. (#43243's
+        # relocation redefined `board_exists` as the WIDER "is anything there?" probe,
+        # so the stray store we just placed here legitimately makes it True — asserting
+        # that would pin another card's definition rather than this one's guarantee.)
+        # Nobody registered `ghost`: no `board.json`, no board, nothing to adopt.
+        assert kb.board_is_registered("ghost") is False
+
+    def test_connect_refuses_to_adopt_a_stub_beside_an_archived_tombstone(self, fresh_home):
+        kb.create_board("laid", name="Laid To Rest")
+        kb.remove_board("laid", archive=True)
+        slot = kb.board_dir("laid")
+        slot.mkdir(parents=True, exist_ok=True)
+        store = slot / "kanban.db"
+        store.touch()
+
+        with pytest.raises(ValueError, match="archived"):
+            kbc.connect(board="laid")
+        assert store.stat().st_size == 0
+        assert kb.read_board_metadata("laid")["archived"] is True
+
+    def test_speaking_a_dead_boards_name_writes_nothing(self, fresh_home):
+        """The card's own repro, with teeth: a read of a dead board leaves the home intact.
+
+        The live board's own trees (a card checkout under ``workspaces/``) are part of
+        the census, so a failure here also catches the guard reaching into a live
+        board's directory on the way to refusing.
+        """
+        kb.create_board("platform")
+        live_ws = kb.workspaces_root(board="platform") / "t_live1"
+        live_ws.mkdir(parents=True)
+        (live_ws / "checkout.txt").write_text("card workspace\n", encoding="utf-8")
+
+        dead = kb.board_dir("reaped")
+        (dead / "workspaces" / "t_old9").mkdir(parents=True)
+        (dead / "workspaces" / "t_old9" / "left-behind.txt").write_text("x", encoding="utf-8")
+
+        before = _tree(fresh_home)
+        for probe in (
+            lambda: kbc.connect(board="reaped"),
+            lambda: kb.init_db(board="reaped"),
+            lambda: kb.kanban_db_path(board="reaped"),
+            lambda: kb.board_exists("reaped"),
+            lambda: kb.list_boards(),
+            lambda: kb.list_boards(include_archived=True),
+        ):
+            try:
+                probe()
+            except ValueError:
+                pass
+        assert _tree(fresh_home) == before
+
+    def test_store_is_never_opened_inside_a_card_tree(self, fresh_home, monkeypatch):
+        """A pin pointing into a per-card tree is refused by name, and mints nothing."""
+        stray = kb.workspaces_root(board="platform") / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(stray))
+
+        with pytest.raises(ValueError, match="per-card trees"):
+            kbc.connect()
+        with pytest.raises(ValueError, match="per-card trees"):
+            kb.init_db()
+        assert not stray.exists()
+
+    def test_fresh_home_still_self_heals_the_default_board(self, fresh_home):
+        """The guard must not over-tighten: no board.json, but ``default`` is not a slot."""
+        with kbc.connect_closing() as conn:
+            conn.execute("SELECT 1").fetchone()
+        assert kb.kanban_db_path().exists()
+        assert kb.kanban_db_path() == fresh_home / "kanban.db"
+
