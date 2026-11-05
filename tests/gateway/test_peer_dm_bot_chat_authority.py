@@ -120,6 +120,30 @@ async def test_a_peer_dm_carrying_delivery_headers_is_also_the_chats_own_admissi
 
 
 @pytest.mark.asyncio
+async def test_a_cli_labelled_bot_chat_takes_the_same_door_as_a_local_one(peer):
+    """The door selects the chat by title/lineage, never by the row's ``source`` label (t_850bdf71).
+
+    Measured on the host: ``profiles/platform-coder/state.db`` holds a ``Bot Chat`` titled
+    ``20260915_162222_002795`` with ``source='cli'`` (``created_source='api_server'``), and the other
+    lanes hold ``source='local'`` rows. That label is the *serving surface*, so it is never
+    ``api_server``/``bot_room`` -- keying the door on it would leave every lane refused. Rewriting the
+    rows would be a lie about provenance, so the door must not read it.
+    """
+    peer.authority.db._execute_write(
+        lambda conn: conn.execute('UPDATE sessions SET source=? WHERE id=?', ('cli', peer.chat))
+    )
+    headers = {'Idempotency-Key': 'wind_down-' + 'b' * 24, 'X-Hermes-Sender-Profile': 'default',
+               'X-Hermes-Wait-Seconds': '5'}
+    resp = await peer.cli.post(f"/api/sessions/{peer.chat}/chat", json={"message": "ping", "author": AUTHOR},
+                               headers=headers)
+    body = await resp.json()
+    assert resp.status == 200, body
+    assert body['result'] == 'delivered', body
+    assert body['reply'] == 'pong', body
+    assert [text for _, _, text, _ in peer.executed] == ['ping']
+
+
+@pytest.mark.asyncio
 async def test_streamed_peer_dm_and_peer_run_ride_the_same_door(peer):
     resp = await peer.cli.post(f"/api/sessions/{peer.chat}/chat/stream", json={"message": "ping", "author": AUTHOR})
     assert resp.status == 200, await resp.text()
