@@ -42,6 +42,31 @@ def _reason(help: str):
     return _arg("--reason", help=help)
 
 
+def _operator_ask_flags():
+    """The operator-ask exemption's options (card t_af03b766) — ONE vocabulary, three acts.
+
+    Declared here rather than per verb so the create, the ``defcon designate`` it is followed by
+    and the ``edit`` that raises the same card cannot drift apart in spelling. Validation lives in
+    :mod:`hermes_cli.kanban_operator_ask` (the exemption's only construction site); every command
+    that cannot be exempted refuses these options loudly instead of ignoring them.
+    """
+    return (
+        _arg("--operator-ask-door", dest="operator_ask_door", metavar="DOOR", default=None,
+             help="OPERATOR-ASK EXEMPTION (the ONLY lift of the delegated-child fence, and only "
+                  "for admin_operator_card): the door filing this raise. Needs "
+                  "--operator-ask-raise and one of exactly three acts — `create`, "
+                  "`defcon designate`, `edit`."),
+        _arg("--operator-ask-raise", dest="operator_ask_raise", metavar="REQUEST", default=None,
+             help="The door's per-call request id. The create writes it onto the new card as an "
+                  "`Operator-ask-door:` provenance line; the designate/edit must present the SAME "
+                  "id with --operator-ask-card, which is what binds the exemption to the card "
+                  "this invocation's door just created and to no other."),
+        _arg("--operator-ask-card", dest="operator_ask_card", metavar="CARD", default=None,
+             help="The card the create just made (designate/edit only). Refused unless that card "
+                  "carries this door's provenance for the same --operator-ask-raise request."),
+    )
+
+
 def _quorum_phrase() -> str:
     """The ACTUAL bulk requirement, in one clause, derived from the guard itself.
 
@@ -318,6 +343,7 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        *_operator_ask_flags(),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     # Card t_36adf9a5: the RELEASE door. Named as THE release by the proof-gate refusal
@@ -435,6 +461,7 @@ _SPECS = [
         _arg("--priority", type=int, help="Replace the task priority"),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
+        *_operator_ask_flags(),
     ], help="Edit task fields or recovery fields on an already-completed task"),
     _cmd("retarget", [
         _TASK_ID,
@@ -638,6 +665,7 @@ _SPECS = [
             _TASK_ID,
             _reason("Why this card holds a reserved-tranche priority (the audit answer)"),
             _arg("--authority", help="Who is designating (default: the acting profile)"),
+            *_operator_ask_flags(),
             _json_flag(),
         ], help="Designate a card: the ledger row first, then priority 990000"),
         _cmd("revoke", [
