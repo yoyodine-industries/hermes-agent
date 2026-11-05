@@ -249,6 +249,27 @@ def test_an_unreadable_guard_fails_open(conn, tmp_path, monkeypatch):
     assert kb.complete_task(conn, tid, summary="done") is True
 
 
+def test_a_lost_deployed_guard_reports_but_still_fails_open(conn, tmp_path, monkeypatch, capsys):
+    """The deletion shape: the dest is there, the guard is gone — SAY SO, refuse nothing.
+
+    Both halves matter. The refusal would be wrong (the perimeter is advisory, and a
+    missing guard must not brick every lane's completion), and the silence would be
+    wrong too: an empty protected set is exactly what a working host with no
+    declaration looks like, so the loss has to be announced somewhere.
+    """
+    monkeypatch.delenv(protected.ENV_GUARD, raising=False)
+    dest = tmp_path / "ops-checks"
+    dest.mkdir()
+    monkeypatch.setattr(protected, "DEPLOYED_GUARD", str(dest / "guard-shared-trees.py"))
+    protected.reset_cache()
+    repo = _clean_repo(tmp_path / "unit")
+    (repo / "stray.py").write_text("x\n", encoding="utf-8")
+    tid = _card(conn, repo)
+
+    assert kb.complete_task(conn, tid, summary="done") is True
+    assert "protected-trees guard missing" in capsys.readouterr().err
+
+
 def test_a_workspace_git_cannot_read_fails_open(conn, tmp_path, monkeypatch):
     """A declared root that is not a git checkout tells this gate nothing — so it refuses
     nothing. Fail-open, or a mis-declared root would stall that lane's completions."""
