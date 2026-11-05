@@ -31,7 +31,7 @@ import logging
 import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, ContextManager, Iterator, Optional, cast
+from typing import Any, Callable, ContextManager, Iterator, Optional, cast
 
 from tools import bot_delivery_queue as delivery_queue
 from tools import bot_delivery_strand_alert as strand_alert
@@ -159,6 +159,90 @@ def target_profile_scope(adapter: Any, record: dict[str, Any]) -> Iterator[None]
         _api_request_profile.reset(token)
 
 
+#: ``status_detail`` on a delivery the Bot Chat's own FIFO owns after this call's budget: the
+#: message is durably admitted there and will run there, so the record must never be re-offered
+#: (a re-offer would deliver it a second time).
+STATUS_DETAIL_CHAT_FIFO = "bot_chat_fifo"
+
+
+async def _bot_chat_turn(
+    adapter: Any, session_id: str, message: str, author: Any
+) -> Optional[dict[str, Any]]:
+    """Admit *message* through the canonical Bot Chat's own FIFO; ``None`` for any other session.
+
+    Under session authority the Bot Chat is a LOCAL session whose only writer is the authority
+    FIFO, so running its turn as an API turn binds the chat as a second writer and the store
+    refuses the admission (``permission_denied``). That is how a ``hermes peer dm`` carrying the
+    delivery headers refused every lane and took the update lane's ``wind_down`` with it
+    (t_850bdf71): the queue record's turn never reached ``_admit_to_live_bot_chat``, which is the
+    door ``peer run`` and the header-less ``peer dm`` already take.
+
+    Returns that admission's receipt -- the reply, or the reason it failed -- or ``None`` when the
+    target is some other session (that turn runs as an ordinary API turn).
+    """
+    admit = cast(Optional[Callable[..., Any]], getattr(adapter, "_admit_to_live_bot_chat", None))
+    wait = cast(Optional[Callable[..., Any]], getattr(adapter, "_await_live_bot_chat_receipt", None))
+    if admit is None or wait is None:
+        return None
+    admitted = await admit(session_id, message, author)
+    if admitted is None:
+        return None
+    return await wait(*admitted)
+
+
+def _settle_bot_chat_turn(
+    adapter: Any,
+    home: Path,
+    delivery_id: str,
+    receipt: dict[str, Any],
+    *,
+    started: float,
+) -> tuple[dict[str, Any], Optional[str]]:
+    """Settle a delivery whose turn the Bot Chat's FIFO answered (or refused)."""
+    status = str(receipt.get("status") or "")
+    if status == "settled":
+        reply = str(receipt.get("reply") or "")
+        settled = delivery_queue.settle(
+            home, delivery_id, status=delivery_queue.STATUS_DELIVERED, reply=reply
+        )
+        adapter._bot_send_record_status(
+            delivery_id, settled, result=delivery_queue.RESULT_DELIVERED, reply=reply
+        )
+        log_delivery_event("turn_end", settled, seconds=round(time.monotonic() - started, 3))
+        return settled, reply
+    if status in ("queued", "claimed"):
+        # Still in the chat's own FIFO when this call's budget ran out: the message IS accepted
+        # and will run there, but the reply was not collected on this call. Settling it delivered
+        # is what forbids a re-offer -- requeueing here would deliver the same text twice.
+        settled = delivery_queue.settle(
+            home,
+            delivery_id,
+            status=delivery_queue.STATUS_DELIVERED,
+            reply="",
+            status_detail=STATUS_DETAIL_CHAT_FIFO,
+        )
+        adapter._bot_send_record_status(
+            delivery_id, settled, result=delivery_queue.RESULT_DELIVERED
+        )
+        log_delivery_event("turn_admitted", settled, status=status)
+        return settled, ""
+    error = str(receipt.get("error") or f"bot chat delivery {status or 'refused'}")
+    reason = str(receipt.get("reason") or "").strip() or _failure_reason(error)
+    settled = delivery_queue.settle(
+        home,
+        delivery_id,
+        status=delivery_queue.STATUS_FAILED,
+        reply=None,
+        error=error,
+        reason=reason,
+    )
+    adapter._bot_send_record_status(
+        delivery_id, settled, result=delivery_queue.RESULT_FAILED, error=error
+    )
+    log_delivery_event("turn_failed", settled, seconds=round(time.monotonic() - started, 3))
+    return settled, None
+
+
 async def run_record(
     adapter: Any,
     home: Path,
@@ -198,6 +282,12 @@ async def run_record(
     delivery_queue.note_turn_start(home, delivery_id)
     try:
         with scope:
+            # A turn aimed at the canonical Bot Chat enters through that chat's own admission; the
+            # store refuses to bind it here as a second (API) writer -- see ``_bot_chat_turn``.
+            author = (kwargs.get("turn_author") if ctx is not None else None)
+            chat_receipt = await _bot_chat_turn(adapter, session_id, str(kwargs.get("user_message") or ""), author)
+            if chat_receipt is not None:
+                return _settle_bot_chat_turn(adapter, home, delivery_id, chat_receipt, started=started)
             history = await adapter._conversation_history_for_session(session_id)
             result, _usage = await adapter._run_agent(
                 conversation_history=history,
