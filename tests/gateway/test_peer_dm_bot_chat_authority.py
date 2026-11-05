@@ -90,6 +90,60 @@ async def test_peer_dm_into_the_bot_chat_is_the_chats_own_admission(peer):
 
 
 @pytest.mark.asyncio
+async def test_a_peer_dm_carrying_delivery_headers_is_also_the_chats_own_admission(peer):
+    """``hermes peer dm`` ALWAYS sends the delivery headers (``peer.py``), so this — not the bare
+    body above — is the request the fleet's wind_down gate makes. The queue record's turn must
+    enter the chat's FIFO; running it here as an API turn is a second writer the store refuses
+    (``permission_denied``, t_850bdf71) and it took the whole update lane down with it.
+    """
+    headers = {'Idempotency-Key': 'wind_down-' + 'a' * 24, 'X-Hermes-Sender-Profile': 'default',
+               'X-Hermes-Wait-Seconds': '5'}
+    resp = await peer.cli.post(f"/api/sessions/{peer.chat}/chat", json={"message": "ping", "author": AUTHOR},
+                               headers=headers)
+    body = await resp.json()
+    assert resp.status == 200, body
+    assert body['object'] == 'hermes.peer.send_result', body
+    assert body['result'] == 'delivered', body
+    assert body['reply'] == 'pong', body
+    assert peer.executed == [(peer.chat, 'automation:' + peer.authority.sessions[peer.chat].route, 'ping', AUTHOR)]
+    assert peer.authority.db._read_all("SELECT 1 FROM session_admissions WHERE principal_id='api'") == [], \
+        'the Bot Chat was never bound as an API conversation'
+
+    # The queue's own idempotency still holds: the same key replays the settled receipt and the
+    # chat never runs the message a second time.
+    again = await peer.cli.post(f"/api/sessions/{peer.chat}/chat", json={"message": "ping", "author": AUTHOR},
+                                headers=headers)
+    replay = await again.json()
+    assert again.status == 200 and replay['replayed'] is True, replay
+    assert replay['result'] == 'delivered' and replay['reply'] == 'pong', replay
+    assert len(peer.executed) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_cli_labelled_bot_chat_takes_the_same_door_as_a_local_one(peer):
+    """The door selects the chat by title/lineage, never by the row's ``source`` label (t_850bdf71).
+
+    Measured on the host: ``profiles/platform-coder/state.db`` holds a ``Bot Chat`` titled
+    ``20260915_162222_002795`` with ``source='cli'`` (``created_source='api_server'``), and the other
+    lanes hold ``source='local'`` rows. That label is the *serving surface*, so it is never
+    ``api_server``/``bot_room`` -- keying the door on it would leave every lane refused. Rewriting the
+    rows would be a lie about provenance, so the door must not read it.
+    """
+    peer.authority.db._execute_write(
+        lambda conn: conn.execute('UPDATE sessions SET source=? WHERE id=?', ('cli', peer.chat))
+    )
+    headers = {'Idempotency-Key': 'wind_down-' + 'b' * 24, 'X-Hermes-Sender-Profile': 'default',
+               'X-Hermes-Wait-Seconds': '5'}
+    resp = await peer.cli.post(f"/api/sessions/{peer.chat}/chat", json={"message": "ping", "author": AUTHOR},
+                               headers=headers)
+    body = await resp.json()
+    assert resp.status == 200, body
+    assert body['result'] == 'delivered', body
+    assert body['reply'] == 'pong', body
+    assert [text for _, _, text, _ in peer.executed] == ['ping']
+
+
+@pytest.mark.asyncio
 async def test_streamed_peer_dm_and_peer_run_ride_the_same_door(peer):
     resp = await peer.cli.post(f"/api/sessions/{peer.chat}/chat/stream", json={"message": "ping", "author": AUTHOR})
     assert resp.status == 200, await resp.text()
