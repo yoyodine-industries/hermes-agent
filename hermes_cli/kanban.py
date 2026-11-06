@@ -345,6 +345,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
         except OSError as exc:
             return _err(f"kanban: --body-file: {exc}", 2)
 
+    # THE WORK-CARRIER GATE (platform-stl ruling 2026-11-05): a LOOP-shaped job filed as a
+    # standalone card is the wrong CARRIER. The board is the state of record, not a work
+    # queue - multi-phase work belongs to a yaan-looping project, whose LOOPING/task_list.md
+    # carries L2/L3 while the board carries ONE card per L1. Judged before anything is
+    # written: pure regex, no model, so the refusal is deterministic and costs one turn.
+    from hermes_cli import kanban_work_carrier_gate as _wcg
+    _carrier_refusal = _wcg.check(title=args.title, body=body,
+                                  project=getattr(args, "project", None))
+    if _carrier_refusal:
+        return _err(f"kanban: {_carrier_refusal}", 2)
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
