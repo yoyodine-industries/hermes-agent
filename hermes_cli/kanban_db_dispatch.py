@@ -3959,12 +3959,17 @@ def measure_host_budget(
 ) -> dict:
     """How much spawn capacity the CONFIG grants the host, as measured numbers.
 
-    ``max_spawn`` is per BOARD while ``max_in_progress`` is per HOST, so a fleet of
-    N dispatch boards advertises ``N x max_spawn`` local slots of which only
-    ``max_in_progress`` can ever hold a worker. That arithmetic used to live only
-    in the reader's head: ``kanban.max_spawn: 8`` x a handful of boards read as
-    "8 slots", the host sat at 12 running, and nothing said which number was the
-    real ceiling (card ``t_843cb0a9``).
+    **A per-board ceiling is a CEILING, never a RESERVATION.** ``kanban.max_spawn``
+    and ``kanban.max_spawn_by_board`` bound only what THAT board may draw; they do
+    not set a slot aside for it. The fleet bound is ``max_in_progress`` alone, and
+    the gateway allocator spends it by GLOBAL CARD PRIORITY with a one-slot
+    per-board floor (``gateway.kanban_watchers_dispatcher.host_budget_shares_by_priority``,
+    :119; called at :739, capacities built at :735 as ``ceiling - running``), so a
+    board with a queue already draws the whole host while its neighbours idle.
+    MEASURED 2026-11-02: platform ran 8 of 8 host slots at ``max_spawn: 8`` while
+    financially and research ran 0 — nothing was stranded. ``Σ ceilings >
+    max_in_progress`` is therefore the NORMAL elastic case, not a defect, and it
+    must never be reported as capacity a schedule cannot use.
 
     ``ceilings`` is the already-resolved per-board map (``kanban.max_spawn_by_board``
     where a board named one, the global value otherwise — the same resolution the
@@ -3973,10 +3978,17 @@ def measure_host_budget(
     the slugs it actually visits); by default the dispatch-enabled boards are
     enumerated, and an unreadable inventory reports ``boards=None`` with no claim
     either way — a measurement that cannot be taken is never reported as a number.
+    ``ceiling_sum`` / ``ceilings`` / ``max_spawn`` / ``boards`` are informational.
 
-    ``unreachable_slots`` is ``ceiling_sum - max_in_progress`` floored at 0, and it
-    is ``None`` (not 0) when no host cap is derived: uncapped dispatch wastes
-    nothing, and 0 would read as "measured, nothing wrong".
+    The ONLY genuinely unreachable capacity is a ceiling that EXCEEDS the host cap:
+    no single board can ever use more than ``max_in_progress`` workers.
+    ``per_board_unreachable`` maps each such board to its excess
+    (``max(ceiling - max_in_progress, 0)``, empty when none do) and
+    ``unreachable_slots`` is that excess summed. ``oversubscribed`` is True only
+    when some SINGLE board's ceiling exceeds the cap — never for the sum.
+    ``unreachable_slots`` is ``None`` (not 0) when no host cap is derived or a
+    ceiling cannot be resolved: a number that cannot be measured is never reported
+    as 0, which would read as "measured, nothing wrong".
     """
     caps = {str(k): int(v) for k, v in (ceilings or {}).items() if v is not None}
     slugs: Optional[list[str]]
@@ -4004,20 +4016,28 @@ def measure_host_budget(
         if resolved and all(cap is not None for cap in resolved):
             ceiling_sum = sum(int(cap) for cap in resolved if cap is not None)
 
+    host_cap = int(max_in_progress) if max_in_progress is not None else None
+    per_board_unreachable: dict[str, int] = {}
     unreachable: Optional[int] = None
-    oversubscribed = False
-    if ceiling_sum is not None and max_in_progress is not None:
-        unreachable = max(int(ceiling_sum) - int(max_in_progress), 0)
-        oversubscribed = int(ceiling_sum) > int(max_in_progress)
+    if host_cap is not None and ceiling_sum is not None:
+        for slug in slugs or []:
+            cap = per_board.get(slug)
+            if cap is None:
+                continue
+            excess = int(cap) - host_cap
+            if excess > 0:
+                per_board_unreachable[slug] = excess
+        unreachable = sum(per_board_unreachable.values())
 
     return {
         "max_spawn": int(max_spawn) if max_spawn is not None else None,
-        "max_in_progress": int(max_in_progress) if max_in_progress is not None else None,
+        "max_in_progress": host_cap,
         "boards": slugs,
         "ceilings": per_board,
         "ceiling_sum": ceiling_sum,
         "unreachable_slots": unreachable,
-        "oversubscribed": oversubscribed,
+        "per_board_unreachable": per_board_unreachable,
+        "oversubscribed": bool(per_board_unreachable),
     }
 
 
