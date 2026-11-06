@@ -94,8 +94,14 @@ MUTATING_VERBS = frozenset({
 #: ``-c key=value`` CONFIG flag is not a path, and reading it as one refused a card that
 #: ordered nothing in a live tree (``git -c core.hooksPath=/dev/null commit`` - seven
 #: archived corpus cards) from any cwd inside ``~/.hermes``. A config flag is never a target.
+#:
+#: A ``<...>`` placeholder is ONE token, spaces and all. Corpus cards really write
+#: ``git -C <corpus checkout> ls-tree ...`` and ``git -C <corpus log> reset --hard``; with a
+#: whitespace-delimited bare token the placeholder stopped at the space and its second word
+#: was read as the VERB - refusing a measurement as ``git checkout``, and admitting a reset
+#: as ``git log`` because a read-only verb ``continue``d before the unbound fall-through.
 _GIT_ACT = re.compile(
-    r"\bgit\s+(?:(?-i:-C)\s*(?P<cwd>\"[^\"]*\"|'[^']*'|[^\s;&|`'\"]+)\s+)?"
+    r"\bgit\s+(?:(?-i:-C)\s*(?P<cwd>\"[^\"]*\"|'[^']*'|<[^<>]*>|[^\s;&|`'\\\"]+)\s+)?"
     r"(?:-[ck]\s+\S+\s+)*(?P<verb>[a-z][a-z-]*)",
     re.IGNORECASE,
 )
@@ -224,8 +230,12 @@ def _absolute_target(target: str) -> Optional[str]:
     if not text:
         return None
     home = _expand("~")
-    for token in ("${HOME}", "$HOME"):
-        text = text.replace(token, home)
+    # ``$HOME`` must END where the variable name ends. A plain ``str.replace`` turned a
+    # card's ``$HOMETOWN`` into ``<home>TOWN`` - an absolute path bound to ANOTHER tree -
+    # so the act was admitted instead of falling through to the mention rule as UNBOUND.
+    # ``${HOME}`` is bounded by its own brace; the bare form is not followed by a variable
+    # character. ``$HOMEDIR`` and ``$HOME_X`` are likewise not this variable.
+    text = re.sub(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])", lambda _m: home, text)
     if text == "~" or text.startswith("~/"):
         text = home + text[1:]
     if not os.path.isabs(text):

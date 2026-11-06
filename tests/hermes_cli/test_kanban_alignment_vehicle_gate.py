@@ -368,3 +368,59 @@ def test_the_refusal_tells_a_noun_phrase_reader_how_to_reword():
     record = gate.evaluate(title="tidy the tree", body="git clean -fdx in ~/.hermes/hermes-agent")
     assert record is not None
     assert "reword it" in record["line"], "over-refusal is kept, but the reader gets a way out"
+
+
+# --- round 4 (contract lens): a <...> placeholder is ONE token --------------------- #
+#
+# The ``-C`` target used to stop at a space, so a second word inside a placeholder was read
+# as the VERB. Two real corpus cards were refused as mutating acts they do not order
+# (``<corpus checkout> ls-tree`` read as ``git checkout``; ``<corpus clone> rev-parse`` read
+# as ``git clone``), and the same tokeniser ADMITTED ``git -C <corpus log> reset --hard``
+# because a read-only "verb" ``continue``d before the unbound fall-through. Both directions
+# are pinned here, one card per test, from both cwds.
+
+@pytest.mark.parametrize("body", [
+    # t_8807a616 (done): a MEASUREMENT through a placeholder, live tree mentioned same line.
+    "require membership in `git -C <corpus checkout> ls-tree -r --name-only HEAD` for "
+    "~/.hermes/profiles/*/skills",
+    # t_7e919a1b (todo, live [land] carrier): another measurement, same spelling family.
+    "git -C <corpus clone> rev-parse origin/main:skills/foo/SKILL.md, then read it from "
+    "the corpus at ~/.hermes",
+])
+def test_a_read_only_act_behind_a_space_containing_placeholder_is_admitted(
+        monkeypatch, tmp_path, temp_live_home, body):
+    assert _verdicts_from_two_cwds(monkeypatch, tmp_path, temp_live_home,
+                                   title="measure the corpus", body=body) == [None, None]
+
+
+def test_a_mutating_act_behind_a_space_containing_placeholder_is_refused(
+        monkeypatch, tmp_path, temp_live_home):
+    """The fail-open arm: ``<corpus log>`` made a reset read as ``git log`` and be ADMITTED."""
+    body = "Run git -C <corpus log> reset --hard origin/main, then re-measure ~/.hermes/hermes-agent."
+    first, second = _verdicts_from_two_cwds(
+        monkeypatch, tmp_path, temp_live_home, title="align the tree", body=body)
+    assert first is not None and second is not None
+    assert first["act"] == "git reset" == second["act"]
+    assert first["via"] == "mention" == second["via"]
+
+
+def test_a_home_prefixed_variable_is_not_a_home_expansion(monkeypatch, tmp_path, temp_live_home):
+    """``$HOMETOWN`` is not ``$HOME``: it is UNBOUND, so the mention rule still applies."""
+    for spelling in ("$HOMETOWN", "${HOMETOWN}"):
+        body = f"Run git -C {spelling} reset --hard, then re-measure ~/.hermes/hermes-agent."
+        first, second = _verdicts_from_two_cwds(
+            monkeypatch, tmp_path, temp_live_home, title="align the tree", body=body)
+        assert first is not None and second is not None, spelling
+        assert first["via"] == "mention" == second["via"], spelling
+        assert first["act"] == "git reset" == second["act"], spelling
+
+
+def test_home_is_still_expanded_when_it_ends_the_variable():
+    """The boundary must not break the expansion the round-3 fix depends on."""
+    home = gate._expand("~")
+    for spelling in ("$HOME", "${HOME}"):
+        assert gate._absolute_target(f"{spelling}/.hermes") == f"{home}/.hermes"
+    assert gate._absolute_target("~/.hermes") == f"{home}/.hermes"
+    assert gate._absolute_target("$HOMETOWN") is None
+    assert gate._absolute_target("${HOMEDIR}") is None
+
