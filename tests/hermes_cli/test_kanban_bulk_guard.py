@@ -33,11 +33,18 @@ GREEN = "green"  # a stand-in approach text that three parties agree on
 
 @pytest.fixture()
 def board_home(tmp_path, monkeypatch):
-    """A registered ``ops`` board in a throwaway hermes root — never the estate's own store."""
+    """A registered ``ops`` board in a throwaway hermes root — never the estate's own store.
+
+    ``board.json`` is written on purpose: REGISTERED is the question the bulk guard asks
+    (:func:`kanban_db.board_is_registered`), and a fixture holding only ``kanban.db``
+    describes a filing-minted stub, not a board. A lying fixture is how the guard's
+    registry check silently stopped firing (ruling t_c21ea472).
+    """
     root = tmp_path / "home"
     board_dir = root / "kanban" / "boards" / "ops"
     board_dir.mkdir(parents=True)
     (board_dir / "kanban.db").write_bytes(b"")
+    (board_dir / "board.json").write_text(json.dumps({"slug": "ops", "name": "ops"}))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
     return root
 
@@ -226,6 +233,31 @@ def test_missing_snapshot_refuses_the_action(ledger, snapshot):
     with pytest.raises(kbg.BulkActionRefused) as exc:
         _evaluate(approval=digest, snapshot=None, snapshot_runner=_no_unit)
     assert exc.value.cause == "snapshot_missing"
+
+
+def test_the_snapshot_target_asks_the_registry_not_the_layout_resolver(board_home):
+    """A board NOBODY registered never reaches the preimage unit (ruling t_c21ea472).
+
+    ``kanban_db_path`` answers a would-be path for any well-formed slug — it must, because
+    ``create_board`` writes ``board.json`` through it. Reading a raise out of it (the old
+    shape of ``_store_for``) therefore stopped refusing the moment the resolver stopped
+    raising, and a ghost slug went to the preimage unit. The registry is asked instead.
+    """
+    from hermes_cli import kanban_db as kb
+
+    def _boom(_store):
+        raise AssertionError("a preimage was attempted on an unregistered board's store")
+
+    with pytest.raises(kbg.BulkActionRefused) as exc:
+        kbg._conclude_snapshot_clause(
+            {"approach": "x"}, board="ghost", store_path=None,
+            snapshot=None, snapshot_runner=_boom, now=time.time(),
+        )
+    assert exc.value.cause == "snapshot_missing"
+    assert "ghost" in str(exc.value)
+    assert not kb.board_dir("ghost").exists(), "the refusal must not mint the board"
+    assert kbg._store_for("ghost") is None
+    assert kbg._store_for("ops") == kb.kanban_db_path("ops")
 
 
 def test_admission_records_the_snapshot_path_on_the_audit_row(ledger, snapshot, monkeypatch):
