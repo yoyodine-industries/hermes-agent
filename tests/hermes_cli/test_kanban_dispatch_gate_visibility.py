@@ -10,8 +10,9 @@ saturated board was indistinguishable from a wedged one.
 Three behaviour contracts:
 1. a budget-held tick NAMES the cards it held, in a bucket that is published, together
    with the cap that held them and the measured running count (``spawn_budget``);
-2. the cap the environment implies ACROSS boards (``max_spawn`` x dispatch boards)
-   against ``max_in_progress`` is a NUMBER a reader can find (``measure_host_budget``);
+2. the cap the environment implies ACROSS boards (``measure_host_budget``) is a NUMBER
+   a reader can find — and a per-board ceiling is a CEILING, not a reservation, so
+   only a ceiling above the host cap is reported as unreachable;
 3. a slot that frees is used by the head card on the very next pass — demonstrated,
    never inferred.
 """
@@ -173,11 +174,17 @@ def test_cli_json_also_reports_spawn_failures_and_tick_yield(
 
 
 # ---------------------------------------------------------------------------
-# 3. The host ceiling is a measured number (max_spawn x boards vs max_in_progress)
+# 3. The host ceiling is MEASURED — and a per-board ceiling is not a reservation
 # ---------------------------------------------------------------------------
 
 
-def test_host_ceiling_reconciles_boards_against_max_in_progress(kanban_home):
+def test_elastic_ceiling_sum_is_not_unreachable_capacity(kanban_home):
+    """Σ ceilings > max_in_progress is the NORMAL case, not a defect.
+
+    A per-board ceiling bounds only what that board may draw; the allocator hands
+    the free host slots out by global card priority, so 3 x 8 against a cap of 8
+    is elastic headroom a busy board can use — not 16 stranded slots.
+    """
     kb.create_board("financially")
     kb.create_board("research")
 
@@ -186,9 +193,25 @@ def test_host_ceiling_reconciles_boards_against_max_in_progress(kanban_home):
     assert set(measured["boards"]) == {kb.DEFAULT_BOARD, "financially", "research"}
     assert measured["max_spawn"] == 8
     assert measured["max_in_progress"] == 8
-    assert measured["ceiling_sum"] == 24          # 3 boards x 8, the number that was implicit
+    assert measured["ceiling_sum"] == 24          # 3 boards x 8, informational only
+    assert measured["per_board_unreachable"] == {}
+    assert measured["oversubscribed"] is False
+    assert measured["unreachable_slots"] == 0     # nothing is stranded
+
+
+def test_a_ceiling_above_the_host_cap_is_the_only_unreachable_class(kanban_home):
+    """No single board can ever use more than max_in_progress workers."""
+    measured = kbd.measure_host_budget(
+        max_spawn=12,
+        max_in_progress=8,
+        ceilings={kb.DEFAULT_BOARD: 12},
+        boards=[kb.DEFAULT_BOARD],
+    )
+
+    assert measured["ceiling_sum"] == 12
+    assert measured["per_board_unreachable"] == {kb.DEFAULT_BOARD: 4}
+    assert measured["unreachable_slots"] == 4
     assert measured["oversubscribed"] is True
-    assert measured["unreachable_slots"] == 16    # 24 - 8: capacity no schedule can use
 
 
 def test_host_ceiling_fits_when_per_board_caps_are_set(kanban_home):
@@ -202,6 +225,7 @@ def test_host_ceiling_fits_when_per_board_caps_are_set(kanban_home):
     )
 
     assert measured["ceiling_sum"] == 8
+    assert measured["per_board_unreachable"] == {}
     assert measured["oversubscribed"] is False
     assert measured["unreachable_slots"] == 0
 
@@ -210,6 +234,7 @@ def test_host_ceiling_is_unmeasured_without_a_host_cap(kanban_home):
     """No cap is not oversubscription: report none rather than invent one."""
     measured = kbd.measure_host_budget(max_spawn=8, max_in_progress=None)
     assert measured["oversubscribed"] is False
+    assert measured["per_board_unreachable"] == {}
     assert measured["unreachable_slots"] is None
 
 
@@ -222,11 +247,20 @@ def test_cli_json_reports_the_host_ceiling(kanban_home, all_assignees_spawnable,
 
     assert payload["host_budget"]["max_spawn"] == 2
     assert payload["host_budget"]["ceiling_sum"] == 4      # 2 boards x max_spawn 2
+    # No host cap is derived in this isolated home, so the unreachable count is
+    # UNMEASURED (None), never invented as 0 — and never the old ceiling_sum - cap.
+    assert payload["host_budget"]["max_in_progress"] is None
+    assert payload["host_budget"]["unreachable_slots"] is None
+    assert payload["host_budget"]["per_board_unreachable"] == {}
+    assert payload["host_budget"]["oversubscribed"] is False
 
 
-def test_cli_text_output_flags_an_oversubscribed_host(
+def test_cli_text_output_prints_no_capacity_advice_for_an_elastic_host(
     kanban_home, all_assignees_spawnable, capsys, monkeypatch
 ):
+    """The false alarm: 2 boards x 8 against a cap of 8 used to print
+    "16 slot(s) are unreachable by config; set kanban.max_spawn_by_board to fit"
+    — advice to SHRINK the headroom that is doing the work."""
     from hermes_cli import config as hermes_config
 
     monkeypatch.setattr(
@@ -239,11 +273,41 @@ def test_cli_text_output_flags_an_oversubscribed_host(
     kanban_ops._cmd_dispatch(_dispatch_args(json=False))
     out = capsys.readouterr().out
 
+    assert not [line for line in out.splitlines() if line.startswith("Host ceiling:")], out
+    assert "unreachable" not in out
+    assert "set kanban.max_spawn_by_board to fit" not in out
+    # The bound is still readable; it just does not read as a defect.
+    assert "Host bound: max_in_progress=8, elastic across 2 board(s)" in out
+
+
+def test_cli_text_output_names_the_board_whose_ceiling_exceeds_the_cap(
+    kanban_home, all_assignees_spawnable, capsys, monkeypatch
+):
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda *a, **kw: {
+            "kanban": {
+                "max_spawn": 8,
+                "max_in_progress": 8,
+                "max_spawn_by_board": {kb.DEFAULT_BOARD: 12},
+            }
+        },
+    )
+
+    kanban_ops._cmd_dispatch(_dispatch_args(json=False))
+    out = capsys.readouterr().out
+
     host_lines = [line for line in out.splitlines() if line.startswith("Host ceiling:")]
-    assert host_lines, f"no Host ceiling line in:\n{out}"
-    assert "2 x max_spawn=8 = 16" in host_lines[0]
-    assert "max_in_progress=8" in host_lines[0]
-    assert "8 slot(s)" in host_lines[0]
+    assert len(host_lines) == 1, f"no single-board Host ceiling line in:\n{out}"
+    assert (
+        f"Host ceiling: board {kb.DEFAULT_BOARD} max_spawn=12 > max_in_progress=8: "
+        f"4 slot(s) that board can never use; lower "
+        f"kanban.max_spawn_by_board[{kb.DEFAULT_BOARD}] or raise max_in_progress."
+    ) == host_lines[0]
+    assert "Host bound:" not in out
 
 
 # ---------------------------------------------------------------------------

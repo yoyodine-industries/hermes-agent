@@ -132,15 +132,29 @@ def _held_lines(res: object, host_budget: dict) -> list[str]:
     yielded = getattr(res, "tick_yielded", "")
     if yielded:
         lines.append(f"Tick yielded: {yielded}")
-    if host_budget.get("oversubscribed"):
-        boards = host_budget.get("boards") or []
+    # A ceiling above the host cap is the ONLY unreachable capacity class: no
+    # single board can ever use more than max_in_progress workers. Σ ceilings >
+    # max_in_progress is the normal ELASTIC case (the allocator hands free slots
+    # out by global card priority), so it must never print as a defect — still
+    # less as advice to shrink the headroom that is doing the work.
+    per_board_unreachable = host_budget.get("per_board_unreachable") or {}
+    host_cap = host_budget.get("max_in_progress")
+    ceilings = host_budget.get("ceilings") or {}
+    for slug in sorted(per_board_unreachable):
         lines.append(
-            f"Host ceiling: {len(boards)} x max_spawn={host_budget.get('max_spawn')} = "
-            f"{host_budget.get('ceiling_sum')} against max_in_progress="
-            f"{host_budget.get('max_in_progress')} — "
-            f"{host_budget.get('unreachable_slots')} slot(s) are unreachable by config; "
-            f"set kanban.max_spawn_by_board to fit."
+            f"Host ceiling: board {slug} max_spawn={ceilings.get(slug)} > "
+            f"max_in_progress={host_cap}: {per_board_unreachable[slug]} slot(s) that "
+            f"board can never use; lower kanban.max_spawn_by_board[{slug}] or raise "
+            f"max_in_progress."
         )
+    if not per_board_unreachable:
+        ceiling_sum = host_budget.get("ceiling_sum")
+        if host_cap is not None and ceiling_sum is not None and int(ceiling_sum) > int(host_cap):
+            boards = host_budget.get("boards") or []
+            lines.append(
+                f"Host bound: max_in_progress={host_cap}, elastic across "
+                f"{len(boards)} board(s)"
+            )
     return lines
 
 
@@ -180,10 +194,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
-    # The CONFIG's own arithmetic: max_spawn is per board, max_in_progress is per
-    # host, so the fleet advertises more slots than it can ever hold. Measured
-    # here so the numbers ride every dispatch output instead of living in a
-    # reader's head (card t_843cb0a9 requirement 2).
+    # The CONFIG's own arithmetic, measured so the numbers ride every dispatch
+    # output instead of living in a reader's head (card t_843cb0a9 requirement 2).
+    # max_spawn is per BOARD and a CEILING, not a reservation; max_in_progress is
+    # the HOST bound, and the allocator hands free host slots out by global card
+    # priority — so Σ ceilings > max_in_progress is elastic headroom, not waste.
     host_budget = kbd.measure_host_budget(
         max_spawn=max_spawn,
         max_in_progress=max_in_progress,
