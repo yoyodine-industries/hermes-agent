@@ -165,7 +165,7 @@ def _segment_spans(title: Optional[str], body: Optional[str]) -> list[tuple[int,
     tree it resets. Every later line stands alone - a mention in the closing paragraph does not
     arm a verb at the top.
     """
-    text = "%s\n%s" % (title or "", body or "")
+    text = f"{title or ''}\n{body or ''}"
     join = len(title or "")
     spans: list[tuple[int, int]] = []
     start = 0
@@ -227,13 +227,13 @@ def find_live_act(text: str, roots: tuple[str, ...],
             # An explicit target settles it: the act is on the tree it names.
             root = _under(cwd, roots)
             if root:
-                return {"act": "git %s" % verb, "root": root, "via": "git -C %s" % cwd,
+                return {"act": f"git {verb}", "root": root, "via": f"git -C {cwd}",
                         "sentence": _judged_sentence(text, segments, match.start())}
             continue                  # bound to some other tree - not this rule's business
         act_segment = _segment_of(match.start(), segments)
         for start, root in mentions:
             if _segment_of(start, segments) == act_segment:
-                return {"act": "git %s" % verb, "root": root, "via": "mention",
+                return {"act": f"git {verb}", "root": root, "via": "mention",
                         "sentence": _judged_sentence(text, segments, match.start())}
     return None
 
@@ -249,18 +249,19 @@ def evaluate(*, title: Optional[str] = None, body: Optional[str] = None,
     roots = roots if roots is not None else live_roots()
     if not roots:
         return None
-    text = "%s\n%s" % (title or "", body or "")
+    text = f"{title or ''}\n{body or ''}"
     act = find_live_act(text, roots, _segment_spans(title, body))
     if act is None:
         return None
     if names_vehicle(text):
         return None
+    head = (title or "").strip()[:80]
     line = (
-        "refused: alignment card names no admitted vehicle: %r orders `%s` in the live tree "
-        "%s, in the card's own sentence %r. The live line is carried by the update chain "
-        "(r5-install / hermes-update) - name it as the vehicle, or move the act to a non-live "
-        "tree."
-        % ((title or "").strip()[:80], act["act"], act["root"], act["sentence"])
+        f"refused: alignment card names no admitted vehicle: {head!r} orders "
+        f"`{act['act']}` in the live tree {act['root']}, in the card's own sentence "
+        f"{act['sentence']!r}. The live line is carried by the update chain "
+        "(r5-install / hermes-update) - name it as the vehicle, or move the act to a "
+        "non-live tree."
     )
     return {"status": "refused", "gate": "alignment_vehicle", "line": line,
             "act": act["act"], "root": act["root"], "via": act["via"],

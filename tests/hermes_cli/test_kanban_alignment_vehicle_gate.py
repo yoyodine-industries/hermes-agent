@@ -74,7 +74,7 @@ def test_naming_the_vehicle_admits_the_same_card():
         assert gate.evaluate(
             title="align the live tree",
             body="git reset --hard origin/overrides/live in ~/.hermes/hermes-agent; "
-                 "carried by %s." % vehicle,
+                 f"carried by {vehicle}.",
         ) is None, vehicle
 
 
@@ -174,16 +174,16 @@ def test_the_incident_card_is_refused():
 
 def test_the_edit_door_refuses_a_rewrite_and_leaves_the_row_unchanged(conn):
     task_id = kb.create_task(conn, title="measure the live tree", assignee="platform-coder",
-                             body="git status in %s" % LIVE, created_by="test")
+                             body=f"git status in {LIVE}", created_by="test")
     assert not is_refusal(task_id)
     refusal = kb.edit_task(
         conn, task_id,
-        body="git reset --hard origin/overrides/live in %s" % LIVE,
+        body=f"git reset --hard origin/overrides/live in {LIVE}",
     )
     assert is_refusal(refusal)
     row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
     assert row[0] == "measure the live tree"
-    assert row[1] == "git status in %s" % LIVE, "a refused edit changes NOTHING"
+    assert row[1] == f"git status in {LIVE}", "a refused edit changes NOTHING"
     assert conn.execute(
         "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'edited'", (task_id,)
     ).fetchone()[0] == 0
@@ -191,11 +191,11 @@ def test_the_edit_door_refuses_a_rewrite_and_leaves_the_row_unchanged(conn):
 
 def test_the_edit_door_admits_a_rewrite_that_names_the_vehicle(conn):
     task_id = kb.create_task(conn, title="measure the live tree", assignee="platform-coder",
-                             body="git status in %s" % LIVE, created_by="test")
+                             body=f"git status in {LIVE}", created_by="test")
     assert not is_refusal(task_id)
     assert kb.edit_task(
         conn, task_id,
-        body="git reset --hard origin/overrides/live in %s, carried by hermes-update" % LIVE,
+        body=f"git reset --hard origin/overrides/live in {LIVE}, carried by hermes-update",
     ) is True
     row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
     assert "hermes-update" in row[0]
@@ -207,7 +207,7 @@ def test_a_host_with_no_live_roots_is_inert(monkeypatch):
 
 
 def test_the_refusal_is_an_answer_not_an_exception():
-    refusal, record = gate.apply(title="align", body="git reset --hard in %s" % LIVE)
+    refusal, record = gate.apply(title="align", body=f"git reset --hard in {LIVE}")
     assert is_refusal(refusal)
     assert not refusal, "a refusal is FALSY: `if not task_id:` must catch it"
     assert isinstance(refusal, str) and "refused: alignment card" in refusal
@@ -219,7 +219,7 @@ def test_the_refusal_is_an_answer_not_an_exception():
 def test_the_create_door_refuses_and_writes_no_row(conn, capsys):
     task_id = kb.create_task(
         conn, title="align the live tree",
-        body="git reset --hard origin/overrides/live in %s" % LIVE,
+        body=f"git reset --hard origin/overrides/live in {LIVE}",
         assignee="platform-coder", created_by="test",
     )
     assert is_refusal(task_id)
@@ -247,9 +247,9 @@ def test_the_decompose_seam_refuses_per_child_and_writes_nothing(conn):
     refusal = kbg.decompose_triage_task(
         conn, root, root_assignee="platform-stl", author="test", children=[
             {"title": "measure the live tree", "assignee": "platform-coder",
-             "body": "git status in %s" % LIVE},
+             "body": f"git status in {LIVE}"},
             {"title": "align the live tree", "assignee": "platform-coder",
-             "body": "git reset --hard origin/overrides/live in %s" % LIVE},
+             "body": f"git reset --hard origin/overrides/live in {LIVE}"},
         ])
     assert is_refusal(refusal)
     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1, \
