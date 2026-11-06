@@ -29,27 +29,35 @@ process and it is visible in the command line an auditor reads.
 
 * ``--operator-ask-door`` names the door; only :data:`DOORS` may hold the exemption, so a second
   tool cannot inherit it by copying the flags.
-* ``--operator-ask-raise <request>`` is the door's per-call id. The CREATE writes it onto the card
-  as a provenance line; the DESIGNATE and EDIT must name ``--operator-ask-card <id>`` and are
-  refused unless that exact card carries the same door+request. That is what stops the exemption
+* ``--operator-ask-raise <request>`` is the door's per-call id. The CREATE writes only its
+  DIGEST onto the card as a provenance line, so a later invocation that can read the card
+  (anyone can) still cannot present a token this kernel accepts; the DESIGNATE and EDIT must
+  name ``--operator-ask-card <id>`` and present the raw id again, and are refused unless that
+  exact card carries this door and this request's digest. That is what stops the exemption
   becoming "a worker may re-prioritise any card on its own board": the id the edit may re-rank is
   the one this invocation's door just created, and no other.
 * The CREATE is refused a priority at or above the reserved tranche, so the exemption can never
-  birth a card inside the operator band.
+  birth a card inside the operator band. The CREATE is also refused a body that already carries
+  the provenance prefix: the kernel writes the ONE line it measured, so a caller-supplied line
+  cannot make the card misstate who filed it or which claim it lifted.
 
 PROVENANCE ON THE CARD, NOT IN A LOG
 ------------------------------------
 The created card's body carries
 
-    Operator-ask-door: door=<name> request=<id> filed-by=<lane> fenced-by=<task-id> board=<slug>
+    Operator-ask-door: door=<name> request=<digest> filed-by=<lane> fenced-by=<task-id> board=<slug>
 
-``fenced-by`` is MEASURED where it can be (the task id of the live claim whose ancestor pid would
-otherwise fence the call) and falls back to the worker's own ``HERMES_KANBAN_TASK``. Raise acts are
-therefore auditable by reading the card instead of reconstructing shell lineage.
+``request`` is a truncated SHA-256 of the door's raw per-call id, never the raw id itself: the
+line is a BIND, not a key, so reading it off the card must not be enough to replay the
+exemption in a later invocation. ``fenced-by`` is MEASURED where it can be (the task id of the
+live claim whose ancestor pid would otherwise fence the call) and falls back to the worker's own
+``HERMES_KANBAN_TASK``. Raise acts are therefore auditable by reading the card instead of
+reconstructing shell lineage.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sqlite3
@@ -78,6 +86,13 @@ ACTS: frozenset[str] = frozenset({"create", "designate", "edit"})
 #: ``Operator-ask:``).
 PROVENANCE_PREFIX = "Operator-ask-door:"
 
+#: The create stamps only a DIGEST of the door's per-call request id — never the raw id — so a
+#: later invocation that can READ the card (the card body is readable by anyone who can see the
+#: board) still cannot present a token the kernel accepts: presenting the printed value digests to
+#: a different value and is refused. The digest binds the create to the designate/edit of the SAME
+#: invocation, which is the whole ruling; the raw id never lands on the card.
+REQUEST_DIGEST_CHARS = 16
+
 #: One token-safe word: the line is machine-readable and is written into a card body, so a value
 #: carrying whitespace or a newline is a refusal, never a body-injection.
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,127}$")
@@ -88,6 +103,17 @@ _PROVENANCE_RE = re.compile(
 
 class RaiseGrantRefused(ValueError):
     """A malformed, incomplete or unbound operator-ask exemption. Nothing is written."""
+
+
+def request_digest(request: str) -> str:
+    """The BIND value written onto the card: a truncated SHA-256 of the raw per-call request id.
+
+    One-way on purpose. The card is a durable, readable artifact; if it carried the raw id, a
+    later invocation could lift the exemption for an existing operator-ask card by copying what it
+    read (measured in review round 1: a third process designated 0->990000 and raised to 999999 a
+    card created by an earlier invocation). The digest can be READ but not PRESENTED.
+    """
+    return hashlib.sha256(request.encode("utf-8")).hexdigest()[:REQUEST_DIGEST_CHARS]
 
 
 @dataclass(frozen=True)
@@ -166,28 +192,56 @@ def admits_store(path: str | Path | None) -> bool:
 
 def provenance_line(*, door: str, request: str, filed_by: str, fenced_by: Optional[str],
                     board: str) -> str:
-    """The machine-readable body line the create writes onto the ask card."""
-    return (f"{PROVENANCE_PREFIX} door={door} request={request} filed-by={filed_by} "
-            f"fenced-by={fenced_by or '-'} board={board}")
+    """The machine-readable body line the create writes onto the ask card.
+
+    ``request`` here is stamped as its DIGEST (:func:`request_digest`): the line is the BIND the
+    designate/edit re-present, and a bind that can be copied off the card is no bind at all.
+    """
+    return (f"{PROVENANCE_PREFIX} door={door} request={request_digest(request)} "
+            f"filed-by={filed_by} fenced-by={fenced_by or '-'} board={board}")
+
+
+def provenance_lines(body: Optional[str]) -> list[dict[str, str]]:
+    """EVERY provenance line in *body*, in body order."""
+    if not body:
+        return []
+    lines: list[dict[str, str]] = []
+    for match in _PROVENANCE_RE.finditer(body):
+        fields: dict[str, str] = {}
+        for part in match.group("rest").split():
+            key, sep, value = part.partition("=")
+            if sep and key not in fields:
+                fields[key] = value
+        lines.append(fields)
+    return lines
 
 
 def parse_provenance(body: Optional[str]) -> dict[str, str]:
-    """The first provenance line in *body* as a dict, or ``{}`` when there is none."""
-    if not body:
-        return {}
-    match = _PROVENANCE_RE.search(body)
-    if match is None:
-        return {}
-    fields: dict[str, str] = {}
-    for part in match.group("rest").split():
-        key, sep, value = part.partition("=")
-        if sep and key not in fields:
-            fields[key] = value
-    return fields
+    """The provenance line in *body*, when the body carries EXACTLY ONE; ``{}`` otherwise.
+
+    Ambiguity is not provenance. ``stamp_body`` refuses to write onto a body that already carries
+    the prefix, so a card this kernel filed has one line and the bind never has to guess which
+    line the kernel wrote (review round 1 measured the old first-match read returning a
+    worker-supplied line while the kernel's measured line sat second).
+    """
+    lines = provenance_lines(body)
+    return lines[0] if len(lines) == 1 else {}
 
 
 def stamp_body(body: Optional[str], grant: RaiseGrant) -> str:
-    """Append the provenance line to *body* — the card, not a log, carries the raise's lineage."""
+    """Append the provenance line to *body* — the card, not a log, carries the raise's lineage.
+
+    A body that already carries an ``Operator-ask-door:`` line is REFUSED, not appended to: the
+    kernel writes the one line it measured, so a caller-supplied line can never make the card
+    name a different lane or a different claim than the one this invocation overrode.
+    """
+    if PROVENANCE_PREFIX in (body or ""):
+        raise RaiseGrantRefused(
+            f"the operator-ask create may not be handed a body that already carries an "
+            f"`{PROVENANCE_PREFIX}` line: the kernel writes the ONE provenance line it measured "
+            "(door, filed-by lane and the claim it overrode), so the body's provenance must be "
+            "the kernel's, never the caller's"
+        )
     line = provenance_line(
         door=grant.door, request=grant.request, filed_by=grant.filed_by,
         fenced_by=grant.fenced_by, board=grant.board,
@@ -221,13 +275,19 @@ def _card_row(store: Path, card_id: str) -> Optional[tuple[str, str, int]]:
 
 
 def card_is_bound(store: Path, card_id: str, *, door: str, request: str) -> bool:
-    """True when *card_id* on *store* carries THIS door's provenance for THIS request."""
+    """True when *card_id* on *store* carries THIS door's provenance for THIS request.
+
+    Compares DIGESTS (:func:`request_digest`): the raw per-call id lives only in the door's own
+    invocation, so holding the card — the artifact anyone on the board can read — is not enough
+    to re-present the exemption in a later process.
+    """
     row = _card_row(store, card_id)
     if row is None:
         return False
     body = row[0]
     fields = parse_provenance(body)
-    return fields.get("door") == door and fields.get("request") == request
+    return (fields.get("door") == door
+            and fields.get("request") == request_digest(request))
 
 
 # ---------------------------------------------------------------------------------------- grant
@@ -378,8 +438,9 @@ def grant_for(args: Any) -> Optional[RaiseGrant]:
     if not card_is_bound(store, card_id, door=door, request=request):
         raise RaiseGrantRefused(
             f"the operator-ask {act} names {card_id}, which carries no provenance for door "
-            f"{door!r} request {request!r}: the exemption is bound to the card this invocation's "
-            "door just created, never to another card on the board"
+            f"{door!r} and this invocation's request id: the bind is a DIGEST of the per-call id "
+            "written by the create THIS invocation made, so a later process re-presenting what "
+            "the card displays is refused, and no other card on the board is reachable"
         )
     if act == "edit":
         priority = getattr(args, "priority", None)

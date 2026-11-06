@@ -57,10 +57,11 @@ def _operator_ask_flags():
                   "--operator-ask-raise and one of exactly three acts — `create`, "
                   "`defcon designate`, `edit`."),
         _arg("--operator-ask-raise", dest="operator_ask_raise", metavar="REQUEST", default=None,
-             help="The door's per-call request id. The create writes it onto the new card as an "
-                  "`Operator-ask-door:` provenance line; the designate/edit must present the SAME "
-                  "id with --operator-ask-card, which is what binds the exemption to the card "
-                  "this invocation's door just created and to no other."),
+             help="The door's per-call request id. The create writes only its DIGEST onto the new "
+                  "card as an `Operator-ask-door:` provenance line; the designate/edit must "
+                  "present the SAME id with --operator-ask-card, which is what binds the exemption "
+                  "to the card this invocation's door just created and to no other (a later "
+                  "process re-presenting the digest printed on the card is refused)."),
         _arg("--operator-ask-card", dest="operator_ask_card", metavar="CARD", default=None,
              help="The card the create just made (designate/edit only). Refused unless that card "
                   "carries this door's provenance for the same --operator-ask-raise request."),

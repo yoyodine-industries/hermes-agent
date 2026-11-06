@@ -498,7 +498,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
     # lineage. Written HERE, at the one create seam, so the kernel writes what it measured.
     create_grant = koa.active_grant()
     if create_grant is not None and create_grant.act == "create":
-        body = koa.stamp_body(body, create_grant)
+        try:
+            body = koa.stamp_body(body, create_grant)
+        except koa.RaiseGrantRefused as exc:
+            # A body that already carries a provenance line is a spoof of the kernel's own audit
+            # trail: refuse loudly, write nothing (review round 1, card t_af03b766).
+            return _err(f"kanban: operator-ask exemption refused: {exc}", 2)
 
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)

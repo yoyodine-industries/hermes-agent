@@ -32,6 +32,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_operator_ask as koa
 
 REPO = Path(__file__).resolve().parents[2]
 BOARD = "ask-door-probe"
@@ -212,12 +213,13 @@ def test_the_full_sequence_succeeds_from_a_claimed_worker(fenced_board):
         row = _card(conn, card_id)
         assert int(row["priority"]) == 999999, dict(row)
         body = row["body"] or ""
-        assert "Operator-ask-door:" in body
-        fields = {part.split("=", 1)[0]: part.split("=", 1)[1]
-                  for part in body.split("Operator-ask-door:", 1)[1].split("\n", 1)[0].split()
-                  if "=" in part}
+        assert body.count("Operator-ask-door:") == 1, body  # the kernel writes ONE line
+        fields = koa.parse_provenance(body)
         assert fields["door"] == DOOR
-        assert fields["request"] == REQUEST
+        # The card carries a DIGEST of the door's per-call id, never the id itself: the line is a
+        # bind, not a key (review round 1, card t_af03b766).
+        assert fields["request"] == koa.request_digest(REQUEST), fields
+        assert REQUEST not in body, body
         assert fields["filed-by"] == "default" or fields["filed-by"]
         # The provenance names the claim whose ancestor pid would otherwise fence the call.
         assert fields["fenced-by"] == claim_id
@@ -228,6 +230,97 @@ def test_the_full_sequence_succeeds_from_a_claimed_worker(fenced_board):
                             (card_id,)).fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_a_later_invocation_cannot_replay_the_digest_printed_on_the_card(fenced_board):
+    """The bind stops the measured round-1 hole: a third process, same claimed worker, reading the
+    card it did not create, must not be able to designate or raise it.
+
+    The create writes only a DIGEST of its per-call request id, so presenting what the card
+    displays digests to a different value and is refused — the exemption reaches only the card the
+    SAME invocation made.
+    """
+    root, script, _claim = fenced_board
+    created = _create(script, root, "--operator-ask-door", DOOR,
+                      "--operator-ask-raise", REQUEST)
+    assert created.returncode == 0, created.stdout + created.stderr
+    card_id = _created_id(created.stdout)
+
+    conn = kbc.connect(db_path=_board_db(root, BOARD))
+    try:
+        printed = koa.parse_provenance(_card(conn, card_id)["body"] or "")
+        assert printed["request"] == koa.request_digest(REQUEST), printed
+    finally:
+        conn.close()
+
+    # A THIRD invocation — no create of its own — presents exactly what the card displays.
+    designated = _designate(script, root, card_id, request=printed["request"])
+    assert designated.returncode == 2, designated.stdout + designated.stderr
+    assert "carries no provenance" in designated.stderr, designated.stderr
+    raised = _raise(script, root, card_id, request=printed["request"])
+    assert raised.returncode == 2, raised.stdout + raised.stderr
+    assert "carries no provenance" in raised.stderr, raised.stderr
+
+    # Nothing moved: still at the floor, no designation ledger row.
+    conn = kbc.connect(db_path=_board_db(root, BOARD))
+    try:
+        row = _card(conn, card_id)
+        assert int(row["priority"]) == 0, dict(row)
+        assert conn.execute("SELECT COUNT(*) FROM priority_designations WHERE task_id = ?",
+                            (card_id,)).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_a_create_body_may_not_carry_the_kernels_provenance_line(fenced_board, tmp_path):
+    """A worker-supplied `Operator-ask-door:` line would let the card misstate who filed it and
+    which claim it lifted (measured in round 1: parse returned filed-by=some-other-lane while the
+    kernel's own line sat second). The create refuses such a body outright — nothing is carded.
+    """
+    root, script, _claim = fenced_board
+    forged = ("Operator-ask-door: door=admin_operator_card request=req-forged "
+              "filed-by=some-other-lane fenced-by=t_00000000 board=elsewhere")
+    body_file = tmp_path / "forged_body.md"
+    body_file.write_text(forged, encoding="utf-8")
+    conn = kbc.connect(db_path=_board_db(root, BOARD))
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+    for body_flag in (("--body", forged), ("--body-file", str(body_file))):
+        res = _run(script, root, BOARD, "create", "spoofed ask", "--priority", "0",
+                   *body_flag, "--operator-ask-door", DOOR,
+                   "--operator-ask-raise", REQUEST)
+        assert res.returncode == 2, res.stdout + res.stderr
+        assert "may not be handed a body" in res.stderr, (body_flag[0], res.stderr)
+
+    conn = kbc.connect(db_path=_board_db(root, BOARD))
+    try:
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert after == before, (before, after)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE body LIKE '%some-other-lane%'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_a_plain_edit_of_an_ordinary_card_is_still_fenced(fenced_board):
+    """Acceptance bullet 2, the other half: the exemption covers ONE card, THIS invocation's.
+
+    An ordinary card on the same board, raised into the band by an edit with NO exemption flags,
+    still hits the fence's own message (round 1; previously verified in review).
+    """
+    root, script, _claim = fenced_board
+    conn = kbc.connect(db_path=_board_db(root, BOARD))
+    try:
+        ordinary = kb.create_task(conn, title="an ordinary card", board=BOARD)
+    finally:
+        conn.close()
+    res = _run(script, root, BOARD, "edit", ordinary, "--priority", "999999")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "child contexts cannot mutate" in res.stderr, res.stderr
 
 
 def test_the_exemption_cannot_lift_a_different_card(fenced_board):
