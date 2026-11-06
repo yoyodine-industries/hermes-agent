@@ -414,25 +414,58 @@ def test_the_other_fence_arms_still_refuse_a_non_exempt_act(fenced_board):
 
 
 def test_the_exemption_is_reachable_from_exactly_one_call_site():
-    """A second tool must not inherit the exemption by copying the flag or the call."""
+    """A second tool must not inherit the exemption by copying the flag or the call.
+
+    Scanned REPO-WIDE across every package that ships in this tree (not just ``hermes_cli`` and
+    ``agent``), so a copy placed in a gateway/app adapter is caught too — review round 1 asked
+    for this widening.
+    """
+    importers: dict[str, str] = {}
     calls = {"grant_for": [], "scoped": []}
-    for path in sorted(REPO.joinpath("hermes_cli").glob("*.py")) + sorted(
-            REPO.joinpath("agent").glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+    roots = [d for d in ("hermes_cli", "agent", "gateway", "tools", "apps", "cron",
+                         "acp_adapter", "evals")
+             if (REPO / d).is_dir()]
+    scanned = 0
+    for root_name in roots:
+        for path in sorted(REPO.joinpath(root_name).rglob("*.py")):
+            if "__pycache__" in path.parts:
                 continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            owner = getattr(getattr(func, "value", None), "id", None)
-            if isinstance(func, ast.Name) and name == "grant_for":
-                calls["grant_for"].append(path)
-            elif isinstance(func, ast.Attribute) and name == "grant_for" and owner == "koa":
-                calls["grant_for"].append(path)
-            elif isinstance(func, ast.Attribute) and name == "scoped" and owner == "koa":
-                calls["scoped"].append(path)
+            scanned += 1
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text, filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name.endswith("kanban_operator_ask"):
+                            importers[str(path.relative_to(REPO))] = (
+                                f"{(node.module or '')}.{alias.name}"
+                            )
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name.endswith("kanban_operator_ask"):
+                            importers[str(path.relative_to(REPO))] = alias.name
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                owner = getattr(getattr(func, "value", None), "id", None)
+                if isinstance(func, ast.Name) and name == "grant_for":
+                    calls["grant_for"].append(path)
+                elif isinstance(func, ast.Attribute) and name == "grant_for" and owner == "koa":
+                    calls["grant_for"].append(path)
+                elif isinstance(func, ast.Attribute) and name == "scoped" and owner == "koa":
+                    calls["scoped"].append(path)
+    assert scanned > 100, scanned  # the scan really walked the packages
     assert calls["grant_for"] == [REPO / "hermes_cli" / "kanban.py"], calls
     assert calls["scoped"] == [REPO / "hermes_cli" / "kanban.py"], calls
+    # The module is imported ONLY by the fence's own seams: the one construction site, and the two
+    # read-only doors that must admit the same store (``admits_store``, never a grant).
+    assert set(importers) == {
+        "hermes_cli/kanban.py",
+        "hermes_cli/kanban_db.py",
+        "hermes_cli/kanban_db_connect.py",
+    }, importers
     # And the generic tool surface never imports the exemption module at all.
     for path in sorted((REPO / "tools").glob("*.py")):
         assert "kanban_operator_ask" not in path.read_text(encoding="utf-8"), path
