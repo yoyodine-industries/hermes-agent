@@ -255,3 +255,107 @@ def test_the_decompose_seam_refuses_per_child_and_writes_nothing(conn):
     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1, \
         "all-or-nothing: the root remains the only row"
     assert conn.execute("SELECT status FROM tasks WHERE id = ?", (root,)).fetchone()[0] == "triage"
+
+
+# --- round 3 (execution lens): one card, ONE verdict, whatever the cwd ------------- #
+#
+# The predicate used to resolve a ``-C`` target with ``os.path.abspath``, i.e. against the
+# FILING PROCESS's directory. Worker workspaces live inside ``~/.hermes``, so the incident
+# shape was refused from a workspace and ADMITTED from ``/opt`` - the fail-open arm was the
+# very act this rule exists to refuse. These tests pin the verdict to the CARD.
+
+@pytest.fixture
+def temp_live_home(tmp_path, monkeypatch):
+    """A temp HOME carrying a declared live root, so ``~``/``$HOME`` spellings resolve inside."""
+    home = tmp_path / "home"
+    checkout = home / ".hermes" / "hermes-agent"
+    (checkout / "pkg").mkdir(parents=True)
+    (home / ".hermes" / "kanban" / "workspaces" / "t_worker").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    return home, (str(checkout), str(home / ".hermes"))
+
+
+def _verdicts_from_two_cwds(monkeypatch, tmp_path, live_home, *, title, body):
+    """One card, two cwds: an outside-the-tree dir and a worker workspace under ``~/.hermes``."""
+    home, roots = live_home
+    outside = tmp_path / "sandbox"
+    outside.mkdir(exist_ok=True)
+    inside = home / ".hermes" / "kanban" / "workspaces" / "t_worker"
+    verdicts = []
+    for cwd in (outside, inside):
+        monkeypatch.chdir(cwd)
+        verdicts.append(gate.evaluate(title=title, body=body, roots=roots))
+    return verdicts
+
+
+def test_the_home_spelling_of_the_incident_shape_is_refused_from_any_cwd(
+        monkeypatch, tmp_path, temp_live_home):
+    """``git -C $HOME/.hermes/hermes-agent reset --hard`` was ADMITTED from ``/opt``."""
+    for spelling in ("$HOME", "${HOME}"):
+        body = f"git -C {spelling}/.hermes/hermes-agent reset --hard origin/overrides/live"
+        first, second = _verdicts_from_two_cwds(
+            monkeypatch, tmp_path, temp_live_home, title="align the serving tree", body=body)
+        assert first is not None and second is not None, spelling
+        assert first["act"] == "git reset" == second["act"]
+        assert first["root"] == second["root"]
+
+
+def test_a_git_config_flag_is_not_a_path_target(monkeypatch, tmp_path, temp_live_home):
+    """``-C`` is case-sensitive: ``git -c core.hooksPath=/dev/null commit`` orders nothing here."""
+    body = ("In ~/.hermes/hermes-agent the tree is dirty.\n"
+            "Run git -c core.hooksPath=/dev/null commit -m stamp")
+    assert _verdicts_from_two_cwds(monkeypatch, tmp_path, temp_live_home,
+                                   title="commit the stamp", body=body) == [None, None]
+
+
+def test_an_unbound_target_is_admitted_from_any_cwd(monkeypatch, tmp_path, temp_live_home):
+    """``<repo>`` names no tree, and the act names no live root: not this rule's business."""
+    body = "git -C <repo> worktree add /tmp/wt overrides/live, then open a PR."
+    assert _verdicts_from_two_cwds(monkeypatch, tmp_path, temp_live_home,
+                                   title="add a worktree", body=body) == [None, None]
+
+
+def test_an_unbound_target_falls_through_to_the_mention_rule(monkeypatch, tmp_path,
+                                                             temp_live_home):
+    """An unresolved ``$VAR`` is not evidence that the tree is NOT live - fail closed."""
+    body = "Run git -C $UNSET_TREE reset --hard, then re-measure ~/.hermes/hermes-agent."
+    first, second = _verdicts_from_two_cwds(
+        monkeypatch, tmp_path, temp_live_home, title="align the tree", body=body)
+    assert first is not None and second is not None
+    assert first["act"] == "git reset" == second["act"]
+    assert first["via"] == "mention" == second["via"]
+
+
+def test_a_lone_dot_is_a_path_not_a_sentence_end(monkeypatch, tmp_path, temp_live_home):
+    """``git -C .`` used to end the sentence at the dot, hiding the tree in the clause behind."""
+    body = ("From the checkout run git -C . reset --hard on the tree ~/.hermes/hermes-agent "
+            "for the served bytes.")
+    first, second = _verdicts_from_two_cwds(
+        monkeypatch, tmp_path, temp_live_home, title="align the tree", body=body)
+    assert first is not None and second is not None
+    assert first["act"] == "git reset" == second["act"]
+
+
+def test_the_create_door_refuses_from_a_workspace_inside_a_live_root(conn, tmp_path,
+                                                                     monkeypatch):
+    """The inside-cwd arm is the one a dispatched worker actually runs in."""
+    home = tmp_path / "createhome"
+    checkout = home / ".hermes" / "hermes-agent"
+    workspace = checkout / ".worktrees" / "t_worker"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(gate.ENV_ROOTS, f"{checkout}:{home / '.hermes'}")
+    monkeypatch.chdir(workspace)
+    task_id = kb.create_task(
+        conn, title="align the live tree",
+        body="git -C $HOME/.hermes/hermes-agent reset --hard origin/overrides/live",
+        assignee="platform-coder", created_by="test",
+    )
+    assert is_refusal(task_id)
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_the_refusal_tells_a_noun_phrase_reader_how_to_reword():
+    record = gate.evaluate(title="tidy the tree", body="git clean -fdx in ~/.hermes/hermes-agent")
+    assert record is not None
+    assert "reword it" in record["line"], "over-refusal is kept, but the reader gets a way out"

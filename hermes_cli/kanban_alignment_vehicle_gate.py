@@ -16,7 +16,10 @@ grammars:
   2. the card ORDERS a MUTATING git act bound to that tree - either ``git -C <live
      root> <verb>``, or a ``git <verb>`` whose mention of the root sits on the SAME LINE as
      the act. Read-only verbs (``status``, ``log``, ``diff``, ``rev-parse``,
-     ``hash-object``, ...) are not acts: measuring a live tree is always allowed;
+     ``hash-object``, ...) are not acts: measuring a live tree is always allowed. A ``-C``
+     target is resolved from the CARD (``~``, ``$HOME``, ``${HOME}``) and never against the
+     process cwd - two cwds must not yield two verdicts - and a target that stays relative
+     is unbound, falling through to the mention rule instead of being admitted;
   3. the card NAMES an admitted vehicle - ``r5-install`` or ``hermes-update`` (the update
      chain). The live line is carried by the chain; a hand git op in a live tree is how the
      2026-10-29 bytes got served for four days.
@@ -86,16 +89,23 @@ MUTATING_VERBS = frozenset({
 })
 
 #: ``git [ -C <path> ] [ -c k=v ... ] <verb>``. The verb is what decides.
+#:
+#: ``-C`` is CASE-SENSITIVE (``(?-i:-C)``) while the rest stays case-insensitive: git's
+#: ``-c key=value`` CONFIG flag is not a path, and reading it as one refused a card that
+#: ordered nothing in a live tree (``git -c core.hooksPath=/dev/null commit`` - seven
+#: archived corpus cards) from any cwd inside ``~/.hermes``. A config flag is never a target.
 _GIT_ACT = re.compile(
-    r"\bgit\s+(?:-C\s*(?P<cwd>[^\s;&|`'\"]+)\s+)?(?:-[ck]\s+\S+\s+)*(?P<verb>[a-z][a-z-]*)",
+    r"\bgit\s+(?:(?-i:-C)\s*(?P<cwd>[^\s;&|`'\"]+)\s+)?(?:-[ck]\s+\S+\s+)*(?P<verb>[a-z][a-z-]*)",
     re.IGNORECASE,
 )
 
 #: A mention must sit in ONE SENTENCE (or one line, when the card writes prose without
 #: punctuation) of the verb it arms. A mention in the closing paragraph of a long spec must not
 #: arm a verb at the top; 260 characters of body was enough rope for exactly that, and a whole
-#: markdown paragraph is just as much rope.
-_BREAK = re.compile(r"(?<=[.!?;])\s+|\n+")
+#: markdown paragraph is just as much rope. A LONE "." is a PATH token, not a full stop:
+#: ``git -C . reset`` must not be split into "a sentence with the act" and "a sentence with the
+#: tree", or a relative target plus a same-sentence mention reads as two unrelated clauses.
+_BREAK = re.compile(r"(?<=[!?;])\s+|(?<=[^\s.])\.[\s]+|\n+")
 
 #: The character class that would make a root match a LONGER, different path. ``/opt/hermes``
 #: must not match inside ``/opt/hermes_sandbox``, ``/opt/hermes_prod``, ``~/.hermes_profiles``.
@@ -124,13 +134,14 @@ def live_roots() -> tuple[str, ...]:
 
 
 def _mention_forms(root: str) -> tuple[str, ...]:
-    """The spellings a card may use for one root: absolute, ``~/...`` and ``$HOME/...``."""
+    """The spellings a card may use for one root: absolute, ``~/...``, ``$HOME/...``, ``${HOME}/...``."""
     home = _expand("~")
     forms = {root}
     if root.startswith(home + "/") or root == home:
         rel = root[len(home):].lstrip("/")
         forms.add("~/" + rel if rel else "~")
         forms.add("$HOME/" + rel if rel else "$HOME")
+        forms.add("${HOME}/" + rel if rel else "${HOME}")
     return tuple(forms)
 
 
@@ -197,11 +208,34 @@ def _judged_sentence(text: str, spans: list[tuple[int, int]], position: int) -> 
     return sentence if len(sentence) <= 200 else sentence[:197] + "..."
 
 
+def _absolute_target(target: str) -> Optional[str]:
+    """The target resolved to an absolute path WITHOUT consulting the process cwd, or None.
+
+    ``os.path.abspath`` resolved a relative target against whatever directory the filing
+    process happened to be in, so the SAME card got two verdicts one cwd apart - and the
+    fail-open arm was the incident shape (``git -C $HOME/.hermes/hermes-agent reset
+    --hard`` admitted from ``/opt``, refused from under ``~/.hermes``, where every worker
+    workspace actually lives). Only ``~``, ``$HOME`` and ``${HOME}`` are expanded: any other
+    ``$VAR`` is left alone, because an environment variable's value is not a fact about the
+    card either. A target that is still relative is UNBOUND - never guessed.
+    """
+    text = (target or "").strip().strip("'\"")
+    if not text:
+        return None
+    home = _expand("~")
+    for token in ("${HOME}", "$HOME"):
+        text = text.replace(token, home)
+    if text == "~" or text.startswith("~/"):
+        text = home + text[1:]
+    if not os.path.isabs(text):
+        return None
+    return text.rstrip("/") or "/"
+
+
 def _under(path: str, roots: tuple[str, ...]) -> Optional[str]:
-    """The live root `path` sits inside, or None."""
-    try:
-        resolved = _expand(os.path.abspath(os.path.expanduser(path)))
-    except (OSError, ValueError):
+    """The live root `path` sits inside, or None. Never resolved against the process cwd."""
+    resolved = _absolute_target(path)
+    if resolved is None:
         return None
     for root in roots:
         if resolved == root or resolved.startswith(root + os.sep):
@@ -216,8 +250,9 @@ def find_live_act(text: str, roots: tuple[str, ...],
         return None
     segments = spans if spans is not None else _segment_spans("", text)
     mentions = _mentions(text, roots)
-    if not mentions:
-        return None
+    # NB: no early return on an empty mention list. ``git -C <spelling> <verb>`` binds the
+    # tree through the TARGET, not through a mention of it, and a card that spells the path
+    # some other way (``${HOME}/...``, an absolute path in a code fence) still names the tree.
     for match in _GIT_ACT.finditer(text):
         verb = (match.group("verb") or "").lower()
         if verb not in MUTATING_VERBS:
@@ -229,7 +264,11 @@ def find_live_act(text: str, roots: tuple[str, ...],
             if root:
                 return {"act": f"git {verb}", "root": root, "via": f"git -C {cwd}",
                         "sentence": _judged_sentence(text, segments, match.start())}
-            continue                  # bound to some other tree - not this rule's business
+            if _absolute_target(cwd) is not None:
+                continue          # bound to a concrete OTHER tree - not this rule's business
+            # UNBOUND: a relative target or an unresolved ``$VAR`` is not evidence that the
+            # tree is NOT live, so it must not escape the rule one spelling away. Fall through
+            # to the mention rule - same segment, fail closed.
         act_segment = _segment_of(match.start(), segments)
         for start, root in mentions:
             if _segment_of(start, segments) == act_segment:
@@ -261,7 +300,8 @@ def evaluate(*, title: Optional[str] = None, body: Optional[str] = None,
         f"`{act['act']}` in the live tree {act['root']}, in the card's own sentence "
         f"{act['sentence']!r}. The live line is carried by the update chain "
         "(r5-install / hermes-update) - name it as the vehicle, or move the act to a "
-        "non-live tree."
+        "non-live tree. If this sentence only MENTIONS the tree rather than ordering a git "
+        "act, reword it (e.g. `a checkout of`, `the tree at`) and file again."
     )
     return {"status": "refused", "gate": "alignment_vehicle", "line": line,
             "act": act["act"], "root": act["root"], "via": act["via"],
