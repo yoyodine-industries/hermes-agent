@@ -881,3 +881,128 @@ def test_the_dispatcher_says_a_budget_refusal_at_warning_level(caplog):
     assert any("refused by the filing budget" in r.getMessage() for r in warnings), \
         [r.getMessage() for r in caplog.records]
 
+
+
+# --- the open-duplicate leg: the board is already owed this obligation -------------------------
+#
+# The closure leg answers "was this identity born and CLOSED?". Nothing answered "is the board
+# already OWED this sentence?" - so a producer that re-derives the same finding every tick was
+# admitted forever and the board's only defence was a human archiving faster than the mill could
+# file. Measured on the live platform board: 17 families / 34 cards in 40 minutes, and a guard
+# re-filing "unclaimed stash(es) on the shared checkout" under four different ids.
+#
+# The contract pinned here: the duplicate is REFUSED naming the surviving card, the PROJECT is
+# part of the identity (the same sentence for two projects is two obligations), a CLOSED copy
+# never refuses (the closure leg owns that), and a policy that does not arm the leg keeps
+# upstream's behaviour exactly.
+
+DUPLICATE_OPEN_LINE = re.compile(
+    r"^refused: duplicate-open \(title='([^']*)' survivor=(t_\w+) status=(\w+) "
+    r"surface=(\S+) band=(\d+)\)$"
+)
+
+TITLE = "[defect] unclaimed stash on the shared checkout /opt/hermes_sandbox/yaan-platform"
+
+
+def armed(tmp_path, *, instrument_path, **overrides):
+    """A policy that ARMS the open-duplicate leg, everything else as the roster above."""
+    overrides.setdefault("open_duplicate_leg", {"enabled": True})
+    return policy_file(tmp_path, instrument_path=instrument_path, **overrides)
+
+
+def _project(name="kr11-family"):
+    """A REAL project row: an unresolvable id is dropped to unscoped by the kernel, and two
+    unscoped cards would look like one project's duplicates."""
+    from hermes_cli import projects_db as pdb
+    with pdb.connect_closing() as pconn:
+        return pdb.create_project(pconn, name=name)
+
+
+def _file(conn, *, title=TITLE, project=None, created_by="board-refusals", **extra):
+    assert project, "a project row must be created for the test's board"
+    return kb.create_task(conn, title=title, assignee="coder", created_by=created_by,
+                          project_id=project, **extra)
+
+
+def test_an_open_card_with_the_same_title_and_project_refuses_the_second_filing(
+        conn, home, instrument, tmp_path, capsys):
+    armed(tmp_path, instrument_path=instrument(merges=10))
+    proj = _project()
+    first = _file(conn, project=proj)
+    assert not kfp.is_refusal(first), first
+
+    # Same obligation, different punctuation/case/spacing: the same identity, not a new one.
+    second = _file(conn, project=proj, title="[DEFECT] Unclaimed stash on the shared checkout   /opt/hermes_sandbox/yaan-platform")
+    assert kfp.is_refusal(second), second
+    line = str(second)
+    match = DUPLICATE_OPEN_LINE.match(line)
+    assert match, line
+    assert match.group(2) == first, "the refusal must NAME the surviving card"
+    assert match.group(3) in kfp.OPEN_STATUSES
+    assert "duplicate-open" in line
+    # The refusal is an ANSWER: no second row behind it.
+    assert _tasks(conn) == 1
+
+
+def test_the_survivor_named_is_the_oldest_open_copy(conn, home, instrument, tmp_path):
+    """A family already carrying copies names the OLDEST - the one a reader must go to."""
+    armed(tmp_path, instrument_path=instrument(merges=10))
+    proj = _project()
+    first = _file(conn, project=proj)
+    # A legacy copy the door never saw (filed before this leg existed), aged behind the first.
+    legacy = kb.create_task(conn, title=TITLE + " (copy)", assignee="coder",
+                            created_by="board-refusals", project_id=proj)
+    conn.execute("UPDATE tasks SET title = ?, created_at = created_at - 3600 WHERE id = ?",
+                 (TITLE, legacy))
+    conn.commit()
+    third = _file(conn, project=proj)
+    assert kfp.is_refusal(third), third
+    assert DUPLICATE_OPEN_LINE.match(str(third)).group(2) == legacy
+
+
+def test_the_same_title_for_another_project_is_a_different_obligation(
+        conn, home, instrument, tmp_path):
+    """Two lanes, two projects, one sentence: two obligations. A title-only leg would eat one."""
+    armed(tmp_path, instrument_path=instrument(merges=10))
+    first = _file(conn, project=_project("kr11-one"))
+    other = _file(conn, project=_project("kr11-two"))
+    assert not kfp.is_refusal(first), first
+    assert not kfp.is_refusal(other), other
+    assert _tasks(conn) == 2
+
+
+def test_a_closed_copy_never_refuses_because_that_is_the_closure_legs_question(
+        conn, home, instrument, tmp_path):
+    armed(tmp_path, instrument_path=instrument(merges=10))
+    proj = _project()
+    first = _file(conn, project=proj)
+    _archive(conn, first)
+    again = _file(conn, project=proj)
+    assert not kfp.is_refusal(again), again
+    assert again != first
+    assert _tasks(conn) == 2
+
+
+def test_a_policy_that_does_not_arm_the_leg_keeps_upstream_behaviour(
+        conn, home, instrument, tmp_path):
+    """Inert is the default: this leg is DATA, so a host that does not declare it sees nothing."""
+    policy_file(tmp_path, instrument_path=instrument(merges=10))
+    proj = _project()
+    first = _file(conn, project=proj)
+    second = _file(conn, project=proj)
+    assert not kfp.is_refusal(first), first
+    assert not kfp.is_refusal(second), second
+    assert _tasks(conn) == 2
+
+
+def test_a_lookup_that_cannot_answer_admits_the_filing(conn, home, instrument, tmp_path):
+    """A board read that raises is NOT a duplicate: an unanswerable door is not a refusal."""
+    armed(tmp_path, instrument_path=instrument(merges=10))
+    proj = _project()
+    first = _file(conn, project=proj)
+    assert not kfp.is_refusal(first), first
+    assert kfp._open_duplicate(None, TITLE, proj) is None
+    class Broken:
+        def execute(self, *a, **k):
+            raise sqlite3.OperationalError("no such table: tasks")
+    assert kfp._open_duplicate(Broken(), TITLE, proj) is None

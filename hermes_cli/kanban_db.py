@@ -2150,7 +2150,7 @@ def create_task(
     from hermes_cli import kanban_filing_policy as _filing
     filing_refusal, filing_record = _filing.apply(
         conn, created_by=created_by, title=title, body=body,
-        idempotency_key=idempotency_key, resurrect=resurrect,
+        idempotency_key=idempotency_key, resurrect=resurrect, project_id=project_id,
     )
     if filing_refusal is not None:
         return filing_refusal

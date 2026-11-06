@@ -103,8 +103,10 @@ THE MOMENT. The hook runs after the idempotency early-return (a keyed refresh of
 the board already holds is not a birth and never draws on the pool) and before any write, so a
 refused filing leaves the database untouched. Its order inside the hook is: policy read → the
 declared identity classes (DATA) → exempt classes (never refused) → the closure-dedupe leg
-(a board fact, no instrument needed, and only for a key whose class the policy declares) →
-the pool reading (the only part that can be unmeasurable, and the only part that fails open).
+(a board fact, no instrument needed, and only for a key whose class the policy declares) → the
+open-duplicate leg (also a board fact: is the board already OWED this sentence? — armed by
+data, ``open_duplicate_leg``) → the pool reading (the only part that can be unmeasurable, and
+the only part that fails open).
 
 A KNOWN ASYMMETRY, STATED RATHER THAN HIDDEN. :func:`_consumed` attributes existing births by
 THE SURFACE's roster precedence while the decision uses the create's RAISED band, so a
@@ -163,6 +165,15 @@ DUPLICATE_FORMAT = ("refused: duplicate-closed-key (key=%s closed=%s status=%s w
 #: status this actually refuses today; ``done`` is listed because the leg must be right about
 #: the board, not about the kernel's early return.
 CLOSED_STATUSES = ("done", "archived")
+# The statuses that mean a card is STILL OWED. A create whose normalised title + project
+# already matches one of these is a second copy of an obligation the board already holds
+# (`triage` and `scheduled` included: a parked card is owed, not closed).
+OPEN_STATUSES = ("ready", "todo", "running", "review", "blocked", "scheduled", "triage")
+# The policy block that arms the open-duplicate leg. DATA, like every other arm here: a host
+# whose policy does not declare it keeps upstream's behaviour byte for byte.
+OPEN_DUPLICATE_BLOCK = "open_duplicate_leg"
+DUPLICATE_OPEN_FORMAT = ("refused: duplicate-open (title=%r survivor=%s status=%s surface=%s "
+                         "band=%s)")
 
 #: The separators that END an identity key's class token: ``pr-disposition:<ref>`` is an
 #: episode of the class ``pr-disposition``; ``dirty-shared-tree|<tree>`` is an observation of
@@ -506,9 +517,61 @@ def _closed_duplicate(conn, key: str, since: float) -> Optional[dict]:
 
 # --- the door -------------------------------------------------------------------------------
 
+def normalise_title(title: Optional[str]) -> str:
+    """A title's IDENTITY: lowercased, every run of non-alphanumerics collapsed to one space.
+
+    Deliberately arithmetic, not inference: the same sentence filed twice with different
+    punctuation, casing or whitespace is the same obligation, and nothing here guesses at
+    synonyms. A leg that scored similarity would refuse honest re-filings and admit
+    paraphrased duplicates, i.e. be wrong in both directions.
+    """
+    return re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
+
+
+def open_duplicate_rule(policy: dict) -> Optional[dict]:
+    """The open-duplicate leg's own row, or ``None`` when this policy does not arm it."""
+    block = policy.get(OPEN_DUPLICATE_BLOCK)
+    if not isinstance(block, dict) or not bool(block.get("enabled", False)):
+        return None
+    return block
+
+
+def _open_duplicate(conn, title: Optional[str], project_id: Optional[str],
+                    statuses=OPEN_STATUSES) -> Optional[dict]:
+    """The OLDEST open card whose normalised title AND project match, or ``None``.
+
+    A board read, like the closure leg: the board IS the ledger of what is still owed, so the
+    leg needs no second store to keep in step, and it works on a host whose instrument is
+    unreadable. ``conn`` is the connection the row would land on, i.e. the destination board.
+
+    Normalised in Python (SQL cannot), over one project's open rows only. The project half is
+    load-bearing: the same sentence filed against two projects is two obligations, and a leg
+    matching on title alone would refuse the second lane's honest filing.
+    """
+    key = normalise_title(title)
+    if conn is None or not key:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT id, title, status, created_at FROM tasks WHERE status IN (%s) "
+            "AND IFNULL(project_id, '') = ?"
+            % ",".join("?" for _ in statuses),
+            (*statuses, str(project_id or "")),
+        ).fetchall()
+    except Exception as exc:  # a board read that cannot answer is NOT a duplicate
+        log.warning("filing policy: open-duplicate lookup failed, admitting: %s", exc)
+        return None
+    matches = [row for row in rows if normalise_title(row[1]) == key]
+    if not matches:
+        return None
+    oldest = min(matches, key=lambda row: int(row[3] or 0))
+    return {"survivor": oldest[0], "status": oldest[2], "title": oldest[1],
+            "copies": len(matches)}
+
 def evaluate(conn, *, created_by: Optional[str] = None, title: Optional[str] = None,
              body: Optional[str] = None, root: Optional[str] = None,
              now: Optional[float] = None, idempotency_key: Optional[str] = None,
+             project_id: Optional[str] = None,
              resurrect: bool = False, quantity: int = 1) -> Optional[dict]:
     """The decision for one create: ``None`` when this host has no policy (inert), else a record.
 
@@ -613,6 +676,37 @@ def evaluate(conn, *, created_by: Optional[str] = None, title: Optional[str] = N
                 # one window).
                 reopened = duplicate
 
+    # THE OPEN-DUPLICATE LEG (KR1.1's second clause). The closure leg above answers "was this
+    # IDENTITY born and closed?"; nothing answered "is the board ALREADY OWED this obligation?".
+    # A producer that re-files the same sentence every tick — a guard naming a dirty tree, a
+    # mill re-deriving a finding — was admitted forever, and the board's only defence was a
+    # human archiving faster than the mill could file. Measured: 17 families / 34 cards in 40
+    # minutes on this board. So a create whose normalised title AND project match an OPEN card
+    # is refused, and the refusal NAMES the survivor so the producer can comment on it instead.
+    # It sits before the pool arithmetic on purpose: a duplicate costs no budget to answer, and
+    # a refused filing must not read as "the pool is spent" (two different repairs).
+    if open_duplicate_rule(policy) is not None:
+        duplicate_open = _open_duplicate(conn, title, project_id)
+        if duplicate_open is not None:
+            state = {"status": "refused", "reason": "duplicate-open", "policy": path,
+                     "surface": surface, "precedence": band,
+                     "survivor": duplicate_open["survivor"],
+                     "survivor_status": duplicate_open["status"],
+                     "copies": duplicate_open["copies"]}
+            if undeclared:
+                state["closure_leg_skipped"] = UNDECLARED
+            state["line"] = DUPLICATE_OPEN_FORMAT % (normalise_title(title),
+                                                     duplicate_open["survivor"],
+                                                     duplicate_open["status"], surface, band)
+            state["why"] = ("an OPEN card already holds this obligation (%s, %s); a second "
+                            "copy duplicates the work instead of adding it — comment on the "
+                            "survivor, or close it before filing again"
+                            % (duplicate_open["survivor"], duplicate_open["status"]))
+            if duplicate_open["copies"] > 1:
+                state["why"] += ("; %d open copies already exist, so this family is owed a "
+                                 "merge, not another member" % duplicate_open["copies"])
+            return state
+
     reading, error = _reading(policy, now)
     if error or reading is None:
         state = _unmeasured(path, error or "the pool could not be measured", surface=surface,
@@ -672,6 +766,7 @@ def _unmeasured(path: str, error: str, *, surface: Optional[str] = None,
 def apply(conn, *, created_by: Optional[str] = None, title: Optional[str] = None,
           body: Optional[str] = None, root: Optional[str] = None,
           now: Optional[float] = None, idempotency_key: Optional[str] = None,
+          project_id: Optional[str] = None,
           resurrect: bool = False,
           quantity: int = 1) -> tuple[Optional[FilingRefusal], Optional[dict]]:
     """Consult the policy at the create door: ``(refusal, record)``.
@@ -687,7 +782,8 @@ def apply(conn, *, created_by: Optional[str] = None, title: Optional[str] = None
     otherwise unchanged — a single create's refusal is byte-identical to the ruling's.
     """
     record = evaluate(conn, created_by=created_by, title=title, body=body, root=root, now=now,
-                      idempotency_key=idempotency_key, resurrect=resurrect, quantity=quantity)
+                      idempotency_key=idempotency_key, project_id=project_id,
+                      resurrect=resurrect, quantity=quantity)
     if record is None:
         return None, None
     if record.get("status") == "refused":
