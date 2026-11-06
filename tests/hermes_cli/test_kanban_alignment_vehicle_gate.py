@@ -308,6 +308,15 @@ def test_a_git_config_flag_is_not_a_path_target(monkeypatch, tmp_path, temp_live
                                    title="commit the stamp", body=body) == [None, None]
 
 
+def test_a_quoted_target_is_still_a_target(monkeypatch, tmp_path, temp_live_home):
+    """Quoting the path must not demote ``-C`` to a config flag and slip past the rule."""
+    body = 'git -C "$HOME/.hermes/hermes-agent" reset --hard origin/overrides/live'
+    first, second = _verdicts_from_two_cwds(
+        monkeypatch, tmp_path, temp_live_home, title="align the tree", body=body)
+    assert first is not None and second is not None
+    assert first["act"] == "git reset" == second["act"]
+
+
 def test_an_unbound_target_is_admitted_from_any_cwd(monkeypatch, tmp_path, temp_live_home):
     """``<repo>`` names no tree, and the act names no live root: not this rule's business."""
     body = "git -C <repo> worktree add /tmp/wt overrides/live, then open a PR."

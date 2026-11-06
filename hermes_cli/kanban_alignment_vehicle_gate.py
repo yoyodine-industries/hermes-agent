@@ -95,7 +95,8 @@ MUTATING_VERBS = frozenset({
 #: ordered nothing in a live tree (``git -c core.hooksPath=/dev/null commit`` - seven
 #: archived corpus cards) from any cwd inside ``~/.hermes``. A config flag is never a target.
 _GIT_ACT = re.compile(
-    r"\bgit\s+(?:(?-i:-C)\s*(?P<cwd>[^\s;&|`'\"]+)\s+)?(?:-[ck]\s+\S+\s+)*(?P<verb>[a-z][a-z-]*)",
+    r"\bgit\s+(?:(?-i:-C)\s*(?P<cwd>\"[^\"]*\"|'[^']*'|[^\s;&|`'\"]+)\s+)?"
+    r"(?:-[ck]\s+\S+\s+)*(?P<verb>[a-z][a-z-]*)",
     re.IGNORECASE,
 )
 
