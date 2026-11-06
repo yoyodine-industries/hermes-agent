@@ -430,22 +430,124 @@ def _target_peer(target: str) -> str:
     return (str(target or "").split("/", 1)[0].strip() or "?")
 
 
-def _refusal_class(exc: BaseException) -> str:
-    """A stable slug for a refusal that must be REPORTED, or ``''`` when it is not one.
+#: A LOCAL SESSION id (`local-<64 hex>`), never an address. Measured 2026-11-06: one of the
+#: five refusal cards filed since 2026-10-13 named a token of exactly this shape.
+_LOCAL_SESSION_RE = re.compile(r"^local-[0-9a-f]{64}$")
 
-    Reported: no such peer, no key for the peer, and any HTTP status the peer itself returned
-    (401/403/404 and 429 - the capacity cap that starves the control channel - measured
-    2026-10-13).
-    NOT reported: transport failures (timeout, refused connection, DNS). A peer that is briefly
-    unreachable is the reachability probe's business, and a card per blip is noise.
+#: The peer's OWN HTTP statuses that mean the DM door is closed (401/403 auth, 404 unknown
+#: endpoint or unserved profile, 429 the capacity cap that starves the control channel -
+#: measured 2026-10-13). Every OTHER status (5xx and the rest) is the peer's own trouble, not
+#: evidence its DM door is shut, so a card for it is alarm noise at the detector.
+REPORTED_HTTP_CODES = frozenset({401, 403, 404, 429})
+
+
+def _root_peers() -> dict:
+    """The machine-level ``bot_peers`` as the ROOT home declares it ({} when it declares none).
+
+    Read separately from :func:`_load_peers` on purpose: the difference between the two
+    answers IS the 2026-10-13 signal - a session that resolves nothing while the machine
+    root carries peers.
     """
-    if isinstance(exc, LookupError):
-        return "no-peer"
-    if isinstance(exc, PermissionError):
-        return "no-key"
-    if isinstance(exc, urllib.error.HTTPError):
-        return f"http-{exc.code}"
+    from hermes_constants import get_hermes_home
+    from hermes_cli.config import load_config
+
+    root = _hermes_root(get_hermes_home())
+    with _config_home(root):
+        cfg = load_config() or {}
+    peers = cfg.get("bot_peers")
+    return peers if isinstance(peers, dict) else {}
+
+
+def _local_lane(target: str) -> str:
+    """Why ``target`` names a lane on THIS host rather than a peer, or ``''``.
+
+    Measured 2026-11-06: of the five refusal cards filed since 2026-10-13, two named a local
+    profile and one a local session id - callers reaching for the cross-machine transport to
+    talk to a seat that lives in this very gateway. Those are caller errors wearing an outage
+    costume, so they are said on stderr with the transport that does work, and no card is
+    filed for them.
+    """
+    from hermes_constants import get_hermes_home
+
+    name = _target_peer(target)
+    if not name or name == "?":
+        return ""
+    if _LOCAL_SESSION_RE.match(name):
+        return (f"'{name}' is a local SESSION id (`local-<64 hex>`), not a peer: read that "
+                f"transcript with `hermes peer reply <peer> --session <id>`.")
+    home = get_hermes_home()
+    for candidate in (home, _hermes_root(home)):
+        profile_dir = candidate / "profiles" / name
+        if profile_dir.is_dir():
+            return (f"'{name}' is a LOCAL lane on this host (profile `{profile_dir}`), not a "
+                    f"peer: reach it locally with `hermes -p {name} chat`, or through this "
+                    f"host's gateway as `hermes peer dm yoyodine/{name}`.")
     return ""
+
+
+def _classify_refusal(target: str, exc: BaseException) -> tuple[str, bool, str]:
+    """``(class, report_to_board, detail)`` - the ruled classification of ONE refusal.
+
+    A card is filed ONLY when the refusal is evidence the DM channel is broken:
+
+    =========================  ==============  ==========================================
+    condition                  class           action
+    =========================  ==============  ==========================================
+    this home resolves none    registry-empty  card (the 2026-10-13 shape)
+    while the root has peers
+    key missing, peer known    no-key          card
+    peer answered 401/403/     http-<code>     card
+    404/429
+    name unknown to a          unknown-peer    stderr only, listing the registered names
+    NON-EMPTY registry
+    target is a local lane     local-lane      stderr only, naming the right transport
+    transport failure          ''              stderr only (the reachability probe's job)
+    =========================  ==============  ==========================================
+
+    Rationale, measured: every card filed between 2026-10-13 and 2026-11-06 was assigned to a
+    seat that then had to disprove it, and four of the five were caller errors. Alarm noise at
+    the detector is how the next real outage goes unread.
+    """
+    if isinstance(exc, ValueError):
+        return "", False, str(exc)
+    if isinstance(exc, PermissionError):
+        return "no-key", True, str(exc)
+    if isinstance(exc, urllib.error.HTTPError):
+        klass = f"http-{exc.code}"
+        if exc.code in REPORTED_HTTP_CODES:
+            return klass, True, _http_error_detail(exc)
+        return klass, False, (f"the peer answered HTTP {exc.code}, which is its own trouble "
+                              f"rather than evidence its DM door is closed")
+    if isinstance(exc, LookupError):
+        return _classify_lookup_miss(target, exc)
+    return "", False, str(exc)
+
+
+def _classify_lookup_miss(target: str, exc: LookupError) -> tuple[str, bool, str]:
+    """Split a resolution miss into the outage shape, a caller error, and a bare host."""
+    peer_name = _target_peer(target)
+    here = _load_peers()
+    if not here:
+        root_peers = _root_peers()
+        local = _local_lane(target)
+        if root_peers:
+            detail = (f"This session resolved an EMPTY peer registry while the machine's root "
+                      f"home carries {len(root_peers)} peer(s) "
+                      f"({', '.join(sorted(root_peers))}). That is the 2026-10-13 outage shape: "
+                      f"every lane's DM dies and nothing else notices.")
+            if local:
+                detail += f" The requested target also names a local lane: {local}"
+            return "registry-empty", True, detail
+        detail = (f"No peer named '{peer_name}', and no `bot_peers` is configured on this host "
+                  f"(neither this home nor the machine root): nothing is registered to reach.")
+        return "no-registry", False, f"{detail} {local}".strip()
+    local = _local_lane(target)
+    if local:
+        return "local-lane", False, local
+    names = ", ".join(sorted(here)) or "(none)"
+    return "unknown-peer", False, (
+        f"No peer named '{peer_name}'. Registered peers: {names}. The registry is intact - "
+        f"this is a name this host does not know, not an outage: no card filed.")
 
 
 def _refusal_target() -> dict:
@@ -505,14 +607,20 @@ def _refusal_body(peer_name: str, klass: str, detail: str) -> str:
         f"- when: {datetime.datetime.now().isoformat(timespec='seconds')}",
         "",
         "## What the classes mean",
-        "- `no-peer`: this session resolves no registry entry for that peer name. The "
-        "2026-10-13 fleet outage was exactly this: `bot_peers` existed in the root "
-        "`~/.hermes/config.yaml` while a profile-scoped session resolves its OWN home.",
-        "- `no-key`: no `HERMES_PEER_<PEER>_KEY` for that peer (auth).",
+        "- `registry-empty`: this session resolves NO peer while the machine root carries "
+        "peers. The 2026-10-13 fleet outage was exactly this: `bot_peers` existed in the "
+        "root `~/.hermes/config.yaml` while a profile-scoped session resolved its OWN home.",
+        "- `no-key`: no `HERMES_PEER_<PEER>_KEY` for a registered peer (auth).",
         "- `http-429`: the peer's own capacity cap refused the turn (`Too many concurrent "
         "runs`) - bulk work starving the control channel.",
-        "- other `http-4xx`: the peer refused the request (401/403 auth, 404 unknown endpoint "
-        "or unserved profile).",
+        "- `http-401`/`http-403`/`http-404`: the peer refused the request (auth, unknown "
+        "endpoint, or an unserved profile).",
+        "",
+        "Caller errors are NOT filed: `unknown-peer` (a name absent from a non-empty "
+        "registry) and `local-lane` (a local profile or `local-<64hex>` session id passed as "
+        "a peer) are printed on stderr only, because four of the five refusal cards filed "
+        "between 2026-10-13 and 2026-11-06 were exactly those and each one was assigned to a "
+        "seat that had to disprove it.",
         "",
         f"Filed by `hermes peer` - one card per (peer, class): idempotency key "
         f"`{_refusal_key(peer_name, klass)}`.",
@@ -599,17 +707,53 @@ def _file_refusal_card(peer_name: str, klass: str, detail: str, *, create=None,
         return "", f"{exc.__class__.__name__}: {exc}"
 
 
-def _report_refusal(peer_name: str, klass: str, detail: str) -> str:
-    """File the refusal card and SAY SO on stderr, in one of THREE outcomes.
+def _served_tree_root() -> Path | None:
+    """The root of the checkout this module runs from, when that tree is an INSTALLED one.
 
-    ``filed`` / ``already filed`` / ``not filed: <the real reason>``. The three are
-    different facts: the idempotency hit used to be indistinguishable from a failure, and
-    a fenced-context refusal used to be reported as an I/O error. The store is resolved ONCE
-    (:func:`_refusal_store`) so the lookup and the write cannot land on different boards, the
-    card is looked up by key FIRST (a read, permitted in a fenced context) so the hit is
-    knowable, and the write runs under the reviewed child-context allowance
-    (``REFUSAL_WRITE_PURPOSE``) so it can act from a dispatcher-spawned worker.
+    A refusal report writes to the LIVE board: :func:`_refusal_store` resolves the real
+    ``~/.hermes/kanban.db`` from the real ``HOME``. So the writer must be the tree the install
+    serves. Measured 2026-11-06: five trees on this host carried this code and only ONE was
+    the install - the rest were ``installs/*/environments/*/workspace`` checkouts and lane
+    worktrees beside the real ``HOME``, each of which would have filed onto the live board.
+    ``install-stamp.json`` at the tree root is what the update routine writes; a lane worktree,
+    a test checkout and an install environment's workspace do not carry it.
     """
+    root = Path(__file__).resolve().parents[2]
+    return root if (root / "install-stamp.json").is_file() else None
+
+
+def _refusal_filer_blocked() -> str:
+    """``''`` when this process may write a refusal card, else the reason it may not.
+
+    Two ways a refusal must NOT reach the board, both measured: a TEST process (a guarded
+    suite resolving the real ``HOME`` would file a real card from a fixture) and any tree that
+    is not the served one. The refusal still lands on stderr, naming the reason.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return "this is a test process (PYTEST_CURRENT_TEST is set)"
+    if _served_tree_root() is None:
+        return (f"this tree ({Path(__file__).resolve().parents[2]}) is not the served tree "
+                f"(it carries no install-stamp.json), so it must not write the live board")
+    return ""
+
+
+def _report_refusal(peer_name: str, klass: str, detail: str) -> str:
+    """File the refusal card and SAY SO on stderr, in one of FOUR outcomes.
+
+    ``filed`` / ``already filed`` / ``not filed: <the real reason>`` - and the caller-error
+    classes never reach this function at all (:func:`_classify_refusal` decides that). The
+    three printed outcomes are different facts: the idempotency hit used to be
+    indistinguishable from a failure, and a fenced-context refusal used to be reported as an
+    I/O error. The store is resolved ONCE (:func:`_refusal_store`) so the lookup and the write
+    cannot land on different boards, the card is looked up by key FIRST (a read, permitted in a
+    fenced context) so the hit is knowable, and the write runs under the reviewed child-context
+    allowance (``REFUSAL_WRITE_PURPOSE``) so it can act from a dispatcher-spawned worker.
+    """
+    blocked = _refusal_filer_blocked()
+    if blocked:
+        print(f"Reported: peer '{peer_name}' refused the request ({klass}) -> NOT FILED: {blocked}",
+              file=sys.stderr)
+        return ""
     target = _refusal_target()
     where, db_path = _refusal_store(target["board"])
     key = _refusal_key(peer_name, klass)
@@ -1001,15 +1145,15 @@ def _peer_failure(peer_name: str, exc: Exception) -> int:
     outage discovered by accident.
     """
     if isinstance(exc, urllib.error.HTTPError):
-        detail = _http_error_detail(exc)
-        print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {detail}",
-              file=sys.stderr)
+        print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): "
+              f"{_http_error_detail(exc)}", file=sys.stderr)
     else:
-        detail = str(exc)
         print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
-    klass = _refusal_class(exc)
-    if klass:
+    klass, report, detail = _classify_refusal(peer_name, exc)
+    if report:
         _report_refusal(peer_name, klass, detail)
+    elif klass:
+        print(f"No refusal card filed ({klass}): {detail}", file=sys.stderr)
     return 1
 
 
@@ -1566,10 +1710,15 @@ def cmd_peer(args) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     except (LookupError, PermissionError) as exc:
+        # WHICH resolution failures are the fleet's DM path failing is the ruled
+        # classification's call: `registry-empty` and `no-key` go on the board, a name this
+        # host does not know and a local lane are caller errors said here and nowhere else.
         print(str(exc), file=sys.stderr)
-        # A no-peer/no-key refusal IS the fleet's DM path failing - not a local typo to
-        # swallow. It goes on the board under the peer the caller named.
-        _report_refusal(_target_peer(args.target), _refusal_class(exc), str(exc))
+        klass, report, detail = _classify_refusal(args.target, exc)
+        if report:
+            _report_refusal(_target_peer(args.target), klass, detail)
+        elif klass:
+            print(f"No refusal card filed ({klass}): {detail}", file=sys.stderr)
         return 1
     try:
         base = _resolve_base(peer, profile, key, peer_name)
