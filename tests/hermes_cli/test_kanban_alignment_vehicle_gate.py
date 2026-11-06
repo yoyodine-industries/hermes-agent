@@ -99,6 +99,108 @@ def test_a_card_about_nothing_is_admitted():
     assert gate.evaluate(title="", body="") is None
 
 
+# --- the review's four corrections (platform-stl ruling, 2026-11-05) -------------- #
+
+def test_a_bare_mention_of_a_sandbox_path_admits_a_rebase():
+    """The estate's most common instruction must not be refused on a prefix collision.
+
+    ``/opt/hermes`` used to match INSIDE ``/opt/hermes_sandbox``; 81 open cards on the platform
+    board were refused by that alone, this exact shape among them.
+    """
+    assert gate.evaluate(
+        title="resolve the conflicts before review",
+        body="Rebase onto current origin/main before review: git rebase origin/main in the "
+             "clone under /opt/hermes_sandbox",
+    ) is None
+
+
+def test_a_bare_mention_of_the_prod_estate_admits_a_commit():
+    """``/opt/hermes_prod`` is a deploy-artifact store, not a live serving line."""
+    assert gate.evaluate(
+        title="land the deploy stamp",
+        body="git commit -am 'stamp' in /opt/hermes_prod/_shared/deploy",
+    ) is None
+
+
+def test_a_longer_path_beginning_with_a_live_root_is_not_a_mention():
+    assert gate.evaluate(
+        title="tidy the backup copy",
+        body="git clean -fdx in ~/.hermes_profiles_backup",
+    ) is None
+
+
+def test_a_mention_in_another_paragraph_does_not_arm_a_verb():
+    """260 chars of body used to be enough rope: a closing note armed a verb at the top."""
+    assert gate.evaluate(
+        title="align the live tree",
+        body="Run git reset --hard origin/overrides/live once the window opens.\n"
+             "\n"
+             "## Context\n"
+             "This card exists because ~/.hermes/hermes-agent drifted from its branch; the "
+             "audit that found it is on the git-alignment DAG, and the drift measurement is "
+             "in the run store if a reader wants the numbers before the window opens.",
+    ) is None
+
+
+def test_the_same_line_binds_the_act_to_the_live_tree():
+    record = gate.evaluate(
+        title="align",
+        body="Serving tree ~/.hermes/hermes-agent is stale.\n"
+             "Run git reset --hard origin/overrides/live in ~/.hermes/hermes-agent.",
+    )
+    assert record is not None and record["act"] == "git reset"
+    assert "Run git reset --hard" in record["sentence"], "the refusal quotes the line it judged"
+
+
+def test_the_title_binds_to_the_first_instruction():
+    record = gate.evaluate(
+        title="align ~/.hermes/hermes-agent to origin/overrides/live",
+        body="git reset --hard origin/overrides/live, then re-measure.",
+    )
+    assert record is not None and record["act"] == "git reset"
+
+
+def test_the_incident_card_is_refused():
+    """t_c909ab62's shape: the act and the tree in one card, no vehicle named."""
+    record = gate.evaluate(
+        title="ruling needed: align the serving tree",
+        body="Reset the serving tree: run 'git -C ~/.hermes/hermes-agent reset --hard "
+             "origin/overrides/live' so the served bytes match the branch.",
+    )
+    assert record is not None
+    assert record["act"] == "git reset"
+    assert record["root"].endswith(".hermes/hermes-agent")
+
+
+def test_the_edit_door_refuses_a_rewrite_and_leaves_the_row_unchanged(conn):
+    task_id = kb.create_task(conn, title="measure the live tree", assignee="platform-coder",
+                             body="git status in %s" % LIVE, created_by="test")
+    assert not is_refusal(task_id)
+    refusal = kb.edit_task(
+        conn, task_id,
+        body="git reset --hard origin/overrides/live in %s" % LIVE,
+    )
+    assert is_refusal(refusal)
+    row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row[0] == "measure the live tree"
+    assert row[1] == "git status in %s" % LIVE, "a refused edit changes NOTHING"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'edited'", (task_id,)
+    ).fetchone()[0] == 0
+
+
+def test_the_edit_door_admits_a_rewrite_that_names_the_vehicle(conn):
+    task_id = kb.create_task(conn, title="measure the live tree", assignee="platform-coder",
+                             body="git status in %s" % LIVE, created_by="test")
+    assert not is_refusal(task_id)
+    assert kb.edit_task(
+        conn, task_id,
+        body="git reset --hard origin/overrides/live in %s, carried by hermes-update" % LIVE,
+    ) is True
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert "hermes-update" in row[0]
+
+
 def test_a_host_with_no_live_roots_is_inert(monkeypatch):
     monkeypatch.setenv(gate.ENV_ROOTS, "")
     assert gate.evaluate(title="align", body="git reset --hard in ~/.hermes/hermes-agent") is None

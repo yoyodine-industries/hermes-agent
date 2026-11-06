@@ -12,10 +12,10 @@ THE RULE, deterministic - no inference, no model, no prose parsing beyond two fi
 grammars:
 
   1. the card NAMES a live tree (``HERMES_LIVE_TREE_ROOTS``, or the host defaults:
-     ``~/.hermes/hermes-agent``, ``~/.hermes``, ``/opt/hermes_prod``, ``/opt/hermes``);
+     ``~/.hermes/hermes-agent``, ``~/.hermes``);
   2. the card ORDERS a MUTATING git act bound to that tree - either ``git -C <live
-     root> <verb>``, or a ``git <verb>`` whose mention sits within a bounded window of the
-     root's own mention. Read-only verbs (``status``, ``log``, ``diff``, ``rev-parse``,
+     root> <verb>``, or a ``git <verb>`` whose mention of the root sits on the SAME LINE as
+     the act. Read-only verbs (``status``, ``log``, ``diff``, ``rev-parse``,
      ``hash-object``, ...) are not acts: measuring a live tree is always allowed;
   3. the card NAMES an admitted vehicle - ``r5-install`` or ``hermes-update`` (the update
      chain). The live line is carried by the chain; a hand git op in a live tree is how the
@@ -28,9 +28,12 @@ the act, the tree and the two admitted vehicles.
 WHY THE DOOR. The refusal travels the SAME channel as the filing-budget refusal
 (``kanban_filing_policy.FilingRefusal``): ``create_task`` returns a falsy ``str`` whose
 value is the line, the CLI prints it and exits 3, and the tool verb reports it in its error
-envelope - no exception, no row, nothing half-written. A host whose cards never name a live
-tree never matches: the gate is inert there, and an unreadable environment admits (the same
-fail-open rule the filing policy follows - a door that cannot measure is not a door).
+envelope - no exception, no row, nothing half-written. The SAME predicate gates the two
+fields it judges on the EDIT door (``edit_task``): a rule with a write path it does not read
+would let a card be created clean and rewritten into the refused shape one verb later. A host
+whose cards never name a live tree never matches: the gate is inert there, and an unreadable
+environment admits (the same fail-open rule the filing policy follows - a door that cannot
+measure is not a door).
 
 WHAT IT IS NOT. It does not judge whether the card is a good idea, does not read the
 worker's intent, and does not touch the tree. It only refuses an instruction whose only
@@ -48,12 +51,17 @@ log = logging.getLogger(__name__)
 
 #: The host's live trees, colon-separated. Unset, the defaults below are used; a host with
 #: none of those paths simply never matches a mention and the gate stays inert.
+#:
+#: ONLY trees an agent's served code actually runs out of are live. ``/opt/hermes`` is in
+#: no host's tree and ``/opt/hermes_prod`` is a deploy-artifact store, not a git checkout -
+#: listing them as roots made ``/opt/hermes`` match INSIDE ``/opt/hermes_sandbox/...`` and
+#: ``/opt/hermes_prod/...`` and refused 4,594 ordinary cards on the platform board (81 open
+#: ones on that prefix collision alone). A card that orders a git act under either estate is
+#: not this rule's business.
 ENV_ROOTS = "HERMES_LIVE_TREE_ROOTS"
 DEFAULT_ROOTS = (
     "~/.hermes/hermes-agent",
     "~/.hermes",
-    "/opt/hermes_prod",
-    "/opt/hermes",
 )
 
 #: The ONE admitted vehicle for an alignment of a live tree. Either spelling of the update
@@ -83,10 +91,15 @@ _GIT_ACT = re.compile(
     re.IGNORECASE,
 )
 
-#: How far from a live-root mention a bare ``git <verb>`` may sit and still be read as an
-#: act ON that tree. One sentence's worth: the card says "reset the live tree
-#: (~/.hermes/hermes-agent)", not "reset ... 40 lines later".
-ROOT_WINDOW = 260
+#: A mention must sit in ONE SENTENCE (or one line, when the card writes prose without
+#: punctuation) of the verb it arms. A mention in the closing paragraph of a long spec must not
+#: arm a verb at the top; 260 characters of body was enough rope for exactly that, and a whole
+#: markdown paragraph is just as much rope.
+_BREAK = re.compile(r"(?<=[.!?;])\s+|\n+")
+
+#: The character class that would make a root match a LONGER, different path. ``/opt/hermes``
+#: must not match inside ``/opt/hermes_sandbox``, ``/opt/hermes_prod``, ``~/.hermes_profiles``.
+_CONTINUATION = re.compile(r"[A-Za-z0-9_-]")
 
 
 def _expand(path: str) -> str:
@@ -122,18 +135,66 @@ def _mention_forms(root: str) -> tuple[str, ...]:
 
 
 def _mentions(text: str, roots: tuple[str, ...]) -> list[tuple[int, str]]:
-    """Every live-root mention as ``(position, root)``, longest root first at one spot."""
+    """Every live-root mention as ``(position, root)``, longest root first at one spot.
+
+    A mention must end at a PATH BOUNDARY. Without it ``/opt/hermes`` matched inside
+    ``/opt/hermes_sandbox/...`` and the gate refused ordinary sandbox cards; a root that is
+    only a prefix of a longer, different path is not a mention of that root.
+    """
     found: list[tuple[int, str]] = []
     taken: list[tuple[int, int]] = []
     for root in roots:
         for form in _mention_forms(root):
             for match in re.finditer(re.escape(form), text):
                 start, end = match.start(), match.end()
+                if end < len(text) and _CONTINUATION.match(text[end]):
+                    continue          # a LONGER path continues: not this root
                 if any(s <= start < e for s, e in taken):
                     continue          # already claimed by a longer root
                 taken.append((start, end))
                 found.append((start, root))
     return sorted(found)
+
+
+def _segment_spans(title: Optional[str], body: Optional[str]) -> list[tuple[int, int]]:
+    """The binding units of one card, as ``(start, end)`` spans of ``title + "\\n" + body``.
+
+    A unit is a LINE (all a sentence needs, and the shape the incident card had). The TITLE is
+    the heading of the card's FIRST instruction, so it is joined to the body's first unit: a card
+    titled "align ~/.hermes/hermes-agent" whose body opens with ``git reset --hard`` names the
+    tree it resets. Every later line stands alone - a mention in the closing paragraph does not
+    arm a verb at the top.
+    """
+    text = "%s\n%s" % (title or "", body or "")
+    join = len(title or "")
+    spans: list[tuple[int, int]] = []
+    start = 0
+    joined = False
+    for match in _BREAK.finditer(text):
+        if not joined and match.start() <= join <= match.end():
+            joined = True
+            continue                  # the title/body join is a heading, not a boundary
+        spans.append((start, match.start()))
+        start = match.end()
+    spans.append((start, len(text)))
+    return spans
+
+
+def _segment_of(position: int, spans: list[tuple[int, int]]) -> int:
+    for index, (start, end) in enumerate(spans):
+        if start <= position <= end:
+            return index
+    return -1
+
+
+def _judged_sentence(text: str, spans: list[tuple[int, int]], position: int) -> str:
+    """The sentence/line the gate judged, verbatim (whitespace collapsed, bounded)."""
+    index = _segment_of(position, spans)
+    if index < 0:
+        return ""
+    start, end = spans[index]
+    sentence = " ".join(text[start:end].split())
+    return sentence if len(sentence) <= 200 else sentence[:197] + "..."
 
 
 def _under(path: str, roots: tuple[str, ...]) -> Optional[str]:
@@ -148,11 +209,15 @@ def _under(path: str, roots: tuple[str, ...]) -> Optional[str]:
     return None
 
 
-def find_live_act(text: str, roots: tuple[str, ...]) -> Optional[dict]:
+def find_live_act(text: str, roots: tuple[str, ...],
+                  spans: Optional[list[tuple[int, int]]] = None) -> Optional[dict]:
     """The first git act bound to a live tree, or None. Deterministic and bounded."""
     if not text:
         return None
+    segments = spans if spans is not None else _segment_spans("", text)
     mentions = _mentions(text, roots)
+    if not mentions:
+        return None
     for match in _GIT_ACT.finditer(text):
         verb = (match.group("verb") or "").lower()
         if verb not in MUTATING_VERBS:
@@ -162,11 +227,14 @@ def find_live_act(text: str, roots: tuple[str, ...]) -> Optional[dict]:
             # An explicit target settles it: the act is on the tree it names.
             root = _under(cwd, roots)
             if root:
-                return {"act": "git %s" % verb, "root": root, "via": "git -C %s" % cwd}
+                return {"act": "git %s" % verb, "root": root, "via": "git -C %s" % cwd,
+                        "sentence": _judged_sentence(text, segments, match.start())}
             continue                  # bound to some other tree - not this rule's business
+        act_segment = _segment_of(match.start(), segments)
         for start, root in mentions:
-            if abs(start - match.start()) <= ROOT_WINDOW:
-                return {"act": "git %s" % verb, "root": root, "via": "mention"}
+            if _segment_of(start, segments) == act_segment:
+                return {"act": "git %s" % verb, "root": root, "via": "mention",
+                        "sentence": _judged_sentence(text, segments, match.start())}
     return None
 
 
@@ -182,19 +250,21 @@ def evaluate(*, title: Optional[str] = None, body: Optional[str] = None,
     if not roots:
         return None
     text = "%s\n%s" % (title or "", body or "")
-    act = find_live_act(text, roots)
+    act = find_live_act(text, roots, _segment_spans(title, body))
     if act is None:
         return None
     if names_vehicle(text):
         return None
     line = (
         "refused: alignment card names no admitted vehicle: %r orders `%s` in the live tree "
-        "%s. The live line is carried by the update chain (r5-install / hermes-update) - "
-        "name it as the vehicle, or move the act to a non-live tree."
-        % ((title or "").strip()[:80], act["act"], act["root"])
+        "%s, in the card's own sentence %r. The live line is carried by the update chain "
+        "(r5-install / hermes-update) - name it as the vehicle, or move the act to a non-live "
+        "tree."
+        % ((title or "").strip()[:80], act["act"], act["root"], act["sentence"])
     )
     return {"status": "refused", "gate": "alignment_vehicle", "line": line,
             "act": act["act"], "root": act["root"], "via": act["via"],
+            "sentence": act["sentence"],
             "admitted_vehicles": list(ADMITTED_VEHICLES)}
 
 

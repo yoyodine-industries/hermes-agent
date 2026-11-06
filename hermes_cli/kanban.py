@@ -1250,6 +1250,11 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             conn, args.task_id, title=title, body=body, priority=priority,
             result=result, summary=summary, metadata=metadata,
         )
+    if kb_is_filing_refusal(ok):
+        # THE ALIGNMENT-VEHICLE GATE refused the rewrite (card t_f79daa7f): the line is
+        # already printed by the gate, the row is untouched, and rc 3 matches the create
+        # door's refusal so a producer cannot read "edit" as a success.
+        return 3
     return _ok_or_err(
         ok,
         f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",
