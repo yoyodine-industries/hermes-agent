@@ -23,6 +23,7 @@ import atexit
 import importlib
 import ipaddress
 import os
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -1647,6 +1648,60 @@ def _forbid_real_user_path_writes(monkeypatch):
 
     monkeypatch.setattr("hermes_cli._launchers._register_windows_user_path", refuse)
     monkeypatch.setattr("hermes_cli._install_repair._write_user_path_raw", refuse)
+
+
+@pytest.fixture(scope="session")
+def _hermetic_hermes_bin_shim(tmp_path_factory):
+    """A ``hermes`` console script that runs THIS checkout under the test interpreter.
+
+    Written once per pytest process into the session's temp root.
+    """
+    bin_dir = tmp_path_factory.mktemp("hermes-bin")
+    body = (
+        "import sys; "
+        f"sys.path.insert(0, {str(PROJECT_ROOT)!r}); "
+        "from hermes_cli.main import main; "
+        "sys.exit(main())"
+    )
+    if os.name == "nt":
+        shim = bin_dir / "hermes.cmd"
+        shim.write_text(f'@"{sys.executable}" -c "{body}" %*\r\n', encoding="utf-8")
+    else:
+        shim = bin_dir / "hermes"
+        shim.write_text(
+            "#!/bin/sh\n"
+            "# Test shim (tests/conftest.py): runs this checkout under the test interpreter,\n"
+            "# never the host's live hermes install.\n"
+            f"exec {shlex.quote(sys.executable)} -c {shlex.quote(body)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+    return bin_dir
+
+
+@pytest.fixture(autouse=True)
+def hermetic_hermes_bin_dir(_hermetic_hermes_bin_shim, monkeypatch):
+    """Pin the ``hermes`` bin dir every spawned local environment prepends to PATH.
+
+    ``tools/environments/local.py::_resolve_hermes_bin_dir`` finds the console-script
+    dir from the tree's sealed payload, else ``shutil.which("hermes")``, else
+    ``sys.argv[0]``/``sys.executable``. On any host with a Hermes install on PATH — a
+    developer box, this fleet's worker shell — that lands in the REAL install's bin dir,
+    so a test that spawns a local environment depends on the host and its probe reds
+    under ``tests/home_io_guard.py``. Seed the cache with the temp shim dir instead: the
+    harness is then host-independent (CI and developer machines behave alike), and the
+    guard never has to exempt the class it protects.
+
+    Tests that own the resolver re-seed ``_HERMES_BIN_DIR`` themselves (``_SENTINEL``
+    re-resolves), so this pins only the spawn path, not the resolver's own tests.
+    """
+    try:
+        from tools.environments import local as _local
+    except Exception:  # optional deps missing: nothing spawns a local environment
+        return
+    monkeypatch.setattr(_local, "_HERMES_BIN_DIR", str(_hermetic_hermes_bin_shim))
+    monkeypatch.setattr(_local, "_HERMES_BIN_DIR_IS_PAYLOAD", False)
+    yield _hermetic_hermes_bin_shim
 
 
 @pytest.fixture(autouse=True)
