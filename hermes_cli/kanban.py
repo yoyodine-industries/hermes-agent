@@ -540,6 +540,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 record = getattr(task_id, "record", {}) or {}
                 if getattr(args, "json", False):
                     _print_json({"refused": True, "reason": str(task_id),
+                                 # `filing_policy` predates a second refusal channel at this
+                                 # door; `refusal_gate` names WHICH rule said no, so a
+                                 # consumer never reads an alignment-vehicle refusal as a
+                                 # budget refusal (card t_f79daa7f).
+                                 "refusal_gate": record.get("gate") or "filing_policy",
                                  "filing_policy": dict(record)})
                 elif record.get("why"):
                     print(f"filing policy: {record['why']}", file=sys.stderr)

@@ -2158,6 +2158,17 @@ def create_task(
     if filing_refusal is not None:
         return filing_refusal
 
+    # THE ALIGNMENT-VEHICLE GATE (card t_f79daa7f; design platform-stl, ruled from
+    # t_c909ab62). The class: a card ordered a git act in the LIVE serving tree and named
+    # no vehicle that may perform it - the dispatched worker could only discover that
+    # after dispatch. The rule belongs where the card is WRITTEN, so it rides this same
+    # door: refused BEFORE any write, travelling as the same falsy ``str`` the filing
+    # budget answers with, and inert on a host whose cards never name a live tree.
+    from hermes_cli import kanban_alignment_vehicle_gate as _vehicle
+    vehicle_refusal, _vehicle_record = _vehicle.apply(title=title, body=body)
+    if vehicle_refusal is not None:
+        return vehicle_refusal
+
     # An unresolvable project link is DROPPED either way (never a dangling reference, never a
     # crash), but a silent drop is a silent failure: the caller believes the card is grouped
     # and it is not. Warn on stderr AND carry the finding into the ``created`` event, so the
