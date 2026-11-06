@@ -2158,6 +2158,17 @@ def create_task(
     if filing_refusal is not None:
         return filing_refusal
 
+    # THE ALIGNMENT-VEHICLE GATE (card t_f79daa7f; design platform-stl, ruled from
+    # t_c909ab62). The class: a card ordered a git act in the LIVE serving tree and named
+    # no vehicle that may perform it - the dispatched worker could only discover that
+    # after dispatch. The rule belongs where the card is WRITTEN, so it rides this same
+    # door: refused BEFORE any write, travelling as the same falsy ``str`` the filing
+    # budget answers with, and inert on a host whose cards never name a live tree.
+    from hermes_cli import kanban_alignment_vehicle_gate as _vehicle
+    vehicle_refusal, _vehicle_record = _vehicle.apply(title=title, body=body)
+    if vehicle_refusal is not None:
+        return vehicle_refusal
+
     # An unresolvable project link is DROPPED either way (never a dangling reference, never a
     # crash), but a silent drop is a silent failure: the caller believes the card is grouped
     # and it is not. Warn on stderr AND carry the finding into the ``created`` event, so the
@@ -6462,8 +6473,13 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
-) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
+) -> bool | str:
+    """Edit task fields, optionally backfilling a completed task's result.
+
+    Returns ``True`` when written, ``False`` when the row/state refuses the edit, and a
+    :class:`~hermes_cli.kanban_filing_policy.FilingRefusal` (falsy ``str``) when the
+    alignment-vehicle gate refuses the two fields it judges - the line is already printed.
+    """
     if priority is not None:
         # Door 2b of the above-tranche guard (card t_2e107499, operator ruling 2026-09-28): the
         # CEILING, deliberately NOT policy-gated - the hand-lift above it is how the class was
@@ -6476,6 +6492,24 @@ def edit_task(
         # board too, because a wiring gate here is how ``defcon`` came to hold 101 rows at
         # 1100000. The FLOOR half is the board's own clause.
         _refuse_priority_outside_domain(conn, priority, board=board, task_id=task_id)
+    if title is not None or body is not None:
+        # THE ALIGNMENT-VEHICLE GATE, at the EDIT door (card t_f79daa7f, platform-stl ruling
+        # 2026-11-05). `edit` replaces exactly the two fields the rule judges, so a card could
+        # be created clean and rewritten into the refused shape one verb later - a rule with a
+        # write path it does not read is decoration. The card is judged AS IT WILL READ: the
+        # incoming field composed over the stored one, so editing a vehicle INTO a card is
+        # admitted and only the refusal shape is not. Refused before the txn: no row changes.
+        current = conn.execute(
+            "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if current is not None:
+            from hermes_cli import kanban_alignment_vehicle_gate as _vehicle
+            vehicle_refusal, _ = _vehicle.apply(
+                title=title if title is not None else current[0],
+                body=body if body is not None else current[1],
+            )
+            if vehicle_refusal is not None:
+                return vehicle_refusal
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None

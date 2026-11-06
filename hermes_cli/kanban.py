@@ -540,6 +540,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 record = getattr(task_id, "record", {}) or {}
                 if getattr(args, "json", False):
                     _print_json({"refused": True, "reason": str(task_id),
+                                 # `filing_policy` predates a second refusal channel at this
+                                 # door; `refusal_gate` names WHICH rule said no, so a
+                                 # consumer never reads an alignment-vehicle refusal as a
+                                 # budget refusal (card t_f79daa7f).
+                                 "refusal_gate": record.get("gate") or "filing_policy",
                                  "filing_policy": dict(record)})
                 elif record.get("why"):
                     print(f"filing policy: {record['why']}", file=sys.stderr)
@@ -1245,6 +1250,11 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             conn, args.task_id, title=title, body=body, priority=priority,
             result=result, summary=summary, metadata=metadata,
         )
+    if kb_is_filing_refusal(ok):
+        # THE ALIGNMENT-VEHICLE GATE refused the rewrite (card t_f79daa7f): the line is
+        # already printed by the gate, the row is untouched, and rc 3 matches the create
+        # door's refusal so a producer cannot read "edit" as a success.
+        return 3
     return _ok_or_err(
         ok,
         f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",
