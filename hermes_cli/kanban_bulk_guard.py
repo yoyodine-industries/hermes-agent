@@ -709,16 +709,18 @@ def _conclude_snapshot_clause(
 def _store_for(board: str, *, required: bool = False) -> Optional[Path]:
     """The board's store, or None when the board is not registered.
 
-    Best-effort by default: an unregistered board is the verb's own refusal to raise, not this
-    guard's (``kanban_db.kanban_db_path`` raises :class:`BoardResolutionError`, which subclasses
-    ``ValueError``, so the CLI already reports it as a usage error). ``required=True`` on the
-    snapshot path, where a store is genuinely needed to take a preimage of.
+    The question is the REGISTRY's, not the layout resolver's: ``kanban_db_path`` answers
+    "where WOULD this board's store be" and is registration-agnostic by design, so it hands
+    back a path for a slug nobody registered (ruling t_c21ea472 — it must, because
+    ``create_board`` derives ``board.json`` through it). Asking it and reading a raise was
+    an accident of the older resolver, and it silently stopped refusing. Ask
+    :func:`board_is_registered` first: a name-shaped slug must never be snapshotted into
+    being. ``required=True`` on the snapshot path, where a store is genuinely needed to
+    take a preimage of.
     """
     from hermes_cli import kanban_db as kb
 
-    try:
-        return Path(kb.kanban_db_path(board))
-    except Exception:
+    if not kb.board_is_registered(board):
         if required:
             raise BulkActionRefused(
                 "snapshot_missing",
@@ -727,6 +729,7 @@ def _store_for(board: str, *, required: bool = False) -> Optional[Path]:
                         f"name the board the action really targets"),
             )
         return None
+    return Path(kb.kanban_db_path(board))
 
 
 def _ask_remedy(board: str, verb: str, scope: str, digest: str) -> str:

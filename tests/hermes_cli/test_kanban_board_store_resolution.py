@@ -4,11 +4,30 @@ The measured defect (2026-09-27, card t_d867ddbd): ``kanban_db_path()`` consulte
 ``HERMES_KANBAN_DB`` path pin BEFORE the ``board=`` argument, so with a worker's pin set
 every registered board — and an unregistered slug — resolved to the ONE pinned store
 (``boards/defcon/kanban.db``). Requirement: an explicitly named board always resolves to
-its OWN store; a board nobody registered REFUSES (naming the board) instead of falling
-back to the current/default board or handing back a would-be path.
+its OWN store, and a miss is never dressed up as the current/default board's store.
 
-``test_named_board_wins_over_a_pinned_store`` and the ``TestRefusesUnregisteredBoard``
-cases FAIL against pre-fix code; see the card for the captured before/after output.
+RULING (card t_c21ea472, 2026-11-06, platform-stl — DESIGN AUTHORITY). The original
+requirement also said an unregistered name must be REFUSED BY THE LAYOUT RESOLVER. That
+half is withdrawn, and the layer split is now the rule:
+
+* LAYOUT (this module's ``kanban_db_path``/``_board_path``) answers "where WOULD this
+  board's store be". It is registration-agnostic BY NECESSITY: ``create_board`` derives
+  ``board.json``'s ``db_path`` through it (``read_board_metadata``) BEFORE that file
+  exists, so a refusing layout resolver cannot register a board at all — measured, not
+  argued: routing ``assert_board_registered`` through ``_board_path`` produced 42 failed
+  + 21 errors across four kanban test modules, the root of it every ``create_board``.
+* EXISTENCE is the CLI's own question before dispatch (``hermes_cli/kanban.py``:
+  ``board_exists`` -> ``board '<x>' does not exist``).
+* REGISTRATION is the doors' question: the filing seam (``board_for_fired_card``), the
+  model-facing resolver (``tools.kanban_tools._board`` -> ``assert_board_registered``)
+  and the creating seam (``kanban_db_connect._refuse_dead_board_resurrection``, which
+  refuses to mint a store for an unregistered slug).
+
+So these tests pin the PROPERTY the incident was about — a name nobody registered never
+becomes an estate, and no door substitutes a different board — not the abandoned
+mechanism. ``test_create_board_still_registers`` is the ratchet: re-plumbing registration
+into the layout resolver fails it first, with the reason in its assertion text.
+
 
 The cards below are a STAND-IN for the card fixtures the board layout normally carries;
 the resolution logic never consults them (it is filesystem-only, so ``hermes kanban
@@ -17,6 +36,7 @@ boards`` works before ``kanban init``).
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -121,49 +141,94 @@ class TestNamedBoardWins:
 
 
 # ---------------------------------------------------------------------------
-# Fail closed: an unknown / unregistered board REFUSES
+# A name nobody registered never becomes an estate (ruling t_c21ea472)
 # ---------------------------------------------------------------------------
 
-class TestRefusesUnregisteredBoard:
+class TestUnregisteredNameNeverBecomesAnEstate:
+    """The PROPERTY at the layer that owns it.
 
-    def test_unregistered_named_board_refuses(self, fresh_home):
-        _register(fresh_home, "ops")
-        with pytest.raises(kb.BoardResolutionError) as exc:
-            kb.kanban_db_path(board="no-such-board")
-        assert "no-such-board" in str(exc.value)
+    The layout resolver answers a would-be path (it must: ``create_board`` writes
+    ``board.json`` THROUGH it before the board exists); every door in front of a creating
+    ``connect()`` refuses; and a would-be path is never a store.
+    """
 
-    def test_refusal_never_falls_back_to_the_current_board(self, fresh_home):
-        """A miss must not resolve to the active/pinned board's store."""
+    def test_the_layout_resolver_answers_the_named_boards_would_be_path(self, fresh_home):
+        """A miss is ANSWERED as the named slug's path — the layout answer, not a refusal."""
         _register(fresh_home, "ops")
+        assert kb.kanban_db_path(board="no-such-board") == (
+            fresh_home / "kanban" / "boards" / "no-such-board" / "kanban.db"
+        )
+
+    def test_a_miss_is_never_dressed_up_as_the_current_boards_store(self, fresh_home):
+        """The defect's other half still holds: a miss must not resolve to the ACTIVE store."""
+        boards = _register(fresh_home, "ops")
         kb.set_current_board("ops")
-        for bad in ("typo-board", "defcon"):
-            with pytest.raises(kb.BoardResolutionError):
-                kb.kanban_db_path(board=bad)
+        for missing in ("typo-board", "defcon"):
+            resolved = kb.kanban_db_path(board=missing)
+            assert resolved != boards["ops"], (
+                f"{missing!r} resolved to the CURRENT board's store {resolved}"
+            )
+            assert resolved == fresh_home / "kanban" / "boards" / missing / "kanban.db"
 
-    def test_unregistered_board_refuses_even_with_the_pin_pointing_at_it(self, fresh_home):
-        """The pin cannot make an unregistered slug resolvable."""
-        import os as _os
+    def test_the_would_be_path_is_inert_nothing_is_minted(self, fresh_home):
+        """Reading the path mints nothing; opening it REFUSES at the creating seam."""
+        about_to_be = kb.kanban_db_path(board="no-such-board")
+        assert not about_to_be.exists() and not about_to_be.parent.exists()
+        with pytest.raises(ValueError) as exc:
+            kb.init_db(board="no-such-board")
+        assert "no-such-board" in str(exc.value) and "does not exist" in str(exc.value)
+        assert not about_to_be.parent.exists(), "the refusal must not mint the board"
+
+    def test_the_door_refuses_the_name_and_mints_nothing(self, fresh_home):
+        """``assert_board_registered`` — the door the layout resolver is NOT — refuses."""
+        with pytest.raises(kb.BoardResolutionError) as exc:
+            kb.assert_board_registered("no-such-board")
+        assert "no-such-board" in str(exc.value)
+        assert not kb.board_dir("no-such-board").exists()
+
+    def test_the_pin_cannot_make_an_unregistered_slug_fileable(self, fresh_home):
+        """A pin changes WHERE the process resolves; it never makes a board registered."""
         phantom = fresh_home / "kanban" / "boards" / "phantom" / "kanban.db"
-        _os.environ["HERMES_KANBAN_DB"] = str(phantom)
-        _os.environ["HERMES_KANBAN_BOARD"] = "phantom"
+        os.environ["HERMES_KANBAN_DB"] = str(phantom)
+        os.environ["HERMES_KANBAN_BOARD"] = "phantom"
         try:
             with pytest.raises(kb.BoardResolutionError):
-                kb.kanban_db_path(board="phantom")
+                kb.assert_board_registered("phantom")
         finally:
-            del _os.environ["HERMES_KANBAN_DB"]
-            del _os.environ["HERMES_KANBAN_BOARD"]
+            del os.environ["HERMES_KANBAN_DB"]
+            del os.environ["HERMES_KANBAN_BOARD"]
 
-    def test_malformed_slug_still_refuses(self, fresh_home):
-        # NB: "" is NOT malformed — an empty name means "the active board" (that is how
-        # the kanban tools pass "no board"), so it is deliberately not in this list.
-        for bad in ("../escape", "UPPER", "-leading", "a/b", "with space"):
+    def test_malformed_slug_refuses_and_uppercase_is_normalisation_not_refusal(self, fresh_home):
+        # "UPPER" is NOT malformed — slugs are lowercased by design (a board named in an
+        # operator's capitals is the same board), so it is asserted separately below.
+        # "" is not malformed either: an empty name means "the active board".
+        for bad in ("../escape", "-leading", "a/b", "with space"):
             with pytest.raises(ValueError):
                 kb.kanban_db_path(board=bad)
+        assert kb.kanban_db_path(board="UPPER") == (
+            fresh_home / "kanban" / "boards" / "upper" / "kanban.db"
+        )
+
+    def test_create_board_still_registers_through_the_layout_resolver(self, fresh_home):
+        """THE RATCHET for the withdrawn reading: registration cannot live in the resolver.
+
+        ``create_board`` writes ``board.json`` — whose ``db_path`` is derived by
+        ``read_board_metadata`` -> ``kanban_db_path`` — BEFORE the board is registered.
+        Make the layout resolver refuse an unregistered name and this raises
+        ``BoardResolutionError`` from inside ``create_board``: no board could ever be
+        created (measured 2026-11-06: 42 failed + 21 errors across four kanban modules).
+        """
+        meta = kb.create_board("brand-new")
+        assert kb.board_is_registered("brand-new") is True
+        assert meta["db_path"] == str(
+            fresh_home / "kanban" / "boards" / "brand-new" / "kanban.db"
+        )
 
     def test_board_exists_is_the_probe_for_a_missing_board(self, fresh_home):
         """Callers that mean "does it exist" ask ``board_exists``, not the resolver."""
         assert kb.board_exists("default") is True
         assert kb.board_exists("nope") is False
+
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +314,19 @@ class TestScopedBoardName:
         # Out of scope, the pin is back in charge of the ACTIVE board.
         assert kb.kanban_db_path() == kb.kanban_db_path(board="defcon")
 
-    def test_scoping_an_unregistered_board_refuses(self, fresh_home):
-        """A scoped name nobody registered refuses instead of falling back to default."""
+    def test_scoping_an_unregistered_board_never_falls_back_to_default(self, fresh_home):
+        """A scoped name nobody registered answers ITS path, and the door refuses it.
+
+        This used to assert that the layout resolver RAISES (withdrawn, ruling
+        t_c21ea472). What must hold is the other half of the incident: the scope never
+        degrades to the ambient/default board's store, and nothing is minted for it.
+        """
+        _register(fresh_home, "ops")
+        kb.set_current_board("ops")
         with kb.scoped_current_board("ghost"):
+            assert kb.kanban_db_path() == (
+                fresh_home / "kanban" / "boards" / "ghost" / "kanban.db"
+            )
             with pytest.raises(kb.BoardResolutionError):
-                kb.kanban_db_path()
+                kb.assert_board_registered("ghost")
+        assert not kb.board_dir("ghost").exists()

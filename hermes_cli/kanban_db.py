@@ -671,15 +671,25 @@ def board_is_registered(board: Optional[str] = None) -> bool:
 class BoardResolutionError(ValueError):
     """A board could not be resolved to exactly ONE store, so nothing was resolved.
 
-    Raised instead of guessing. Canonical board resolution never falls back to the
-    current board, never falls back to ``default``, and never hands back a would-be
-    path under ``boards/<slug>/`` for a board nobody registered: a caller that asked
-    for a board by name gets that board's store or a refusal naming the board.
+    Raised instead of guessing, by the DOORS that stand in front of a creating
+    ``connect()``: the filing seam (:func:`board_for_fired_card`), the model-facing board
+    resolver (``tools.kanban_tools._board`` -> :func:`assert_board_registered`) and the
+    CLI's own board validation. Canonical board resolution never falls back to the
+    current board and never falls back to ``default``: a caller that asked for a board by
+    name gets that board, or a refusal naming it.
 
-    Subclasses ``ValueError`` so the CLI surfaces it as a usage error. Callers that
-    mean "does this board exist" ask :func:`board_exists` instead — that is the
-    probe; this is the refusal.
+    NOT raised by the LAYOUT resolver (:func:`kanban_db_path` / :func:`_board_path`).
+    That function answers "where WOULD this board's store be", never "does this board
+    exist": ``create_board`` derives ``board.json``'s ``db_path`` through it BEFORE the
+    board is registered, and every cross-board probe/enumeration resolves through it, so
+    requiring registration there makes board CREATION impossible (ruling t_c21ea472;
+    measured, not argued — 42 failed + 21 errors across four kanban modules). Registration
+    is enforced at the doors above and at
+    ``kanban_db_connect._refuse_dead_board_resurrection``, which refuses to mint a store
+    for an unregistered slug — so a would-be path is never a store. Callers that mean
+    "does this board exist" ask :func:`board_exists` / :func:`board_is_registered`.
     """
+
 
 
 def unregistered_board_refusal(slug: str) -> str:
