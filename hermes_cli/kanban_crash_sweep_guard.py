@@ -30,7 +30,9 @@ no evidence of its own:
 That is exactly the class in which a broken liveness witness masquerades as N card failures.
 ``protocol_violation`` (the worker exited rc=0 and only skipped its paperwork) and
 ``terminal_provider`` (the provider rejected the credential/model) each carry their own evidence and
-their own bounded budget, and ``rate_limited`` is not a crash at all. Counting those would refuse a
+their own bounded budget, ``rate_limited`` is not a crash at all, and ``substrate_import`` (the
+worker's own output names a module THIS tree ships that its interpreter could not resolve) carries
+the artifact and its hash. Counting those would refuse a
 *legitimate* sweep of N cards whose workers each finished successfully -- the false-refusal storm
 this guard must not become. The narrow class is named in code (:data:`UNEXPLAINED_DEATH_KINDS`), not
 left to a reader of the sweep.
@@ -252,12 +254,18 @@ class SweepClosure:
     protocol_violation: bool = False
     terminal_provider: bool = False
     rate_limited: bool = False
+    substrate_import: bool = False
+    """The worker's own output attributed its death to a module THIS tree ships: the closure
+    carries its evidence (provider path, hash), so it is not an unexplained death. Counting it
+    would refuse the sweep on a fault that recurs every tick, freezing the rows as ``running``
+    with dead pids instead of releasing them spaced."""
     claim_lock: Optional[str] = None
 
     @property
     def is_unexplained_death(self) -> bool:
         """True when this closure is the class a bad liveness evaluation can forge."""
-        if self.protocol_violation or self.terminal_provider or self.rate_limited:
+        if (self.protocol_violation or self.terminal_provider or self.rate_limited
+                or self.substrate_import):
             return False
         return self.kind in UNEXPLAINED_DEATH_KINDS
 
