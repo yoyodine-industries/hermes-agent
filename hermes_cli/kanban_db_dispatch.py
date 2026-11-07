@@ -4163,6 +4163,13 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     return total
 
 
+# The reserved key of ``kanban.max_spawn_by_board`` that names the ceiling for
+# every board the map does NOT name. The host budget is measured from the SAME
+# key the gateway enforces, because a dry-run that dropped it would report a
+# budget the dispatcher never applies (card t_5e3fcfc9).
+DEFAULT_CEILING_KEY = "default"
+
+
 def measure_host_budget(
     max_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
@@ -4192,17 +4199,32 @@ def measure_host_budget(
     either way — a measurement that cannot be taken is never reported as a number.
     ``ceiling_sum`` / ``ceilings`` / ``max_spawn`` / ``boards`` are informational.
 
+    ``ceilings`` may also carry the reserved ``default`` key, which the gateway
+    resolves for every board the map does not name. It is POPPED here, never
+    treated as a board: it is applied to each such board (so a board nobody named
+    reports the ceiling the dispatcher will actually enforce, ``0`` included) and
+    therefore lands in ``ceiling_sum`` — the gate arithmetic must count the very
+    value that decides whether a new board can starve the named ones. A map with
+    no ``default`` keeps the historical behaviour exactly: unmapped boards take
+    ``max_spawn``.
+
     The ONLY genuinely unreachable capacity is a ceiling that EXCEEDS the host cap:
     no single board can ever use more than ``max_in_progress`` workers.
     ``per_board_unreachable`` maps each such board to its excess
     (``max(ceiling - max_in_progress, 0)``, empty when none do) and
     ``unreachable_slots`` is that excess summed. ``oversubscribed`` is True only
-    when some SINGLE board's ceiling exceeds the cap — never for the sum.
-    ``unreachable_slots`` is ``None`` (not 0) when no host cap is derived or a
-    ceiling cannot be resolved: a number that cannot be measured is never reported
-    as 0, which would read as "measured, nothing wrong".
+    when some SINGLE board's ceiling exceeds the cap — never for the sum, and a
+    ``default`` above the cap therefore flips it through the boards that inherit
+    that ceiling. ``unreachable_slots`` is ``None`` (not 0) when no host cap is
+    derived or a ceiling cannot be resolved: a number that cannot be measured is
+    never reported as 0, which would read as "measured, nothing wrong".
+    ``ceiling_sum_exceeds_cap`` is the informational comparison of the two
+    (``None`` when either is unmeasured) — elastic headroom, not a defect.
     """
     caps = {str(k): int(v) for k, v in (ceilings or {}).items() if v is not None}
+    # The fallback arm is a resolution rule, not a board: pop it before the
+    # per-board walk so it can never be reported as a slot of its own.
+    default_cap = caps.pop(DEFAULT_CEILING_KEY, None)
     slugs: Optional[list[str]]
     if boards is not None:
         slugs = [str(slug) for slug in boards]
@@ -4219,6 +4241,8 @@ def measure_host_budget(
     if slugs is not None:
         for slug in slugs:
             cap = caps.get(slug)
+            if cap is None and default_cap is not None:
+                cap = default_cap
             per_board[slug] = int(cap) if cap is not None else (
                 int(max_spawn) if max_spawn is not None else None
             )
@@ -4244,9 +4268,14 @@ def measure_host_budget(
     return {
         "max_spawn": int(max_spawn) if max_spawn is not None else None,
         "max_in_progress": host_cap,
+        "default_ceiling": default_cap,
         "boards": slugs,
         "ceilings": per_board,
         "ceiling_sum": ceiling_sum,
+        "ceiling_sum_exceeds_cap": (
+            None if (host_cap is None or ceiling_sum is None)
+            else bool(int(ceiling_sum) > host_cap)
+        ),
         "unreachable_slots": unreachable,
         "per_board_unreachable": per_board_unreachable,
         "oversubscribed": bool(per_board_unreachable),

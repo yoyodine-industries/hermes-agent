@@ -59,27 +59,41 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _max_spawn_by_board(_kanban_cfg: dict) -> dict:
-    """``kanban.max_spawn_by_board`` as ``{slug: int}``, junk dropped silently.
+    """``kanban.max_spawn_by_board`` as ``{slug: ceiling}``, junk dropped silently.
 
     Read here for the MEASUREMENT only: the CLI never passes these ceilings to
     ``dispatch_once`` (that is the gateway dispatcher's job, and it resolves and
-    warns about the same map). A value that is not a positive int can never be a
-    ceiling, so it is left out rather than coerced into one.
+    warns about the same map). A NAMED board's ceiling can never be a
+    non-positive int, so it is left out rather than coerced into one.
+
+    The reserved ``default`` key is the one exception, and it is a different
+    rule on purpose: it is the arm for every board the map does not name, where
+    ``0`` means "an unmapped board draws no slots". Dropping it here would make
+    the dry-run report a budget the gateway does not apply — the exact false
+    green this reader exists to prevent — so the measurement applies the SAME
+    rule the enforcement parser (``gateway.kanban_watchers_dispatcher``) applies:
+    ``default`` accepts any non-negative int, named boards stay positive.
     """
     raw = _kanban_cfg.get("max_spawn_by_board") if isinstance(_kanban_cfg, dict) else None
     if not isinstance(raw, dict):
         return {}
     ceilings: dict = {}
     for slug, value in raw.items():
-        if isinstance(value, bool):
+        key = str(slug).strip()
+        if not key or isinstance(value, bool):
             continue
         try:
             ival = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
-        if ival < 1 or ival != value:
+        if ival != value:
             continue
-        ceilings[str(slug)] = ival
+        if key == kbd.DEFAULT_CEILING_KEY:
+            if ival < 0:
+                continue
+        elif ival < 1:
+            continue
+        ceilings[key] = ival
     return ceilings
 
 
