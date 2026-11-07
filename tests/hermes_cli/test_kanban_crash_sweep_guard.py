@@ -433,14 +433,35 @@ def test_a_synthetic_tick_that_would_close_three_runs_writes_nothing_and_alerts(
         assert _task_row(conn, tid)["status"] == "running"
 
 
-def test_the_alert_is_idempotent_inside_the_hour_bucket(board):
+def test_the_alert_is_idempotent_inside_the_hour_bucket(board, monkeypatch):
     conn = board
+    # The seam stamps the TICK's own clock, so the clock must MOVE between the two ticks: two
+    # ticks inside the same second mint the same `ended_at`, which makes a key built from the
+    # tick's signature accidentally stable -- a wiring regression (passing `verdict.signature`
+    # as the key again) would still file one card and this test would stay green. Advance one
+    # dispatcher tick (63 s), staying inside the same hour bucket, so only a tick-INVARIANT key
+    # can produce the one card the condition is entitled to.
+    clock = {"now": _TICK_INSTANT}
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+
     fingerprint = _comparable_fingerprint()
     dead = _dead_pid()
     for _ in range(3):
         _claimed_running(conn, pid=dead, started_at=fingerprint)
+
     kbd.detect_crashed_workers(conn)
+    first = kbd.detect_crashed_workers._last_crash_sweep_abort
+    clock["now"] = _TICK_INSTANT + _TICK_SECONDS
     kbd.detect_crashed_workers(conn)
+    later = kbd.detect_crashed_workers._last_crash_sweep_abort
+
+    # Two DIFFERENT instants, one hour bucket, one unchanged condition ...
+    assert first is not None and later is not None
+    assert first.ended_at != later.ended_at
+    assert first.ended_at // _HOUR_SECONDS == later.ended_at // _HOUR_SECONDS
+    assert first.count == later.count
+
+    # ... and the card must NOT multiply.
     rows = conn.execute(
         "SELECT COUNT(*) AS c FROM tasks WHERE idempotency_key LIKE 'mass-crash:%'",
     ).fetchone()
