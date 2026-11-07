@@ -467,6 +467,129 @@ def substrate_import_signature(
     return f"{SUBSTRATE_SIGNATURE_PREFIX}{evidence['provider_rel']}:{evidence['symbol']}"
 
 
+#: A dead worker leaves TEXT, not an exception. These read the same two disagreement shapes
+#: ``_tree_import_evidence`` reads from an exception, out of the transcript the worker left behind.
+_NO_MODULE_NAMED_RE = re.compile(r"No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]")
+_CANNOT_IMPORT_FROM_RE = re.compile(
+    r"cannot import name ['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s+from\s+['\"]?([A-Za-z_][A-Za-z0-9_.]*)"
+)
+_OUTPUT_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
+
+
+def _module_source_under_tree(name: str, tree: Path) -> Optional[Path]:
+    """The source file THIS tree supplies for dotted ``name``, or None -- resolved on disk, never imported.
+
+    The output-shaped half of ``_provider_source``: the text names a module, and the only question
+    is whether the tree ships it. A name with no source under the tree (a missing third-party
+    dependency) answers None, and the failure therefore stays the card's, exactly as at spawn time.
+    """
+    parts = [part for part in (name or "").split(".") if part]
+    if not parts or any(not part.isidentifier() for part in parts):
+        return None
+    base = Path(tree).joinpath(*parts)
+    for candidate in (base / "__init__.py", base.with_suffix(".py")):
+        try:
+            if candidate.is_file() and _is_under(candidate, tree):
+                return candidate
+        except OSError:
+            continue
+    # ``foo.bar`` whose ``bar`` source is gone still names a package the tree ships; fall back to
+    # the owner, so one fault does not split into two signatures.
+    return _module_source_under_tree(".".join(parts[:-1]), tree) if len(parts) > 1 else None
+
+
+def _output_importer_frame(output: str, tree: Path) -> Optional[tuple[str, int]]:
+    """Deepest ``File "<path>", line N`` in the text whose path is source under ``tree``, else None."""
+    found: Optional[tuple[str, int]] = None
+    for match in _OUTPUT_FRAME_RE.finditer(output):
+        if _is_under(match.group(1), tree):
+            found = (_relative_to_tree(match.group(1), tree), int(match.group(2)))
+    return found
+
+
+def _tree_import_naming_line(
+    provider: Path,
+    tree: Path,
+    subject: str,
+    importer: Optional[tuple[str, int]],
+    task_id: Optional[str],
+) -> str:
+    """The stored, front-loaded line for a post-spawn substrate death -- same marker, same shape.
+
+    It LEADS the stored error (which is cut at 500 chars) for the same reason the spawn seam's does:
+    the reader greps ``tree-import-inconsistency:`` and needs the importer, the provider and its
+    bytes before the cut.
+    """
+    try:
+        raw = provider.read_bytes()
+    except OSError:
+        raw = b""
+    sha256 = hashlib.sha256(raw).hexdigest() if raw else "unknown"
+    provider_rel = _relative_to_tree(provider, tree)
+    head = _head_verdict(tree, provider_rel, sha256) if raw else None
+    head_text = "unknown" if head is None else ("yes" if head else "no")
+    importer_text = (
+        f"importer {importer[0]}:{importer[1]}" if importer
+        else "importer this tree's own entrypoint"
+    )
+    return (
+        f"{TREE_IMPORT_INCONSISTENCY} {importer_text} imports {subject}; provider {provider_rel}"
+        f" sha256={sha256} differs-from-HEAD={head_text}; the worker died after spawn,"
+        f" nothing of card {task_id or 'unknown'} ran"
+    )
+
+
+def substrate_import_in_worker_output(
+    output: str, *, tree: Optional[Path] = None, task_id: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
+    """``(signature, naming_line)`` when a DEAD worker's own output blames THIS tree, else None.
+
+    The spawn seam classifies an EXCEPTION: its ``name``/``path`` attributes and its traceback
+    frames. A worker that dies one second after a successful spawn leaves only text, and that text
+    carries the same disagreement in one of two shapes:
+
+    * ``cannot import name 'X' from 'Y'`` -- a traceback frame under the tree asked the tree's own
+      module ``Y`` for ``X`` and did not get it (both halves required, as at spawn time);
+    * ``No module named 'Y'`` (also inside ``python -m``'s "Error while finding module
+      specification for 'Y'") -- the interpreter could not find a module THIS tree ships. The
+      importer here is the tree's own entrypoint, so no frame is required: the spawn's own
+      interpreter could not see the tree's package.
+
+    Only a name whose SOURCE resolves under this tree is attributed: a missing third-party
+    dependency answers None and stays the card's, exactly as :func:`classify_spawn_failure`
+    decides it at spawn time. This is the dead-worker half of that ONE decider -- callers must not
+    re-implement the rule beside it.
+    """
+    text = output or ""
+    if not text.strip():
+        return None
+    tree = Path(tree) if tree is not None else _dispatching_tree_root()
+
+    mismatch = _CANNOT_IMPORT_FROM_RE.search(text)
+    if mismatch:
+        symbol, provider_name = mismatch.group(1), mismatch.group(2)
+        provider = _module_source_under_tree(provider_name, tree)
+        importer = _output_importer_frame(text, tree)
+        if provider is None or importer is None:
+            return None
+        return (
+            f"{SUBSTRATE_SIGNATURE_PREFIX}{_relative_to_tree(provider, tree)}:{symbol}",
+            _tree_import_naming_line(provider, tree, symbol, importer, task_id),
+        )
+
+    missing = _NO_MODULE_NAMED_RE.search(text)
+    if missing:
+        name = missing.group(1)
+        provider = _module_source_under_tree(name, tree)
+        if provider is None:
+            return None
+        return (
+            f"{SUBSTRATE_SIGNATURE_PREFIX}{_relative_to_tree(provider, tree)}:{name}",
+            _tree_import_naming_line(provider, tree, name, None, task_id),
+        )
+    return None
+
+
 def classify_spawn_failure(exc: BaseException, *, tree: Optional[Path] = None) -> str:
     """The ONE decider for who owns a failed spawn: ``card`` | ``substrate_import`` | ``host_capacity``.
 
@@ -1014,6 +1137,12 @@ class DispatchResult:
     to ``ready`` WITHOUT counting a failure. The VISIBILITY surface for this
     class: a card looping on a wedged store must be readable in the tick
     summary, never silent."""
+    substrate_import: list[str] = field(default_factory=list)
+    """Task ids whose worker died AFTER a successful spawn for a reason the dispatching
+    tree owns: a module the tree ships was not importable in the worker's interpreter,
+    read from the worker's own last output. Released to ``ready`` WITHOUT counting a
+    failure and spaced by ``check_respawn_guard``'s ``substrate_cooldown``; the lane
+    actor names the tree artifact. The VISIBILITY surface for this class."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -2681,6 +2810,14 @@ class _DeadWorker:
     """``KANBAN_STORAGE_LOCKED_EXIT_CODE``: the turn was stopped by the profile
     state store's write lock being held by a peer — infrastructure, so the run is
     booked ``storage_locked`` and NEVER counted against the breaker."""
+    substrate_import: bool = False
+    """The dead worker's OWN OUTPUT attributed its death to a module THIS tree ships
+    (:func:`substrate_import_in_worker_output`): nothing of the card ran, so the run is booked
+    ``spawn_failed`` with ``infrastructure``/``substrate_import`` metadata, the card is not
+    charged, and ``check_respawn_guard`` spaces the retry on the same ``substrate_cooldown``
+    the spawn seam uses."""
+    substrate_signature: Optional[str] = None
+    """``substrate_import:<provider-relpath>:<symbol>`` -- the lane actor's dedupe key."""
 
     @property
     def run_outcome(self) -> str:
@@ -2690,7 +2827,29 @@ class _DeadWorker:
         # store reads as a crash of the card's own work.
         if self.storage_locked:
             return "storage_locked"
-        return "rate_limited" if self.rate_limited else "crashed"
+        if self.rate_limited:
+            return "rate_limited"
+        if self.substrate_import:
+            # A post-spawn substrate death is recorded in the SAME vocabulary as the spawn seam's
+            # (``spawn_failed``): ``check_respawn_guard`` already spaces that class through its
+            # ``substrate_cooldown`` branch and the lane actor already counts those events. One
+            # vocabulary, one cooldown ladder -- never a second one beside it.
+            return "spawn_failed"
+        return "crashed"
+
+
+def _is_unexplained_death(dead: _DeadWorker) -> bool:
+    """Is this the family whose verdict is "the process is gone" with no evidence of its own?
+
+    Exactly the class the crash guard counts and that would otherwise be charged to the card: NOT
+    a quota wall, a busy store, a protocol violation or a provider wall -- each of those already
+    carries a verdict of its own. A death admitted here is then RE-READ from the worker's output:
+    the output is what decides whether the tree or the card owns it.
+    """
+    return dead.event_kind == "crashed" and not (
+        dead.rate_limited or dead.storage_locked or dead.protocol_violation
+        or dead.terminal_provider
+    )
 
 
 def _classify_dead_worker(
@@ -2705,13 +2864,34 @@ def _classify_dead_worker(
     requeue does not need it. Excluding the storage-locked branch is load-bearing:
     that requeue's stamped error text must stay free of arbitrary worker prose,
     which ``check_respawn_guard`` re-scans against ``_RESPAWN_BLOCKER_RE``.
+
+    One second after a successful spawn the worker can still die for a reason THIS tree owns --
+    its interpreter could not resolve a module the tree ships. The exit status alone cannot see
+    that, so an unexplained death's own output is read through
+    :func:`substrate_import_in_worker_output` (the dead-worker half of the spawn seam's ONE
+    decider) and, when the tree is named, the death is re-booked as infrastructure: same
+    ``substrate_signature`` on the run and the event, the worker's words kept as the evidence,
+    and no charge to the card.
     """
     dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
     if task_id and not (dead.rate_limited or dead.storage_locked):
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
-            dead.error_text += f"{WORKER_OUTPUT_SEP}{worker_output!r}"
-            dead.event_payload["worker_output"] = worker_output
+            dead.event_payload["worker_output"] = worker_output      # the evidence, unchanged
+            naming = ""
+            if _is_unexplained_death(dead):
+                found = substrate_import_in_worker_output(worker_output, task_id=task_id)
+                if found is not None:
+                    signature, naming = found
+                    dead.substrate_import = True
+                    dead.substrate_signature = signature
+                    dead.event_kind = "spawn_failed"
+                    dead.event_payload["infrastructure"] = True
+                    dead.event_payload["substrate_import"] = True
+                    dead.event_payload["substrate_signature"] = signature
+            dead.error_text = (
+                f"{naming} {dead.error_text}" if naming else dead.error_text
+            ) + f"{WORKER_OUTPUT_SEP}{worker_output!r}"
     return dead
 
 
@@ -2815,6 +2995,12 @@ class _CrashSweep:
     # from ``crash_details`` so a storage lock-stop can never reach
     # ``_account_crashes`` and never trips the breaker.
     storage_locked: list[str] = field(default_factory=list)
+    # Requeued WITHOUT counting a failure because the worker's own output attributed its death to
+    # a module THIS tree ships (a post-spawn substrate import). Held apart from ``crash_details``
+    # for the same reason as ``storage_locked``.
+    substrate_deferred: list[str] = field(default_factory=list)
+    # The distinct signatures those deaths carried: the lane actor's input, filed after the txn.
+    substrate_signatures: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -3015,6 +3201,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                     protocol_violation=dead.protocol_violation,
                     terminal_provider=dead.terminal_provider,
                     rate_limited=dead.rate_limited,
+                    substrate_import=dead.substrate_import,
                     claim_lock=row["claim_lock"],
                 )
                 for row, pid, dead, _ in pending
@@ -3086,13 +3273,17 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.storage_locked or dead.protocol_violation:
+            if (dead.rate_limited or dead.storage_locked or dead.protocol_violation
+                    or dead.substrate_import):
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a storage-locked requeue shows it its own transient kind;
                 # a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
                 # board UI and retry worker need the corrective message.
+                # A substrate death stamps it too -- the board must show WHICH tree
+                # artifact the run died on. The guard reads the RUN outcome first, so
+                # the stamped prose can never trap the card behind a blocker.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (error_text[:500], row["id"]),
@@ -3104,6 +3295,16 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 # reach ``_account_crashes`` (the breaker) and must not count toward
                 # the mass-crash abort either.
                 sweep.storage_locked.append(row["id"])
+            elif dead.substrate_import:
+                # NEVER crash_details, for the SAME reason as a lock-stop: nothing of the
+                # card ran, so the death is the tree's and must not spend the card's
+                # retry budget. It is also excluded from the mass-crash abort: a substrate
+                # fault repeats on every tick, and refusing the sweep would freeze these
+                # rows as ``running`` with dead pids instead of releasing them spaced.
+                # Counted for the LANE actor (filenames the artifact) after the txn.
+                sweep.substrate_deferred.append(row["id"])
+                if dead.substrate_signature:
+                    sweep.substrate_signatures.append(dead.substrate_signature)
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -3200,7 +3401,9 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     wall and ``KANBAN_STORAGE_LOCKED_EXIT_CODE`` is a state-store lock-stop —
     both are infrastructure, released WITHOUT counting a failure and surfaced
     via the ``_last_rate_limited`` / ``_last_storage_locked`` attributes (the
-    return stays crashed-only).
+    return stays crashed-only). A worker that died days after a clean spawn for a
+    module THIS tree ships — read from its own last words, not from its exit code —
+    is the same class of infrastructure and surfaces via ``_last_substrate_import``.
     """
     sweep = _reclaim_dead_workers(conn, board=board)
     if sweep.assessment is not None and sweep.assessment.alerting:
@@ -3222,6 +3425,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
         detect_crashed_workers._last_auto_blocked = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_rate_limited = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_storage_locked = []  # type: ignore[attr-defined]
+        detect_crashed_workers._last_substrate_import = []  # type: ignore[attr-defined]
         return []
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
@@ -3231,6 +3435,14 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
     detect_crashed_workers._last_storage_locked = sweep.storage_locked  # type: ignore[attr-defined]
+    detect_crashed_workers._last_substrate_import = sweep.substrate_deferred  # type: ignore[attr-defined]
+    # The LANE half of a post-spawn substrate death, filed only now (it needs its own write txn)
+    # and idempotent per signature: the card keeps its retry budget, and the tree artifact is
+    # counted for the design authority instead of the lane going silently dead card by card.
+    for signature in dict.fromkeys(sweep.substrate_signatures):
+        _maybe_file_substrate_actor(
+            conn, signature, tree=_dispatching_tree_root(), board=board,
+        )
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -6439,6 +6651,7 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.storage_locked.extend(getattr(detect_crashed_workers, "_last_storage_locked", []))
+    result.substrate_import.extend(getattr(detect_crashed_workers, "_last_substrate_import", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
     # Door 3 of the above-tranche guard (t_6ce41549, restored by card t_2e107499): a row ABOVE
