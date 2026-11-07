@@ -17,6 +17,13 @@ from typing import Any, Optional
 
 from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
 
+# The reserved key of ``kanban.max_spawn_by_board`` that names the ceiling for
+# every board the map does NOT name. One definition lives in the budget module
+# (``hermes_cli.kanban_db_dispatch``) because the MEASUREMENT reads the same key
+# the ENFORCEMENT resolves: two spellings of it would let a dry-run report a
+# budget the gateway never applies.
+from hermes_cli.kanban_db_dispatch import DEFAULT_CEILING_KEY
+
 
 def _kbc():
     from hermes_cli import kanban_db_connect
@@ -239,26 +246,53 @@ class _DispatcherSettings:
 
         Resolution lives here, at the per-tick call site, so the budget function
         (``_tick_spawn_budget``) stays pure and every board agrees on the
-        precedence: a board named in ``kanban.max_spawn_by_board`` uses its own
-        value, any other board keeps the global ``kanban.max_spawn``.
+        precedence:
+
+        1. a board the map NAMES uses its own value;
+        2. a board the map does not name uses the map's ``default`` arm when it
+           declares one — and ``default: 0`` therefore means "a board this map
+           does not name draws no slots", which is the only way to bound a board
+           that is not yet in the map;
+        3. only a map that declares no ``default`` arm keeps the global
+           ``kanban.max_spawn``, which is the historical behaviour (kept so an
+           existing map cannot change the look of a board it never named).
+
+        The root board's slug is literally ``default``, so it resolves through
+        arm 1 with the very number arm 2 would give it: the value means the same
+        thing whether it is reached as a name or as the fallback.
         """
         if slug in self.max_spawn_by_board:
             return self.max_spawn_by_board[slug]
+        if DEFAULT_CEILING_KEY in self.max_spawn_by_board:
+            return self.max_spawn_by_board[DEFAULT_CEILING_KEY]
         return self.max_spawn
 
 
 def _parse_max_spawn_by_board(kanban_cfg: dict, kb: Any) -> dict:
-    """Parse ``kanban.max_spawn_by_board``: board slug -> positive-int ceiling.
+    """Parse ``kanban.max_spawn_by_board``: board slug -> ceiling, plus ``default``.
 
-    Boards not named keep the global ``kanban.max_spawn``, so this map is purely
-    additive. A non-mapping value, a value that is not a positive integer — a
-    non-integral float such as ``2.5`` included, never truncated, and a
-    non-finite ``.inf``, which must never reach ``int()`` — a value below 1, and
-    a slug that names no board in the inventory are each IGNORED with a warning:
-    a typo must be visible, never fatal and never silently ineffective. An
-    unreadable board inventory leaves the map as configured: an entry for a board
-    nothing serves simply never matches, so a read failure can never drop a real
-    ceiling.
+    A board the map NAMES takes its own ceiling. A board the map does not name
+    takes the map's ``default`` arm when it declares one; only a map with no
+    ``default`` arm leaves it on the global ``kanban.max_spawn``. So the
+    ``default`` key is how a host bounds a board nobody has named yet — the hole
+    that let a fourth board draw the whole global ceiling — and ``default: 0``
+    means "a board this map does not name draws no slots".
+
+    ``0`` is legal ONLY for the ``default`` key. A NAMED board's ceiling must
+    still be a positive integer: a named board at 0 is a typo or a lever already
+    covered by ``dispatch: off``, and a typo must never silently disarm a board.
+    The rejection rule and the zero-means-none rule are therefore not the same
+    rule, which is why they are written as two branches.
+
+    A non-mapping value, a value that is not an integer — a non-integral float
+    such as ``2.5`` included, never truncated, and a non-finite ``.inf``, which
+    must never reach ``int()`` — a bool (an int subclass, not a ceiling), a
+    negative value, an empty slug, and a slug that names no board in the
+    inventory are each IGNORED with a warning: a typo must be visible, never
+    fatal and never silently ineffective. ``default`` names no board, so it is
+    exempt from the inventory check. An unreadable board inventory leaves the
+    map as configured: an entry for a board nothing serves simply never matches,
+    so a read failure can never drop a real ceiling.
     """
     raw = kanban_cfg.get("max_spawn_by_board")
     if raw is None:
@@ -279,7 +313,7 @@ def _parse_max_spawn_by_board(kanban_cfg: dict, kb: Any) -> dict:
     parsed: dict[str, int] = {}
     for slug, value in raw.items():
         key = str(slug).strip()
-        # A ceiling is a positive integer. A non-integral float (2.5) is a typo and
+        # A ceiling is an integer. A non-integral float (2.5) is a typo and
         # must never be truncated into a different, dispatch-governing cap; a
         # non-finite float (.inf/.nan) must never reach int() at all — that raises
         # OverflowError out of config resolution. A bool is an int subclass but not
@@ -296,13 +330,30 @@ def _parse_max_spawn_by_board(kanban_cfg: dict, kb: Any) -> dict:
                 "kanban dispatcher: invalid kanban.max_spawn_by_board[%r]=%r; ignoring", slug, value
             )
             continue
-        if not key or ceiling < 1:
+        if not key:
             logger.warning(
-                "kanban dispatcher: kanban.max_spawn_by_board[%r]=%r must name a board with a "
-                "positive ceiling; ignoring", slug, value
+                "kanban dispatcher: kanban.max_spawn_by_board[%r]=%r must name a board (or the "
+                "reserved 'default' key) with a ceiling; ignoring", slug, value
             )
             continue
-        if known is not None and key not in known:
+        if key == DEFAULT_CEILING_KEY:
+            # The fallback arm for every board the map does not name: a NEGATIVE
+            # ceiling is not a thing, but 0 is the whole point of this key.
+            if ceiling < 0:
+                logger.warning(
+                    "kanban dispatcher: kanban.max_spawn_by_board[%r]=%r must be a non-negative "
+                    "integer (0 = a board this map does not name draws no slots); ignoring",
+                    slug, value,
+                )
+                continue
+        elif ceiling < 1:
+            logger.warning(
+                "kanban dispatcher: kanban.max_spawn_by_board[%r]=%r must name a board with a "
+                "positive ceiling; ignoring and keeping the global max_spawn for it "
+                "(0 is only meaningful for the reserved 'default' key)", slug, value
+            )
+            continue
+        elif known is not None and key not in known:
             logger.warning(
                 "kanban dispatcher: kanban.max_spawn_by_board names unknown board %r; ignoring", key
             )

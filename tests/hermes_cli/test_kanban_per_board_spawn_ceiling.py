@@ -15,7 +15,9 @@ precondition is asserted in ``test_imports_resolve_to_this_tree``).
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +26,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_ops
 from gateway import kanban_watchers_dispatcher as kwd
 
 
@@ -428,3 +431,252 @@ def test_no_map_configured_matches_a_direct_dispatch(
     assert len(mapped_res.spawned) == len(control_res.spawned) == 4
     assert mapped_res.deferred_board_capped == []
     assert control_res.deferred_board_capped == []
+
+
+# ---------------------------------------------------------------------------
+# The DEFAULT arm: kanban.max_spawn_by_board["default"]
+#
+# The residual after the map landed (t_5e3fcfc9): a board the map does not NAME
+# still drew the GLOBAL max_spawn, so the first new board could starve every
+# board the operator had apportioned. `default: 0` is now expressible end to end
+# — parsed by both readers, resolved by the gateway, counted by the host-budget
+# measurement — and `default: -1` is still junk.
+# ---------------------------------------------------------------------------
+
+
+def test_max_spawn_for_board_resolves_all_four_arms(kanban_home):
+    """The four arms of the resolution rule, each asserted on its own.
+
+    (1) a NAMED board uses its own ceiling; (2) an unmapped board uses the
+    ``default`` arm, 0 included; (3) a map with NO default arm keeps the global
+    ``kanban.max_spawn`` (the compatibility arm); (4) a non-zero default bounds
+    an unmapped board without touching a named one.
+    """
+    named_and_zero_default = _settings(
+        max_spawn=8, max_spawn_by_board={"platform": 4, "default": 0}
+    )
+    assert named_and_zero_default.max_spawn_for_board("platform") == 4      # (1)
+    assert named_and_zero_default.max_spawn_for_board("defcon") == 0        # (2)
+
+    no_default_arm = _settings(max_spawn=8, max_spawn_by_board={"platform": 4})
+    assert no_default_arm.max_spawn_for_board("defcon") == 8                # (3)
+    assert no_default_arm.max_spawn_for_board(kb.DEFAULT_BOARD) == 8
+
+    nonzero_default = _settings(
+        max_spawn=8, max_spawn_by_board={"platform": 4, "default": 3}
+    )
+    assert nonzero_default.max_spawn_for_board("platform") == 4             # (4)
+    assert nonzero_default.max_spawn_for_board("defcon") == 3
+
+    assert _settings(max_spawn=8, max_spawn_by_board={}).max_spawn_for_board(
+        "defcon"
+    ) == 8                                                                   # (3), empty map
+
+
+def test_default_zero_parses_while_a_named_zero_is_still_refused(kanban_home, caplog):
+    """Zero is legal ONLY for the reserved key — the two rules are not one rule."""
+    kb.create_board("defcon")
+    with caplog.at_level("WARNING"):
+        settings = kwd._resolve_dispatcher_settings(
+            {"max_spawn": 8, "max_spawn_by_board": {"default": 0, "defcon": 0}}, kb
+        )
+
+    assert dict(settings.max_spawn_by_board) == {"default": 0}
+    assert settings.max_spawn_for_board("defcon") == 0
+    # ...and the NAMED board's zero was refused loudly, keeping the global cap.
+    assert any(
+        "positive ceiling" in r.getMessage() and "defcon" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_negative_default_is_dropped_with_a_warning(kanban_home, caplog):
+    kb.create_board("platform")
+    with caplog.at_level("WARNING"):
+        settings = kwd._resolve_dispatcher_settings(
+            {"max_spawn": 8, "max_spawn_by_board": {"platform": 4, "default": -1}}, kb
+        )
+
+    assert dict(settings.max_spawn_by_board) == {"platform": 4}
+    # A dropped default restores the compatibility arm, not a silent 0.
+    assert settings.max_spawn_for_board("defcon") == 8
+    assert any(
+        "'default'" in r.getMessage() and "non-negative" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_measurement_reader_agrees_with_the_enforcement_reader(kanban_home):
+    """The dry-run's map and the gateway's map must be the SAME map.
+
+    A measurement reader that dropped ``default: 0`` would report a budget the
+    gateway never applies — the false green this card exists to close.
+    """
+    kb.create_board("platform")
+    kb.create_board("defcon")
+    maps = [
+        {"default": 0, "platform": 4},
+        {"default": 3},
+        {"platform": 4},
+        {"default": -1, "platform": 4},
+        {"platform": 0, "defcon": 2},
+        {"default": 0, "defcon": 0},
+        {"platform": 2.5, "default": True},
+        {"platform": "lots", "default": float("inf")},
+    ]
+    for mapped in maps:
+        enforced = kwd._parse_max_spawn_by_board({"max_spawn_by_board": mapped}, kb)
+        measured = kanban_ops._max_spawn_by_board({"max_spawn_by_board": mapped})
+        assert measured == dict(enforced), mapped
+
+
+def test_default_zero_an_unmapped_board_takes_no_slots(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """The card's DoD verbatim: an unmapped board at `default: 0` spawns nothing.
+
+    Behavioural, not resolver-level: the tick runs the REAL dispatch gate with
+    the ceiling the default arm resolved, and NAMES the cards it held.
+    """
+    kb.create_board("defcon")
+    _seed("defcon", 5)
+    monkeypatch.setattr(kbd, "_default_spawn", lambda task, workspace, *, board=None: 42)
+
+    dispatcher = kwd._KanbanDispatcher(
+        kb, _settings(max_spawn=8, max_spawn_by_board={"default": 0})
+    )
+    res = dispatcher.tick_once_for_board("defcon")
+
+    assert res.spawned == []
+    assert len(res.deferred_board_capped) == 5
+    assert res.spawn_budget_blocked == "max_spawn"
+    assert res.spawn_budget_detail["cap"] == 0
+
+
+def test_without_the_default_arm_an_unmapped_board_keeps_the_global_max(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """Compatibility, ASSERTED: no default arm -> the unmapped board still runs."""
+    kb.create_board("defcon")
+    _seed("defcon", 5)
+    monkeypatch.setattr(kbd, "_default_spawn", lambda task, workspace, *, board=None: 42)
+
+    dispatcher = kwd._KanbanDispatcher(
+        kb, _settings(max_spawn=8, max_spawn_by_board={"platform": 4})
+    )
+    res = dispatcher.tick_once_for_board("defcon")
+
+    assert len(res.spawned) == 5          # the global max_spawn, unchanged
+    assert res.spawn_budget_detail == {}
+
+
+def test_default_zero_and_the_named_board_sharing_one_host(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """The DoD's fleet shape: platform at 4 while the unmapped board holds 0."""
+    kb.create_board("platform")
+    kb.create_board("defcon")
+    _seed("platform", 10)
+    _seed("defcon", 10)
+    monkeypatch.setattr(kbd, "_default_spawn", lambda task, workspace, *, board=None: 42)
+
+    dispatcher = kwd._KanbanDispatcher(
+        kb,
+        _settings(
+            max_in_progress=8,
+            max_spawn=8,
+            max_spawn_by_board={"platform": 4, "default": 0},
+        ),
+    )
+    for _ in range(4):
+        dispatcher.tick_once()
+
+    assert _running("platform") == 4
+    assert _running("defcon") == 0
+    assert _running("platform") + _running("defcon") <= 8
+
+
+def test_the_ceiling_sum_counts_the_default(kanban_home):
+    """The host-budget arithmetic includes the very value that decides starvation."""
+    kb.create_board("platform")
+    kb.create_board("defcon")
+
+    measured = kbd.measure_host_budget(
+        max_spawn=8,
+        max_in_progress=8,
+        ceilings={"platform": 4, "default": 0},
+        boards=["platform", "defcon"],
+    )
+    assert measured["default_ceiling"] == 0
+    assert measured["ceilings"] == {"platform": 4, "defcon": 0}
+    assert "default" not in measured["ceilings"]      # a rule, never a board
+    assert measured["ceiling_sum"] == 4
+    assert measured["ceiling_sum_exceeds_cap"] is False
+    assert measured["oversubscribed"] is False
+    assert measured["unreachable_slots"] == 0
+
+    # A default ABOVE the cap reaches the same arithmetic and flips it.
+    over = kbd.measure_host_budget(
+        max_spawn=8,
+        max_in_progress=8,
+        ceilings={"platform": 4, "default": 12},
+        boards=["platform", "defcon"],
+    )
+    assert over["ceilings"] == {"platform": 4, "defcon": 12}
+    assert over["ceiling_sum"] == 16
+    assert over["ceiling_sum_exceeds_cap"] is True
+    assert over["per_board_unreachable"] == {"defcon": 4}
+    assert over["oversubscribed"] is True
+    assert over["unreachable_slots"] == 4
+
+
+def test_the_default_does_not_invent_a_measurement_without_a_host_cap(kanban_home):
+    """None stays None: a default is not a cap and cannot make one measurable."""
+    unmeasured = kbd.measure_host_budget(
+        max_spawn=8,
+        max_in_progress=None,
+        ceilings={"default": 12},
+        boards=["defcon"],
+    )
+    assert unmeasured["default_ceiling"] == 12
+    assert unmeasured["ceiling_sum"] == 12
+    assert unmeasured["ceiling_sum_exceeds_cap"] is None
+    assert unmeasured["unreachable_slots"] is None
+    assert unmeasured["oversubscribed"] is False
+
+
+def test_cli_dry_run_reports_the_default_arm(
+    kanban_home, all_assignees_spawnable, capsys, monkeypatch
+):
+    """The DRY-RUN carries the default, because the measurement reader kept it."""
+    from hermes_cli import config as hermes_config
+
+    kb.create_board("platform")
+    kb.create_board("defcon")
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda *a, **kw: {
+            "kanban": {
+                "max_spawn": 8,
+                "max_in_progress": 8,
+                "max_spawn_by_board": {"platform": 4, "default": 0},
+            }
+        },
+    )
+
+    rc = kanban_ops._cmd_dispatch(Namespace(json=True, dry_run=True, max=None, failure_limit=3))
+    assert rc == 0
+    host_budget = json.loads(capsys.readouterr().out)["host_budget"]
+
+    assert host_budget["default_ceiling"] == 0
+    assert host_budget["ceilings"]["platform"] == 4
+    assert host_budget["ceilings"]["defcon"] == 0
+    # One ceiling per enumerated board and no phantom entry: the fallback arm is
+    # reported once, as default_ceiling, never as a board of its own. (The ROOT
+    # board is literally `default`, so it appears here as a board — at the same
+    # number the arm gives it.)
+    assert set(host_budget["ceilings"]) == set(host_budget["boards"])
+    # platform 4 + defcon 0 + the root board 0 (all inherited from `default: 0`)
+    assert host_budget["ceiling_sum"] == 4
+    assert host_budget["ceiling_sum_exceeds_cap"] is False
