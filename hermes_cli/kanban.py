@@ -1299,12 +1299,51 @@ def _cmd_retarget(args: argparse.Namespace) -> int:
     return 0
 
 
-def _commented(conn, reason: Optional[str], author, prefix: str, op):
-    """Wrap a per-task ``op`` so a ``reason`` is first recorded as a ``PREFIX: reason`` comment."""
+#: The writer's OWN marker for a ``_commented`` verb outcome. Because a comment PREFIX is
+#: caller prose, it cannot corroborate itself: no reader can tell ``BLOCKED: parked`` written
+#: by the verb from the same sentence typed by a lane, so a census built on the prefix can
+#: only ever answer UNRESOLVABLE. The durable record of what the WRITER did therefore belongs
+#: on the event stream, written where the outcome is known: payload carries ``verb`` and
+#: ``applied`` (plus the prefix/reason the claim would have carried), one row per id per
+#: invocation, so refusal-vs-success is decidable at the writer forever (t_0b5d5988).
+VERB_OUTCOME_EVENT = "verb_outcome"
+
+
+def _commented(conn, reason: Optional[str], author, prefix: str, op, *, verb: str = ""):
+    """Wrap a per-task ``op`` so ``reason`` is recorded **only once the transition applied**.
+
+    ORDER IS THE CONTRACT, and it used to be backwards: the comment was written first and
+    asserted ``PREFIX: reason`` unconditionally, so a REFUSED block left a board row that read
+    "BLOCKED: ..." authored by the caller while the task never moved (measured: financially
+    t_58e17240 comment 7263 said BLOCKED, the row still read in_progress). Every gate, sweep,
+    dashboard and next reader trusts that record, and the refusal itself survived only in a
+    terminal's stderr and an exit code -- the lie durable, the truth transient. So:
+
+    * ``op(tid)`` runs FIRST; a True return is what licenses the ``PREFIX: reason`` comment.
+    * A REFUSAL WRITES NO COMMENT. A ``REFUSED: ...`` sentence would be the same caller prose
+      in a different costume; the honest record is a :data:`VERB_OUTCOME_EVENT` with
+      ``applied: false``, which no prefix can counterfeit.
+    * The marker lands in the SAME TRANSACTION as the comment (one ``write_txn``), so the two
+      can never disagree, and it is written for every invocation -- applied or not, reason or
+      not -- so the writer's record is total rather than only where a comment happened to be.
+    * DECIDED PER ID: ``_bulk_apply`` calls this once per id, so a mixed batch records exactly
+      the cards that moved instead of narrating the whole batch from the first one.
+    """
+    verb = verb or prefix.lower()
+
     def run(tid):
-        if reason:
-            kb.add_comment(conn, tid, author, f"{prefix}: {reason}")
-        return op(tid)
+        applied = bool(op(tid))
+        with kb.write_txn(conn, allow_nested=True):
+            kb._append_event(conn, tid, VERB_OUTCOME_EVENT, {
+                "verb": verb,
+                "applied": applied,
+                "prefix": prefix,
+                "reason": reason or None,
+            })
+            if applied and reason:
+                kb.add_comment(conn, tid, author, f"{prefix}: {reason}")
+        return applied
+
     return run
 
 
@@ -1379,7 +1418,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}{fence_note}"
 
-        op = _commented(conn, reason, author, "BLOCKED", op)
+        op = _commented(conn, reason, author, "BLOCKED", op, verb="block")
         return _bulk_apply(ids, op, ok_msg, lambda tid: failures.get(tid) or f"cannot block {tid}")
 
 
@@ -1412,7 +1451,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             return False
 
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "SCHEDULED", op)
+        op = _commented(conn, reason, author, "SCHEDULED", op, verb="schedule")
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}{due_note}",
                            lambda tid: failures.get(tid) or f"cannot schedule {tid}")
 
@@ -1427,7 +1466,8 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        op = _commented(conn, reason, author, "UNBLOCK",
+                        lambda tid: kb.unblock_task(conn, tid), verb="unblock")
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
