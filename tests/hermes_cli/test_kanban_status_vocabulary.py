@@ -184,8 +184,12 @@ def test_census_reports_both_defect_classes(board):
     kb, conn = board
     tid = _plant_unmodelled(kb, conn, started_at="2026-11-07T07:43:01-05:00")
     found = kb.census_unmodelled_status(conn)
-    assert {"id": tid, "status": "in_progress", "defect": "status"} in found
-    assert {"id": tid, "status": "2026-11-07T07:43:01-05:00", "defect": "started_at"} in found
+    # `status` stays the row's REAL status even when the defect is an epoch column: a consumer
+    # that read the offending value out of `status` would treat a timestamp as a phase.
+    assert {"id": tid, "status": "in_progress", "defect": "status",
+            "value": "in_progress"} in found
+    assert {"id": tid, "status": "in_progress", "defect": "started_at",
+            "value": "2026-11-07T07:43:01-05:00"} in found
 
 
 # --------------------------------------------------------------------------

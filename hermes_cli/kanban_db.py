@@ -3804,9 +3804,12 @@ def census_unmodelled_status(conn: sqlite3.Connection) -> list[dict]:
     """Every row on this board whose ``status`` is outside the vocabulary, or whose epoch
     columns hold text. Read-only; the census the nightly sweep and the diagnostics both read.
 
-    Returns ``[{"id", "status", "defect"}]`` where ``defect`` is ``"status"`` or the offending
-    epoch column name, in id order. Board-level accounting for a board that cannot say what
-    state its cards are in -- and, for the epoch case, cannot do arithmetic on when they started.
+    Returns ``[{"id", "status", "defect", "value"}]`` in id order: ``defect`` is ``"status"`` or
+    the offending epoch column name, ``value`` is the stored value that is off (so a consumer
+    never has to re-open the row to quote it), and ``status`` is always the row's real status --
+    a field that carried the epoch value would read as a status to every caller. Board-level
+    accounting for a board that cannot say what state its cards are in -- and, for the epoch
+    case, cannot do arithmetic on when they started.
     """
     found: list[dict] = []
     legal = sorted(VALID_STATUSES)
@@ -3814,18 +3817,20 @@ def census_unmodelled_status(conn: sqlite3.Connection) -> list[dict]:
     for row in conn.execute(
         f"SELECT id, status FROM tasks WHERE status NOT IN ({placeholders}) ORDER BY id", legal
     ):
-        found.append({"id": row["id"], "status": row["status"], "defect": "status"})
+        found.append({"id": row["id"], "status": row["status"], "defect": "status",
+                      "value": row["status"]})
     for column in EPOCH_TASK_COLUMNS:
         try:
             rows = conn.execute(
-                f"SELECT id, {column} AS v FROM tasks "
+                f"SELECT id, status, {column} AS v FROM tasks "
                 f"WHERE {column} IS NOT NULL AND typeof({column}) NOT IN ('integer', 'real') "
                 "ORDER BY id"
             ).fetchall()
         except sqlite3.OperationalError:
             continue          # a legacy board that predates the column
         for row in rows:
-            found.append({"id": row["id"], "status": row["v"], "defect": column})
+            found.append({"id": row["id"], "status": row["status"], "defect": column,
+                          "value": row["v"]})
     return found
 
 
