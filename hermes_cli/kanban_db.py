@@ -33,6 +33,14 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli.kanban_workflow import (
+    UNMODELLED,
+    InvalidStatus,
+    is_modelled,
+    render_status,
+    validate_status,
+)
+
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
 
@@ -2077,7 +2085,8 @@ def create_task(
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
-        raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+        validate_status(initial_status, where="kanban create --initial-status",
+                        allowed=frozenset(VALID_INITIAL_STATUSES))
     if assignee:
         # INVARIANT B at its earliest door (design record platform-stl t_6747232b): an assignee
         # that resolves to no profile on disk and to no declared pull lane can never be spawned
@@ -2909,8 +2918,8 @@ def list_tasks(
     workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
     now: Optional[float] = None,
 ) -> list[Task]:
-    if status is not None and status not in VALID_STATUSES:
-        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+    if status is not None:
+        validate_status(status, where="kanban list --status")
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
     for col, val in (
@@ -4234,6 +4243,173 @@ def _append_event(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
     )
+
+
+#: Recovery destinations ``kanban normalise`` may write. Deliberately narrow:
+#: an unmodelled row's real state is unknown, so the repair may only queue it
+#: (``ready``/``todo``), or park it for a human (``blocked``). ``done``,
+#: ``archived``, ``review`` and ``running`` each assert something happened that
+#: this instrument cannot know.
+NORMALISE_TARGETS = frozenset({"ready", "todo", "blocked"})
+
+
+def _task_type_defects(conn: sqlite3.Connection, task_id: Optional[str] = None) -> list[dict]:
+    """Return ``tasks`` cells whose storage type contradicts the column's type.
+
+    SQLite is dynamically typed, so an ISO-8601 string in the ``started_at``
+    epoch column lands without complaint and then reads as "started at 0"
+    through ``_to_epoch``. Epoch seconds are well-formed as INTEGER or REAL
+    (``time.time()`` is a float); the defect is TEXT/BLOB in the cell. This is
+    the census half of the guard; the INSERT/UPDATE triggers installed by
+    ``kanban_db_connect`` are the write half.
+    """
+    where = " AND id = ?" if task_id is not None else ""
+    params: tuple = (task_id,) if task_id is not None else ()
+    defects: list[dict] = []
+    for column in tuple(_TASK_EPOCH_COLUMNS) + ("due_at",):
+        try:
+            rows = conn.execute(
+                f"SELECT id, {column} AS value, typeof({column}) AS value_type FROM tasks "
+                f"WHERE {column} IS NOT NULL AND typeof({column}) IN ('text','blob'){where}",
+                params,
+            ).fetchall()
+        except sqlite3.OperationalError:  # column absent on a reduced legacy board
+            continue
+        defects.extend(
+            {"id": row["id"], "column": column, "value": row["value"],
+             "value_type": row["value_type"]}
+            for row in rows
+        )
+    return defects
+
+
+def status_vocabulary_census(conn: sqlite3.Connection, *, board: Optional[str] = None) -> dict:
+    """Measure one board for values the workflow cannot express.
+
+    Reports, never raises and never writes: the nightly sweep calls this on
+    every board it walks, and a board carrying the defect must still be
+    readable so the repair (``normalise_task_status``) can reach it.
+    """
+    try:
+        total = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+    except sqlite3.OperationalError:
+        total = 0
+    legal = ", ".join("?" * len(VALID_STATUSES))
+    unmodelled = [
+        {"id": row["id"], "status": row["status"]}
+        for row in conn.execute(
+            f"SELECT id, status FROM tasks WHERE status IS NULL OR typeof(status) != 'text' "
+            f"OR status NOT IN ({legal}) ORDER BY id",
+            tuple(sorted(VALID_STATUSES)),
+        ).fetchall()
+    ]
+    defects = _task_type_defects(conn)
+    return {
+        "board": board if board is not None else board_for_connection(conn),
+        "tasks": total,
+        "unmodelled": unmodelled,
+        "type_defects": defects,
+        "ok": not unmodelled and not defects,
+    }
+
+
+def normalise_task_status(
+    conn: sqlite3.Connection, task_id: str, *, to: str, reason: str,
+    evidence: str, actor: str, block_kind: Optional[str] = None,
+) -> Optional[dict]:
+    """Move a card whose status the model cannot express onto a modelled one.
+
+    ONE transaction writes the row AND its audit event, so the board's own
+    ledger records the transition the offline writer never recorded. Refuses a
+    modelled source: ordinary cards move through the ordinary verbs, and this
+    door must not become a second, unaudited way to set ``status``.
+
+    The same transaction repairs any epoch cell on the card that holds a
+    non-integer value (an ISO string coerced to epoch seconds) and records each
+    repair on the event, because a typed value and an unmodelled status are the
+    same defect class: a write that bypassed every seam.
+    """
+    validate_status(to, where="kanban normalise --to")
+    if to not in NORMALISE_TARGETS:
+        raise ValueError(
+            f"kanban normalise: --to {to!r} is not a recovery destination; "
+            f"legal targets are {sorted(NORMALISE_TARGETS)}"
+        )
+    reason = (reason or "").strip()
+    evidence = (evidence or "").strip()
+    actor = (actor or "").strip()
+    if not reason:
+        raise ValueError("kanban normalise: --reason is required (it is the audit row's why)")
+    if not evidence:
+        raise ValueError("kanban normalise: --evidence is required (it names what was measured)")
+    if to == "blocked":
+        block_kind = (block_kind or "needs_input").strip()
+        if block_kind not in VALID_BLOCK_KINDS:
+            raise ValueError(
+                f"kanban normalise: --block-kind {block_kind!r} is not one of "
+                f"{sorted(VALID_BLOCK_KINDS)}"
+            )
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        from_status = row["status"]
+        repairs: dict[str, dict] = {}
+        for defect in _task_type_defects(conn, task_id):
+            column = defect["column"]
+            coerced = _to_epoch(defect["value"])
+            if coerced is None:
+                raise ValueError(
+                    f"kanban normalise: {task_id}.{column} holds {defect['value']!r}, "
+                    "which is not an epoch or an ISO-8601 instant; refusing to guess"
+                )
+            repairs[column] = {"from": defect["value"], "to": coerced}
+        status_changed = from_status != to
+        if is_modelled(from_status) and status_changed:
+            raise ValueError(
+                f"kanban normalise: {task_id} reads the modelled status {from_status!r}; "
+                f"move it with the ordinary verb for {to!r}. Normalise exists for values "
+                "the workflow cannot express."
+            )
+        if not status_changed and not repairs:
+            raise ValueError(
+                f"kanban normalise: {task_id} already reads {to!r} and carries no "
+                "non-integer epoch cell; nothing to normalise"
+            )
+        if repairs:
+            sets = ", ".join(f"{col} = ?" for col in repairs)
+            conn.execute(
+                f"UPDATE tasks SET {sets} WHERE id = ?",
+                tuple(repairs[col]["to"] for col in repairs) + (task_id,),
+            )
+        if status_changed:
+            conn.execute(
+                "UPDATE tasks SET status = ?, block_kind = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "current_run_id = NULL, last_heartbeat_at = NULL "
+                "WHERE id = ?",
+                (to, block_kind if to == "blocked" else None, task_id),
+            )
+        payload = {
+            "from": from_status,
+            "to": to,
+            "by": actor or "unknown",
+            "reason": reason,
+            "evidence": evidence,
+        }
+        if repairs:
+            payload["repaired"] = repairs
+        _append_event(
+            conn, task_id, "status_changed" if status_changed else "type_repaired", payload,
+        )
+    return {
+        "id": task_id,
+        "from": from_status,
+        "to": to,
+        "changed": status_changed,
+        "repaired": repairs,
+        "event": "status_changed" if status_changed else "type_repaired",
+    }
 
 
 
@@ -8384,11 +8560,17 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         if oldest_row and oldest_row["ts"] is not None else None
     )
 
+    census = status_vocabulary_census(conn)
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
         "zero_run_ready": zero_run_ready(conn, now=now),
+        # A status outside the vocabulary (and an epoch cell holding the wrong
+        # storage type) is reported alongside the counts, never folded into a
+        # live column: that folding is what made the origin defect invisible.
+        "unmodelled": census["unmodelled"],
+        "type_defects": census["type_defects"],
         "now": now,
     }
 

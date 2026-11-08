@@ -729,7 +729,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  {label + ':':<11}{value}")
 
     print(f"Task {task.id}: {task.title}")
-    field("status", task.status)
+    field("status", kanban_workflow.render_status(task.status))
     if task.due_at:
         policy = task.due_window_policy or kb.DEFAULT_DUE_WINDOW_POLICY
         field("due", f"{_fmt_ts(task.due_at)} ({policy})")
@@ -1655,6 +1655,13 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     print("By status:")
     for k in kanban_workflow.DEFAULT_WORKFLOW.keys():
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
+    # A status outside the vocabulary is NOT a column: it is a defect, and it is
+    # counted here rather than folded into a live lane.
+    for row in stats.get("unmodelled") or []:
+        print(f"  {kanban_workflow.UNMODELLED:8s}  {row['id']}  {row['status']!r}")
+    for defect in stats.get("type_defects") or []:
+        print(f"  type-defect  {defect['id']}  {defect['column']} = {defect['value']!r} "
+              f"({defect['value_type']})")
     if stats["by_assignee"]:
         print("\nBy assignee:")
         for who, counts in sorted(stats["by_assignee"].items()):
@@ -1676,6 +1683,83 @@ def _cmd_stats(args: argparse.Namespace) -> int:
             )
         print(line)
     return 0
+
+
+def _normalise_actor(args: argparse.Namespace) -> str:
+    return (
+        getattr(args, "by", None)
+        or os.environ.get("HERMES_KANBAN_ACTOR")
+        or os.environ.get("HERMES_PROFILE")
+        or "hermes-kanban-normalise"
+    )
+
+
+def _cmd_normalise(args: argparse.Namespace) -> int:
+    """Move a card whose status the workflow cannot express onto a modelled one.
+
+    Refuses a modelled source: ordinary cards move through the ordinary verbs.
+    """
+    try:
+        with kbc.connect_closing() as conn:
+            result = kb.normalise_task_status(
+                conn, args.task_id, to=args.to, reason=args.reason,
+                evidence=args.evidence, actor=_normalise_actor(args),
+                block_kind=getattr(args, "block_kind", None),
+            )
+    except (kb.InvalidStatus, ValueError) as exc:
+        return _err(str(exc))
+    if result is None:
+        return _err(f"no such task: {args.task_id}")
+    if _json_out(args, result):
+        return 0
+    print(f"normalised {result['id']}: {result['from']!r} -> {result['to']} "
+          f"(event {result['event']})")
+    for column, repair in (result.get("repaired") or {}).items():
+        print(f"  repaired {column}: {repair['from']!r} -> {repair['to']}")
+    return 0
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    """Census every board (or ``--board``) for values the workflow cannot express.
+
+    Exit 1 when any board carries an unmodelled status or a wrong-typed epoch
+    cell, so a sweep that calls this cannot report a clean run over a defect.
+    """
+    from hermes_cli.kanban_db_boards import list_boards
+
+    slugs = [args.board] if getattr(args, "board", None) else [
+        b["slug"] for b in list_boards(include_archived=False)
+    ]
+    reports = []
+    for slug in slugs:
+        try:
+            with kbc.connect_closing(board=slug) as conn:
+                reports.append(kb.status_vocabulary_census(conn, board=slug))
+        except Exception as exc:  # noqa: BLE001 - one unreadable board must not hide the rest
+            reports.append({
+                "board": slug, "tasks": 0, "unmodelled": [], "type_defects": [],
+                "ok": False, "error": f"{type(exc).__name__}: {exc}",
+            })
+    bad = [r for r in reports if not r["ok"]]
+    if _json_out(args, {"ok": not bad, "boards": reports}):
+        return 0 if not bad else 1
+    for report in reports:
+        if report["ok"]:
+            if getattr(args, "verbose", False):
+                print(f"ok       {report['board']}  ({report['tasks']} task(s))")
+            continue
+        print(f"DEFECT   {report['board']}")
+        if report.get("error"):
+            print(f"  unreadable: {report['error']}")
+        for row in report["unmodelled"]:
+            print(f"  status   {row['id']}  {row['status']!r}  -> "
+                  f"{kanban_workflow.render_status(row['status'])}")
+        for defect in report["type_defects"]:
+            print(f"  type     {defect['id']}  {defect['column']} = "
+                  f"{defect['value']!r} ({defect['value_type']})")
+    if not bad and not getattr(args, "verbose", False):
+        print(f"ok  {len(reports)} board(s) clean")
+    return 0 if not bad else 1
 
 
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
@@ -2096,6 +2180,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "set-contract": _cmd_set_contract, "retarget": _cmd_retarget,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock, "reopen": _cmd_reopen,
+    "normalise": _cmd_normalise, "audit": _cmd_audit,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
