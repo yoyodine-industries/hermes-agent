@@ -169,9 +169,14 @@ class TestFireOverdueJobs:
     def test_estop_skips_sweep_and_next_sweep_after_resume_catches_up(
         self, tmp_cron_dir, tmp_path, monkeypatch
     ):
-        """`hermes pause` must silence the backstop too — otherwise it force-fires every job
-        that ESTOP held back. Nothing to unwind: the first sweep after `hermes resume`
-        catches up through the ordinary claim_fire path."""
+        """A total halt must silence the backstop too — otherwise it force-fires every job
+        that ESTOP held back. Nothing to unwind: the first sweep after the hold is lifted
+        catches up through the ordinary claim_fire path.
+
+        A `mode: estop` hold can only be PRE-RULING state now — arming one is not a supported
+        operation any more (operator ruling 2026-10-10, card t_e04b4c81) — so the legacy body
+        is written directly, and lifted BY HANDLE, exactly as the ops seat would.
+        """
         from agent import estop
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -181,12 +186,13 @@ class TestFireOverdueJobs:
         parked_at = get_job(job["id"])["next_run_at"]
         provider = RecordingProvider()
 
-        estop.engage(reason="runaway fan-out")
+        (tmp_path / "ESTOP").write_text('{"reason": "runaway fan-out"}\n', encoding="utf-8")
+        handle = estop.holds()[0]["handle"]
         assert fire_overdue_jobs(provider) == 0
         assert provider.fired == []
         assert get_job(job["id"])["next_run_at"] == parked_at  # nothing claimed or re-armed
 
-        estop.disengage()
+        estop.release(handle=handle)
         assert fire_overdue_jobs(provider) == 1
         assert provider.wait_fired()
         assert provider.fired == [job["id"]]

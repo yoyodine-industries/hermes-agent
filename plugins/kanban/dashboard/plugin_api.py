@@ -36,6 +36,7 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_gate_invariants import GateRefused
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
 
 log = logging.getLogger(__name__)
@@ -159,6 +160,27 @@ _value_error_400 = partial(_map_errors, 400, ValueError)  # domain-layer validat
 
 
 @contextmanager
+def _gate_errors_400() -> Iterator[None]:
+    """Map a write-door gate refusal to 400, NAMING the invariant that refused it.
+
+    ``kanban_gate_invariants.GateRefused`` is a ``ValueError`` on purpose (it is a validation
+    refusal, not an internal error), so it would otherwise reach the client as bare prose that
+    happens to be a 400. The dashboard needs the family too: ``invariant=assignee`` tells the UI
+    the write was refused because the handle cannot run (invariant B) rather than because the
+    evidence was missing (A) or the payload was malformed — three different remedies behind one
+    status code. Any other ``ValueError`` keeps the plain-text 400 it always had.
+    """
+    from hermes_cli.kanban_gate_invariants import GateRefused
+
+    try:
+        yield
+    except GateRefused as exc:
+        raise HTTPException(status_code=400, detail=f"invariant={exc.invariant}: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@contextmanager
 def _errors_to_500(prefix: str) -> Iterator[None]:
     """Map any unexpected exception to ``500 "<prefix>: <exc>"``; HTTPExceptions pass through."""
     try:
@@ -172,8 +194,11 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 # --- Serialization helpers --------------------------------------------------
 
 # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column), from the
-# one workflow definition. A status missing here gets mis-bucketed into ``todo``.
+# one workflow definition. A status outside that definition is NOT drawn into any of them: it
+# used to be mis-bucketed into ``todo``, which made a card the workflow cannot see read as
+# ordinary queue work. Such rows go to ``UNMODELLED_COLUMN``, appended only when it has cards.
 BOARD_COLUMNS: list[str] = list(kanban_workflow.DEFAULT_WORKFLOW.keys())
+UNMODELLED_COLUMN = "unmodelled"
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -188,6 +213,10 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
         d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
     # Latest non-null run summary (workers hand off via ``task_runs.summary``, not ``tasks.result``).
     d["latest_summary"] = latest_summary
+    # The vocabulary judgement travels WITH the card, so a UI (and the tests) can tell a real
+    # phase from a value the workflow has never heard of without re-implementing the rule.
+    d["status_modelled"] = kanban_db.is_modelled_status(task.status)
+    d["status_display"] = kanban_db.render_status(task.status)
     # Start of the current task_runs row (``tasks.started_at`` is the FIRST-EVER
     # start; after a retry the run clock must tick from the fresh run).
     d["current_run_started_at"] = current_run_started_at
@@ -213,6 +242,14 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     if task_ids is not None and not task_ids:
         return {}
     diag_config = kd.config_from_runtime_config(load_config())
+    # A path-less ``worktree`` card anchors on the board's ``default_workdir``; the workspace
+    # rule needs it to answer for one (card t_15dce81a). Best-effort: no metadata, no judgement.
+    try:
+        diag_config["board_default_workdir"] = str(
+            kanban_db.read_board_metadata(kanban_db.board_for_connection(conn)).get("default_workdir") or ""
+        )
+    except Exception:
+        pass
     if task_ids is not None:
         rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
     else:
@@ -331,7 +368,19 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
-            columns[t.status if t.status in columns else "todo"].append(d)
+            # NEVER draw an unmodelled value into a live column: it is its own column, appended
+            # below only when it holds a card, so the board's phase counts stay honest.
+            if kanban_db.is_modelled_status(t.status) and t.status in columns:
+                columns[t.status].append(d)
+            else:
+                columns.setdefault(UNMODELLED_COLUMN, []).append(d)
+
+        # A status the workflow does not model is not a phase: surface it as its own trailing
+        # column, labelled, so an operator sees the row instead of it hiding among todo work.
+        if columns.get(UNMODELLED_COLUMN):
+            columns[UNMODELLED_COLUMN].sort(key=lambda d: d["id"])
+        else:
+            columns.pop(UNMODELLED_COLUMN, None)
 
         # Queue lanes keep the list_tasks dispatch order; the done column is
         # history, so order it newest-completed-first. Two stable sorts compose
@@ -549,6 +598,11 @@ class UpdateTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    # -> 'archived': the receipt the archive seam REQUIRES (no anonymous archive).
+    # ``reason`` is one of kanban_db.ARCHIVE_REASONS; ``destination`` is
+    # '<board>/<card>' for the card that inherits this one (rehomed|duplicate).
+    reason: Optional[str] = None
+    destination: Optional[str] = None
 
 
 class BulkTaskBody(BaseModel):
@@ -561,6 +615,9 @@ class BulkTaskBody(BaseModel):
     summary: Optional[str] = None
     metadata: Optional[dict] = None
     reclaim_first: bool = False
+    # Same semantics as UpdateTaskBody (``archive: true`` needs ``reason`` too).
+    reason: Optional[str] = None
+    destination: Optional[str] = None
     # Same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
@@ -574,6 +631,10 @@ class _StatusRejected(Exception):
 
 
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
+
+#: Archive refusals that are the CALLER's payload to fix (400) rather than the
+#: estate's state (409): a missing/invalid reason, or a missing destination.
+_ARCHIVE_PAYLOAD_REFUSALS = frozenset({"reason_missing", "reason_invalid", "destination_missing"})
 
 
 def _drag_to(conn, task_id: str, s: str) -> bool:
@@ -640,7 +701,17 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
     s = payload.status
     if s == "archived":
-        ok = kanban_db.archive_task(conn, task_id)
+        # A refusal from the archive seam is a 400 the human can fix in the request
+        # (missing reason / destination) or a 409 about the estate's state (the
+        # destination is archived / already keyed, the card is bound to an open item).
+        try:
+            ok = kanban_db.archive_task(
+                conn, task_id, reason=payload.reason, actor="dashboard",
+                destination=payload.destination)
+        except kanban_db.ArchiveRefused as exc:
+            if exc.code in _ARCHIVE_PAYLOAD_REFUSALS:
+                raise HTTPException(status_code=400, detail=str(exc))
+            raise _conflict(str(exc))
     else:
         with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
@@ -697,7 +768,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
         if payload.assignee is not None and not review_assignee_deferred:
-            with _map_errors(409, RuntimeError):
+            # A running card is still a 409 (release the claim first); a handle that cannot run
+            # is a 400 naming ``invariant=assignee`` — the two are different remedies.
+            with _map_errors(409, RuntimeError), _gate_errors_400():
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
@@ -830,8 +903,16 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
-    if payload.archive and not kanban_db.archive_task(conn, tid):
-        entry.update(ok=False, error="archive refused")
+    if payload.archive:
+        try:
+            archived = kanban_db.archive_task(
+                conn, tid, reason=payload.reason, actor="dashboard",
+                destination=payload.destination)
+        except kanban_db.ArchiveRefused as exc:
+            archived = False
+            entry.update(ok=False, error=str(exc))
+        if not archived and entry.get("ok", True):
+            entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
@@ -842,7 +923,15 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
                   else kanban_db.assign_task(conn, tid, payload.assignee or None))
             if not ok:
                 entry.update(ok=False, error="assign refused")
-        except RuntimeError as e:
+        # ``GateRefused`` is the gate's own refusal family (Invariant B at this door: a handle
+        # that cannot run): a ValueError subclass raised ON PURPOSE as a per-row validation
+        # refusal, so it is RECORDED here like any other per-row refusal — letting it escape
+        # made the family invisible to the sweep's own contract ("records refusals ...
+        # without aborting the remaining ops"). The catch is narrowed to that family plus
+        # ``RuntimeError`` so a plain ValueError — the shape of a genuine bug in this door,
+        # not a refusal — still propagates to the caller instead of being laundered into an
+        # ``ok=False`` row nobody investigates.
+        except (GateRefused, RuntimeError) as e:
             entry.update(ok=False, error=str(e))
     if payload.priority is not None:
         _set_priority(conn, tid, payload.priority, board)
@@ -1040,7 +1129,7 @@ class ReassignBody(BaseModel):
 def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[str] = Query(None)):
     """Reassign to another profile, optionally reclaiming first
     (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
-    with _board_conn(board) as (board, conn):
+    with _board_conn(board) as (board, conn), _gate_errors_400():
         ok = kanban_db.reassign_task(
             conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
         if not ok:
@@ -1606,7 +1695,11 @@ def decompose_task_endpoint(task_id: str, payload: DecomposeBody, board: Optiona
     outcome = _run_aux(board, "kanban_decompose", "decompose_task", task_id, payload.author)
     return {
         "ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason,
-        "fanout": bool(outcome.fanout), "child_ids": outcome.child_ids or [], "new_title": outcome.new_title}
+        "fanout": bool(outcome.fanout), "child_ids": outcome.child_ids or [], "new_title": outcome.new_title,
+        # A refused fan-out carries the filing budget's line in ``reason``; the flag tells a
+        # caller that this was the DOOR's decision (the card is still in triage) rather than a
+        # malformed reply from the decomposer.
+        "refused": bool(getattr(outcome, "refused", False))}
 
 
 # --- Orchestration settings (kanban.orchestrator_profile / default_assignee /

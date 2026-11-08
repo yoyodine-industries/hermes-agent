@@ -11,6 +11,7 @@ recovery action and auto-clears when the failure mode resolves.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 import json
 import time
@@ -190,6 +191,79 @@ def _runs_newest_first(runs) -> list[Any]:
 # ``events``/``runs`` are kanban_db rows/dataclasses or same-shaped dicts.
 
 RuleFn = Callable[[Any, list[Any], list[Any], int, dict], list[Diagnostic]]
+
+# --- Overdue parked cards (due_at) -----------------------------------------
+#
+# ``due_at`` is a promise only while something releases it: the RELEASE leg is
+# the deployed ``maintenance-sweep`` workflow's ``scheduled_wake`` node. A card
+# armed while nothing releases -- or a release leg that keeps refusing -- leaves
+# the card parked with nobody watching. These two thresholds are how lateness
+# turns into a signal.
+_DUE_OVERDUE_GRACE_SECONDS = 5 * 60
+_DUE_STALE_SECONDS = 6 * 3600
+
+
+def _due_duration(seconds: int) -> str:
+    """``90`` -> ``1m30s``, ``5400`` -> ``1h30m``, ``172800`` -> ``2d0h``."""
+    s = max(0, int(seconds))
+    if s >= 86400:
+        return f"{s // 86400}d{(s % 86400) // 3600}h"
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60}m"
+    if s >= 60:
+        return f"{s // 60}m{s % 60}s"
+    return f"{s}s"
+
+
+def _rule_overdue_scheduled(task, events, runs, now_ts, cfg) -> list[Diagnostic]:
+    """A parked card whose clock fence passed and is still parked.
+
+    Fires on lateness, not on a heartbeat, so it holds even when nothing ran at
+    all: the card is the evidence. The ONE releaser it names is the deployed
+    ``maintenance-sweep`` ``scheduled_wake`` node -- named because that is the
+    release leg this tree can point at, never because it was observed ticking.
+    Nothing in this tree writes a tick heartbeat (the releaser is a prod node),
+    so a tick-keyed branch could only ever assert a cause it cannot read.
+    """
+    if _task_field(task, "status") not in ("scheduled", "blocked"):
+        return []
+    due_at = _task_field(task, "due_at")
+    if not due_at:
+        return []
+    overdue = int(now_ts) - int(due_at)
+    grace = _positive_int(cfg.get("due_grace_seconds"), _DUE_OVERDUE_GRACE_SECONDS)
+    if overdue < grace:
+        return []
+    stale_after = _positive_int(cfg.get("due_stale_seconds"), _DUE_STALE_SECONDS)
+    task_id = _task_field(task, "id", "")
+    why = (
+        "The release leg for a clock-fenced card is the ``scheduled_wake`` node "
+        "the deployed ``maintenance-sweep`` workflow runs -- one releaser, by "
+        "rule; the dispatcher does not release a clock-fenced card, it only ever "
+        "promotes parents-complete work. Check that node's last run for a refusal "
+        "(a reserved execution band, or a broken window map)."
+    )
+    return [Diagnostic(
+        kind="overdue_scheduled",
+        severity="error" if overdue >= stale_after else "warning",
+        title=f"Scheduled card is {_due_duration(overdue)} past its due time",
+        detail=(
+            f"Due {time.strftime('%Y-%m-%d %H:%M', time.localtime(int(due_at)))} "
+            f"({_due_duration(overdue)} ago) and still parked. {why}"
+        ),
+        actions=[
+            _cli_hint(f"Release it now: hermes kanban unblock {task_id}",
+                      f"hermes kanban unblock {task_id}", suggested=True),
+            _cli_hint(f"Re-arm the wait: hermes kanban schedule {task_id} --due +15m",
+                      f"hermes kanban schedule {task_id} --due +15m"),
+        ],
+        first_seen_at=int(due_at),
+        last_seen_at=int(now_ts),
+        data={
+            "due_at": int(due_at),
+            "overdue_seconds": overdue,
+        },
+    )]
 
 
 def _aux_slot_explicit(slot: Any) -> bool:
@@ -807,8 +881,155 @@ def _rule_stale_running(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+# --- workspace resolution (card t_15dce81a / t_e5ff985b) ---------------------
+
+#: Repo probes memoised per ANCHOR for a SHORT window (``_ANCHOR_REPO_TTL``). A board snapshot
+#: asks the same question about sibling cards that share an anchor, and a ``git rev-parse``
+#: subprocess per card would make the snapshot cost O(cards). The window is deliberately short:
+#: the dashboard runs this in a LONG-LIVED gateway process, so a folder that an operator turns
+#: into a repo must stop being reported within a minute, not for the life of the process.
+_ANCHOR_HAS_REPO_CACHE: dict[str, tuple[float, bool]] = {}
+_ANCHOR_REPO_TTL = 60.0
+
+
+def _anchor_has_repo(anchor: str) -> bool:
+    """True when *anchor* resolves into a git repository — the SPAWN SEAM's own predicate.
+
+    ``kanban_db_workspace._repo_root_for_worktree_target`` walks from the nearest EXISTING path
+    upward, which is exactly what ``resolve_workspace`` does before materialising
+    ``<repo>/.worktrees/<id>``. Reusing it (instead of a second, hand-rolled check) is what makes
+    this rule and the dispatcher unable to disagree about whether a card can resolve.
+
+    Fail-open: a broken import must never invent a defect.
+    """
+    now = time.monotonic()
+    cached = _ANCHOR_HAS_REPO_CACHE.get(anchor)
+    if cached is not None and now - cached[0] < _ANCHOR_REPO_TTL:
+        return cached[1]
+    try:
+        from hermes_cli import kanban_db_workspace as kbw
+
+        ok = kbw._repo_root_for_worktree_target(Path(anchor)) is not None
+    except Exception:
+        ok = True
+    _ANCHOR_HAS_REPO_CACHE[anchor] = (now, ok)
+    return ok
+
+
+def workspace_anchor_cannot_resolve(task, cfg) -> Optional[str]:
+    """The anchor this card would materialise under IF it can never resolve, else ``None``.
+
+    The single predicate behind both the per-card diagnostic and the board-level count below, so
+    the number a burndown snapshot prints and the cards it names cannot drift apart.
+    """
+    if _task_field(task, "status") != "ready":
+        return None
+    if _task_field(task, "claim_lock"):
+        # Claimed: past the resolution seam, being worked on.
+        return None
+    if (_task_field(task, "workspace_kind") or "scratch") != "worktree":
+        return None
+    workspace_path = _task_field(task, "workspace_path")
+    if workspace_path:
+        anchor = str(workspace_path)
+    else:
+        # No path of its own: the dispatcher anchors on the board's default_workdir.
+        anchor = str(cfg.get("board_default_workdir") or "").strip()
+        if not anchor:
+            return None
+    return None if _anchor_has_repo(anchor) else anchor
+
+
+def _rule_workspace_cannot_resolve(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``ready`` worktree card whose workspace can NEVER resolve (not a git repo).
+
+    Measured 2026-10-18: cards born with ``workspace_kind=worktree`` anchored on a program's
+    STATE folder (a plain directory, never a repo) died at every claim — the dispatcher retried
+    once, charged the card, and left it ``ready`` looking as though it were merely waiting its
+    turn. The spawn gate blocks such a card on its FIRST attempt and names the repair; this rule
+    is the BOARD-level half, so a snapshot counts the class instead of an operator inferring it
+    from a pile of ``stranded_in_ready`` warnings whose real cause is invisible.
+    """
+    anchor = workspace_anchor_cannot_resolve(task, cfg)
+    if anchor is None:
+        return []
+    task_id = _task_field(task, "id") or ""
+    project_id = _task_field(task, "project_id")
+    detail = f"``{anchor}`` cannot resolve into a git repository."
+    try:
+        from hermes_cli import kanban_db_workspace as kbw
+
+        detail = kbw.no_repo_refusal(
+            anchor=anchor,
+            task_id=task_id,
+            project_id=project_id,
+            project_slug=kbw.project_label(project_id),
+        )
+    except Exception:
+        pass
+    actions = [
+        _cli_hint(
+            "Re-anchor this card onto a git repo",
+            f"hermes kanban retarget {task_id} --workspace worktree:<git-repo>",
+            suggested=True,
+        ),
+        _cli_hint("Board health snapshot", "hermes kanban diagnostics"),
+    ]
+    return [Diagnostic(
+        kind="workspace_cannot_resolve", severity="critical",
+        title="Workspace cannot resolve: anchor is not a git repo",
+        detail=detail,
+        actions=actions,
+        first_seen_at=int(_task_field(task, "created_at", default=0) or 0),
+        last_seen_at=int(now),
+        count=1,
+        data={"anchor": anchor, "workspace_path": _task_field(task, "workspace_path"),
+              "project_id": project_id, "workspace_kind": "worktree"},
+    )]
+
+
+def _rule_unmodelled_status(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """The card's ``status`` is outside the workflow's vocabulary -- it is in NO phase.
+
+    ``critical``, because this is not a card in a bad state: it is a card whose STATE THE BOARD
+    CANNOT NAME. Every verb switches on status, so none of them can move it, and the dispatcher
+    will never pick it up; left alone it sits forever. The measured case (financially t_58e17240)
+    was written by a tool carrying the todo/SDLC vocabulary (``in_progress``) into a kanban write,
+    which also left no ``task_events`` row, so the ledger could not even prove the transition.
+
+    The action is the repair door: ``hermes kanban normalise`` writes the modelled status AND its
+    ``status_changed`` event in one transaction.
+    """
+    from hermes_cli import kanban_db as kb
+
+    status = _task_field(task, "status")
+    if kb.is_modelled_status(status):
+        return []
+    task_id = _task_field(task, "id")
+    legal = ", ".join(sorted(kb.VALID_STATUSES))
+    return [Diagnostic(
+        kind="unmodelled_status", severity="critical",
+        title=f"Status {status!r} is not a kanban status — this card is in NO phase",
+        detail=(f"tasks.status holds {status!r}, which is outside the workflow vocabulary "
+                f"({legal}). No verb switches on it (reclaim/block/unblock/reopen all refuse), "
+                f"the dispatcher never claims it, and it counts as no phase. Another host "
+                f"vocabulary (todo/SDLC/escalation) was carried into a kanban write. Repair it "
+                f"and record the act in one transaction with `hermes kanban normalise "
+                f"{task_id} --to <ready|blocked|todo> --reason <why> --evidence <ref>`."),
+        actions=[DiagnosticAction(
+            kind="cli_hint",
+            label=f"hermes kanban normalise {task_id} --to ready --reason ... --evidence ...",
+            payload={"command": f"hermes kanban normalise {task_id} --to ready "
+                                f"--reason 'unmodelled status {status}' --evidence 'diagnostic'"},
+            suggested=True)],
+        first_seen_at=now, last_seen_at=now, count=1,
+        data={"status": status, "legal": sorted(kb.VALID_STATUSES)},
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
+    _rule_unmodelled_status,
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
@@ -820,6 +1041,8 @@ _RULES: list[RuleFn] = [
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
     _rule_stale_running,
+    _rule_workspace_cannot_resolve,
+    _rule_overdue_scheduled,
 ]
 
 
@@ -838,6 +1061,13 @@ DEFAULT_CONFIG = {
     # still `running` an hour past its expiry means every reclaim path declined
     # it. Same hour the heartbeat backstop uses.
     "stale_running_grace_seconds": 60 * 60,
+    # Lateness (seconds) before a parked card whose clock fence has passed is
+    # called overdue: one release interval plus slack, so a healthy board stays
+    # quiet.
+    "due_grace_seconds": 5 * 60,
+    # Lateness past which an overdue release is an error, not a warning: no band
+    # or tick noise explains being this late.
+    "due_stale_seconds": 6 * 3600,
 }
 
 

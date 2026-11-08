@@ -19,7 +19,8 @@ from hermes_cli.web_server_gateway import _display_system_platform
 from starlette.concurrency import run_in_threadpool
 from fastapi import HTTPException, Request
 from gateway.status import (
-    derive_gateway_busy, derive_gateway_drainable, normalize_updated_at, parse_active_agents,
+    derive_gateway_busy, derive_gateway_drainable, normalize_updated_at,
+    own_profile_platforms_owned_by, parse_active_agents,
     profile_platforms_from_multiplexer, resolve_gateway_liveness,
     retained_gateway_state,
     runtime_status_heartbeat_age_s, runtime_status_is_stale)
@@ -116,6 +117,46 @@ async def get_ssh_ownership(request: Request):
             "runtimeIntact": _ssh_runtime_intact()}
 
 
+@router.get("/api/substrate")
+async def get_substrate(format: Optional[str] = None):
+    """The substrate authority record, as the ONE normalized read (design §3.6 carrier 6).
+
+    Read-only, boot-volume only, and deliberately dumb: it answers "is the runtime's
+    substrate reachable" from `<hermes_home>/substrate_status.json` without touching
+    the volume the ticks probe, so it still answers while `/Volumes/yoyofs1` is
+    denying. `state` is `ok` / `denied` / `unknown` — `unknown` (no record, unreadable
+    record, or a record nobody has refreshed) is a real answer and never rendered as
+    green. `guards_blind` counts the launcher-armed hook rows currently failing open.
+
+    `?format=text` renders the same read as one plain-text block, which is what a
+    browser tab or a `curl` on :8643 shows without the SPA build.
+
+    Host paths and root names live here (gated), NOT on `/api/status`, which is public.
+    """
+    from hermes_cli import substrate_view
+
+    view = await run_in_threadpool(substrate_view.read)
+    if (format or "").strip().lower() in ("text", "txt", "plain"):
+        from fastapi.responses import PlainTextResponse
+
+        lines = [substrate_view.render_line(view)]
+        if view.get("roots"):
+            lines.append("denied roots:")
+            lines += [
+                f"  {root.get('path')}  op={root.get('op')}  errno={root.get('errno')}  tier={root.get('tier')}"
+                for root in view["roots"]
+            ]
+        if view.get("guards"):
+            lines.append(f"blind guards ({view.get('guards_blind')} of {view.get('guards_total')}):")
+            lines += [
+                f"  {item.get('hook')}  row={item.get('row')}  since={item.get('since')}  {item.get('reason')}"
+                for item in view["guards"]
+            ]
+        lines.append(f"record: {view.get('record', {}).get('path')}  generated: {view.get('generated_at')}")
+        return PlainTextResponse("\n".join(lines) + "\n")
+    return view
+
+
 @router.get("/api/health")
 async def get_health():
     """Lightweight process liveness for desktop/backend readiness probes.
@@ -204,7 +245,13 @@ def _status_platform_key_allowed(key: object, configured: set[str] | None) -> bo
 # Per-entry writer-identity stamps (added by gateway.status.write_runtime_status for the
 # aggregation ownership check) are process recon — the same class of detail as the
 # auth-gated top-level ``gateway_pid`` — and must not project onto the public endpoint.
-_PRIVATE_PLATFORM_ENTRY_KEYS = frozenset({"writer_pid", "writer_start_time"})
+# The ``stale_*`` fields park a previous gateway life's verdict when a platform entry is
+# downgraded across a life boundary (see gateway.status._downgrade_foreign_life_platforms):
+# process recon too, and never public.
+_PRIVATE_PLATFORM_ENTRY_KEYS = frozenset({
+    "writer_pid", "writer_start_time",
+    "stale_state", "stale_writer_pid", "stale_writer_start_time",
+})
 
 
 def _public_platform_entry(value: Any) -> Any:
@@ -270,8 +317,9 @@ def _project_gateway_platforms(gateway_platforms: dict, configured: set[str] | N
     for the key rules). A cleanly stopped gateway's platform states are stale noise and are
     cleared so a dead process can't report "connected"; a startup_failed gateway's FATAL
     entries are the diagnosis (credential collisions, auth failures) that the single
-    exit_reason string can't express, so they are kept — upstream writer-identity/freshness
-    filtering already dropped other processes' entries."""
+    exit_reason string can't express, so they are kept. Upstream writer-identity filtering
+    (``_own_profile_platforms_owned_by``) already dropped entries a previous gateway life
+    wrote, so a live process can only certify platforms IT connected."""
     platforms = {key: _public_platform_entry(value) for key, value in gateway_platforms.items()
                  if _status_platform_key_allowed(key, configured)}
     if gateway_running:
@@ -358,7 +406,8 @@ async def _resolve_gateway_status(profile_dir: Optional[Path], health_url) -> di
             # as ``hermes gateway status`` so the sidebar strip and the CLI agree.
             gateway_heartbeat_stale_s = runtime_status_heartbeat_age_s(runtime)
         gateway_platforms = _project_gateway_platforms(
-            runtime.get("platforms") or {}, configured, gateway_running, gateway_state)
+            own_profile_platforms_owned_by(runtime, getattr(liveness, "pid", None)),
+            configured, gateway_running, gateway_state)
         gateway_exit_reason = None if gateway_state == "stopped" else runtime.get("exit_reason")
         # Contract: gateway_updated_at is RFC3339 string | null, never a number. ``runtime``
         # may be the local gateway_state.json (legacy gateways wrote epoch floats; hand
@@ -608,6 +657,11 @@ async def get_status(profile: Optional[str] = None,
         status["components"] = components
         status["overall"] = ("ok" if all(item.get("status") == "ok" for item in components.values())
                              else "degraded")
+        # The substrate read, low-sensitivity half only (state / episode / guards_blind):
+        # this handler is in PUBLIC_API_PATHS, so host paths stay on /api/substrate.
+        from hermes_cli import substrate_view
+
+        status["substrate"] = await run_in_threadpool(substrate_view.summary)
         await _advisory_pressure(status, profile_dir if profile_dir else get_hermes_home())
 
         # Profile NAMES and ``gateway_mode`` are low-sensitivity product surface (Hermes Cloud

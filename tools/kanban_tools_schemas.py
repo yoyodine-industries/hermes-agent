@@ -16,9 +16,10 @@ _DESC_BOARD = (
     "Kanban board slug to target. When omitted, the call resolves the "
     "active board the usual way: HERMES_KANBAN_DB env → "
     "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "home → 'default'. An explicit slug targets that board, but if it "
+    "resolves to a different board than the pinned DB (HERMES_KANBAN_DB) "
+    "the call is refused (ValueError) rather than silently served from "
+    "the pin."
 )
 
 
@@ -195,6 +196,39 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "due_at": _prop("string", (
+            "Optional clock fence on the hold: WHEN the card should come back. "
+            "ISO-8601 local (2026-09-16T01:40), an offset from now (+90m, +2h, "
+            "+1d), or epoch seconds. The deployed maintenance-sweep releaser "
+            "unblocks the card once it passes. OMIT for an ordinary block -- a "
+            "hold waiting on a person, not on a clock -- which is never "
+            "auto-released. Refused with kind='dependency'."
+        )),
+        "window_policy": {
+            "type": "string",
+            "enum": ["defer", "ambient"],
+            "description": (
+                "What a release should do when the due time lands inside a "
+                "reserved execution band: 'defer' (the default) holds it until "
+                "the band closes; 'ambient' releases anyway, for a lightweight "
+                "check that has to move around the clock. Needs due_at."
+            ),
+        },
+        "clear_due": _prop("boolean", (
+            "Drop the task's due time (the hold stays, with no clock). "
+            "Mutually exclusive with due_at."
+        )),
+        "waits_on": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Card ids this block WAITS ON: each becomes a parent edge of the "
+                "blocked card, so the board resumes it when that work finishes. "
+                "Required whenever a kind='dependency' reason NAMES a card — a "
+                "prose-only wait is invisible to the board's own dependency "
+                "machinery and would sit blocked after that work shipped."
+            ),
+        },
     },
     ["reason"],
 )
@@ -202,9 +236,13 @@ KANBAN_BLOCK_SCHEMA = _schema(
 KANBAN_SCHEDULE_SCHEMA = _schema(
     "kanban_schedule",
     (
-        "Park your task as 'scheduled' while it waits for a time or external event. This ends the current run and makes the "
-        "task non-dispatchable until an orchestrator unblocks it; it does not "
-        "create a timer. Put any wake-up marker such as "
+        "Park your current task in the 'scheduled' state while it waits for "
+        "time or an external event. This ends the current run and makes the "
+        "task non-dispatchable until a releaser wakes it; it creates no timer "
+        "of its own. With no due_at this is the HUMAN HOLD -- a card waiting on "
+        "a person, which is never auto-released. Pass due_at to arm a clock "
+        "fence instead, and the deployed maintenance-sweep releaser unblocks "
+        "the card once it passes. Put any wake-up marker such as "
         "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
     ),
     {
@@ -212,6 +250,28 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
         "reason": _prop("string", (
             "Optional reason or machine-readable wake-up marker recorded on "
             "the completed run and scheduled event."
+        )),
+        "due_at": _prop("string", (
+            "Optional clock fence: WHEN the card should come back. ISO-8601 "
+            "local (2026-09-16T01:40), an offset from now (+90m, +2h, +1d), or "
+            "epoch seconds. The deployed maintenance-sweep releaser unblocks "
+            "the card once it passes. OMIT for the human hold -- a card parked "
+            "on a person, not on a clock -- which is never auto-released."
+        )),
+        "window_policy": {
+            "type": "string",
+            "enum": ["defer", "ambient"],
+            "description": (
+                "What a release should do when the due time lands inside a "
+                "reserved execution band: 'defer' (the default) holds it until "
+                "the band closes; 'ambient' releases anyway, for a wake that is "
+                "a lightweight check and has to move around the clock. Needs "
+                "due_at."
+            ),
+        },
+        "clear_due": _prop("boolean", (
+            "Drop the task's due time (it stays parked until released by "
+            "hand). Mutually exclusive with due_at."
         )),
     },
     [],
@@ -303,6 +363,89 @@ KANBAN_HEARTBEAT_SCHEMA = _schema(
     },
     [],
 )
+
+KANBAN_RECORD_LANDING_VERDICT_SCHEMA = _schema(
+    "kanban_record_landing_verdict",
+    (
+        "Record a LANDING VERDICT on the card that DECLARES the deliverable PR — "
+        "the one sanctioned door for a `[land]` carrier worker that has ruled a "
+        "landing not owed (superseded / re-cut / already live) or genuinely "
+        "deferred. Writes `landing_not_owed` or `landing_deferred` where the "
+        "completion clause and the landing reconciler both read it, WITHOUT "
+        "closing or otherwise moving the target card. Validation is the clause's "
+        "own: `landing_not_owed` needs a substantive reason that NAMES what the "
+        "landing rides instead (a repo#N ref, a card id, or a URL); "
+        "`landing_deferred` needs a substantive reason. The target must actually "
+        "declare a PR, or the call is refused (a verdict there discharges "
+        "nothing). Merges into the newest run's metadata — existing keys are "
+        "preserved — and audits both cards. Does NOT weaken the completion "
+        "gate: a close that declares an unlanded PR is still refused."
+    ),
+    {
+        "target_task_id": _prop("string", (
+                "The DECLARING card — the one whose own close declared the PR. "
+                "Not your own `[land]` carrier: a verdict written there is "
+                "invisible to the reconciler."
+        )),
+        "verdict": {
+            "type": "string",
+            "enum": ["landing_not_owed", "landing_deferred"],
+            "description": (
+                "`landing_not_owed` — this PR is not the landing (superseded, "
+                "re-cut, or already live); the reason must name the replacement. "
+                "`landing_deferred` — the landing is genuinely owed but not yet "
+                "carried; the deferral is the landing reconciler's own input "
+                "class."
+            ),
+        },
+        "reason": _prop("string", (
+                "Why, in words a reader does not have to interpret. For "
+                "`landing_not_owed` it must name the replacement it rides "
+                "(a repo#N ref, a t_... card id, or a URL) and clear the "
+                "clause's length floor."
+        )),
+        "result": _prop("string", (
+                "Optional: also set the target card's `result`. Omit unless you "
+                "mean to rewrite its handoff line — untouched when omitted."
+        )),
+    },
+    ["target_task_id", "verdict", "reason"],
+)
+
+KANBAN_CLOSE_SIBLING_SCHEMA = {
+    "name": "kanban_close_sibling",
+    "description": (
+        "Close a SIBLING card on this board as DELEGATED work — the door for a lane LEAD "
+        "that absorbed a sibling's task (the fix landed in your branch, the card was "
+        "superseded, or it duplicates work you just did). The close rides the kernel's own "
+        "completion path, so every gate still applies: a sibling that declares an unlanded "
+        "PR is REFUSED by the landing-carrier clause, a live run is REFUSED by the claim "
+        "fence, and an already-done or archived card is refused as nothing to close. Your "
+        "own card cannot be closed here — use kanban_complete, which carries the "
+        "run-ownership proof. The stored result and the closing run's summary record that "
+        "the close was DELEGATED and name your card, a comment naming you is written on the "
+        "sibling, and the closed card's incomplete children are re-promoted to ready (a "
+        "child with another unfinished parent stays put and is reported gated)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "sibling_task_id": _prop("string", (
+                    "The SIBLING card to close — not your own (your own closes through "
+                    "kanban_complete) and not a card whose work is still owed."
+            )),
+            "summary": _prop("string", (
+                    "What the absorb means, in one line. Stored on the closing run after the "
+                    "delegation provenance, and written into the comment on the sibling."
+            )),
+            "result": _prop("string", (
+                    "Optional: the sibling card's `result` line. Defaults to `summary`; both "
+                    "carry the DELEGATED provenance and the caller's card id."
+            )),
+        },
+        "required": ["sibling_task_id"],
+    },
+}
 
 KANBAN_COMMENT_SCHEMA = _schema(
     "kanban_comment",
@@ -453,6 +596,13 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "exists, return that task's id instead of creating "
                 "a duplicate. Useful for retry-safe automation."
         )),
+        "resurrect": _prop("boolean", (
+                "With idempotency_key: file it again even though a "
+                "task with that key was already CLOSED inside the "
+                "filing window. Without it the create answers "
+                "'refused: duplicate-closed-key' and names the "
+                "closed card."
+        )),
         "max_runtime_seconds": _prop("integer", (
                 "Per-task runtime cap. When exceeded, the "
                 "dispatcher SIGTERMs the worker and re-queues the "
@@ -495,6 +645,18 @@ KANBAN_CREATE_SCHEMA = _schema(
         "completion_contract": _prop("string", (
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
+        )),
+        "from_inbox": _prop("string", (
+            "File this card FROM a seat's inbox (<domain>/<profile>), e.g. 'platform/platform-coder'. "
+            "The card's body gains a '## Inbox item' block naming the seat and quoting from_inbox_item, "
+            "so the item->card linkage stays checkable after the item is struck from the seat file. "
+            "REFUSED (nothing created) when the seat's TASKS.md does not exist or no longer holds the item. "
+            "Requires from_inbox_item; use it whenever the work came from an inbox item."
+        )),
+        "from_inbox_item": _prop("string", (
+            "The inbox item's own words, verbatim as the seat's TASKS.md writes them (required with "
+            "from_inbox). Whitespace and markdown noise are ignored when matching, but the block quotes "
+            "exactly what you pass."
         )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
@@ -548,4 +710,60 @@ KANBAN_LINK_SCHEMA = _schema(
         "child_id":  {"type": "string", "description": "Child task id."},
     },
     ["parent_id", "child_id"],
+)
+
+KANBAN_ADJUDICATE_SCHEMA = _schema(
+    "kanban_adjudicate",
+    (
+        "The ONE seat-scoped exit door for a card the ordinary completion door cannot "
+        "reach: a card sitting in `triage`, `todo` or `scheduled`. You must be a live "
+        "worker (your own card, your own run) and the target must be ANOTHER card in the "
+        "lane you are working. `disposition='promote'` releases the card and returns it to "
+        "the dispatch queue (`triage`/`todo`/`scheduled` -> `ready`, or stays `todo` while a "
+        "parent is unfinished — the receipt then names the blocking parents and `gated` is "
+        "true). `disposition='close'` releases it, claims it and completes it with your "
+        "reason as the closing summary; a card that cannot be claimed or whose completion "
+        "gate refuses is returned to `ready` and the refusal is written on YOUR card as "
+        "`adjudication_refused`. Only these three statuses are adjudicable: a `ready`, "
+        "`running`, `blocked` or `review` card is closed with `kanban_complete`, and a "
+        "`done`/`archived` card is reopened with `hermes kanban reopen`. Every refusal is "
+        "machine-readable (`no_caller`, `own_card`, `caller_run_not_current`, "
+        "`target_unknown`, `not_a_door_source`, `status_moved`, `lane_mismatch`, "
+        "`claim_lost`, `gate_refused`) and writes nothing before the claim. The act is "
+        "recorded on the target as one `adjudicated` event plus a comment naming you and "
+        "your run."
+    ),
+    {
+        "target_task_id": _prop("string", (
+            "The OTHER card to adjudicate — never your own. It must be in `expect_status`."
+        )),
+        "disposition": {
+            "type": "string",
+            "enum": ["close", "promote"],
+            "description": (
+                "`promote` — release the card and make it dispatchable (never claims it). "
+                "`close` — release it, claim it, and finish it."
+            ),
+        },
+        "expect_status": _prop("string", (
+            "The status you read on the target: `triage`, `todo` or `scheduled`. A "
+            "mismatch is refused as `status_moved` rather than acted on, so a card that "
+            "moved under you is never pushed to a state you did not intend."
+        )),
+        "reason": _prop("string", (
+            "Why, in words a reader does not have to interpret. Recorded verbatim on the "
+            "target: it becomes the closing summary when `disposition='close'`."
+        )),
+        "result": _prop("string", (
+            "Optional result line for the close. Defaults to `reason`."
+        )),
+        "title": _prop("string", (
+            "Optional spec title, applied when the target is in `triage` (the specify "
+            "step writes it). Omit to leave the card's own title alone."
+        )),
+        "body": _prop("string", (
+            "Optional spec body, applied only on the `triage` -> `todo` step."
+        )),
+    },
+    ["target_task_id", "disposition", "expect_status", "reason"],
 )

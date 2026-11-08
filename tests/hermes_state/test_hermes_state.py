@@ -3623,7 +3623,7 @@ class TestVacuum:
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
         monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.5)  # ratio gate open
         vacuum_calls = []
-        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+        monkeypatch.setattr(db, "vacuum", lambda *_a, **_k: vacuum_calls.append(True))
 
         result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
 
@@ -3636,7 +3636,7 @@ class TestVacuum:
         monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.5)  # ratio gate open
         db.set_meta("last_vacuum", str(time.time()))
         vacuum_calls = []
-        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+        monkeypatch.setattr(db, "vacuum", lambda *_a, **_k: vacuum_calls.append(True))
 
         result = db.maybe_auto_prune_and_vacuum(
             min_interval_hours=0,
@@ -3651,7 +3651,7 @@ class TestVacuum:
         monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.5)  # ratio gate open
         db.set_meta("last_vacuum", str(time.time() - 31 * 86400))
         vacuum_calls = []
-        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+        monkeypatch.setattr(db, "vacuum", lambda *_a, **_k: vacuum_calls.append(True))
 
         result = db.maybe_auto_prune_and_vacuum(
             min_interval_hours=0,
@@ -3666,7 +3666,7 @@ class TestVacuum:
         monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.5)  # ratio gate open
         vacuum_calls = []
 
-        def fail_first_vacuum():
+        def fail_first_vacuum(*_a, **_k):
             vacuum_calls.append(True)
             if len(vacuum_calls) == 1:
                 raise RuntimeError("vacuum failed")
@@ -3690,7 +3690,7 @@ class TestVacuum:
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
         monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.05)
         vacuum_calls = []
-        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+        monkeypatch.setattr(db, "vacuum", lambda *_a, **_k: vacuum_calls.append(True))
 
         result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
 
@@ -3706,7 +3706,7 @@ class TestVacuum:
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
         monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.40)
         vacuum_calls = []
-        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+        monkeypatch.setattr(db, "vacuum", lambda *_a, **_k: vacuum_calls.append(True))
 
         result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
 
@@ -3721,7 +3721,7 @@ class TestVacuum:
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
         monkeypatch.setattr(db, "_freelist_ratio", lambda: AUTO_VACUUM_MIN_FREELIST_RATIO)
         vacuum_calls = []
-        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+        monkeypatch.setattr(db, "vacuum", lambda *_a, **_k: vacuum_calls.append(True))
 
         result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
 
@@ -3733,7 +3733,7 @@ class TestVacuum:
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
         monkeypatch.setattr(db, "_freelist_ratio", lambda: None)
         vacuum_calls = []
-        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+        monkeypatch.setattr(db, "vacuum", lambda *_a, **_k: vacuum_calls.append(True))
 
         result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
 
@@ -3745,7 +3745,7 @@ class TestVacuum:
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 1)
         monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.10)
         vacuum_calls = []
-        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+        monkeypatch.setattr(db, "vacuum", lambda *_a, **_k: vacuum_calls.append(True))
 
         result = db.maybe_auto_prune_and_vacuum(
             min_interval_hours=0, min_vacuum_freelist_ratio=0.05

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from pm import termux_libs
 from pm.install import _facts, _lockfile, _reclaim_set_aside, _store, ensure, stage_only
+from pm.mapped import describe, holders
 from pm.operations import lock_project
 from pm.package import InstallError
 from pm.paths import repo_root
@@ -568,6 +569,17 @@ def _gc_store(store, facts) -> tuple[int, int]:
                 continue
             if item.name in keep:
                 continue
+            if not item.name.startswith("fetch-"):
+                # An orphaned version may still be the interpreter a running process maps:
+                # unlinking it is the same blindness a retired entry would cause (t_b3709ecc).
+                # A fetch-<sha> archive was never published, so nothing can have started from it.
+                mapped = holders(item)
+                if mapped is None:
+                    print(f"keeping {item.name}: cannot tell whether a live process maps it")
+                    continue
+                if mapped:
+                    print(f"keeping {item.name}: still mapped by {describe(mapped)}")
+                    continue
             print(f"removing {item.name}")
             shutil.rmtree(item, ignore_errors=True)
             removed += 1

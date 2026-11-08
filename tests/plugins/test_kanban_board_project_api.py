@@ -9,6 +9,7 @@ on a scoped board inheriting the project.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -50,8 +51,11 @@ def client(kanban_home):
 
 @pytest.fixture
 def project(tmp_path):
+    # A project primary must be a GIT REPO (spawn gate, t_e5ff985b / t_15dce81a): a worktree card
+    # may no longer be born under a plain folder, and the board inherits this primary.
     repo = tmp_path / "widget-repo"
     repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True, text=True)
     with pdb.connect_closing() as conn:
         pid = pdb.create_project(conn, name="Widget", primary_path=str(repo))
     return {"id": pid, "primary_path": str(repo)}

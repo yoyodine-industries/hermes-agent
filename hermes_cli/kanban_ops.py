@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -57,10 +58,125 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
+def _max_spawn_by_board(_kanban_cfg: dict) -> dict:
+    """``kanban.max_spawn_by_board`` as ``{slug: ceiling}``, junk dropped silently.
+
+    Read here for the MEASUREMENT only: the CLI never passes these ceilings to
+    ``dispatch_once`` (that is the gateway dispatcher's job, and it resolves and
+    warns about the same map). A NAMED board's ceiling can never be a
+    non-positive int, so it is left out rather than coerced into one.
+
+    The reserved ``default`` key is the one exception, and it is a different
+    rule on purpose: it is the arm for every board the map does not name, where
+    ``0`` means "an unmapped board draws no slots". Dropping it here would make
+    the dry-run report a budget the gateway does not apply — the exact false
+    green this reader exists to prevent — so the measurement applies the SAME
+    rule the enforcement parser (``gateway.kanban_watchers_dispatcher``) applies:
+    ``default`` accepts any non-negative int, named boards stay positive.
+    """
+    raw = _kanban_cfg.get("max_spawn_by_board") if isinstance(_kanban_cfg, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    ceilings: dict = {}
+    for slug, value in raw.items():
+        key = str(slug).strip()
+        if not key or isinstance(value, bool):
+            continue
+        try:
+            ival = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if ival != value:
+            continue
+        if key == kbd.DEFAULT_CEILING_KEY:
+            if ival < 0:
+                continue
+        elif ival < 1:
+            continue
+        ceilings[key] = ival
+    return ceilings
+
+
+def _held_lines(res: object, host_budget: dict) -> list[str]:
+    """Every card a gate held this tick, named on one line, or ``[]``.
+
+    The SEV1 (card ``t_843cb0a9``): a board at its ceiling and a wedged dispatcher
+    printed EXACTLY the same output, because the budget gate's two fields were
+    recorded on the result and never published. A held card is the estate's
+    normal loaded state, so it prints as a deferral with the cap that held it —
+    never as silence, and never as a failure.
+    """
+    lines: list[str] = []
+    detail = getattr(res, "spawn_budget_detail", None) or {}
+    gate = getattr(res, "spawn_budget_blocked", None)
+
+    board_ids = list(getattr(res, "deferred_board_capped", None) or [])
+    host_ids = list(getattr(res, "deferred_in_progress_capped", None) or [])
+    share_ids = list(getattr(res, "deferred_host_capped", None) or [])
+
+    def _cards(ids: list) -> str:
+        shown = ", ".join(ids[:12])
+        more = "" if len(ids) <= 12 else f" (+{len(ids) - 12} more)"
+        return f" — {shown}{more}" if ids else ""
+
+    if gate == "max_spawn":
+        lines.append(
+            f"Held (board ceiling max_spawn={detail.get('cap')} met: "
+            f"{detail.get('board_running')} running on this board): "
+            f"{len(board_ids)} ready card(s){_cards(board_ids)}"
+        )
+    elif gate == "max_in_progress":
+        lines.append(
+            f"Held (host cap max_in_progress={detail.get('host_cap')} met: "
+            f"{detail.get('host_running')} running host-wide, "
+            f"{detail.get('board_running')} on this board): "
+            f"{len(host_ids)} ready card(s){_cards(host_ids)}"
+        )
+    elif board_ids:
+        lines.append(
+            f"Held (board ceiling reached): {len(board_ids)} ready card(s){_cards(board_ids)}"
+        )
+    if share_ids:
+        lines.append(
+            f"Held (no host slot for this board this tick — another board drew "
+            f"the share): {len(share_ids)} ready card(s){_cards(share_ids)}"
+        )
+    for task_id, assignee, reason in getattr(res, "spawn_failed", None) or []:
+        lines.append(f"Spawn failed: {task_id} ({assignee}): {reason}")
+    yielded = getattr(res, "tick_yielded", "")
+    if yielded:
+        lines.append(f"Tick yielded: {yielded}")
+    # A ceiling above the host cap is the ONLY unreachable capacity class: no
+    # single board can ever use more than max_in_progress workers. Σ ceilings >
+    # max_in_progress is the normal ELASTIC case (the allocator hands free slots
+    # out by global card priority), so it must never print as a defect — still
+    # less as advice to shrink the headroom that is doing the work.
+    per_board_unreachable = host_budget.get("per_board_unreachable") or {}
+    host_cap = host_budget.get("max_in_progress")
+    ceilings = host_budget.get("ceilings") or {}
+    for slug in sorted(per_board_unreachable):
+        lines.append(
+            f"Host ceiling: board {slug} max_spawn={ceilings.get(slug)} > "
+            f"max_in_progress={host_cap}: {per_board_unreachable[slug]} slot(s) that "
+            f"board can never use; lower kanban.max_spawn_by_board[{slug}] or raise "
+            f"max_in_progress."
+        )
+    if not per_board_unreachable:
+        ceiling_sum = host_budget.get("ceiling_sum")
+        if host_cap is not None and ceiling_sum is not None and int(ceiling_sum) > int(host_cap):
+            boards = host_budget.get("boards") or []
+            lines.append(
+                f"Host bound: max_in_progress={host_cap}, elastic across "
+                f"{len(boards)} board(s)"
+            )
+    return lines
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path.
+    max_spawn_by_board: dict = {}
     try:
         from hermes_cli.config import load_config
         _cfg = load_config()
@@ -78,6 +194,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = (
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
+        max_spawn_by_board = _max_spawn_by_board(_kanban_cfg)
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
@@ -91,6 +208,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+    # The CONFIG's own arithmetic, measured so the numbers ride every dispatch
+    # output instead of living in a reader's head (card t_843cb0a9 requirement 2).
+    # max_spawn is per BOARD and a CEILING, not a reservation; max_in_progress is
+    # the HOST bound, and the allocator hands free host slots out by global card
+    # priority — so Σ ceilings > max_in_progress is elastic headroom, not waste.
+    host_budget = kbd.measure_host_budget(
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        ceilings=max_spawn_by_board,
+    )
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
@@ -101,6 +228,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_self_review": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.skipped_self_review
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -112,8 +243,34 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
+            "skipped_board_disabled": res.skipped_board_disabled,
             "memory_pressure": res.memory_pressure,
+            # The budget gates. These were recorded on the result and never
+            # published, so a saturated board reported every bucket empty: the
+            # tick that spawns nothing for want of capacity now names the gate,
+            # the ceiling that was met, the measured running count, and the cards
+            # it held (card t_843cb0a9).
+            "spawn_budget_blocked": res.spawn_budget_blocked,
+            "spawn_budget": res.spawn_budget_detail,
+            "deferred_board_capped": res.deferred_board_capped,
+            "deferred_host_capped": res.deferred_host_capped,
+            "deferred_in_progress_capped": res.deferred_in_progress_capped,
+            "spawn_failed": [
+                {"task_id": tid, "assignee": who, "reason": why}
+                for (tid, who, why) in res.spawn_failed
+            ],
+            "skipped_top_level_only": getattr(res, "skipped_top_level_only", []),
+            "tick_yielded": res.tick_yielded,
+            "host_budget": host_budget,
         }, ascii=True)
+        return 0
+    if res.skipped_board_disabled:
+        # The loudest possible zero: this tick did not run because the board it
+        # resolved to is an estate/scratch board (card t_17c9c847). Silence here
+        # is what made a redirect to a "scratch" board look like isolation.
+        print("Refused:      board is NOT dispatch-enabled (estate/scratch board) — "
+              "no card on it can be spawned; `hermes kanban boards set-dispatch "
+              "<slug> on` admits it again.")
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
     if res.reaped_terminal_workers:
@@ -146,6 +303,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, reason in res.skipped_self_review:
+        if reason == "implementer_unknown":
+            print(
+                f"Parked in review (no implementer provenance to prove a "
+                f"distinct reviewer): {tid}"
+            )
+        else:
+            print(
+                f"Parked in review (assignee is the implementer - name a "
+                f"distinct reviewer): {tid}"
+            )
     for tid, reason in res.respawn_guarded:
         print(f"Guarded ({reason}): {tid}")
     if res.rate_limited:
@@ -154,6 +322,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    for line in _held_lines(res, host_budget):
+        print(line)
     return 0
 
 
@@ -167,6 +337,29 @@ _DAEMON_DEPRECATED = (
     "for claims. If you truly need the old standalone\ndaemon (no gateway available), rerun with "
     "--force."
 )
+
+
+def _daemon_health_step(
+    health: kbd.DispatcherHealth,
+    board: str,
+    res: object,
+    pending: Optional[kbd.PendingWork] = None,
+    now: Optional[float] = None,
+) -> Optional[kbd.HealthReport]:
+    """One standalone-daemon tick through the shared health tracker.
+
+    Module-level and importable ON PURPOSE (card t_bda9ac11, D7). The tracker
+    itself is unit-tested elsewhere, but what was broken on the live line is the
+    WIRING: ``observe_tick`` iterates its first argument, so a bare
+    ``DispatchResult`` raises ``TypeError: 'DispatchResult' object is not
+    iterable`` inside ``collect_spawn_failures`` — and ``run_daemon`` wraps
+    ``on_tick(res)`` in ``contextlib.suppress(Exception)``, which turns that into
+    a CLI telemetry surface that is silently dead. The tick's result MUST go in
+    board-tagged (``[(board, res)]``), and this seam is what a test can hold.
+
+    Returns the report to emit, or ``None`` to stay silent.
+    """
+    return health.observe_tick([(board, res)], pending=pending, now=now)
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -198,42 +391,77 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
 
-    # Health telemetry: warn when every tick finds ready work but spawns
-    # nothing (broken profile, PATH drift, missing venv, credential loss) —
-    # the per-task breaker auto-blocks quietly, so the operator needs a signal.
+    # Health telemetry (shared with the gateway watcher via DispatcherHealth): a
+    # warning here must mean the dispatcher is BROKEN, not merely busy. Capacity
+    # deferrals (kanban.max_spawn / max_in_progress / per-profile cap), guards
+    # (respawn, board-held, memory pressure) and work that just arrived are the
+    # steady state on a loaded host and stay silent; a card claimed but never
+    # launched warns at once, naming board, profile, task and reason.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health = kbd.DispatcherHealth(window=HEALTH_WINDOW)
+    # The board this daemon ticks: the health line's label and the pending
+    # probe's board. `run_daemon` connects with no board kwarg, so the current
+    # board IS the daemon's board.
+    health_board = getattr(args, "board", None)
+    try:
+        health_board = health_board or kb.get_current_board()
+    except Exception:
+        health_board = health_board or kb.DEFAULT_BOARD
+    last_stuck_probe_at = 0
 
-    def _ready_queue_nonempty() -> bool:
-        """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
-        Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
+    def _oldest_pending():
+        """Longest-waiting spawnable card on this board, ``None`` when nothing is."""
         try:
             with kbc.connect_closing() as conn:
-                return kbd.has_spawnable_ready(conn)
+                task_id, age = kbd.oldest_spawnable_pending(conn)
         except Exception:
-            return False
+            return None
+        if not task_id:
+            return None
+        return kbd.PendingWork(
+            board=health_board, task_id=task_id, age_seconds=age
+        )
+
+    def _zero_run_ready():
+        """Stuck-ready probe on this board: ready cards nothing has attempted."""
+        try:
+            with kbc.connect_closing() as conn:
+                stats = kbd.zero_run_ready(conn)
+        except Exception:
+            return None
+        return stats if int(stats.get("count") or 0) else None
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
-            health_state["bad_ticks"] += 1
-        else:
-            health_state["bad_ticks"] = 0
-        # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
-        if health_state["bad_ticks"] >= HEALTH_WINDOW:
-            now = int(time.time())
-            if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
+        nonlocal last_stuck_probe_at
+        report = _daemon_health_step(
+            health, health_board, res, _oldest_pending(), time.time()
+        )
+        if report is not None:
+            # One vocabulary, owned by kanban_db_dispatch: the tracker's own
+            # message, plus the live line's "held back" annotation on warnings.
+            note = (
+                kbd.suppression_note([(health_board, res)])
+                if report.level == "warning"
+                else ""
+            )
+            print(
+                f"[{_fmt_ts(int(time.time()))}] {report.message}{note}",
+                file=sys.stderr if report.level == "warning" else sys.stdout,
+                flush=True,
+            )
+        # Stuck-ready probe, on its own (throttled) cadence: ready cards nothing has
+        # EVER attempted. The dead-assignee case it exists for is bucketed
+        # ``skipped_nonspawnable``, which the stall rule deliberately ignores — so
+        # the tracker is silent on exactly the fault that matters most.
+        now_stuck = int(time.time())
+        if now_stuck - last_stuck_probe_at >= 300:
+            last_stuck_probe_at = now_stuck
+            stuck = _zero_run_ready()
+            if stuck:
                 print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
+                    f"[{_fmt_ts(now_stuck)}] WARN {kbd.stuck_ready_message(stuck)}",
                     file=sys.stderr, flush=True,
                 )
-                health_state["last_warn_at"] = now
         if not verbose:
             return
         did_work = (

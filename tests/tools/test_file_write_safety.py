@@ -1078,3 +1078,118 @@ class TestMultiplexProfileWriteGuardsAreProfileScoped:
             reset_hermes_home_override(tok)
         assert err is not None
         assert "Refusing to write to Hermes config file" in err
+
+
+class TestProtectedInstructionAllowlistRetired:
+    """``security.protected_instruction_allowlist_dirs`` is RETIRED (ruling t_cd80bb5a D2).
+
+    The key existed (design t_0f96022e) and was refused: a whole-tree exemption answers
+    "can this TREE ever be written", when this gate's question is "is this one change
+    consented, by this one card, once". It also did not help the cards that were actually
+    stuck -- they were writing to a tree the allowlist did not name -- so it was a bypass
+    bought with no unblock. These tests are its tombstone: the key must not come back to
+    the defaults, and a host config still carrying it must NOT be honoured, because a
+    stale config.yaml would otherwise silently reopen the hole.
+
+    The sanctioned exit is the consent surface's CARD-BOUND approval
+    (``project-instruction-file:<repo-slug>``), covered in
+    ``tests/tools/test_protected_instruction_door.py``.
+    """
+
+    @pytest.fixture
+    def approvals(self, monkeypatch):
+        """A CLI approval callback that DENIES: a gate that fires is visible, not silent."""
+        from tools.terminal_tool import set_approval_callback
+        state = {"calls": [], "answer": "deny"}
+
+        def cb(command, description, **kwargs):
+            state["calls"].append(
+                {"command": command, "description": description, **kwargs})
+            return state["answer"]
+
+        set_approval_callback(cb)
+        yield state
+        set_approval_callback(None)
+
+    def _write(self, path, content="edited"):
+        import json
+        from tools.file_tools import write_file_tool
+        return json.loads(write_file_tool(str(path), content))
+
+    def test_default_config_carries_no_allowlist(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        security = DEFAULT_CONFIG["security"]
+        assert "protected_instruction_allowlist_dirs" not in security
+        assert security["protected_instruction_files"] is True
+
+    def test_a_host_config_that_still_carries_the_key_is_ignored(self, tmp_path, monkeypatch):
+        import hermes_cli.config as cfgmod
+        import tools.file_tools_write_guards as ft
+
+        work = tmp_path / "hermes_sandbox"
+        work.mkdir()
+        monkeypatch.setattr(cfgmod, "load_config", lambda: {"security": {
+            "protected_instruction_files": True,
+            "protected_instruction_extra_patterns": [],
+            "protected_instruction_allowlist_dirs": [str(work)]}})
+        assert ft._protected_instruction_config() == (True, [])
+        assert ft._protected_instruction_reason(str(work / "AGENTS.md")) == "AGENTS.md"
+
+    def test_a_work_tree_file_still_prompts(self, tmp_path, monkeypatch, approvals):
+        work = tmp_path / "hermes_sandbox" / "platform" / "work" / "lane"
+        work.mkdir(parents=True)
+        target = work / "AGENTS.md"
+        res = self._write(target)
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert not target.exists()
+
+    def test_extra_patterns_still_gate(self, tmp_path, monkeypatch, approvals):
+        import tools.file_tools_write_guards as ft
+
+        monkeypatch.setattr(
+            ft, "_protected_instruction_config", lambda: (True, ["*-soul.md"]))
+        target = tmp_path / "lane" / "platform-coder-soul.md"
+        target.parent.mkdir()
+        assert ft._protected_instruction_reason(str(target)) == "platform-coder-soul.md"
+        res = self._write(target)
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert not target.exists()
+
+    def test_project_local_hermes_config_still_gates(self, tmp_path, approvals):
+        repo = tmp_path / "some-repo" / ".hermes"
+        repo.mkdir(parents=True)
+        assert ft_reason(repo / "config.yaml")
+        res = self._write(repo / "config.yaml")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert not (repo / "config.yaml").exists()
+
+    @pytest.mark.require_symlinks
+    def test_symlink_out_of_a_work_tree_stays_gated(self, tmp_path, approvals):
+        work = tmp_path / "hermes_sandbox"
+        work.mkdir()
+        live = tmp_path / "hermes_prod" / "SOUL.md"
+        live.parent.mkdir()
+        live.write_text("live original", encoding="utf-8")
+        link = work / "innocent.txt"
+        link.symlink_to(live)
+        res = self._write(link)
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert live.read_text(encoding="utf-8") == "live original"
+
+    def test_config_read_failure_keeps_the_gate_on(self, monkeypatch):
+        import hermes_cli.config as cfgmod
+        import tools.file_tools_write_guards as ft
+
+        def boom():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr(cfgmod, "load_config", boom)
+        assert ft._protected_instruction_config() == (True, [])
+
+
+def ft_reason(path):
+    """``_protected_instruction_reason`` on the module under test."""
+    import tools.file_tools_write_guards as ft
+    return ft._protected_instruction_reason(str(path))
+

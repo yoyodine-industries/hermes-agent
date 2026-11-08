@@ -11,8 +11,10 @@ whole-file overwrite of content this task never saw or that changed since.
 """
 
 import fnmatch
+import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from agent.file_safety import get_nt_namespace_error
 from tools import file_state
@@ -26,6 +28,8 @@ from tools.file_tools_paths import (
     _expand_tilde, _resolve_path_for_task, _ssh_path_escapes_home, _terminal_env_type_for_task)
 from tools.file_tools_read_tracking import _has_full_write_baseline, _is_own_blind_patch, _read_mtime_drifted
 import itertools
+
+logger = logging.getLogger(__name__)
 
 # Prefixes matched after realpath. macOS: /private/var mirrors /var — block the
 # sensitive subtrees only; a blanket "/private/var/" refuses every temp-file
@@ -177,6 +181,44 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
+# ── The consent-gated live surface (design t_cb9259fc, section 3a) ────────────
+# A write landing on a consent-gated live surface -- the root or a profile
+# `config.yaml`, `.env`, a live `SOUL.md`, the plugin trees, a launchd plist -- needs an
+# APPROVED approval whose scope COVERS that surface, cited by the kanban card that owns
+# the session. This is a STANDALONE clause, same tier as
+# `_check_protected_instruction_write`: --yolo, approvals.mode=off, an allowlist and the
+# approval prompt cannot re-open it (a ref never re-opens a hard deny; only the operator
+# or the terminal door with its own consent floor can). Ordering is design section 6:
+# this runs AFTER the hard denies above (they win), and BEFORE the always-ask and
+# approval gates (both still run where they ran -- the clause is additive).
+def _check_consent_surface(paths: list[str], task_id: str = "default",
+                           ctx: object = None) -> str | None:
+    """Refuse a write to a consent-gated live surface the owning card is not licensed for.
+
+    INERT when no kanban card owns the session (``HERMES_KANBAN_TASK`` unset -- a human at
+    the console IS the consent authority) and for every non-surface path. The refusal
+    names the surface, the target, the owning card, the references it cites and the scope
+    token a filer must file under, records ONE deduped receipt on the card and parks it
+    ``blocked``/``needs_input``. ``task_id`` is the TOOL's task key (path resolution); the
+    owning card comes from the guard's own resolution, never from here.
+    """
+    if not paths:
+        return None
+    try:
+        from hermes_cli import consent_surface_doors as doors
+    except ImportError:  # vendored / partial install: post the same inert answer as the siblings
+        logger.warning("consent-surface clause unavailable (import failed): %s",
+                       "hermes_cli.consent_surface_doors", exc_info=True)
+        return None
+    return doors.file_denial([_resolved_or_raw(p, task_id) for p in paths],
+                             ctx=ctx, verb="write",
+                             # The protected-instruction surface is refused by
+                             # `_check_protected_instruction_write`, whose licence is
+                             # CARD-BOUND (ruling t_cd80bb5a D1): one clause, one cause,
+                             # one receipt for that class.
+                             exclude=(doors.PROTECTED_SURFACE,))
+
+
 # ── Protected agent-instruction files (always-ask approval gate) ─────────
 # Files that steer FUTURE agent behavior are a prompt-injection persistence
 # vector (AGENTS.md / CLAUDE.md / SOUL.md / .cursorrules / project .hermes tree).
@@ -194,9 +236,23 @@ _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
 
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
-    """Return ``(enabled, extra_patterns)`` from ``security.protected_instruction_files`` /
-    ``security.protected_instruction_extra_patterns`` (fnmatch on basename). Config read
-    failures keep the gate ON — fail-safe for a security boundary."""
+    """Return ``(enabled, extra_patterns)`` from
+    ``security.protected_instruction_files`` and
+    ``security.protected_instruction_extra_patterns`` (fnmatch on basename).
+    Config read failures keep the gate ON — fail-safe for a security boundary.
+
+    There is deliberately NO allowlist here. ``security.protected_instruction_allowlist_dirs``
+    existed once -- it exempted whole directory trees from the always-ask prompt -- and was
+    RETIRED by the ruling on card ``t_cd80bb5a`` (D2). Do not re-add it. A directory
+    allowlist answers "can this TREE ever be written", which is not the question this gate
+    asks ("is this one change consented, by this one card, once"): the sanctioned way to
+    work in a checkout was to make every project ``AGENTS.md`` in
+    ``/opt/hermes_sandbox`` and ``/opt/hermes_prod`` silently writable, which is the
+    prompt-persistence vector the gate exists to stop, and it left the four cards that
+    were actually blocked by this gate -- correct behaviour -- still blocked. The consent
+    surface's ``project-instruction-file`` clause (``_check_protected_instruction_write``)
+    is the sanctioned exit: a CARD-BOUND approved approval, per write.
+    """
     try:
         from hermes_cli.config import load_config, cfg_get
         cfg = load_config()
@@ -220,6 +276,17 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     Matching runs on BOTH the normalized input path and its realpath so neither a symlink pointing AT a
     protected file (#41351) nor a protected name that is itself a symlink escapes the gate. ``..`` traversal
     is neutralized by normpath/realpath before the basename compare.
+
+    ONE narrow exemption runs before the match: the Hermes home tree(s)
+    (``_hermes_exempt_homes`` — the agent's own store, which has its own config hard-block
+    and mirror guard). Project-local files have NO tree exemption, because the tree
+    exemption is the bypass ruling ``t_cd80bb5a`` D2 retired (see
+    ``_protected_instruction_config``).
+
+    This is also the ONE match set of the consent surface's ``project-instruction-file``
+    class: ``hermes_cli.consent_surface_doors.protected_write_target`` calls this function
+    rather than defining a second matcher, so the always-ask prompt and the consent
+    surface can never disagree about what a protected instruction file is.
     """
     if enabled is None or extra_patterns is None:
         enabled, extra_patterns = _protected_instruction_config()
@@ -244,8 +311,9 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     for candidate in (normalized, resolved):
         base = os.path.basename(candidate)
         base_lower = base.lower()
-        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
-                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
+        if any(fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
+            return base
+        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES:
             return base
         # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
         # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
@@ -346,17 +414,76 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
+#: Sentinel: the consent clause does not own this session (no owning card), so the
+#: always-ask prompt still answers. A licensed write returns ``None`` and a refusal a
+#: ``str`` -- which is why the clause needs a third value of its own.
+_CONSENT_NOT_OURS: Any = object()
+
+
 def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
-    the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
+    the ENTIRE multi-file patch (one prompt, all-or-nothing).
+
+    THREE OUTCOMES since the ruling on card ``t_cd80bb5a`` (D1):
+
+    1. the session has an owning kanban card and that card holds a CARD-BOUND approved
+       approval covering ``project-instruction-file:<repo-slug>`` -- the write proceeds
+       with ZERO prompts and no human channel;
+    2. the session has an owning card and no such approval -- a deterministic refusal
+       (surface, target, card, the token, and a copy-paste filer), a ``consent_refused``
+       receipt and a park. NO prompt: the ask is the operator's, and a worker has no
+       authority to answer it for them;
+    3. no owning card (a human at a console, cron, the operator) -- the pre-existing
+       always-ask prompt below, unchanged, headless answer included.
+
+    This clause is a FLOOR: it runs before the prompt, so ``--yolo``,
+    ``approvals.mode=off``, an allowlist and unattended mode cannot re-open it, and the
+    coverage consult is what gives the class a non-interactive exit that is not a prompt.
+    """
     enabled, extra = _protected_instruction_config()
     if not enabled:
         return None
-    reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra)
+    reasons = [r for r in (_protected_instruction_reason(
+                               p, task_id, enabled=enabled, extra_patterns=extra)
                            for p in paths) if r]
     if not reasons:
         return None
+    gated = _protected_write_consent(paths, reasons, task_id)
+    if gated is not _CONSENT_NOT_OURS:
+        return gated
     return _request_protected_instruction_approval(reasons, task_id)
+
+
+def _protected_write_consent(paths: list[str], reasons: list[str], task_id: str) -> Any:
+    """The ``project-instruction-file`` consent clause for the FILE door (D1).
+
+    Returns ``_CONSENT_NOT_OURS`` when the clause does not apply (no owning card, or the
+    doors are not importable), ``None`` when the write is LICENSED (proceed silently), or
+    the refusal string. Decision, receipt and park all come from the guard, so the file
+    door and the terminal/exec doors refuse this class with one voice.
+    """
+    try:
+        from hermes_cli import consent_surface_doors as doors
+        from hermes_cli import consent_surface_guard as guard
+    except ImportError:  # vendored / partial install: the prompt path still stands
+        logger.debug("consent-surface clause unavailable (import failed); prompting", exc_info=True)
+        return _CONSENT_NOT_OURS
+    try:
+        if not guard.consent_gate_active():
+            return _CONSENT_NOT_OURS
+        hit = doors.hit_for_paths(paths)
+    except Exception:  # a clause must never take a write path down
+        logger.warning("protected-instruction consent clause could not classify; "
+                       "falling back to the prompt", exc_info=True)
+        return _CONSENT_NOT_OURS
+    if hit is None or getattr(hit, "surface", None) != doors.PROTECTED_SURFACE:
+        return _CONSENT_NOT_OURS
+    result = guard.refuse_surface_write(hit)
+    if result.get("approved"):
+        return None
+    return str(result.get("message") or (
+        f"BLOCKED (consent surface): {getattr(hit, 'surface', '?')} needs an approved, "
+        "card-bound approval. See the card's consent_refused receipt."))
 
 
 def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:

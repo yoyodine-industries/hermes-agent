@@ -17,6 +17,7 @@ from pm import paths
 from pm.downloader import DownloadPaused, ProgressFn
 from pm.filesystem import native, remove_tree, retry_held
 from pm.lock import Facts, Lockfile
+from pm.mapped import describe, holders, snapshot, under
 from pm.package import InstallError, Package, Runner, StatePackage, compose_env
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection, StagedUpdate
 from pm.registry import get_package, walk
@@ -252,48 +253,96 @@ def _remove_entry(store: Store, entry_name: str, *, attempts: int = 5) -> None:
 _SET_ASIDE_PREFIX = ".reclaim-"
 
 
-def _discard_entry(store: Store, entry_name: str) -> None:
-    """Drop a tree a finished publish or restore left behind as garbage.
+def _set_aside_target(store: Store, entry_name: str) -> Path:
+    """A fresh ``.reclaim-*`` name for ``entry_name``, in the store root itself.
 
-    A running Hermes process can keep the replaced interpreter's DLLs mapped
-    far past the retry window, and failing here reports a completed install
-    as broken (#124807). Windows still allows renaming a tree with mapped
-    images, so it moves to a `.reclaim-*` name: its slot is free for the next
-    publish, no restore ever picks it up, and the next install or
-    `hermes pm gc` deletes it once the hold is gone.
+    Retiring is a RENAME, so source and target must be two names in one directory on one
+    filesystem - anything else is EXDEV and the tree never moves. A name that escapes the root
+    (``..``) is a caller bug, not a state to work around, so it raises rather than renaming bytes
+    into somebody else's tree.
     """
     import uuid
 
-    try:
-        _remove_entry(store, entry_name)
+    entry = store.entry(entry_name)
+    target = store.entry(f"{_SET_ASIDE_PREFIX}{uuid.uuid4().hex}")
+    if entry.parent != store.root or target.parent != store.root:
+        raise RuntimeError(f"refusing to set aside {entry_name!r} outside the store root {store.root}")
+    return target
+
+
+def _discard_entry(store: Store, entry_name: str) -> None:
+    """Retire a tree a finished publish or restore left behind - by RENAME, never by unlink.
+
+    A live process may still map this tree's interpreter and DLLs: Windows refuses the unlink
+    (#124807), and POSIX unlinks it without a word and leaves that process holding a vnode with
+    no path, which is how a runtime upgrade blinds a running fleet (card t_b3709ecc). So the tree
+    moves to a `.reclaim-*` name: its slot is free for the next publish, no restore ever picks it
+    up, the holder keeps its mapping, and `_reclaim_set_aside` unlinks the bytes once nothing maps
+    them. Deleting here would delete the only evidence that a process needs recycling - so this
+    door never unlinks, and callers that really may (a never-published fetch archive) use
+    ``_remove_entry`` directly.
+    """
+    entry = store.entry(entry_name)
+    target = _set_aside_target(store, entry_name)
+    if not (entry.exists() or entry.is_symlink()):
         return
-    except OSError as e:
-        error = e
     try:
-        store.entry(entry_name).rename(store.entry(f"{_SET_ASIDE_PREFIX}{uuid.uuid4().hex}"))
+        retry_held(lambda: entry.rename(target))
+    except OSError as error:
+        LOG.warning("could not set aside %s: %s", entry_name, error)
+        return
+    mapped = holders(target)
+    if mapped:
+        LOG.warning("%s retired as %s; STILL MAPPED by %s - recycle that process and the next install "
+                    "or `hermes pm gc` reclaims the bytes", entry_name, target.name, describe(mapped))
+    else:
+        LOG.warning("%s retired as %s; the next install or `hermes pm gc` reclaims it", entry_name, target.name)
+
+
+def _reclaim_or_keep(store: Store, item: Path, rows) -> bool:
+    """Delete one set-aside tree if no live process maps it; False when it was kept.
+
+    The question is asked of identity, not of existence (see :mod:`pm.mapped`): the tree is
+    unlinked only when nothing names it, because unlinking a mapped interpreter is what leaves a
+    running process holding a vnode with no path - the state TCC refuses (card t_b3709ecc).
+    ``rows`` is one snapshot shared by the whole sweep, and None means no probe could answer.
+    """
+    if rows is None:
+        LOG.warning("cannot tell whether a live process maps %s (no lsof and no /proc); keeping it", item.name)
+        return False
+    mapped = under(rows, item)
+    if mapped:
+        LOG.warning("%s is still mapped by %s; keeping it - recycle that process and the next install "
+                    "or `hermes pm gc` reclaims it", item.name, describe(mapped))
+        return False
+    try:
+        _remove_entry(store, item.name, attempts=1)
     except OSError:
-        LOG.warning("could not remove or set aside %s: %s", entry_name, error)
-        return
-    LOG.warning("%s is still in use (%s); set aside for the next install or `hermes pm gc`",
-                entry_name, error)
+        return False
+    return True
 
 
 def _reclaim_set_aside(store: Store) -> int:
     """Delete set-aside trees whose hold is gone; the caller holds the store lock."""
-    removed = 0
-    for item in sorted(store.root.glob(f"{_SET_ASIDE_PREFIX}*")):
-        try:
-            _remove_entry(store, item.name, attempts=1)
-        except OSError:
-            continue
-        removed += 1
-    return removed
+    trees = sorted(store.root.glob(f"{_SET_ASIDE_PREFIX}*"))
+    if not trees:
+        return 0
+    rows = snapshot()
+    return sum(1 for item in trees if _reclaim_or_keep(store, item, rows))
 
 
 def _remove_downloads(store: Store, artifacts: list[dict]) -> None:
-    """Release this package's archives after publication, under its store lock."""
+    """Release this package's archives after publication, under its store lock.
+
+    These are UNLINKABLE where a retired entry is not: a fetch-<sha> archive was never
+    published, so no process can have started from it and nothing maps it. A hold on one is a
+    real error (an over-eager antivirus scan) and the next `hermes pm gc` finishes the job.
+    """
     for artifact in artifacts:
-        _discard_entry(store, f"fetch-{artifact['sha256']}")
+        try:
+            _remove_entry(store, f"fetch-{artifact['sha256']}", attempts=2)
+        except OSError as error:
+            LOG.warning("could not remove download cache for %s: %s", artifact["sha256"][:12], error)
 
 
 def _entry_verified(package: Package, fact: dict, store: Store, target: str) -> bool:
@@ -829,6 +878,11 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
     try:
         result = {} if current else (package.apply(enabled, explicit=explicit,
                                                    skip_invalid_secondary=skip_invalid_secondary, **inputs) or {})
+        if current:
+            # No rebuild to carry a pin: retrofit a generation built before source pinning
+            # (`hermes update` / `hermes pm install` over an unchanged dependency graph).
+            from pm.environments import ensure_source_pin
+            ensure_source_pin(package.project_root())
         if not repair and package.expected_stamp(enabled, **inputs) != stamp:
             raise ValueError("Dependency inputs changed while preparing publication; retry.")
         if change is not None:

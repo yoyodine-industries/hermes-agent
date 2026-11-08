@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -28,27 +29,44 @@ def hermes_home(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _legacy_total(reason="ops incident", **extra) -> str:
+    """Write the PRE-RULING total-halt body, and return its handle.
+
+    Arming a `mode: estop` hold is not a supported operation any more (operator ruling
+    2026-10-10, card t_e04b4c81): the fleet-wide stop is retired, so no verb may create this
+    state — including the tests. The GATE still has to behave on one, because a total hold can
+    be sitting on disk from older bytes and the boundary statement calls it an alarm to LIFT,
+    so these tests set that legacy state up the way a pre-ruling install left it (a whole-body
+    sentinel, no registry, no provenance) and lift it BY HANDLE.
+    """
+    body = {"reason": reason, "engaged_at": datetime.now(UTC).isoformat()}
+    body.update(extra)
+    estop.sentinel_path().write_text(json.dumps(body) + "\n", encoding="utf-8")
+    held = [hold for hold in estop.holds() if (hold.get("reason") or "") == reason]
+    return held[0]["handle"] if held else ""
+
+
 # ── sentinel create / remove ────────────────────────────────────────────────
 
 
-def test_engage_creates_sentinel_and_is_engaged(hermes_home):
+def test_a_legacy_total_body_still_reads_as_a_hold(hermes_home):
     assert estop.is_engaged() is False
-    estop.engage()
+    _legacy_total("ops incident")
     assert (hermes_home / "ESTOP").exists()
     assert estop.is_engaged() is True
 
 
-def test_disengage_removes_sentinel(hermes_home):
-    estop.engage()
-    assert estop.disengage() is True
+def test_the_alarm_is_lifted_by_handle(hermes_home):
+    handle = _legacy_total("ops incident")
+    assert estop.release(handle=handle).released is True
     assert not (hermes_home / "ESTOP").exists()
     assert estop.is_engaged() is False
-    # Disengaging when not engaged is a no-op that reports False.
+    # A bare disengage has no hold of its own to lift, and reports that (never a silent success).
     assert estop.disengage() is False
 
 
 def test_reason_and_timestamp_stored(hermes_home):
-    estop.engage(reason="runaway cron fan-out")
+    _legacy_total("runaway cron fan-out")
     state = estop.get_state()
     assert state is not None
     assert state["reason"] == "runaway cron fan-out"
@@ -75,11 +93,12 @@ def test_corrupt_sentinel_still_engages(hermes_home):
 
 
 def test_paused_reply_surfaces_reason_and_resume_hint(hermes_home):
-    estop.engage(reason="deploy window")
+    handle = _legacy_total("deploy window")
     notice = estop.paused_reply()
     assert notice is not None
     assert "paused" in notice.lower()
     assert "deploy window" in notice
+    assert handle in notice, "the notice NAMES the hold, so it can be lifted by hand"
 
 
 
@@ -103,7 +122,7 @@ def test_cron_tick_skips_dispatch_when_engaged(hermes_home, monkeypatch):
 
     monkeypatch.setattr(scheduler, "get_due_jobs", _fake_get_due_jobs)
 
-    estop.engage(reason="test")
+    _legacy_total("test")
     assert scheduler.tick(verbose=False) == 0
     assert calls == [], "engaged ESTOP must skip the due-job scan entirely"
 
@@ -119,11 +138,11 @@ def test_cron_tick_resumes_after_disengage(hermes_home, monkeypatch):
 
     monkeypatch.setattr(scheduler, "get_due_jobs", _fake_get_due_jobs)
 
-    estop.engage()
+    handle = _legacy_total("cron window")
     scheduler.tick(verbose=False)
     assert calls == []
 
-    estop.disengage()
+    estop.release(handle=handle)
     scheduler.tick(verbose=False)
     assert calls == [1], "resume must restore normal cron dispatch"
 
@@ -135,9 +154,9 @@ def test_kanban_dispatch_blocked_when_engaged(hermes_home):
     from gateway.kanban_watchers_common import _kanban_dispatch_allowed
 
     assert _kanban_dispatch_allowed() is True
-    estop.engage(reason="test")
+    handle = _legacy_total("test")
     assert _kanban_dispatch_allowed() is False
-    estop.disengage()
+    estop.release(handle=handle)
     assert _kanban_dispatch_allowed() is True
 
 
@@ -170,7 +189,7 @@ async def test_gateway_new_turn_gets_paused_reply(hermes_home):
 
     runner = object.__new__(GatewayRunner)
     runner._is_user_authorized = lambda source: True  # bare-instance stub
-    estop.engage(reason="maintenance")
+    _legacy_total("maintenance")
     reply = await runner._handle_message(_FakeEvent())
     assert reply is not None
     assert "paused" in reply.lower()
@@ -183,7 +202,7 @@ async def test_gateway_internal_events_bypass_estop(hermes_home):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
-    estop.engage()
+    _legacy_total("maintenance")
     event = _FakeEvent()
     event.internal = True
     # An internal event proceeds past the estop gate; the bare runner then
@@ -199,32 +218,33 @@ async def test_gateway_internal_events_bypass_estop(hermes_home):
 # ── CLI: hermes pause / hermes resume ───────────────────────────────────────
 
 
-def test_cli_pause_engages_with_reason(hermes_home, capsys):
+def test_cli_pause_refuses_the_fleet_wide_form_and_writes_nothing(hermes_home, capsys):
     from hermes_cli.subcommands.pause import cmd_pause
 
     rc = cmd_pause(argparse.Namespace(reason="ops incident"))
-    assert rc == 0
-    assert estop.is_engaged() is True
-    assert estop.get_state()["reason"] == "ops incident"
-    assert "paused" in capsys.readouterr().out.lower()
+    assert rc == 2, "a bare `hermes pause` is not a supported operation"
+    assert estop.is_engaged() is False
+    out = capsys.readouterr().out
+    assert "set-dispatch" in out and "cron pause" in out and "--lockdown" in out
 
 
-def test_cli_pause_idempotent(hermes_home, capsys):
+def test_cli_pause_refuses_idempotently(hermes_home, capsys):
     from hermes_cli.subcommands.pause import cmd_pause
 
-    assert cmd_pause(argparse.Namespace(reason=None)) == 0
-    assert cmd_pause(argparse.Namespace(reason=None)) == 0
-    assert estop.is_engaged() is True
+    assert cmd_pause(argparse.Namespace(reason=None)) == 2
+    assert cmd_pause(argparse.Namespace(reason=None)) == 2
+    assert estop.is_engaged() is False
+    assert not estop.sentinel_path().exists()
 
 
-def test_cli_resume_disengages(hermes_home, capsys):
-    from hermes_cli.subcommands.pause import cmd_pause, cmd_resume
+def test_cli_resume_lifts_the_hold_by_handle(hermes_home, capsys):
+    from hermes_cli.subcommands.pause import cmd_resume
 
-    cmd_pause(argparse.Namespace(reason=None))
-    rc = cmd_resume(argparse.Namespace())
+    handle = _legacy_total("deploy window")
+    rc = cmd_resume(argparse.Namespace(handle=handle))
     assert rc == 0
     assert estop.is_engaged() is False
-    assert "resumed" in capsys.readouterr().out.lower()
+    assert "released" in capsys.readouterr().out.lower()
 
 
 
@@ -234,16 +254,17 @@ def test_cli_resume_disengages(hermes_home, capsys):
 # ── hermes status surfacing ─────────────────────────────────────────────────
 
 
-def test_status_line_when_paused(hermes_home):
+def test_status_line_when_held_names_the_scope(hermes_home):
     from hermes_cli.status import _estop_status_line
 
     assert _estop_status_line() is None
-    estop.engage(reason="ops")
+    handle = _legacy_total("ops")
     line = _estop_status_line()
     assert line is not None
-    assert "paused" in line.lower()
+    assert "HOLD" in line and handle in line
     assert "ops" in line
-    estop.disengage()
+    assert "global emergency stop" not in line, "the status line names the SCOPE, not the fleet"
+    estop.release(handle=handle)
     assert _estop_status_line() is None
 
 
@@ -281,15 +302,15 @@ async def test_gateway_slash_commands_bypass_estop(hermes_home):
 
     runner = object.__new__(GatewayRunner)
     runner._is_user_authorized = lambda source: True
-    estop.engage(reason="maintenance")
+    _legacy_total("maintenance")
     # The command proceeds past the estop gate; the bare runner then blows
-    # up further down on missing attributes — anything but the paused
+    # up further down on missing attributes — anything but the hold
     # notice proves the gate let it through.
     try:
         reply = await runner._handle_message(_FakeCmdEvent())
     except Exception:
         return
-    assert reply is None or "hermes is paused" not in (reply or "").lower()
+    assert reply is None or "LEGACY fleet-wide halt" not in (reply or "")
 
 
 class _FakePauseEvent(_FakeEvent):
@@ -306,26 +327,26 @@ class _FakePauseEvent(_FakeEvent):
 
 
 @pytest.mark.asyncio
-async def test_gateway_pause_command_engages_and_resumes(hermes_home):
+async def test_gateway_pause_command_refuses_and_pause_off_is_the_release(hermes_home):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
 
+    # THE ARM DIRECTION IS RETIRED: the unscoped (and only) form refuses, naming the controls.
     reply = await runner._handle_pause_command(_FakePauseEvent("deploy window"))
-    assert "paused" in reply.lower()
-    assert estop.is_engaged() is True
-    assert estop.get_state()["reason"] == "deploy window"
+    assert "set-dispatch" in reply and "cron pause" in reply and "lockdown" in reply
+    assert estop.is_engaged() is False
 
-    # Re-issuing without args reports already-paused instead of clobbering.
-    reply = await runner._handle_pause_command(_FakePauseEvent(""))
-    assert "already paused" in reply.lower()
-
+    # `/pause off` still lifts the CALLER's OWN hold.
+    handle = estop.arm(owner="wind-down", mode=estop.MODE_LOCKDOWN, ttl="30m",
+                       allow={"profiles": ["platform-coder"]}).handle
     reply = await runner._handle_pause_command(_FakePauseEvent("off"))
     assert "resumed" in reply.lower()
     assert estop.is_engaged() is False
+    assert handle
 
     reply = await runner._handle_pause_command(_FakePauseEvent("off"))
-    assert "wasn't paused" in reply.lower()
+    assert "no hold is in force" in reply.lower()
 
 
 def test_pause_command_registered_for_gateway():
@@ -355,12 +376,14 @@ def test_profile_gateway_honors_canonical_root_estop(tmp_path, monkeypatch):
     (root / "ESTOP").write_text("{\"reason\": \"thundering herd\"}\n", encoding="utf-8")
     assert estop.is_engaged() is True
     assert estop.paused_reply() is not None
-    assert "paused" in estop.paused_reply().lower()
-    # Profile-local engage still works and is independent.
-    estop.engage(reason="local")
+    assert "fleet-wide halt" in estop.paused_reply()
+    # A profile-local hold is independent of the root's — and is armed through the ENGINE (the
+    # only hold shape left is a scoped one).
+    handle = estop.arm(owner="wind-down", mode=estop.MODE_LOCKDOWN, ttl="30m",
+                       allow={"profiles": ["fleet-analyst"]}).handle
     assert (profile / "ESTOP").exists()
     assert estop.is_engaged() is True
     (root / "ESTOP").unlink()
     assert estop.is_engaged() is True  # still held by profile sentinel
-    estop.disengage()
+    assert estop.release(handle=handle).released is True
     assert estop.is_engaged() is False

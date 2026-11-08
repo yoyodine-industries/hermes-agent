@@ -22,9 +22,11 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
+from hermes_cli import kanban_bulk_guard as kbg
 from hermes_cli import kanban_workflow
+from hermes_cli.kanban_filing_policy import is_refusal as kb_is_filing_refusal
 from hermes_cli.kanban_output import (
-    _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
+    _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, BOARD_PIN_REMEDY, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
     _task_to_dict,
 )
@@ -151,7 +153,23 @@ def kanban_command(args: argparse.Namespace) -> int:
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
-        return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
+        return _err(_DELEGATED_CHILD_CLI_REFUSAL)
+
+    # One seam for the operator's 2026-09-27 bulk-action rule (card t_bf9605f8): a destructive BULK
+    # board action is REFUSED unless an authorized ask (the profile in
+    # `kanban_bulk_guard.AUTHORIZED_ASK_PROFILE`; REQUIRED_APPROVALS is 0, so no second party is
+    # needed) and a VERIFIED
+    # snapshot of the target store all exist — and the approval binds this EXACT action (board +
+    # verb + canonical scope), so it cannot be transplanted to a different parameter set. Gated by
+    # classification, so a bulk verb is covered by construction (`kanban_bulk_guard.BULK_SURFACES`);
+    # a non-bulk single-card write returns None here and is untouched. The ONE waiver is a declared
+    # estate board (board.json `"dispatch": false`), torn down single-actor via
+    # `hermes kanban boards rm --estate <slug>` with the ask/APR clause skipped and the destination
+    # claim, verified snapshot and ledger/audit row kept (ruling t_fcf7a321, Decision 2).
+    try:
+        kbg.gate_cli(args)
+    except kbg.BulkActionRefused as exc:
+        return _err(str(exc), 1)
 
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
     # the `--board` routing override (else `--board beta boards show` reports beta).
@@ -169,6 +187,17 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: {exc}", 2)
         if not normed:
             return _err("kanban: --board requires a slug", 2)
+        # The board pin is a FENCE, and it must be a LOUD one. Under HERMES_KANBAN_DB /
+        # HERMES_KANBAN_BOARD every slug resolves to the pinned store, so `--board <other>`
+        # used to run against <other>'s NAME and the pinned board's DATA: `show` answered
+        # "no such task" for a card that exists, and the write verbs (create/comment/complete/
+        # archive) mutated the pinned board while the operator believed they named <other>
+        # (measured 2026-10-27, card t_398313ec). Compared HERE, at the one seam every
+        # subcommand passes through, before anything is read or written — not per verb.
+        try:
+            kb.assert_board_matches_env_pin(normed)
+        except ValueError as exc:
+            return _err(f"kanban: {exc}\n{BOARD_PIN_REMEDY}")
         # Boards other than 'default' must already exist — typoed slugs would otherwise silently
         # create an empty board.
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
@@ -200,15 +229,20 @@ def kanban_command(args: argparse.Namespace) -> int:
 # --- Handlers ---
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
-    from hermes_cli.profiles import current_profile_name
-    return current_profile_name("user") or "user"
+    """Best-effort author name for a board write from the CLI or a gateway-served turn."""
+    from hermes_cli.profiles import resolve_acting_profile_name
+    return resolve_acting_profile_name("user")
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    # set-contract is a DECLARATION rewrite (which contract the card must satisfy to close), so a
+    # delegated child — inside the parent's own process or a spawned descendant — must not perform
+    # it. It was already an ESTATE write (tree_identity.ESTATE_MUTATING_ACTIONS); this closes the
+    # delegated fence over it too. (Card t_36adf9a5)
+    "set-contract",
+    "schedule", "unblock", "reopen", "normalise", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -216,20 +250,103 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
-    "set-default-workdir", "import",
+    "set-default-workdir", "set-project", "set-priority-policy", "import",
 })
 
 
+#: Printed for BOTH cooperative arms and the provenance arm (ruling t_fcf7a321, Decision 1(b)):
+#: a refused worker must learn the ACTUAL requirement and the ONE sanctioned release, never be
+#: told to reach for an ``env -u`` strip.
+_DELEGATED_CHILD_CLI_REFUSAL: str = (
+    "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI "
+    "(and a shell that merely unsets HERMES_DELEGATED_CHILD_CONTEXT is still refused when it "
+    "descends from a LIVE dispatched worker holding a claim on this board). Run the action from a "
+    "top-level session; the one sanctioned non-top-level release is the estate path — a board "
+    "whose own board.json declares \"dispatch\": false is torn down single-actor with "
+    "`hermes kanban boards rm --estate <slug>`."
+)
+
+
+def _fence_target_store(args: argparse.Namespace) -> Optional[Path]:
+    """The board store the invocation actually TARGETS, or ``None`` when a NAMED board is no board.
+
+    ``--board`` names the board a command addresses; the ambient chain
+    (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` -> ``<kanban>/current``) resolves only
+    the board that is ACTIVE in this process. Judging the fast-fail against the ambient board
+    refuses a mutation targeting a board this lineage holds no claim on, and lets the verdict
+    flip when ``<kanban>/current`` moves (card t_63a0c2d9).
+
+    THREE OUTCOMES, NOT TWO (ruling t_ecd51c9c): a name that resolves to no board is not a store
+    at all, so it answers ``None``. A fence may allow or deny the object the caller NAMED; it may
+    never SUBSTITUTE a different object, and falling back to the AMBIENT board did exactly that —
+    it judged the invocation against a board it never named, over-refusing a caller descended from
+    a live worker there and MASKING the CLI's own ``board '<x>' does not exist`` (measured on the
+    sdlc birth node: run 20261008-0844, gateway caller -> honest error, the item BIRTHS; run
+    20261008-0958, worker caller -> the fence message; cron 16b8c8db4ed7 failure_streak=10).
+
+    The ``boards …`` actions are the exception: they ignore ``--board`` by construction (board
+    metadata and the current-board pointer live at the root), so the caller keeps the ambient
+    resolution for them.
+    """
+    named = getattr(args, "board", None)
+    if named:
+        # Existence is the CLI's own question, and the CLI's own validation asks the board
+        # REGISTRY (:func:`kanban_command` refuses an unregistered slug before dispatch). Asking
+        # the registry first is what keeps the verdict scoped to the board that was NAMED: the
+        # store path cannot answer it, because a worker's env pin legitimately overrides explicit
+        # intent (``explicit_board_intent_is_pinned``) and would hand back the PINNED board.
+        try:
+            normed = kb._normalize_board_slug(named)
+        except ValueError:
+            return None
+        if not normed or (normed != kb.DEFAULT_BOARD and not kb.board_exists(normed)):
+            return None
+        try:
+            return kb.kanban_db_path(board=named)
+        except Exception:  # health: allow BLE001, S110 -- fail-open (t_fcf7a321): the fast-fail must never raise; a name that resolves to no store answers "no board"
+            # The fast-fail must never raise from here (that property is why the guard exists).
+            # What it must NOT do is fall back to the ambient board: that is a DIFFERENT board's
+            # verdict, and it would refuse this invocation before :func:`kanban_command` can
+            # print the honest board-resolution error.
+            return None
+    return kb.kanban_db_path()
+
+
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
+    """Fence a mutating CLI verb from a non-top-level session.
+
+    Two cooperative arms (the ContextVar and the ``HERMES_DELEGATED_CHILD_CONTEXT`` marker,
+    both inside :func:`kanban_path_is_fenced`) plus the PROVENANCE arm (ruling t_fcf7a321,
+    Decision 1): a process descended from a LIVE dispatched worker is refused even after the
+    marker has been stripped. Reads never reach this helper — the caller checks the action
+    vocabulary first.
+
+    Both arms are judged against the board the invocation TARGETS (:func:`_fence_target_store`),
+    never the host-global ambient board: a mutation aimed at another board is not this lineage's
+    to fence, and the verdict must not move when ``<kanban>/current`` does. A NAMED board that
+    resolves to no board is no board at all, so the verdict is ``False`` — no fence verdict, not a
+    refusal — and the CLI's own board validation produces the honest error (ruling t_ecd51c9c).
+    """
     action = getattr(args, "kanban_action", None)
     if action == "boards":
         if (getattr(args, "boards_action", None) or "list") not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
             return False
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
-    from agent.delegation_context import kanban_path_is_fenced
+    from agent.delegation_context import ancestor_owns_live_kanban_claim, kanban_path_is_fenced
 
-    return kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(kb.kanban_db_path())
+    # ``boards …`` ignores ``--board``, so its target is the ambient board (as before).
+    target = kb.kanban_db_path() if action == "boards" else _fence_target_store(args)
+    if target is None:
+        # A NAMED board that resolved to no board: no store exists for this lineage to hold a
+        # claim on, and there is nothing here to mutate. Answer "no fence verdict" — the CLI
+        # refuses the invocation itself, naming the board, instead of this fast-fail speaking for
+        # (and masking) a board the caller never touched.
+        return False
+    if kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(target):
+        return True
+    # Durable arm: the marker is clearable, ancestry is not. Same fence, proven from the TARGET board.
+    return ancestor_owns_live_kanban_claim(target)
 
 
 def _joined_words(words) -> Optional[str]:
@@ -251,8 +368,13 @@ def _ok_or_err(ok, fail: str, done: str) -> int:
 
 
 def _bulk_ids(args: argparse.Namespace) -> list[str]:
-    """Positional ``task_id`` plus ``--ids`` extras (bulk verbs)."""
-    return [args.task_id] + list(getattr(args, "ids", None) or [])
+    """Positional ``task_id`` plus ``--ids`` extras (bulk verbs).
+
+    Delegates to the guard's one definition so the cards a verb MUTATES and the cards its bulk
+    scope BINDS are the same set, computed once — the drift between the two is what left a
+    two-card ``promote``/``block``/``schedule`` ungated (card t_6d0e6cdb).
+    """
+    return kbg.bulk_ids_from_args(args)
 
 
 def _require_ids(args: argparse.Namespace) -> tuple[list[str], int]:
@@ -360,35 +482,131 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
-    with kbc.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn, title=args.title, body=body, assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
-            project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
-            parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries, model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            completion_contract=getattr(args, "completion_contract", None),
-            initial_status=getattr(args, "initial_status", "running"),
-            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
-                             if is_dispatcher_owned_worker_context() else None),
-        )
-        task = kb.get_task(conn, task_id)
+    if bool(getattr(args, "resurrect", False)) and not getattr(args, "idempotency_key", None):
+        # Nothing to resurrect without an identity: silently accepting the flag would teach
+        # a producer that it had overridden a dedupe that never ran.
+        return _err("kanban: --resurrect needs --idempotency-key "
+                    "(it re-opens a KEYED identity that is already closed)", 2)
+    # A card fired from another card lands on the SAME board as the card that fired
+    # it (operator standing order): the source card's board outranks the ambient
+    # board, which is only a fallback for a filing with no source card (a loop, a
+    # cron row, a sweep). Read the source card's board from the board stores - the
+    # ambient pin/pointer is a property of this process and can be stale or wrong.
+    fired_board = kb.board_for_fired_card(
+        getattr(args, "board", None),
+        source_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                        if is_dispatcher_owned_worker_context() else None))
+    from hermes_cli.profiles import list_profile_names
+    from hermes_cli.kanban_inbox import InboxRefusal
+    try:
+        with kbc.connect_closing(board=fired_board) as conn:
+            task_id, outcome = kb.create_task_reported(
+                conn, title=args.title, body=body, assignee=args.assignee,
+                # The card's OWN board, not the ambient one: the priority policy, the
+                # board floor and every board-scoped read below must see the board the
+                # card actually lands on (a policy run against the ambient board computed
+                # a value the destination board's floor then refused).
+                board=fired_board,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+                project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+                parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                resurrect=bool(getattr(args, "resurrect", False)),
+                max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries, model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                completion_contract=getattr(args, "completion_contract", None),
+                initial_status=getattr(args, "initial_status", "running"),
+                serves=getattr(args, "serves", None),
+                # Provenance is GATED in the kernel, not composed here: `create_task` is the
+                # one moment every filing surface reaches, so the CLI and the kanban_create
+                # tool cannot disagree about what counts as proof that the seat holds the
+                # item. A refusal arrives as InboxRefusal before any row exists.
+                from_inbox=getattr(args, "from_inbox", None),
+                from_inbox_item=getattr(args, "from_inbox_item", None),
+                creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                 if is_dispatcher_owned_worker_context() else None),
+                # The receipt's dead-assignee probe reads THIS process's live profiles.
+                profiles=list_profile_names(),
+            )
+            # THE FILING-BUDGET REFUSAL (card t_80ff9b6a). No row was written and the line was
+            # already printed to stderr by the kernel's own module; rc 3 is the machine-readable
+            # half of that answer, so a shell or DAG node can tell "the budget door said no"
+            # from a usage error (2) and from a board fault (1) without parsing prose.
+            if kb_is_filing_refusal(task_id):
+                record = getattr(task_id, "record", {}) or {}
+                if getattr(args, "json", False):
+                    _print_json({"refused": True, "reason": str(task_id),
+                                 "filing_policy": dict(record)})
+                elif record.get("why"):
+                    print(f"filing policy: {record['why']}", file=sys.stderr)
+                    print(f"filing policy: {record.get('policy', '-')}", file=sys.stderr)
+                return 3
+            task = kb.get_task(conn, task_id)
+    except InboxRefusal as exc:
+        # A usage refusal, not a board fault: rc 2 so a shell can tell "the provenance could
+        # not be proved" from "the card said no", and nothing was written.
+        return _err(f"kanban: --from-inbox: {exc}", 2)
     if getattr(args, "json", False):
-        _print_json(_task_to_dict(task))
+        _print_json({**_task_to_dict(task), **kb.receipt_fields(outcome)})
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        # Same words as `hermes kanban link`: a card FILED behind a parent nobody will finish
+        # is the same silent park, and stderr keeps `Created <id>` parsable on stdout.
+        if outcome.parents:
+            print(f"Parent state ({len(outcome.parents)} edge(s)):", file=sys.stderr)
+            for edge in outcome.parents:
+                print(f"  {edge.id}  {edge.code}  {edge.text}", file=sys.stderr)
+        if outcome.warning:
+            print(outcome.warning, file=sys.stderr)
+        # One-line authoring advisory (card t_36adf9a5): a card born on a repo/PR/landed contract
+        # is the one that can strand, and the door out of that declaration is `set-contract`.
+        # Named HERE, at the moment the declaration is authored, so the operator never has to
+        # discover the release from a refusal. Unassigned / triage / todo cards are covered too --
+        # the advisory is about the DECLARATION, not the dispatch.
+        if (task.completion_contract or "local-only") != "local-only":
+            print(f"  completion contract {task.completion_contract}: release it with "
+                  f"`hermes kanban set-contract {task_id} local-only --reason '<why>'`")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
         if task.status == "ready" and task.assignee:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_set_contract(args: argparse.Namespace) -> int:
+    """``hermes kanban set-contract <id> <contract> --reason <why>`` — the release door.
+
+    Registered here and in ``kanban_parser``; the kernel half is :func:`kb.set_contract`. The
+    blank-reason refusal is returned as rc 2 (a usage error) rather than being left to the
+    dispatcher's generic ``ValueError`` catch (rc 1), so a shell can tell "you omitted the why"
+    from "the card said no".
+    """
+    reason = (getattr(args, "reason", None) or "").strip()
+    if not reason:
+        return _err("kanban set-contract: --reason is required and must not be blank "
+                    "(the release records WHY the contract is being re-scoped)", 2)
+    actor = getattr(args, "author", None) or _profile_author()
+    with kbc.connect_closing() as conn:
+        try:
+            ok = kb.set_contract(conn, args.task_id, args.contract, reason=reason, actor=actor)
+        except ValueError as exc:
+            return _err(f"kanban set-contract: {exc}", 2)
+        except RuntimeError as exc:
+            return _err(f"kanban set-contract: {exc}")
+        if not ok:
+            return _err(f"kanban set-contract: no such task {args.task_id!r}")
+        task = kb.get_task(conn, args.task_id)
+    if getattr(args, "json", False):
+        _print_json(_task_to_dict(task))
+    else:
+        print(f"contract_changed: {args.task_id} {task.completion_contract} "
+              f"(reason: {reason}; actor: {actor})")
     return 0
 
 
@@ -422,7 +640,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
         assignee = _profile_author()
     with kbc.connect_closing() as conn:
         # Cheap mini-dispatch so list reflects dependencies cleared since the last tick.
-        kb.recompute_ready(conn)
+        # A FENCED caller (delegated child, or a shell descended from a LIVE dispatched worker —
+        # ruling t_fcf7a321) lists READ-ONLY: ``recompute_ready`` is housekeeping the board's
+        # OWNER performs every tick, and letting it refuse would fence a read verb, which the
+        # fence must never do. ``connect`` already hands such a caller a read-only connection.
+        try:
+            kb.recompute_ready(conn)
+        except PermissionError:
+            pass
         tasks = kb.list_tasks(
             conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
             include_archived=args.archived, order_by=getattr(args, "sort", None),
@@ -444,6 +669,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
         return 0
     for t in tasks:
         print(_fmt_task_line(t))
+    unmodelled = [t for t in tasks if not kb.is_modelled_status(t.status)]
+    if unmodelled:
+        # Not a footnote: this is the board telling you its own count is untrustworthy for these
+        # rows. Every one of them is invisible to the workflow, so it is NOT part of any phase.
+        print(f"\n{kb.UNMODELLED_LABEL}: {len(unmodelled)} card(s) hold a status outside the "
+              f"workflow ({', '.join(sorted({t.status for t in unmodelled}))}). They count as NO "
+              "phase and no verb will move them; repair with `hermes kanban normalise`.")
     return 0
 
 
@@ -492,8 +724,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
+        _task = _task_to_dict(task)
+        # Machine readers keep the RAW value in `status` (changing it would silently rewrite
+        # every consumer), and get the judgement explicitly alongside it.
+        _task["status_display"] = kb.render_status(task.status)
+        _task["status_modelled"] = kb.is_modelled_status(task.status)
         _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "task": _task, "latest_summary": latest_summary, "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -504,11 +741,32 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  {label + ':':<11}{value}")
 
     print(f"Task {task.id}: {task.title}")
-    field("status", task.status)
+    field("status", kb.render_status(task.status))
+    if not kb.is_modelled_status(task.status):
+        # Say it in words as well as in the value: a reader who sees this must know that no verb
+        # switches on the status they are looking at, and that a card can sit here forever.
+        print(f"\n  !! {kb.UNMODELLED_LABEL}: {task.status!r} is not a kanban status "
+              f"(legal: {', '.join(sorted(kb.VALID_STATUSES))}).")
+        print("     No verb switches on it: reclaim/block/unblock/reopen all refuse it. Repair the "
+              "row and record the act in one transaction with")
+        print(f"     `hermes kanban normalise {task.id} --to <ready|blocked|todo> "
+              f"--reason <why> --evidence <ref>`")
+    if task.due_at:
+        policy = task.due_window_policy or kb.DEFAULT_DUE_WINDOW_POLICY
+        field("due", f"{_fmt_ts(task.due_at)} ({policy})")
+    elif task.status in ("scheduled", "blocked"):
+        # A parked card with no clock fence is a wait only a human can end. Say so
+        # on the card, so "scheduled forever" is visible rather than inferred.
+        field("due", "none — no due time; released by hand only")
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
+    if task.project_id:
+        # The project the card is scoped to (kanban_db.create_task stores it, and a
+        # project-scoped board supplies it with no --project flag). Printed because
+        # "which project is this card in" is otherwise only visible under --json.
+        field("project", task.project_id)
     if task.branch_name:
         field("branch", task.branch_name)
     if task.skills:
@@ -529,7 +787,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(
+        task, events, runs, graph=graph,
+    )
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -572,8 +832,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
-    with kbc.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.assign_task(conn, args.task_id, profile)
+    # ``ValueError`` is the assignee invariant's refusal (a handle that cannot run) and
+    # ``RuntimeError`` is a claimed card: both are validation refusals with a named remedy, so
+    # they print as ``kanban: <message>`` with rc 2 — never a traceback.
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
     return _ok_or_err(ok, f"no such task: {args.task_id}",
                       f"Assigned {args.task_id} to {profile or '(unassigned)'}")
 
@@ -608,8 +874,13 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     reclaim = bool(getattr(args, "reclaim", False))
-    with kbc.connect_closing() as conn:
-        ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+    # Same two refusal families as _cmd_assign: a handle that cannot run (ValueError, the
+    # assignee invariant) and a claimed card (RuntimeError). Both are rc 2 with a message.
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
     return _ok_or_err(
         ok,
         f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",
@@ -638,7 +909,19 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
     diag_config = kd.config_from_runtime_config(load_config())
 
+    fleet_mode = not getattr(args, "task", None)
+    unresolved_workspaces: list[str] = []
     with kbc.connect_closing() as conn:
+        if fleet_mode:
+            # A path-less ``worktree`` card anchors on the board's ``default_workdir``, so the
+            # workspace rule needs that value to answer for one. Best-effort: a board with no
+            # metadata simply has no such card to judge.
+            try:
+                diag_config["board_default_workdir"] = str(
+                    kb.read_board_metadata(kb.board_for_connection(conn)).get("default_workdir") or ""
+                )
+            except Exception:
+                pass
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
@@ -662,6 +945,14 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                                                      graph=graph_by.get(tid), config=diag_config)
                     if dl:
                         diags_by_task[tid] = dl
+
+        # Computed BEFORE the severity filter: the board-level count is a property of the BOARD,
+        # not of the slice an operator asked to see, so ``--severity warning`` cannot hide the
+        # critical class this line exists to surface.
+        unresolved_workspaces = [
+            tid for tid, dl in diags_by_task.items()
+            if any(d.kind == "workspace_cannot_resolve" for d in dl)
+        ]
 
         sev = getattr(args, "severity", None)
         if sev:
@@ -689,6 +980,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         return 0
 
     print(f"kanban.dispatch_profiles: {allowlist}")
+    if fleet_mode:
+        named = f" ({', '.join(unresolved_workspaces)})" if unresolved_workspaces else ""
+        print(
+            f"workspace_unresolvable: {len(unresolved_workspaces)} ready card(s) whose "
+            f"workspace cannot resolve{named}"
+        )
     if not diags_by_task:
         print("No active diagnostics on this board.")
         return 0
@@ -697,32 +994,20 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     print(f"{total} active diagnostic(s) across {len(diags_by_task)} task(s):\n")
     for tid, dl in diags_by_task.items():
         m = meta.get(tid, {})
-        print(f"  {tid}  {m.get('status') or '?':8s}  @{m.get('assignee') or '(unassigned)':18s}  "
-              f"{m.get('title') or '(untitled)'}")
+        # Same renderer as `list`/`show`: the diagnostics table is a human read surface too, and a
+        # raw unmodelled value here would read as a phase in the one view that reports on it.
+        print(f"  {tid}  {kb.render_status(m.get('status')) or '?':8s}  "
+              f"@{m.get('assignee') or '(unassigned)':18s}  {m.get('title') or '(untitled)'}")
         _print_diagnostics(dl, "    ", with_kind=True)
         print()
     return 0
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
-    # A worker linking its own running card (dependency-block handoff) proves
-    # ownership with its run id; linking a foreign task never needs one.
-    expected_child_run_id = (
-        _worker_run_id_for(args.child_id)
-        if args.child_id == os.environ.get("HERMES_KANBAN_TASK") else None)
-    with kbc.connect_closing() as conn:
-        gated = kb.link_tasks(conn, args.parent_id, args.child_id,
-                              expected_child_run_id=expected_child_run_id)
-    print(f"Linked {args.parent_id} -> {args.child_id}")
-    if gated:
-        print(
-            f"Note: {args.child_id} was ready and is now todo — parent "
-            f"{args.parent_id} is not done yet. The ready -> running claim "
-            f"re-checks parents, so the child only runs after the parent "
-            f"completes; use `hermes kanban unlink {args.parent_id} {args.child_id}` "
-            f"to run it now."
-        )
-    return 0
+    """Delegate to :mod:`hermes_cli.kanban_link_cmd` (behaviour lives in the sibling)."""
+    from hermes_cli.kanban_link_cmd import cmd_link
+
+    return cmd_link(args)
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
@@ -741,7 +1026,13 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
                         f"lock={existing.claim_lock or '(none)'}")
-        workspace = kbw.resolve_workspace(task)
+        try:
+            workspace = kbw.resolve_workspace(task)
+        except kbw.WorkspaceVolumeUnavailable as exc:
+            # A HOST condition, not a bad command: name it and stop, instead of a traceback that
+            # reads like a broken CLI. The claim above stays until its TTL expires (unchanged
+            # behaviour for every resolve failure, and the dispatcher's own path defers instead).
+            return _err(f"cannot prepare the workspace for {task.id}: {exc}", 3)
         kbw.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
@@ -931,6 +1222,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
+            except (kb.PhantomRefsRefused, kb.VoidClaimUnmeasured, kb.VoidClaimRefused) as ref_err:
+                # The DISCHARGE gate refused the ARGUMENT (design record platform-stl
+                # t_0608ce6d) and nothing was written. The kernel's message carries the cause and
+                # the remedy; render it rather than the generic "unknown id or terminal state".
+                fail_msg[tid] = str(ref_err)
+                return False
+            if isinstance(done, kb.CompletionRefusal):
+                # A refusal is DATA (``complete_task``'s contract): the CLI must render the
+                # cause and its remedy, or the operator sees the generic "unknown id or
+                # terminal state" for a card that is neither -- and a fence nobody can read
+                # is a fence nobody can satisfy. Same shape as the tool layer
+                # (``tools/kanban_tools.py::_handle_complete``).
+                fail_msg[tid] = f"cannot complete {tid} ({done.cause}): {done.detail}"
+                return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
                 # name the open parents instead of claiming the id is unknown.
@@ -970,6 +1275,53 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_retarget(args: argparse.Namespace) -> int:
+    """Re-point a card's project + workspace — the recovery door for a mis-born card.
+
+    Usable on a ``blocked``/``ready``/``todo`` card (the state a mis-born card is in
+    while somebody notices it is bound to the wrong repo); refused on a terminal card
+    and on a card another worker currently holds a live claim on (``--force``
+    overrides the claim guard). The change is recorded as a ``retargeted`` event.
+    """
+    try:
+        ws_kind, ws_path = _parse_workspace_flag(getattr(args, "workspace", None))
+        branch = _parse_branch_flag(getattr(args, "branch", None))
+    except argparse.ArgumentTypeError as exc:
+        return _err(f"kanban retarget: {exc}", 2)
+    if branch and ws_kind not in (None, "worktree"):
+        return _err("kanban retarget: --branch is only valid with a worktree workspace", 2)
+    with kbc.connect_closing() as conn:
+        try:
+            result = kb.retarget_task(
+                conn, args.task_id,
+                project=getattr(args, "project", None),
+                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch,
+                reason=getattr(args, "reason", None),
+                actor=getattr(args, "author", None) or _profile_author(),
+                force=bool(getattr(args, "force", False)),
+            )
+        except ValueError as exc:
+            return _err(f"kanban retarget: {exc}", 2)
+    if result is None:
+        return _err(f"cannot retarget {args.task_id}: unknown task id", 2)
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    old, new = result["old"], result["new"]
+    if not result["changed"]:
+        print(f"{args.task_id} already bound to {new['workspace_kind']}"
+              f"{' ' + new['workspace_path'] if new['workspace_path'] else ''} "
+              f"(project {new['project_id'] or '-'}) - no change")
+        return 0
+    print(f"Retargeted {args.task_id}: project {old['project_id'] or '-'} -> "
+          f"{new['project_id'] or '-'}, workspace {old['workspace_kind']}"
+          f"{' ' + old['workspace_path'] if old['workspace_path'] else ''} -> "
+          f"{new['workspace_kind']}"
+          f"{' ' + new['workspace_path'] if new['workspace_path'] else ''} "
+          f"(recorded as a retargeted event; a parked card stays parked - unblock it to resume)")
+    return 0
+
+
 def _commented(conn, reason: Optional[str], author, prefix: str, op):
     """Wrap a per-task ``op`` so a ``reason`` is first recorded as a ``PREFIX: reason`` comment."""
     def run(tid):
@@ -979,12 +1331,61 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
     return run
 
 
+def _due_fence_args(args: argparse.Namespace):
+    """``(due_at, window_policy, error)`` for the ``schedule``/``block`` verbs.
+
+    ``--due`` is ADDITIVE and has NO default: omitting it returns ``kb.UNSET``,
+    which leaves whatever fence the card already carries. The human hold -- a
+    card waiting on a person, not on a clock -- must never be converted into a
+    timed hold by omission, and a verb that did so would be the bug, not the fix.
+    ``--clear-due`` is the explicit opposite: it passes ``None`` (drop the fence)
+    and is refused alongside ``--due``, because the two say different things.
+    """
+    due_raw = getattr(args, "due", None)
+    clear_due = bool(getattr(args, "clear_due", False))
+    window_policy = getattr(args, "window_policy", None)
+    if due_raw and clear_due:
+        return kb.UNSET, None, "--due and --clear-due are mutually exclusive"
+    if clear_due:
+        return None, None, ""
+    if not due_raw:
+        return kb.UNSET, window_policy, ""
+    from hermes_cli import kanban_due as kdue
+    try:
+        return kdue.parse_due(due_raw), window_policy, ""
+    except ValueError as exc:
+        return kb.UNSET, None, f"--due {due_raw!r}: {exc}"
+
+
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    due_at, window_policy, due_err = _due_fence_args(args)
+    if due_err:
+        return _err(due_err)
+    fence_note = ""
+    if due_at is not kb.UNSET:
+        fence_note = (
+            f" — clock-fenced, auto-release {_fmt_ts(int(due_at))} "
+            f"({window_policy or kb.DEFAULT_DUE_WINDOW_POLICY})"
+            if due_at is not None
+            else " — due time cleared (stays blocked until released by hand)"
+        )
+    failures: dict[str, str] = {}
+
+    def op(tid: str) -> bool:
+        try:
+            return kb.block_task(
+                conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+                due_at=due_at, window_policy=window_policy,
+            )
+        except ValueError as exc:  # --due with --kind dependency, policy with no fence
+            failures[tid] = f"{tid}: {exc}"
+            return False
+
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -999,11 +1400,10 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 verdict = ("needs a human decision" if (landed.block_kind if landed else kind) == "needs_input"
                            else "orchestration attention needed")
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
-            return f"Blocked {tid}{suffix}"
+            return f"Blocked {tid}{suffix}{fence_note}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        op = _commented(conn, reason, author, "BLOCKED", op)
+        return _bulk_apply(ids, op, ok_msg, lambda tid: failures.get(tid) or f"cannot block {tid}")
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -1011,10 +1411,33 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    due_at, window_policy, due_err = _due_fence_args(args)
+    if due_err:
+        return _err(due_err)
+    due_note = ""
+    if due_at is not kb.UNSET:
+        due_note = (
+            f" — due {_fmt_ts(int(due_at))} "
+            f"({window_policy or kb.DEFAULT_DUE_WINDOW_POLICY})"
+            if due_at is not None
+            else " — due time cleared (released by hand only)"
+        )
+    failures: dict[str, str] = {}
+
+    def op(tid: str) -> bool:
+        try:
+            return kb.schedule_task(
+                conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
+                due_at=due_at, window_policy=window_policy,
+            )
+        except ValueError as exc:  # e.g. --window-policy with no due time
+            failures[tid] = f"{tid}: {exc}"
+            return False
+
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+        op = _commented(conn, reason, author, "SCHEDULED", op)
+        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}{due_note}",
+                           lambda tid: failures.get(tid) or f"cannot schedule {tid}")
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
@@ -1030,6 +1453,99 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+
+
+def _cmd_reopen(args: argparse.Namespace) -> int:
+    """THE operator REOPEN door: a finished card back to a live status, in one audited act.
+
+    ``done``/``archived`` only -- every other state has its own door (``unblock``,
+    ``reopen-review``) and the kernel refuses BY NAME rather than guessing. ``--to blocked``
+    is the parked landing: a card whose work is DONE must not go back in front of a worker;
+    ``--to todo`` restores a card without making it dispatchable; ``--to ready`` (the
+    default) re-gates to ``todo`` on its own while a parent is unfinished.
+
+    ``--reason`` is RECORDED but NOT required: the kernel does not demand it, and the
+    shell surface does not add a requirement the kernel does not have. The SDLC repair always
+    passes one (``REPAIR_REASON``), and a bare ``reopen <id>`` is a legal operator act whose
+    comment simply carries no reason.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban reopen is orchestrator-only; a worker must hand off its assigned "
+                    "task instead of reopening a finished card")
+    task_id = getattr(args, "task_id", None)
+    if not task_id:
+        return _err("kanban reopen requires a task id", 2)
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    author = _profile_author()
+    dry_run = bool(getattr(args, "dry_run", False))
+    with kbc.connect_closing() as conn:
+        try:
+            ok, err, info = kb.reopen_task(
+                conn, task_id, actor=author, reason=reason or "",
+                dest_status=getattr(args, "to", None) or "ready",
+                block_kind=getattr(args, "block_kind", None), dry_run=dry_run)
+        except (ValueError, RuntimeError) as exc:
+            return _err(f"cannot reopen {task_id}: {exc}")
+    if not ok:
+        return _err(f"cannot reopen {task_id}: {err or 'refused'}")
+    if getattr(args, "json", False):
+        print(json.dumps({"id": task_id, **info}, sort_keys=True))
+    else:
+        print(f"{'Would reopen' if dry_run else 'Reopened'} {task_id}: "
+              f"{info.get('from_status')} -> {info.get('to_status')}")
+    return 0
+
+
+def _cmd_normalise(args: argparse.Namespace) -> int:
+    """THE repair door for a row holding an UNMODELLED ``tasks.status``.
+
+    A status outside ``kanban_workflow.DEFAULT_STATUSES`` (``in_progress`` is the measured one)
+    is refused by every verb that switches on status -- reclaim says "not running", reopen says
+    "only finished", unblock says "blocked/scheduled only", block refuses -- so the card is
+    stranded while the write that put it there left no audit row. This verb lands it on a modelled
+    status AND writes the ``status_changed`` event in the SAME transaction, so the fix is provable
+    by the instrument that should have caught the write.
+
+    ``--reason`` and ``--evidence`` are required (a forensic repair states its cause and points at
+    its measurement); ``--to`` is limited to ready/todo/blocked, because anything else would
+    fabricate work state rather than repair it.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban normalise is orchestrator-only; a worker must hand off its assigned "
+                    "task instead of rewriting a card's status")
+    task_id = getattr(args, "task_id", None) or getattr(args, "card", None)
+    if task_id and getattr(args, "task_id", None) and getattr(args, "card", None) \
+            and args.task_id != args.card:
+        return _err(f"kanban normalise names two different cards: {args.task_id!r} and "
+                    f"{args.card!r} — name one", 2)
+    if not task_id:
+        return _err("kanban normalise requires a task id (positional, or --card <id>)", 2)
+    with kbc.connect_closing() as conn:
+        try:
+            ok, refused, info = kb.normalise_task(
+                conn, task_id,
+                to=getattr(args, "to", None) or "",
+                reason=getattr(args, "reason", None) or "",
+                evidence=getattr(args, "evidence", None) or "",
+                by=_profile_author(),
+                block_kind=getattr(args, "block_kind", None),
+            )
+        except (ValueError, RuntimeError) as exc:
+            return _err(f"cannot normalise {task_id}: {exc}")
+        if not ok:
+            return _err(f"cannot normalise {task_id}: {refused or 'refused'}")
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    landed = info.get("to_status")
+    if getattr(args, "json", False):
+        print(json.dumps({"id": task_id, **info}, sort_keys=True))
+    else:
+        print(f"Normalised {task_id}: {info.get('from_status')!r} -> {landed!r}"
+              + (" (re-gated: an unfinished parent holds it in todo)"
+                 if info.get("to_status") != info.get("requested_to") else ""))
+    # A row that is STILL unmodelled after the write means something re-wrote it under us; say so.
+    if row is not None and not kb.is_modelled_status(row["status"]):
+        return _err(f"normalise wrote {landed!r} but the row now reads {row['status']!r}")
+    return 0
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1130,8 +1646,40 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
-                           lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+        reason = (getattr(args, "reason", None) or "").strip().lower()
+        if not reason and len(ids) > 1 and ids[-1].strip().lower() in kb.ARCHIVE_REASONS:
+            # ``promote``'s positional shape: ``archive <id>... <reason>``. A task id
+            # is never an archive reason token and the enum is a closed set, so the
+            # trailing token is unambiguous — no id can be misread as a reason.
+            reason, ids = ids[-1].strip().lower(), ids[:-1]
+        choices = "|".join(kb.ARCHIVE_REASONS)
+        # Refused HERE, before any card is touched: a bulk archive with no reason
+        # must not archive "most" of the selection and report the rest.
+        if not reason:
+            return _err(f"kanban archive: reason_missing: refusing to archive {', '.join(ids)} "
+                        f"with no reason — a reason is required and must be one of: {choices}", 2)
+        if reason not in kb.ARCHIVE_REASONS:
+            return _err(f"kanban archive: reason_invalid: {reason!r} is not an archive reason — "
+                        f"use one of: {choices}", 2)
+        destination = getattr(args, "destination", None)
+        actor = getattr(args, "actor", None) or _profile_author()
+        failed = False
+        for tid in ids:
+            try:
+                ok = kb.archive_task(conn, tid, reason=reason, actor=actor, destination=destination)
+            except kb.ArchiveRefused as exc:
+                # The code is the report: a caller branches on it, so it is printed
+                # verbatim rather than paraphrased into a sentence.
+                failed = True
+                print(f"cannot archive {tid}: {exc}", file=sys.stderr)
+                continue
+            if ok:
+                print(f"Archived {tid} ({reason})"
+                      + (f" -> {destination}" if destination else ""))
+            else:
+                failed = True
+                print(f"cannot archive {tid} (unknown id, or already archived)", file=sys.stderr)
+        return 1 if failed else 0
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
@@ -1149,6 +1697,19 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    stuck = stats.get("zero_run_ready") or {}
+    if int(stuck.get("count") or 0) > 0:
+        line = (
+            f"\nNever attempted: {stuck['count']} ready task(s); oldest "
+            f"{stuck['oldest_task_id']} ({stuck.get('oldest_assignee') or 'unassigned'}) "
+            f"waiting {int(stuck['oldest_age_seconds'])}s"
+        )
+        if stuck.get("oldest_spawnable") is False:
+            line += (
+                " - its assignee is not a live profile, so the dispatcher will never "
+                "launch a worker for it (reassign it, or create it unassigned)"
+            )
+        print(line)
     return 0
 
 
@@ -1314,8 +1875,249 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_decompose as decomp
 
     return _run_triage_sweep(args, "decompose", decomp, decomp.decompose_task, "decomposed",
-                             ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
+                             ("task_id", "ok", "reason", "fanout", "child_ids", "new_title",
+                              "refused"), _decompose_ok_line)
 
+
+def _defcon_authority(args: argparse.Namespace) -> str:
+    """Who is designating: ``--authority`` when given, else the acting profile."""
+    return (getattr(args, "authority", None) or "").strip() or _profile_author()
+
+
+def _cmd_defcon_designate(args: argparse.Namespace) -> int:
+    """Put one card in the reserved tranche: ledger row first, then the priority."""
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    if not reason:
+        return _err("kanban defcon designate: --reason is required (it is the audit answer)", 2)
+    with kbc.connect_closing() as conn:
+        try:
+            row = kb.designate_priority(
+                conn, args.task_id, reason=reason, authority=_defcon_authority(args),
+            )
+        except (ValueError, PermissionError) as exc:
+            return _err(f"kanban defcon designate: {exc}")
+    if _json_out(args, row):
+        return 0
+    print(f"Designated {row['task_id']}: priority {row['priority']} on board {row['board']!r}.\n"
+          f"  Authority: {row['authority']}\n"
+          f"  Reason:    {row['reason']}\n"
+          f"  Revoke restores priority {row['restore_priority']}.")
+    return 0
+
+
+def _cmd_defcon_revoke(args: argparse.Namespace) -> int:
+    """Release a designation: annotate the ledger row, restore the card's own priority.
+
+    The exit door. ``None`` from the kernel means the card holds no LIVE designation, and
+    that is a refusal rather than a silent no-op: a caller who believes they released a card
+    that was never designated has a wrong picture of the board.
+    """
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    if not reason:
+        return _err("kanban defcon revoke: --reason is required (it is the audit answer)", 2)
+    with kbc.connect_closing() as conn:
+        try:
+            row = kb.revoke_priority_designation(conn, args.task_id, reason=reason)
+        except (ValueError, PermissionError) as exc:
+            return _err(f"kanban defcon revoke: {exc}")
+    if row is None:
+        return _err(f"kanban defcon revoke: no live designation on {args.task_id} — "
+                    "nothing to release")
+    if _json_out(args, row):
+        return 0
+    print(f"Released {row['task_id']}: priority restored to {row['restored_priority']} on "
+          f"board {row['board']!r}.\n"
+          f"  Reason:     {row['revoke_reason']}\n"
+          f"  Designation: {row['reason']}")
+    if row.get("correction"):
+        corr = row["correction"]
+        print(f"  Correction: the ledger held {corr['stored']}; clamped to {corr['applied']} "
+              f"({corr['reason']}).")
+    if row.get("gate_lifts"):
+        print(f"  Gate lifts: {len(row['gate_lifts'])} card(s) re-lifted to hold the "
+              "work they still gate.")
+    return 0
+
+
+_DEFCON_HANDLERS = {"designate": _cmd_defcon_designate, "revoke": _cmd_defcon_revoke}
+
+def _cmd_defcon(args: argparse.Namespace) -> int:
+    """``hermes kanban defcon designate|revoke`` - the two doors into and out of the tranche."""
+    action = getattr(args, "defcon_action", None) or ""
+    handler = _DEFCON_HANDLERS.get(action)
+    if handler is None:
+        return _err(f"kanban defcon: unknown action {action!r}; use designate or revoke", 2)
+    return handler(args)
+
+
+#: Printed when `gates reconcile` is asked from a non-top-level session. Reading is safe anywhere;
+#: repairing rewrites priorities and edges on boards the caller may be judged on, so it is a
+#: host/operator act - and the write door refuses it at the DB layer as well, so this is the
+#: honest explanation rather than the trust boundary.
+_GATES_DELEGATED_CHILD_REFUSAL: str = (
+    "kanban gates reconcile: delegate_task child contexts cannot rewrite priorities and edges via "
+    "the CLI (a shell that merely unsets HERMES_DELEGATED_CHILD_CONTEXT is still refused when it "
+    "descends from a LIVE dispatched worker holding a claim on this board). "
+    "`hermes kanban gates report` is read-only and stays available anywhere; run reconcile from a "
+    "top-level session."
+)
+
+
+def _gates_from_delegated_child() -> bool:
+    """Is this invocation a delegated-child / card context? (the write door's own predicate)"""
+    from agent.delegation_context import kanban_path_is_fenced
+
+    return (kanban_path_is_fenced(kb.kanban_home())
+            or kanban_path_is_fenced(kb.kanban_db_path()))
+
+
+def _print_discharge(discharge: dict) -> None:
+    """One line for the discharge gate's two families: ``phantom_refs`` and ``void_claims``.
+
+    Printed in BOTH the clean and the violated branch, because the gate's outcomes are telemetry
+    and not part of the exit code: a refusal a worker answered must be countable without turning
+    ``gates report`` red forever (design record platform-stl t_0608ce6d).
+    """
+    families = (discharge or {}).get("families") or {}
+    if not families:
+        return
+    parts = []
+    for name in ("phantom_refs", "void_claims"):
+        counts = families.get(name) or {}
+        shown = ", ".join(f"{key} {value}" for key, value in counts.items() if value)
+        parts.append(f"{name}: {shown or 'none'}")
+    print(f"Discharge gate (mode={discharge.get('mode', '?')}): " + "; ".join(parts))
+
+
+def _cmd_gates(args: argparse.Namespace) -> int:
+    """``hermes kanban gates report|reconcile`` — the relations the write seams enforce.
+
+    FOUR invariant families, one verb: ``rank`` (no card ranks below a card it gates),
+    ``assignee`` (no row is assigned to a handle that cannot run), ``dependency`` (no block
+    waits on a card in prose with no edge) and ``evidence`` (no completion carries no evidence
+    record). Since the DISCHARGE gate (design record platform-stl t_0608ce6d) the record also
+    carries its two event families, ``phantom_refs`` and ``void_claims``, counted from
+    ``task_events`` - TELEMETRY, so they print and appear under ``--json`` but never move the
+    exit code. ``report`` is read-only and its EXIT CODE is the answer (0 = every invariant
+    holds, 1 = at least one is violated), so a carrier can gate on it instead of parsing prose.
+    ``reconcile`` is the deterministic pass: it repairs what has a deterministic repair, then
+    RE-MEASURES, and a non-zero exit means the board is still out of order after the pass - a
+    false green is the failure mode this exists to make impossible.
+
+    Restored 2026-10-13 (card t_dcd61b4d) with the kernel it drives (``kanban_db.gate_violations``
+    / ``reconcile_gate_priorities``): both were carried by the retired untracked-override set and
+    went dark with it, so the rank invariant could be neither measured nor reconciled.
+    """
+    from hermes_cli import kanban_gate_invariants as _gate_inv
+    action = (getattr(args, "action", None) or "report").strip().lower()
+    if action not in ("report", "reconcile"):
+        return _err(f"kanban gates: unknown action {action!r}; use report or reconcile", 2)
+    if action == "reconcile" and _gates_from_delegated_child():
+        return _err(_GATES_DELEGATED_CHILD_REFUSAL)
+    with kbc.connect_closing() as conn:
+        if action == "report":
+            violations = kb.gate_violations(conn)
+            families = _gate_inv.report(conn)
+            # The DISCHARGE gate's event families (design record platform-stl t_0608ce6d). Read
+            # here rather than inside ``report()`` so the kernel's invariant report keeps its
+            # four-family contract, and so this telemetry can never leak into ``open_total`` /
+            # the exit code: a refusal a worker then answered is a gate WORKING, not an open
+            # violation, and counting it as one would pin the report red forever.
+            from hermes_cli.kanban_completion_refs import event_families
+
+            discharge = event_families(conn)
+            record: dict = {
+                "board": kb.board_for_connection(conn) or "",
+                "violations": violations,
+                "violations_total": len(violations),
+                "families": families["violations"],
+                "counts": families["counts"],
+                "families_total": families["violations_total"],
+                "open_total": families["open_total"],
+                "armed": {**families["armed"], "discharge_gate": discharge["mode"]},
+                "discharge": discharge,
+            }
+            remaining = record["violations_total"] + families["open_total"]
+        else:
+            record = kb.reconcile_gate_priorities(conn)
+            extra = _gate_inv.reconcile(conn, cause="gates reconcile")
+            record["families"] = extra["violations"]
+            record["counts"] = extra["counts_after"]
+            record["counts_before_families"] = extra["counts_before"]
+            record["repaired"] = extra["repaired"]
+            record["unrepaired"] = extra["unrepaired"]
+            record["families_before"] = extra["violations_before"]
+            record["families_after"] = extra["violations_after"]
+            record["open_total"] = extra["open_total_after"]
+            record["armed"] = extra["armed"]
+            record["evidence_gate_since"] = extra["evidence_gate_since"]
+            record["reconcile_stamped_evidence_since"] = extra["stamped_evidence_since"]
+            remaining = record["violations_after"] + extra["open_total_after"]
+    if _json_out(args, record):
+        return 0 if (remaining == 0 and not record.get("failed")) else 1
+    if action == "report":
+        families = record["families"] or {}
+        rank_rows = families.get("rank") or record["violations"]
+        open_total = record["violations_total"] + record["open_total"]
+        if open_total == 0:
+            print(f"Gate invariants hold on board {record['board']!r}: no open violation in rank, "
+                  "assignee, dependency or evidence.")
+            return 0
+        print(f"Gate invariants on board {record['board']!r}: {open_total} open violation(s) "
+              f"(rank {len(rank_rows)}, assignee {len(families.get('assignee') or [])}, "
+              f"dependency {len(families.get('dependency') or [])}, "
+              f"evidence {len(families.get('evidence') or [])}).")
+        for name in ("rank", "assignee", "dependency", "evidence"):
+            rows = rank_rows if name == "rank" else (families.get(name) or [])
+            if not rows:
+                continue
+            print(f"{name}: {len(rows)}")
+            for row in rows[:50]:
+                if name == "rank":
+                    print(f"  {row['parent_id']} (p={row['parent_priority']}) ranks below the card "
+                          f"it gates, {row['child_id']} (p={row['child_priority']})")
+                elif name == "assignee":
+                    print(f"  {row['task_id']} ({row['status']}) assignee={row['assignee']!r} "
+                          "resolves nowhere")
+                elif name == "dependency":
+                    shipped = row.get("dependencies_shipped") or []
+                    suffix = f" (already shipped: {', '.join(shipped)})" if shipped else ""
+                    print(f"  {row['task_id']} blocked, names "
+                          f"{', '.join(row.get('named') or [])} with no edge{suffix}")
+                else:
+                    print(f"  {row['task_id']} done with no evidence record")
+        _print_discharge(record.get("discharge") or {})
+        if record["violations_total"] == 0 and record["open_total"] == 0:
+            return 0
+        return 1
+    print(f"Gate reconcile on board {record['board']!r}: {record['violations_before']} rank "
+          f"edge(s) before, {record['lifts_total']} lift(s), {record['violations_after']} after; "
+          f"assignee/dependency/evidence {dict(record.get('families_before') or {})} before -> "
+          f"{dict(record.get('families_after') or {})} after.")
+    for lift in record["lifts"]:
+        print(f"  lifted {lift['task_id']}: {lift['before']} -> {lift['now']} "
+              f"(gates {lift['gate']} at {lift['gate_priority']}, cause {lift['cause']}"
+              f"{', designating it' if lift['tranche'] else ''})")
+    for row in record.get("repaired", []):
+        print(f"  repaired {row}")
+    for row in record.get("unrepaired", [])[:25]:
+        print(f"  UNREPAIRED {row.get('task_id')} "
+              f"({row.get('assignee') or row.get('block_kind') or ''}): {row.get('why')}",
+              file=sys.stderr)
+    for bad in record["failed"]:
+        print(f"  FAILED {bad['task_id']}: {bad['error']}", file=sys.stderr)
+    return 0 if (remaining == 0 and not record["failed"]) else 1
+
+
+def _cmd_bulk_approvals(args: argparse.Namespace) -> int:
+    """``hermes kanban bulk-approvals <ask|approve|list|show>`` (decked in kanban_bulk_guard)."""
+    handler = kbg.APPROVAL_HANDLERS.get(getattr(args, "bulk_approvals_action", None))
+    if not handler:
+        return _err("kanban bulk-approvals: unknown subcommand", 2)
+    try:
+        return int(handler(args) or 0)
+    except kbg.BulkActionRefused as exc:
+        return _err(str(exc), 1)
 
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
@@ -1327,7 +2129,9 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "set-contract": _cmd_set_contract, "retarget": _cmd_retarget,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "reopen": _cmd_reopen,
+    "normalise": _cmd_normalise,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
@@ -1336,7 +2140,14 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc,
+    "gc": _cmd_gc, "defcon": _cmd_defcon,
+    # The authorized-ask door behind the bulk gate (decked in kanban_bulk_guard): a bulk action
+    # is refused unless its ask is filed HERE first, and this is how the ask gets filed.
+    "bulk-approvals": _cmd_bulk_approvals,
+    # The gate invariant's pass. Read-only `report` stays available to every lane (it is how a
+    # lane answers "is the board out of order?"); `reconcile` writes, and is refused to a
+    # delegated child inside the handler.
+    "gates": _cmd_gates,
 }
 
 

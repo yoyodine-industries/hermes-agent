@@ -83,7 +83,7 @@ def _cmd_status(emit_json: bool) -> int:
     from agent.lsp.servers import UNTRUSTED_SAFE_SERVERS
     servers = _all_servers()
     svc = get_service()
-    info = svc.get_status() if svc is not None else {"enabled": False}
+    info = svc.get_status() if svc is not None else _host_residency_without_service()
     if emit_json:
         import json
         registry = [{"server_id": s.server_id, "extensions": list(s.extensions), "description": s.description,
@@ -108,6 +108,14 @@ def _cmd_status(emit_json: bool) -> int:
         if untrusted := info.get("untrusted_skipped"):
             out.append(f"  untrusted skips: {len(untrusted)} (add the workspace to lsp.trusted_workspaces)")
             out += [f"    - {sid:20s} root={root}" for sid, root in untrusted]
+    # The HOST bound, which the per-process clients above are only one profile's share of.
+    resident = info.get("resident_servers") or []
+    ceiling = info.get("max_resident_servers")
+    limit = f"{ceiling}" if ceiling else "off (unbounded)"
+    out.append(f"  host residency:  {len(resident)}/{limit} resident servers (all profiles)")
+    out += [f"    - {r['server_id']:20s} profile={r.get('profile', '?')!s:18s} "
+            f"idle={r.get('idle_seconds', 0):>6}s pid={r.get('pid')} root={r.get('workspace_root')}"
+            for r in resident]
     # Sidecar gaps the registry table can't show (bash-language-server -> shellcheck).
     if backend_warnings := _backend_warnings():
         out += ["", "Backend warnings", "================"] + [f"  ! {line}" for line in backend_warnings]
@@ -123,6 +131,30 @@ def _cmd_status(emit_json: bool) -> int:
             out.append(f"      {s.description}{gate}")
     sys.stdout.write("\n".join(out) + "\n")
     return 0
+
+
+def _host_residency_without_service() -> dict:
+    """Status for a process that owns no LSP service (LSP disabled here, or a bare ``hermes lsp status``).
+
+    The HOST's resident set is not this process's property, so it is still read and published:
+    servers another profile spawned are exactly what the ceiling is about.
+    """
+    from agent.lsp.manager import DEFAULT_MAX_RESIDENT_SERVERS, _count_setting
+    from agent.lsp.residency import HostResidency
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        lsp_cfg = load_config_readonly().get("lsp") or {}
+    except Exception:
+        lsp_cfg = {}
+    ceiling = (_count_setting(lsp_cfg.get("max_resident_servers"), DEFAULT_MAX_RESIDENT_SERVERS)
+               if isinstance(lsp_cfg, dict) else DEFAULT_MAX_RESIDENT_SERVERS)
+    try:
+        resident = [entry.as_status() for entry in HostResidency().census()]
+    except Exception:
+        resident = []
+    return {"enabled": False, "max_resident_servers": ceiling,
+            "resident_count": len(resident), "resident_servers": resident}
 
 
 def _cmd_list(installed_only: bool) -> int:

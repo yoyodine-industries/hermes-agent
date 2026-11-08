@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import functools
 import sys
+from typing import Optional
 
 from hermes_cli import projects_db as pdb
 
@@ -47,6 +48,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     project_sub("remove-folder", "Remove a folder from a project").add_argument("path", help="Folder path")
     project_sub("rename", "Rename a project").add_argument("name", help="New name")
     project_sub("set-primary", "Set the primary folder").add_argument("path", help="Folder path (must already be in project)")
+    project_sub("set-about", "Set the project's about (one-line description)").add_argument(
+        "text", help="New about text, stored verbatim (pass \"\" to clear it)"
+    )
     p_use = sub.add_parser("use", help="Set the active project")
     p_use.add_argument("project", nargs="?", default=None, help="Project id or slug (omit to clear)")
     project_sub("archive", "Archive a project")
@@ -191,6 +195,17 @@ def _cmd_set_primary(args, conn, proj):
     return f"Set primary of {proj.slug} -> {args.path}"
 
 
+@_with_project
+def _cmd_set_about(args, conn, proj) -> str:
+    """``hermes project set-about <project> <text>`` — the post-create about editor.
+
+    Stored verbatim (no strip, no rewriting) so ``show`` round-trips byte-exactly; ``""`` is
+    legal and clears it, which makes ``_print_project`` drop the ``about:`` line.
+    """
+    pdb.update_project(conn, proj.id, description=args.text)
+    return f"Set about of {proj.slug}"
+
+
 @_db_command
 def _cmd_use(args, conn):
     if not args.project:
@@ -208,21 +223,101 @@ def _flag_command(op: str, verb: str):
     return _with_project(lambda args, conn, proj: (getattr(pdb, op)(conn, proj.id), f"{verb} {proj.slug}")[1])
 
 
-@_with_project
-def _cmd_bind_board(args, conn, proj) -> str:
-    pdb.update_project(conn, proj.id, board_slug=args.board)
-    if not args.board.strip():
-        return f"Unbound board from {proj.slug}"
-    if proj.primary_path:  # best-effort: point the bound board's default_workdir at the primary repo
-        try:
-            from hermes_cli import kanban_db as kb
+def _board_meta_writer(board: str):
+    """``(slug, write_board_metadata)`` for a board that exists, else ``(None, None)``.
 
-            slug = kb._normalize_board_slug(args.board)
-            if slug and (slug == kb.DEFAULT_BOARD or kb.board_exists(slug)):
-                kb.write_board_metadata(slug, default_workdir=proj.primary_path)
-        except Exception:
-            pass
-    return f"Bound {proj.slug} -> board {args.board}"
+    Never raises: ``bind-board`` is a convenience for the human filing a workstream, so a
+    board slug that matches nothing must not fail the project write (it stays fail-soft,
+    exactly like the ``default_workdir`` write this seam already made).
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+
+        slug = kb._normalize_board_slug(board)
+        if slug and (slug == kb.DEFAULT_BOARD or kb.board_exists(slug)):
+            return slug, kb.write_board_metadata
+    except Exception:
+        pass
+    return None, None
+
+
+def _board_project_write(board: str, **fields) -> Optional[str]:
+    """Write ``board``'s metadata; return a refusal message, or ``None`` on success/skip.
+
+    Fail-soft is the ruling for a board that does not RESOLVE (``_board_meta_writer`` gives
+    ``(None, None)``): the project row is what the caller asked for and it must not fail on the
+    board convenience. A REFUSAL is not a missing board. ``write_board_metadata`` calls
+    ``_assert_not_delegated_child_mutation``, which refuses a board write from a session
+    descended from a live dispatched worker — and swallowing that made ``bind-board`` print
+    ``Bound … -> board …`` while nothing landed (measured 2026-10-13 from a dispatched worker's
+    own session, i.e. the very lane that files workstream cards): a false green of exactly the
+    class this card closes. A refusal comes back as a message the caller reports.
+    """
+    slug, write = _board_meta_writer(board)
+    if write is None:
+        return None
+    try:
+        write(slug, **fields)
+    except PermissionError as exc:
+        return str(exc) or "the board write was refused"
+    except Exception:
+        return None
+    return None
+
+
+def _clear_board_project(board: str, proj) -> Optional[str]:
+    """Fail-soft: drop ``board``'s default project when it points at ``proj``."""
+    slug, _write = _board_meta_writer(board)
+    if slug is None:
+        return None
+    try:
+        from hermes_cli import kanban_db as kb
+
+        current = (kb.read_board_metadata(slug).get("project_id") or "").strip()
+    except Exception:
+        return None
+    if current and current in {proj.slug, proj.id}:
+        return _board_project_write(slug, project_id="")
+    return None
+
+
+def _board_refusal(proj, board: str, refusal: str) -> int:
+    """The project row landed, the board link did not: say so and exit non-zero."""
+    return _err(
+        f"{proj.slug} -> board {board}: the project row was updated, but the board's "
+        f"default project did NOT land \u2014 {refusal}"
+    )
+
+
+@_with_project
+def _cmd_bind_board(args, conn, proj) -> int | str:
+    """``hermes project bind-board <project> [board]`` — the board half of the link.
+
+    Binding writes the board's DEFAULT PROJECT (``board.json:project_id``) beside the
+    ``default_workdir`` it already wrote. ``create_task`` reads that key to scope every new
+    task on the board to the project (deterministic worktree + branch), so "the project
+    groups the cards" no longer rests on every creator remembering ``--project``. The value
+    stored is the project's **slug**, never its ``p_…`` id: a slug is stable across the
+    per-profile registries (``$HERMES_HOME/projects.db``), an id is not. Unbinding (no board
+    argument) clears the key again. The board writes stay fail-soft for a board that does not
+    resolve, but a REFUSED write is reported rather than dressed as success.
+    """
+    previous_board = (proj.board_slug or "").strip()
+    board = (args.board or "").strip()
+    pdb.update_project(conn, proj.id, board_slug=args.board)
+    if not board:
+        refusal = _clear_board_project(previous_board, proj)
+        if refusal:
+            return _board_refusal(proj, previous_board, refusal)
+        return f"Unbound board from {proj.slug}"
+    refusal = _board_project_write(
+        board, default_workdir=proj.primary_path, project_id=proj.slug,
+    )
+    if previous_board and previous_board != board:
+        _clear_board_project(previous_board, proj)
+    if refusal:
+        return _board_refusal(proj, board, refusal)
+    return f"Bound {proj.slug} -> board {board}"
 
 
 _HANDLERS = {
@@ -234,6 +329,7 @@ _HANDLERS = {
     "remove-folder": _cmd_remove_folder,
     "rename": _cmd_rename,
     "set-primary": _cmd_set_primary,
+    "set-about": _cmd_set_about,
     "use": _cmd_use,
     "archive": _flag_command("archive_project", "Archived"),
     "restore": _flag_command("restore_project", "Restored"),

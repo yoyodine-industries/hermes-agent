@@ -618,11 +618,78 @@ describe('gateway mirror', () => {
   it('omits empty runtime rooms', async () => {
     const { chat } = await loadRoom()
 
+    // The disband path flags its runtime tombstone (`tombstone: true`,
+    // group-chat-view.tsx) — that flag, not the empty log, is what keeps it
+    // out of the mirror.
     const snapshot = chat.groupChatSyncSnapshot({
-      Disbanded: { log: [], members: [{ name: 'research' }] }
+      Disbanded: { log: [], members: [{ name: 'research' }], tombstone: true, running: false },
+      // A disband husk that lost its roster (the id-carrying record a late
+      // prompt harvest rewrites) must not publish either — it would come back
+      // as a normalized room on the next hydrate.
+      Husk: { log: [], roomId: 'rm-husk', stranded: { research: 0 } }
     } as unknown as Record<string, GroupChat>)
 
     expect(Object.keys(snapshot.rooms)).toEqual([])
+  })
+
+  it('publishes a freshly created room that has no messages yet', async () => {
+    const { chat } = await loadRoom()
+
+    const snapshot = chat.groupChatSyncSnapshot({
+      'New Room': {
+        log: [],
+        members: [{ name: 'research' }, { name: 'builder' }],
+        roomId: 'rm-new-room',
+        syncRevision: 0
+      }
+    } as unknown as Record<string, GroupChat>)
+
+    // A room the user just made used to be filtered out until someone spoke
+    // in it, so it never reached the mirror at all.
+    expect(Object.keys(snapshot.rooms)).toEqual(['id:rm-new-room'])
+    expect(snapshot.rooms['id:rm-new-room'].members?.map(member => member.name)).toEqual([
+      'research',
+      'builder'
+    ])
+  })
+
+  it('sheds log entries to fit the budget, never a room', async () => {
+    const { chat } = await loadRoom()
+
+    const entry = (index: number) => ({
+      at: index,
+      from: { kind: 'user' as const, name: 'You' },
+      text: `${index} ${'x'.repeat(1200)}`
+    })
+
+    const fat = (prefix: string) => ({
+      log: Array.from({ length: 16 }, (_, index) => entry(index)),
+      members: [{ name: 'research' }],
+      roomId: prefix
+    })
+
+    // ~4 × 20 KB of history in a 48 KB budget: the old fit trimmed each room
+    // to one entry and then deleted whatever still did not fit — and because
+    // the loop ran newest-room-last, that was always the room just created.
+    const snapshot = chat.groupChatSyncSnapshot({
+      Platform: fat('rm-platform'),
+      Alpha: fat('rm-alpha'),
+      Beta: fat('rm-beta'),
+      Gamma: fat('rm-gamma'),
+      Fresh: { log: [], members: [{ name: 'builder' }], roomId: 'rm-fresh' }
+    } as unknown as Record<string, GroupChat>)
+
+    expect(Object.keys(snapshot.rooms).sort()).toEqual([
+      'id:rm-alpha',
+      'id:rm-beta',
+      'id:rm-fresh',
+      'id:rm-gamma',
+      'id:rm-platform'
+    ])
+    expect(chat.groupChatGatewayJsonSize(snapshot)).toBeLessThanOrEqual(48000)
+    expect(snapshot.rooms['id:rm-platform'].log.length).toBeLessThan(16)
+    expect(snapshot.rooms['id:rm-platform'].omitted).toBe(16 - snapshot.rooms['id:rm-platform'].log.length)
+    expect(snapshot.rooms['id:rm-fresh'].log).toEqual([])
   })
 
   it('an empty hydrate cannot erase a shared room mirror', async () => {
@@ -643,7 +710,10 @@ describe('gateway mirror', () => {
     const envelope = published(room)
 
     expect(Object.keys(envelope.rooms as object)).toEqual([])
-    expect((envelope.deleted as Record<string, number>)['name:Research']).toBeGreaterThan(0)
+    // Legacy name tombstones are read-only compat: honouring one here is fine,
+    // republishing it is not — every publish writes the deleted union back, so
+    // a name key would outlive every mirror and bar that name from reuse.
+    expect(envelope.deleted).toBeUndefined()
   })
 })
 
@@ -695,7 +765,9 @@ describe('snapshot merge', () => {
     )
 
     expect(stale.rooms['name:Research']).toBeUndefined()
-    expect(stale.deleted?.['name:Research']).toBe(2)
+    // Read compat: the legacy name tombstone still retired the room above, but
+    // it is NOT carried into the publish — that union is what made it immortal.
+    expect(stale.deleted).toBeUndefined()
 
     const recreated = chat.mergeGroupChatSyncSnapshots(stale, {
       rooms: {
@@ -725,7 +797,62 @@ describe('snapshot merge', () => {
     )
 
     expect(merged.rooms['name:ClockSkewed']).toBeUndefined()
-    expect(merged.deleted?.['name:ClockSkewed']).toBe(9)
+    expect(merged.deleted).toBeUndefined()
+  })
+
+  it('a v3 snapshot carrying legacy name tombstones republishes only id tombstones', async () => {
+    const { chat } = await loadRoom()
+
+    const merged = chat.mergeGroupChatSyncSnapshots(
+      {
+        deleted: { 'name:Research': 40, 'name:Engines Group Chat': 12, 'id:room-7': 41 },
+        rooms: {},
+        version: 3
+      },
+      { deleted: { 'name:Financially Team Chat': 9 }, rooms: {}, version: 3 }
+    )
+
+    // Id-only round trip: the poison keys are read (they already did their
+    // job) and dropped, so the mirror heals on the next publish.
+    expect(Object.keys(merged.deleted || {})).toEqual(['id:room-7'])
+  })
+
+  it('a name tombstone still retires a legacy name-keyed room on read', async () => {
+    const { chat } = await loadRoom()
+
+    const merged = chat.mergeRemoteGroupChatSnapshotIntoRooms(
+      { deleted: { 'name:Legacy': 4 }, rooms: {}, version: 3 },
+      {
+        Legacy: {
+          log: [{ at: 1, from: { kind: 'user', name: 'You' }, text: 'old' }],
+          members: [{ name: 'research' }],
+          syncRevision: 0
+        }
+      } as unknown as Record<string, GroupChat>
+    )
+
+    expect(merged.Legacy).toBeUndefined()
+  })
+
+  it('a name tombstone cannot delete a room that carries a roomId', async () => {
+    const { chat } = await loadRoom()
+
+    // The incident shape: a stale mirror still publishes `name:Research`
+    // forever, and the user just remade Research, which starts at
+    // syncRevision 0 and can never outrank the tombstone's revision.
+    const merged = chat.mergeRemoteGroupChatSnapshotIntoRooms(
+      { deleted: { 'name:Research': 999 }, rooms: {}, version: 3 },
+      {
+        Research: {
+          log: [{ at: 5, from: { kind: 'user', name: 'You' }, text: 'recreated' }],
+          members: [{ name: 'research' }],
+          roomId: 'rm354wsu3b-fqc24',
+          syncRevision: 0
+        }
+      } as unknown as Record<string, GroupChat>
+    )
+
+    expect(merged.Research?.log[0].text).toBe('recreated')
   })
 
   it('lets a conflicting writer merge the winner and preserve both stable message ids', async () => {
@@ -872,7 +999,7 @@ describe('cold hydrate', () => {
 // field update on the same key, and a name-keyed tombstone must never be able
 // to kill an id-keyed room (or vice versa).
 describe('room identity', () => {
-  it('rename publishes a new room plus an old-name tombstone that cold hydrate cannot resurrect', async () => {
+  it('rename publishes the new room and leaves no name tombstone behind', async () => {
     const { chat } = await loadRoom()
 
     const before: SyncSnapshot = {
@@ -906,7 +1033,9 @@ describe('room identity', () => {
     const hydrated = chat.mergeRemoteGroupChatSnapshotIntoRooms(after, {})
 
     expect(after.rooms['name:Old']).toBeUndefined()
-    expect(after.deleted?.['name:Old']).toBe(5)
+    // The old name is not retired by a published tombstone: a `name:` key
+    // outlives the room it remembers and would forbid the name forever.
+    expect(after.deleted).toBeUndefined()
     expect(after.rooms['name:New'].revision).toBe(5)
     expect(after.rooms['name:New'].image).toBe('data:image/png;base64,room')
     expect(hydrated.Old).toBeUndefined()
@@ -1047,9 +1176,9 @@ describe('room identity', () => {
     expect(after.rooms['id:room-3']).toBeDefined()
     expect(after.rooms['id:room-3'].name).toBe('New')
     expect(after.deleted?.['id:room-3']).toBeUndefined()
-    // A residual name:Old tombstone is correct — it retires stale v2/legacy
-    // copies of this room that older clients published under the name key.
-    expect(after.deleted?.['name:Old']).toBe(3)
+    // No name:Old residue either — an id-keyed room's rename needs no tombstone,
+    // and a name key would bar that name from reuse on every mirror forever.
+    expect(after.deleted).toBeUndefined()
 
     // Hydrate path: the pull that races the rename write must not delete the
     // locally re-keyed record just because the remote copy still says Old.

@@ -19,7 +19,9 @@ def test_script_termination_reaps_descendants(tmp_path, monkeypatch, trigger, to
     from cron import scheduler, scheduler_script
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr(scheduler_script, "_get_script_timeout", lambda: 3 if trigger == "timeout" else 60)
+    # Signature mirrors the real helper's new optional ``job`` argument (the job's own
+    # script_timeout_seconds); the pinned budgets and every assertion are unchanged.
+    monkeypatch.setattr(scheduler_script, "_get_script_timeout", lambda job=None: 3 if trigger == "timeout" else 60)
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     ready = tmp_path / "child.pid"

@@ -172,6 +172,7 @@ def _git_ignored(root: Path) -> set[Path]:
         out = subprocess.run(
             ["git", "-C", str(root), "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
             capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+            encoding="utf-8", errors="replace",
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return set()

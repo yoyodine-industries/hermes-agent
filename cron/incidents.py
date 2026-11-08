@@ -30,6 +30,27 @@ EXECUTIONS_FILE: Optional[Path] = None
 # ``resolved``: the job ran OK after the failure (auto); ``closed``: the operator acked the signature
 # and wants it silent. Only ``closed`` is terminal; a repeat of a resolved error re-opens it.
 INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
+#: The failure class whose jobs CANNOT run rather than merely failing: the job invokes a path
+#: that is not there. Judged by the predicates below rather than by the keyword table - every one
+#: of these failures also contains "script" (the `no_agent` wrapper writes it), so the table would
+#: file them all as ``script`` and the act that depends on this class (``cron/unreachable_path.py``)
+#: would never fire. ``exit 127`` and the shell's own "No such file or directory" are the only
+#: reliable discriminators.
+UNREACHABLE_PATH = "unreachable_path"
+# ``bash: /opt/x/y.sh: No such file or directory`` and, with a line number in front of it,
+# ``bash: line 50: exec /opt/x/python3: No such file or directory`` - the path is captured, not
+# swallowed: the act routes the card from it. Case-insensitive because a shell message is not
+# guaranteed to keep the reference capitalization.
+_NO_SUCH_FILE_RE = re.compile(
+    r"(?:bash: )?(?:line \d+: )?(?P<path>/\S*?): no such file or directory", re.IGNORECASE
+)
+# The 127 exit says the same thing when the shell's stderr did not survive into the error text.
+_EXIT_127_RE = re.compile(
+    r"\bexit(?:ed)?\b[^0-9\n]{0,20}\b127\b|\b(?:code|status)[\s:=]+127\b", re.IGNORECASE
+)
+# Last resort for a 127 that names its path in a shape the shell message above does not cover
+# (``/opt/x/y: command not found``): the first absolute path in the text.
+_FIRST_ABS_PATH_RE = re.compile(r"(?P<path>/[\w./+@-]+)")
 _FAILURE_TYPE_ORDER = (
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
@@ -93,6 +114,16 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     # Ledgers created before the alert-once gate lack ``alerted_at``; add it in place.
     add_column_if_missing(conn, "cron_incidents", "alerted_at", "alerted_at TEXT")
+    # The unreachable_path ACT (``cron/unreachable_path.py``) stamps the card it filed - and the
+    # board that holds it - on the row it filed it for, or the reason it could not. The row is the
+    # index recovery closes from, so a failure-to-act is observable in the same place the operator
+    # reads the failure. Ledgers created before the act lack all three; add them in place.
+    add_column_if_missing(conn, "cron_incidents", "unreachable_card_id",
+                          "unreachable_card_id TEXT")
+    add_column_if_missing(conn, "cron_incidents", "unreachable_card_board",
+                          "unreachable_card_board TEXT")
+    add_column_if_missing(conn, "cron_incidents", "unreachable_card_error",
+                          "unreachable_card_error TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_cron_incidents_job "
         "ON cron_incidents(job_id)"
@@ -138,11 +169,41 @@ def _incident_id(job_id: str, error_sig: str) -> str:
     return f"{job_id[:6]}_{error_sig}"
 
 
+def is_unreachable_path(error: str) -> bool:
+    """Whether ``error`` names a path that is not there (or carries the ``127`` exit).
+
+    Read from the RAW text, not the normalized one: the captured path is case-sensitive on disk,
+    and ``_normalize_error`` lowercases. Both predicates are shell facts, not keywords.
+    """
+    text = str(error or "")
+    if not text.strip():
+        return False
+    return bool(_NO_SUCH_FILE_RE.search(text) or _EXIT_127_RE.search(text))
+
+
+def captured_path(error: str) -> Optional[str]:
+    """The path the failure says is missing; ``None`` when the text names none.
+
+    The shell's own message wins (it is the path the kernel was handed); a bare ``127`` with no
+    such message falls back to the first absolute path in the text, because a 127 that names its
+    path as ``<path>: command not found`` is the same defect and must still route somewhere.
+    """
+    text = str(error or "")
+    if not text.strip():
+        return None
+    match = _NO_SUCH_FILE_RE.search(text) or _FIRST_ABS_PATH_RE.search(text)
+    return match.group("path") if match else None
+
+
 def _classify_failure_type(error: str) -> str:
     """Classify a failure from error-text keywords; ``unknown`` is the default."""
     text = _normalize_error(error)
     if not text:
         return "unknown"
+    # The unreachable-path class is judged FIRST and by its own predicates: see UNREACHABLE_PATH
+    # above for why the keyword table below cannot be trusted to find it.
+    if is_unreachable_path(error):
+        return UNREACHABLE_PATH
     for kind, patterns in _FAILURE_TYPE_ORDER:
         for pattern in patterns:
             if pattern.startswith("\\b") and pattern.endswith("\\b"):
@@ -291,3 +352,68 @@ def count_incidents(state: Optional[str] = None) -> int:
     with _transaction() as conn:
         row = conn.execute("SELECT COUNT(*) AS n FROM cron_incidents" + where, params).fetchone()
     return int(row["n"]) if row is not None else 0
+
+
+def record_unreachable_card(
+    incident_id: str, *, card_id: Optional[str] = None, board: Optional[str] = None,
+    error: Optional[str] = None,
+) -> bool:
+    """Stamp the card the unreachable-path act filed, or why it filed none.
+
+    A ``card_id`` records the act; an ``error`` (with no card) records a failure-to-act, which is
+    the case a reader must be able to see - a job failing every tick with neither a card nor a
+    reason on its row is the silent failure the act exists to end.
+    """
+    if not incident_id:
+        return False
+    with _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE cron_incidents
+               SET unreachable_card_id=?, unreachable_card_board=?, unreachable_card_error=?
+               WHERE id=?""",
+            (
+                str(card_id) if card_id else None,
+                str(board) if board else None,
+                _redact_error(error) if error else None,
+                str(incident_id),
+            ),
+        )
+        return bool(cursor.rowcount)
+
+
+def record_unreachable_card_closed(incident_id: Optional[str], card_id: Optional[str]) -> bool:
+    """Drop the row's card stamp once recovery has closed it, so the next success is cheap.
+
+    The ``unreachable_card_error`` is cleared with it: the act's own record is spent the moment
+    the card it points at is closed, and a stale pointer would make every later success pay for
+    a board read.
+    """
+    if not incident_id or not card_id:
+        return False
+    with _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE cron_incidents
+               SET unreachable_card_id=NULL, unreachable_card_board=NULL, unreachable_card_error=NULL
+               WHERE id=? AND unreachable_card_id=?""",
+            (str(incident_id), str(card_id)),
+        )
+        return bool(cursor.rowcount)
+
+
+def open_unreachable_cards(job_id: str) -> list[dict[str, Any]]:
+    """Rows for ``job_id`` that still point at a card the act filed.
+
+    This is the recovery INDEX, and the reason a healthy job costs no board access at all: an
+    empty answer here means nothing was ever filed for the job, so there is nothing to close.
+    """
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT id, unreachable_card_id, unreachable_card_board, unreachable_card_error
+               FROM cron_incidents
+               WHERE job_id=? AND unreachable_card_id IS NOT NULL
+                     AND unreachable_card_id != ''
+               ORDER BY last_seen_at DESC""",
+            (str(job_id or ""),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+

@@ -230,6 +230,47 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
     return True, f"unmerged:{len(unmerged)}" if unmerged else ""
 
 
+PARKED_ACTION_SWITCH_BACK = "switch_back"
+PARKED_ACTION_IN_PLACE = "in_place"
+PARKED_ACTION_KEPT = "kept"
+PARKED_ACTION_BLOCKED = "blocked"
+
+
+def resolve_parked_branch_action(
+    switch_safe: bool, switch_block_reason: str, strategy: str, switch_branch: bool = False
+) -> tuple[str, str]:
+    """The one place the ORDER of ``strategy`` vs ``dirty`` is decided (card t_81a8216c).
+
+    ``_assess_parked_branch_switch`` answers "may this checkout be SWITCHED back to the target".
+    That is not the same question as "may this checkout be UPDATED", and answering the second
+    with the first is what left the live ``overrides/live`` line un-updated for ten days: a dirty
+    tree is unswitchable, but under ``parked_branch_strategy: update_in_place`` nothing is switched
+    at all, so the uncommitted work never crosses a branch - which is the only thing the dirty
+    bail exists to prevent.
+
+    - switch_safe, no ``unmerged:``     -> ``switch_back`` (fully merged; switching loses nothing)
+    - switch_safe, ``unmerged:<n>``     -> ``in_place`` when the strategy allows it, else ``kept``
+      (loud notice, switch anyway: non-interactive callers cannot resolve a skip)
+    - not switch_safe, ``dirty``        -> ``in_place`` when the strategy allows it, else ``blocked``
+    - anything else (``disabled``/``unverifiable``) -> ``blocked``
+
+    ``--switch-branch`` turns the in-place arm off for the run, because the act it requests IS a
+    switch - so a dirty tree is blocked again, exactly as before this change. Unknown or
+    unreadable strategy keeps the historical default (``switch``), so a config failure can only
+    ever REMOVE the in-place arm, never grant it.
+    """
+    in_place_allowed = (strategy == "update_in_place") and not switch_branch
+    if switch_safe:
+        if not str(switch_block_reason or "").startswith("unmerged:"):
+            return PARKED_ACTION_SWITCH_BACK, switch_block_reason
+        return (
+            PARKED_ACTION_IN_PLACE if in_place_allowed else PARKED_ACTION_KEPT
+        ), switch_block_reason
+    if switch_block_reason == "dirty" and in_place_allowed:
+        return PARKED_ACTION_IN_PLACE, switch_block_reason
+    return PARKED_ACTION_BLOCKED, switch_block_reason
+
+
 _PARKED_SKIP_WHY = {
     "dirty": "the working tree has uncommitted changes",
     "disabled": "updates.auto_switch_parked_branch is set to false in config.yaml",

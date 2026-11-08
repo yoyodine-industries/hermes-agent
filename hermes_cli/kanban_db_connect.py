@@ -720,8 +720,24 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
-    from agent.delegation_context import kanban_path_is_fenced
-    if kanban_path_is_fenced(path):
+    from agent.delegation_context import (
+        ancestor_owns_live_kanban_claim,
+        child_kanban_write_purpose,
+        kanban_path_is_fenced,
+    )
+    # The PROVENANCE arm joins the marker arm here for the same reason it exists (ruling
+    # t_fcf7a321): a descendant that has stripped the marker is still a descendant. It must
+    # take the READ-ONLY route below, not fall through to the schema/backfill write pass —
+    # ``_migrate_add_optional_columns`` runs ``write_txn``, whose durable assertion would
+    # otherwise refuse every verb the CLI initializes (reads included: ``kanban_command``
+    # calls ``kb.init_db()`` before dispatch). Reads stay served; mutations are still refused
+    # by ``_assert_not_delegated_child_mutation`` at the write seams.
+    # ONE exception, consulted HERE so it reaches both doors (card t_703af8d1, defect D11):
+    # a caller inside the reviewed child-context write allowance
+    # (``agent.delegation_context.child_kanban_write_allowance``, purpose
+    # ``peer-refusal-report``) is here to WRITE, so it opens read-write; the write itself
+    # still passes the allowance check at the write seam, which logs every use.
+    if (kanban_path_is_fenced(path) or ancestor_owns_live_kanban_claim(path)) and not child_kanban_write_purpose():
         # Reads must not enter schema/backfill write transactions. Never create a
         # missing board or migrate on a descendant's behalf; the owner initializes it.
         conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
@@ -777,6 +793,11 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
+                # The vocabulary/epoch write guards (the BACKSTOP for a writer that never calls
+                # the kernel). DDL stored in the board file, so every later connection -- ours or
+                # somebody's raw sqlite3 -- is bound by them. Installed here, after the column
+                # migration, so a legacy board gets its missing columns first.
+                _kb.install_write_guards(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -884,6 +905,11 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Clock fence for a parked card (absolute epoch seconds). NULL = parked with
+    # no clock -- the human hold -- which is never auto-released.
+    ("due_at", "due_at INTEGER"),
+    # One of VALID_DUE_WINDOW_POLICIES; NULL reads as 'defer'.
+    ("due_window_policy", "due_window_policy TEXT"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
 )
@@ -951,6 +977,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
+    # Partial: only fenced cards are ever selected by due time, so the human holds
+    # (due_at IS NULL, the majority) cost a row in no index.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_at) WHERE due_at IS NOT NULL")
 
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).
@@ -1246,8 +1275,23 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     ``add_comment``) opt in — helpers with post-commit side effects
     (``complete_task`` & co.) must never run under an open outer transaction,
     since those side effects would fire while the outer txn can still roll back.
+
+    The child-context fence is enforced here, with ONE reviewed exception: a caller that
+    has explicitly entered a NAMED allowance
+    (``agent.delegation_context.child_kanban_write_allowance``) may write — logged at
+    WARNING so the exception is visible rather than silent. See the allowlist's own
+    comment for why that single write is safe from a child context (card t_703af8d1).
     """
-    _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
+    from agent.delegation_context import child_kanban_write_purpose
+
+    purpose = child_kanban_write_purpose()
+    if purpose:
+        _kb._log.warning(
+            "kanban: child-context write ALLOWED by the reviewed exception %r on %s",
+            purpose, _main_db_file(conn),
+        )
+    else:
+        _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(

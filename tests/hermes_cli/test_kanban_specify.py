@@ -101,18 +101,22 @@ def test_specify_task_happy_path(kanban_home):
 # CLI wiring — argparse + _cmd_specify
 # ---------------------------------------------------------------------------
 
-def _run_cli(*argv: str) -> int:
-    """Invoke the `hermes kanban …` argparse surface directly."""
+def _parse_cli(*argv: str):
+    """The argparse namespace `hermes kanban …` would build — for deriving the gate's own scope."""
     root = argparse.ArgumentParser()
     subp = root.add_subparsers(dest="cmd")
     kanban_cli.build_parser(subp)
-    ns = root.parse_args(["kanban", *argv])
-    return kanban_cli.kanban_command(ns)
+    return root.parse_args(["kanban", *argv])
+
+
+def _run_cli(*argv: str) -> int:
+    """Invoke the `hermes kanban …` argparse surface directly."""
+    return kanban_cli.kanban_command(_parse_cli(*argv))
 
 
 
 
-def test_cli_specify_tenant_filter(kanban_home, capsys):
+def test_cli_specify_tenant_filter(kanban_home, capsys, tmp_path, monkeypatch):
     with kbc.connect() as conn:
         outside = kb.create_task(conn, title="outside", triage=True)
         inside = kb.create_task(
@@ -121,8 +125,17 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
 
     content = jsonlib.dumps({"title": "spec", "body": "body"})
     p, _ = _patch_aux_client(content)
+    # `specify --all` is a mass update, so since the operator's 2026-09-27 rule (card t_bf9605f8)
+    # the CLI seam REFUSES it without the approval bundle for this exact action (board + tenant +
+    # scope). Admit it the way production does, then assert the tenant filter this test is about.
+    from hermes_cli import kanban_bulk_guard as kbg
+    from tests.hermes_cli.bulk_guard_admission import admit
+
+    scope = kbg.classify("specify", kbg.params_from_args(
+        "specify", _parse_cli("specify", "--all", "--tenant", "proj-a")))
+    digest = admit(monkeypatch, tmp_path, board=kb.get_current_board(), verb="specify", scope=scope)
     with p:
-        rc = _run_cli("specify", "--all", "--tenant", "proj-a", "--json")
+        rc = _run_cli("specify", "--all", "--tenant", "proj-a", "--json", "--approval", digest)
     assert rc == 0
     lines = [
         jsonlib.loads(l)

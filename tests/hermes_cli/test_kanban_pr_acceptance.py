@@ -82,9 +82,12 @@ def test_pr_completion_requires_current_required_evidence(github):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
             ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
-            assert ok is (conclusion == "success")
+            # ``complete_task`` returns ``bool | CompletionRefusal`` -- a TYPED, falsy refusal for a
+            # non-green receipt -- so compare TRUTHINESS, never identity: ``is False`` read a typed
+            # acceptance refusal as a test failure (measured 2026-10-10, t_36adf9a5).
+            assert bool(ok) is (conclusion == "success")
             task = kb.get_task(conn, tid)
-            assert (task.status == "done") is ok
+            assert (task.status == "done") is bool(ok)
             receipts = [json.loads(r[0]) for r in conn.execute(
                 "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))]
             assert receipts and receipts[-1]["head_sha"] == "a" * 40
@@ -230,3 +233,43 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+def test_no_required_checks_is_accepted_on_merge_state(monkeypatch):
+    """Ruling t_9082c751: a repository with no required checks is satisfied by the MERGE.
+
+    Before the ruling this receipt was ``missing`` with ``required=[]`` -- read as "no
+    retry can ever pass", which parked a published card with its work done and left it,
+    beside the landing fence, with no legal contract at all. Merge state is the evidence
+    now: an OPEN PR is ``pending`` (retryable, never parked), a MERGED one is ``success``.
+    """
+    from hermes_cli import kanban_pr_acceptance as accept
+
+    sha = "a" * 40
+    state = {"pr": "OPEN"}
+
+    def fake_api(endpoint, *, query=None, paginate=False, profile_home=None):
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": sha, "baseRefName": "main", "state": state["pr"],
+                "mergeCommit": {"oid": "b" * 40},
+                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": []}}}}}}
+        if "/rules/branches/" in endpoint:
+            return [[]]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(accept, "_api", fake_api)
+    url = "https://github.com/acme/repo/pull/7"
+
+    pending = accept.collect_acceptance(url, None)
+    assert pending["ok"] is False
+    assert pending["classification"] == "pending"
+    assert pending["required"] == []
+    assert "MERGED state" in pending["detail"]
+    assert "local-only" not in pending["detail"]
+
+    state["pr"] = "MERGED"
+    merged = accept.collect_acceptance(url, None)
+    assert merged["ok"] is True
+    assert merged["classification"] == "success"
+    assert merged["merge_sha"] == "b" * 40

@@ -66,6 +66,12 @@ _GLOBAL_FLAGS = r'(?:-\S++(?:\s++(?!-\S)\S++)?\s++)*'
 # Same grammar for the docker/podman rules, which have always taken a separate value only after exactly
 # one whitespace character; keeping that means this fix changes no approval decision.
 _CONTAINER_GLOBAL_FLAGS = r'(?:-\S++(?:\s(?!-\S)\S++)?\s++)*'
+# Global flags before a git subcommand, where a flag's VALUE may be a quoted string containing
+# whitespace (`git -C "/opt/hermes sandbox/clone" push -f`). Same grammar as _GLOBAL_FLAGS plus
+# that branch: one parse per flag, a value cannot itself be a flag, so a long run that never
+# reaches the subcommand fails in linear time instead of holding the GIL (#129281). Docker's
+# grammar above is deliberately untouched.
+_QUOTED_GLOBAL_FLAGS = r'(?:-\S++(?:\s++(?!-\S)(?:"[^"]*"|\'[^\']*\'|\S++))?\s++)*'
 # macOS: /etc, /var, /tmp, /home are symlinks to /private/*, so /private/etc/sudoers would bypass a plain
 # "/etc/" check. Match both forms.
 _MACOS_PRIVATE_SYSTEM_PATH = r'/private/(?:etc|var|tmp|home)/'
@@ -152,7 +158,7 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'kill\s+(-[^\s]+\s+)*-1\b', "kill all processes"),
     (_CMDPOS + r'(shutdown|reboot|halt|poweroff)\b', "system shutdown/reboot"),
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
-    (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
+    (_CMDPOS + r'systemctl\s+' + _GLOBAL_FLAGS + r'(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
 ]
 
@@ -242,6 +248,13 @@ def detect_hardline_command(command: str) -> tuple:
 
 
 # ---- Dangerous command patterns -----------------------------------------------------------
+# A git push DESTINATION — or the ref a lease is held against — that is main/master, in any
+# spelling git accepts: bare, `+name` (forced refspec), `refs/heads/name`, `src:name`,
+# `HEAD:name`, `"name"`. The separator class is what keeps path-adjacent text out (`feature/main`
+# is not `main`), and the trailing lookahead keeps near-misses (`main-ref`, `main/x`, `main~1`)
+# out — the block must land on the default branch, not on any name that merely starts with it.
+_PUSH_MAIN_REF = r'''[:+\s"'](?:refs/heads/)?(?:main|master)(?![\w./^~-])'''
+
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
@@ -316,7 +329,7 @@ DANGEROUS_PATTERNS = [
     (r'\bDELETE\s+FROM\b(?![^\n]*\bWHERE\b)', "SQL DELETE without WHERE"),
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
     (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
-    (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
+    (rf'\bsystemctl\s+{_GLOBAL_FLAGS}(stop|restart|disable|mask)\b', "stop/restart system service"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
     # killall with SIGKILL (-9 / -KILL / -s KILL / -SIGKILL) and `killall -r <regex>` broad sweeps
@@ -461,20 +474,43 @@ DANGEROUS_PATTERNS = [
     # Git destructive operations. `git reset --hard` accepts any unambiguous long-flag prefix (--h,
     # --ha, --har): --hard is the only reset mode starting with "h", and `--help` is special-cased
     # by git before mode resolution.
-    (r'\bgit\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
-    (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
-    (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
-    (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
+    # `git push --force-with-lease` is ONE verb with TWO verdicts, and it is NOT the bare
+    # `--force` class: it refuses to overwrite a remote tip that moved since the lease was
+    # taken, so it can be consented to on its own (``command_allowlist`` holds the pattern key,
+    # see ``tools/approval.py::_is_permanently_approved``). ORDER IS THE MECHANISM — this function
+    # returns the FIRST matching pattern — so the scope guards come first and keep the BARE key
+    # for everything outside the authorized shape: a leased push whose destination (or lease ref)
+    # is main/master, and the bulk `--all` / `--mirror` / `-a` forms, which are never "the
+    # caller's own branch". Segment-bounded (`[^;|&\n]`) so an unrelated later command cannot
+    # contaminate the verdict. An ABBREVIATED spelling (`--force-with-leas`, which git resolves)
+    # does not match the lease pattern below and falls through to the bare key: it fails CLOSED.
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}push\b[^;|&\n]*--force-with-lease[^;|&\n]*{_PUSH_MAIN_REF}',
+     "git force push (rewrites remote history)"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}push\b[^;|&\n]*{_PUSH_MAIN_REF}[^;|&\n]*--force-with-lease',
+     "git force push (rewrites remote history)"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}push\b[^;|&\n]*--force-with-lease[^;|&\n]*(?:\s)(?:--(?:mirror|all)|-a)\b',
+     "git force push (rewrites remote history)"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}push\b[^;|&\n]*(?:\s)(?:--(?:mirror|all)|-a)\b[^;|&\n]*--force-with-lease',
+     "git force push (rewrites remote history)"),
+    # The lease-checked form itself, with its OWN key so a profile can pre-approve exactly this
+    # verb and nothing wider. Covers `--force-with-lease` and `--force-with-lease=<ref>` (`\b`
+    # sits between the flag name and `=`).
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}push\b[^;|&\n]*--force-with-lease\b',
+     "git push --force-with-lease (lease-checked force push)"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}push\b.*-f\b', "git force push short flag (rewrites remote history)"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     # `-D` = `-d --force`: only the capital short flag is force-delete, so the group opts out of
     # the module-wide re.IGNORECASE and relies on _lower_preserving_flags keeping dash-prefixed
     # tokens' case in the detection input (every other pattern matches case-insensitively and is
     # unaffected). The safe merged-only -d / --delete stays ungated by design — git itself refuses
     # to delete a branch that is not fully merged.
-    (r'\bgit\s+branch\s+(?-i:-D)\b', "git branch force delete"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}branch\s+(?-i:-D)\b', "git branch force delete"),
     # `-D` = `-d --force`; the long spellings are different tokens, so match delete+force in either order, bounded to
     # one command segment (no `;`/`|`/`&`/newline) so an unrelated later command isn't contaminated.
-    (r'\bgit\s+branch\b[^;|&\n]*?(?:-d\b|--delete\b)[^;|&\n]*?(?:-f\b|--force\b)', "git branch force delete (long flags)"),
-    (r'\bgit\s+branch\b[^;|&\n]*?(?:-f\b|--force\b)[^;|&\n]*?(?:-d\b|--delete\b)', "git branch force delete (long flags, force-first)"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}branch\b[^;|&\n]*?(?:-d\b|--delete\b)[^;|&\n]*?(?:-f\b|--force\b)', "git branch force delete (long flags)"),
+    (rf'\bgit\s+{_QUOTED_GLOBAL_FLAGS}branch\b[^;|&\n]*?(?:-f\b|--force\b)[^;|&\n]*?(?:-d\b|--delete\b)', "git branch force delete (long flags, force-first)"),
     # chmod +x then immediate run: the script content may hold dangerous commands individual patterns miss.
     (r'\bchmod\s+\+x\b.*[;&|]+\s*\./', "chmod +x followed by immediate execution"),
     # Sudo stdin/askpass/shell/list-privs flags. The agent has no TTY, so sudo invocations that succeed

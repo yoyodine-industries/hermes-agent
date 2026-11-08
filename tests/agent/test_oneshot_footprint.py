@@ -41,8 +41,14 @@ def _skills_dir(tmp_path):
 @pytest.fixture
 def interactive_prompt(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    # The fork retires the flat skills index by default (operator ruling 2026-09-30), so the
+    # interactive prompt is the deprecation banner unless the hatch is opened. This control exists to
+    # prove the INTERACTIVE surface still carries the authoring coaching, so ask for the flat index
+    # explicitly (t_a97bae7e: the two rulings compose -- dark interactive, guided one-shot).
+    monkeypatch.setenv("HERMES_SKILLS_INDEX", "flat")
     prompt = build_skills_system_prompt(available_tools={"skill_view", "skills_list", "skill_manage"},
                                         skills_dir_override=_skills_dir(tmp_path))
+    monkeypatch.delenv("HERMES_SKILLS_INDEX", raising=False)
     monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
     return prompt
 

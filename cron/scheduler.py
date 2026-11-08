@@ -203,6 +203,40 @@ class CronTickYielded(RuntimeError):
 _STALE_YIELD_RE = re.compile(r"stale code: booted on (\S+), disk is at (\S+)\)")
 
 
+class CronSubstrateDenied(RuntimeError):
+    """A cron tick held EVERY job because the substrate it needs answered a denial.
+
+    Raised by ``tick()`` BEFORE the tick lock, exactly like :class:`CronTickYielded` and for the
+    same reason -- but the condition is the machine, not the code: a root the tick must read or
+    write (a DAG script, the prod tree, the store) refused a REAL operation with EACCES/EPERM/EROFS
+    (card ``t_0ae49984``, design ``t_72e9bf03`` §3.3).
+
+    Nothing is advanced and nothing is marked failed: ``next_run_at`` is untouched (so the overdue
+    job fires on the first tick after recovery instead of being silently lost) and no job takes a
+    ``last_status: error`` row -- that is the whole point of the door, because the error-row storm
+    is how a host fault reads as eighteen broken jobs. One EPISODE replaces them, and the ticker
+    wrapper records this class name in ``ticker_last_error`` like the stale-code yield, so
+    ``hermes cron status`` is never falsely green.
+
+    Raised, not returned, and never thrown for an indeterminate reading: fail-open is invariant I4.
+    """
+
+    def __init__(self, report=None) -> None:
+        self.report = report
+        try:
+            from hermes_cli import substrate_access as _sa
+
+            detail = _sa._matrix_sentence(report.matrix()) if report is not None else "no report"
+        except Exception:  # health: allow BLE001 -- the exception message must never raise
+            detail = "probe report unavailable"
+        super().__init__(
+            "Cron tick held by substrate admission: a root this tick must use refused a real "
+            f"operation ({detail}). No job was advanced or marked failed; the overdue work fires "
+            "on the first tick after the substrate is readable again."
+        )
+
+
+
 def stale_code_yield_labels(recorded_error: str | None) -> tuple[str, str] | None:
     """``(boot_rev, disk_rev)`` when a persisted ``ticker_last_error`` is a ``CronTickYielded``.
 
@@ -362,13 +396,19 @@ def _upsert_incident_for_failure(
     already went out) -> suppress the per-run ping. Store errors log at debug; the caller delivers
     as if none existed."""
     try:
-        from cron.incidents import get_incident, upsert_incident
+        from cron.incidents import UNREACHABLE_PATH, get_incident, upsert_incident
 
-        incident_id, _is_new = upsert_incident(
+        incident_id, is_new = upsert_incident(
             job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file)
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
+        # A failure whose incident is NEW (first sighting, or a recurrence after a resolved one)
+        # ACTS: the classes that cannot run file one card routed to the lane that owns the fix.
+        # A repeat tick of a signature already open does not - the card is already there, and a
+        # comment per tick would bury it.
+        if is_new and (incident or {}).get("failure_type") == UNREACHABLE_PATH:
+            _act_on_unreachable_path_failure(job, error, incident_id=incident_id)
         return withheld, incident_id
     except Exception as exc:
         logger.debug(
@@ -377,15 +417,47 @@ def _upsert_incident_for_failure(
         return False, None
 
 
+def _act_on_unreachable_path_failure(
+    job: dict, error: str, *, incident_id: Optional[str] = None
+) -> None:
+    """Best-effort: the ``unreachable_path`` class files its ONE card (``cron/unreachable_path``).
+
+    The act is the terminal failure node for a job that CANNOT run: it routes the card to the
+    lane that owns the missing path and closes it on the job's next success. Every failure in
+    here is already recorded on the incident row by the act itself, so nothing is swallowed;
+    the scheduler's own delivery must not depend on the board being reachable.
+    """
+    try:
+        from cron.unreachable_path import act_on_failure
+
+        act_on_failure(
+            job["id"], str(error or ""), job_name=job.get("name"), incident_id=incident_id)
+    except Exception as exc:
+        logger.debug("unreachable_path act failed for job %s: %s", job["id"], exc)
+
+
 def _resolve_incidents_for_recovered_job(job: dict) -> None:
     """Best-effort: a successful run marks the job's open incidents ``resolved`` (never touches an
     operator ``closed`` ack). Store errors log at debug; delivery is unaffected."""
+    # Close the cards first, while the rows still point at them: the close clears each row's card
+    # stamp, so the incident resolution that follows cannot cost a stale board read.
+    _close_unreachable_path_cards(job)
     try:
         from cron.incidents import close_incidents_for_recovered_job
 
         close_incidents_for_recovered_job(job["id"])
     except Exception as exc:
         logger.debug("Incident store unavailable for job %s (delivery unaffected): %s", job["id"], exc)
+
+
+def _close_unreachable_path_cards(job: dict) -> None:
+    """Best-effort: the job ran OK, so the cards its unreachable-path failures filed are done."""
+    try:
+        from cron.unreachable_path import close_cards_for_recovered_job
+
+        close_cards_for_recovered_job(job["id"])
+    except Exception as exc:
+        logger.debug("unreachable_path recovery failed for job %s: %s", job["id"], exc)
 
 
 def _mark_incident_alerted(incident_id: Optional[str]) -> None:
@@ -524,7 +596,7 @@ from cron.jobs import (
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
 from cron import store_health
-from cron.execution_identity import enter_cron_execution, exit_cron_execution
+from cron.execution_identity import cron_execution_env, enter_cron_execution, exit_cron_execution
 from cron.executions import (
     FIRER_FINISHED_STATES, _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
@@ -1634,14 +1706,40 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
                     model = str(_main or "").strip() or model
     except Exception as e:  # ConfigBackendUnavailable is not one: run_job fails this fire, never defaults
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
-    model = (model if isinstance(model, str) else "").strip() or trial_model()
+    model = (model if isinstance(model, str) else "").strip()
+
+    # Host fallback (card t_92b4a684): a NAMED profile with no ``model:`` of its own still runs
+    # unpinned jobs on the HOST root config's default model + provider, as the root profile does,
+    # instead of dying at the raise below.
+    if not model:
+        try:
+            from cron.jobs import host_default_model
+            _host_model, _host_provider, _host_model_cfg = host_default_model(_get_hermes_home())
+        except Exception as e:
+            logger.debug("Job '%s': host model fallback failed: %s", job_id, e)
+            _host_model = _host_provider = ""
+            _host_model_cfg = {}
+        if _host_model:
+            model = _host_model
+            if not _cron_default_provider and _host_provider:
+                _cron_default_provider = _host_provider
+            if not _model_cfg:
+                _model_cfg = _host_model_cfg
+
+    # A claimed welcome trial's model is the last resort before the fire fails (upstream chain).
+    if not model:
+        model = trial_model()
+
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400 (#23979).
     if not model:
+        _active_home = _get_hermes_home()
+        _store = _active_home.name if _active_home.parent.name == "profiles" else "default"
         raise RuntimeError(
-            f"Cron job '{job_name}' has no model configured "
+            f"Cron job '{job_name}' has no model configured in the '{_store}' profile's store "
             f"(job.model={job.get('model')!r}, "
             f"HERMES_MODEL={cron_env_setting('HERMES_MODEL')!r}, "
-            "config.yaml model.default missing or empty). "
+            "that profile's config.yaml model.default missing or empty, and the host config carries "
+            "no model.default either). "
             f"Set a per-job model via "
             f"`hermes cron edit {job_id} --model <name>` or set a "
             "default with `hermes model <name>`."
@@ -2810,6 +2908,7 @@ def run_one_job(
         execution = create_execution(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
         job["execution_id"] = execution["id"]
+        job["source"] = execution.get("source")
 
     execution_id = str(job["execution_id"])
     note_cron_execution(job)
@@ -3698,6 +3797,10 @@ def _launch_external_cron_worker(job: dict) -> bool:
             extra={"HERMES_HOME": str(profile_home)},
         ))
     worker_env = systemd_user_bus_env(worker_env)
+    # The worker is a fresh process adopting this execution: it needs the occurrence identity
+    # for the same reason a script does, and it cannot re-derive it (see
+    # cron/execution_identity.py). Applied after the sanitizer, like the PYTHONPATH pin below.
+    worker_env.update(cron_execution_env(job))
     # Unattended worker: the gateway sets HERMES_EXEC_ASK at startup (interactive launches set
     # the other two), and an inherited presence var makes every env-fallback consumer in the
     # child (`_is_interactive_cli`, sudo prompting, `check_cronjob_requirements`) believe a
@@ -4239,6 +4342,9 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    # The CAS record has no source; the fire snapshot carries the execution's own, so the
+    # child-env identity contract (cron.execution_identity.cron_execution_env) is complete.
+    claimed_job["source"] = job.get("source")
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
@@ -4300,7 +4406,9 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     try:
         execution = create_execution(
             job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
-        dispatched_job = dict(job, execution_id=execution["id"])
+        # ``source`` rides the dispatched snapshot beside execution_id so every child env
+        # (script, prerun gate, restart-safe worker) can name the execution's origin.
+        dispatched_job = dict(job, execution_id=execution["id"], source=execution.get("source"))
         note_cron_execution(dispatched_job)
         _ctx = contextvars.copy_context()
     except Exception as execution_err:

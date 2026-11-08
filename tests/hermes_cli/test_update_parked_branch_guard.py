@@ -546,6 +546,93 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
     assert "feature work" in _git(repo_pair, "log", "--oneline").stdout
 
 
+def _in_place_dirty_setup(repo_pair, monkeypatch, capsys):
+    """Shared arrange/act for the dirty-in-place tests (card t_81a8216c)."""
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"updates": {"parked_branch_strategy": "update_in_place",
+                             "non_interactive_local_changes": "stash"}},
+    )
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    class _StopFlow(Exception):
+        pass
+
+    monkeypatch.setattr(
+        update_cmd,
+        "_complete_source_update",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+    with pytest.raises(_StopFlow):
+        hermes_main.cmd_update(args)
+    return capsys.readouterr().out
+
+
+def test_update_dirty_branch_is_updated_in_place_when_configured(
+    repo_pair, monkeypatch, capsys
+):
+    """t_81a8216c: ``update_in_place`` + a DIRTY parked branch must UPDATE, not skip.
+
+    The dirty bail exists for one reason - uncommitted work must not ride an autostash across
+    branches. The in-place strategy never switches, so that hazard is absent and the dirt must
+    not stop the update. The live ``overrides/live`` line stopped 15 consecutive times on
+    exactly this shape (dirty tree + ``parked_branch_strategy: update_in_place``).
+
+    The dirt here is on a path upstream never touches, so it must round-trip cleanly.
+    """
+    (repo_pair / "keep.txt").write_text("keep v1\n", encoding="utf-8")
+    _git(repo_pair, "add", "keep.txt")
+    _git(repo_pair, "commit", "-qm", "keep file")
+    (repo_pair / "keep.txt").write_text("dirty edit\n", encoding="utf-8")
+
+    out = _in_place_dirty_setup(repo_pair, monkeypatch, capsys)
+
+    assert "CODE UPDATE SKIPPED" not in out
+    assert "with uncommitted changes" in out
+    # The checkout never moved off its branch.
+    assert (
+        _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == "old-feature"
+    )
+    # origin/main's code actually arrived...
+    assert (repo_pair / "b.txt").exists()
+    assert (repo_pair / "a.txt").read_text(encoding="utf-8-sig") == "two\n"
+    # ...and the uncommitted bytes came back, not stashed away and forgotten.
+    assert (repo_pair / "keep.txt").read_text(encoding="utf-8-sig") == "dirty edit\n"
+    # The branch's own commit survived the in-place merge.
+    assert "keep file" in _git(repo_pair, "log", "--oneline").stdout
+
+
+def test_dirty_in_place_conflict_keeps_the_stash_instead_of_losing_it(
+    repo_pair, monkeypatch, capsys
+):
+    """t_81a8216c: when the dirty path DOES conflict, the update must not lose the bytes.
+
+    The dirty file is one upstream also rewrites, so restoring the autostash conflicts. The one
+    acceptable outcome is that the update still ran and the work is still reachable - restored,
+    or kept in the stash the run records. Never silently discarded.
+    """
+    (repo_pair / "a.txt").write_text("local edit\n", encoding="utf-8")
+
+    out = _in_place_dirty_setup(repo_pair, monkeypatch, capsys)
+
+    assert "CODE UPDATE SKIPPED" not in out
+    assert (
+        _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == "old-feature"
+    )
+    restored = (repo_pair / "a.txt").read_text(encoding="utf-8-sig") == "local edit\n"
+    listed = _git(repo_pair, "stash", "list").stdout
+    assert restored or listed.strip(), (
+        "the dirty bytes were neither restored nor kept in a stash: "
+        f"a.txt={(repo_pair / 'a.txt').read_text(encoding='utf-8-sig')!r} stashes={listed!r}"
+    )
+
+
 def test_switch_branch_flag_overrides_in_place_strategy(
     repo_pair, monkeypatch, capsys
 ):

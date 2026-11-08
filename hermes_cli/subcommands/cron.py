@@ -98,6 +98,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Absolute or ~ path to a Python in your own venv (e.g. ~/venvs/report/bin/python) "
             "for a .py --script / --monitor-script, so it can import packages Hermes does not "
             "ship. .sh/.bash still run under bash. Omit to use Hermes' Python.")
+    # Declared as a bare string (no type=int) so an empty value can CLEAR the override on edit,
+    # mirroring --reasoning-effort; the numeric grammar is validated before storing.
+    cron_create.add_argument("--script-timeout-seconds", dest="script_timeout_seconds",
+        help="Per-job budget in seconds for this job's --script, overriding "
+            "cron.script_timeout_seconds for THIS job only (every other script "
+            "job in the profile keeps the global cap). Must be a positive "
+            "integer; the script is killed and reported as timed out past it. "
+            "Omit to follow the global/env chain.")
     cron_create.add_argument("--timezone",
         help="IANA zone for this job's schedule (e.g. Asia/Hong_Kong), so the cron "
             "expression is read as THAT zone's wall clock whatever the profile's timezone "
@@ -177,6 +185,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--interpreter",
         help="Absolute or ~ path to a Python for a .py script / monitor script. "
             "Pass empty string to clear (back to Hermes' Python).")
+    cron_edit.add_argument("--script-timeout-seconds", dest="script_timeout_seconds",
+        help="Per-job budget in seconds for this job's script, overriding "
+            "cron.script_timeout_seconds for THIS job ONLY. Must be a positive "
+            "integer. Pass empty string to clear the override and follow the "
+            "global/env chain again.")
     cron_edit.add_argument("--timezone",
         help="IANA zone for this job's schedule. Pass empty string to clear the pin "
             "(back to the profile timezone); next_run_at is recomputed in the new zone.")

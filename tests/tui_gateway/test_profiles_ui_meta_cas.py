@@ -111,3 +111,50 @@ def test_two_concurrent_writers_cannot_both_replace_the_same_revision(home):
     loser = next(result for result in results if result["ui_meta"] is False)
     assert loser["ui_meta_conflicts"]["shared-room"]["actual"] == 1
     assert _default_profile()["ui_meta_revisions"]["shared-room"] == 1
+
+
+def test_over_cap_ui_meta_write_fails_loudly_and_writes_nothing(home):
+    """A ``ui_meta`` write over the gateway cap must reach the caller as an error.
+
+    It used to ``return`` silently: the RPC succeeded, nothing landed, and a
+    client that keeps a mirror in ``ui_meta`` (the group-chat projection) fell
+    permanently out of date with no error anywhere.
+    """
+    from tui_gateway import methods_profiles
+
+    _configure({"keep": {"v": 1}})
+
+    cap = methods_profiles.UI_META_MAX_BYTES
+    # Well over the cap without importing it: the old code answered a normal
+    # result here and wrote nothing.
+    oversized = {"blob": "x" * 70000}
+    assert len(json.dumps(oversized)) > 65536
+
+    response = srv._methods["profiles.configure"](
+        "configure", {"name": "default", "ui_meta": oversized}
+    )
+
+    assert "result" not in response
+    assert response["error"]["code"] == 5064
+    assert str(cap) in response["error"]["message"]
+    assert "nothing was written" in response["error"]["message"]
+
+    row = _default_profile()
+    assert row["ui_meta"]["keep"] == {"v": 1}
+    assert "blob" not in row["ui_meta"]
+    assert row["ui_meta_revisions"] == {"keep": 1}
+
+
+def test_ui_meta_at_the_cap_still_writes(home):
+    from tui_gateway import methods_profiles
+
+    cap = methods_profiles.UI_META_MAX_BYTES
+    # json.dumps({"blob": "<pad>"}) == len('{"blob": ""}') + pad
+    pad = cap - len(json.dumps({"blob": ""}))
+    payload = {"blob": "x" * pad}
+    assert len(json.dumps(payload)) == cap
+
+    applied = _configure(payload)
+
+    assert applied["ui_meta"] is True
+    assert _default_profile()["ui_meta"]["blob"] == "x" * pad

@@ -62,7 +62,7 @@ required contexts, paginates exact-head check runs and legacy statuses, then
 re-reads the PR head/base. Optional failed/skipped telemetry does not veto accepted
 required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
 neutral **required** evidence cannot complete the card. Neither can zero-run
-acceptance, unreadable policy or GitHub API failures. A repository without required
+acceptance or unreadable policy. A repository without required
 checks needs a local-only contract. `gh` must be authenticated with read access to
 the repository's checks and rules; no remote writes are performed by this gate.
 Acceptance reads run as the **assignee profile's** `gh` login — its `GH_TOKEN` /
@@ -77,6 +77,25 @@ falling through to `~/.config/gh`; unassigned cards still use the ambient
 login. A login that cannot see the repository is rejected with
 `classification=auth`, naming the profile and repository, instead of a
 retryable infra failure.
+
+A GitHub API failure is the one class that is **not** a verdict on the PR: the forge
+could not be *read* (`gh` absent, network down), so the completion is accepted and
+recorded **unverified** rather than refused forever. The `pr_acceptance` receipt keeps
+`ok: false` with `classification: infra`, plus `degraded: true`, and a
+`pr_acceptance_unverified` WARN row carries the reason — nothing is ever reported green,
+and the landing carrier and deploy proof still judge the close. Every answer the gate
+did get still refuses: `pending`, `failure`, `stale`, `auth` and a missing required
+check keep the card open. A refusal always quotes the persisted contract verbatim, so a
+worker is never sent to satisfy a declaration it cannot read. A stored contract that
+cannot be parsed as a declaration (empty, blank, truncated) is repaired at completion
+time, with a `completion_contract_repaired` event recording the value it replaced: to
+`local-only`, the value that claims nothing, which is all an unreadable contract says.
+The close is then recorded **unverified** (no acceptance leg is claimed), and the landing
+carrier still judges the declared PR — an empty and a `local-only` contract are the same
+thing to that clause, so the repair adds no refusal the card did not already face and
+never binds the card to a declaration only a merge can satisfy. `--force` overrides the
+live-claim guard only: it never bypasses acceptance, the landing carrier or the deploy
+proof.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
 store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery

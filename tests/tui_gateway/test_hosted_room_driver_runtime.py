@@ -18,6 +18,7 @@ from tui_gateway.hosted_room_driver import (
     ROOM_SESSION_SOURCE,
     HostedRoomBinding,
     HostedRoomRuntime,
+    room_session_key,
     room_session_title,
 )
 from tui_gateway.hosted_room_peer_http import PeerRunsHTTPError
@@ -41,17 +42,23 @@ class RecordingTurnLocks:
 
     def __init__(self) -> None:
         self.events: list[tuple[str, str]] = []
+        self.sessions: list[str | None] = []
         self.local = threading.local()
 
     @contextmanager
-    def __call__(self, profile: str):
+    def __call__(self, profile: str, session: str | None = None):
+        # The granularity IS the contract (t_47082c1d): a room turn locks its own transcript, never
+        # the whole seat, so the key is recorded with every entering event.
         self.events.append(("lock-enter", profile))
+        self.sessions.append(session)
         self.local.profile = profile
+        self.local.session = session
         try:
             yield
         finally:
             self.events.append(("lock-exit", profile))
             self.local.profile = None
+            self.local.session = None
 
     def held_for(self, profile: str) -> bool:
         return getattr(self.local, "profile", None) == profile
@@ -1984,6 +1991,10 @@ def test_profile_turn_lock_covers_resolve_submit_and_terminal_observation(db: Pa
     # Balanced enter/exit pairs on the task's profile only (a loaded runner may run extra cycles).
     assert locks.events and all(profile == PROFILE for _event, profile in locks.events)
     assert locks.events.count(("lock-enter", PROFILE)) == locks.events.count(("lock-exit", PROFILE))
+    # …and every hold names the ROOM's transcript, never the bare seat (t_47082c1d): a room turn must
+    # not exclude that profile's DM or Desktop turns, and two turns on this room must still exclude
+    # each other.
+    assert locks.sessions and all(key == room_session_key(ROOM_ID) for key in locks.sessions)
     methods = [method for method, _params in rpc.calls]
     assert methods.index("resolve_exact") < methods.index("submit")
     assert methods.index("submit") < methods.index("complete")

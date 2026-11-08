@@ -91,16 +91,29 @@ def _effective_provider_label() -> str:
 
 
 def _estop_status_line():
-    """One-line pause banner for `hermes status`, or None when not paused."""
+    """One-line HOLD banner for `hermes status`, or None when no hold is in force.
+
+    Names the SCOPE — ``hold <handle> lanes=[…] until <ts>`` — never a fleet-wide "PAUSED
+    (global emergency stop)" (operator ruling 2026-10-10 §5): whoever reads the line must see
+    WHAT is held and how to lift it. A total entry can only be PRE-RULING state by now, since
+    the arm verb refuses one, and is shown as the legacy alarm it is.
+    """
     try:
-        from agent.estop import get_state
+        from agent.estop import dominant_hold, read_state
     except ImportError:
         return None
-    state = get_state()
-    if state is None:
+    state = read_state()
+    if not state.engaged:
         return None
-    reason = state.get("reason")
-    return f"⏸️  PAUSED (global emergency stop{f' — reason: {reason}' if reason else ''}; `hermes resume` to lift)"
+    hold = dominant_hold(state)
+    handle = hold.get("handle") or "?"
+    reason = f" — reason: {hold['reason']}" if hold.get("reason") else ""
+    lift = f"`hermes resume --handle {handle}`"
+    if state.total:
+        return f"⏸️  HOLD {handle} — LEGACY fleet-wide halt{reason}; lift it by handle: {lift}"
+    lanes = ", ".join(sorted(state.allow_profiles)) or "(no lane named — every lane is held)"
+    until = f" until {hold['expires_at']}" if hold.get("expires_at") else ""
+    return f"⏸️  HOLD {handle} lanes=[{lanes}]{until}{reason}; lift it with {lift}"
 
 
 # --- Data tables driving the per-section renderers -------------------------

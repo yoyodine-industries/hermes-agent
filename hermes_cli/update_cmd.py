@@ -1356,7 +1356,25 @@ def _apply_parked_branch_guard(
         return False, False, None
     switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
         git_cmd, _m().PROJECT_ROOT, current_branch, branch)
-    if not switch_safe:
+    # The strategy is resolved BEFORE the assessment's verdict is acted on (card t_81a8216c):
+    # the assessment answers "may this be SWITCHED", while "may this be UPDATED" is a different
+    # question - a dirty tree answers the first no and, under update_in_place, the second yes.
+    # Read through _best_effort so a config failure leaves the default "switch": an unreadable
+    # value may only ever REMOVE the in-place arm, never grant it.
+    from hermes_cli.update_cmd_git import (
+        PARKED_ACTION_BLOCKED,
+        PARKED_ACTION_IN_PLACE,
+        PARKED_ACTION_KEPT,
+        PARKED_ACTION_SWITCH_BACK,
+        resolve_parked_branch_action,
+    )
+
+    _strategy = "switch"
+    with _best_effort('Could not read updates.parked_branch_strategy: %s'):
+        _strategy = _updates_config().get("parked_branch_strategy", "switch") or "switch"
+    action, _action_reason = resolve_parked_branch_action(
+        switch_safe, switch_block_reason, _strategy, switch_branch)
+    if action == PARKED_ACTION_BLOCKED:
         _m()._print_parked_branch_skip_warning(
             git_cmd, _m().PROJECT_ROOT, current_branch, branch, switch_block_reason)
         print()
@@ -1364,25 +1382,30 @@ def _apply_parked_branch_guard(
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         _record_stop("parked_branch_blocked")
         sys.exit(1)
-    if not switch_block_reason.startswith("unmerged:"):
+    if action == PARKED_ACTION_SWITCH_BACK:
         print(f"  ⚠ Checkout was parked on '{current_branch}' (fully merged) — switching back to {branch}...")
         return True, False, switch_block_reason
-    _in_place_configured = False
-    with _best_effort('Could not read updates.parked_branch_strategy: %s'):
-        _in_place_configured = (
-            _updates_config().get("parked_branch_strategy", "switch") == "update_in_place")
-    if not _in_place_configured or switch_branch:
+    if action == PARKED_ACTION_KEPT:
         _m()._print_parked_branch_kept_notice(
             current_branch, branch, switch_block_reason.split(":", 1)[1])
         return True, False, switch_block_reason
+    assert action == PARKED_ACTION_IN_PLACE, action
     # --branch typos used to surface via the checkout failing, which this path skips.
     if _git_run(git_cmd, ["rev-parse", "--verify", "--quiet", f"origin/{branch}"]).returncode != 0:
         print(f"✗ Branch '{branch}' does not exist locally or on origin.")
         _record_stop("branch_missing")
         sys.exit(1)
-    print(
-        f"  ℹ On branch '{current_branch}' — updating it in place from "
-        f"origin/{branch} (no branch switch; local commits preserved).")
+    if switch_block_reason == "dirty":
+        # The notice names the mechanism: the dirt does not block the update because it is
+        # stashed around an in-place merge on its OWN branch, and kept if the restore conflicts.
+        print(
+            f"  ℹ On branch '{current_branch}' with uncommitted changes — updating it in place "
+            f"from origin/{branch} (no branch switch, so nothing rides a stash across branches).")
+        print("    Your changes are stashed around the merge and KEPT in the stash if restoring them conflicts.")
+    else:
+        print(
+            f"  ℹ On branch '{current_branch}' — updating it in place from "
+            f"origin/{branch} (no branch switch; local commits preserved).")
     return False, True, switch_block_reason
 
 

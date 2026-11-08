@@ -298,14 +298,21 @@ def _filter_secret_env(
 def _finalize_child_env(env: dict) -> dict:
     """Guards shared by every spawn surface: profile-home propagation, session-context
     bridging, Hermes-owned PYTHONPATH + venv-marker strip, MSYS defaults, delegate_task
-    Kanban scrub. Returns the (possibly new) dict."""
+    Kanban scrub, cron occurrence identity. Returns the (possibly new) dict."""
     _apply_profile_home(env)
     _inject_session_context_env(env)
     _strip_hermes_owned_pythonpath_and_runtime_markers(env)
     strip_supervised_process_identity(env)
     _apply_windows_msys_bash_env_defaults(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    env = delegated_child_subprocess_env(env)
+    # The occurrence identity of the cron fire this context runs under, if any. Same posture
+    # as the session bridge above and for the same reason: a ContextVar is authoritative for
+    # this thread's children, where the process env would hand a concurrent fire's children
+    # another fire's row. A delegated child reads no fire (it is not the occurrence), and a
+    # process outside cron has none to report, so both pass through untouched.
+    from cron.execution_identity import cron_identity_child_env
+    return cron_identity_child_env(env)
 
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
@@ -413,7 +420,12 @@ def build_subprocess_env(
         env.update(extra)
     strip_supervised_process_identity(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    env = delegated_child_subprocess_env(env)
+    # This branch skips ``_finalize_child_env`` (it must stay byte-passing for git credential
+    # flows), so the fire's occurrence identity is overlaid here instead: a hook or git child
+    # of a cron run has the same claim to it as a terminal child.
+    from cron.execution_identity import cron_identity_child_env
+    return cron_identity_child_env(env)
 
 
 def served_profile_child_env(
@@ -657,7 +669,16 @@ def _resolve_hermes_bin_dir() -> str | None:
 
     # A payload's venv also holds a `hermes`, but on Windows its redirector names the
     # build machine's interpreter, so PATH order must not decide which copy children get.
-    payload_dir = payload_command_dir(Path(__file__).resolve().parents[2])
+    #
+    # The framing probe reads `<tree>/../manifest.json`, so a tree that cannot be probed
+    # (an unreadable manifest, a guarded/foreign home, any fault inside PM) reads as "not a
+    # sealed payload" and the resolution falls through to the PATH candidates below. PATH
+    # construction must never be able to fail a spawn — `cron.scheduler_worker_env` takes the
+    # same posture around its own PM read.
+    try:
+        payload_dir = payload_command_dir(Path(__file__).resolve().parents[2])
+    except Exception:
+        payload_dir = None
     if payload_dir is not None and payload_dir.is_dir():
         _HERMES_BIN_DIR, _HERMES_BIN_DIR_IS_PAYLOAD = str(payload_dir), True
         return _HERMES_BIN_DIR
@@ -913,7 +934,11 @@ def _wait_for_group_exit(proc, pgid: int, timeout: float) -> bool:
 def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
     """SIGKILL snapshotted survivors that escaped the process group via ``setsid``
     — after TERM→KILL so in-group members keep their grace; psutil's identity-aware
-    Process skips recycled PIDs. POSIX-only (see _IS_WINDOWS gate in caller)."""
+    Process skips recycled PIDs. POSIX-only (see _IS_WINDOWS gate in caller).
+
+    A WORKFLOW DEPARTURE (a production flight, marked ``HERMES_WORKFLOW_DEPARTURE``) is
+    spared even as an escapee: it shares an ancestor with this command tree but is owned by
+    no turn, and reaping it here is exactly the t_4b9843a4 defect."""
     for child in descendants:
         try:
             if not child.is_running():
@@ -923,6 +948,9 @@ def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
                     continue  # group-kill already covers it
             except OSError:  # ProcessLookupError / PermissionError included
                 pass
+            from tools.workflow_departure import pid_is_departure
+            if pid_is_departure(child.pid):
+                continue  # a detached production flight is not ours to reap
             child.kill()
         except Exception:
             continue

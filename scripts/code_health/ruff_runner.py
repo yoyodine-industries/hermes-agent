@@ -41,7 +41,7 @@ def _version_of(cmd: list[str]) -> str | None:
     try:
         out = subprocess.run(
             [*cmd, "--version"], capture_output=True, text=True, timeout=60,
-            stdin=subprocess.DEVNULL, check=False,
+            stdin=subprocess.DEVNULL, check=False, encoding="utf-8", errors="replace",
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         return None

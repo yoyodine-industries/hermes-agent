@@ -42,6 +42,35 @@ def _reason(help: str):
     return _arg("--reason", help=help)
 
 
+def _quorum_phrase() -> str:
+    """The ACTUAL bulk requirement, in one clause, derived from the guard itself.
+
+    Stated once and reused by every ``--approval`` help so the operator's 2026-10-03 rule
+    (one authorized ask, NO separate bot approvals) plus the ONE waiver (a declared estate
+    board, ruling t_fcf7a321) can never drift between flags. The guard module is imported
+    lazily: the parser stays free of the store, and the numbers come from the decision.
+    """
+    from hermes_cli import kanban_bulk_guard as kbg
+
+    return (
+        f"the authorized ask profile ({kbg.AUTHORIZED_ASK_PROFILE}) files the ask first; "
+        f"no separate bot approvals are required (REQUIRED_APPROVALS={kbg.REQUIRED_APPROVALS}). "
+        "The ONE waiver is a board whose own board.json declares \"dispatch\": false — an "
+        "estate torn down single-actor with `hermes kanban boards rm --estate <slug> "
+        "--reason \"…\"`."
+    )
+
+
+def _approval_flag(what: str):
+    """``--approval`` for a gated verb: the digest the authorized ask was recorded under."""
+    return _arg(
+        "--approval", metavar="DIGEST",
+        help=(f"The digest an authorized ask was recorded under, authorizing {what}. "
+              + _quorum_phrase()),
+    )
+
+
+
 def _nonnegative_int(value: str) -> int:
     """argparse type for retention days: a negative window builds a future cutoff
     that matches every row, so reject it at the CLI boundary before any sweep."""
@@ -70,6 +99,7 @@ def _triage_sweep_args(verb: str, Verb: str, noun: str):
         _arg("--tenant", help="When used with --all, restrict the sweep to this tenant"),
         _arg("--author",
              help=f"Author name recorded on the audit comment (default: $HERMES_PROFILE or '{noun}')"),
+        _approval_flag(f"a `{verb} --all` sweep over more than one card"),
         _json_flag(help="Emit one JSON object per task on stdout"),
     )
 
@@ -107,21 +137,75 @@ _BOARD_SPECS = [
         _arg("--color", help="Optional hex color (e.g. '#8b5cf6') for the dashboard"),
         _arg("--switch", action="store_true", help="Switch to the new board after creating it"),
         _arg("--default-workdir", help="Default workspace path for tasks created on this board"),
+        _arg("--no-dispatch", action="store_true", dest="no_dispatch",
+             help="Mark an ESTATE/scratch board: write \"dispatch\": false into the "
+                  "board's metadata so the dispatcher NEVER serves it. Use this for a "
+                  "rehearsal board a SEV1/failure card may be redirected to — a redirect "
+                  "to a normal board is not isolation, because the dispatcher serves every "
+                  "non-archived board."),
     ], aliases=["new"], help="Create a new board"),
     _cmd("rm", [
         _SLUG,
         _arg("--delete", action="store_true",
              help="Hard-delete the board directory instead of archiving it. "
                   "Default is to move it to boards/_archived/ so it's recoverable."),
+        _arg("--estate", action="store_true",
+             help="Declare this board a declared estate (its own board.json carries "
+                  "\"dispatch\": false) and tear it down SINGLE-ACTOR: the ask/APR clause is "
+                  "waived, while the destination claim, the verified preimage and the "
+                  "ledger/audit row are still taken. Requires --reason."),
+        _reason("Why the board is torn down. REQUIRED with --estate: it lands in the ledger "
+                "row and the audit row."),
+        _approval_flag("archiving this board"),
     ], aliases=["remove", "delete"], help="Archive (default) or delete a board"),
     _cmd("switch", [_SLUG], aliases=["use"], help="Set the active board for subsequent CLI calls"),
-    _cmd("show", aliases=["current"], help="Print the currently-active board slug"),
+    _cmd("show", [
+        _arg("slug", nargs="?", help="Board to report (default: the current board)"),
+        _json_flag(help="Emit the board's metadata as JSON"),
+    ], aliases=["current"], help="Report a board's metadata (default: the current board)"),
     _cmd("rename", [_SLUG, _arg("name", help="New display name")],
          help="Change a board's human-readable display name (slug is immutable)"),
     _cmd("set-default-workdir", [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-project", [
+        _SLUG,
+        _arg("project", nargs="?", default=None,
+             help="Project SLUG (or id) to make this board's default project: new tasks "
+                  "on the board inherit it (deterministic worktree + branch under the "
+                  "project's primary repo) with no --project flag. A SLUG is the portable "
+                  "handle — the registry is per-profile, so an id is not. Omit with "
+                  "--clear to unscope the board."),
+        _arg("--clear", action="store_true",
+             help="Clear the board's default project (new tasks are unscoped again)."),
+    ], help="Set (or clear) the board's default project"),
+    _cmd("set-dispatch", [
+        _SLUG,
+        _arg("state", choices=("on", "off"),
+             help="'off' marks an estate/scratch board the dispatcher must never "
+                  "serve; 'on' admits it again"),
+        _json_flag(),
+    ], help="Admit or exclude a board from the dispatcher's set "
+            "(off = estate/scratch board, never served)"),
+    _cmd("set-priority-policy", [
+        _SLUG,
+        _arg("--module",
+             help="Absolute path to the board's priority policy module (a .py file). "
+                  "The module's band_birth() decides what a card filed on this board is "
+                  "BORN with, and its own band_floor() declares the board's floor. Omit "
+                  "to CLEAR the policy (and disarm the board's storage guard)."),
+        _arg("--function",
+             help="Callable in that module to use as band_birth (default: band_birth)"),
+        _json_flag(),
+    ], help="Wire (or clear) a board's birth-time priority policy and arm its storage guard",
+         description=(
+             "A board that declares a priority policy takes its cards' birth priorities from "
+             "that policy instead of from the caller, and its storage guard refuses a raw "
+             "write outside the ordinary domain (or below the board's own floor). Unwired "
+             "boards are inert: this verb writes the key, syncs the guard and nothing else "
+             "changes."
+         )),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
@@ -138,6 +222,7 @@ _BOARD_SPECS = [
         _arg("archive", help="Path to the .tar.gz archive"),
         _arg("--as", dest="as_slug", help="Slug for the imported board (default: from the archive)"),
         _arg("--switch", action="store_true", help="Switch to the imported board afterwards"),
+        _approval_flag("importing a whole board"),
         _json_flag(),
     ], help="Import a board archive as a new board", description=(
         "Import a .tar.gz produced by `hermes kanban boards export`. The board always lands as a "
@@ -171,9 +256,13 @@ _SPECS = [
                   "an explicit 'scratch' also opts out of a project-scoped board's project)"),
         _arg("--branch", help="Branch name for worktree tasks, e.g. wt/t6-wire"),
         _arg("--project",
-             help="Link to a project (id or slug). Anchors the task's "
-                  "worktree under the project's primary repo with a "
-                  "deterministic branch. See `hermes project list`."),
+             help="Link to a project (by slug; an id resolves only in this profile's "
+                  "registry). Anchors the task's worktree under the project's primary "
+                  "repo with a deterministic branch. A SLUG is the portable handle \u2014 the "
+                  "registry is per-profile, so another profile's id does not resolve "
+                  "here. An unresolvable ident is DROPPED loudly (a stderr warning plus "
+                  "`project_link_unresolved` on the created event), leaving the card "
+                  "unscoped. See `hermes project list`."),
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",
@@ -181,11 +270,23 @@ _SPECS = [
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
+        _arg("--resurrect", action="store_true",
+             help="With --idempotency-key: file it again even though a task with that "
+                  "key was already CLOSED inside the filing window (the filing-budget "
+                  "door otherwise answers `refused: duplicate-closed-key`)."),
         _arg("--max-runtime",
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
                   "SIGKILLs) the worker and re-queues the task."),
         _arg("--created-by", default="user", help="Author name recorded on the task (default: user)"),
+        _arg("--from-inbox", metavar="<domain>/<profile>",
+             help="File this card FROM a seat's inbox: writes the `## Inbox item` block "
+                  "(the seat and the item's own words) into the body, so the item->card "
+                  "linkage stays checkable after the item is struck. REFUSES when the "
+                  "seat's TASKS.md does not exist or does not hold the item. Needs "
+                  "--from-inbox-item."),
+        _arg("--from-inbox-item", metavar="TEXT",
+             help="The inbox item's own words, verbatim as filed (required with --from-inbox)."),
         _arg("--skill", action="append", default=[], dest="skills",
              help="Skill to force-load into the worker (repeatable). The kanban "
                   "lifecycle is already injected automatically. Example: --skill "
@@ -219,6 +320,23 @@ _SPECS = [
                   "to skip the brief running-to-blocked transition."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
+    # Card t_36adf9a5: the RELEASE door. Named as THE release by the proof-gate refusal
+    # (``kanban_proof_gate.py``), the agent-tool refusal (``tools/kanban_tools.py``) and the
+    # estate fence (``tree_identity.ESTATE_MUTATING_ACTIONS``) -- and, until this record existed,
+    # registered nowhere: `hermes kanban set-contract` answered "not a `hermes kanban` command".
+    # TOP-LEVEL ONLY: the verb is in ``kanban._DELEGATED_CHILD_DENIED_ACTIONS`` and in
+    # ``tree_identity.ESTATE_MUTATING_ACTIONS``, so a dispatched worker / delegated child is
+    # refused before the handler runs.
+    _cmd("set-contract", [
+        _TASK_ID,
+        _arg("contract",
+             help="New declaration: local-only, OWNER/REPO, an exact GitHub PR URL, or landed"),
+        _reason("WHY the contract is being re-scoped (required; recorded on the audit event)"),
+        _arg("--author",
+             help="Actor recorded on the contract_changed event "
+                  "(default: the current profile)"),
+        _json_flag(),
+    ], help="Re-scope a card's completion_contract (the release door; top-level only)"),
     _cmd("swarm", [
         _arg("goal", help="Swarm goal / final outcome"),
         _arg("--worker", action="append", default=[], metavar="PROFILE:TITLE[:SKILL,SKILL]",
@@ -229,6 +347,7 @@ _SPECS = [
         _PRIORITY,
         _arg("--created-by", help="Creator/anchor profile"),
         _arg("--idempotency-key", help="Dedup key for the root card"),
+        _approval_flag("this swarm fan-out"),
         _json_flag(help="Emit JSON output"),
     ], help="Create a Kanban Swarm v1 graph (parallel workers → verifier → synthesizer)"),
     _cmd("list", [
@@ -264,6 +383,7 @@ _SPECS = [
         _arg("--reclaim", action="store_true",
              help="Release any active claim before reassigning (required if task is running)"),
         _RECLAIM_REASON,
+        _approval_flag("a reclaim-reassign over more than one card"),
     ], help="Reassign a task to a different profile, optionally reclaiming first"),
     _cmd("diagnostics", [
         _arg("--severity", choices=["warning", "error", "critical"],
@@ -302,7 +422,11 @@ _SPECS = [
                   '"tests_run": 12}\'). Stored on the closing run.'),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
-                  "even without owning its run (closes the worker's run)."),
+                  "even without owning its run (closes the worker's run). It also waives "
+                  "the DISCHARGE gate (a cited card id that resolves nowhere, or a void "
+                  "claim with no measurement) and records the waiver on the card. It does "
+                  "NOT bypass PR acceptance, the landing-carrier fence or the deploy "
+                  "proof: those still judge the card's own evidence."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
@@ -312,6 +436,25 @@ _SPECS = [
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
+    _cmd("retarget", [
+        _TASK_ID,
+        _arg("--project",
+             help="Project id or slug to re-anchor the card to (its primary repo + a "
+                  "deterministic worktree branch); 'none' clears the link. Must exist - "
+                  "an unknown project is refused. See `hermes project list`."),
+        _arg("--workspace",
+             help="scratch | worktree | worktree:<path> | dir:<path> - re-resolve the "
+                  "workspace kind/path. Omit to keep the current kind (a project anchors "
+                  "a worktree under its repo)."),
+        _arg("--branch", help="Branch name for a worktree binding"),
+        _arg("--reason", required=True,
+             help="Why the card is being re-pointed (recorded on the retargeted event)"),
+        _arg("--author", help="Author recorded on the change (default: $HERMES_PROFILE or 'user')"),
+        _arg("--force", action="store_true",
+             help="Retarget even while a worker holds a live claim on the card"),
+        _json_flag(),
+    ], help="Re-point a card's project + workspace (the recovery door for a mis-born "
+            "card) — usable on a blocked/ready card; refused on done/archived"),
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
@@ -322,16 +465,85 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--due", metavar="WHEN",
+             help="Clock-fence the hold: a due time (ISO-8601 local 2026-09-16T01:40, "
+                  "an offset from now +90m/+2h/+1d, or epoch seconds). The deployed "
+                  "maintenance-sweep releaser unblocks the card once it passes. Omit "
+                  "for an ordinary block, which waits on a human and is never "
+                  "auto-released. Refused with --kind dependency (a parent wait is "
+                  "not a clock wait). Reason words must come BEFORE the flags."),
+        _arg("--window-policy", choices=["defer", "ambient"], metavar="POLICY",
+             help="What a release should do when the due time lands inside a reserved "
+                  "execution band: 'defer' (default) holds it until the band closes; "
+                  "'ambient' releases anyway, for a hold that is a lightweight check "
+                  "and has to move around the clock. Needs --due."),
+        _arg("--clear-due", action="store_true",
+             help="Drop the task's due time (the hold stays, with no clock)."),
+        _approval_flag("a bulk block"),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
+        _arg("--due", metavar="WHEN",
+             help="Clock-fence the park: a due time (ISO-8601 local 2026-09-16T01:40, "
+                  "an offset from now +90m/+2h/+1d, or epoch seconds). The deployed "
+                  "maintenance-sweep releaser unblocks the card once it passes. Omit "
+                  "for the human hold -- a card that waits on a person, never on a "
+                  "clock. Reason words must come BEFORE the flags."),
+        _arg("--window-policy", choices=["defer", "ambient"], metavar="POLICY",
+             help="What a release should do when the due time lands inside a reserved "
+                  "execution band: 'defer' (default) holds it until the band closes; "
+                  "'ambient' releases anyway, for a wake that is a lightweight check "
+                  "and has to move around the clock. Needs --due."),
+        _arg("--clear-due", action="store_true",
+             help="Drop the task's due time (it stays parked until released by hand)."),
+        _approval_flag("a bulk schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("reopen", [
+        _TASK_ID,
+        _arg("--reason",
+             help="Why the finished card is work again — recorded on the card and its event "
+                  "stream. Quote multi-word reasons."),
+        _arg("--to", dest="to", choices=("ready", "todo", "blocked"), default="ready",
+             help="Landing for the reopened card: 'ready' (default; re-gates to todo while a "
+                  "parent is unfinished), 'todo' (landed as asked — restored but not "
+                  "dispatchable), or 'blocked' (PARKED — the work is done and must not go "
+                  "back in front of a worker)"),
+        _arg("--block-kind", dest="block_kind", default=None,
+             help="Why a blocked landing is parked (default: external)"),
+        _arg("--dry-run", action="store_true",
+             help="Validate the reopen without mutating state"),
+        _json_flag(help="Print the result as a JSON object"),
+    ], help="Reopen finished (done/archived) tasks — the operator door back to a live status"),
+    _cmd("normalise", [
+        _arg("task_id", nargs="?", default=None,
+             help="Card holding the unmodelled status (or pass --card)"),
+        _arg("--card", dest="card", default=None, metavar="<id>",
+             help="The card holding the unmodelled status — the contract form "
+                  "(`kanban normalise --card <id> --to ... --reason ... --evidence ...`); an alias "
+                  "for the positional id"),
+        _arg("--to", dest="to", required=True, choices=("ready", "todo", "blocked"),
+             help="Modelled status to land the card on: 'ready' (re-gates to todo while a parent "
+                  "is unfinished), 'todo' (restored but not dispatchable) or 'blocked' (parked). "
+                  "done/review/running are refused — this verb repairs a broken row, it does "
+                  "not fabricate work state"),
+        _arg("--reason", required=True,
+             help="Why the row holds an unmodelled value — recorded on the status_changed event "
+                  "and the card. Required: a repair states its cause"),
+        _arg("--evidence", required=True,
+             help="A card id, PR ref, path or command whose output shows the row is in this "
+                  "state. Required: a repair points at its measurement"),
+        _arg("--block-kind", dest="block_kind", default=None,
+             help="Why a blocked landing is parked (default: needs_input — a repaired row has no "
+                  "machine-readable cause)"),
+        _json_flag(help="Print the result as a JSON object"),
+    ], help="Move a card holding an UNMODELLED status back onto the workflow, writing the "
+            "status and its status_changed event in ONE transaction"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
@@ -353,12 +565,23 @@ _SPECS = [
         _bulk_ids("promote"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
+        _approval_flag("a bulk promote"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
+        _reason("Why the card is being archived — REQUIRED, one of: "
+                "duplicate|superseded|rehomed|generated-moot|never-started|operator. "
+                "A trailing bare token from that set is read as the reason too "
+                "(promote's positional shape); --reason is the unambiguous form."),
+        _arg("--destination",
+             help="The card that INHERITS this one, as <board>/<card>. The rehome key is "
+                  "written on it and read back BEFORE the source is archived. Required for "
+                  "--reason rehomed|duplicate."),
+        _arg("--actor", help="Who is archiving (recorded on the receipt; defaults to the acting profile)"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
-    ], help="Archive one or more tasks"),
+        _approval_flag("a multi-card archive or a purge"),
+    ], help="Archive one or more tasks (a reason is required; a rehome writes its link first)"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
@@ -434,13 +657,70 @@ _SPECS = [
               "routed to specialist profiles by description. Falls back "
               "to specify-style single-task promotion when the task "
               "doesn't benefit from fan-out. Uses auxiliary.kanban_decomposer."),
+    _cmd("defcon", children=("defcon_action", [
+        _cmd("designate", [
+            _TASK_ID,
+            _reason("Why this card holds a reserved-tranche priority (the audit answer)"),
+            _arg("--authority", help="Who is designating (default: the acting profile)"),
+            _json_flag(),
+        ], help="Designate a card: the ledger row first, then priority 990000"),
+        _cmd("revoke", [
+            _TASK_ID,
+            _reason("Why the designation is being released (it is the audit answer)"),
+            _json_flag(),
+        ], help="Release a designation: annotate the ledger row, restore the card's own "
+                "priority (clamped to what the board allows)"),
+    ]), help="The designation door - the ONLY way into the reserved priority tranche"),
+    _cmd("bulk-approvals", children=("bulk_approvals_action", [
+        _cmd("ask", [
+            _arg("--verb", required=True,
+                 help="The gated verb the ask authorizes (gc, repair, archive, board-rm, …)"),
+            _arg("--scope", required=True,
+                 help="The verb's canonical scope EXACTLY as the refusal printed it. The action's "
+                      "digest is derived from it, so a different spelling is a different action."),
+            _arg("--approach", required=True,
+                 help="What is being authorized, in the operator's terms — the plan, not a "
+                      "summary of it."),
+            _arg("--apr", required=True,
+                 help="The approved APR that authorizes it (APR-0747, 'apr 747', or 747)"),
+            _arg("--board", default=argparse.SUPPRESS, metavar="<slug>",
+                 help="Board the action targets (default: the current board)"),
+            _arg("--actor",
+                 help="Profile filing the ask (default: the acting profile). Only the authorized "
+                      "ask profile may file — the guard names it in its refusal."),
+            _json_flag(),
+        ], help="File the authorized ask; prints the digest the action must then carry"),
+        _cmd("approve", [
+            _arg("digest", help="The digest printed by `bulk-approvals ask`"),
+            _arg("--approach", required=True, help="Must be the ask's approach, verbatim"),
+            _arg("--reason", help="Why this approver agrees (recorded on the ledger row)"),
+            _arg("--actor", help="Approving profile (default: the acting profile)"),
+            _json_flag(),
+        ], help="Record one approval against an ask's digest (never the ask's own author)"),
+        _cmd("list", [_json_flag(help="Emit the whole ledger as JSON")],
+             help="List the ledger: one line per ask, approval and estate teardown"),
+        _cmd("show", [
+            _arg("digest", help="The digest to report"),
+            _json_flag(help="Accepted for symmetry; the record is always JSON"),
+        ], help="Show the bundle behind one digest (ask, approvers, quorum)"),
+    ]), help="The authorized-ask ledger behind the bulk-action gate",
+         description=(
+             "A destructive BULK board action is refused unless the authorized ask profile has "
+             "filed the ask that names this EXACT action (board + verb + canonical scope) in the "
+             "guard's ledger, and a verified preimage of the target store exists. This verb is "
+             "that filing door: `ask` records it and prints the digest, which the action then "
+             "passes as `--approval <digest>`. The ledger lives outside every board store, so "
+             "the record survives the destruction it gates."
+         )),
     _cmd("gc", [
         _arg("--event-retention-days", type=_nonnegative_int, default=30,
              help="Delete task_events older than N days for terminal tasks (default: 30; 0 disables)"),
         _arg("--log-retention-days", type=_nonnegative_int, default=30,
              help="Delete worker log files older than N days (default: 30; 0 disables)"),
+        _approval_flag("a gc sweep"),
     ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
-    _cmd("repair", [_json_flag(help="Emit the repair report as JSON")],
+    _cmd("repair", [_json_flag(help="Emit the repair report as JSON"),
+                    _approval_flag("a quarantine + index repair")],
          help="Check kanban.db integrity and auto-repair index-only corruption",
          description=(
              "Runs PRAGMA integrity_check on the board's DB and reports the result. When the "
@@ -450,6 +730,28 @@ _SPECS = [
              "the same narrow auto-repair the connect-time guard applies. Any other corruption "
              "class is reported and left untouched (fail-closed). Exits 0 when the DB is healthy "
              "or was repaired, non-zero when it is still corrupt."
+         )),
+    _cmd("gates", [
+        _arg("action", nargs="?", default="report", choices=("report", "reconcile"),
+             help="report: measure the gate invariant, change nothing (default). "
+                  "reconcile: lift every gate to the cards it still holds, then measure."),
+        _json_flag(help="Emit the record as JSON (the counts, the lifts, the remaining edges)"),
+    ],
+         help="The gate invariant: a card must never rank below a card it gates",
+         description=(
+             "Holds one relation over the board's graph: for every edge parent -> child, the "
+             "parent's priority is at least the child's while the parent is open, transitively "
+             "through open nodes. The kernel applies it at every write seam (a filing that names "
+             "parents, a new link, a re-rank, a designation release); this verb is the "
+             "DETERMINISTIC PASS that normalises what those seams cannot reach - a value written "
+             "by raw SQL, a restored backup - and states its counts. 'report' is read-only and "
+             "exit 0/1 says whether the invariant holds; 'reconcile' lifts, then re-measures, so "
+             "'violations_after' is a query result rather than a claim. A lift that has to enter "
+             "the reserved tranche goes through the designation door first (authority "
+             "'gate-lift'), and every lift is recorded on the card as a 'reprioritized' event "
+             "carrying the edge that caused it, the value before and after, and the cause. "
+             "'reconcile' is refused from a delegated-child / dispatched-card context; 'report' "
+             "is read-only and available anywhere."
          )),
 ]
 

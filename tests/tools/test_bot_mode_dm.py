@@ -5,6 +5,7 @@ canonical Bot Chat session on a Bot-Mode-managed install, and must refuse to
 deliver from anywhere else even if a schema leaks.
 """
 
+import hashlib
 import json
 import os
 import shlex
@@ -336,6 +337,14 @@ def test_local_delivery_admits_canonically_and_acks(tmp_path, monkeypatch):
     assert result["status"] == "queued"
     assert result["to"] == "@researcher"
     assert result["process_id"] == "proc_test1234"
+    # P9(a)/§1.2: the ack is a RECEIPT — the receipt word rides "result"; "status" keeps the
+    # live line's dispatch word.
+    assert result["result"] == "receipt"
+    assert len(result["delivery_id"]) == 64  # content-addressed, never a send_id
+    # The live-owner branch keeps upstream's own detail wording; the P9(a)/§1.2 substance is the
+    # receipt word above plus the do-NOT-resend / do-NOT-wait guidance below.
+    assert "resend" in result["detail"].lower()
+    assert "do NOT wait" in result["guidance"]
 
     # Exactly one canonical admission, on the target profile's own authority.
     assert [h for h, _p in authority.calls] == [target.resolve()]
@@ -356,6 +365,10 @@ def test_local_delivery_admits_canonically_and_acks(tmp_path, monkeypatch):
     assert mode == "query-file"
     assert Path(profile_home) == target.resolve()
     assert transport_argv[:3] == ["hermes", "-p", "researcher"]
+    assert result["delivery_id"] == hashlib.sha256(str(Path(dm_file).resolve()).encode()).hexdigest()
+    # Upstream's live-owner route spawns a WAITER, not a model turn: the runner's transport argv is
+    # the pinned profile and nothing more (the row's `chat --in ~ -c "Bot Chat"` turn is retired).
+    assert transport_argv == ["hermes", "-p", "researcher"]
     # message body rides the temp file, never the command line
     assert "PAYLOAD_SENTINEL_7A91" not in command
     assert "$(" not in command
@@ -775,12 +788,12 @@ def _admitted_live_dm(tmp_path, monkeypatch, delivery_id):
     record = live.deliver_to_live_owner(tmp_path, owner, "ping", delivery_id=delivery_id)
     monkeypatch.setattr(bot_mode_dm, "_LIVE_WAIT_SECONDS", 0.01)
     monkeypatch.setattr(live, "_POLL_SECONDS", 0.01)
-    return live, authority, record
+    return live, authority, record, owner
 
 
 def test_live_dm_wait_reports_reply_after_initial_wait_budget(tmp_path, monkeypatch, capsys):
     """A retained admission still delivers its reply after the first wait window (main a94b9758313)."""
-    _live, authority, record = _admitted_live_dm(tmp_path, monkeypatch, "a" * 32)
+    _live, authority, record, _owner = _admitted_live_dm(tmp_path, monkeypatch, "a" * 32)
     settling = threading.Timer(0.05, lambda: authority.settle(record["delivery_id"], status="settled", reply="PONG"))
     settling.start()
     try:
@@ -789,14 +802,20 @@ def test_live_dm_wait_reports_reply_after_initial_wait_budget(tmp_path, monkeypa
         settling.join(timeout=2)
     notice = json.loads(capsys.readouterr().out)
     assert exit_code == 0
-    assert (notice["status"], notice["reply"]) == ("settled", "PONG")
+    assert (notice["status"], notice["reply"]) == ("delivered", "PONG")
+
+
+
+
+
+
 
 
 @pytest.mark.parametrize("lookup", ["raises", "holds"])
 def test_live_dm_wait_is_bounded_and_never_cancels_an_admission(tmp_path, monkeypatch, capsys, lookup):
     """An authority that cannot be confirmed, or one that never settles, releases the runner with a
     do-not-resend pending notice; the admitted receipt is never cancelled (main a6509d6b8fd)."""
-    live, _authority, record = _admitted_live_dm(tmp_path, monkeypatch, "2" * 32)
+    live, _authority, record, _owner = _admitted_live_dm(tmp_path, monkeypatch, "2" * 32)
     monkeypatch.setattr(bot_mode_dm, "_LIVE_WAIT_MAX_SECONDS", 0.1)
     if lookup == "raises":
         def lookup_fails(_home):
@@ -1194,7 +1213,7 @@ def test_settled_live_wait_unlinks_the_intent_but_a_pending_one_keeps_it(tmp_pat
     dm_file.write_text("secret plaintext", encoding="utf-8")
     intent = tmp_path / "dm-x.txt.live.json"
     intent.write_text("{}", encoding="utf-8")
-    _live, authority, record = _admitted_live_dm(tmp_path, monkeypatch, "b" * 32)
+    _live, authority, record, _owner = _admitted_live_dm(tmp_path, monkeypatch, "b" * 32)
 
     outcomes = []
     waiting = threading.Thread(target=lambda: outcomes.append(bot_mode_dm._wait_live_dm(

@@ -57,5 +57,45 @@ def test_rename_and_archive(tmp_path):
         assert len(pdb.list_projects(conn)) == 1
 
 
+def test_set_about_round_trips_verbatim_and_leaves_the_row_alone(capsys, tmp_path):
+    """`set-about` writes `description` verbatim, and touches nothing else on the row."""
+    assert _run(["create", "About Target", str(tmp_path), "--description", "created"]) == 0
+    capsys.readouterr()
+    with pdb.connect_closing() as conn:
+        before = pdb.get_project(conn, "about-target")
+        assert before is not None
+        snapshot = (before.id, before.slug, before.board_slug, before.primary_path)
+
+    text = "  registry row for x — one line, verbatim %s  "
+    assert _run(["set-about", "about-target", text]) == 0
+    assert "Set about of about-target" in capsys.readouterr().out
+
+    with pdb.connect_closing() as conn:
+        after = pdb.get_project(conn, "about-target")
+        assert after is not None
+        # (1) the text round-trips into the column itself.
+        assert after.description == text
+        # (2) every other column is byte-identical, not merely still truthy.
+        assert (after.id, after.slug, after.board_slug, after.primary_path) == snapshot
+
+    assert _run(["show", "about-target"]) == 0
+    assert text in capsys.readouterr().out
+
+    # `""` is legal and clears it; the `about:` line then disappears from `show`.
+    assert _run(["set-about", "about-target", ""]) == 0
+    with pdb.connect_closing() as conn:
+        cleared = pdb.get_project(conn, "about-target")
+        assert cleared is not None
+        assert cleared.description == ""
+    assert _run(["show", "about-target"]) == 0
+    assert "about:" not in capsys.readouterr().out
+
+
+def test_set_about_refuses_an_unknown_project_by_name(capsys):
+    assert _run(["set-about", "ghost-project", "whatever"]) == 1
+    err = capsys.readouterr().err
+    assert "no such project: ghost-project" in err
+
+
 
 

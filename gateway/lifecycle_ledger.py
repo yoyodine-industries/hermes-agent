@@ -188,8 +188,8 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]
 # and the restart loop never reaches the cron ticker. The progress handler below renews
 # a phase-owned lease for as long as SQLite is making progress; without a deadline it
 # always returns 0 so it never aborts the check, and the ok/absent/first-complaint
-# verdicts stay fail-closed. When an explicit ``deadline_at`` is supplied the
-# handler returns non-zero once it passes, so SQLite aborts the scan and the caller
+# verdicts stay fail-closed. When an explicit ``deadline_at`` is supplied (t_8a73f016)
+# the handler returns non-zero once it passes, so SQLite aborts the scan and the caller
 # can bound a pathological store instead of pinning the boot path.
 _INTEGRITY_CHECK_LEASE_PHASE = "state_db_unclean_integrity_check"
 _INTEGRITY_CHECK_LEASE_S = 900.0
@@ -241,7 +241,7 @@ def check_state_db_integrity(home: Optional[Path] = None, *, deadline_s: Optiona
     (renewed from a SQLite progress handler, #115542) so a long healthy check
     on a huge store is not mistaken for a parked deadlock.
 
-    ``deadline_s`` (optional): abort the scan once that many seconds elapse and
+    ``deadline_s`` (optional, t_8a73f016): abort the scan once that many seconds elapse and
     return ``"check-incomplete: exceeded <N>s"``.  ``deadline_s=None`` (default) is the
     historic unbounded behaviour -- the progress handler never aborts the PRAGMA.
     """
@@ -404,6 +404,47 @@ def run_deferred_integrity_check(
     except Exception:
         logger.debug("Deferred state.db integrity check failed", exc_info=True)
         return "check-failed: deferred scan raised"
+
+
+def record_shutdown_drain_capped(
+    *,
+    configured_drain_s: float,
+    effective_drain_s: float,
+    cron_drain_s: Optional[float] = None,
+    launchd_exit_timeout_s: Optional[float] = None,
+    timed_out: bool = False,
+    active_agents: int = 0,
+    active_cron_jobs: int = 0,
+    active_api_runs: int = 0,
+    home: Optional[Path] = None,
+) -> None:
+    """Append a durable ``gateway.shutdown_drain_capped`` row when a signal-driven stop cannot
+    drain to its configured budget before the supervisor's kill window.
+
+    The write is deliberately lossy-compatible: it is the ONLY durable trace of *why* in-flight
+    work was force-interrupted (a log line is not enough; the next boot's
+    ``gateway.previous_unclean_exit`` rationale is inferred, not recorded, and a hard kill leaves
+    nothing else behind). Written at the moment the stop path knows the drain was clamped by the
+    live ``launchd_exit_timeout_s`` (or timed out), so the losing executions are surfaced rather
+    than silently reconciled as ``interrupted``. Never raises.
+    """
+    try:
+        record: Dict[str, Any] = {
+            "ts": _now_iso(),
+            "tag": "gateway.shutdown_drain_capped",
+            "pid": os.getpid(),
+            "configured_drain_s": configured_drain_s,
+            "effective_drain_s": effective_drain_s,
+            "cron_drain_s": cron_drain_s,
+            "launchd_exit_timeout_s": launchd_exit_timeout_s,
+            "timed_out": bool(timed_out),
+            "active_agents": int(active_agents),
+            "active_cron_jobs": int(active_cron_jobs),
+            "active_api_runs": int(active_api_runs),
+        }
+        _append_exit_diag(record, home)
+    except Exception:
+        logger.debug("Failed to record a capped shutdown drain", exc_info=True)
 
 
 def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdown", home: Optional[Path] = None) -> None:
