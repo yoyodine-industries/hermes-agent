@@ -112,6 +112,11 @@ def test_secondary_probe_exit_status_is_unknown_never_death(monkeypatch):
     # that as "different boot" would declare every live row dead in one tick — the incident itself.
     monkeypatch.setattr(gw_status, "host_boot_witness", lambda: "boottime:179041285600")
     assert kbd._worker_liveness(os.getpid(), "bootsession:SOME-OTHER-BOOT|1") == kbd.WORKER_UNKNOWN
+    # ... and the same in the OTHER direction: a row recorded under the boot-epoch fallback, with the
+    # host answering a boot-session UUID this time. Mixed forms are "cannot tell", never DEAD.
+    assert kbd._worker_liveness(
+        os.getpid(), "boottime:179041285600|179041285600|5458133"
+    ) == kbd.WORKER_UNKNOWN
 
 
 @pytest.mark.platforms("macos")

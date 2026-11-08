@@ -282,12 +282,29 @@ def test_the_three_circulating_shapes_are_distinguishable():
 
 def test_a_cross_generation_pair_is_incomparable():
     assert guard.shapes_comparable("boot-witness/2", "boot-witness/3") is False
-    assert guard.shapes_comparable("epoch-cs/2", "boot-witness/2") is False
+    assert guard.shapes_comparable("boot-witness/3", "boot-witness/2") is False
+    assert guard.shapes_comparable("epoch-cs/2", "boot-witness/3") is False
+    assert guard.shapes_comparable("boot-witness/3", "epoch-cs/2") is False
     assert guard.shapes_comparable("boot-witness/2", "boot-witness/2") is True
     # A row with no fingerprint, and the UNVERIFIED marker, keep the bare-existence rule.
     assert guard.shapes_comparable("boot-witness/2", "none") is True
     assert guard.shapes_comparable("boot-witness/2", "unverified") is True
     assert guard.shapes_comparable("epoch-cs/2", "legacy-int") is True
+
+
+def test_the_same_structure_under_two_different_probes_is_comparable():
+    """t_a9e8be6f's false positive: the SPELLING moved, the STRUCTURE did not.
+
+    ``boot-witness/3`` and ``composed/3`` are both ``<witness>|<reference_cs>|<start>``. Which
+    probe answered (a boot-session UUID, the boot-epoch fallback) is a value inside the record;
+    the value comparator answers UNKNOWN for mixed witness forms, so they are comparable.
+    """
+    assert guard.shapes_comparable("boot-witness/3", "composed/3") is True
+    assert guard.shapes_comparable("composed/3", "boot-witness/3") is True
+    # The field count is the structure: a different count is still a different generation.
+    assert guard.shapes_comparable("composed/2", "boot-witness/3") is False
+    assert guard.shapes_comparable("boot-witness/2", "composed/2") is True
+    assert guard.shapes_comparable("composed/4", "boot-witness/3") is False
 
 
 def test_a_row_from_another_generation_is_held_and_not_counted():
@@ -339,13 +356,82 @@ def test_losing_psutil_alerts(tmp_path):
     assert "psutil-lost" in tick.reasons
 
 
-def test_an_interpreter_minor_move_alerts_and_a_patch_bump_does_not(tmp_path):
+def test_an_interpreter_move_is_evidence_not_divergence(tmp_path):
+    """The card's false positive: 3.14 vs 3.11 with an IDENTICAL write shape must be silent.
+
+    The launchd entry venv (3.11) is a supported entry point that self-relaunches into the pinned
+    tool python and produces the same ``boot-witness/3``, psutil and witness symbols. The tick's
+    interpreter is RECORDED in the stamp as evidence, never compared.
+    """
     path = tmp_path / "stamp.json"
-    guard.check_deployed_generation(sample="|1", interpreter="3.11.16", path=path, now=1000)
-    patch = guard.check_deployed_generation(sample="|1", interpreter="3.11.9", path=path, now=2000)
-    assert patch.alerting is False
-    minor = guard.check_deployed_generation(sample="|1", interpreter="3.14.7", path=path, now=3000)
-    assert minor.reasons == ["interpreter-changed:3.11->3.14"]
+    guard.check_deployed_generation(
+        sample="bootsession:U|179160482300|5458133", interpreter="3.14.9", psutil=True,
+        witness_symbols=["_worker_liveness", "WORKER_ALIVE"], path=path, now=1000,
+    )
+    tick = guard.check_deployed_generation(
+        sample="bootsession:U|179160482300|5458133", interpreter="3.11.15", psutil=True,
+        witness_symbols=["_worker_liveness", "WORKER_ALIVE"], path=path, now=2000,
+    )
+    assert tick.reasons == []
+    assert tick.alerting is False
+    # It IS recorded -- evidence a reader of the stamp can use, not a reason to page a lane.
+    stamp = guard.read_generation_stamp(path)
+    assert stamp["interpreter_full"] == "3.11.15"
+    assert stamp["shape"] == "boot-witness/3"
+
+
+def test_a_witness_probe_change_with_the_same_structure_is_not_a_divergence(tmp_path):
+    """t_a9e8be6f: ``_darwin_boot_session_uuid`` hiccuped, the write shape did not change."""
+    path = tmp_path / "stamp.json"
+    guard.check_deployed_generation(sample="bootsession:U|179160482300|5458133", path=path, now=1000)
+    tick = guard.check_deployed_generation(
+        sample="boottime:179160482300|179160482300|5458133", path=path, now=2000,
+    )
+    assert tick.stamp["shape"] == "composed/3"
+    assert tick.reasons == []
+    assert tick.alerting is False
+    assert guard.read_generation_stamp(path)["shape"] == "composed/3"
+
+
+def test_a_field_count_change_still_alerts_under_the_same_family(tmp_path):
+    path = tmp_path / "stamp.json"
+    guard.check_deployed_generation(sample="bootsession:U|5458133", path=path, now=1000)
+    tick = guard.check_deployed_generation(sample="bootsession:U|179160482300|5458133", path=path, now=2000)
+    assert tick.reasons == ["identity-shape-changed:boot-witness/2->boot-witness/3"]
+
+
+def test_compare_generation_does_not_alert_on_the_probe_spelling_alone():
+    """t_a9e8be6f: boot-witness/3 -> composed/3 is the same three-field structure."""
+    recorded = {
+        "shape": "boot-witness/3", "interpreter": "3.14", "interpreter_full": "3.14.9",
+        "psutil": True, "witness_symbols": ["WORKER_ALIVE", "_worker_liveness"],
+        "sample": "bootsession:U|179160482300|5458133",
+    }
+    current = {
+        "shape": "composed/3", "interpreter": "3.14", "interpreter_full": "3.14.9",
+        "psutil": True, "witness_symbols": ["WORKER_ALIVE", "_worker_liveness"],
+        "sample": "boottime:179160482300|5458133",
+    }
+    assert guard.shapes_comparable(recorded["shape"], current["shape"]) is True
+    assert guard.compare_generation(recorded, current) == []
+
+
+def test_the_divergence_body_marks_the_sample_not_compared():
+    """The sample's last field is the process's own start: showing it side by side implies a
+    difference that is not one, so the row says so."""
+    recorded = {
+        "shape": "boot-witness/3", "interpreter": "3.14", "interpreter_full": "3.14.9",
+        "psutil": True, "witness_symbols": ["WORKER_ALIVE"], "tree": "/t",
+        "sample": "bootsession:U|179160482300|5458133", "recorded_at": 1000,
+    }
+    current = dict(recorded, shape="boot-witness/2", sample="bootsession:U|5458133", recorded_at=2000)
+    tick = guard.GenerationTick(
+        stamp=current, reasons=["identity-shape-changed:boot-witness/3->boot-witness/2"],
+        recorded=False, reference=recorded,
+    )
+    body = guard.divergence_body(tick, board="b", tree="/t")
+    assert "| sample (not compared) |" in body
+    assert "| interpreter | `3.14` | `3.14` |" in body
 
 
 def test_losing_a_witness_symbol_alerts_but_gaining_one_does_not(tmp_path):

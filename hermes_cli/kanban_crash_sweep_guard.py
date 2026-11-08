@@ -61,10 +61,12 @@ Two mechanisms, both deterministic:
    (``<kanban_home>/kanban/dispatcher_identity_generation.json``) on the first tick and compared on
    every later tick. A divergence -- an interpreter move that changes the shape, a tree write that
    drops the witness bytes -- is detected in ONE tick and alerted, instead of being discovered by a
-   false crash sweep hours later. Measured 2026-10-10, three incomparable shapes in circulation at
-   once: ``'|<abs-epoch-cs>'`` (``.venv`` 3.11.16 + psutil), ``None`` -> ``'unverified'`` (the 3.14
-   gateway interpreter, no psutil), and ``bootsession:<uuid>|<ref_cs>|<boot-relative start>`` (the
-   live rows).
+   false crash sweep hours later. The comparison is STRUCTURAL (:func:`shapes_comparable`): the
+   interpreter tag and which probe spelled the witness are EVIDENCE, so a tick that produces the
+   same field structure is the same generation whatever process ran it. Measured 2026-10-10, three
+   incomparable shapes in circulation at once: ``'|<abs-epoch-cs>'`` (``.venv`` 3.11.16 + psutil),
+   ``None`` -> ``'unverified'`` (the 3.14 gateway interpreter, no psutil), and
+   ``bootsession:<uuid>|<ref_cs>|<boot-relative start>`` (the live rows).
 
 2. **The per-row hold.** The same comparison is made against the fingerprints actually READ off the
    running rows. When the shape the sweep READS was built by a different identity generation than
@@ -118,17 +120,38 @@ IDENTITY_SHAPE_LEGACY_INT = "legacy-int"
 IDENTITY_SHAPE_OTHER = "other"
 
 #: Families whose values are *identity-bearing*: a comparison between two of these is a real
-#: liveness comparison only if the shapes match exactly. ``none`` (a legacy row with no fingerprint)
-#: and ``unverified`` are deliberately excluded -- they carry no identity to compare, and the
-#: existing bare-existence rule owns them.
+#: liveness comparison only if their STRUCTURE is comparable (see :func:`shapes_comparable`).
+#: ``none`` (a legacy row with no fingerprint) and ``unverified`` are deliberately excluded -- they
+#: carry no identity to compare, and the existing bare-existence rule owns them.
 IDENTITY_SHAPE_FAMILIES: frozenset[str] = frozenset({
     IDENTITY_SHAPE_BOOT_WITNESS, IDENTITY_SHAPE_EPOCH_CS, IDENTITY_SHAPE_COMPOSED,
+})
+
+#: Families that are the SAME structure wearing a different probe's answer:
+#: ``<witness>|<reference_cs>|<start>``. Which probe filled the first field (a boot-session UUID,
+#: the boot-epoch fallback) is a VALUE, not a structure -- and the value comparator already answers
+#: UNKNOWN, never DEAD, for mixed witness forms -- so these two are interchangeable at equal field
+#: counts. ``epoch-cs`` is NOT here: it is ``<empty witness>|<reference>`` with no start field, a
+#: different structure that only compares with itself.
+WITNESS_BEARING_FAMILIES: frozenset[str] = frozenset({
+    IDENTITY_SHAPE_BOOT_WITNESS, IDENTITY_SHAPE_COMPOSED,
 })
 
 
 def shape_family(shape: str) -> str:
     """``"boot-witness/3"`` -> ``"boot-witness"``."""
     return str(shape).split("/", 1)[0]
+
+
+def _shape_field_count(shape: str) -> Optional[int]:
+    """``"boot-witness/3"`` -> ``3``; a token that names no field count -> ``None``."""
+    _family, sep, count = str(shape).partition("/")
+    if not sep:
+        return None
+    try:
+        return int(count)
+    except (TypeError, ValueError):
+        return None
 
 
 def identity_shape(sample: Any) -> str:
@@ -164,20 +187,32 @@ def identity_shape(sample: Any) -> str:
 
 
 def shapes_comparable(write_shape: str, read_shape: str) -> bool:
-    """False when a liveness comparison between these two fingerprints is meaningless.
+    """True when a liveness comparison between these two fingerprints means something.
 
-    Equal shapes are always comparable. A pair that names two different identity-bearing families,
-    or two field counts of the same family, is not -- that is the measured 2026-10-10 condition.
-    Anything involving ``none`` / ``unverified`` / ``legacy-int`` is left to the existing
-    bare-existence rule.
+    Comparability is STRUCTURAL, not equal-by-spelling. ``boot-witness/3`` and ``composed/3`` are
+    both ``<witness>|<reference_cs>|<start>``: which probe answered the first field (a boot-session
+    UUID, the boot-epoch fallback) is a VALUE inside the record, never a different structure. The
+    value comparator already answers UNKNOWN -- never DEAD -- when two witnesses are not of a
+    comparable form, so those two families are interchangeable at equal field counts.
+
+    The field count IS the structure. ``epoch-cs/2`` vs ``boot-witness/3`` and ``boot-witness/2``
+    vs ``boot-witness/3`` have different numbers of fields and stay incomparable -- that is the
+    measured 2026-10-10 condition. ``epoch-cs`` (an empty witness and a reference, no start) only
+    compares with itself. Anything involving ``none`` / ``unverified`` / ``legacy-int`` is left to
+    the existing bare-existence rule.
     """
+    write_shape = str(write_shape)
+    read_shape = str(read_shape)
     if write_shape == read_shape:
         return True
-    if shape_family(write_shape) not in IDENTITY_SHAPE_FAMILIES:
+    write_family = shape_family(write_shape)
+    read_family = shape_family(read_shape)
+    if write_family not in IDENTITY_SHAPE_FAMILIES or read_family not in IDENTITY_SHAPE_FAMILIES:
         return True
-    if shape_family(read_shape) not in IDENTITY_SHAPE_FAMILIES:
-        return True
-    return False
+    if write_family not in WITNESS_BEARING_FAMILIES or read_family not in WITNESS_BEARING_FAMILIES:
+        # ``epoch-cs`` is its own structure (its only comparable partner is itself, above).
+        return False
+    return _shape_field_count(write_shape) == _shape_field_count(read_shape)
 
 
 # --- R4: the mass-crash abort ----------------------------------------------------------------
@@ -823,10 +858,11 @@ def _psutil_available() -> bool:
 
 
 def _interpreter_tag(version: Optional[str] = None) -> str:
-    """``major.minor`` -- the part of an interpreter change that can move the identity shape.
+    """``major.minor`` -- recorded as EVIDENCE, never compared (see :func:`compare_generation`).
 
-    Patch releases are recorded but not compared: a routine patch bump must not page a lane, while a
-    3.11 -> 3.14 move (psutil present -> absent, ``'|<epoch-cs>'`` -> ``'unverified'``) must.
+    A patch bump and a minor move both stay out of the divergence reasons: what alerts is a change
+    in the identity shape actually WRITTEN (a lost psutil, a lost witness symbol, an incomparable
+    field structure). The tag names the process that produced the stamp when a human reads the card.
     """
     raw = version or platform.python_version()
     parts = str(raw).split(".")
@@ -860,18 +896,26 @@ def generation_stamp(
 def compare_generation(recorded: Optional[dict], current: dict) -> list[str]:
     """Divergence reasons, in a deterministic order. Empty means the generation is unchanged.
 
-    Direction matters: an interpreter MINOR change, a shape change, a lost psutil, and a LOST witness
-    symbol all alert. A GAINED witness symbol does not -- that is the R1-R3 fix landing.
+    The comparison is STRUCTURAL. The shape reason fires only when the two fingerprints are not
+    comparable (see :func:`shapes_comparable`) -- never when their tokens merely differ, because a
+    token differing is not a different shape (``boot-witness/3`` and ``composed/3`` are the same
+    three fields under two probes). A lost psutil and a LOST witness symbol alert; a GAINED witness
+    symbol does not -- that is the R1-R3 fix landing.
+
+    ``interpreter`` / ``interpreter_full`` are RECORDED and shown in any card body as EVIDENCE, but
+    they are never a divergence reason. Measured 2026-11-07: the launchd entry interpreter is a
+    supported entry point that self-relaunches into the pinned tool python and writes an IDENTICAL
+    shape (same family, same fields, same reference, same psutil, 4/4 witness symbols). Alerting on
+    the process that ticked was a false positive: comparability is a property of the WRITE SHAPE,
+    not of the interpreter's version tag.
     """
     if not recorded:
         return []
     reasons: list[str] = []
-    if recorded.get("shape") != current.get("shape"):
-        reasons.append(f"identity-shape-changed:{recorded.get('shape')}->{current.get('shape')}")
-    if recorded.get("interpreter") != current.get("interpreter"):
-        reasons.append(
-            f"interpreter-changed:{recorded.get('interpreter')}->{current.get('interpreter')}"
-        )
+    recorded_shape = str(recorded.get("shape") or IDENTITY_SHAPE_NONE)
+    current_shape = str(current.get("shape") or IDENTITY_SHAPE_NONE)
+    if not shapes_comparable(recorded_shape, current_shape):
+        reasons.append(f"identity-shape-changed:{recorded_shape}->{current_shape}")
     if recorded.get("psutil") and not current.get("psutil"):
         reasons.append("psutil-lost")
     lost = sorted(set(recorded.get("witness_symbols") or []) - set(current.get("witness_symbols") or []))
@@ -958,7 +1002,15 @@ def check_deployed_generation(
 
 
 def divergence_body(tick: GenerationTick, *, board: Optional[str] = None, tree: Any = None) -> str:
-    """The acting card's body for a generation divergence: both generations, side by side."""
+    """The acting card's body for a generation divergence: both generations, side by side.
+
+    The ``sample`` row is marked NOT COMPARED on purpose. Its last field is the process's own
+    boot-relative start time, which differs by construction between any two processes, so a
+    side-by-side of the raw values reads as a difference that is not one. What IS compared is the
+    STRUCTURE (family, field count) and the substrate (psutil, witness symbols); a foreign tick of
+    the same tree under a different interpreter that yields the same shape is not a deployment
+    change, and it never reaches this card.
+    """
     recorded = tick.reference or {}
     current = tick.stamp
     resolved_tree = tree if tree is not None else dispatching_tree()
@@ -980,10 +1032,17 @@ def divergence_body(tick: GenerationTick, *, board: Optional[str] = None, tree: 
         "| field | recorded | current |",
         "| --- | --- | --- |",
     ]
-    for key in ("shape", "interpreter", "interpreter_full", "psutil", "witness_symbols", "sample", "tree"):
+    for key in ("shape", "interpreter", "interpreter_full", "psutil", "witness_symbols", "tree"):
         lines.append(f"| {key} | `{recorded.get(key)}` | `{current.get(key)}` |")
+    # Evidence, NOT a comparison: the sample's last field is the process's own boot-relative
+    # start, so two live processes always differ there by construction.
+    lines.append(
+        f"| sample (not compared) | `{recorded.get('sample')}` | `{current.get('sample')}` |"
+    )
     lines += [
         "",
+        "- `interpreter` / `interpreter_full` are EVIDENCE, never a divergence reason: this host's",
+        "  supported entry interpreter relaunches into the pinned one and writes the same shape.",
         f"- recorded_at: {recorded.get('recorded_at')}",
         f"- observed_at: {current.get('recorded_at')}",
         "",
