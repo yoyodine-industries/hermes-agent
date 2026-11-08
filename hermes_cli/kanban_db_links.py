@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
 from hermes_cli.kanban_parent_state import ParentState, parent_promotion_state
+from hermes_cli.kanban_promotion import promote_state
 
 #: A parent in one of these has finished: the kernel promotes a child past it
 #: (``_parents_satisfied``/``recompute_ready``), so such an edge is no gate at all.
@@ -78,14 +79,32 @@ def parent_edges(conn: sqlite3.Connection, child_id: str, profiles=None) -> list
         return []
     rows = {
         row["id"]: row for row in conn.execute(
-            "SELECT id, status, assignee, block_kind, current_run_id, due_at FROM tasks "
-            f"WHERE id IN ({','.join('?' * len(ids))})", tuple(ids))
+            "SELECT id, status, assignee, block_kind, current_run_id, due_at, worker_pid, "
+            "last_heartbeat_at "
+            f"FROM tasks WHERE id IN ({','.join('?' * len(ids))})", tuple(ids))
     }
     edges = []
     for pid in ids:
         row = rows.get(pid) or {"status": "", "assignee": "", "block_kind": None,
-                                "current_run_id": None, "due_at": None}
+                                "current_run_id": None, "due_at": None,
+                                "worker_pid": None, "last_heartbeat_at": None}
         state = parent_promotion_state(row, profiles=profiles)
+        if not state.self_moves:
+            # The graph said "nothing will move this", and the graph does not read the ROW:
+            # it never sees a live worker_pid, a heartbeat, a human hold, or a PR carrier
+            # the tracker refuses. One predicate, here as everywhere else.
+            promo = promote_state(row, tracker=False)
+            if promo.outcome == "IN_FLIGHT":
+                state = ParentState(
+                    code="in_flight",
+                    text=(f"a run is on it (worker_pid {promo.fields.get('worker_pid')}, "
+                          f"heartbeat {promo.fields.get('heartbeat_age_s')}s) — it will move"),
+                    self_moves=True)
+            elif promo.outcome == "UNCHECKED":
+                state = ParentState(
+                    code="unverified",
+                    text=(f"its readiness could not be verified — {promo.reason}"),
+                    self_moves=False)
         edges.append(ParentEdgeState(code=state.code, text=state.text,
                                      self_moves=state.self_moves,
                                      id=pid, status=str(row["status"] or "")))

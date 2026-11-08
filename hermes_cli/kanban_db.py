@@ -4473,6 +4473,31 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def _record_promotion_deferred(conn: sqlite3.Connection, task_id: str, state) -> None:
+    """Put a refused promotion on the event stream — ONCE per distinct outcome.
+
+    The spec's rule for notices (3.3) applies here too: a card waiting for the same
+    reason must not emit an event on every tick, but a card whose reason CHANGED (the
+    tracker went from clean to refusing, say) must, because that change is the news.
+    """
+    last = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'promotion_deferred' "
+        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    if last is not None:
+        try:
+            prev = json.loads(last["payload"] or "{}")
+        except (TypeError, ValueError):
+            prev = {}
+        if isinstance(prev, dict) and prev.get("outcome") == state.outcome:
+            return
+    _append_event(conn, task_id, "promotion_deferred", {
+        "outcome": state.outcome,
+        "reason": state.reason,
+        "receipt": state.receipt(),
+        "promotion": state.as_dict(),
+    })
+
+
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
@@ -4488,11 +4513,26 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
-    with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+    # ONE PREDICATE, TWO PHASES. The promotion decision may consult the tracker (a network
+    # round trip), so it is computed BEFORE any write lock is taken: a gh call inside
+    # ``write_txn`` would hold the board's writer for the length of a network timeout.
+    todo_rows = conn.execute(
+        "SELECT id, status, consecutive_failures, max_retries "
+        "FROM tasks WHERE status IN ('todo', 'blocked')"
+    ).fetchall()
+    decisions: dict[str, object] = {}
+    for row in todo_rows:
+        task_id = row["id"]
+        if row["status"] == "blocked" and _has_sticky_block(conn, task_id):
+            continue  # explicit human-intervention block; only ``unblock_task`` exits it
+        parents = conn.execute(
+            "SELECT t.status FROM tasks t JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ?", (task_id,),
         ).fetchall()
+        if not all(p["status"] in ("done", "archived") for p in parents):
+            continue  # the graph alone refuses; the tracker is not asked
+        decisions[task_id] = _promotion_state(conn, task_id)
+    with write_txn(conn):
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
@@ -4505,6 +4545,13 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                # The graph is satisfied. The ROW still has a say: a live claim, a human
+                # hold, or a PR carrier the tracker refuses all stop the promotion here,
+                # with the receipt on the event stream (spec 3.3: once per state change).
+                state = decisions.get(task_id)
+                if state is not None and not state.promotable:
+                    _record_promotion_deferred(conn, task_id, state)
+                    continue
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -7217,6 +7264,19 @@ def request_changes(
     return True, implementer
 
 
+def _promotion_state(conn: sqlite3.Connection, task_id: str, *, tracker=None):
+    """The ONE promotion decision for a card — see :mod:`hermes_cli.kanban_promotion`.
+
+    Imported lazily: ``kanban_promotion`` reads the fleet's PR declaration through
+    ``kanban_landing_carrier``, and this module is on both their import paths.
+    """
+    from hermes_cli.kanban_promotion import promote_state_for
+
+    if tracker is None:
+        return promote_state_for(conn, task_id)
+    return promote_state_for(conn, task_id, tracker=tracker)
+
+
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     dry_run: bool = False,
@@ -7252,7 +7312,14 @@ def promote_task(
         )
 
     if dry_run:
+        state = _promotion_state(conn, task_id)
+        if not state.promotable:
+            return False, f"refused by the promotion gate: {state.receipt()}"
         return True, None
+
+    state = _promotion_state(conn, task_id)
+    if not state.promotable:
+        return False, f"refused by the promotion gate: {state.receipt()}"
 
     with write_txn(conn):
         upd = conn.execute(
@@ -7261,7 +7328,9 @@ def promote_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        _append_event(conn, task_id, "promoted_manual",
+                      {"actor": actor, "reason": reason,
+                       "promotion": state.as_dict(), "receipt": state.receipt()})
 
     return True, None
 
@@ -7451,6 +7520,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 def unblock_task(
     conn: sqlite3.Connection, task_id: str, *, extra_event: Optional[dict] = None,
+    force: bool = False,
 ) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first.
@@ -7458,7 +7528,22 @@ def unblock_task(
     ``extra_event`` merges into the ``unblocked`` event payload, so a caller that
     released the card for a reason of its own (a due-fence releaser, say) leaves
     that reason on the board's event stream without a second event.
+
+    THE GATE: a release goes through the SAME :func:`promote_state` predicate the
+    promotion branch and the notifier use. ``IN_FLIGHT`` (a live pid with a fresh
+    heartbeat), ``HUMAN_HOLD`` (needs_input / sticky / manual hold) and an unreadable
+    PR carrier (``UNCHECKED``) REFUSE, raising :class:`PromotionRefused` with the
+    receipt — a bare ``kanban unblock`` used to buy exactly the crash the automaton
+    would have bought. ``force=True`` is the operator's override for a hold; it is the
+    ONLY way past one. ``SCHEDULED`` is NOT a refusal here: the caller of ``unblock``
+    is the clock fence being released.
     """
+    state = _promotion_state(conn, task_id)
+    if not force and state.outcome in ("IN_FLIGHT", "HUMAN_HOLD", "UNCHECKED",
+                                       "NOT-PROMOTABLE"):
+        from hermes_cli.kanban_promotion import PromotionRefused
+
+        raise PromotionRefused(state)
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
