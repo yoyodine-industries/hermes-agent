@@ -347,6 +347,10 @@ def get_board(
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
             columns["archived"] = []
+        # A status outside the workflow is NOT a column and is never bucketed
+        # into one. Folding it into ``todo`` (the old fallback) drew the stranded
+        # row as live work in progress and hid the defect from every reader.
+        unmodelled: list[dict] = []
         # One window-function query for latest summaries (avoids N+1); cards get a
         # truncated preview, the full text comes from /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
@@ -361,7 +365,11 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
-            columns[t.status if t.status in columns else "todo"].append(d)
+            if t.status in columns:
+                columns[t.status].append(d)
+            else:
+                d["unmodelled_status"] = t.status
+                unmodelled.append(d)
 
         # Queue lanes keep the list_tasks dispatch order; the done column is
         # history, so order it newest-completed-first. Two stable sorts compose
@@ -380,7 +388,9 @@ def get_board(
         assignees = [entry["name"] for entry in kanban_db.known_assignees(conn)]
         return {
             "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
-            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
+            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time()),
+            # Rendered by the dashboard as a defect banner, never as a lane.
+            "unmodelled": unmodelled}
 
 
 _read_board = coalesced_read(get_board)
@@ -797,6 +807,9 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     """Direct status write for drag-drop moves without a structured verb (todo<->ready,
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
+    # Refuse before the write so the caller gets a message naming the value and
+    # the legal set; the storage trigger is the backstop, not the first line.
+    kanban_workflow.validate_status(new_status, where="dashboard status write")
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):

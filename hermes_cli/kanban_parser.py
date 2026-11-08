@@ -520,6 +520,26 @@ _SPECS = [
              help="Validate the reopen without mutating state"),
         _json_flag(help="Print the result as a JSON object"),
     ], help="Reopen finished (done/archived) tasks — the operator door back to a live status"),
+    _cmd("normalise", [
+        _arg("--card", dest="task_id", required=True,
+             help="Card id whose status is outside the workflow vocabulary."),
+        _arg("--to", dest="to", required=True, choices=("ready", "todo", "blocked"),
+             help="Recovery destination: queue it (ready/todo) or park it for a human (blocked). "
+                  "done/archived/review/running are refused — they assert work this instrument cannot know."),
+        _arg("--reason", required=True,
+             help="Why the row is being normalised — written to the audit event. Quote multi-word reasons."),
+        _arg("--evidence", required=True,
+             help="What was measured (card id, census line, log ref) — written to the audit event."),
+        _arg("--block-kind", dest="block_kind", default=None,
+             help="Typed block reason when --to blocked (default: needs_input)"),
+        _arg("--by", default=None, help="Actor recorded on the event (default: profile/env)"),
+        _json_flag(help="Print the result as a JSON object"),
+    ], help="Normalise a card whose status the workflow cannot express (status + audit event, one transaction)"),
+    _cmd("audit", [
+        _arg("--board", default=None, help="Census one board instead of every board"),
+        _arg("--verbose", action="store_true", help="Print a line for every clean board"),
+        _json_flag(help="Print the census as JSON"),
+    ], help="Census boards for unmodelled statuses and wrong-typed epoch cells (exit 1 on a defect)"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

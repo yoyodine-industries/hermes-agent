@@ -1018,6 +1018,109 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
 
     _rebuild_drifted_tables(conn)
+    _ensure_write_guards(conn)
+
+
+def _ensure_write_guards(conn: sqlite3.Connection) -> None:
+    """Install the schema backstops behind the status vocabulary and epoch types.
+
+    The Python seams (``create_task``, the dashboard status verbs, the
+    ``normalise`` verb) refuse an unmodelled status with a message that names
+    the value and the legal set. That is not enough on its own: the row these
+    guards exist for carried ``status='in_progress'`` and *no* ``status`` event,
+    i.e. it was written by something that never passed a seam (measured on the
+    financially board, card t_58e17240). The triggers below bind the same
+    vocabulary and the epoch-column types at the STORAGE boundary, so every
+    writer - kernel verb, dashboard PATCH, agent tool, yoyoflow node, or a raw
+    sqlite3 handle - is refused.
+
+    Re-created on every init rather than ``CREATE TRIGGER IF NOT EXISTS``: the
+    table rebuilds above drop triggers with the table they replace, and a stale
+    trigger body must never outlive a vocabulary change. DDL only; no row is
+    touched, so a board that already carries an offending row still opens (it
+    is reported by ``kanban_db.status_vocabulary_census`` and repaired by
+    ``kanban normalise`` - refusing to open it would strand exactly the card
+    this guard makes fixable).
+    """
+    from hermes_cli import kanban_workflow as _workflow
+
+    if not _table_exists(conn, "tasks"):
+        # A board store with no task surface (the migrations/test DBs) has no
+        # status to guard; the seed path creates it later and re-runs this.
+        return
+    have = set(_column_names(conn, "tasks"))
+    if "status" not in have:
+        return
+    statuses = sorted(_workflow.DEFAULT_STATUSES)
+    legal = ", ".join(statuses)
+    status_in = ", ".join("'%s'" % s for s in statuses)
+    epoch_cols = tuple(c for c in _kb._TASK_EPOCH_COLUMNS if c in have)
+    epoch_list = ", ".join(epoch_cols)
+    # An epoch cell is well-formed when it is NUMERIC (SQLite may hold epoch
+    # seconds as INTEGER or REAL - ``time.time()`` is a float and a writer that
+    # does not int() it is still keeping an instant, not a string). The defect
+    # this binds is the measured one: TEXT/BLOB in an epoch column, which
+    # ``_to_epoch`` then reads back as "epoch 0".
+    epoch_check = " OR ".join(
+        f"(NEW.{col} IS NOT NULL AND typeof(NEW.{col}) IN ('text','blob'))"
+        for col in epoch_cols
+    )
+    status_msg = (
+        f"kanban: tasks.status is outside the workflow vocabulary; legal values are {legal}"
+    )
+    epoch_msg = (f"kanban: tasks epoch column must be numeric epoch seconds, "
+                 f"not TEXT/BLOB (one of: {epoch_list})")
+    # NULL is not "absent" here: ``NULL NOT IN (...)`` evaluates to NULL, so a
+    # bare NOT IN let a NULL status through the guard while the census flagged it.
+    status_when = (f"NEW.status IS NULL OR typeof(NEW.status) != 'text' "
+                   f"OR NEW.status NOT IN ({status_in})")
+
+    for name in ("tasks_status_vocabulary_insert", "tasks_status_vocabulary_update",
+                 "tasks_epoch_type_insert", "tasks_epoch_type_update"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    conn.execute(
+        f"""
+        CREATE TRIGGER tasks_status_vocabulary_insert
+        BEFORE INSERT ON tasks
+        WHEN {status_when}
+        BEGIN
+            SELECT RAISE(ABORT, '{status_msg}');
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER tasks_status_vocabulary_update
+        BEFORE UPDATE OF status ON tasks
+        WHEN {status_when}
+        BEGIN
+            SELECT RAISE(ABORT, '{status_msg}');
+        END
+        """
+    )
+    if not epoch_cols:  # a reduced legacy table carries none of them
+        return
+    conn.execute(
+        f"""
+        CREATE TRIGGER tasks_epoch_type_insert
+        BEFORE INSERT ON tasks
+        WHEN {epoch_check}
+        BEGIN
+            SELECT RAISE(ABORT, '{epoch_msg}');
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER tasks_epoch_type_update
+        BEFORE UPDATE OF {epoch_list} ON tasks
+        WHEN {epoch_check}
+        BEGIN
+            SELECT RAISE(ABORT, '{epoch_msg}');
+        END
+        """
+    )
+
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
