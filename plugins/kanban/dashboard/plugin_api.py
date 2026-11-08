@@ -194,8 +194,11 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 # --- Serialization helpers --------------------------------------------------
 
 # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column), from the
-# one workflow definition. A status missing here gets mis-bucketed into ``todo``.
+# one workflow definition. A status outside that definition is NOT drawn into any of them: it
+# used to be mis-bucketed into ``todo``, which made a card the workflow cannot see read as
+# ordinary queue work. Such rows go to ``UNMODELLED_COLUMN``, appended only when it has cards.
 BOARD_COLUMNS: list[str] = list(kanban_workflow.DEFAULT_WORKFLOW.keys())
+UNMODELLED_COLUMN = "unmodelled"
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -210,6 +213,10 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
         d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
     # Latest non-null run summary (workers hand off via ``task_runs.summary``, not ``tasks.result``).
     d["latest_summary"] = latest_summary
+    # The vocabulary judgement travels WITH the card, so a UI (and the tests) can tell a real
+    # phase from a value the workflow has never heard of without re-implementing the rule.
+    d["status_modelled"] = kanban_db.is_modelled_status(task.status)
+    d["status_display"] = kanban_db.render_status(task.status)
     # Start of the current task_runs row (``tasks.started_at`` is the FIRST-EVER
     # start; after a retry the run clock must tick from the fresh run).
     d["current_run_started_at"] = current_run_started_at
@@ -361,7 +368,19 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
-            columns[t.status if t.status in columns else "todo"].append(d)
+            # NEVER draw an unmodelled value into a live column: it is its own column, appended
+            # below only when it holds a card, so the board's phase counts stay honest.
+            if kanban_db.is_modelled_status(t.status) and t.status in columns:
+                columns[t.status].append(d)
+            else:
+                columns.setdefault(UNMODELLED_COLUMN, []).append(d)
+
+        # A status the workflow does not model is not a phase: surface it as its own trailing
+        # column, labelled, so an operator sees the row instead of it hiding among todo work.
+        if columns.get(UNMODELLED_COLUMN):
+            columns[UNMODELLED_COLUMN].sort(key=lambda d: d["id"])
+        else:
+            columns.pop(UNMODELLED_COLUMN, None)
 
         # Queue lanes keep the list_tasks dispatch order; the done column is
         # history, so order it newest-completed-first. Two stable sorts compose

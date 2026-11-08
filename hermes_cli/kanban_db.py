@@ -39,6 +39,120 @@ from utils import unlink_files_older_than
 _log = logging.getLogger(__name__)
 
 
+# --- The status VOCABULARY boundary ------------------------------------------------------
+#
+# ``tasks.status`` has ONE legal vocabulary -- the workflow's (``kanban_workflow.DEFAULT_STATUSES``,
+# imported here as ``VALID_STATUSES``). Other host vocabularies carry a same-spelled column and a
+# DIFFERENT set: ``tools/todo_tool.py`` (pending/in_progress/completed/cancelled), the escalation
+# ledger's disposition states and the SDLC session stages all use ``in_progress``. A writer that
+# carries one of those into a kanban write used to succeed, silently, because SQLite's TEXT column
+# accepts any string: the row then had a status that NO verb switches on (``block_task`` routes only
+# from running/ready, so ``in_progress`` fell through and returned False), no column rendered, and --
+# because the writer bypassed the kernel -- no ``task_events`` row proving the transition ever
+# happened. Measured on financially t_58e17240 (2026-11-07): five verbs refused it, the ledger held
+# no status event at all, and ``started_at`` held an ISO string where the column carries epoch ints.
+#
+# The boundary is enforced in THREE layers so a bypass cannot reproduce it:
+#   1. :func:`require_status` at every public write seam (clear refusal naming the value and the
+#      legal set);
+#   2. ``tasks_status_vocabulary`` INSERT/UPDATE triggers installed on every board connection
+#      (``kanban_db_connect._install_write_guards``) -- the backstop for a writer that never calls
+#      this module at all, which is exactly the writer that produced the row;
+#   3. :func:`render_status` / :func:`is_modelled_status` at every read surface, so a row that
+#      somehow predates the guards is shown as UNMODELLED instead of being drawn into a live column.
+
+UNMODELLED_LABEL = "UNMODELLED"
+
+
+class StatusRefusal(ValueError):
+    """A write named a ``tasks.status`` value the kanban workflow does not model.
+
+    A ``ValueError`` (every existing caller of these seams already handles that) carrying the
+    refused value and the legal set by name, because the value arrives from a writer that was
+    reading a DIFFERENT vocabulary and needs to be told which one this column speaks.
+    """
+
+    def __init__(self, value: Any, *, where: str = "kanban") -> None:
+        self.value = value
+        self.where = where
+        self.legal = tuple(sorted(VALID_STATUSES))
+        super().__init__(
+            f"{where}: status {value!r} is not a kanban status. "
+            f"kanban tasks.status accepts exactly {list(self.legal)} "
+            f"(hermes_cli.kanban_workflow.DEFAULT_STATUSES); "
+            f"{value!r} belongs to another host vocabulary (todo/SDLC/escalation) and is not "
+            f"translatable implicitly. Use `hermes kanban normalise <id> --to "
+            f"<ready|blocked|todo> --reason <why> --evidence <ref>` to move a card that already "
+            f"holds an unmodelled value (the card id is POSITIONAL, like every other verb)."
+        )
+
+
+def is_modelled_status(value: Any) -> bool:
+    """True when ``value`` is one of the workflow's statuses (the only renderable ones)."""
+    return isinstance(value, str) and value in VALID_STATUSES
+
+
+def require_status(value: Any, *, where: str = "kanban") -> str:
+    """Return ``value`` when it is a modelled status, else raise :class:`StatusRefusal`.
+
+    The ONE validator every write seam calls. ``where`` names the seam so the refusal says which
+    door refused (``kanban_block``, ``kanban_unblock``, ...) instead of a generic message.
+    """
+    if not is_modelled_status(value):
+        raise StatusRefusal(value, where=where)
+    return value
+
+
+def render_status(value: Any) -> str:
+    """The value as a reader should see it: a modelled status verbatim, else ``UNMODELLED ('x')``.
+
+    Used by every human read surface (``show``, ``list``, the dashboard badge). An unmodelled value
+    is QUOTED so it can never be mistaken for a live column name, and it is never silently mapped
+    onto one (the dashboard used to bucket every unrecognised status into ``todo``, which is how a
+    stuck card read as ordinary queue work).
+    """
+    if is_modelled_status(value):
+        return str(value)
+    return f"{UNMODELLED_LABEL} ({value!r})"
+
+
+#: Columns on ``tasks`` that carry EPOCH SECONDS. SQLite is dynamically typed, so an ISO-8601
+#: string written into one lands silently and then defeats every arithmetic reader (``now -
+#: started_at`` raises, or a text comparison orders by lexicon). ``started_at`` is the one measured
+#: live (financially t_58e17240 held ``"2026-11-07T07:43:01-05:00"``).
+#:
+#: ``worker_started_at`` is DELIBERATELY absent even though the schema declares it INTEGER: the
+#: dispatcher stores a process FINGERPRINT there (``kanban_db_dispatch._set_worker_pid``), so a
+#: text value is the correct shape and a type guard over it would refuse the spawn path. The
+#: declaration is a schema defect, not a licence to guard the column.
+EPOCH_TASK_COLUMNS: tuple[str, ...] = (
+    "started_at", "completed_at", "claim_expires", "last_heartbeat_at",
+)
+
+
+def require_epoch(value: Any, *, column: str, where: str = "kanban") -> Optional[int]:
+    """``value`` as epoch seconds, or a refusal when it is not a number/None.
+
+    Accepts an int or a float (truncated). REFUSES ``str`` -- including an ISO-8601 string, which
+    :func:`_to_epoch` happily parses at READ time (that tolerance is for rows that already exist,
+    never a licence to write one). ``bool`` is refused too: ``True`` would land as ``1``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{where}: {column} is epoch seconds; got bool {value!r}. Pass int(time.time())."
+        )
+    if isinstance(value, (int, float)):
+        return int(value)
+    raise ValueError(
+        f"{where}: {column} is an INTEGER epoch-seconds column; got {type(value).__name__} "
+        f"{value!r}. SQLite would store it silently and every `now - {column}` reader would "
+        f"then be wrong or raise. Convert it at the caller (`int(time.time())` for now, or "
+        f"`kanban_db._to_epoch(...)` for a parsed timestamp) before writing."
+    )
+
+
 # --- Shared micro-helpers (row access, JSON, env, git) ---
 
 def _lossy_text(value: Any) -> Any:
@@ -2239,6 +2353,11 @@ def create_task(
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                # THE VOCABULARY BOUNDARY at the create seam. `initial_task_state` answers from
+                # the workflow today, but it is the one function that MAPS a caller's request onto
+                # a status; validating its ANSWER here means a future mapping (or a caller's
+                # `initial_status` reaching it unfiltered) cannot mint an unmodelled row.
+                require_status(task_status, where="kanban_create")
                 # THE TOP-LEVEL-ONLY GATE, create door (ruling t_efa908e8, card
                 # t_0d8f71ae). A card whose whole DoD needs a genuine top-level
                 # context declares it with a line-leading `GATE-TOP-LEVEL-ONLY`;
@@ -3570,7 +3689,6 @@ def disarm_priority_tranche_guard(board: Optional[str] = None) -> list:
 
 def sync_priority_tranche_guard(board: Optional[str] = None) -> str:
     """Make *board*'s storage guard follow its ``priority_policy`` key; returns its state.
-
     ``"armed"`` when the board is wired (guard in place), ``"unarmed"`` when it is not (no
     guard, so the board behaves exactly as it did before this seam existed). The wiring action
     calls this, so the guard can never drift from the key that turns the domain on.
@@ -3582,6 +3700,133 @@ def sync_priority_tranche_guard(board: Optional[str] = None) -> str:
         return "armed"
     disarm_priority_tranche_guard(board)
     return "unarmed"
+
+
+# --- The status/epoch write guards: the BACKSTOP for a writer that never calls this module -----
+#
+# The Python seams (``require_status`` / ``require_epoch``) give a good refusal, but they only
+# bind writers that go through them. The row this card is about was written by a writer that did
+# NOT: no kernel verb, no ``task_events`` row, an ISO string in an epoch column. A rule that only
+# the kernel enforces would have missed it by construction.
+#
+# These triggers live in the BOARD FILE, so every connection -- the CLI, the gateway, a yoyoflow
+# node, or somebody's one-off ``sqlite3 kanban.db`` -- is bound by them. They are installed on
+# every board at connect() time (``kanban_db_connect._init_if_needed``), and RE-INSTALLED
+# (DROP + CREATE) so the baked-in vocabulary always follows ``kanban_workflow.DEFAULT_STATUSES``.
+
+STATUS_GUARD_TRIGGERS = ("tasks_status_vocabulary_insert", "tasks_status_vocabulary_update")
+EPOCH_GUARD_TRIGGERS = ("tasks_epoch_type_insert", "tasks_epoch_type_update")
+
+
+def _sql_status_literal() -> str:
+    """The legal set as a SQL literal, e.g. ``('archived', 'blocked', ...)``."""
+    return "(" + ", ".join("'" + s.replace("'", "''") + "'" for s in sorted(VALID_STATUSES)) + ")"
+
+
+def write_guard_trigger_ddl() -> tuple[str, ...]:
+    """DDL for the vocabulary + epoch-type guards on ``tasks``.
+
+    * STATUS: any INSERT, and any UPDATE that CHANGES ``status``, whose new value is outside
+      ``VALID_STATUSES`` is ABORTed with a message naming the value and the legal set. The
+      UPDATE clause is ``OF status`` + a real change test, so a generic no-op field update on a
+      legacy row (one that predates the guard) is never aborted -- the guard exists to stop new
+      unmodelled values being INTRODUCED, and an existing one is repaired through ``normalise``
+      (which writes a modelled value, so the guard passes it).
+    * EPOCH: the same shape for :data:`EPOCH_TASK_COLUMNS` -- a text value written into an epoch
+      column is refused. ``typeof`` is SQLite's own storage class, so this is the only check that
+      can see the difference between ``1757240000`` and ``"2026-11-07T07:43:01-05:00"``.
+    """
+    legal = _sql_status_literal()
+    legal_text = ", ".join(sorted(VALID_STATUSES))
+    status_prose = (
+        f" is not a kanban status. Legal: {legal_text}. Another host vocabulary "
+        "(todo/SDLC/escalation) does not translate implicitly; "
+        "run `hermes kanban normalise <id> --to <ready|blocked|todo> --reason ... "
+        "--evidence ...` to move a row that already holds one."
+    ).replace("'", "''")
+    # An expression, not a bare literal: the refused VALUE is interpolated by SQLite at abort
+    # time (QUOTE), so the message names the value as well as the legal set.
+    status_expr = f"'kanban tasks.status ' || QUOTE(NEW.status) || '{status_prose}'"
+    epoch_cols = " OR ".join(
+        f"typeof(NEW.{c}) NOT IN ('null', 'integer', 'real')" for c in EPOCH_TASK_COLUMNS
+    )
+    epoch_change = " OR ".join(
+        f"(OLD.{c} IS NOT NEW.{c} AND typeof(NEW.{c}) NOT IN ('null', 'integer', 'real'))"
+        for c in EPOCH_TASK_COLUMNS
+    )
+    epoch_message = (
+        "kanban epoch column must hold INTEGER epoch seconds, not text: "
+        + ", ".join(EPOCH_TASK_COLUMNS)
+        + ". SQLite stores an ISO-8601 string silently and every `now - column` reader then "
+          "misreads it; convert with int(time.time()) (or kanban_db._to_epoch) before writing."
+    ).replace("'", "''")
+    return (
+        f"CREATE TRIGGER {STATUS_GUARD_TRIGGERS[0]}\nBEFORE INSERT ON tasks\nFOR EACH ROW\n"
+        f"WHEN NEW.status NOT IN {legal}\nBEGIN\n  SELECT RAISE(ABORT, {status_expr});\nEND;",
+        f"CREATE TRIGGER {STATUS_GUARD_TRIGGERS[1]}\nBEFORE UPDATE OF status ON tasks\nFOR EACH ROW\n"
+        f"WHEN NEW.status IS NOT OLD.status AND NEW.status NOT IN {legal}\n"
+        f"BEGIN\n  SELECT RAISE(ABORT, {status_expr});\nEND;",
+        f"CREATE TRIGGER {EPOCH_GUARD_TRIGGERS[0]}\nBEFORE INSERT ON tasks\nFOR EACH ROW\n"
+        f"WHEN {epoch_cols}\nBEGIN\n  SELECT RAISE(ABORT, '{epoch_message}');\nEND;",
+        f"CREATE TRIGGER {EPOCH_GUARD_TRIGGERS[1]}\nBEFORE UPDATE OF "
+        + ", ".join(EPOCH_TASK_COLUMNS)
+        + " ON tasks\nFOR EACH ROW\n"
+        f"WHEN {epoch_change}\nBEGIN\n  SELECT RAISE(ABORT, '{epoch_message}');\nEND;",
+    )
+
+
+def install_write_guards(conn: sqlite3.Connection) -> list:
+    """Install (or refresh) the vocabulary and epoch-type guards on this connection's board.
+
+    Idempotent and DDL-only: DROP + CREATE keeps the baked-in vocabulary current when
+    ``DEFAULT_STATUSES`` grows, which ``CREATE TRIGGER IF NOT EXISTS`` would silently not do.
+    Returns the trigger names present afterwards. Called from the connect/init path, so every
+    board carries them from its next connection onwards.
+    """
+    for name in (*STATUS_GUARD_TRIGGERS, *EPOCH_GUARD_TRIGGERS):
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    for statement in write_guard_trigger_ddl():
+        conn.execute(statement)
+    return write_guards_present(conn)
+
+
+def write_guards_present(conn: sqlite3.Connection) -> list:
+    """The write-guard triggers present on this connection's DB (``[]`` when absent)."""
+    names = (*STATUS_GUARD_TRIGGERS, *EPOCH_GUARD_TRIGGERS)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?, ?, ?)",
+        names,
+    ).fetchall()
+    return sorted(row["name"] for row in rows)
+
+
+def census_unmodelled_status(conn: sqlite3.Connection) -> list[dict]:
+    """Every row on this board whose ``status`` is outside the vocabulary, or whose epoch
+    columns hold text. Read-only; the census the nightly sweep and the diagnostics both read.
+
+    Returns ``[{"id", "status", "defect"}]`` where ``defect`` is ``"status"`` or the offending
+    epoch column name, in id order. Board-level accounting for a board that cannot say what
+    state its cards are in -- and, for the epoch case, cannot do arithmetic on when they started.
+    """
+    found: list[dict] = []
+    legal = sorted(VALID_STATUSES)
+    placeholders = ", ".join("?" for _ in legal)
+    for row in conn.execute(
+        f"SELECT id, status FROM tasks WHERE status NOT IN ({placeholders}) ORDER BY id", legal
+    ):
+        found.append({"id": row["id"], "status": row["status"], "defect": "status"})
+    for column in EPOCH_TASK_COLUMNS:
+        try:
+            rows = conn.execute(
+                f"SELECT id, {column} AS v FROM tasks "
+                f"WHERE {column} IS NOT NULL AND typeof({column}) NOT IN ('integer', 'real') "
+                "ORDER BY id"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            continue          # a legacy board that predates the column
+        for row in rows:
+            found.append({"id": row["id"], "status": row["v"], "defect": column})
+    return found
 
 
 def _refuse_priority_outside_domain(conn: sqlite3.Connection, priority: int, *,
@@ -4347,6 +4592,24 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def current_status_or_refuse(
+    conn: sqlite3.Connection, task_id: str, *, where: str,
+) -> Optional[str]:
+    """The row's ``status``, refusing BY NAME when it is outside the workflow; ``None`` = no row.
+
+    Every status-switching verb reads the current row to pick its source phase, and an
+    unmodelled value matches none of those branches -- so the verb fell through to a bare
+    ``False`` and the operator saw "cannot block t_x (not running)" with no cause. That is
+    exactly how financially ``t_58e17240`` (``in_progress``) took five refusals from five verbs
+    with nothing naming the value. Reading through here turns the dead end into a message that
+    names the value, the legal set and the repair verb.
+    """
+    status = _task_status(conn, task_id)
+    if status is not None:
+        require_status(status, where=where)
+    return status
+
+
 # Distinguishes "caller named the acting profile" (which may legitimately be
 # None for an unassigned card) from "read the card's current assignee".
 _UNSET: Any = object()
@@ -4567,6 +4830,14 @@ def _claim_and_open_run(
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    # The source status is interpolated into the CAS below, so it is validated HERE (a name that
+    # is not a status is a caller bug, not a lost race) -- and the run clock it stamps is
+    # type-checked, because `started_at` is an INTEGER epoch column.
+    require_status(source_status, where="kanban_claim")
+    checked_now = require_epoch(now, column="started_at", where="kanban_claim")
+    if checked_now is None:
+        raise ValueError("kanban_claim: started_at must be epoch seconds, not None")
+    now = checked_now
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -4925,6 +5196,7 @@ def reclaim_task(
     ).fetchone()
     if not row:
         return False
+    current_status_or_refuse(conn, task_id, where="kanban_reclaim")
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
@@ -4933,6 +5205,7 @@ def reclaim_task(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
+        require_status(retry_status, where="kanban_reclaim")
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -5615,6 +5888,16 @@ def _not_completable_refusal(conn: sqlite3.Connection, task_id: str) -> Completi
     status = _task_status(conn, task_id)
     if status is None:
         return CompletionRefusal("unknown_id", f"no task {task_id} on this board")
+    if status not in VALID_STATUSES:
+        # Not a door problem: the VALUE is outside the workflow, so no door will ever accept it
+        # and the only exit is the repair verb. Naming that beats "the status has no door".
+        return CompletionRefusal(
+            "status_not_completable",
+            f"{task_id} holds {status!r}, which is not a kanban status at all (legal: "
+            f"{', '.join(sorted(VALID_STATUSES))}). No verb switches on it; repair the row with "
+            f"`hermes kanban normalise --card {task_id} --to <ready|blocked|todo> --reason ... "
+            f"--evidence ...`",
+        )
     if status in _COMPLETABLE or status in ("done", "archived"):
         # A completable status that moved, or a card that already reached the terminal pair:
         # both are "it moved while you were closing it", which is what ``not_running`` means
@@ -6811,6 +7094,10 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        # Read the CURRENT status through the vocabulary guard: an unmodelled value matches no
+        # branch below, and the bare ``False`` it fell through to is the silent refusal this
+        # card exists to kill. Refuse by name instead, before anything is decided.
+        require_status(cur_row["status"], where="kanban_block")
         if (window_policy is not None and due_at is UNSET
                 and _row_get(cur_row, "due_at") is None):
             # Same refusal as schedule_task: an arm policy with no fence to apply
@@ -6857,6 +7144,7 @@ def block_task(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
+        require_status(new_status, where="kanban_block")
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
@@ -7461,6 +7749,7 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
+        current_status_or_refuse(conn, task_id, where="kanban_unblock")
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -7484,6 +7773,7 @@ def unblock_task(
         # is a fresh start for the retry budget. The due columns are cleared
         # because the card is no longer clock-fenced: leaving a stale ``due_at``
         # behind would re-release (or falsely alarm about) a card already running.
+        require_status(new_status, where="kanban_unblock")
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL, "
@@ -7501,6 +7791,128 @@ def unblock_task(
             payload = {**(payload or {}), **extra_event}
         _append_event(conn, task_id, "unblocked", payload)
         return True
+
+
+#: The statuses :func:`normalise_task` may land on. Deliberately NOT every modelled status: the
+#: verb exists to take a card OUT of an unmodelled value, and the three non-dispatchable/queue
+#: landings are the ones that can be asserted without inventing work state (``done`` would
+#: fabricate a completion, ``review`` would put it in front of a reviewer, ``running`` would need a
+#: claim). ``blocked`` is the park, ``todo`` the wait, ``ready`` the queue.
+NORMALISE_TARGETS: tuple[str, ...] = ("ready", "blocked", "todo")
+
+
+def normalise_task(
+    conn: sqlite3.Connection, task_id: str, *, to: str, reason: str, evidence: str,
+    by: Optional[str] = None, block_kind: Optional[str] = None,
+) -> tuple[bool, str, dict]:
+    """Move a card to a modelled status AND record the transition, in ONE transaction.
+
+    THE door out of an UNMODELLED ``tasks.status``. Before it existed, a row holding e.g.
+    ``in_progress`` was refused by every verb that switches on status (reclaim: not running;
+    reopen: only finished; unblock: blocked/scheduled only; block: refused) -- a card no
+    sanctioned instrument could move, whose writer had also left no ``task_events`` row, so the
+    board's own ledger could not prove the transition had ever happened.
+
+    ``to`` is one of :data:`NORMALISE_TARGETS`. ``reason`` and ``evidence`` are REQUIRED: this is
+    a forensic repair, and a repair without a stated cause and a reference to the measurement is
+    a silent write with a nicer name. ``by`` names the actor (defaults to the environment's
+    author, like every other audited verb).
+
+    ONE write txn does all of it, so the status and its audit row cannot diverge:
+
+      1. re-read the status inside the write lock and CAS the UPDATE on it -- a card that moved
+         in between is refused by name, never flipped from a stale read;
+      2. reclaim any leaked run, keeping ``current_run_id IS NULL <=> run terminal``;
+      3. land ``blocked`` with ``block_kind`` (default ``waiting``) and the ``blocked`` event the
+         sticky-block reader needs; land ``ready`` re-gated to ``todo`` while a parent is
+         unfinished (the same re-gate ``unblock`` applies) and say so in the payload;
+      4. append ``kind='status_changed'`` carrying ``from`` / ``to`` / ``by`` / ``reason`` /
+         ``evidence`` -- the event the nightly status census and any future forensic read use --
+         plus the legacy ``kind='status'`` event the live feed and sweeps already read;
+      5. leave a comment carrying the same facts for a human reading the card.
+
+    Returns ``(ok, why_not, info)``; ``info`` is ``{"from_status", "to_status", "requested_to"}``.
+    """
+    to = (to or "").strip().lower()
+    if to not in NORMALISE_TARGETS:
+        raise ValueError(
+            f"kanban normalise: --to must be one of {list(NORMALISE_TARGETS)}; got {to!r}. "
+            f"(done/review/running are refused: they would fabricate work state, not repair it.)"
+        )
+    reason = (reason or "").strip()
+    evidence = (evidence or "").strip()
+    if not reason:
+        raise ValueError("kanban normalise: --reason is required (a repair states its cause)")
+    if not evidence:
+        raise ValueError(
+            "kanban normalise: --evidence is required (a card id, PR ref, path or command whose "
+            "output proves the state being repaired)"
+        )
+    actor = (by or "").strip() or os.environ.get("HERMES_PROFILE") or "operator"
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found", {}
+        prior = row["status"]
+        if prior == to:
+            # Nothing to repair: report it, write NOTHING (a no-op event would be noise on the
+            # very ledger this verb exists to keep honest).
+            return False, f"task {task_id} is already {to!r}", {}
+        _reclaim_dangling_run(
+            conn, task_id, statuses=(prior,), now=now,
+            note="invariant recovery on normalise",
+        )
+        landing = to
+        if to == "ready" and not _parents_satisfied(conn, task_id):
+            landing = "todo"          # never dispatch ahead of an unfinished parent
+        if landing == "blocked":
+            # ``needs_input`` is the human-hold kind: a card repaired out of an unmodelled value
+            # has no machine-readable reason, and pretending it does (dependency/transient) would
+            # make `recompute_ready` or a releaser act on a fiction.
+            kind = block_kind or "needs_input"
+            if kind not in VALID_BLOCK_KINDS:
+                raise ValueError(
+                    f"kanban normalise: --block-kind must be one of "
+                    f"{sorted(VALID_BLOCK_KINDS)}; got {kind!r}")
+        else:
+            kind = None
+        # CAS on the status we read: a concurrent writer wins, and this verb refuses by name.
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, block_kind = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+            "current_run_id = NULL, due_at = NULL, due_window_policy = NULL "
+            "WHERE id = ? AND status = ?",
+            (landing, kind, task_id, prior),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed during normalise", {}
+        payload = {
+            "from": prior, "to": landing, "by": actor,
+            "reason": reason, "evidence": evidence,
+        }
+        if landing != to:
+            payload["requested_to"] = to
+            payload["regated"] = "an unfinished parent holds it in todo"
+        _append_event(conn, task_id, "status_changed", payload)
+        # The legacy event every live-feed consumer and sweep already reads.
+        _append_event(conn, task_id, "status", {
+            "status": landing, "reason": "normalised", "previous_status": prior,
+        })
+        if landing == "blocked":
+            # The SAME shape `block_task` writes: the newest 'blocked' event is what makes the
+            # park sticky against `recompute_ready`.
+            _append_event(conn, task_id, "blocked", {
+                "kind": kind, "reason": f"normalised from {prior!r}: {reason}",
+                "source": "normalise",
+            })
+        _insert_comment(
+            conn, task_id, actor,
+            f"NORMALISED from {prior!r} to {landing!r} by {actor}: {reason} "
+            f"(evidence: {evidence})",
+            now,
+        )
+        return True, "", {"from_status": prior, "to_status": landing, "requested_to": to}
 
 
 #: Statuses after which a card's declaration is FROZEN: ``set_contract`` refuses a terminal card
@@ -8194,6 +8606,8 @@ def schedule_task(
             (task_id,),
         ).fetchone()
         was_scheduled = row is not None and row["status"] == "scheduled"
+        if row is not None:
+            require_status(row["status"], where="kanban_schedule")
         # A band policy with nothing to apply it to is dead state no release will
         # ever read: refuse it instead of writing an inert column.
         if (window_policy is not None and due_at is UNSET

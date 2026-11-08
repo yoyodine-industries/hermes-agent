@@ -83,10 +83,21 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
 
 
 def _fmt_task_line(t: kb.Task) -> str:
-    icon = _STATUS_ICONS.get(t.status, "?")
+    """One board row. A status the workflow does not model is printed AS unmodelled.
+
+    Rendering it verbatim (the old behaviour) made a stuck card look like ordinary queue work in
+    a column that no other row could share; an icon lookup miss was the only hint. The value is
+    QUOTED and labelled, so a reader can tell ``UNMODELLED ('in_progress')`` from a real phase.
+    """
+    if kb.is_modelled_status(t.status):
+        icon = _STATUS_ICONS.get(t.status, "?")
+    else:
+        icon = "!"
+    # Same renderer as `show` and the JSON surfaces, so the label cannot drift between them.
+    status_text = kb.render_status(t.status)
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    return f"{icon} {t.id}  {status_text:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
@@ -96,4 +107,8 @@ def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     d = _obj_dict(t, _TASK_DICT_FIELDS)
     d["skills"] = list(t.skills) if t.skills else []
+    # A row whose status the workflow does not model must be VISIBLE as such to machine readers
+    # too -- without changing the raw `status` value every existing consumer parses.
+    d["status_modelled"] = kb.is_modelled_status(t.status)
+    d["status_display"] = kb.render_status(t.status)
     return d

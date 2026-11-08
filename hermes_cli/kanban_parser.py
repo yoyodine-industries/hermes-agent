@@ -520,6 +520,30 @@ _SPECS = [
              help="Validate the reopen without mutating state"),
         _json_flag(help="Print the result as a JSON object"),
     ], help="Reopen finished (done/archived) tasks — the operator door back to a live status"),
+    _cmd("normalise", [
+        _arg("task_id", nargs="?", default=None,
+             help="Card holding the unmodelled status (or pass --card)"),
+        _arg("--card", dest="card", default=None, metavar="<id>",
+             help="The card holding the unmodelled status — the contract form "
+                  "(`kanban normalise --card <id> --to ... --reason ... --evidence ...`); an alias "
+                  "for the positional id"),
+        _arg("--to", dest="to", required=True, choices=("ready", "todo", "blocked"),
+             help="Modelled status to land the card on: 'ready' (re-gates to todo while a parent "
+                  "is unfinished), 'todo' (restored but not dispatchable) or 'blocked' (parked). "
+                  "done/review/running are refused — this verb repairs a broken row, it does "
+                  "not fabricate work state"),
+        _arg("--reason", required=True,
+             help="Why the row holds an unmodelled value — recorded on the status_changed event "
+                  "and the card. Required: a repair states its cause"),
+        _arg("--evidence", required=True,
+             help="A card id, PR ref, path or command whose output shows the row is in this "
+                  "state. Required: a repair points at its measurement"),
+        _arg("--block-kind", dest="block_kind", default=None,
+             help="Why a blocked landing is parked (default: needs_input — a repaired row has no "
+                  "machine-readable cause)"),
+        _json_flag(help="Print the result as a JSON object"),
+    ], help="Move a card holding an UNMODELLED status back onto the workflow, writing the "
+            "status and its status_changed event in ONE transaction"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

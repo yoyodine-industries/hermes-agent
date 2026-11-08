@@ -242,7 +242,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     # it. It was already an ESTATE write (tree_identity.ESTATE_MUTATING_ACTIONS); this closes the
     # delegated fence over it too. (Card t_36adf9a5)
     "set-contract",
-    "schedule", "unblock", "reopen", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "reopen", "normalise", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -669,6 +669,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
         return 0
     for t in tasks:
         print(_fmt_task_line(t))
+    unmodelled = [t for t in tasks if not kb.is_modelled_status(t.status)]
+    if unmodelled:
+        # Not a footnote: this is the board telling you its own count is untrustworthy for these
+        # rows. Every one of them is invisible to the workflow, so it is NOT part of any phase.
+        print(f"\n{kb.UNMODELLED_LABEL}: {len(unmodelled)} card(s) hold a status outside the "
+              f"workflow ({', '.join(sorted({t.status for t in unmodelled}))}). They count as NO "
+              "phase and no verb will move them; repair with `hermes kanban normalise`.")
     return 0
 
 
@@ -717,8 +724,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
+        _task = _task_to_dict(task)
+        # Machine readers keep the RAW value in `status` (changing it would silently rewrite
+        # every consumer), and get the judgement explicitly alongside it.
+        _task["status_display"] = kb.render_status(task.status)
+        _task["status_modelled"] = kb.is_modelled_status(task.status)
         _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "task": _task, "latest_summary": latest_summary, "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -729,7 +741,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  {label + ':':<11}{value}")
 
     print(f"Task {task.id}: {task.title}")
-    field("status", task.status)
+    field("status", kb.render_status(task.status))
+    if not kb.is_modelled_status(task.status):
+        # Say it in words as well as in the value: a reader who sees this must know that no verb
+        # switches on the status they are looking at, and that a card can sit here forever.
+        print(f"\n  !! {kb.UNMODELLED_LABEL}: {task.status!r} is not a kanban status "
+              f"(legal: {', '.join(sorted(kb.VALID_STATUSES))}).")
+        print("     No verb switches on it: reclaim/block/unblock/reopen all refuse it. Repair the "
+              "row and record the act in one transaction with")
+        print(f"     `hermes kanban normalise {task.id} --to <ready|blocked|todo> "
+              f"--reason <why> --evidence <ref>`")
     if task.due_at:
         policy = task.due_window_policy or kb.DEFAULT_DUE_WINDOW_POLICY
         field("due", f"{_fmt_ts(task.due_at)} ({policy})")
@@ -973,8 +994,10 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     print(f"{total} active diagnostic(s) across {len(diags_by_task)} task(s):\n")
     for tid, dl in diags_by_task.items():
         m = meta.get(tid, {})
-        print(f"  {tid}  {m.get('status') or '?':8s}  @{m.get('assignee') or '(unassigned)':18s}  "
-              f"{m.get('title') or '(untitled)'}")
+        # Same renderer as `list`/`show`: the diagnostics table is a human read surface too, and a
+        # raw unmodelled value here would read as a phase in the one view that reports on it.
+        print(f"  {tid}  {kb.render_status(m.get('status')) or '?':8s}  "
+              f"@{m.get('assignee') or '(unassigned)':18s}  {m.get('title') or '(untitled)'}")
         _print_diagnostics(dl, "    ", with_kind=True)
         print()
     return 0
@@ -1470,6 +1493,58 @@ def _cmd_reopen(args: argparse.Namespace) -> int:
     else:
         print(f"{'Would reopen' if dry_run else 'Reopened'} {task_id}: "
               f"{info.get('from_status')} -> {info.get('to_status')}")
+    return 0
+
+
+def _cmd_normalise(args: argparse.Namespace) -> int:
+    """THE repair door for a row holding an UNMODELLED ``tasks.status``.
+
+    A status outside ``kanban_workflow.DEFAULT_STATUSES`` (``in_progress`` is the measured one)
+    is refused by every verb that switches on status -- reclaim says "not running", reopen says
+    "only finished", unblock says "blocked/scheduled only", block refuses -- so the card is
+    stranded while the write that put it there left no audit row. This verb lands it on a modelled
+    status AND writes the ``status_changed`` event in the SAME transaction, so the fix is provable
+    by the instrument that should have caught the write.
+
+    ``--reason`` and ``--evidence`` are required (a forensic repair states its cause and points at
+    its measurement); ``--to`` is limited to ready/todo/blocked, because anything else would
+    fabricate work state rather than repair it.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban normalise is orchestrator-only; a worker must hand off its assigned "
+                    "task instead of rewriting a card's status")
+    task_id = getattr(args, "task_id", None) or getattr(args, "card", None)
+    if task_id and getattr(args, "task_id", None) and getattr(args, "card", None) \
+            and args.task_id != args.card:
+        return _err(f"kanban normalise names two different cards: {args.task_id!r} and "
+                    f"{args.card!r} — name one", 2)
+    if not task_id:
+        return _err("kanban normalise requires a task id (positional, or --card <id>)", 2)
+    with kbc.connect_closing() as conn:
+        try:
+            ok, refused, info = kb.normalise_task(
+                conn, task_id,
+                to=getattr(args, "to", None) or "",
+                reason=getattr(args, "reason", None) or "",
+                evidence=getattr(args, "evidence", None) or "",
+                by=_profile_author(),
+                block_kind=getattr(args, "block_kind", None),
+            )
+        except (ValueError, RuntimeError) as exc:
+            return _err(f"cannot normalise {task_id}: {exc}")
+        if not ok:
+            return _err(f"cannot normalise {task_id}: {refused or 'refused'}")
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    landed = info.get("to_status")
+    if getattr(args, "json", False):
+        print(json.dumps({"id": task_id, **info}, sort_keys=True))
+    else:
+        print(f"Normalised {task_id}: {info.get('from_status')!r} -> {landed!r}"
+              + (" (re-gated: an unfinished parent holds it in todo)"
+                 if info.get("to_status") != info.get("requested_to") else ""))
+    # A row that is STILL unmodelled after the write means something re-wrote it under us; say so.
+    if row is not None and not kb.is_modelled_status(row["status"]):
+        return _err(f"normalise wrote {landed!r} but the row now reads {row['status']!r}")
     return 0
 
 
@@ -2056,6 +2131,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "set-contract": _cmd_set_contract, "retarget": _cmd_retarget,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock, "reopen": _cmd_reopen,
+    "normalise": _cmd_normalise,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

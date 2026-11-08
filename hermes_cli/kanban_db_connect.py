@@ -793,6 +793,11 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
+                # The vocabulary/epoch write guards (the BACKSTOP for a writer that never calls
+                # the kernel). DDL stored in the board file, so every later connection -- ours or
+                # somebody's raw sqlite3 -- is bound by them. Installed here, after the column
+                # migration, so a legacy board gets its missing columns first.
+                _kb.install_write_guards(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)

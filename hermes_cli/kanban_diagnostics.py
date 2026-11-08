@@ -988,8 +988,48 @@ def _rule_workspace_cannot_resolve(task, events, runs, now, cfg) -> list[Diagnos
     )]
 
 
+def _rule_unmodelled_status(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """The card's ``status`` is outside the workflow's vocabulary -- it is in NO phase.
+
+    ``critical``, because this is not a card in a bad state: it is a card whose STATE THE BOARD
+    CANNOT NAME. Every verb switches on status, so none of them can move it, and the dispatcher
+    will never pick it up; left alone it sits forever. The measured case (financially t_58e17240)
+    was written by a tool carrying the todo/SDLC vocabulary (``in_progress``) into a kanban write,
+    which also left no ``task_events`` row, so the ledger could not even prove the transition.
+
+    The action is the repair door: ``hermes kanban normalise`` writes the modelled status AND its
+    ``status_changed`` event in one transaction.
+    """
+    from hermes_cli import kanban_db as kb
+
+    status = _task_field(task, "status")
+    if kb.is_modelled_status(status):
+        return []
+    task_id = _task_field(task, "id")
+    legal = ", ".join(sorted(kb.VALID_STATUSES))
+    return [Diagnostic(
+        kind="unmodelled_status", severity="critical",
+        title=f"Status {status!r} is not a kanban status — this card is in NO phase",
+        detail=(f"tasks.status holds {status!r}, which is outside the workflow vocabulary "
+                f"({legal}). No verb switches on it (reclaim/block/unblock/reopen all refuse), "
+                f"the dispatcher never claims it, and it counts as no phase. Another host "
+                f"vocabulary (todo/SDLC/escalation) was carried into a kanban write. Repair it "
+                f"and record the act in one transaction with `hermes kanban normalise "
+                f"{task_id} --to <ready|blocked|todo> --reason <why> --evidence <ref>`."),
+        actions=[DiagnosticAction(
+            kind="cli_hint",
+            label=f"hermes kanban normalise {task_id} --to ready --reason ... --evidence ...",
+            payload={"command": f"hermes kanban normalise {task_id} --to ready "
+                                f"--reason 'unmodelled status {status}' --evidence 'diagnostic'"},
+            suggested=True)],
+        first_seen_at=now, last_seen_at=now, count=1,
+        data={"status": status, "legal": sorted(kb.VALID_STATUSES)},
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
+    _rule_unmodelled_status,
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
