@@ -25,6 +25,7 @@ from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_bulk_guard as kbg
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_filing_policy import is_refusal as kb_is_filing_refusal
+from hermes_cli.kanban_promotion import PromotionRefused
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, BOARD_PIN_REMEDY, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -1465,11 +1466,22 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = _stripped_or_none(getattr(args, "reason", None))
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
+    force = bool(getattr(args, "force", False))
+    failures: dict[str, str] = {}
+
+    def op(tid: str) -> bool:
+        try:
+            return kb.unblock_task(conn, tid, force=force)
+        except PromotionRefused as exc:
+            # The receipt IS the message: outcome, reason, and the evidence behind it.
+            failures[tid] = f"refused: {exc}"
+            return False
+
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK",
-                        lambda tid: kb.unblock_task(conn, tid), verb="unblock")
+        op = _commented(conn, reason, author, "UNBLOCK", op, verb="unblock")
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: failures.get(tid)
+                           or f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
 def _cmd_reopen(args: argparse.Namespace) -> int:

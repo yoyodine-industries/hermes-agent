@@ -142,7 +142,8 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         assert kb.get_task(conn, child).status == "blocked"
 
         # A cron/human unblocks; the worker re-declares the same impossible wait.
-        assert kb.unblock_task(conn, child)
+        # A cron/human release of a re-kinded (needs_input) park: the operator door.
+        assert kb.unblock_task(conn, child, force=True)
         assert kb.claim_task(conn, child, claimer="worker") is not None
         assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
         assert kb.get_task(conn, child).status == "triage"
