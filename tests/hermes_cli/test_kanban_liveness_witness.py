@@ -13,6 +13,7 @@ the claim. They also pin the run fence that rides on the verdict, and the recove
 reclaim honestly instead of leaving a crash as the attempt history's last word.
 """
 
+import contextlib
 import json
 import os
 import signal
@@ -119,26 +120,81 @@ def test_secondary_probe_exit_status_is_unknown_never_death(monkeypatch):
     ) == kbd.WORKER_UNKNOWN
 
 
+# --------------------------------------------------------------------------- the premise, pinned
+#
+# Every test below arms psutil's boot reference by mutating ``psutil._psosx.INIT_BOOT_TIME`` on THE
+# MODULE OBJECT the library reads. Two facts pin that premise, because the previous version of these
+# tests asserted a measurement nobody had made (card t_22ad9694):
+#
+#  * the arm must move the reading it claims to move -- ``adjust_proc_create_time(t) - t`` is asserted
+#    to equal the armed delta, BY THAT SAME MODULE OBJECT (psutil ignores a fraction of a second;
+#    |diff| < 1 returns the reading untouched, so a sub-second or wrong-object arm no-ops silently);
+#  * the private module has an EXPIRY DATE: ``_psosx`` is a third-party internal, so its measured
+#    version set is pinned here and a bump fails naming psutil, on the day it happens, instead of
+#    surfacing weeks later as a mystery fingerprint regression.
+#
+# MEASURED (2026-11-08, Python 3.14.8, psutil 7.2.2, the interpreter the live tick runs):
+#   adjust_proc_create_time(t) - t ........ 0.0 unarmed, 9.0 armed by +9 s, 0.0 restored
+#   a FRESH Process(pid).create_time() .... 9.0 armed (the adjusted path really does shift)
+#   process_birth() (monotonic=True) ...... 0.0 armed -- the kernel start carries NO psutil shift,
+#                                            which is why the witness's correction must not be applied
+#                                            to it (gateway.status._start_reading_carries_boot_shift).
+_PSUTIL_VERSIONS_MEASURED = {"7.2.2"}
+
+
+def _assert_psutil_premise_version():
+    import psutil
+
+    assert psutil.__version__ in _PSUTIL_VERSIONS_MEASURED, (
+        "psutil moved to %s, which this premise was not measured against (measured set: %s) - "
+        "re-arm the boot-reference premise before trusting these tests"
+        % (psutil.__version__, sorted(_PSUTIL_VERSIONS_MEASURED))
+    )
+
+
+@contextlib.contextmanager
+def _boot_reference_armed(delta=9.0):
+    """Arm psutil's own boot reference by ``delta`` seconds and prove the arm reached the library."""
+    import importlib
+
+    _assert_psutil_premise_version()
+    psosx = importlib.import_module("psutil._psosx")
+    original = psosx.INIT_BOOT_TIME
+    assert original, "psutil exposes no boot reference to shift"
+    probe = time.time()
+    try:
+        psosx.INIT_BOOT_TIME = original + delta
+        assert psosx.adjust_proc_create_time(probe) - probe == delta, (
+            "the premise no longer holds: arming the boot reference by %ss moved psutil's adjusted "
+            "reading by %s, so this test would be asserting a measurement nobody made"
+            % (delta, psosx.adjust_proc_create_time(probe) - probe)
+        )
+        yield psosx
+    finally:
+        psosx.INIT_BOOT_TIME = original
+        assert psosx.adjust_proc_create_time(probe) - probe == 0.0, "the boot reference was not restored"
+
+
 @pytest.mark.platforms("macos")
 def test_boot_reference_shift_does_not_move_the_fingerprint(monkeypatch):
     """The reproduction's ~9 s drift: psutil imported before the boot reference was adjusted.
 
-    ``psutil._psosx.adjust_proc_create_time`` shifts ``create_time()`` by ``|INIT_BOOT_TIME - boot|``
-    for the rest of that process's life, so two readers of the SAME live process disagree. The
-    boot-relative accessor undoes that shift, and the fingerprint it produces is identical either way.
-    """
-    import importlib
+    The reproduction's ~9 s drift: a psutil imported before the boot reference was adjusted shifts
+    its ``create_time()`` by ``|INIT_BOOT_TIME - boot|``, so two readers of the SAME live process
+    disagreed. The boot-relative accessor must produce an identical fingerprint either way.
 
-    psosx = importlib.import_module("psutil._psosx")
-    original = psosx.INIT_BOOT_TIME
-    assert original, "psutil exposes no boot reference to shift"
+    THE PREMISE IS ASSERTED, NOT ASSUMED: ``_boot_reference_armed`` proves the arm moved psutil's
+    adjusted reading by exactly the delta before this test trusts anything else, so a psutil that
+    stops honouring the arm fails HERE, naming the premise, instead of failing as a fingerprint
+    difference that looks like a liveness bug.
+    """
     before = gw_status.get_process_uptime_start_time(os.getpid())
     assert before is not None
-    try:
-        psosx.INIT_BOOT_TIME = original + 9
+    with _boot_reference_armed(9.0) as psosx:
         shifted = gw_status.get_process_uptime_start_time(os.getpid())
-    finally:
-        psosx.INIT_BOOT_TIME = original
+        # The reading the correction would corrupt is the kernel's monotonic birth, which psutil
+        # never shifts -- that is exactly why the correction is skipped for it.
+        assert not gw_status._start_reading_carries_boot_shift(os.getpid())
     assert shifted == before
     assert abs(shifted - before) <= gw_status.START_TIME_DRIFT_TOLERANCE
 
@@ -266,21 +322,30 @@ def _failing_ps(monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_the_start_time_accessor_does_not_move_with_the_boot_reference():
-    """BRANCH A at the source: the 9 s offsets in the evidence are psutil's own adjustment."""
-    psosx = pytest.importorskip("psutil._psosx")
+    """BRANCH A at the source: the witness's accessor is the kernel's clock-step-stable birth.
+
+    The deployed pre-witness reader moved by ``|INIT_BOOT_TIME - boot|`` because it read psutil's
+    ADJUSTED ``create_time()`` -- psutil 7.2.2 still moves that reading by the armed step (asserted
+    below, so the incident's mechanism is real and reachable at the library level). ``process_birth``
+    now takes the kernel's monotonic start instead (#140580), which no psutil generation shifts, so
+    the accessor the witness reads is INVARIANT to a peer generation's boot reference.
+    """
+    import psutil
+
     before = gw_status.get_process_start_time(os.getpid())
     assert before is not None
-    original = psosx.INIT_BOOT_TIME
-    try:
-        psosx.INIT_BOOT_TIME = original + 9  # psutil imported before the reference moved by 9 s
+    adjusted_before = round(psutil.Process(os.getpid()).create_time() * 100)
+    with _boot_reference_armed(9.0):
         after = gw_status.get_process_start_time(os.getpid())
         shifted = gw_status.get_process_uptime_start_time(os.getpid())
-    finally:
-        psosx.INIT_BOOT_TIME = original
+        adjusted_after = round(psutil.Process(os.getpid()).create_time() * 100)
     assert after is not None and shifted is not None
-    # The absolute accessor is the one that moves (its callers keep needing epoch time; the fix leaves
-    # its semantics alone) — that movement is the incident, and it is what the pair below replaces.
-    assert abs(before - after) > gw_status.START_TIME_DRIFT_TOLERANCE
+    # THE INCIDENT'S MECHANISM, still alive at the psutil level: a fresh Process in a peer generation
+    # reads the same live process a full step away. This is why inequality against a fresh reading was
+    # never proof of a recycled pid.
+    assert abs(adjusted_after - adjusted_before) >= gw_status.START_TIME_DRIFT_TOLERANCE
+    # ...and the accessors the witness reads do not inherit it.
+    assert abs(before - after) <= gw_status.START_TIME_DRIFT_TOLERANCE
     assert shifted == gw_status.get_process_uptime_start_time(os.getpid())
 
 
@@ -476,9 +541,11 @@ def test_the_20260929_false_dead_read_is_refused():
         assert kbd._worker_not_dead(os.getpid(), fingerprint) is True
 
     # The old reader's only test was inequality against a fresh reading. A peer psutil generation
-    # moves that reading by |INIT_BOOT_TIME - boot| — the #123811/#124570 shift — so "differs" is not
-    # "recycled", and a live pid answered DEAD on the deployed pre-witness bytes. The witness-aware
-    # fingerprint answers the same skew with the same value.
+    # moves psutil's ADJUSTED create_time() by |INIT_BOOT_TIME - boot| (the #123811/#124570 shift), so
+    # "differs" was never "recycled" -- AND that inequality is now GONE from the reader itself: the
+    # pre-witness fingerprint is built from process_birth, the kernel's monotonic start, which no
+    # psutil generation adjusts. So both readers return the same value under the same skew, which is
+    # the stronger statement: the old comparator cannot manufacture a false DEAD here at all.
     import importlib
 
     psosx = importlib.import_module("psutil._psosx")
@@ -488,13 +555,18 @@ def test_the_20260929_false_dead_read_is_refused():
     fixed_here = kbd._process_fingerprint(os.getpid())
     try:
         psosx.INIT_BOOT_TIME = original + 8
+        probe = original  # a fixed input: the delta must be exact, not a time.time() reading apart
+        assert psosx.adjust_proc_create_time(probe) - probe == 8.0, (
+            "the premise no longer holds: the armed boot reference did not move psutil's adjusted "
+            "reading, so this test would be asserting a measurement nobody made"
+        )
         read_by_peer = _pre_witness_fingerprint(os.getpid())
         fixed_by_peer = kbd._process_fingerprint(os.getpid())
     finally:
         psosx.INIT_BOOT_TIME = original
 
     assert read_here.startswith("|") and read_here.count("|") == 1  # the incident's shape
-    assert read_here != read_by_peer  # what the pre-witness comparator read as "recycled"
+    assert read_here == read_by_peer  # the old comparator's inequality is gone: clock-step-stable
     assert fixed_by_peer == fixed_here  # the witness-aware reader is invariant to the same skew
     assert fixed_here is not None and not fixed_here.startswith("|")
 

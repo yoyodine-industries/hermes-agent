@@ -531,6 +531,22 @@ def _psutil_init_boot_time() -> Optional[float]:
     return None
 
 
+def _start_reading_carries_boot_shift(pid: int) -> bool:
+    """True when this process's start reading is psutil's ADJUSTED ``create_time()``.
+
+    The boot-reference correction below only applies to a reading that psutil shifted. macOS
+    ``process_birth`` uses the kernel's monotonic start (the #140580 fix), which no psutil
+    generation adjusts, so correcting it would move a live process by the clock step instead of
+    leaving it alone -- the same false dead read, mirrored.
+    """
+    try:
+        import psutil  # type: ignore
+        from hermes_cli.process_identity import birth_uses_adjusted_reference
+        return birth_uses_adjusted_reference(psutil.Process(pid))
+    except Exception:
+        return False
+
+
 def _psutil_available() -> bool:
     """True when ``psutil`` can be imported in THIS process — the primary, cheapest start-time source.
 
@@ -675,7 +691,13 @@ def get_process_uptime_fingerprint(pid: int) -> Optional[tuple[int, int]]:
     if live_boot is None:
         return None
     init_boot = _psutil_init_boot_time()
-    shift_cs = 0 if not init_boot else int(round(abs(init_boot - live_boot) * 100))
+    # UNDO THE SHIFT ONLY IF THE READING CARRIES IT. `process_birth` takes the kernel's monotonic
+    # start on macOS (the #140580 fix), and no psutil generation adjusts that reading -- so
+    # subtracting the shift here moves a live process by the clock step whenever the two references
+    # differ, which is the false dead read from the other side (measured psutil 7.2.2: an armed
+    # reference moves `create_time()` by the step and the monotonic reading by 0).
+    shifted = _start_reading_carries_boot_shift(pid)
+    shift_cs = 0 if not (init_boot and shifted) else int(round(abs(init_boot - live_boot) * 100))
     reference_cs = int(round(live_boot * 100))
     return reference_cs, int(start) - reference_cs - shift_cs
 

@@ -92,6 +92,32 @@ def process_birth(proc) -> float:
     return float(proc.create_time())
 
 
+def birth_uses_adjusted_reference(proc) -> bool:
+    """True when ``process_birth(proc)`` is psutil's ADJUSTED ``create_time()``.
+
+    Only the adjusted reading carries psutil's boot-reference shift (``INIT_BOOT_TIME`` vs
+    ``boot_time()``), so only it needs the caller to undo that shift. On macOS ``process_birth``
+    takes the kernel's monotonic start, which NO psutil generation adjusts -- undoing a shift it
+    never applied moves a live process's reading by exactly the clock step, which is the same false
+    dead read from the other side. Measured on psutil 7.2.2 / Python 3.14.8: with
+    ``INIT_BOOT_TIME = boot_time() + 9``, ``adjust_proc_create_time()`` shifts by 9.0 s and a fresh
+    ``Process.create_time()`` moves by 9.0 s, while the monotonic reading does not move at all.
+    """
+    import psutil
+    if not getattr(psutil, "MACOS", False):
+        return False  # Linux/Windows apply no per-process reference (see process_birth)
+    platform_proc = getattr(proc, "_proc", None)
+    if platform_proc is None:
+        return True  # process_birth falls back to the adjusted read
+    try:
+        platform_proc.create_time(monotonic=True)
+    except TypeError:  # a psutil without the monotonic read: process_birth used the adjusted one
+        return True
+    except Exception:
+        return False
+    return False
+
+
 def worker_birth(proc) -> float:
     """The birth a managed worker's identity fences compare: its hello, its scope and the Kanban
     owner receipt. :func:`process_birth`, except on Linux, where psutil's ``create_time()`` adds the
