@@ -249,3 +249,28 @@ async def test_refused_watch_wake_logs_the_refusal_code(tmp_path, monkeypatch, c
             'Watch notification not admitted for discord chat=42: admission_conflict']
     finally:
         authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_queue_full_watch_refusal_is_logged_at_info_not_warning(tmp_path, monkeypatch, caplog):
+    """A full AUTOMATION FIFO is the designed backpressure, not an incident: the notice is held
+    (requeued, never given up) and the refusal is logged at INFO so the WARNING stream keeps only
+    the refusals that need a reader (t_0b41230f)."""
+    import logging
+    from hermes_state_runtime import RuntimeStoreError
+    runner, authority, _adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'human')
+    try:
+        async def full(*args, **kwargs):
+            raise RuntimeStoreError('queue_full', field='automation_fifo')
+        monkeypatch.setattr('gateway.session_automation.admit_process_notice', full)
+        evt = {'type': 'completion', 'session_id': 'proc_x', 'session_key': metadata['gateway_session_key'],
+               'platform': 'discord', 'chat_id': '42', 'chat_type': 'dm', 'exit_code': 0, 'output': 'done',
+               'started_at': 1.0, 'parent_session_id': metadata['gateway_session_id']}
+        with caplog.at_level(logging.INFO, logger='gateway.run'):
+            assert await runner._inject_watch_notification('[done]', evt) is False
+        assert [r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING and 'Watch notification' in r.getMessage()] == []
+        assert [r.getMessage() for r in caplog.records if 'held back' in r.getMessage()] == [
+            'Watch notification held back for discord chat=42: queue_full']
+    finally:
+        authority.db.close()
