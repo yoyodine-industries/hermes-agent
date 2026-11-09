@@ -573,6 +573,13 @@ dev = [
 test = [
   "distlib==0.4.4; sys_platform == 'win32'",
   "anthropic==0.125.0",
+  # The suite imports these optional-capability modules UNGUARDED in the tests
+  # that exercise them (keyring in tests/hermes_cli, fal-client in tests/tools),
+  # so a test environment without them collects errors that read as code
+  # failures. Pins mirror the `keychain` and `fal` runtime extras so the test
+  # environment and a real install can never disagree about the version.
+  "keyring==25.7.0",
+  "fal-client==0.14.1",
 ]
 
 [build-system]
