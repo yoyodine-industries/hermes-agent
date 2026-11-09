@@ -1047,8 +1047,18 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return None
             if not raise_not_accepted:
                 queued["_refusal_permanent"] = exc.permanent  # the drain counts only permanent refusals
-            logger.warning("Watch notification not admitted for %s chat=%s: %s",
-                           platform_name, source.chat_id, exc)
+            if exc.reason == 'queue_full':
+                # The AUTOMATION class's FIFO is full: this is the designed backpressure (the notice
+                # stays requeued and the drain retries it -- ``queue_full`` is not a permanent
+                # refusal, see ``wake.PERMANENT_REFUSAL_REASONS``), not an incident. A peer DM or an
+                # operator prompt is never refused by this class (``hermes_state_runtime
+                # .admission_class``), so at fleet volume this fires hundreds of times an hour and a
+                # WARNING per tick buries the refusals that DO matter (t_0b41230f).
+                logger.info("Watch notification held back for %s chat=%s: %s",
+                            platform_name, source.chat_id, exc)
+            else:
+                logger.warning("Watch notification not admitted for %s chat=%s: %s",
+                               platform_name, source.chat_id, exc)
             # Durable callers refund the claim; ordinary watch callers just requeue.
             if raise_not_accepted:
                 raise

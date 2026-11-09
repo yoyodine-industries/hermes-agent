@@ -124,7 +124,46 @@ def begin_runtime_epoch(db, *, instance_id: str) -> int:
 
 
 # Main's busy-queue cap (GatewayRunner._BUSY_QUEUE_MAX_PENDING): queued inputs one session holds.
+# The cap is PER DELIVERY CLASS, never shared: one FIFO carries two kinds of input with wildly
+# different value, and a backlog of hints must never refuse a fact (t_0b41230f).
 ADMISSION_QUEUE_MAX = 32
+
+#: The automation class: a notice the seat may read later (a liveness tick, a completion batch, a
+#: kanban/loop wake). It is the class a full FIFO may hold back.
+AUTOMATION = 'automation'
+#: The interactive class: a fact another seat is waiting on -- an operator prompt, an API turn, a
+#: peer DM (a relayed bot message carries ``turn_author``). It is never held behind the other class.
+INTERACTIVE = 'interactive'
+
+# ``queue_full`` refusals name the class whose budget fired. The reason is unchanged (callers and
+# the retryable envelope key on it); the field only says WHICH budget refused.
+_QUEUE_FULL_CLASS = {'automation': 'automation_fifo', 'interactive': 'interactive_fifo'}
+
+# A queued row is automation iff it carries a ``local_automation_v1`` descriptor with no
+# ``turn_author``: every notice the gateway produces itself has one (a watch tick, a completion
+# batch, a route wake), while a relayed peer DM carries ``turn_author`` and a person's prompt or an
+# API turn carries no descriptor at all. ``payload_json`` is always written by ``_json``, so the
+# extract never throws.
+_AUTOMATION_ROW_SQL = ("(json_extract(payload_json,'$.local_automation_v1') IS NOT NULL"
+                       " AND json_extract(payload_json,'$.local_automation_v1.turn_author') IS NULL)")
+# Interactive rows sort before automation rows in the claim; seq keeps FIFO order inside a class.
+_CLAIM_ORDER_SQL = _AUTOMATION_ROW_SQL + ', seq'
+
+
+def admission_class(payload) -> str:
+    """``(AUTOMATION | INTERACTIVE)`` for an admission payload -- the same test as
+    :data:`_AUTOMATION_ROW_SQL` in Python, so a caller that ranks queued rows agrees with the
+    claim's own ORDER BY. An unknown payload is INTERACTIVE: holding back a hint is recoverable,
+    dropping a fact is not."""
+    descriptor = payload.get('local_automation_v1') if isinstance(payload, dict) else None
+    if isinstance(descriptor, dict) and descriptor.get('turn_author') is None:
+        return AUTOMATION
+    return INTERACTIVE
+
+
+def admission_claim_rank(row) -> tuple:
+    """``(class_rank, seq)`` -- the order :func:`claim_session_input` drains a FIFO in."""
+    return (1 if admission_class(row.get('payload')) == AUTOMATION else 0, row.get('seq') or 0)
 
 
 def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
@@ -160,14 +199,21 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)
-        queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
-            AND status='queued' ''', (session_id,)).fetchone()[0]
-        # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
-        # input after Discard, so it must not grow without bound while nobody resolves it.
-        if queued >= ADMISSION_QUEUE_MAX:
-            raise RuntimeStoreError('queue_full')
         if _authorize_write is not None:
+            # Ahead of the cap: a replacement retires the queued row it supersedes in this same
+            # transaction, so at a full FIFO it frees the slot it takes. Checked first, a
+            # replacement would be refused queue_full forever while it is the row that keeps the
+            # depth bounded (a liveness tick superseding its own queued predecessor).
             _authorize_write(conn)
+        klass = admission_class(payload)
+        queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
+            AND status='queued' AND ''' + (_AUTOMATION_ROW_SQL if klass == AUTOMATION
+                                           else 'NOT ' + _AUTOMATION_ROW_SQL), (session_id,)).fetchone()[0]
+        # Each class holds its own budget: a FIFO paused behind an unknown turn runs every accepted
+        # input after Discard, so neither class may grow without bound while nobody resolves it --
+        # but a backlog of automation hints never refuses a peer DM or an operator prompt.
+        if queued >= ADMISSION_QUEUE_MAX:
+            raise RuntimeStoreError('queue_full', field=_QUEUE_FULL_CLASS[klass])
         admission_id = uuid.uuid4().hex
         conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
             target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
@@ -223,7 +269,8 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
             raise RuntimeStoreError('unknown_execution')
         if blocked or workers:
             return None
-        row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' ORDER BY seq LIMIT 1", (session_id,)).fetchone()
+        row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' "
+                           "ORDER BY " + _CLAIM_ORDER_SQL + " LIMIT 1", (session_id,)).fetchone()
         if head is not _ANY_HEAD and (row['admission_id'] if row is not None else None) != head:
             return False
         if row is None:
