@@ -1675,26 +1675,18 @@ def test_the_clause_never_raises_on_a_hostile_verdict(conn, pr_facts):
 # the TOOL door (``kanban_complete`` -- the door most carriers actually close through)
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "measured gap OUTSIDE this card's scope: tools/kanban_tools.py renders detail "
-        "inline only for the causes its own tuple names, and the three verdict causes are "
-        "not in it yet -- so the door answers a run-ownership sentence. Strict so this "
-        "fails the day the door is widened and has to be turned green."
-    ),
-)
 def test_tool_door_renders_the_verdict_refusal_and_not_a_run_ownership_sentence(
     conn, pr_facts, monkeypatch,
 ):
     """``_handle_complete`` must render the three shapes, not a run-ownership sentence.
 
-    ``tools/kanban_tools.py`` renders ``detail`` inline for the causes it knows; a cause
-    it does not know falls through to ``live_row_refusal``, which hands the refused
-    worker a run-ownership sentence with no cause and no way out. That is the same
-    defect t_88f6cb12 fixed for the two landing causes, and it is MEASURED here rather
-    than assumed: this is a known gap in a file outside this card's scope, kept strict so
-    it fails the day the door is widened and has to be turned green.
+    ``tools/kanban_tools.py`` renders ``detail`` inline only for the causes its own tuple
+    names; a cause it does not name falls through to ``live_row_refusal``, which hands the
+    refused worker a run-ownership sentence with no cause and no way out. That is the same
+    defect t_88f6cb12 fixed for the two landing causes. The three verdict causes were
+    measured as that gap here (strict xfail) until **t_53a17874** added them to the tuple;
+    the case is a plain PASS now, so a regression that drops a cause from the tuple is a
+    RED test rather than an xfail that silently keeps passing.
     """
     task_id = _carrier_card(conn)
 
