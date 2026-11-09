@@ -337,6 +337,59 @@ class SessionMaintenanceMixin:
         open_where = f"s.ended_at IS NULL{where[len(ended_guard):]}"
         return int(self._read_one(f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params)[0])
 
+    def retention_window_census(self, older_than_days: Optional[float] = None,
+                                source: str | None = None, *,
+                                whole_lineages: bool = True, **filters) -> dict[str, Any]:
+        """What the retention window SELECTS, and what it still HOLDS (card t_0ee10a96).
+
+        One definition, asked twice. ``selected_*`` is exactly what :meth:`prune_sessions`
+        would take under the same filters — the same ``_prune_where`` call, with the same
+        whole-lineage rule — and ``past_window_*`` is every session and message past the same
+        age line, kept or not. A carrier reads its numbers here instead of re-typing the
+        predicate, so an eligibility carve-out (the orphan-reap fence, a human archive, a pin,
+        a protected lineage) can never drift between the count a run PLANS and the count the
+        runtime ACTS on.
+
+        ``pruned=0`` with ``past_window_messages>0`` is a stall, not a clean window; a caller
+        that records only the first number cannot tell the two apart.
+        """
+        where, params = self._prune_where(older_than_days, source, filters,
+                                          whole_lineages=whole_lineages)
+        selected_ids = [str(row["id"]) for row in self._read_all(
+            f"SELECT s.id FROM sessions s WHERE {where}", params)]
+        selected_messages = 0
+        for chunk in _id_chunks(selected_ids):
+            row = self._read_one(
+                f"SELECT COUNT(*) FROM messages WHERE session_id IN ({_placeholders(chunk)})",
+                chunk)
+            selected_messages += int(row[0] if row is not None else 0)
+        past_sessions = 0
+        past_messages = 0
+        for age_sql, age_params in self._window_age_arms(filters):
+            past_sessions += int(self._read_one(
+                f"SELECT COUNT(*) FROM sessions s WHERE {age_sql}", age_params)[0])
+            past_messages += int(self._read_one(
+                "SELECT COUNT(*) FROM messages WHERE session_id IN "
+                f"(SELECT s.id FROM sessions s WHERE {age_sql})", age_params)[0])
+        return {
+            "cutoff": filters.get("last_active_before", filters.get("started_before")),
+            "selected_sessions": len(selected_ids),
+            "selected_messages": selected_messages,
+            "selected_ids": selected_ids,
+            "past_window_sessions": past_sessions,
+            "past_window_messages": past_messages,
+        }
+
+    @staticmethod
+    def _window_age_arms(filters: Dict[str, Any]) -> list[Tuple[str, list]]:
+        """The age clause(s) that define "past the window" for the census, independent of
+        eligibility: activity, else start time, else nothing can be past an unbounded window."""
+        if filters.get("last_active_before") is not None:
+            return [(f"{_LAST_ACTIVE_SQL} < ?", [filters["last_active_before"]])]
+        if filters.get("started_before") is not None:
+            return [("s.started_at < ?", [filters["started_before"]])]
+        return [("0", [])]
+
     def archive_stale_sessions(self, idle_days: float, *, exclude_pinned: bool = True) -> int:
         """Archive every session untouched for ``idle_days`` (freshest of ``last_activity_at`` /
         latest message / ``started_at``); may archive unended sessions.  ``archived = 0`` makes

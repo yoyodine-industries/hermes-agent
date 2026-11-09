@@ -800,6 +800,19 @@ def _cmd_prune_or_archive(db, args, action):
     include_open = not prune and getattr(args, "include_open", False)
     if include_open:
         filters["include_open"] = True
+    if prune and getattr(args, "json", False):
+        # Machine-readable retention census (card t_0ee10a96). The class carrier reads its
+        # numbers from HERE rather than re-typing the predicate: this is the same selection
+        # the apply leg runs, so a planned count can never disagree with the acted one.
+        if not args.dry_run:
+            print("Error: --json reports a census; it requires --dry-run (nothing is deleted).",
+                  file=sys.stderr)
+            return 1
+        census = db.retention_window_census(**filters, whole_lineages=True)
+        census["action"] = action
+        census["filters"] = describe_filters(filters)
+        print(json.dumps(census, sort_keys=True, default=str))
+        return
     if not filters["include_pinned"]:
         _note_pinned_skipped(db, filters, action)
     # Prune deletes a compression lineage only as a unit; the preview must list the rows it deletes.
