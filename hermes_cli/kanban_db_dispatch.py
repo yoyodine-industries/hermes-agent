@@ -1066,6 +1066,17 @@ class DispatchResult:
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids with no assignee at all — operator-actionable (usually a
     misfiled task waiting for routing)."""
+    skipped_operator_rung: list[str] = field(default_factory=list)
+    """Ready task ids left UNASSIGNED on purpose because their priority sits in the reserved
+    tranche (``kanban_priority_policy.TRANCHE_FLOOR..TRANCHE_TOP``) and ``kanban.default_assignee``
+    declined to adopt them (card t_5ffd29bc).
+
+    Bucketed apart from ``skipped_unassigned`` because the remedy differs: an unassigned ordinary
+    card wants ROUTING to a lane, while one of these wants the OWNER ITS FILER CHOSE — the operator
+    surface for an ask, the lane named on a designated SEV. It is not a stall and not a failure:
+    the fallback is simply not the authority for a card ranked above the ordinary domain, and the
+    tick names the card here instead of quietly handing the rung back to the lane that filed it.
+    """
     auto_assigned_default: list[str] = field(default_factory=list)
     """Unassigned task ids that had ``kanban.default_assignee`` applied this
     tick before spawning, so telemetry/CLI/dashboard can show the dispatcher
@@ -1327,6 +1338,11 @@ def tick_deferral_reason(result: Optional[object]) -> Optional[str]:
         return "respawn_guarded"
     if getattr(result, "skipped_per_profile_capped", None):
         return "per_profile_capped"
+    if getattr(result, "skipped_operator_rung", None):
+        # Named before skipped_unassigned: a card held at the operator rung is a DELIBERATE
+        # unowned state (the fallback is not its authority), not a misfiled card waiting for
+        # routing, and the two need different remedies.
+        return "operator_rung_unowned"
     if getattr(result, "skipped_unassigned", None):
         return "unassigned"
     return None
@@ -6565,6 +6581,76 @@ def _park_for_consent(conn: sqlite3.Connection, task_id: str, verdict) -> None:
         )
 
 
+def _reserved_tranche_reason(priority: Any) -> Optional[str]:
+    """Why ``kanban.default_assignee`` must NOT adopt a row, or ``None`` when it may.
+
+    ``kanban.default_assignee`` is an ORDINARY-DOMAIN fallback: it answers "nobody routed
+    this card, so the operator's configured seat takes it". A priority inside the RESERVED
+    TRANCHE (``kanban_priority_policy.TRANCHE_FLOOR..TRANCHE_TOP``) answers a different
+    question — the card is an operator-facing artifact (an ask, or a declared SEV), and its
+    rank is what puts it in front of the operator. Handing it to the default seat is how the
+    rung is defeated: the card is dispatched back to the lane that filed it, which can
+    neither grant the consent it asked for nor complete it (card t_78dca4ba: filed through
+    ``admin_operator_card`` at 999999 at 22:49:35, auto-assigned to the default at 22:53:48,
+    run 1506).
+
+    So the tranche is not the fallback's to enter. The rule keys on the PRIORITY, not on the
+    filer, which is what makes it cover every present and future filing door: the
+    designation door, a gate lift that carries an ordinary card into the tranche, and a
+    caller ``admin_operator_card`` does not know about yet. The card is left exactly as it
+    was — unassigned, at its rank, still ``ready`` — and an explicit owner (a lane, or the
+    operator surface) can still set one at any time, which the seam then honours unchanged.
+
+    Fail-open on an unreadable policy: a policy module that cannot be imported must never
+    take a dispatch tick down, and the tranche constants are a pure-stdlib read.
+    """
+    try:
+        from hermes_cli import kanban_priority_policy as policy
+    except Exception:  # pragma: no cover - import of a stdlib-only sibling module
+        _kb._log.debug("kanban dispatch: priority policy unreadable", exc_info=True)
+        return None
+    try:
+        inside = policy.in_tranche(priority)
+    except Exception:  # pragma: no cover - a policy that cannot answer
+        _kb._log.debug("kanban dispatch: priority policy refused %r", priority, exc_info=True)
+        return None
+    if not inside:
+        return None
+    return (
+        f"priority {int(priority)} is in the reserved tranche "
+        f"({int(policy.TRANCHE_FLOOR)}-{int(policy.TRANCHE_TOP)}): an operator-facing card, "
+        f"not the default assignee's to adopt"
+    )
+
+
+def _record_reserved_tranche_hold(
+    conn: sqlite3.Connection, task_id: str, reason: str, *, dry_run: bool,
+) -> None:
+    """Leave ONE durable line on the card saying the fallback declined it.
+
+    Once per card, not once per tick: the payload is compared against the last event of
+    this kind, so a card that sits unowned for an hour carries one record, not six hundred.
+    Best-effort by design — a record that cannot be written must not change the tick's
+    verdict (the card is still unassigned, which is the behaviour that matters).
+    """
+    if dry_run:
+        return
+    payload = {"source": "kanban.default_assignee", "reason": reason}
+    try:
+        with _kb.write_txn(conn):
+            last = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'assign_refused' "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if last is None or last["payload"] != _kb._json_or_null(payload):
+                _kb._append_event(conn, task_id, "assign_refused", payload)
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: reserved-tranche hold could not be recorded for %s",
+            task_id, exc_info=True,
+        )
+
+
 def _apply_default_assignee(
     conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool,
 ) -> bool:
@@ -7110,7 +7196,17 @@ def _dispatch_once_locked(
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
-            # park in 'ready' forever.
+            # park in 'ready' forever — EXCEPT inside the reserved tranche: that rank is an
+            # operator-facing artifact (an ask or a declared SEV), so the fallback is not its
+            # authority. Adopting it would dispatch the card back to the lane that filed it,
+            # which cannot grant the consent it asked for and cannot complete it either
+            # (card t_78dca4ba). The row is left untouched: unassigned, at its rank, still
+            # ready, and still reachable the moment anyone sets an explicit owner.
+            tranche_reason = _reserved_tranche_reason(row["priority"]) if default_assignee else None
+            if tranche_reason:
+                result.skipped_operator_rung.append(row["id"])
+                _record_reserved_tranche_hold(conn, row["id"], tranche_reason, dry_run=dry_run)
+                continue
             if not default_assignee or not _apply_default_assignee(
                 conn, row["id"], default_assignee, dry_run=dry_run,
             ):

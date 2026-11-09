@@ -227,6 +227,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
             ],
             "skipped_unassigned": res.skipped_unassigned,
+            "skipped_operator_rung": getattr(res, "skipped_operator_rung", []),
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "skipped_self_review": [
                 {"task_id": tid, "reason": reason}
@@ -296,6 +297,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    if getattr(res, "skipped_operator_rung", None):
+        # Named on its own line: the operator rung is not "unassigned, wants routing" — it is
+        # unowned BY DESIGN and wants the owner its filer chose (card t_5ffd29bc).
+        print(
+            "Held (operator rung, no owner — kanban.default_assignee does not adopt it): "
+            f"{', '.join(res.skipped_operator_rung)}"
+        )
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
     if res.skipped_nonspawnable:
