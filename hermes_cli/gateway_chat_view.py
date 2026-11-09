@@ -3,6 +3,7 @@ import asyncio
 from contextlib import suppress
 import logging
 import sys
+from typing import Any, Callable
 import uuid
 
 from hermes_cli.gateway_client import GatewayClientError
@@ -41,6 +42,12 @@ _BLOCKING_CONTROL_EVENTS = frozenset({
     "approval.request", "approval.settled", "clarify.request", "clarify.settled",
     "session.info",
 })
+
+# A one-shot whose socket died mid-turn dials again at most this many times, then polls the
+# admission's receipt: the turn is the OWNER's, so a resume names its outcome without resending the
+# work (which may already have run). A gateway that answers neither keeps the honest unknown copy.
+_RECONNECT_ATTEMPTS = 2
+_RECEIPT_POLL_SECONDS = 2.0
 
 
 def pending_lines(pending, *, interactive=True):
@@ -113,6 +120,11 @@ class GatewayChatView:
         self.cut, self.mine, self.gaps, self._attaching = {}, {}, 0, asyncio.Lock()
         self.changed = asyncio.Event()
         self.failure = None
+        # A socket factory for a redial after the transport dies mid-turn (``run_gateway_chat``
+        # passes ``connect_gateway``); None when this view has no way to dial again.
+        self.dial: Callable[[], Any] | None = None
+        self._dialled = []  # the extra sockets a recovery opened; ``run`` closes them
+        self.reconnects = 0
         # Set once with ``failure``: the interactive composer races its line read against it so a
         # dead owner ends the REPL immediately instead of on the next keypress.
         self.failed = asyncio.Event()
@@ -226,6 +238,79 @@ class GatewayChatView:
             self.changed.set()
         elif verdict is None and self.finite:  # unreadable: fails as before (interactive: the next gap retries)
             self._fail(GatewayClientError("session_replay_gap"))
+
+    @staticmethod
+    def _transport_lost(error):
+        """The failure that says the socket is gone, not that the owner refused something."""
+        if isinstance(error, GatewayClientError):
+            return str(error).startswith(("Gateway disconnected", "Gateway connection", "Gateway did not answer"))
+        return True  # a transport exception the client never wrapped
+
+    async def _survive_disconnect(self, admission):
+        """The socket died mid-turn: the turn is the OWNER's, so redial, resume this session and read
+        ``admission``'s receipt — the turn's own outcome — instead of reporting an unknown one. The
+        prompt is never resubmitted: its work may already have run."""
+        if not self.finite or self.dial is None or admission is None:
+            return False
+        if not self._transport_lost(self.failure) or self.reconnects >= _RECONNECT_ATTEMPTS:
+            return False
+        self.reconnects += 1
+        sid = self.session_id
+        try:
+            manager = self.dial()
+            client = await manager.__aenter__()
+        except Exception as exc:  # health: allow BLE001 -- no redial means no readable outcome
+            logger.debug("redial after a gateway disconnect failed: %s", exc)
+            return False
+        self._dialled.append(manager)
+        try:
+            snapshot = await client.rpc("session.resume", session_id=sid)
+        except Exception as exc:  # health: allow BLE001 -- the resumed socket may die too (bounded)
+            logger.debug("resume after a gateway disconnect failed: %s", exc)
+            return False
+        if self.session_id != sid:
+            return False  # /new or /branch moved this view meanwhile
+        self.client = client
+        self.session_id = snapshot.get("stored_session_id") or sid
+        self.generation = snapshot.get("execution_generation", self.generation)
+        self.pending = snapshot.get("pending", [])
+        self.failure = None
+        self.failed.clear()
+        self.reconnects = 0  # a later disconnect gets its own budget
+        await self._settle_by_receipt(admission)
+        return True
+
+    async def _settle_by_receipt(self, admission):
+        """Poll the admission's receipt until the owner settles it: a redialled viewer sees no events
+        for a turn that ended while its socket was gone, so the receipt is its only account."""
+        while admission not in self.completions:
+            try:
+                receipt = await self.client.rpc("prompt.receipt", session_id=self.session_id,
+                                                 admission_id=admission, include_result=True)
+            except Exception as exc:  # health: allow BLE001 -- an unreadable receipt is not an outcome
+                logger.debug("receipt for %s unreadable after a redial: %s", admission, exc)
+                return
+            status = receipt.get("status")
+            if status in ("terminal", "unknown"):
+                result = receipt.get("result")
+                outcome = receipt.get("outcome") or ("completed" if isinstance(result, dict) else "unknown")
+                if status == "unknown":
+                    outcome = "unknown"
+                text = (result or {}).get("final_response") if isinstance(result, dict) else ""
+                if not text:
+                    text = _UNKNOWN_OUTCOME if outcome == "unknown" else ""
+                self._complete(admission, {"outcome": {"interrupted": "cancelled"}.get(outcome, outcome),
+                                           "_receipt": receipt, "text": text})
+                self.changed.set()
+                return
+            await asyncio.sleep(_RECEIPT_POLL_SECONDS)
+
+    async def _close_dialled(self):
+        """Close every socket a recovery dialled; the owner is told nothing by the close."""
+        while self._dialled:
+            manager = self._dialled.pop()
+            with suppress(Exception):
+                await manager.__aexit__(None, None, None)
 
     async def _read_line(self, prompt, symbol):
         """The next composer line, or ``""`` once the event stream failed first (``self.failure``
@@ -560,6 +645,10 @@ class GatewayChatView:
                 while admission not in self.completions:
                     self.changed.clear()
                     if self.failure:
+                        # A dead socket does not make the turn anonymous: the owner still has it and
+                        # its receipt names the outcome, so recover before reporting anything.
+                        if await self._survive_disconnect(admission):
+                            continue
                         raise self.failure
                     blocked = self._finite_block(admission)
                     if blocked:
@@ -630,6 +719,7 @@ class GatewayChatView:
             renderer.cancel()
             with suppress(asyncio.CancelledError):
                 await renderer
+            await self._close_dialled()
 
 
 def _oneshot_admission(receipt):

@@ -232,6 +232,7 @@ async def run_gateway_chat(args, emitter=None):
             emitter.bind_session(snapshot["stored_session_id"])
         view = GatewayChatView(client, snapshot, quiet=quiet, emitter=emitter,
                                usage_file=getattr(args, "usage_file", None))
+        view.dial = connect_gateway  # a one-shot recovers a turn whose socket died mid-flight
         view.launch_api_key = getattr(args, "api_key", None)  # /new keeps this launch's key
         view.unattended = isinstance(oneshot_prompt, str)
         view.resume_footer = oneshot and not quiet
