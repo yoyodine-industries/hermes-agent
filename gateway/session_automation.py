@@ -418,6 +418,22 @@ def automation_display_metadata(metadata):
         raise RuntimeStoreError('invalid_params')
     return {'display_kind': kind, 'display_text': text}
 
+
+def automation_turn_author_metadata(metadata):
+    """A relayed peer DM's author, carried inside whichever automation shape the route writes.
+
+    A notice the gateway produces itself has none, so this field is what tells the admission FIFO a
+    fact from a hint (``hermes_state_runtime.admission_class``) on a native route exactly as on a
+    LOCAL one. Absent keys omit it, keeping an unchanged admission's fingerprint stable."""
+    if metadata.get('turn_author') is None:
+        return {}
+    from agent.turn_author import parse_turn_author
+    author = parse_turn_author(metadata['turn_author'])
+    if author is None:
+        raise RuntimeStoreError('invalid_params')
+    return {'turn_author': author}
+
+
 # notification_origin / original_trigger_message_id are producer debug context (#52694) and are not
 # persisted; notification_category="diagnostic" rides the snapshot so the replayed wake still mutes,
 # and display_kind/display_text so the persisted row is the card the producer named; heartbeat_tick is
@@ -466,7 +482,7 @@ def snapshot_automation(authority, adapter, event, identity):
             or set(event.metadata) - _AUTOMATION_METADATA):
         raise RuntimeStoreError('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
-                    | _tick_metadata(event.metadata))
+                    | automation_turn_author_metadata(event.metadata) | _tick_metadata(event.metadata))
     entry = _owner(runner, event, authority)
     from gateway.session_detached import detached_route_of
     if event.source.platform == Platform.LOCAL or detached_route_of(event.source):
@@ -552,12 +568,8 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
                   'route': entry.session_key, 'target': entry.session_id}
     descriptor.update(automation_notification_metadata(event.metadata))
     descriptor.update(automation_display_metadata(event.metadata))
+    descriptor.update(automation_turn_author_metadata(event.metadata))
     descriptor.update(_tick_metadata(event.metadata))
-    if event.metadata.get('turn_author') is not None:
-        from agent.turn_author import parse_turn_author
-        descriptor['turn_author'] = parse_turn_author(event.metadata['turn_author'])
-        if descriptor['turn_author'] is None:
-            raise RuntimeStoreError('invalid_params')
     if event.metadata.get('automation_identities'):
         descriptor['identities'] = sorted(set(event.metadata['automation_identities']))
     if getattr(event, '_heartbeat_session_id', None):

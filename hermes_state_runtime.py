@@ -139,15 +139,47 @@ INTERACTIVE = 'interactive'
 # the retryable envelope key on it); the field only says WHICH budget refused.
 _QUEUE_FULL_CLASS = {'automation': 'automation_fifo', 'interactive': 'interactive_fifo'}
 
-# A queued row is automation iff it carries a ``local_automation_v1`` descriptor with no
-# ``turn_author``: every notice the gateway produces itself has one (a watch tick, a completion
-# batch, a route wake), while a relayed peer DM carries ``turn_author`` and a person's prompt or an
+# A queued row is automation iff it carries a gateway automation descriptor with no
+# ``turn_author``. The gateway writes that descriptor in TWO shapes, one per route: a LOCAL route
+# gets ``local_automation_v1`` (``snapshot_local_automation``), a native route gets
+# ``native_text_v1.automation`` (``snapshot_automation``'s non-local branch). Every notice the
+# gateway produces itself carries one of them (a watch tick, a completion batch, a route wake),
+# while a relayed peer DM carries ``turn_author`` inside its own shape and a person's prompt or an
 # API turn carries no descriptor at all. ``payload_json`` is always written by ``_json``, so the
 # extract never throws.
-_AUTOMATION_ROW_SQL = ("(json_extract(payload_json,'$.local_automation_v1') IS NOT NULL"
-                       " AND json_extract(payload_json,'$.local_automation_v1.turn_author') IS NULL)")
+AUTOMATION_DESCRIPTOR_PATHS = ('local_automation_v1', 'native_text_v1.automation')
+
+
+def _automation_row_sql(path: str) -> str:
+    """One shape's test over ``payload_json`` -- the SQL twin of the Python walk below.
+
+    ``COALESCE(json_type(...),'')='object'`` is the SQL spelling of the helper's
+    ``isinstance(block, dict)``: a descriptor a transport wrote as a string or a list is NOT
+    automation in either twin (an unknown payload is a fact), so the two can never disagree about a
+    shape neither recognises. The COALESCE is load-bearing, not decoration: an absent path makes
+    ``json_type`` NULL, and ``NULL = 'object'`` would poison the whole OR with NULL -- which the
+    class budgets read as ``NOT NULL`` (nothing counted), so the interactive FIFO would never fill."""
+    pointer = "'$." + path + "'"
+    return ("(COALESCE(json_type(payload_json," + pointer + "),'') = 'object'"
+            " AND json_extract(payload_json,'$." + path + ".turn_author') IS NULL)")
+
+
+# Any shape carrying a descriptor with no ``turn_author`` is automation: the OR is exactly what
+# :func:`admission_class` does over the same list, so the two never disagree.
+_AUTOMATION_ROW_SQL = '(' + ' OR '.join(_automation_row_sql(path)
+                                        for path in AUTOMATION_DESCRIPTOR_PATHS) + ')'
 # Interactive rows sort before automation rows in the claim; seq keeps FIFO order inside a class.
 _CLAIM_ORDER_SQL = _AUTOMATION_ROW_SQL + ', seq'
+
+
+def _automation_descriptors(payload):
+    """Every automation descriptor ``payload`` carries, in either shape the gateway writes."""
+    for path in AUTOMATION_DESCRIPTOR_PATHS:
+        block = payload
+        for key in path.split('.'):
+            block = block.get(key) if isinstance(block, dict) else None
+        if isinstance(block, dict):
+            yield block
 
 
 def admission_class(payload) -> str:
@@ -155,8 +187,7 @@ def admission_class(payload) -> str:
     :data:`_AUTOMATION_ROW_SQL` in Python, so a caller that ranks queued rows agrees with the
     claim's own ORDER BY. An unknown payload is INTERACTIVE: holding back a hint is recoverable,
     dropping a fact is not."""
-    descriptor = payload.get('local_automation_v1') if isinstance(payload, dict) else None
-    if isinstance(descriptor, dict) and descriptor.get('turn_author') is None:
+    if any(descriptor.get('turn_author') is None for descriptor in _automation_descriptors(payload)):
         return AUTOMATION
     return INTERACTIVE
 

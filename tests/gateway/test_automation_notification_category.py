@@ -179,6 +179,36 @@ async def _native_owner(tmp_path, monkeypatch, human_message_id, fields=_SOURCE,
 
 
 @pytest.mark.asyncio
+async def test_native_automation_roundtrip_keeps_a_relayed_peer_dm_author(tmp_path, monkeypatch):
+    """The native envelope is the SAME block for a notice and for a relayed peer DM, so the FIFO
+    needs ``turn_author`` inside it to tell a fact from a hint -- and ``restore_native`` puts it
+    back on the way in (t_1bc575c0). Without it, widening the predicate would hold a fact back."""
+    from gateway.session_envelope import restore_native
+    from hermes_state_runtime import AUTOMATION, INTERACTIVE, admission_class
+    runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'human-1')
+    author = {'id': 'bot:platform-stl', 'name': 'platform-stl', 'is_bot': True}
+    try:
+        dm = MessageEvent(text='message from a peer', source=source, internal=True,
+                          metadata={**metadata, 'turn_author': dict(author)})
+        receipt = await authority.admit_automation(adapter, dm, 'bot:peer')
+        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+        assert row is not None
+        assert row['payload']['native_text_v1']['automation']['turn_author'] == author
+        assert admission_class(row['payload']) == INTERACTIVE
+        assert restore_native(row['payload'], runner).metadata['turn_author'] == author
+
+        notice = MessageEvent(text='notice', source=source, internal=True, metadata=dict(metadata))
+        notice_row = get_session_admission(
+            authority.db, admission_id=(await authority.admit_automation(adapter, notice, 'notice')).admission_id)
+        assert notice_row is not None
+        assert 'turn_author' not in notice_row['payload']['native_text_v1']['automation']
+        assert admission_class(notice_row['payload']) == AUTOMATION
+        assert 'turn_author' not in restore_native(notice_row['payload'], runner).metadata
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
 async def test_native_completion_wake_admits_when_source_differs_only_by_message_id(tmp_path, monkeypatch):
     """A synthetic wake clears ``message_id`` (#52694/#123097) while the committed human
     envelope keeps it; the admission must still match the route and drop the stale anchor."""
