@@ -15,7 +15,10 @@ _SCALARS = (type(None), bool, int, float, str)
 
 def _filters(raw):
     from hermes_state_maintenance import _PRUNE_FILTER_NAMES
-    if (not isinstance(raw, dict) or set(raw) - (_PRUNE_FILTER_NAMES | {'older_than_days'})
+    # ``auto_archived_prunable`` is not a row predicate but the selector's archive policy: prune
+    # must reach rows the auto-archive sweep hid, or retention can never delete them.
+    allowed = _PRUNE_FILTER_NAMES | {'older_than_days', 'auto_archived_prunable'}
+    if (not isinstance(raw, dict) or set(raw) - allowed
             or not all(isinstance(value, _SCALARS) for value in raw.values())):
         raise RuntimeStoreError('invalid_params')
     return dict(raw)
