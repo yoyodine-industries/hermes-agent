@@ -23,7 +23,7 @@ from gateway.session_pending_controls import PendingControls
 from gateway.session_producer_lifecycle import drop_producer_turn, mark_producer_admission
 from hermes_cli.observability.shared_metrics_busy import busy_row_settled
 from hermes_state_runtime import (
-    STEERING, RuntimeStoreError, admit_session_input, begin_runtime_epoch,
+    STEERING, RuntimeStoreError, admit_session_input, admission_claim_rank, begin_runtime_epoch,
     cancel_session_input, claim_session_input, get_session_admission,
     list_session_admissions, recover_session_inputs, resolve_unknown_session_input,
 )
@@ -1079,7 +1079,8 @@ class SessionAuthority:
             pending = list_session_admissions(self.db, session_id=ref.session_id)
             if any(row['status'] == 'unknown' for row in pending):
                 raise RuntimeStoreError('unknown_execution')
-            first = next((row for row in pending if row['status'] == 'queued'), None)
+            first = min((row for row in pending if row['status'] == 'queued'),
+                        key=admission_claim_rank, default=None)
             from gateway.config import Platform
             if live.source.platform == Platform.LOCAL:
                 # A reasoning command or a model pick made while the previous turn ran lands here, at the
@@ -1234,8 +1235,9 @@ class SessionAuthority:
                         # A verdict on the head alone (its route or binding moved under it) that every drain
                         # repeats: pausing behind it strands the FIFO for good. Refused only once the same
                         # head conflicted twice, read after each: never a successor a cancel advanced to.
-                        head = next((row['admission_id'] for row in list_session_admissions(
-                            self.db, session_id=ref.session_id) if row['status'] == 'queued'), None)
+                        queued = [row for row in list_session_admissions(
+                            self.db, session_id=ref.session_id) if row['status'] == 'queued']
+                        head = min(queued, key=admission_claim_rank)['admission_id'] if queued else None
                         if head is not None and head != conflicted:
                             conflicted = head
                             continue

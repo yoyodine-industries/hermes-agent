@@ -19,8 +19,11 @@ async def test_queue_full_refusal_withdraws_the_pin_and_the_retry_admits(bot):
     from tools.bot_live_delivery import read_delivery_result
     authority = bot.authority
     authority._schedule = lambda ref: None  # hold the backlog: nothing drains until we cancel it
+    # The cap is per delivery class: this delivery is an automation notice (a producer report, no
+    # turn_author), so the backlog that must refuse it is the automation class's own.
     fillers = [admit_session_input(authority.db, epoch=authority.epoch, principal_id='uid:1000',
-               session_id=bot.chat, request_id=f'fill{i}', payload={'text': f'f{i}'})
+               session_id=bot.chat, request_id=f'fill{i}',
+               payload={'text': f'f{i}', 'local_automation_v1': {'identity': f'fill:{i}'}})
                for i in range(ADMISSION_QUEUE_MAX)]
     with pytest.raises(RuntimeStoreError, match='queue_full'):
         await deliver(bot.connection, dict(id=KEY, profile='default', message='ping'))
