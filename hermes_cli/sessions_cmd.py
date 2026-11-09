@@ -786,6 +786,10 @@ def _cmd_prune_or_archive(db, args, action):
 
     # Prune skips archived rows unless --include-archived; archive only targets not-yet-archived rows.
     filters["archived"] = None if prune and getattr(args, "include_archived", False) else False
+    # Retention exemptions are INTENT (pinned, deliberately archived) and LIVENESS, never the
+    # runtime's own hiding: prune must reach rows the auto-archive sweep hid, or they are
+    # invisible to retention forever and the store grows past its window with pruned=0.
+    filters["auto_archived_prunable"] = prune
     filters["include_pinned"] = getattr(args, "include_pinned", False)
     # Archive flips a compression lineage as a unit, matched through its tip (an old ancestor alone
     # never qualifies); the preview must show the same rows the archive will touch.

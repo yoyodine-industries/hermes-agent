@@ -219,6 +219,7 @@ class SessionMaintenanceMixin:
     @staticmethod
     def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
                             lineage_tips_only: bool = False, include_open: bool = False,
+                            auto_archived_prunable: bool = False,
                             **filters) -> tuple[str, list]:
         """Shared WHERE clause for bulk prune/archive selection (alias ``s``): ``_PRUNE_FILTERS``
         AND together, only ended sessions are ever candidates, ``archived`` is tri-state
@@ -243,7 +244,14 @@ class SessionMaintenanceMixin:
                 clauses.extend(new_clauses)
                 params.extend(new_params)
         if isinstance(archived, bool):
-            clauses.append(f"s.archived = {int(archived)}")
+            if auto_archived_prunable and not archived:
+                # Retention exemptions are INTENT (pinned, deliberately archived) and LIVENESS
+                # (the ended guard above), never the runtime's own hiding. ``archived = 1`` with
+                # ``auto_archived = 1`` means the sweep hid the row; the user never asked to keep
+                # it, so excluding it made every auto-archived row invisible to prune forever.
+                clauses.append("(s.archived = 0 OR COALESCE(s.auto_archived, 0) = 1)")
+            else:
+                clauses.append(f"s.archived = {int(archived)}")
         # Pinned is a durable "keep" flag: bulk prune/delete/archive exclude pinned rows unless opted in.
         if not include_pinned:
             clauses.append(_not_pinned_sql())
