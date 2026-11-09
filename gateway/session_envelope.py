@@ -323,6 +323,10 @@ def restore_native(payload, runner=None):
         from gateway.session_automation import automation_display_metadata, automation_notification_metadata
         event.metadata.update(automation_notification_metadata(envelope['automation']))
         event.metadata.update(automation_display_metadata(envelope['automation']))
+        if envelope['automation'].get('turn_author') is not None:
+            # A relayed peer DM keeps its author on the way back in, so the replayed event is the
+            # same fact the FIFO classified: no notice ever carries one (gateway/session_automation).
+            event.metadata['turn_author'] = deepcopy(envelope['automation']['turn_author'])
     return event
 
 
