@@ -1676,3 +1676,31 @@ def real_bash() -> str:
             if candidate.exists():
                 return str(candidate)
     return found or "bash"
+
+
+# ---------------------------------------------------------------------------
+# Environment preflight (card t_cf7c63c0)
+#
+# An absent dependency used to surface as one collection error per importing
+# module -- 109 of them, all truthful about the INTERPRETER and all readable as
+# failures of the TREE. Ask the environment question first and refuse once, in a
+# typed line, so a runner can tell an environment from a regression.
+# ---------------------------------------------------------------------------
+def pytest_report_header(config):
+    """Name the interpreter and its environment root on every run's header."""
+    from tests import preflight
+
+    return preflight.interpreter()
+
+
+def pytest_configure(config):
+    """Refuse once, before collection, when the test environment is incomplete."""
+    from tests import preflight
+
+    line = preflight.check()
+    if line:
+        pytest.exit(
+            "%s -- install the declared test environment: "
+            "python -m pm.build_env --source . --out .venv --group dev --group test" % line,
+            returncode=preflight.EXIT_ENV_INCOMPLETE,
+        )
