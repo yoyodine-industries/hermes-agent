@@ -7,6 +7,7 @@ the user scheduled for that minute as ``missed`` without ever running it. A hold
 never came back, or a reminder due hours into an endless external drain, is still retired (#93526).
 """
 
+import json
 import threading
 import time
 from datetime import datetime, timedelta, UTC
@@ -78,3 +79,66 @@ def test_stale_oneshot_is_retired_despite_a_hold(cron_store, monkeypatch, hold_t
 
     assert _scan_at(monkeypatch, start) == []
     assert load_jobs() == []
+
+
+# --- the stamp must not outlive the hold (t_895cf539) -------------------------------------------
+# A frozen {"since": X, "last": X} file reads exactly like a dispatcher that stopped ticking, and
+# it was read that way: financially-stl concluded dispatch "had NOT ticked since 00:29 (10.3h)"
+# from a file left behind by a drain that had resumed precisely BECAUSE the ticker was dispatching.
+
+def _stamp(cron_dir, since, last):
+    (cron_dir / "dispatch_held.json").write_text(
+        json.dumps({"since": since, "last": last}), encoding="utf-8"
+    )
+
+
+def test_a_resumed_dispatch_retires_its_own_hold_stamp(cron_store):
+    from cron.dispatch_hold import note_dispatching, read
+
+    cron_dir = cron_store / "cron"
+    note_held(now=time.time() - 100)
+    note_held(now=time.time())
+    assert read(cron_dir) is not None  # a held tick leaves the stamp
+
+    note_dispatching()  # the first dispatching tick still feeds grace_starts_at ...
+    assert read(cron_dir) is not None
+    note_dispatching()  # ... the next one retires it: no file = no hold
+    assert read(cron_dir) is None
+    assert not (cron_dir / "dispatch_held.json").exists()
+
+
+def test_a_stamp_left_by_a_previous_gateway_is_retired_once_dispatch_resumes(cron_store):
+    from cron.dispatch_hold import note_dispatching, read
+
+    cron_dir = cron_store / "cron"
+    _stamp(cron_dir, since=time.time() - 200, last=time.time() - 200)  # that gateway never came back
+
+    # The restarting gateway's first read must still see it, or a one-shot due mid-drain loses
+    # the grace extension this module exists for (#93526, the test above).
+    note_dispatching()
+    assert read(cron_dir) is not None
+    note_dispatching()
+    assert read(cron_dir) is None
+
+
+def test_a_live_hold_is_not_retired_by_a_reading_process(cron_store):
+    from cron.dispatch_hold import note_dispatching, read
+
+    cron_dir = cron_store / "cron"
+    note_held(now=time.time() - 100)
+    note_dispatching()  # a process that observed dispatch but never held this store
+    note_held(now=time.time())  # the hold is still being stamped every tick
+    note_dispatching()
+    assert read(cron_dir) is not None, "a hold that is still ticking must keep its stamp"
+
+
+def test_grace_still_extends_across_the_retiring_tick(cron_store, monkeypatch):
+    """The extension must survive the tick that resumes dispatch -- the retiring tick is the next one."""
+    from cron.dispatch_hold import grace_starts_at, note_dispatching
+
+    cron_dir = cron_store / "cron"
+    now = time.time()
+    note_held(now=now - 100)
+    due = now - 90
+    note_dispatching()
+    assert grace_starts_at(cron_dir, due, grace=120) > due
