@@ -157,3 +157,29 @@ def test_archive_without_flag_reports_open_skips(monkeypatch, capsys):
     assert "include_open" not in filters
     assert "2 matching sessions still open" in out
     assert "--include-open" in out
+
+
+def test_prune_default_reaches_the_runtime_auto_archive(monkeypatch, capsys):
+    """Card t_0ee10a96 L1: prune's "not archived" means NOT HUMAN-ARCHIVED.
+
+    The runtime auto-archives an idle session before retention would reach it, so a plain
+    ``s.archived = 0`` made the whole selection a structural zero. The delete path asks for the
+    auto-archived arm; the preview reads the same filters, so it lists what the prune deletes.
+    """
+    filters, _out = _run_prune(monkeypatch, capsys, ["--older-than", "7", "--dry-run"])
+    assert filters["archived"] is False
+    assert filters["include_auto_archived"] is True
+
+
+def test_prune_include_archived_still_names_both_arms(monkeypatch, capsys):
+    """--include-archived keeps its meaning: the human opted into every archived row."""
+    filters, _out = _run_prune(
+        monkeypatch, capsys, ["--older-than", "7", "--include-archived", "--dry-run"])
+    assert filters["archived"] is None
+    assert filters["include_auto_archived"] is False
+
+
+def test_archive_never_takes_the_prune_arm(monkeypatch, capsys):
+    """Archive is unchanged: re-archiving an already-archived row is a no-op."""
+    filters, _out = _run_prune(monkeypatch, capsys, ["--title", "dupes", "--yes"], sub="archive")
+    assert filters["include_auto_archived"] is False

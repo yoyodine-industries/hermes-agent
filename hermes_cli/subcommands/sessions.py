@@ -151,6 +151,12 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
             "never reach these — it only ever selects ended sessions")
     _flag(sessions_prune, "--force",
         help="With no gateway running: run even while another Hermes process (Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped. With the gateway running, prune always goes through it")
+    _flag(sessions_prune, "--json", default=False,
+        help="With --dry-run: print the machine-readable retention census instead of the "
+            "human preview — what this prune's OWN selection takes (selected_sessions / "
+            "selected_messages / selected_ids) and what the window still holds past the same "
+            "age line (past_window_sessions / past_window_messages). Carriers read this "
+            "instead of re-typing the predicate")
 
     sessions_archive = sessions_subparsers.add_parser(
         "archive", help="Bulk-archive (soft-hide) sessions matching filters — no deletion")

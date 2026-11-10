@@ -78,7 +78,20 @@ _PRUNE_FILTERS = (
     ("min_tool_calls", "notnone", _one("COALESCE(s.tool_call_count, 0) >= ?")),
     ("max_tool_calls", "notnone", _one("COALESCE(s.tool_call_count, 0) <= ?")),
 )
-_PRUNE_FILTER_NAMES = frozenset(name for name, _, _ in _PRUNE_FILTERS) | {"archived", "include_pinned", "lineage_tips_only"}
+_PRUNE_FILTER_NAMES = frozenset(name for name, _, _ in _PRUNE_FILTERS) | {
+    "archived", "include_pinned", "lineage_tips_only", "include_auto_archived"}
+
+#: The prune-eligible archived arm (card t_0ee10a96, L1). The runtime AUTO-archives an idle
+#: session (``archive_stale_sessions`` -> ``archived=1``, ``auto_archived=1``) once it passes
+#: ``sessions.auto_archive_days``; a HUMAN archive (``archived=1`` with ``auto_archived=0``) is
+#: operator intent. Prune's default selection is therefore "unarchived OR runtime-archived":
+#: exempting every archived row makes the selection a STRUCTURAL ZERO on a store whose
+#: archive_days is shorter than its retention window (measured on platform-stl: 249
+#: auto-archived sessions / 136,588 rows invisible to prune, ``hermes sessions prune`` deleting
+#: 0 rows past the window while the store grew). Narrow the exemption, never widen it: intent
+#: (auto_archived=0) and liveness (the ended-guard, turn leases, the live-work ledger) still keep
+#: their rows, and ``archived is None`` (``--include-archived``) still means both arms.
+_ARCHIVED_ELIGIBLE_SQL = "(s.archived = 0 OR COALESCE(s.auto_archived, 0) = 1)"
 
 # Child ``c`` continues compression-ended ``p`` (same predicate as compression's child lookup).
 _CONTINUATION_EDGE_SQL = "p.end_reason = 'compression'\n" + _non_continuation_child_sql("c.", "p.id")
@@ -232,6 +245,7 @@ class SessionMaintenanceMixin:
     @staticmethod
     def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
                             lineage_tips_only: bool = False, include_open: bool = False,
+                            include_auto_archived: bool = False,
                             **filters) -> tuple[str, list]:
         """Shared WHERE clause for bulk prune/archive selection (alias ``s``): ``_PRUNE_FILTERS``
         AND together, only ended sessions are ever candidates, ``archived`` is tri-state
@@ -240,7 +254,9 @@ class SessionMaintenanceMixin:
         their tip, never on their own age — matching an old ancestor would fan out over the lineage
         and hide its OPEN, recently active tip (#115489). ``include_open`` lifts the ended guard
         for reversible archive only — never for prune/delete (#139597: desktop sessions never set
-        ``ended_at``)."""
+        ``ended_at``). ``include_auto_archived`` (prune only, card t_0ee10a96) turns
+        ``archived=False`` into "unarchived OR runtime-auto-archived" — see
+        :data:`_ARCHIVED_ELIGIBLE_SQL`; ``archived=True`` and ``archived=None`` are unaffected."""
         unknown = set(filters) - _PRUNE_FILTER_NAMES
         if unknown:
             raise TypeError("SessionMaintenanceMixin._prune_filter_where() got an unexpected "
@@ -256,7 +272,12 @@ class SessionMaintenanceMixin:
                 clauses.extend(new_clauses)
                 params.extend(new_params)
         if isinstance(archived, bool):
-            clauses.append(f"s.archived = {int(archived)}")
+            # Ruling t_0ee10a96 L1: BOOKKEEPING does not keep a row, INTENT does. ``archived=False``
+            # on the prune path selects the unarchived PLUS every session the runtime archived.
+            if not archived:
+                clauses.append(_ARCHIVED_ELIGIBLE_SQL if include_auto_archived else "s.archived = 0")
+            else:
+                clauses.append("s.archived = 1")
         # Pinned is a durable "keep" flag: bulk prune/delete/archive exclude pinned rows unless opted in.
         if not include_pinned:
             clauses.append(_not_pinned_sql())
@@ -315,6 +336,59 @@ class SessionMaintenanceMixin:
             raise RuntimeError("prune filter lost its ended-session safety guard")
         open_where = f"s.ended_at IS NULL{where[len(ended_guard):]}"
         return int(self._read_one(f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params)[0])
+
+    def retention_window_census(self, older_than_days: Optional[float] = None,
+                                source: str | None = None, *,
+                                whole_lineages: bool = True, **filters) -> dict[str, Any]:
+        """What the retention window SELECTS, and what it still HOLDS (card t_0ee10a96).
+
+        One definition, asked twice. ``selected_*`` is exactly what :meth:`prune_sessions`
+        would take under the same filters — the same ``_prune_where`` call, with the same
+        whole-lineage rule — and ``past_window_*`` is every session and message past the same
+        age line, kept or not. A carrier reads its numbers here instead of re-typing the
+        predicate, so an eligibility carve-out (the orphan-reap fence, a human archive, a pin,
+        a protected lineage) can never drift between the count a run PLANS and the count the
+        runtime ACTS on.
+
+        ``pruned=0`` with ``past_window_messages>0`` is a stall, not a clean window; a caller
+        that records only the first number cannot tell the two apart.
+        """
+        where, params = self._prune_where(older_than_days, source, filters,
+                                          whole_lineages=whole_lineages)
+        selected_ids = [str(row["id"]) for row in self._read_all(
+            f"SELECT s.id FROM sessions s WHERE {where}", params)]
+        selected_messages = 0
+        for chunk in _id_chunks(selected_ids):
+            row = self._read_one(
+                f"SELECT COUNT(*) FROM messages WHERE session_id IN ({_placeholders(chunk)})",
+                chunk)
+            selected_messages += int(row[0] if row is not None else 0)
+        past_sessions = 0
+        past_messages = 0
+        for age_sql, age_params in self._window_age_arms(filters):
+            past_sessions += int(self._read_one(
+                f"SELECT COUNT(*) FROM sessions s WHERE {age_sql}", age_params)[0])
+            past_messages += int(self._read_one(
+                "SELECT COUNT(*) FROM messages WHERE session_id IN "
+                f"(SELECT s.id FROM sessions s WHERE {age_sql})", age_params)[0])
+        return {
+            "cutoff": filters.get("last_active_before", filters.get("started_before")),
+            "selected_sessions": len(selected_ids),
+            "selected_messages": selected_messages,
+            "selected_ids": selected_ids,
+            "past_window_sessions": past_sessions,
+            "past_window_messages": past_messages,
+        }
+
+    @staticmethod
+    def _window_age_arms(filters: Dict[str, Any]) -> list[Tuple[str, list]]:
+        """The age clause(s) that define "past the window" for the census, independent of
+        eligibility: activity, else start time, else nothing can be past an unbounded window."""
+        if filters.get("last_active_before") is not None:
+            return [(f"{_LAST_ACTIVE_SQL} < ?", [filters["last_active_before"]])]
+        if filters.get("started_before") is not None:
+            return [("s.started_at < ?", [filters["started_before"]])]
+        return [("0", [])]
 
     def archive_stale_sessions(self, idle_days: float, *, exclude_pinned: bool = True) -> int:
         """Archive every session untouched for ``idle_days`` (freshest of ``last_activity_at`` /
@@ -385,7 +459,12 @@ class SessionMaintenanceMixin:
         or compression lock while expired/dead holders are reclaimed and fenced.  A compression
         ancestor is deleted only together with every continuation after it (``whole_lineages``).
         ``deleted_ids`` (the owning gateway) receives the removed ids, so it can retire their
-        in-memory routes and live sessions after the commit."""
+        in-memory routes and live sessions after the commit.
+
+        ``include_auto_archived`` (card t_0ee10a96) widens the archived arm to the rows the
+        RUNTIME archived: with it, ``archived=False`` means "unarchived OR auto_archived=1",
+        while a human archive (``archived=1`` and ``auto_archived=0``) stays excluded. The
+        retention carriers pass it; nothing else does, and ``list`` semantics never use it."""
         if filters.get("include_open"):
             # Deletion is not reversible, so the ended-session guard is structural here: the
             # archive-only escape hatch (#139597) must never reach the delete path.
@@ -870,7 +949,8 @@ class SessionMaintenanceMixin:
             # once at entry. No-op when the watchdog is not armed; never raises.
             report_startup_progress(900.0, phase="state_db_auto_prune")
             result["pruned"] = pruned = self.prune_sessions(
-                older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True)
+                older_than_days=retention_days, sessions_dir=sessions_dir,
+                exclude_active_write_guards=True, include_auto_archived=True)
             # Message-level retention (card t_3e9bccd0): the SAME declared window, applied to
             # ROWS of the declared stateless sources and restricted to rows no reader can see. A
             # session that never goes idle is structurally out of prune_sessions' reach, so
