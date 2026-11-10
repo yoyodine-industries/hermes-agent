@@ -4765,11 +4765,15 @@ def release_stale_claims(
     with ``consecutive_failures`` stuck at 0, so the breaker never trips.
     ``reclaim_task`` (operator path) deliberately resets the counter instead.
 
-    A host-local worker that is still alive gets its claim *extended* instead
-    (a slow model can sit longer than the TTL inside one tool-free call, so no
-    heartbeat) — unless ``last_heartbeat_at`` is older than
-    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (wedged; ``_touch_activity``
-    keeps any genuinely active worker fresh). Safe to call often.
+    LIVENESS IS THE HEARTBEAT'S TO REPORT (card t_28747981): a claim whose
+    ``last_heartbeat_at`` is inside ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``
+    gets *extended*, whether or not a ``worker_pid`` is on the row. The pid is
+    recorded on 0.4% of fleet runs, so requiring one was requiring evidence the
+    record almost never keeps: 1,709 of 1,716 reclaims released a claim on the
+    absence of a pid nobody wrote. A live host-local pid still extends a claim
+    that carries no heartbeat at all (a worker inside one long tool-free call
+    cannot heartbeat), and that branch is corroboration — never a precondition.
+    Safe to call often.
 
     Reclaiming a live worker mid-flight produces the spawn- then-immediately-reclaim loop seen on slow
     models that spend longer than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM call (#23025):
@@ -4799,16 +4803,31 @@ def release_stale_claims(
             continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = _to_epoch(row["last_heartbeat_at"])
+        heartbeat_age = (now - hb) if hb is not None else None
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        heartbeat_stale = (heartbeat_age is not None
+                           and heartbeat_age > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS)
+        # THE HEARTBEAT IS THE LIVENESS TEST; THE PID IS CORROBORATION, NEVER A PRECONDITION
+        # (card t_28747981, ruled 2026-11-10). Measured across 47,942 fleet runs: a
+        # ``worker_pid`` is recorded on 0.4% of them, so a pid-first conjunction could only
+        # ever extend 0.4% of live claims and released the rest on absence of evidence — 138
+        # platform runs were reclaimed with a heartbeat under 300 s old, and 1,709 of 1,716
+        # reclaims consulted a pid that was never there. A recorder heartbeat inside the
+        # stale window is evidence the worker was making progress, with or without a pid.
+        heartbeat_fresh = hb is not None and not heartbeat_stale
         started_at = _row_get(row, "worker_started_at")
         # ``not_dead``, not ``alive``: an unprovable worker must HOLD its claim too. Releasing it
         # beside a process that may still be running is how a duplicate is spawned next to it
         # (#123811); the worker's own fence still lets it close the card.
-        if (host_local and row["worker_pid"] and _worker_not_dead(row["worker_pid"], started_at)
-                and not heartbeat_stale):
-            _extend_live_stale_claim(conn, row, now)
+        pid_alive = (not heartbeat_stale and host_local and bool(row["worker_pid"])
+                     and _worker_not_dead(row["worker_pid"], started_at))
+        if heartbeat_fresh or pid_alive:
+            _extend_live_stale_claim(
+                conn, row, now,
+                reason="heartbeat_fresh" if heartbeat_fresh else "pid_alive",
+                heartbeat_age=heartbeat_age,
+            )
             continue
 
         termination = _terminate_reclaimed_worker(
@@ -4885,10 +4904,17 @@ def _record_reclaim(
     return run_id
 
 
-def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> None:
-    """TTL-expired claim whose host-local worker is alive: extend instead of
-    reclaiming (``claim_extended`` event). CAS on the same expired lock so a
-    concurrent reclaimer wins cleanly."""
+def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: int, *,
+                             reason: str = "pid_alive",
+                             heartbeat_age: Optional[int] = None) -> None:
+    """TTL-expired claim with a live worker: extend instead of reclaiming
+    (``claim_extended`` event). CAS on the same expired lock so a
+    concurrent reclaimer wins cleanly.
+
+    ``reason`` records WHICH evidence held the claim — a fresh heartbeat (``heartbeat_fresh``,
+    which needs no pid on the row) or a live pid (``pid_alive``) — because
+    ``worker_pid`` is NULL on almost every run and an event that cannot say what it saw is the
+    absence-of-evidence defect one level down (card t_28747981)."""
     new_expires = now + _resolve_claim_ttl_seconds()
     with write_txn(conn):
         cur = conn.execute(
@@ -4904,12 +4930,13 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
         _append_event(
             conn, row["id"], "claim_extended",
             {
-                "reason": "pid_alive",
-                "worker_pid": int(row["worker_pid"]),
+                "reason": reason,
+                "worker_pid": _opt_int(row["worker_pid"]),
                 "claim_lock": row["claim_lock"],
                 "claim_expires_was": _to_epoch(row["claim_expires"]),
                 "claim_expires_now": new_expires,
                 "last_heartbeat_at": _to_epoch(row["last_heartbeat_at"]),
+                "heartbeat_age_s": heartbeat_age,
             },
             run_id=run_id,
         )
