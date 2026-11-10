@@ -98,7 +98,8 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "session_row_missing", "unknown",
+    "replaced", "deleted_wal", "disk", "session_row_missing",
+    "worker_receipt_timeout", "worker_receipt_deadline", "pending_receipt", "unknown",
 )
 
 
@@ -277,6 +278,14 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
     (StateDbCorruptError, "corrupt"),
 )
 _PERSISTENCE_CAUSE_BY_PHRASE = (
+    # A worker's persist RPC that missed the owner gateway's receipt budget is an OWNER-LOOP
+    # TIMEOUT, not storage contention: the owner re-applies an identical retry and the write is
+    # retained in the worker's outbox. These three match FIRST, both because their recovery text
+    # is different and so no later substring rule can ever claim them (the lock bucket below
+    # matches bare "locked"/"busy"). t_aab50f7e / t_769a3276.
+    (("worker_receipt_timeout",), "worker_receipt_timeout"),
+    (("worker_receipt_deadline",), "worker_receipt_deadline"),
+    (("pending_receipt",), "pending_receipt"),
     (("turn lease",), "turn_lease"),
     (("closed by compression",), "compression_closed"),
     (("being compressed", "compression lease"), "compression"),
@@ -299,7 +308,12 @@ def classify_persistence_error(exc_or_str) -> str:
     corruption to the FTS index (the transcript store is not damaged); "replaced" =
     main-file replacement; "deleted_wal" = a retired sidecar generation requiring
     capture inspection; "session_row_missing" = the session row was deleted under a
-    live agent (FK rejection; the flush recreates it)."""
+    live agent (FK rejection; the flush recreates it); 'worker_receipt_timeout' =
+    the persist RPC missed the owner gateway's receipt budget (a stalled owner loop, not
+    storage); 'worker_receipt_deadline' = the bounded replay window closed with the write
+    still unacknowledged (retained in the outbox, replayed on the next construction);
+    'pending_receipt' = an earlier write is still unacknowledged, so another was not
+    stacked on top of it."""
     if exc_or_str is None:
         return "unknown"
     # Lease refusals contain neither "locked" nor "busy": match by type first,
