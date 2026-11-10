@@ -100,7 +100,8 @@ from hermes_cli.update_cmd_git import (
     _discard_lockfile_churn, _ensure_non_trampoline_git, _get_origin_url, _git_is_trampoline,
     _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
     _normalize_managed_eol, _park_detached_head, _portable_git_candidates, _print_fetch_failure,
-    _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
+    _print_owed_branch_refusal, _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
+    owed_branch,
     _prune_orphan_rescue_refs, _push_synced_fork, _should_skip_upstream_prompt, _sync_fork_with_upstream,
     _sync_with_upstream_if_needed, UpstreamTargetBroken)
 from hermes_cli.update_cmd_maint import (
@@ -1369,11 +1370,21 @@ def _apply_parked_branch_guard(
         resolve_parked_branch_action,
     )
 
-    _strategy = "switch"
+    _updates_cfg: dict = {}
     with _best_effort('Could not read updates.parked_branch_strategy: %s'):
-        _strategy = _updates_config().get("parked_branch_strategy", "switch") or "switch"
+        _updates_cfg = _updates_config() or {}
+    _strategy = _updates_cfg.get("parked_branch_strategy", "switch") or "switch"
     action, _action_reason = resolve_parked_branch_action(
         switch_safe, switch_block_reason, _strategy, switch_branch)
+    if action == PARKED_ACTION_KEPT and not switch_branch and owed_branch(current_branch, _updates_cfg):
+        # The override set is owed work, not a badge: moving the checkout to the update target
+        # leaves every fork commit on a branch nothing runs (2026-11-06, card t_391ae86c), so
+        # refuse and name exactly which commits are still unapplied. `--switch-branch` is an
+        # operator asking for the switch explicitly; it is not overridden.
+        _print_owed_branch_refusal(git_cmd, _m().PROJECT_ROOT, current_branch, branch)
+        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        _record_stop("parked_branch_owed")
+        sys.exit(1)
     if action == PARKED_ACTION_BLOCKED:
         _m()._print_parked_branch_skip_warning(
             git_cmd, _m().PROJECT_ROOT, current_branch, branch, switch_block_reason)

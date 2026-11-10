@@ -230,6 +230,69 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
     return True, f"unmerged:{len(unmerged)}" if unmerged else ""
 
 
+#: Branches whose commits the running fleet depends on (the fork's override set). An update may
+#: bring them forward -- in place, or by rebasing them onto the new tip -- but it may never leave
+#: one behind while the checkout moves to the update target: on 2026-11-06 that dropped the 289
+#: fork commits every lane imports and nothing refused the end state (card t_391ae86c). Override
+#: with ``updates.owed_branches``; an empty list opts out.
+DEFAULT_OWED_BRANCHES = ("overrides/live",)
+
+#: Where the full unapplied-commit list of an owed branch is written (the printed form is capped).
+UNAPPLIED_COMMITS_FILE = "update-unapplied-commits.txt"
+
+
+def owed_branch(branch: str, updates_cfg: dict | None) -> bool:
+    """True when *branch* is one whose commits an update owes re-applying, never abandoning.
+
+    An unreadable or malformed ``owed_branches`` keeps the DEFAULT (the override set), so a config
+    failure can only ever add protection, never silently drop it; an explicit empty list is a
+    deliberate opt-out and is honoured.
+    """
+    owed = (updates_cfg or {}).get("owed_branches", DEFAULT_OWED_BRANCHES)
+    if not isinstance(owed, (list, tuple)):
+        owed = DEFAULT_OWED_BRANCHES
+    return branch in {str(name) for name in owed}
+
+
+def unapplied_commits(git_cmd: list[str], cwd: Path, branch: str, target: str) -> list[str]:
+    """``<short-sha> <subject>`` for every commit on *branch* that ``origin/<target>`` lacks.
+
+    Newest first. Never raises: an unresolvable ref answers ``[]`` (the caller's refusal names the
+    branch either way, and a count it could not measure is reported as unknown, not as zero).
+    """
+    out = _git_stdout(git_cmd, ["log", "--no-decorate", "--format=%h %s", f"origin/{target}..{branch}", "--"], cwd)
+    return [line.strip() for line in (out or "").splitlines() if line.strip()]
+
+
+def unapplied_commits_path() -> Path:
+    """Hermes home path holding the full unapplied list of the last owed-branch refusal."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / UNAPPLIED_COMMITS_FILE
+
+
+def report_unapplied_commits(git_cmd: list[str], cwd: Path, branch: str, target: str) -> list[str]:
+    """Print (capped) and persist the unapplied commits of an owed *branch*; return the full list."""
+    commits = unapplied_commits(git_cmd, cwd, branch, target)
+    if not commits:
+        return commits
+    path = unapplied_commits_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(f"{line}\n" for line in commits), encoding="utf-8"
+        )
+        where = str(path)
+    except OSError as exc:
+        where = f"(could not be written: {exc})"
+    for line in commits[:20]:
+        print(f"    {line}")
+    if len(commits) > 20:
+        print(f"    ... {len(commits) - 20} more")
+    print(f"  All {len(commits)} unapplied commit(s) listed in {where}")
+    return commits
+
+
 PARKED_ACTION_SWITCH_BACK = "switch_back"
 PARKED_ACTION_IN_PLACE = "in_place"
 PARKED_ACTION_KEPT = "kept"
@@ -309,6 +372,32 @@ def _print_parked_branch_kept_notice(current_branch: str, target_branch: str, un
         f"  Switching to {target_branch} so the update can proceed — your "
         f"commit(s) are safe on '{current_branch}'.\n\n"
         f"  To pick the work back up later:\n    git checkout {current_branch}\n{_BAR}"
+    )
+
+
+def _print_owed_branch_refusal(git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str) -> None:
+    """LOUD refusal: this branch's commits are owed, so the update must not leave them behind.
+
+    Names the branch, the number of commits still unapplied against ``origin/<target>``, the list
+    itself (capped; the full list is persisted), and both sanctioned remedies. Silence here is the
+    defect this exists for: the 2026-11-06 run switched the fleet onto ``main`` and printed a
+    success tail while 289 fork commits sat on a branch nothing was running.
+    """
+    print(f"\n{_BAR}\n✗ CODE UPDATE REFUSED — checkout is parked on the OWED branch '{current_branch}'")
+    print(
+        f"  '{current_branch}' carries commits that are not in origin/{target_branch}, and this "
+        f"install\n  runs them. Switching to {target_branch} would leave that work unapplied, so the "
+        f"checkout stays\n  where it is and nothing was updated."
+    )
+    report_unapplied_commits(git_cmd, cwd, current_branch, target_branch)
+    print(
+        f"\n  Re-apply the owed set, then re-run the update:\n"
+        f"    git -C {cwd} rebase origin/{target_branch} {current_branch}   # bring it onto the new tip\n"
+        f"    hermes update\n"
+        f"  Or maintain it in place (merge origin/{target_branch} INTO '{current_branch}', no switch):\n"
+        f"    updates.parked_branch_strategy: update_in_place   # in config.yaml\n"
+        f"  Switching anyway abandons this work and is an explicit operator decision:\n"
+        f"    hermes update --switch-branch\n{_BAR}"
     )
 
 
