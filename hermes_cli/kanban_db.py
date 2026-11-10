@@ -4842,6 +4842,9 @@ def release_stale_claims(
                 conn, row["id"], termination,
                 error=error,
                 payload={
+                    "verdict": "reclaimed",
+                    "gate": "heartbeat_stale" if heartbeat_stale else "ttl_expired",
+                    "reason": "heartbeat_stale" if heartbeat_stale else "worker_dead",
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
                     "claim_expires": _to_epoch(row["claim_expires"]),
@@ -4904,6 +4907,12 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
         _append_event(
             conn, row["id"], "claim_extended",
             {
+                # The KEEP verdict for a claim the TTL expired on: the worker is alive, so the
+                # claim is renewed instead of released. Same ``verdict`` vocabulary as
+                # ``reclaim_deferred``/``reclaimed`` (card t_48194194) so one audit query reads
+                # every examination, whatever kind it was filed under.
+                "verdict": "claim_kept",
+                "gate": "pid_liveness",
                 "reason": "pid_alive",
                 "worker_pid": int(row["worker_pid"]),
                 "claim_lock": row["claim_lock"],
@@ -5353,6 +5362,45 @@ DISOWNED_RUN_REASONS = frozenset({
     "ttl_expired_worker_alive",
     "heartbeat_stale_worker_alive",
 })
+
+
+# ---------------------------------------------------------------------------
+# Limit kinds: WHICH limiter terminated a run (card t_48194194)
+# ---------------------------------------------------------------------------
+# ``task_runs.error`` names two DIFFERENT limiters, and a ledger that adds them together is
+# counting one population as another: the runtime reaper's ``elapsed Ns > limit Ns`` (a wall-clock
+# cap stopping a worker) and the worker's own ``Iteration budget exhausted`` (its turn budget ran
+# out; no runtime cap took part). Prose stays, because it is what an operator reads; the prefixes
+# below are the documented contract that maps that prose to a stable kind, so no reader has to
+# invent its own LIKE pattern -- and so the two can never be summed by accident again.
+#
+# Every writer that terminates a run on a limit ALSO stamps ``metadata['limit_kind']``, and a
+# runtime cap additionally writes the applied ``max_runtime_seconds`` onto the run row: a row a
+# limit killed must carry the limit that killed it.
+LIMIT_KIND_RUNTIME_CAP = "runtime_cap"
+"""``kanban_db_dispatch.enforce_max_runtime``: the card's ``max_runtime_seconds`` elapsed."""
+
+LIMIT_KIND_ITERATION_BUDGET = "iteration_budget"
+"""``agent.turn_finalizer``: the worker exhausted ``max_iterations``; no runtime cap involved."""
+
+LIMIT_ERROR_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("elapsed ", LIMIT_KIND_RUNTIME_CAP),
+    ("Iteration budget", LIMIT_KIND_ITERATION_BUDGET),
+)
+
+
+def limit_kind_for_error(error: Optional[str]) -> Optional[str]:
+    """Which limiter ``error`` names, keyed on :data:`LIMIT_ERROR_PREFIXES`; ``None`` if neither.
+
+    Prefix-anchored on purpose. A ``LIKE '%elapsed%'`` probe would re-conflate the populations the
+    moment a worker quoted the other limiter in its own output, which is exactly the artefact class
+    (a count that travels without its predicate) this mapping exists to end.
+    """
+    text = (error or "").lstrip()
+    for prefix, kind in LIMIT_ERROR_PREFIXES:
+        if text.startswith(prefix):
+            return kind
+    return None
 
 
 def _run_was_disowned(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> bool:

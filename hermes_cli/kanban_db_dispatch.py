@@ -2308,6 +2308,7 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
+    gate: str = "worker_liveness",
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
@@ -2315,6 +2316,10 @@ def _defer_reclaim_for_live_worker(
     stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
     The next tick retries the kill; not spawning a duplicate is what lets the
     throttled worker finally die.
+
+    The row is a KEEP VERDICT, so it says so in the shared vocabulary (card
+    t_48194194): ``verdict`` names the side of the ledger, ``gate`` names which
+    liveness gate decided, ``reason`` names why that gate kept the claim.
     """
     grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
     with _kb.write_txn(conn):
@@ -2328,7 +2333,13 @@ def _defer_reclaim_for_live_worker(
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
-        payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
+        payload = {
+            "verdict": "reclaim_deferred",
+            "gate": gate,
+            "reason": reason,
+            "claim_lock": claim_lock,
+            "claim_expires_now": grace,
+        }
         payload.update(termination)
         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
@@ -2371,6 +2382,40 @@ def heartbeat_worker(
     return True
 
 
+def _record_claim_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    gate: str,
+    reason: str,
+    extra: Optional[dict] = None,
+) -> None:
+    """Record ONE examination verdict for a claim WITHOUT moving the claim.
+
+    Card ``t_48194194``: the kept side of the reaper's ledger already existed
+    (``reclaim_deferred``), but a claim that was examined and then silently skipped wrote nothing,
+    so "the reaper never looked" and "the reaper looked and could not act" were the same event --
+    nothing. Every reclaim sweep now writes a verdict for each claim it actually examines:
+    ``reclaimed`` (booked by the reclaim path with its own event kind) or a hold row written here
+    (``reclaim_deferred`` / ``reclaim_refused``), carrying ``verdict``, ``gate`` and ``reason`` so
+    the balance is countable per gate instead of per prose string.
+
+    Safe under an open outer transaction (savepoint) and on its own (own txn).
+    """
+    payload = {
+        "verdict": kind,
+        "gate": gate,
+        "reason": reason,
+        "liveness_contract": globals().get("LIVENESS_CONTRACT_ID"),
+    }
+    if extra:
+        payload.update(extra)
+    with _kb.write_txn(conn, allow_nested=True):
+        run_id = _kb._current_run_id(conn, task_id)
+        _kb._append_event(conn, task_id, kind, payload, run_id=run_id)
+
+
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -2405,8 +2450,6 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     ).fetchall()
     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
-            continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
@@ -2415,6 +2458,17 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         elapsed = now - (_kb._to_epoch(row["active_started_at"]) or now)  # unreadable clock: never kill
         limit = int(row["max_runtime_seconds"])
         if elapsed < limit:
+            continue
+        # An over-budget row whose attempt receipt is ambiguous is this sweep's business (it is the
+        # one limiter about to fire), so its hold is a verdict rather than a silent skip.
+        if owner_reclaim_blocked(conn, row["id"]):
+            _record_claim_verdict(
+                conn, row["id"], kind="reclaim_deferred", gate="owner_recovery",
+                reason="owner_recovery_hold",
+                extra={"worker_pid": _kb._opt_int(row["worker_pid"]),
+                       "elapsed_seconds": int(elapsed), "limit_seconds": limit,
+                       "limit_kind": _kb.LIMIT_KIND_RUNTIME_CAP},
+            )
             continue
 
         pid = int(row["worker_pid"])
@@ -2426,12 +2480,27 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             # may still be running (no release beside it). Hold the claim; the next tick re-reads.
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but its process "
                              "identity cannot be read; held, not signalled", tid, pid)
+            _record_claim_verdict(
+                conn, tid, kind="reclaim_deferred", gate="pid_liveness",
+                reason="held_unverifiable",
+                extra={"worker_pid": pid, "liveness": verdict,
+                       "elapsed_seconds": int(elapsed), "limit_seconds": limit,
+                       "limit_kind": _kb.LIMIT_KIND_RUNTIME_CAP},
+            )
             continue
         if started_at == UNVERIFIED_WORKER_FINGERPRINT and verdict != WORKER_DEAD:
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
             # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
                              "identity; not signalled", tid, pid)
+            _record_claim_verdict(
+                conn, tid, kind="reclaim_deferred", gate="pid_liveness",
+                reason="held_unverifiable",
+                extra={"worker_pid": pid, "liveness": verdict,
+                       "fingerprint": "unverified",
+                       "elapsed_seconds": int(elapsed), "limit_seconds": limit,
+                       "limit_kind": _kb.LIMIT_KIND_RUNTIME_CAP},
+            )
             continue
         # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
         # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
@@ -2452,6 +2521,12 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             # Again under the write lock, after the kill wait: an interpreter that bound
             # meanwhile is invisible to the pid/claim CAS below. Host-local by the filter above.
             if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
+                _record_claim_verdict(
+                    conn, tid, kind="reclaim_deferred", gate="owner_recovery",
+                    reason="owner_recovery_hold",
+                    extra={"worker_pid": pid, "elapsed_seconds": int(elapsed),
+                           "limit_seconds": limit, "limit_kind": _kb.LIMIT_KIND_RUNTIME_CAP},
+                )
                 continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -2463,7 +2538,22 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 (retry_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
+                # A ROW A LIMIT KILLED MUST CARRY THE LIMIT (card t_48194194). The run row is the
+                # population every clamp query counts, and it was inserted at claim time -- before
+                # a defaulted cap was known and before a cap could be edited mid-run -- so the cap
+                # is written here from the value this sweep actually applied.
+                run_id = _kb._current_run_id(conn, tid)
+                if run_id is not None:
+                    conn.execute(
+                        "UPDATE task_runs SET max_runtime_seconds = COALESCE(max_runtime_seconds, ?) "
+                        "WHERE id = ?",
+                        (limit, run_id),
+                    )
                 payload = {
+                    "verdict": "reclaimed",
+                    "gate": "elapsed_over_limit",
+                    "reason": "elapsed_over_limit",
+                    "limit_kind": _kb.LIMIT_KIND_RUNTIME_CAP,
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
@@ -2476,6 +2566,15 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 )
                 _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
                 timed_out.append(tid)
+            else:
+                # Decided to reclaim, then lost the claim CAS: the worker (or another reclaim) moved
+                # under us. That is a KEEP, and it is written, so the balance still closes.
+                _record_claim_verdict(
+                    conn, tid, kind="reclaim_deferred", gate="claim_cas",
+                    reason="cas_missed",
+                    extra={"worker_pid": pid, "elapsed_seconds": int(elapsed),
+                           "limit_seconds": limit, "limit_kind": _kb.LIMIT_KIND_RUNTIME_CAP},
+                )
         # Outside the write_txn above because ``_record_task_failure`` opens its
         # own. If the breaker trips this flips the task to ``blocked`` and emits
         # ``gave_up`` on top of the ``timed_out`` already emitted.
@@ -2554,6 +2653,7 @@ def detect_stale_running(
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
+                gate="pid_liveness",
             )
             continue
 
@@ -2574,6 +2674,9 @@ def detect_stale_running(
                 continue
 
             payload = {
+                "verdict": "reclaimed",
+                "gate": "heartbeat_stale",
+                "reason": "heartbeat_stale",
                 "elapsed_seconds": int(elapsed),
                 "last_heartbeat_at": _kb._opt_int(last_hb),
                 "heartbeat_age_seconds": _kb._opt_int(hb_age),
@@ -2639,6 +2742,8 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 _kb._append_event(
                     conn, tid, "reclaim_deferred",
                     {
+                        "verdict": "reclaim_deferred",
+                        "gate": "pid_liveness",
                         "reason": "orphaned_running_worker_alive",
                         "liveness": verdict,
                         "claim_lock": row["claim_lock"],
@@ -2662,6 +2767,8 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             if cur.rowcount != 1:
                 continue
             payload = {
+                "verdict": "reclaimed",
+                "gate": "orphaned_claim",
                 "reason": "orphaned_running",
                 "claim_lock": row["claim_lock"],
                 "claim_expires": _kb._to_epoch(row["claim_expires"]),
@@ -3026,6 +3133,15 @@ class _CrashSweep:
     # The guard's whole decision for this sweep (the R4 count verdict and the R6 held rows), or
     # ``None`` when the sweep was never assessed.
     assessment: Optional[_crash_guard.SweepAssessment] = None
+    # VERDICT LEDGER (card t_48194194). ``candidates`` counts the claims this sweep actually
+    # examined (a healthy, provably-live worker is NOT examined -- it is not a reclaim candidate and
+    # writing a row for it every tick would be an event storm). ``verdicts`` is one entry per
+    # candidate that this tick COMMITTED a verdict for: ``(task_id, kind, gate, reason)``. The
+    # invariant a test asserts is ``len(verdicts) == candidates`` -- no claim is examined without a
+    # verdict. A guard refusal writes NOTHING (R4 refuses the tick in full), so it reports
+    # ``candidates`` with no verdicts and the caller must read ``assessment.refusal_needed`` first.
+    candidates: int = 0
+    verdicts: list[tuple[str, str, str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -3073,13 +3189,19 @@ def _hold_claim_in_txn(
     event_kind: str,
     reason: str,
     extra: Optional[dict] = None,
-) -> None:
+    gate: Optional[str] = None,
+) -> bool:
     """Extend a running claim's expiry and record WHY it was not released.
 
     ASSUMES an open write txn (caller holds one). No release, no failure accounting, no
     re-spawn: the row stays ``running`` and is re-read next tick. Mirrors
     ``_defer_reclaim_for_live_worker``'s vocabulary (``reclaim_deferred``) and adds
     ``reclaim_refused`` for the stale-contract case; neither counts a failure.
+
+    A held claim is a VERDICT (card t_48194194), so the row carries one: ``verdict`` names the
+    side of the ledger (``reclaim_deferred`` or ``reclaim_refused``), ``gate`` names the gate that
+    decided, ``reason`` names why. A claim that is examined and then silently skipped is
+    indistinguishable from a claim the reaper never looked at, which is why the hold writes.
     """
     grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
     cur = conn.execute(
@@ -3088,11 +3210,13 @@ def _hold_claim_in_txn(
         (grace, task_id, claim_lock),
     )
     if cur.rowcount != 1:
-        return
+        return False
     run_id = _kb._current_run_id(conn, task_id)
     if run_id is not None:
         conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
     payload = {
+        "verdict": event_kind,
+        "gate": gate or reason,
         "reason": reason,
         "claim_lock": claim_lock,
         "claim_expires_now": grace,
@@ -3101,6 +3225,7 @@ def _hold_claim_in_txn(
     if extra:
         payload.update(extra)
     _kb._append_event(conn, task_id, event_kind, payload, run_id=run_id)
+    return True
 
 
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
@@ -3162,15 +3287,39 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             started_at = _kb._to_epoch(_kb._row_get(row, "started_at"))
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
-            if _worker_not_dead(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
-                # Alive, or unprovable. Only PROOF of death releases a claim or spawns beside it.
+            pid = int(row["worker_pid"])
+            liveness = _worker_liveness(pid, _kb._row_get(row, "worker_started_at"))
+            if liveness == WORKER_ALIVE:
+                # A provably-live worker is the healthy steady state, not a claim to judge: counting
+                # it (or writing a verdict for it every tick) would be an event storm, so it leaves
+                # before the candidate count. EVERY branch below this line writes one verdict.
+                continue
+            sweep.candidates += 1
+            if liveness == WORKER_UNKNOWN:
+                # Alive-or-unprovable is no longer a silent skip (card t_48194194): an identity the
+                # host cannot read is an examination that reached no verdict, and that used to look
+                # exactly like "the reaper never looked".
+                withheld.append((
+                    "reclaim_deferred", "held_unverifiable", row["id"], row["claim_lock"],
+                    {
+                        "worker_pid": pid,
+                        "liveness": liveness,
+                        "gate": "pid_liveness",
+                    },
+                ))
                 continue
             # An ambiguous receipt holds the card while the attempt may still run; once nothing
             # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
             if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
+                withheld.append((
+                    "reclaim_deferred", "owner_recovery_hold", row["id"], row["claim_lock"],
+                    {
+                        "worker_pid": pid,
+                        "gate": "owner_recovery",
+                    },
+                ))
                 continue
 
-            pid = int(row["worker_pid"])
             # R1: the running module must declare a current contract before ANY release.
             if not contract_ok:
                 withheld.append((
@@ -3179,6 +3328,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                         "worker_pid": pid,
                         "declared_contract": globals().get("LIVENESS_CONTRACT_ID"),
                         "required_contract": REQUIRED_LIVENESS_CONTRACT_ID,
+                        "gate": "liveness_contract",
                     },
                 ))
                 continue
@@ -3192,6 +3342,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                         "worker_pid": pid,
                         "heartbeat_age_seconds": hb_age,
                         "veto_seconds": veto_seconds,
+                        "gate": "heartbeat_veto",
                     },
                 ))
                 continue
@@ -3230,15 +3381,36 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             # holds, not one booking.
             return sweep
         for event_kind, reason, task_id, claim_lock, extra in withheld:
-            _hold_claim_in_txn(
+            wrote = _hold_claim_in_txn(
                 conn, task_id, claim_lock, now,
                 event_kind=event_kind, reason=reason, extra=extra,
             )
+            if wrote:
+                sweep.verdicts.append(
+                    (task_id, event_kind, str((extra or {}).get("gate") or reason), reason)
+                )
+            else:
+                # The hold lost its CAS (the claim moved under us): still a verdict, and still
+                # written, so ``len(verdicts) == candidates`` keeps meaning what it says.
+                _record_claim_verdict(
+                    conn, task_id, kind="reclaim_deferred", gate="claim_cas",
+                    reason="cas_missed", extra=extra,
+                )
+                sweep.verdicts.append((task_id, "reclaim_deferred", "claim_cas", "cas_missed"))
         held = frozenset(assessment.held)
-        # PASS 2 -- book the survivors. A held row gets NO write: its claim stays, and the loud
-        # path has already reported the shape divergence.
+        # PASS 2 -- book the survivors. A held row's claim STAYS (the loud path has already
+        # reported the shape divergence), but the hold is a VERDICT, not a skip: R6 refusing to
+        # judge a fingerprint used to be indistinguishable from the reaper never looking.
         for row, pid, dead, retry_status in pending:
             if row["id"] in held:
+                _record_claim_verdict(
+                    conn, row["id"], kind="reclaim_deferred", gate="crash_guard",
+                    reason="identity_shape_incomparable",
+                    extra={"worker_pid": pid, "exit_kind": dead.kind},
+                )
+                sweep.verdicts.append(
+                    (row["id"], "reclaim_deferred", "crash_guard", "identity_shape_incomparable")
+                )
                 continue
             dead.event_payload["retry_status"] = retry_status
             # The attempt is RECORDED, not discarded: an exit code alone says
@@ -3258,6 +3430,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if budget is not None:
                 dead.event_payload["limit_seconds"] = int(budget)
             dead.event_payload.setdefault("exit_kind", dead.kind)
+            # The TOOK side of the verdict ledger (card t_48194194): the reclaim names the gate that
+            # fired (proof of death is the only gate that releases a claim here) and the reason it
+            # fired. ``verdict`` is the shared vocabulary the kept side already uses, so one audit
+            # query reads both sides without inferring a keep from a total going down.
+            dead.event_payload.setdefault("verdict", "reclaimed")
+            dead.event_payload.setdefault("gate", "dead_pid")
+            dead.event_payload.setdefault("reason", dead.kind)
             dead.event_payload["liveness_contract"] = globals().get("LIVENESS_CONTRACT_ID")
             error_text = (
                 f"{dead.error_text} "
@@ -3271,6 +3450,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
+                # Decided, then lost the claim CAS. A keep, and written, so the balance still closes.
+                _record_claim_verdict(
+                    conn, row["id"], kind="reclaim_deferred", gate="claim_cas",
+                    reason="cas_missed", extra={"worker_pid": pid, "exit_kind": dead.kind},
+                )
+                sweep.verdicts.append((row["id"], "reclaim_deferred", "claim_cas", "cas_missed"))
                 continue
             run_id = _kb._end_run(
                 conn, row["id"],
@@ -3279,6 +3464,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+            sweep.verdicts.append(
+                (row["id"], "reclaimed", "dead_pid", str(dead.event_payload.get("reason")))
+            )
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -7316,10 +7504,21 @@ def _stamp_default_max_runtime_seconds(
         )
         if cur.rowcount != 1:
             return None
+        # The RUN row carries the cap it is working against (card t_48194194). The claim inserted
+        # that row BEFORE this default existed, so without this write the cap lives only on
+        # ``tasks``: every defaulted cap reads as NULL on ``task_runs``, and the ledger query
+        # ``dur >= max_runtime_seconds`` silently drops half the population it claims to describe.
+        run_id = _kb._current_run_id(conn, task_id)
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET max_runtime_seconds = ? "
+                "WHERE id = ? AND max_runtime_seconds IS NULL",
+                (int(limit), run_id),
+            )
         _kb._append_event(conn, task_id, "runtime_cap_defaulted", {
             "max_runtime_seconds": int(limit),
             "source": "kanban.default_max_runtime_seconds",
-        })
+        }, run_id=run_id)
     return int(limit)
 
 
