@@ -11,7 +11,8 @@ latest). It crosses the restart: the next gateway reads it from the same store. 
 came due during the hold (and was not already expired when it began) counts its grace from the
 hold's last tick instead of its due time, so it fires once when dispatch resumes; a hold whose
 gateway never came back within the grace still retires it (#93526: no stale reminders after
-downtime).
+downtime). Once dispatch resumes, the stamp is retired (``note_dispatching``): on disk it means a
+hold is running, not that the ticker stopped.
 """
 
 from __future__ import annotations
@@ -30,6 +31,9 @@ MAX_EXTENSION_SECONDS = 1800.0
 # This process's ongoing holds: cron dir -> first held tick. Kept in memory so a failed write
 # mid-drain cannot reset ``since``; cleared when the ticker dispatches again (note_dispatching).
 _hold_since: dict[str, float] = {}
+# Stores seen dispatching while a stamp was on disk -> that stamp's ``last``. The next dispatching
+# tick retires the stamp only if nobody re-stamped it meanwhile (a live hold keeps ticking).
+_dispatching_seen: dict[str, float] = {}
 
 
 def note_held(now: Optional[float] = None) -> None:
@@ -51,10 +55,32 @@ def note_held(now: Optional[float] = None) -> None:
 
 
 def note_dispatching() -> None:
-    """The ticker dispatches the active cron store again: this process's hold on it has ended."""
+    """The ticker dispatches the active cron store again: the hold on it has ended.
+
+    The stamp must not outlive the hold: a frozen ``{"since": X, "last": X}`` file is what a
+    reader sees when dispatch has stopped ticking, and leaving one behind after the drain ends
+    makes "held then resumed" indistinguishable from "still held" without reading this source.
+
+    It is cleared on the SECOND dispatching tick, never the first: the tick that resumes dispatch
+    still runs the due scan, and ``grace_starts_at`` must read the stamp of the hold a one-shot
+    came due in (the cross-restart case this module exists for). A store is ticked by one gateway
+    at a time, so a stamp still on disk at the second dispatching tick belongs to a hold that is
+    over -- this process's own, or a previous gateway's that never resumed.
+    """
     from cron.jobs import _current_cron_store
 
-    _hold_since.pop(str(_current_cron_store().cron_dir), None)
+    cron_dir = Path(_current_cron_store().cron_dir)
+    key = str(cron_dir)
+    _hold_since.pop(key, None)
+    held = read(cron_dir)
+    seen_last = _dispatching_seen.pop(key, None)
+    if held is None:
+        return
+    if seen_last is not None and held["last"] == seen_last:
+        with contextlib.suppress(OSError):  # an unwritable store is reported by the tick itself
+            (cron_dir / _FILE).unlink()
+        return
+    _dispatching_seen[key] = held["last"]
 
 
 def note_held_profiles(profiles) -> None:
