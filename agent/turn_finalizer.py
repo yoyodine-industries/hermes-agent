@@ -73,7 +73,16 @@ def _record_kanban_budget_exhausted(
                 outcome="timed_out",
                 release_claim=True,
                 end_run=True,
-                event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                event_payload_extra={
+                    "budget_used": api_call_count,
+                    "budget_max": max_iterations,
+                    # WHICH limiter this is (card t_48194194). The iteration budget is not the
+                    # runtime cap: summing the two populations as "clamps" is how a 7,000-8,000s
+                    # band counted 55 budget deaths as runtime kills. The field, not the prose, is
+                    # what a reader groups on; ``kanban_db.limit_kind_for_error`` maps the prose.
+                    "limit_kind": "iteration_budget",
+                },
+                metadata_extra={"limit_kind": "iteration_budget"},
             )
         finally:
             with suppress(Exception):
