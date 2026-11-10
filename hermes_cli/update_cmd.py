@@ -100,7 +100,8 @@ from hermes_cli.update_cmd_git import (
     _discard_lockfile_churn, _ensure_non_trampoline_git, _get_origin_url, _git_is_trampoline,
     _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
     _normalize_managed_eol, _park_detached_head, _portable_git_candidates, _print_fetch_failure,
-    _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
+    _print_owed_branch_refusal, _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
+    owed_branch,
     _prune_orphan_rescue_refs, _push_synced_fork, _should_skip_upstream_prompt, _sync_fork_with_upstream,
     _sync_with_upstream_if_needed, UpstreamTargetBroken)
 from hermes_cli.update_cmd_maint import (
@@ -255,7 +256,57 @@ def _record_pre_update_backup_outcome(args, snapshot_id) -> None:
 
 def _record_snapshot_stage(args, snapshot_id) -> None:
     skipped = not snapshot_id and _resolve_pre_update_backup_mode(args) == "off"
-    _completion_receipt.record_stage("snapshot", "success" if snapshot_id else "skipped" if skipped else "failed")
+    _completion_receipt.record_stage(
+        "snapshot", "success" if snapshot_id else "skipped" if skipped else "failed",
+        **({"snapshot_id": str(snapshot_id)} if snapshot_id else {}))
+
+
+def _resumable_stage() -> dict:
+    """The stage the previous run started and never finished (``{}`` when there is none).
+
+    Read AFTER ``_begin_update_receipt_and_plan``: opening the receipt reconciles the dead run and
+    keeps its unfinished stage, so this is the one place a resume decision may come from.
+    """
+    with suppress(Exception):
+        from hermes_cli.update_receipt import resumable_stage
+        return resumable_stage() or {}
+    return {}
+
+
+def _resume_snapshot_id() -> str | None:
+    """The snapshot the interrupted run captured, so its work is reused instead of redone."""
+    stage = _resumable_stage()
+    snapshot_id = stage.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+        return None
+    if stage.get("name") not in (None, "snapshot", "apply"):
+        return None
+    return snapshot_id.strip()
+
+
+def _resume_interrupted_apply(completion_request: dict | None) -> dict | None:
+    """The previous run died inside ``apply`` and the tree ALREADY sits at its target commit.
+
+    Returns ``{"target_sha": <recorded>, "head": <current>}`` when the apply must be COMPLETED
+    rather than restarted, else ``None``. Re-running the pull would be a no-op at best and a
+    second, unrecorded move at worst: the receipt's own start mark names the commit the killed
+    run was moving to, so a checkout already there has nothing left to apply.
+    """
+    stage = _resumable_stage()
+    if stage.get("name") != "apply":
+        return None
+    target = str(stage.get("target_sha") or "").strip().lower()
+    head = (_current_checkout_sha() or "").strip().lower()
+    if not target or not head:
+        return None
+    if not (head.startswith(target) or target.startswith(head)):
+        return None
+    if completion_request is not None:
+        # Pin the completion to the code that is already on disk: the resume must not be
+        # re-derived from a later fetch and start a second move.
+        completion_request["expected_sha"] = head
+    return {"target_sha": target, "head": head}
+
 
 
 
@@ -1369,11 +1420,21 @@ def _apply_parked_branch_guard(
         resolve_parked_branch_action,
     )
 
-    _strategy = "switch"
+    _updates_cfg: dict = {}
     with _best_effort('Could not read updates.parked_branch_strategy: %s'):
-        _strategy = _updates_config().get("parked_branch_strategy", "switch") or "switch"
+        _updates_cfg = _updates_config() or {}
+    _strategy = _updates_cfg.get("parked_branch_strategy", "switch") or "switch"
     action, _action_reason = resolve_parked_branch_action(
         switch_safe, switch_block_reason, _strategy, switch_branch)
+    if action == PARKED_ACTION_KEPT and not switch_branch and owed_branch(current_branch, _updates_cfg):
+        # The override set is owed work, not a badge: moving the checkout to the update target
+        # leaves every fork commit on a branch nothing runs (2026-11-06, card t_391ae86c), so
+        # refuse and name exactly which commits are still unapplied. `--switch-branch` is an
+        # operator asking for the switch explicitly; it is not overridden.
+        _print_owed_branch_refusal(git_cmd, _m().PROJECT_ROOT, current_branch, branch)
+        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        _record_stop("parked_branch_owed")
+        sys.exit(1)
     if action == PARKED_ACTION_BLOCKED:
         _m()._print_parked_branch_skip_warning(
             git_cmd, _m().PROJECT_ROOT, current_branch, branch, switch_block_reason)
@@ -1873,7 +1934,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Backup before any git/file mutation; the snapshot id (None if disabled/failed) feeds
     # the post-update cron-jobs safety net. A deliberate opt-out is recorded as a skip with its
     # reason, not as a failed step (see _record_pre_update_backup_outcome).
-    pre_update_snapshot_id = _m()._run_pre_update_backup(args)
+    # A run killed inside the backup leaves its start mark; one killed afterwards leaves the id as
+    # a fact. Either way the snapshot is work already paid for, so it is reused, not re-taken.
+    _completion_receipt.begin_stage("snapshot", mode=_resolve_pre_update_backup_mode(args))
+    resumed_snapshot_id = _resume_snapshot_id()
+    if resumed_snapshot_id:
+        print(f"  ✓ Reusing the pre-update snapshot the interrupted run captured ({resumed_snapshot_id})")
+        _record_update_step("pre_update_backup_resumed", True, f"snapshot={resumed_snapshot_id}")
+    pre_update_snapshot_id = resumed_snapshot_id or _m()._run_pre_update_backup(args)
+    if pre_update_snapshot_id and not resumed_snapshot_id:
+        # Durable the moment it exists: the id must survive a kill that lands on the next stage.
+        _completion_receipt.record_fact("pre_update_snapshot_id", str(pre_update_snapshot_id))
+        _completion_receipt.persist_running_receipt()
     _record_pre_update_backup_outcome(args, pre_update_snapshot_id)
     _record_snapshot_stage(args, pre_update_snapshot_id)
     from hermes_cli.update_stage import publish_stage
@@ -1996,6 +2068,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("→ Updates available (commit count unknown on this shallow checkout)")
 
         print("→ Pulling updates...")
+        # The tree move is the one stage that must never be repeated blindly: mark its START with
+        # the commit it is moving to, so a run killed mid-apply is COMPLETED, not re-fired.
+        _completion_receipt.begin_stage(
+            "apply", mode=completion_request.get("apply_mode", "git") if completion_request else "git",
+            target_sha=str(completion_request.get("expected_sha") or release_sha or "") if completion_request
+            else str(release_sha or ""))
+        resumed_apply = _resume_interrupted_apply(completion_request)
+        if resumed_apply is not None:
+            print(f"→ The previous update was interrupted after the tree moved to "
+                  f"{resumed_apply['head'][:10]}; completing it instead of re-applying.")
+            _record_update_step("apply_resumed", True, f"target={resumed_apply['head'][:12]}")
+            _apply_pulled_update(
+                git_cmd, branch, None, _plan,
+                _windows_gateway_resume=_windows_gateway_resume, completion_request=completion_request)
+            return
         movement_baseline = _pull_updates(
             git_cmd, branch, _plan.auto_stash_ref, prompt_for_restore=_plan.prompt_for_restore,
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
