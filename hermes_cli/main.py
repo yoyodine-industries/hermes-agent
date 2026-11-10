@@ -2416,6 +2416,21 @@ def cmd_update(args):
         _finalize_update_receipt(1, f"{type(_update_exc).__name__}: {_update_exc}")
         raise
     else:
+        # The end-state guard: a stage log is not evidence of the tree handed back. An update
+        # that switched the checkout off the branch its install stamp names and never rebuilt it
+        # must fail HERE, loudly, instead of feeding the next launch a mismatch it cannot repair.
+        from hermes_cli.update_end_state import checkout_off_install_stamp
+
+        off_stamp = checkout_off_install_stamp(PROJECT_ROOT)
+        if off_stamp:
+            print()
+            print(off_stamp)
+            _finalize_update_receipt(1, "install_stamp_mismatch")
+            if gateway_mode:
+                from hermes_cli.update_cmd_fleet import _write_gateway_update_exit_code
+                _write_gateway_update_exit_code(False)
+            raise SystemExit(1)
+
         from hermes_cli.update_receipt import COMMAND_BOUNDARY_STOP_REASON
 
         _finalize_update_receipt(0, COMMAND_BOUNDARY_STOP_REASON)
