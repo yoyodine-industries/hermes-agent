@@ -371,6 +371,45 @@ def test_classify_persistence_error_turn_lease_lost_is_distinct():
     ) == "turn_lease"
 
 
+def test_classify_persistence_error_receipt_classes_are_owner_timeouts():
+    """A receipt that missed its budget is a stalled owner loop, never storage.
+
+    ``worker_receipt_timeout`` matched no marker, fell through to ``unknown`` and told the
+    operator the drive was out of room or another process held the database — the text that
+    misdirected t_769a3276 (44 Gi free, zero ``database is locked`` on the worker path). Each
+    receipt class is its own bucket, first-class in the explainer, and must not be swallowed
+    by the ``locked``/``busy`` phrase table.
+    """
+    from agent.runtime_session_store import WorkerPersistenceError
+    from hermes_state import classify_persistence_error
+
+    for error in (
+        TimeoutError("worker_receipt_timeout"),  # _OwnerLink.receive, the 20 s receipt budget
+        "worker_receipt_timeout",  # RPC-wrapped: the exception type is lost in transit
+        WorkerPersistenceError("worker_receipt_timeout"),
+    ):
+        assert classify_persistence_error(error) == "worker_receipt_timeout"
+    for error in ("worker_receipt_deadline", WorkerPersistenceError("worker_receipt_deadline")):
+        assert classify_persistence_error(error) == "worker_receipt_deadline"
+    for error in ("pending_receipt", WorkerPersistenceError("pending_receipt")):
+        assert classify_persistence_error(error) == "pending_receipt"
+
+    # First-class, not a fall-through to explainer.persistence.default: the storage
+    # text (disk / space / lock / database / doctor) must be gone for every one.
+    for cause in ("worker_receipt_timeout", "worker_receipt_deadline", "pending_receipt"):
+        text = AIAgent._format_turn_completion_explanation(
+            "session_persistence_failed", cause
+        ).lower()
+        assert text, cause
+        for wrong in ("disk", "space", "room", "locked", "busy", "database", "doctor"):
+            assert wrong not in text, (cause, wrong, text)
+    timeout_text = AIAgent._format_turn_completion_explanation(
+        "session_persistence_failed", "worker_receipt_timeout"
+    ).lower()
+    assert "acknowledg" in timeout_text  # what actually happened
+    assert "retr" in timeout_text or "send your message again" in timeout_text
+
+
 def test_persistence_error_causes_tuple_matches_classifier():
     """PERSISTENCE_ERROR_CAUSES must cover every value the classifier can
     return (consumers like cron suppression iterate it)."""
@@ -386,6 +425,9 @@ def test_persistence_error_causes_tuple_matches_classifier():
         "FATAL: state.db was replaced underneath the gateway",
         "FATAL: a live process holds a deleted state.db-wal or state.db-shm inode.",
         "database or disk is full",
+        "worker_receipt_timeout",
+        "worker_receipt_deadline",
+        "pending_receipt",
         "something else entirely",
         None,
     )
