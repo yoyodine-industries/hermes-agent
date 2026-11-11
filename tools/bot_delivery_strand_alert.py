@@ -346,6 +346,11 @@ def alert(root_home: str | os.PathLike[str], *,
             filed = not card_id
             card_id = filed_id
     totals = verdict["census"]["totals"]
+    # THE PERMANENT REFUSAL CENSUS (t-37b8e0c562 d): printed on EVERY evaluation, never a bare
+    # total -- how much of the queue_full population persisted the cap that fired, and how much
+    # is the pre-fix window nobody can recover. Persisting the field reaches none of the window,
+    # so this line is the record that it is a window and not a defect count.
+    refusal_census_line = delivery_queue.fleet_refusal_census_line(root_home)
     log("strand_alert", None,
         stranded=verdict["fleet_total"],
         previous=verdict["previous_total"],
@@ -356,7 +361,11 @@ def alert(root_home: str | os.PathLike[str], *,
         claimed_stuck=int(totals.get("claimed_stuck") or 0),
         ambiguous=int(totals.get("ambiguous") or 0),
         generation=verdict["generation"],
-        card=card_id or "-")
+        card=card_id or "-",
+        # ONE log line per evaluation still: the refusal census is a FIELD of it, so the line
+        # that already gets read every tick also carries how much of the queue_full population
+        # persisted the cap that fired and how much is the pre-fix window (t-37b8e0c562 d).
+        refusals=refusal_census_line)
     try:
         write_state(path, {
             "version": STATE_VERSION,
@@ -371,7 +380,7 @@ def alert(root_home: str | os.PathLike[str], *,
         logger.warning("[bot_delivery] strand alert ledger could not be written", exc_info=True)
     result = dict(verdict)
     result.update({"card_id": card_id, "filed": filed, "board": board, "assignee": assignee,
-                   "priority": priority})
+                   "priority": priority, "refusal_census_line": refusal_census_line})
     return result
 
 
@@ -421,6 +430,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                          "delivered": data["delivered"],
                          "oldest_age_seconds": data["oldest_age_seconds"]}
                   for seat, data in census["seats"].items()},
+        "refusal_census_line": verdict.get("refusal_census_line"),
         "grown_seats": verdict["grown_seats"],
         "generation": verdict["generation"],
         "card_id": verdict["card_id"],

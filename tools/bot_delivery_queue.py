@@ -33,6 +33,7 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -52,6 +53,12 @@ SETTLED_DIR = "settled"
 
 # --- ENUM B: durable record lifecycle (7 values, no "target_busy").
 STATUS_QUEUED = "queued"
+#: A record whose refusal was RETRYABLE waits here, in the queue DIRECTORY but not in the
+#: queued STATE: every consumer selects on status, so a deferred record cannot be offered
+#: early by any consumer -- ours, the Desktop's, or one written next year by someone who never
+#: read the card (platform-stl's ruling on t-76be5e4334). ``not_before_ns`` carries the instant
+#: it becomes eligible again; :func:`promote_deferred` is the only writer of the transition.
+STATUS_DEFERRED = "deferred"
 STATUS_RUNNING = "running"
 STATUS_DELIVERED = "delivered"
 STATUS_FAILED = "failed"
@@ -61,6 +68,7 @@ STATUS_AMBIGUOUS = "ambiguous"
 
 STATUSES = (
     STATUS_QUEUED,
+    STATUS_DEFERRED,
     STATUS_RUNNING,
     STATUS_DELIVERED,
     STATUS_FAILED,
@@ -204,6 +212,26 @@ STATUS_DETAIL_AMBIGUOUS_LEASE = (
 LIMIT_PER_PROFILE = "per_profile"
 LIMIT_PER_SENDER = "per_sender"
 
+#: The version a queue_full refusal row declares in its own ``schema`` key (t-37b8e0c562 a).
+#: v1 is EVERY row written before this change: it carries no ``limit_kind``, so the cap that
+#: refused it is unrecoverable and no reader may re-derive one -- the census counts those rows
+#: as the pre-fix window and the envelope names them ``cap unknown``.
+REFUSAL_SCHEMA_V2 = "bot_delivery/refusal/2"
+
+#: The kinds an ENVELOPE may name. Exactly these two: a refusal that names any other budget
+#: (the admission FIFO classes ``automation_fifo``/``interactive_fifo``, which a session budget
+#: caps, not a delivery cap) is recorded under ``limit_class`` and renders ``cap unknown`` --
+#: naming it a delivery cap would send the operator to raise the wrong limit, twice.
+RENDERABLE_LIMIT_KINDS = (LIMIT_PER_PROFILE, LIMIT_PER_SENDER)
+
+#: The three literals the queue_full envelope may print, and nothing else (t-37b8e0c562 b).
+#: The third says what is TRUE of the row: no ``limit_kind`` was persisted when it was written.
+CAP_UNKNOWN_LITERAL = "cap unknown (field not persisted at write)"
+
+#: The census's name for a queue_full row that persisted NO kind at all -- i.e. every v1 row,
+#: and any v2 row whose writer named neither a delivery cap nor a class.
+REFUSAL_SCHEMA_V1_UNKINDED = "unrecorded"
+
 REASON_QUEUED_EXPIRED = "queued_expired"
 #: A claim whose lease ran out: the turn it was taken for never
 #: settled it and no live process holds the seat. Terminal only where the claim's own
@@ -221,6 +249,10 @@ REASON_LEASE_LOST = "lease_lost"
 #: files no notice for (c), so an unoffered expiry can never feed a notice back into
 #: the same busy spool.
 REASON_NEVER_OFFERED = "never_offered"
+#: A retryable refusal (``queue_full`` / ``runtime_offline``) whose retry budget is spent. The
+#: record settles ``failed`` with this reason and the sender is told once, by a bounce written
+#: straight into its settled store (never re-queued: t-76be5e4334 ruling c).
+REASON_REFUSED_EXHAUSTED = "refused_exhausted"
 
 #: `retryable(envelope)` is derived from the *envelope reason* only. It is
 #: unrelated to ``retry_action()`` (agent auto-retry) -- never derive one from
@@ -228,6 +260,19 @@ REASON_NEVER_OFFERED = "never_offered"
 RETRYABLE_REASONS = frozenset({"queue_full", "runtime_offline"})
 
 QUEUE_FULL_RETRY_AFTER_SECONDS = 60.0
+#: The retry budget of a retryable refusal, and the shape of its backoff (ruling on
+#: t-76be5e4334). ``not_before = now + min(60 * 2**reoffer_count, 900)``: a FLAT 60 s against a
+#: saturated drainer is a spin at one revolution per minute against a queue that is still full --
+#: the delay's job is to REDUCE LOAD so the drainer catches up, and only growth does that. After
+#: ``MAX_REOFFER`` attempts the refusal is terminal and the sender is told, once, by a bounce.
+DEFERRAL_CAP_SECONDS = 900.0
+MAX_REOFFER = 5
+
+
+def deferral_delay_seconds(reoffer_count: int) -> float:
+    """The delay before the next offer: 60 s, doubling per re-offer, capped at 900 s."""
+    count = max(0, int(reoffer_count))
+    return min(QUEUE_FULL_RETRY_AFTER_SECONDS * float(2 ** min(count, 16)), DEFERRAL_CAP_SECONDS)
 
 _DELIVERY_ID_RE = re.compile(r"[0-9a-f]{32,64}")
 
@@ -652,28 +697,58 @@ def expiry_classification(
     return REASON_QUEUED_EXPIRED, expired_detail(ttl_seconds)
 
 
+def queue_full_cap_literal(record: dict[str, Any] | None = None, *,
+                           limit_kind: str | None = None,
+                           limit: int | None = None) -> str:
+    """The ONE cap phrase a queue_full surface may print (t-37b8e0c562 b).
+
+    Exactly three literals, and none is derived from ABSENCE:
+
+      * ``cap per_profile (<n>)``  — the record persisted ``limit_kind = per_profile``
+      * ``cap per_sender (<n>)``   — the record persisted ``limit_kind = per_sender``
+      * ``cap unknown (field not persisted at write)`` — it persisted no ``limit_kind``
+
+    An old row carries no kind, and defaulting it to ``per_profile`` is the defect this
+    replaces: a specific value is worse than "unknown" because it is actionable, and it sent
+    the operator to raise the wrong limit. A row whose refusal names a NON-delivery budget
+    (the admission FIFO classes) is ``cap unknown`` too, by design: that budget is not the
+    per-profile or per-sender delivery cap, and naming it as one would misdirect the same way.
+    ``limit`` is the cap VALUE: taken from the record when it persisted one, else the live
+    configured cap for that kind -- the kind itself is never inferred.
+    """
+    source = record or {}
+    kind = limit_kind if limit_kind is not None else source.get("limit_kind")
+    kind = "" if kind is None else str(kind).strip()
+    value = limit if limit is not None else source.get("limit")
+    if kind == LIMIT_PER_PROFILE:
+        cap = max_per_profile() if value is None else int(value)
+        return f"cap per_profile ({cap})"
+    if kind == LIMIT_PER_SENDER:
+        cap = max_per_sender() if value is None else int(value)
+        return f"cap per_sender ({cap})"
+    return CAP_UNKNOWN_LITERAL
+
+
 def queue_full_detail(
     per_profile: int | None = None,
     retry_after: float | None = None,
     *,
-    limit_kind: str = LIMIT_PER_PROFILE,
+    limit_kind: str | None = None,
     limit: int | None = None,
 ) -> str:
     """Name the cap that actually refused the send (VERIFICATION D6).
 
     A send refused by the per-sender cap was previously reported as
-    ``queue full (32 per profile)`` -- an operator would raise the wrong limit.
+    ``queue full (32 per profile)`` -- an operator would raise the wrong limit. The KIND now
+    has no default either: a caller that does not know it renders the ``cap unknown`` literal
+    rather than the historical per-profile one (t-37b8e0c562 b).
     """
-    if limit is not None:
-        cap = int(limit)
-    elif per_profile is None:
-        cap = max_per_profile()
-    else:
-        cap = int(per_profile)
+    if limit is None and per_profile is not None and limit_kind == LIMIT_PER_PROFILE:
+        limit = int(per_profile)
+    cap = queue_full_cap_literal(limit_kind=limit_kind, limit=limit)
     after = QUEUE_FULL_RETRY_AFTER_SECONDS if retry_after is None else retry_after
-    scope = "per profile" if limit_kind == LIMIT_PER_PROFILE else "pending from this sender"
     return (
-        f"queue full ({cap} {scope}); no reservation was taken — "
+        f"{cap}; no reservation was taken — "
         f"safe to retry with the same idempotency_key after {int(after)}s"
     )
 
@@ -1034,7 +1109,7 @@ def claim_next(
             record
             for record in _list(root, QUEUE_DIR)
             if record.get("target_profile") == target_profile
-            and record.get("status") == STATUS_QUEUED
+            and _offered_now(record, now_ns)
         ]
         if not queued:
             return None
@@ -1123,6 +1198,226 @@ def requeue(
         _fsync_dir(root / CLAIMED_DIR)
         _log("requeued", updated, reoffer_count=updated["reoffer_count"])
         return dict(updated)
+
+
+def _offered_now(record: dict[str, Any], now_ns: int) -> bool:
+    """Whether a record may be offered to a turn AT ``now_ns``.
+
+    Belt and braces beside the store's gate (ruling on t-76be5e4334): a deferred record is not
+    in :data:`STATUS_QUEUED`, so no consumer can see it early -- this predicate ALSO refuses a
+    queued record whose ``not_before_ns`` is still in the future, which is the state a promoter
+    killed mid-write leaves behind. An unparseable stamp is treated as eligible: a malformed
+    field must never freeze a delivery, it must merely fail to gate one.
+    """
+    if record.get("status") != STATUS_QUEUED:
+        return False
+    not_before = record.get("not_before_ns")
+    if not_before is None:
+        return True
+    try:
+        return int(not_before) <= int(now_ns)
+    except (TypeError, ValueError):
+        return True
+
+
+def defer_or_fail(
+    home: str | os.PathLike[str],
+    delivery_id: str,
+    *,
+    reason: str,
+    now_ns: int | None = None,
+    error: str = "",
+    limit_kind: str | None = None,
+    limit: int | None = None,
+    limit_class: str | None = None,
+) -> dict[str, Any]:
+    """The ONE door a retryable refusal takes: DEFER with backoff, or settle FAILED and bounce.
+
+    A ``queue_full`` (or any :data:`RETRYABLE_REASONS`) refusal used to settle ``failed`` at
+    ``attempts=1`` with nothing said to the sender -- a silent loss. Now the record goes back
+    into the queue DIRECTORY with ``status = deferred`` and ``not_before_ns = now + backoff``:
+    it is not in the queued STATE, so no consumer -- ours, the Desktop's, or one written next
+    year -- can offer it early. ``attempts`` is NOT charged (the turn never ran: it was refused
+    admission), ``reoffer_count`` is the retry budget, and after :data:`MAX_REOFFER` the refusal
+    is terminal: it settles ``failed`` and :func:`tools.bot_delivery_notices.bounce_to_sender`
+    tells the sender once, by its own door, never by re-entering the queue.
+
+    The terminal arm settles OUTSIDE the store lock, because ``settle`` takes the same lock.
+    Returns the record as written plus ``deferral`` = ``deferred`` / ``exhausted`` / ``terminal``.
+    """
+    key_id = validate_delivery_id(delivery_id)
+    now_ns = time.time_ns() if now_ns is None else int(now_ns)
+    named = str(reason or "")
+    retryable_reason = named in RETRYABLE_REASONS
+    with _locked(home) as root:
+        claimed_path = root / CLAIMED_DIR / f"{key_id}.json"
+        queued_path = root / QUEUE_DIR / f"{key_id}.json"
+        record = _read(claimed_path) or _read(queued_path)
+        if record is None:
+            raise FileNotFoundError(f"no claimed or queued record for {key_id}")
+        count = int(record.get("reoffer_count") or 0)
+        if retryable_reason and count < MAX_REOFFER:
+            delay = deferral_delay_seconds(count)
+            updated = dict(record)
+            updated["status"] = STATUS_DEFERRED
+            updated["status_detail"] = named
+            updated["reason"] = named
+            updated["deferred_at_ns"] = now_ns
+            updated["reoffer_count"] = count + 1
+            updated["not_before_ns"] = now_ns + int(delay * 1_000_000_000)
+            updated["retry_after_seconds"] = delay
+            updated["updated_at"] = now_ns
+            # The turn never ran: it was refused admission, so the attempt the claim charged is
+            # REFUNDED and the entry is closed as deferred. `reoffer_count` is the retry budget;
+            # `attempts` counts turns that actually ran (acceptance ix: two requeues -> 0).
+            entry = _open_attempt(updated)
+            if entry is not None:
+                entry["ended_at"] = now_ns
+                entry["status"] = STATUS_DEFERRED
+                entry["reason"] = named
+                entry["charged"] = False
+                if int(updated.get("attempts") or 0) > 0:
+                    updated["attempts"] = int(updated["attempts"]) - 1
+            if limit_kind is not None:
+                updated["limit_kind"] = str(limit_kind) if str(limit_kind) in RENDERABLE_LIMIT_KINDS else None
+                if str(limit_kind) not in RENDERABLE_LIMIT_KINDS:
+                    updated["limit_class"] = str(limit_kind)
+            if limit_class:
+                updated["limit_class"] = str(limit_class)
+            if limit is not None:
+                updated["limit"] = int(limit)
+            if claimed_path.exists():
+                os.replace(claimed_path, queued_path)
+                _fsync_dir(root / CLAIMED_DIR)
+            updated["queue_position"] = None
+            _write(queued_path, updated)
+            _log("deferred", updated, reason=named, retry_after_seconds=delay,
+                 reoffer_count=updated.get("reoffer_count"))
+            return dict(updated, deferral="deferred")
+        outcome = "exhausted" if retryable_reason else "terminal"
+        from_claimed = claimed_path.exists()
+    if not from_claimed:
+        raise FileNotFoundError(f"no claimed record for {key_id}")
+    settled = settle(
+        home,
+        key_id,
+        status=STATUS_FAILED,
+        reply=None,
+        error=error,
+        reason=named or None,
+        status_detail=STATUS_DETAIL_QUEUE_FULL if retryable_reason else None,
+        limit_kind=limit_kind,
+        limit=limit,
+        limit_class=limit_class,
+        now_ns=now_ns,
+    )
+    bounced = None
+    try:
+        from tools import bot_delivery_notices
+
+        bounced = bot_delivery_notices.bounce_to_sender(
+            settled, fallback_home=home, now_ns=now_ns, outcome=outcome
+        )
+    except Exception:  # a bounce must never turn a refusal into a crash
+        logger.exception("bot_delivery bounce failed: %s", key_id)
+    _log("refusal_terminal", settled, outcome=outcome, reason=named,
+         reoffer_count=int(settled.get("reoffer_count") or 0),
+         bounced=bool(bounced))
+    return dict(settled, deferral=outcome, bounced=bool(bounced))
+
+
+def promote_deferred(
+    home: str | os.PathLike[str], *, now_ns: int | None = None
+) -> dict[str, Any]:
+    """Move every DEFERRED record whose ``not_before_ns`` has arrived back to ``queued``.
+
+    The ONLY writer of ``deferred -> queued``. It is a store operation on purpose: a deferral
+    that lived in a reader would let the real consumer (which is not our code -- ``claim_next``
+    has no production caller) keep re-offering the record immediately. Returns counts ONLY, so a
+    caller can print ``promoted`` and, crucially, the records still deferred.
+    """
+    now_ns = time.time_ns() if now_ns is None else int(now_ns)
+    promoted = 0
+    still = 0
+    oldest: float | None = None
+    next_eligible: int | None = None
+    with _locked(home) as root:
+        for record in _list(root, QUEUE_DIR):
+            if record.get("status") != STATUS_DEFERRED:
+                continue
+            try:
+                not_before = int(record.get("not_before_ns") or 0)
+            except (TypeError, ValueError):
+                not_before = 0
+            if not_before > now_ns:
+                still += 1
+                age = max(0.0, (now_ns - int(record.get("deferred_at_ns") or now_ns)) / 1e9)
+                oldest = age if oldest is None else max(oldest, age)
+                next_eligible = not_before if next_eligible is None else min(next_eligible, not_before)
+                continue
+            updated = dict(record)
+            updated["status"] = STATUS_QUEUED
+            updated["promoted_at_ns"] = now_ns
+            updated["updated_at"] = now_ns
+            updated["status_detail"] = STATUS_DETAIL_TARGET_BUSY
+            updated["queue_position"] = _queue_position(root, updated) or 1
+            _write(root / QUEUE_DIR / f"{updated['delivery_id']}.json", updated)
+            _log("promoted", updated, deferred_seconds=round(
+                max(0.0, (now_ns - int(record.get("deferred_at_ns") or now_ns)) / 1e9), 1))
+            promoted += 1
+    return {"promoted": promoted, "deferred": still,
+            "oldest_deferred_age_seconds": oldest, "next_eligible_ns": next_eligible}
+
+
+def deferred_census(
+    home: str | os.PathLike[str], *, now_ns: int | None = None
+) -> dict[str, Any]:
+    """``deferred`` as a FIRST-CLASS countable state: count, oldest age, next eligible instant.
+
+    Printed BESIDE ``queued`` (never folded into it): "0 queued" reads as healthy while N records
+    sit frozen, which is exactly the failure a promoter that died would produce.
+    """
+    now_ns = time.time_ns() if now_ns is None else int(now_ns)
+    root = delivery_root(home)
+    count = 0
+    oldest: float | None = None
+    oldest_id: str | None = None
+    next_eligible: int | None = None
+    for record in _list(root, QUEUE_DIR):
+        if record.get("status") != STATUS_DEFERRED:
+            continue
+        count += 1
+        age = max(0.0, (now_ns - int(record.get("deferred_at_ns") or now_ns)) / 1e9)
+        if oldest is None or age > oldest:
+            oldest = age
+            oldest_id = str(record.get("delivery_id") or "")
+        try:
+            not_before = int(record.get("not_before_ns") or 0)
+        except (TypeError, ValueError):
+            not_before = 0
+        if not_before and (next_eligible is None or not_before < next_eligible):
+            next_eligible = not_before
+    return {"deferred": count, "oldest_deferred_age_seconds": oldest,
+            "oldest_deferred_delivery_id": oldest_id, "next_eligible_ns": next_eligible}
+
+
+def promote_deferred_all(
+    root_home: str | os.PathLike[str], *, now_ns: int | None = None
+) -> dict[str, Any]:
+    """Run the promoter across every live seat's spool; the fleet's own deferred census."""
+    now_ns = time.time_ns() if now_ns is None else int(now_ns)
+    seats: dict[str, dict[str, Any]] = {}
+    for seat, seat_home in spool_homes(root_home):
+        try:
+            seats[seat] = promote_deferred(seat_home, now_ns=now_ns)
+        except Exception:  # one unreadable seat must not stop the promoter
+            logger.exception("bot_delivery promoter failed for seat %s", seat)
+            seats[seat] = {"promoted": 0, "deferred": None, "error": True}
+    totals = {"promoted": 0, "deferred": 0}
+    for row in seats.values():
+        totals["promoted"] += int(row.get("promoted") or 0)
+        totals["deferred"] += int(row.get("deferred") or 0)
+    return {"now_ns": now_ns, "seats": seats, "totals": totals}
 
 
 def requeue_unstarted(
@@ -1215,11 +1510,28 @@ def settle(
     error: str | None = "",
     reason: str | None = "",
     status_detail: str | None = None,
+    limit_kind: str | None = None,
+    limit: int | None = None,
+    limit_class: str | None = None,
     now_ns: int | None = None,
 ) -> dict[str, Any]:
-    """Move a claimed record to ``settled/`` with a terminal status."""
+    """Move a claimed record to ``settled/`` with a terminal status.
+
+    A ``queue_full`` settlement is a REFUSAL ROW and must say which budget refused it
+    (t-37b8e0c562 a): one of ``limit_kind`` (a delivery cap: ``per_profile`` / ``per_sender``)
+    or ``limit_class`` (a session budget's own class field, e.g. ``automation_fifo``) has to be
+    given -- neither the record's absence nor this signature supplies a default, because a
+    refusal row that names the wrong cap is worse than one that names none. The row is stamped
+    ``schema = bot_delivery/refusal/2`` so a reader can count v1 (no kind, unrecoverable) apart
+    from v2 rows.
+    """
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"status must be terminal, got {status!r}")
+    if reason == STATUS_DETAIL_QUEUE_FULL and not (limit_kind or limit_class):
+        raise ValueError(
+            "a queue_full settlement must persist the cap that fired: pass limit_kind "
+            "(per_profile/per_sender) or limit_class (the refusal's own class field)"
+        )
     key_id = validate_delivery_id(delivery_id)
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     with _locked(home) as root:
@@ -1248,6 +1560,20 @@ def settle(
             updated["error"] = error
         if reason not in (None, ""):
             updated["reason"] = reason
+        if reason == STATUS_DETAIL_QUEUE_FULL:
+            # The refusal's own facts, taken from the caller or from the record the refusal
+            # site stamped -- never inferred from which one is missing.
+            kind = limit_kind if limit_kind is not None else record.get("limit_kind")
+            klass = limit_class if limit_class is not None else record.get("limit_class")
+            cap = limit if limit is not None else record.get("limit")
+            updated["limit_kind"] = kind if kind in RENDERABLE_LIMIT_KINDS else None
+            if kind and kind not in RENDERABLE_LIMIT_KINDS:
+                updated["limit_class"] = str(kind)
+            if klass:
+                updated["limit_class"] = str(klass)
+            if cap is not None:
+                updated["limit"] = int(cap)
+            updated["schema"] = REFUSAL_SCHEMA_V2
         entry = _open_attempt(updated)
         if entry is not None:
             entry["ended_at"] = now_ns
@@ -1544,6 +1870,17 @@ def sweep_delivery_queue(
         # 2. expire records that waited past the TTL
         if expire and ttl > 0:
             for record in _list(root, QUEUE_DIR):
+                if record.get("status") == STATUS_DEFERRED:
+                    # DEFERRED IS EXEMPT FROM THE OVER-TTL SWEEP (ruling on t-76be5e4334 b).
+                    # Its age is measured from ``not_before_ns``, not from ``created_at``: the
+                    # backoff IS the wait this record was told to have, so expiring it for being
+                    # old would destroy the delivery the deferral just saved. A deferred record's
+                    # staleness is reported by ``deferred_census`` and by the promoter, never by
+                    # this sweep -- if the promoter dies the record freezes as ``deferred``, which
+                    # is visible, and the promoter's own failure node CARDS.
+                    _log("deferred_kept_from_ttl", record,
+                         not_before_ns=record.get("not_before_ns"))
+                    continue
                 if record.get("status") != STATUS_QUEUED:
                     continue
                 if queued_seconds(record, now_ns=now_ns) <= ttl:
@@ -1613,9 +1950,10 @@ def queued_target_profiles(home: str | os.PathLike[str]) -> list[str]:
 #: lease ran out is a strand that ``pending_over_ttl`` structurally could not see
 #: (an open attempt froze its reading), so it is counted on its own -- never merely
 #: inferred from the over-TTL term.
-_CENSUS_COUNT_KEYS = ("queued", "pending_over_ttl", "claimed_stuck", "expired", "ambiguous",
-                      "failed", "delivered", "stranded")
-_CENSUS_AGE_KEYS = ("oldest_age_seconds", "oldest_delivery_id", "oldest_path")
+_CENSUS_COUNT_KEYS = ("queued", "deferred", "pending_over_ttl", "claimed_stuck", "expired",
+                      "ambiguous", "failed", "delivered", "stranded")
+_CENSUS_AGE_KEYS = ("oldest_age_seconds", "oldest_delivery_id", "oldest_path",
+                    "oldest_deferred_age_seconds")
 
 
 def _empty_census_seat() -> dict[str, Any]:
@@ -1675,6 +2013,18 @@ def seat_strand_census(home: str | os.PathLike[str], *, now_ns: int | None = Non
         for record in _list(root, sub):
             if record.get("status") in TERMINAL_STATUSES:
                 continue
+            if record.get("status") == STATUS_DEFERRED:
+                # A DEFERRED record is NOT a strand and NOT a queued record (ruling on
+                # t-76be5e4334 b/vi): its age is measured from ``deferred_at_ns``, its next
+                # offer from ``not_before_ns``, and the over-TTL term structurally must not see
+                # it. It is counted on its own so "0 queued" can never read as healthy while N
+                # records wait out a backoff.
+                seat["deferred"] += 1
+                age = max(0.0, (now_ns - int(record.get("deferred_at_ns") or now_ns)) / 1e9)
+                current = seat.get("oldest_deferred_age_seconds")
+                if current is None or age > float(current):
+                    seat["oldest_deferred_age_seconds"] = age
+                continue
             seat["queued"] += 1
             path = root / sub / f"{record.get('delivery_id')}.json"
             if lease_lost(record, home=home, now_ns=now_ns):
@@ -1722,6 +2072,10 @@ def _sum_census_seats(seats: dict[str, dict[str, Any]]) -> dict[str, Any]:
             totals["oldest_age_seconds"] = float(age)
             totals["oldest_delivery_id"] = seat.get("oldest_delivery_id")
             totals["oldest_path"] = seat.get("oldest_path")
+        deferred_age = seat.get("oldest_deferred_age_seconds")
+        current = totals.get("oldest_deferred_age_seconds")
+        if deferred_age is not None and (current is None or float(deferred_age) > float(current)):
+            totals["oldest_deferred_age_seconds"] = float(deferred_age)
     return totals
 
 
@@ -1742,6 +2096,96 @@ def strand_census(root_home: str | os.PathLike[str], *,
         "seats": seats,
         "totals": _sum_census_seats(seats),
     }
+
+
+def refusal_kind_census(home: str | os.PathLike[str]) -> dict[str, Any]:
+    """The queue_full REFUSAL population of one spool, counted by what its rows persisted.
+
+    ``schema = bot_delivery/refusal/2`` rows carry the cap that fired; every row written before
+    that version carries none and can never be recovered, so it is counted as the PRE-FIX
+    WINDOW with its own first/last instants. Persisting the field reaches none of them -- which
+    is exactly why this is a permanent line and not a migration (t-37b8e0c562 d).
+    """
+    root = delivery_root(home)
+    rows = [r for r in _list(root, SETTLED_DIR) if r.get("reason") == STATUS_DETAIL_QUEUE_FULL]
+    by_kind: dict[str, int] = {}
+    persisted = 0
+    window: list[int] = []
+    for record in rows:
+        kind = record.get("limit_kind")
+        if kind in RENDERABLE_LIMIT_KINDS:
+            persisted += 1
+            by_kind[str(kind)] = by_kind.get(str(kind), 0) + 1
+        else:
+            klass = record.get("limit_class")
+            key = f"class:{klass}" if klass else REFUSAL_SCHEMA_V1_UNKINDED
+            by_kind[key] = by_kind.get(key, 0) + 1
+            window.append(int(record.get("updated_at") or record.get("created_at") or 0))
+    return {
+        "queue_full": len(rows),
+        "limit_kind_persisted": persisted,
+        "cap_unknown": len(rows) - persisted,
+        "pre_fix_first_ns": min(window) if window else None,
+        "pre_fix_last_ns": max(window) if window else None,
+        "by_kind": dict(sorted(by_kind.items())),
+    }
+
+
+def refusal_kind_census_line(census: dict[str, Any]) -> str:
+    """The PERMANENT one-line census (t-37b8e0c562 d), never a bare total.
+
+    ``queue_full N · limit_kind persisted k · cap-unknown (pre-fix window) N-k, first .. last``
+    -- so the reader can always tell how much of N is a fact and how much is a window.
+    """
+    total = int(census.get("queue_full") or 0)
+    persisted = int(census.get("limit_kind_persisted") or 0)
+    unknown = int(census.get("cap_unknown") or 0)
+    if unknown:
+        first = _iso_instant(census.get("pre_fix_first_ns"))
+        last = _iso_instant(census.get("pre_fix_last_ns"))
+        window = f"first {first} .. last {last}"
+    else:
+        window = "no window"
+    return (f"queue_full {total} · limit_kind persisted {persisted} · "
+            f"cap-unknown (pre-fix window) {unknown}, {window}")
+
+
+def _iso_instant(ns: Any) -> str:
+    if not ns:
+        return "unknown"
+    return datetime.fromtimestamp(int(ns) / 1e9, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def fleet_refusal_census(root_home: str | os.PathLike[str]) -> dict[str, Any]:
+    """Every spool's refusal census, summed -- the numbers the permanent line prints."""
+    total = 0
+    persisted = 0
+    firsts: list[int] = []
+    lasts: list[int] = []
+    by_kind: dict[str, int] = {}
+    for _seat, home in spool_homes(root_home):
+        seat = refusal_kind_census(home)
+        total += int(seat["queue_full"])
+        persisted += int(seat["limit_kind_persisted"])
+        if seat.get("pre_fix_first_ns"):
+            firsts.append(int(seat["pre_fix_first_ns"]))
+        if seat.get("pre_fix_last_ns"):
+            lasts.append(int(seat["pre_fix_last_ns"]))
+        for key, count in (seat.get("by_kind") or {}).items():
+            by_kind[key] = by_kind.get(key, 0) + int(count)
+    return {
+        "queue_full": total,
+        "limit_kind_persisted": persisted,
+        "cap_unknown": total - persisted,
+        "pre_fix_first_ns": min(firsts) if firsts else None,
+        "pre_fix_last_ns": max(lasts) if lasts else None,
+        "by_kind": dict(sorted(by_kind.items())),
+    }
+
+
+def fleet_refusal_census_line(root_home: str | os.PathLike[str]) -> str:
+    """The PERMANENT fleet-wide refusal census line (t-37b8e0c562 d)."""
+    return refusal_kind_census_line(fleet_refusal_census(root_home))
 
 
 def stranded_breakdown(census: dict[str, Any]) -> str:
@@ -1869,13 +2313,13 @@ def build_envelope(
     elif status == STATUS_AMBIGUOUS:
         detail = unknown_detail(record.get("idempotency_key"))
     elif reason == "queue_full":
-        # Report the cap that ACTUALLY refused the send (VERIFICATION D6): the
-        # per-sender cap (8) used to be reported as the per-profile cap (32), so an
-        # operator would raise the wrong limit. Absent the fired limit, the
-        # per-profile reading is the historical one.
+        # Report the cap that ACTUALLY refused the send (VERIFICATION D6), and ONLY from what
+        # the record persisted: a row with no ``limit_kind`` renders ``cap unknown (field not
+        # persisted at write)``. It used to fall back to the per-profile reading -- a specific
+        # value derived from absence, and the reason an operator raised the wrong limit twice
+        # (t-37b8e0c562).
         detail = queue_full_detail(
-            limit_kind=str(record.get("limit_kind") or LIMIT_PER_PROFILE),
-            limit=record.get("limit"))
+            limit_kind=record.get("limit_kind"), limit=record.get("limit"))
     elif result == RESULT_RECEIPT:
         detail = DETAIL_RECEIPT
     else:

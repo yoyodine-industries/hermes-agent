@@ -102,6 +102,107 @@ def _deliver_into_live_context(
         return False
 
 
+def bounce_notice_key(delivery_id: str) -> str:
+    """The idempotency key of the ONE bounce owed for a refused delivery."""
+    return f"refusal-bounce:{delivery_id}"
+
+
+def bounce_to_sender(
+    record: dict[str, Any],
+    *,
+    home: str | os.PathLike[str] | None = None,
+    fallback_home: str | os.PathLike[str] | None = None,
+    now_ns: int | None = None,
+    outcome: str = "exhausted",
+) -> dict[str, Any] | None:
+    """Tell the SENDER that a retryable refusal ran out of retries -- without re-entering the queue.
+
+    A ``queue_full`` refusal used to die at ``failed``/``attempts=1`` in silence (t-76be5e4334).
+    The deferral gives it a retry budget; when the budget is spent the sender is owed ONE word
+    about it. That word MUST NOT be a queued delivery: written through the normal enqueue path it
+    would inherit ``queue_full`` and bounce into itself, growing the very queue it reports on.
+
+    So the bounce is written DIRECT into the sender's ``settled/`` store -- ``ref`` = the original
+    delivery id, ``depth`` = 1, the original message copied verbatim so a resend is one call --
+    and, when the sender has a live consumer, into its next turn context as well. Status is
+    ``failed`` (terminal, so no sweep, no TTL, no re-offer can touch it), and a bounce never
+    bounces: any record already carrying ``depth >= 1`` is refused here.
+
+    Idempotent on the original delivery id; returns the record written, or ``None`` when no
+    bounce is owed (no sender, a notice about a notice, an unknown profile, already written).
+    """
+    from tools import bot_delivery_queue as q
+
+    delivery_id = str(record.get("delivery_id") or "")
+    sender = str(record.get("sender_profile") or "")
+    target = str(record.get("target_profile") or "")
+    if not delivery_id or not sender or sender == q.EXPIRED_NOTICE_SENDER:
+        return None
+    if int(record.get("depth") or 0) >= 1:
+        return None  # a bounce does not bounce
+    if home is None:
+        home = _profile_home(sender)
+        if home is None and fallback_home is not None:
+            # The sender's profile home is unknown (a lane that was renamed or never existed).
+            # The word is still owed: it lands in the store of the spool that holds the record,
+            # addressed to the sender -- visible, terminal, and NOT queued.
+            home = fallback_home
+            q._log("refusal_bounce_fallback_store", record, target=sender)
+        if home is None:
+            q._log("refusal_bounce_skipped", record, reason="unknown_sender_profile")
+            return None
+    now_ns = q.time.time_ns() if now_ns is None else int(now_ns)
+    key = bounce_notice_key(delivery_id)
+    bounce_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    root = q.delivery_root(home)
+    path = root / q.SETTLED_DIR / f"{bounce_id}.json"
+    existing = q._read(path)
+    if existing is not None:
+        return dict(existing)
+    retries = int(record.get("reoffer_count") or 0)
+    kind = str(record.get("limit_kind") or record.get("limit_class") or "unknown")
+    cap = record.get("limit")
+    cap_text = f"{kind} ({cap})" if cap is not None else kind
+    message = (
+        f"[peer-delivery FAILED] your delivery {delivery_id} to {target} was REFUSED "
+        f"{retries} time(s) (cap {cap_text}) and its retry budget is spent; it was never "
+        f"delivered. Nothing is still in flight. The original message is quoted below so a "
+        f"resend is one call:\n\n{(record.get('message') or '')}"
+    )
+    bounce = {
+        "delivery_id": bounce_id,
+        "idempotency_key": key,
+        "fingerprint": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "sender_profile": q.EXPIRED_NOTICE_SENDER,
+        "target_profile": sender,
+        "target_session_id": None,
+        "message": message,
+        "status": q.STATUS_FAILED,
+        "status_detail": f"refused_{outcome}",
+        "reason": q.REASON_REFUSED_EXHAUSTED,
+        "ref": delivery_id,
+        "depth": 1,
+        "attempts": 0,
+        "reoffer_count": retries,
+        "limit_kind": record.get("limit_kind"),
+        "limit": cap,
+        "original_message": record.get("message"),
+        "created_at": now_ns,
+        "updated_at": now_ns,
+        "claimed_at": None,
+        "queue_position": None,
+        "attempts_log": [],
+        "reply": None,
+        "error": None,
+        "sequence": 0,
+    }
+    q._write(path, bounce)
+    delivered = _deliver_into_live_context(Path(home), message, record=record)
+    q._log("refusal_bounce", record, bounce_id=bounce_id, target=sender,
+           retries=retries, delivered_to="live_context" if delivered else "settled")
+    return bounce
+
+
 def notice_expired_to_sender(
     record: dict[str, Any],
     *,

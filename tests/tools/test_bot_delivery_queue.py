@@ -74,10 +74,14 @@ def _settled_path(home, n):
 
 # ---------------------------------------------------------------- vocabulary
 def test_no_target_busy_in_vocabulary():
-    assert len(q.STATUSES) == 7
+    # 8 since t-76be5e4334: `deferred` is a first-class state (a retryable refusal waiting out
+    # its backoff), and `target_busy` is still NOT a status -- contention is expressed as
+    # `queued` + a status_detail, which is why the count is 8 and not 9.
+    assert len(q.STATUSES) == 8
     assert "target_busy" not in q.STATUSES
     assert set(q.STATUSES) == {
         "queued",
+        "deferred",
         "running",
         "delivered",
         "failed",
@@ -165,7 +169,7 @@ def test_capacity_per_profile_is_32(tmp_path):
     with pytest.raises(q.QueueFullError) as excinfo:
         _admit(tmp_path, 99, sender="sender-99")
     assert excinfo.value.reason == "queue_full"
-    assert "queue full (32 per profile)" in str(excinfo.value)
+    assert "cap per_profile (32)" in str(excinfo.value)
     assert excinfo.value.retry_after_seconds == 60.0
     # no reservation was taken: the 33rd delivery left nothing behind
     assert q.queue_depth(tmp_path, target_profile="bravo") == 32
@@ -648,13 +652,16 @@ def test_queue_full_envelope_names_the_cap_that_fired():
         {**base, "limit_kind": q.LIMIT_PER_SENDER, "limit": 8})
     assert per_sender["result"] == q.RESULT_FAILED
     assert per_sender["retryable"] is True
-    assert "8 pending from this sender" in per_sender["detail"]
-    assert "per profile" not in per_sender["detail"]
+    assert "cap per_sender (8)" in per_sender["detail"]
+    assert "per_profile" not in per_sender["detail"]
 
     per_profile = q.build_envelope(
         {**base, "limit_kind": q.LIMIT_PER_PROFILE, "limit": q.max_per_profile()})
-    assert f"{q.max_per_profile()} per profile" in per_profile["detail"]
+    assert f"cap per_profile ({q.max_per_profile()})" in per_profile["detail"]
 
-    # A row that lost the fired cap (an older record) reads as it always did.
+    # A row that lost the fired cap (an older record) must NOT be given the historical
+    # per-profile reading: a specific value derived from absence is what sent the operator to
+    # raise the wrong limit twice (t-37b8e0c562 b/c).
     legacy = q.build_envelope(base)
-    assert f"{q.max_per_profile()} per profile" in legacy["detail"]
+    assert q.CAP_UNKNOWN_LITERAL in legacy["detail"]
+    assert "per_profile" not in legacy["detail"]

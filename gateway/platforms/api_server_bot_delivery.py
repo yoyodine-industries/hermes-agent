@@ -228,6 +228,38 @@ def _settle_bot_chat_turn(
         return settled, ""
     error = str(receipt.get("error") or f"bot chat delivery {status or 'refused'}")
     reason = str(receipt.get("reason") or "").strip() or _failure_reason(error)
+    if reason in delivery_queue.RETRYABLE_REASONS:
+        # A RETRYABLE refusal is NOT terminal: it defers with backoff and keeps its budget
+        # (t-76be5e4334 ruling). The store carries the gate -- status=deferred, not queued --
+        # so no consumer can offer it early, and a spent budget settles failed AND bounces.
+        settled = delivery_queue.defer_or_fail(
+            home,
+            delivery_id,
+            reason=reason,
+            error=error,
+            limit_kind=receipt.get("limit_kind"),
+            limit=receipt.get("limit"),
+            limit_class=receipt.get("limit_class"),
+        )
+        if settled.get("deferral") == "deferred":
+            adapter._bot_send_record_status(
+                delivery_id, settled, result=delivery_queue.RESULT_RECEIPT, error=error
+            )
+            log_delivery_event(
+                "turn_deferred",
+                settled,
+                seconds=round(time.monotonic() - started, 3),
+                retry_after_seconds=settled.get("retry_after_seconds"),
+            )
+            return settled, None
+        adapter._bot_send_record_status(
+            delivery_id, settled, result=delivery_queue.RESULT_FAILED, error=error
+        )
+        log_delivery_event(
+            "turn_failed", settled, seconds=round(time.monotonic() - started, 3),
+            deferral=settled.get("deferral"), bounced=settled.get("bounced"),
+        )
+        return settled, None
     settled = delivery_queue.settle(
         home,
         delivery_id,
@@ -235,6 +267,12 @@ def _settle_bot_chat_turn(
         reply=None,
         error=error,
         reason=reason,
+        # The cap that fired rides on the receipt, stamped by the refusal site that caught it
+        # (``admit_peer_turn``); settle() persists it so the row can never carry a queue_full
+        # reason with no budget (t-37b8e0c562 a).
+        limit_kind=receipt.get("limit_kind"),
+        limit=receipt.get("limit"),
+        limit_class=receipt.get("limit_class"),
     )
     adapter._bot_send_record_status(
         delivery_id, settled, result=delivery_queue.RESULT_FAILED, error=error
@@ -297,13 +335,20 @@ async def run_record(
     except Exception as exc:  # noqa: BLE001 - any turn failure settles the record
         logger.exception("[api_server] peer delivery turn failed: %s", delivery_id)
         error = str(exc) or exc.__class__.__name__
+        reason = _failure_reason(error)
         settled = delivery_queue.settle(
             home,
             delivery_id,
             status=delivery_queue.STATUS_FAILED,
             reply=None,
             error=error,
-            reason=_failure_reason(error),
+            reason=reason,
+            # A refusal carries the cap on the exception itself (QueueFullError.limit_kind for a
+            # delivery cap, RuntimeStoreError.field for a session budget); a turn that failed for
+            # any other reason passes neither and settle() persists none.
+            limit_kind=getattr(exc, "limit_kind", None),
+            limit=getattr(exc, "limit", None),
+            limit_class=getattr(exc, "field", None) if reason == "queue_full" else None,
         )
         adapter._bot_send_record_status(
             delivery_id, settled, result=delivery_queue.RESULT_FAILED, error=error
@@ -502,6 +547,19 @@ async def sweep_once(adapter: Any, home: Path) -> int:
     holder / the cap's own wait is exactly what will drain it next (t_43f11055 a).
     """
     lanes = _spooled_lanes(Path(home))
+    # 0. PROMOTE first: a deferred record whose backoff has arrived is queued work, and the
+    #    drain below must see it in the same tick. The promoter is a store transition
+    #    (deferred -> queued) and is idempotent, so a tick that promotes nothing costs a scan.
+    #    It has its own schedule too (tools/bot_delivery_promote.py): this call is the fast
+    #    path, not the only one -- if the schedule dies, records stay VISIBLY deferred rather
+    #    than silently re-offered (t-76be5e4334 a/viii).
+    for _name, lane_home in lanes:
+        try:
+            promoted = delivery_queue.promote_deferred(lane_home)
+            if promoted.get("promoted"):
+                log_delivery_event("deferred_promoted", {}, **promoted)
+        except Exception:  # one unreadable lane must not stop the sweep
+            logger.exception("bot_delivery promoter failed for lane %s", _name)
     for _name, lane_home in lanes:
         delivery_queue.sweep_delivery_queue(lane_home, expire=False)
     drained = await drain_once(adapter, Path(home))
