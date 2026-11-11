@@ -102,9 +102,20 @@ def _deliver_into_live_context(
         return False
 
 
-def bounce_notice_key(delivery_id: str) -> str:
-    """The idempotency key of the ONE bounce owed for a refused delivery."""
-    return f"refusal-bounce:{delivery_id}"
+def bounce_notice_key(delivery_id: str, target: str, reason: str) -> str:
+    """The idempotency key of ONE bounce owed for a refused delivery: the TRIPLE, never a hash.
+
+    (original ``delivery_id``, ``target``, ``reason``) is IDENTITY, not content. A digest of the
+    bounce body was ruled wrong (review on t-76be5e4334): a re-render changes the body, so a body
+    hash would file a SECOND bounce for one undelivered brief. The triple gives exactly the two
+    facts that matter -- the same failure twice is ONE bounce, and a brief that failed twice for
+    DIFFERENT reasons is two facts and owes two bounces.
+
+    The key is verifiable from the record and not only from this function: ``ref``,
+    ``refusal_target`` and ``refusal_reason`` are written onto the bounce itself, so a reader
+    holding the bounce can recompute the key without the code that wrote it.
+    """
+    return f"refusal-bounce:{delivery_id}:{target}:{reason}"
 
 
 def bounce_to_sender(
@@ -128,8 +139,11 @@ def bounce_to_sender(
     ``failed`` (terminal, so no sweep, no TTL, no re-offer can touch it), and a bounce never
     bounces: any record already carrying ``depth >= 1`` is refused here.
 
-    Idempotent on the original delivery id; returns the record written, or ``None`` when no
-    bounce is owed (no sender, a notice about a notice, an unknown profile, already written).
+    Idempotent on the TRIPLE (``delivery_id``, ``target``, ``reason``) -- identity, not content:
+    the same failure twice is ONE bounce, a brief that failed twice for DIFFERENT reasons owes
+    TWO, and a body hash would file two for one brief the moment the body is re-rendered.
+    Returns the record written, or ``None`` when no bounce is owed (no sender, a notice about a
+    notice, an unknown profile, already written).
     """
     from tools import bot_delivery_queue as q
 
@@ -152,7 +166,8 @@ def bounce_to_sender(
             q._log("refusal_bounce_skipped", record, reason="unknown_sender_profile")
             return None
     now_ns = q.time.time_ns() if now_ns is None else int(now_ns)
-    key = bounce_notice_key(delivery_id)
+    refusal_reason = str(record.get("reason") or "")
+    key = bounce_notice_key(delivery_id, target, refusal_reason)
     bounce_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
     root = q.delivery_root(home)
     path = root / q.SETTLED_DIR / f"{bounce_id}.json"
@@ -165,7 +180,8 @@ def bounce_to_sender(
     cap_text = f"{kind} ({cap})" if cap is not None else kind
     message = (
         f"[peer-delivery FAILED] your delivery {delivery_id} to {target} was REFUSED "
-        f"{retries} time(s) (cap {cap_text}) and its retry budget is spent; it was never "
+        f"{retries} time(s) (cap {cap_text}) for the same reason each time (last: "
+        f"{refusal_reason or 'unknown'}) and its retry budget is spent; it was never "
         f"delivered. Nothing is still in flight. The original message is quoted below so a "
         f"resend is one call:\n\n{(record.get('message') or '')}"
     )
@@ -181,6 +197,8 @@ def bounce_to_sender(
         "status_detail": f"refused_{outcome}",
         "reason": q.REASON_REFUSED_EXHAUSTED,
         "ref": delivery_id,
+        "refusal_target": target,
+        "refusal_reason": refusal_reason,
         "depth": 1,
         "attempts": 0,
         "reoffer_count": retries,

@@ -323,3 +323,59 @@ def test_a_non_retryable_reason_is_terminal_at_once_and_still_bounces(tmp_path, 
     assert out["deferral"] == "terminal"
     assert out["status"] == q.STATUS_FAILED
     assert _queued(target_home, 1) is None or _queued(target_home, 1)["status"] != q.STATUS_DEFERRED
+
+
+# --------------------------------- (xi) the bounce key is the TRIPLE, identity not content
+def test_the_bounce_key_is_the_TRIPLE_and_is_verifiable_from_the_record(tmp_path, sender_store):
+    """A reader holding the bounce recomputes its key without the code that wrote it."""
+    sender_home = sender_store["alpha"]
+    target_home = sender_store["bravo"]
+    _admit(target_home, 1)
+    record = _queued(target_home, 1)
+    record["reason"] = "queue_full"
+    bounce = notices.bounce_to_sender(record, now_ns=ORIGIN)
+    assert bounce is not None
+    assert bounce["refusal_target"] == "bravo"
+    assert bounce["refusal_reason"] == "queue_full"
+    assert bounce["idempotency_key"] == notices.bounce_notice_key(
+        bounce["ref"], bounce["refusal_target"], bounce["refusal_reason"]), (
+        "the key must be derivable from the record's own fields")
+    assert bounce["idempotency_key"] != bounce["fingerprint"], (
+        "a body hash would file a second bounce the moment the body is re-rendered")
+    assert len(list((_root(sender_home) / q.SETTLED_DIR).glob("*.json"))) == 1
+
+
+def test_a_re_rendered_body_does_not_owe_a_SECOND_bounce(tmp_path, sender_store):
+    """Content changes, identity does not: one brief, one word."""
+    sender_home = sender_store["alpha"]
+    target_home = sender_store["bravo"]
+    _admit(target_home, 1, message="the original words")
+    record = _queued(target_home, 1)
+    record["reason"] = "queue_full"
+    first = notices.bounce_to_sender(record, now_ns=ORIGIN)
+    restyled = dict(record, message="the original words, re-rendered")
+    second = notices.bounce_to_sender(restyled, now_ns=ORIGIN + 90 * SECOND)
+    assert first is not None and second is not None
+    assert first["delivery_id"] == second["delivery_id"]
+    assert len(list((_root(sender_home) / q.SETTLED_DIR).glob("*.json"))) == 1
+
+
+def test_two_DIFFERENT_reasons_for_one_delivery_are_TWO_bounces(tmp_path, sender_store):
+    """Different failures are different facts, and each owes its own word."""
+    sender_home = sender_store["alpha"]
+    target_home = sender_store["bravo"]
+    _admit(target_home, 1)
+    record = _queued(target_home, 1)
+    first = notices.bounce_to_sender(dict(record, reason="queue_full"), now_ns=ORIGIN)
+    second = notices.bounce_to_sender(dict(record, reason="runtime_offline"),
+                                      now_ns=ORIGIN + 90 * SECOND)
+    assert first is not None and second is not None
+    assert first["delivery_id"] != second["delivery_id"], "two facts, two records"
+    assert first["ref"] == second["ref"] == record["delivery_id"]
+    bounces = [q._read(p) for p in (_root(sender_home) / q.SETTLED_DIR).glob("*.json")]
+    assert len(bounces) == 2
+    assert {b["refusal_reason"] for b in bounces} == {"queue_full",
+                                                      "runtime_offline"}
+    # and neither of them may bounce again
+    for b in bounces:
+        assert notices.bounce_to_sender(b, now_ns=ORIGIN) is None
