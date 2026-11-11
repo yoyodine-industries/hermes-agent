@@ -225,8 +225,18 @@ REASON_NEVER_OFFERED = "never_offered"
 #: `retryable(envelope)` is derived from the *envelope reason* only. It is
 #: unrelated to ``retry_action()`` (agent auto-retry) -- never derive one from
 #: the other.
-RETRYABLE_REASONS = frozenset({"queue_full", "runtime_offline"})
+#:
+#: A reason belongs here only if something DRAINS it. ``queue_full`` does not:
+#: 39 of 39 refusals in one measured hour carried attempts=1 at a queue depth of
+#: ZERO -- a FALSE ADMISSION REFUSAL, an in-code defect rather than capacity
+#: (ruling t-76be5e4334 §1). Auto-retrying it turns a loud defect into silent
+#: delay and multiplies the log volume, so ``runtime_offline`` is the only member
+#: until a refusal at depth < cap is impossible.
+RETRYABLE_REASONS = frozenset({"runtime_offline"})
 
+#: Kept for the refusal path that REPORTS capacity (``queue_full_detail``) and for
+#: the drain that will honour it (PR B). Deliberately NOT advertised on a refusal:
+#: no actor reads it yet, and a wait nobody honours is a lie in a payload.
 QUEUE_FULL_RETRY_AFTER_SECONDS = 60.0
 
 _DELIVERY_ID_RE = re.compile(r"[0-9a-f]{32,64}")
@@ -670,11 +680,14 @@ def queue_full_detail(
         cap = max_per_profile()
     else:
         cap = int(per_profile)
-    after = QUEUE_FULL_RETRY_AFTER_SECONDS if retry_after is None else retry_after
+    # The wait is named ONLY when a caller passes one (a drain that will honour it).
+    # Defaulting to 60s put "safe to retry ... after 60s" on a refusal that nothing
+    # drains (ruling t-76be5e4334 §1): the retry advice was the lie, not the refusal.
+    wait = "" if retry_after is None else f" after {int(retry_after)}s"
     scope = "per profile" if limit_kind == LIMIT_PER_PROFILE else "pending from this sender"
     return (
         f"queue full ({cap} {scope}); no reservation was taken — "
-        f"safe to retry with the same idempotency_key after {int(after)}s"
+        f"safe to retry with the same idempotency_key{wait}"
     )
 
 
@@ -726,9 +739,10 @@ class QueueFullError(RuntimeError):
         self.limit_kind = limit_kind
         self.limit = limit
         self.retry_after_seconds = (
-            QUEUE_FULL_RETRY_AFTER_SECONDS
-            if retry_after_seconds is None
-            else float(retry_after_seconds)
+            # None means the refusal promises NO wait (ruling t-76be5e4334 §1):
+            # nothing drains a queue_full, so the old 60.0 default taught senders to
+            # poll a defect. A wait is only ever named when a drain records one.
+            None if retry_after_seconds is None else float(retry_after_seconds)
         )
         super().__init__(
             message or queue_full_detail(limit_kind=limit_kind, limit=limit)
@@ -1856,11 +1870,12 @@ def build_envelope(
     result = _result_for_status(status)
     reason = record.get("reason")
     is_retryable = result == RESULT_FAILED and reason in RETRYABLE_REASONS
-    retry_after: float | None = None
-    if is_retryable and reason == "queue_full":
-        retry_after = QUEUE_FULL_RETRY_AFTER_SECONDS
-    elif is_retryable:
-        retry_after = record.get("retry_after_seconds")
+    # The wait is a fact about THIS record, never a constant attached to a reason:
+    # ``record["retry_after_seconds"]`` is written by a drain that will actually
+    # re-offer the send, so its absence reads as "no known wait", never "60s".
+    retry_after: float | None = (
+        record.get("retry_after_seconds") if is_retryable else None
+    )
 
     if record.get("status_detail") == STATUS_DETAIL_LIVE_OWNER:
         detail: str | None = DETAIL_HELD_LIVE
