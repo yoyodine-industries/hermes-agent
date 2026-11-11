@@ -170,7 +170,10 @@ def test_capacity_per_profile_is_32(tmp_path):
         _admit(tmp_path, 99, sender="sender-99")
     assert excinfo.value.reason == "queue_full"
     assert "cap per_profile (32)" in str(excinfo.value)
-    assert excinfo.value.retry_after_seconds == 60.0
+    # The refusal names the cap and nothing else: nothing drains it, so it advertises
+    # no wait (ruling t-76be5e4334) and its text promises no retry window.
+    assert excinfo.value.retry_after_seconds is None
+    assert "after " not in str(excinfo.value)
     # no reservation was taken: the 33rd delivery left nothing behind
     assert q.queue_depth(tmp_path, target_profile="bravo") == 32
 
@@ -503,11 +506,82 @@ def test_build_envelope_expired_and_unknown(tmp_path):
 
 
 def test_retryable_is_reason_only():
-    assert q.retryable({"result": "failed", "reason": "queue_full"}) is True
+    """Only a reason with a DRAIN behind it is retryable (ruling t-76be5e4334).
+
+    After the store-side deferral, `queue_full` HAS a drain -- the refusal door defers it with
+    backoff and a promoter brings it back -- so it belongs in the set. Membership is now
+    load-bearing (the door reads it), which is why it may only list reasons that are drained.
+    """
     assert q.retryable({"result": "failed", "reason": "runtime_offline"}) is True
+    assert q.retryable({"result": "failed", "reason": "queue_full"}) is True
     assert q.retryable({"result": "failed", "reason": "delivery_failed"}) is False
     assert q.retryable({"result": "receipt", "reason": "queue_full"}) is False
     assert q.retryable({"result": "delivered", "reason": None}) is False
+
+
+def test_the_retryable_set_is_exactly_the_reasons_that_have_a_drain():
+    assert q.RETRYABLE_REASONS == frozenset({"queue_full", "runtime_offline"}), (
+        "adding a reason here is a claim that something DRAINS it; a reason with no actor "
+        "behind it turns `retryable: true` into a lie in a payload -- and removing a drained "
+        "one turns its refusal back into a silent settle"
+    )
+
+
+def test_a_refusal_names_no_wait_it_cannot_back_with_the_store():
+    """A queue_full envelope is retryable (it defers) but never invents the wait.
+
+    The wait is `deferral_delay_seconds(reoffer_count)` -- 60 s doubling to 900 s -- written onto
+    the deferred row. A payload that reported the module constant as if it were the answer would
+    contradict the store it was built from; with no recorded wait it says nothing at all.
+    """
+    env = q.build_envelope(
+        {
+            "status": q.STATUS_FAILED,
+            "reason": "queue_full",
+            "limit_kind": q.LIMIT_PER_SENDER,
+            "limit": 8,
+        }
+    )
+    assert env["retryable"] is True
+    assert env["retry_after_seconds"] is None
+    # ...while the reason still reports the cap that ACTUALLY fired (D6), so the refusal
+    # stays diagnosable without promising a wait.
+    assert env["reason"] == "queue_full"
+    assert "8" in (env["detail"] or "")
+
+    deferred = q.build_envelope(
+        {
+            "status": q.STATUS_DEFERRED,
+            "reason": "queue_full",
+            "limit_kind": q.LIMIT_PER_SENDER,
+            "limit": 8,
+            "retry_after_seconds": q.deferral_delay_seconds(2),
+        }
+    )
+    assert deferred["retry_after_seconds"] == q.deferral_delay_seconds(2) == 240.0, (
+        "a deferred row advertises the wait the STORE recorded, not the 60 s base delay"
+    )
+
+
+def test_the_retry_hint_comes_from_the_record_not_from_a_constant():
+    """`retry_after` is a fact about the record, never a default bolted onto a reason."""
+    with_wait = q.build_envelope(
+        {"status": q.STATUS_FAILED, "reason": "runtime_offline", "retry_after_seconds": 12.0}
+    )
+    assert with_wait["retryable"] is True
+    assert with_wait["retry_after_seconds"] == 12.0
+
+    without = q.build_envelope({"status": q.STATUS_FAILED, "reason": "runtime_offline"})
+    assert without["retryable"] is True
+    assert without["retry_after_seconds"] is None, (
+        "a hardcoded 60.0 taught senders to poll; only a recorded wait is advertised"
+    )
+
+
+def test_the_refusal_exception_does_not_advertise_a_wait():
+    exc = q.QueueFullError("bravo", limit_kind=q.LIMIT_PER_PROFILE, limit=q.max_per_profile())
+    assert exc.reason == "queue_full"
+    assert exc.retry_after_seconds is None
 
 
 def test_notification_text_strings(tmp_path):
@@ -530,7 +604,8 @@ def test_check_capacity_matches_admit_caps(tmp_path):
     with pytest.raises(q.QueueFullError) as exc:
         q.check_capacity(tmp_path, target_profile="bravo", sender_profile="alpha")
     assert exc.value.reason == "queue_full"
-    assert exc.value.retry_after_seconds == 60.0
+    # Nothing drains a refusal, so it advertises no wait (ruling t-76be5e4334 §1).
+    assert exc.value.retry_after_seconds is None
     # A different sender is blocked by the same per-sender cap only for itself.
     q.check_capacity(tmp_path, target_profile="bravo", sender_profile="charlie")
 
@@ -651,9 +726,14 @@ def test_queue_full_envelope_names_the_cap_that_fired():
     per_sender = q.build_envelope(
         {**base, "limit_kind": q.LIMIT_PER_SENDER, "limit": 8})
     assert per_sender["result"] == q.RESULT_FAILED
+    # The refusal stays diagnosable (cap named, D6) and now carries the retry flag the
+    # deferral door reads -- but promises no wait, because the wait is a fact the store
+    # records on the deferred row (ruling t-76be5e4334).
     assert per_sender["retryable"] is True
+    assert per_sender["retry_after_seconds"] is None
     assert "cap per_sender (8)" in per_sender["detail"]
     assert "per_profile" not in per_sender["detail"]
+    assert "after " not in per_sender["detail"]  # no invented wait window
 
     per_profile = q.build_envelope(
         {**base, "limit_kind": q.LIMIT_PER_PROFILE, "limit": q.max_per_profile()})
