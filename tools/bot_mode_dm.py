@@ -539,6 +539,13 @@ def _delivery_attempt_log() -> Path:
     return base / "bot_delivery_attempts.jsonl"
 
 
+#: Codes this module EMITS that the closed vocabulary spells differently. `runtime_unavailable`
+#: is what a held/unavailable live target reports here; the vocabulary's word for a target that is
+#: down is `runtime_offline`. Without this map a target that is down today emits a code NO set
+#: knows, and reading the field would still classify it final.
+_REASON_ALIASES = {"runtime_unavailable": "runtime_offline"}
+
+
 def _retryable_reason(exc: BaseException) -> str:
     """The retryable reason carried by an admission failure, or "" when it is final.
 
@@ -550,11 +557,61 @@ def _retryable_reason(exc: BaseException) -> str:
         retryable = delivery_queue.RETRYABLE_REASONS
     except Exception:  # pragma: no cover - the queue module is always importable in the agent
         return ""
+    # THE FIELD FIRST. Every refusal exception already CARRIES its code as an attribute -
+    # `EnvelopeRefusedError.reason` (bot_relay.py), `LiveTargetUnavailableError.reason` - so
+    # scanning a rendering is the defect this fix exists to remove, one layer in: a code that
+    # never appears verbatim in its own message (`runtime_offline` is raised with the text
+    # "<lane> is offline right now ...") is invisible to a substring scan, and it classified a
+    # DEFINITE NO-SEND as final - resending was safe and the sender was told not to.
+    carried = getattr(exc, "reason", None)
+    if isinstance(carried, str) and carried.strip():
+        code = _REASON_ALIASES.get(carried.strip(), carried.strip())
+        return code if code in retryable else ""
+    # The substring scan survives ONLY as the fallback for an exception that carries no code -
+    # not as the primary read, and never in preference to an attribute that is present.
     text = str(exc)
     for reason in sorted(retryable):
         if reason and reason in text:
             return reason
     return ""
+
+
+#: How many TRAILING log rows the attempt counter reads. The ack path re-reads this log on every
+#: refusal, so a full-file read makes the worst day quadratic in the number of refusals (measured:
+#: 800 rows is nothing, and nothing is not a retention policy). THE BOUND IS THE RETENTION: only the
+#: last _ATTEMPT_SCAN_WINDOW rows are counted, so retries of one delivery are counted exactly as
+#: long as fewer than this many OTHER refusals arrive between them - which at the observed rate is
+#: hours, and the ack still names an attempt number either way. A log that grows past this without
+#: rotation is a retention question for the store owner, not a reason to scan it whole on the hot
+#: path.
+_ATTEMPT_SCAN_WINDOW = 4096
+
+
+def _tail_rows(path, window):
+    """The last ``window`` JSON rows of an append-only log, read from the END of the file."""
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            block = 65536
+            data = b""
+            pos = size
+            while pos > 0 and data.count(b"\n") <= window:
+                step = min(block, pos)
+                pos -= step
+                stream.seek(pos)
+                data = stream.read(step) + data
+    except OSError:
+        return []
+    rows = []
+    for line in data.decode("utf-8", "replace").splitlines()[-window:]:
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
 
 
 def _record_admission_attempt(dm_file: str, exc: BaseException, *, reason: str,
@@ -566,14 +623,9 @@ def _record_admission_attempt(dm_file: str, exc: BaseException, *, reason: str,
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    try:
-                        row = json.loads(line)
-                    except ValueError:
-                        continue
-                    if row.get("delivery_id") == delivery_id:
-                        attempt += 1
+            for row in _tail_rows(path, _ATTEMPT_SCAN_WINDOW):
+                if row.get("delivery_id") == delivery_id:
+                    attempt += 1
         row = dict(at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                    delivery_id=delivery_id, reason=reason or None,
                    retryable=bool(reason), attempt=attempt,
