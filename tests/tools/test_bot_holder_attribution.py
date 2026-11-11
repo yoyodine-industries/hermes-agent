@@ -293,7 +293,17 @@ def _run_refused_turn(tmp_path, monkeypatch, capsys, owner_entry):
     monkeypatch.setattr("tools.bot_live_delivery.find_canonical_owner",
                         lambda home: None if owner_entry is None else dict(owner_entry))
     monkeypatch.setattr(bot_mode_dm.subprocess, "run", lambda *a, **k: _RefusingProc())
-    rc = bot_mode_dm._run_local_turn(["hermes", "-p", "ops", "chat"], str(dm))
+
+    def _held(*_args, **_kwargs):
+        raise bot_mode_dm.LiveTargetHeldError("Bot Chat is held by another session writer")
+
+    # THE MERGED ENTRY, not the fork's `_run_local_turn` (which this merge dropped): the
+    # held path is `_admit_live_dm` raising `LiveTargetHeldError` inside `_run_delivery`,
+    # answered by `_settled_no_send`. Driving it here means the green lane exercises the
+    # code production runs; the fork function's absence is the proof it used to be a test
+    # over a symbol nothing called.
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", _held)
+    rc = bot_mode_dm._run_delivery(["hermes", "-p", "ops", "chat"], str(dm), stdin_file=False)
     return rc, json.loads(capsys.readouterr().out.strip())
 
 

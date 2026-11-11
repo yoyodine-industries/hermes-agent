@@ -1,0 +1,41 @@
+name: fork-symbol-census
+
+# A census that only runs when someone remembers is a census that runs never (ruling
+# t-df0c4501f3 (4b)). So it runs in the two places the silent-loss mode is created:
+#   * on every PR that touches the files carrying the fork's held-receipt machinery;
+#   * on the MERGE RESULT after a merge lands on overrides/live, where HEAD's two parents are
+#     the fork delta the census is derived from.
+on:
+  pull_request:
+    paths:
+      - tools/bot_live_delivery.py
+      - tools/bot_mode_dm.py
+      - tui_gateway/methods_bot_relay.py
+      - scripts/fork_symbol_census.py
+      - .github/workflows/fork-symbol-census.yml
+  push:
+    branches:
+      - overrides/live
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # the census reads both parents; a shallow clone cannot answer
+      - name: Census the fork delta (absent OR unreferenced fork symbols fail)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            python3 scripts/fork_symbol_census.py --repo . \
+              --fork "${{ github.event.pull_request.head.sha }}" \
+              --upstream-base "${{ github.event.pull_request.base.sha }}"
+          else
+            # A push to overrides/live is the merge result: HEAD^1/HEAD^2 are its two parents.
+            python3 scripts/fork_symbol_census.py --repo .
+          fi

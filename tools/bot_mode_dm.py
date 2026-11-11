@@ -523,7 +523,49 @@ def _unavailable_payload(dm_file: str, exc: LiveTargetUnavailableError) -> str:
                        "error": f"{exc} — the message was NOT sent; it is safe to resend {exc.resend}."})
 
 
-def _settled_no_send(dm_file: str, exc: LiveTargetUnavailableError) -> str:
+def _held_receipt(dm_file: str, exc: LiveTargetUnavailableError,
+                  profile_home: Path | None) -> dict | None:
+    """The HELD receipt, re-expressed inside the MERGED runner (ruling t-df0c4501f3 (b)).
+
+    A chat held by a live owner is a RETAINED delivery, and a retained delivery owes its
+    sender the receipt it always owed: ``status_detail=live_owner_present``, ``busy``,
+    ``attempts`` 0, and the holder - surface, session, pid, age - beside the refusal that
+    says the chat is held, in one place. Re-expressed HERE because the fork's local
+    transport, which used to print this receipt, is not in the merged runner: a test over
+    that function stayed green forever while production answered a bare ``reason``.
+    Only a HELD error gets this shape; every other unavailable outcome keeps the definite
+    no-send payload, which is a refusal and not a receipt.
+    """
+    if not isinstance(exc, LiveTargetHeldError):
+        return None
+    from tools import bot_delivery_queue as delivery_queue
+
+    profile = ""
+    try:
+        intent = json.loads(Path(_live_intent_file(dm_file)).read_text(encoding="utf-8-sig"))
+        profile = str(((intent.get("owner") or {}) if isinstance(intent, dict) else {}).get("profile") or "")
+    except Exception:  # noqa: BLE001 - the profile is a label; the receipt must not depend on it
+        profile = ""
+    holder = None
+    if profile_home is not None:
+        try:
+            from tools.bot_live_delivery import find_canonical_owner
+            from tools.bot_relay import holder_from_live_owner
+            # ONE projector for every surface that names a live owner: the registry entry is
+            # raw (surface/session/pid/started_at), and `holder_from_live_owner` is what adds
+            # `kind: live_owner`, `alive` and the age the receipt's detail line formats. A
+            # second spelling here would drift from the refusal wording.
+            entry = find_canonical_owner(profile_home)
+            holder = holder_from_live_owner(entry) if entry else None
+        except Exception:  # noqa: BLE001 - best-effort by contract: unknown holder, no loss
+            holder = None
+    return _delivery_receipt(_dm_delivery_id(dm_file), profile,
+                             status_detail=delivery_queue.STATUS_DETAIL_LIVE_OWNER,
+                             holder=holder)
+
+
+def _settled_no_send(dm_file: str, exc: LiveTargetUnavailableError,
+                     profile_home: Path | None = None) -> str:
     """The answer to a definite no-send, for both the tool and its runner: first the payload and
     any pinned intent go, so nothing local can rebuild or replay the delivery. A file that is still
     there is not settlement: the answer is then the unknown outcome, never "safe to resend"."""
@@ -534,6 +576,9 @@ def _settled_no_send(dm_file: str, exc: LiveTargetUnavailableError) -> str:
             left.append(path)
     if left:
         return _live_outcome_unknown(dm_file, f"could not remove {left[0]}")
+    receipt = _held_receipt(dm_file, exc, profile_home)
+    if receipt is not None:
+        return json.dumps(receipt)
     return _unavailable_payload(dm_file, exc)
 
 
@@ -731,8 +776,13 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
             try:
                 record = _admit_live_dm(home, dm_file, author)
             except LiveTargetHeldError as exc:
-                print(_settled_no_send(dm_file, exc))  # the owner settled the id: drop the payload too
-                return 1
+                # A HELD CHAT IS A DURABLE HAND-OFF, NEVER A FAILURE (§5.2/P12): the owner
+                # settled the id as never-sent and the receipt is the answer, so the runner
+                # resolves 0. It resolved 1 while the receipt was a bare ``reason`` only —
+                # a retained delivery reported as a death is what makes a sender retry a
+                # message the queue already owns.
+                print(_settled_no_send(dm_file, exc, profile_home=home))
+                return 0
             except LiveTargetUnavailableError as exc:
                 print(_unavailable_payload(dm_file, exc))
                 return 1
@@ -786,7 +836,7 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
         try:
             record = _admit_live_dm(profile_home, dm_file, author)
         except LiveTargetUnavailableError as exc:
-            return _settled_no_send(dm_file, exc)
+            return _settled_no_send(dm_file, exc, profile_home=profile_home)
         except Exception as exc:
             return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
                 "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
