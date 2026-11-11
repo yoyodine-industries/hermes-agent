@@ -706,3 +706,85 @@ def test_queue_full_envelope_names_the_cap_that_fired():
     # A row that lost the fired cap (an older record) reads as it always did.
     legacy = q.build_envelope(base)
     assert f"{q.max_per_profile()} per profile" in legacy["detail"]
+
+# --------------------------------------------------------------------------------------
+# THE OBSERVATION AND THE STORE MUST BE THE SAME OBJECT (evidence from the live host,
+# 2026-11-11): a refusal was read as "2 of 32 in flight" by pairing one store's settled count
+# with another store's in-flight count. A count, a store and an instant travel together or the
+# number is not falsifiable.
+# --------------------------------------------------------------------------------------
+def test_the_observation_carries_THE_INSTANT_it_was_taken(tmp_path):
+    """Inflight moves; a count without a time cannot be reconciled later.
+
+    Measured on the host: one store read `0 queued / 0 claimed` at 16:45Z and `queue 3 /
+    claimed 1` hours later, with no refusal in between. Both readings are true, and only the
+    instant tells a FALSE number from a STALE one.
+    """
+    for n in range(1, 33):
+        _admit(tmp_path, n, sender=f"sender-{n}")
+    before = q.time.time_ns()
+    with pytest.raises(q.QueueFullError) as excinfo:
+        _admit(tmp_path, 99, sender="sender-99")
+    err = excinfo.value
+    assert err.as_of_ns is not None and before <= err.as_of_ns <= q.time.time_ns()
+    text = str(err)
+    assert "as of " in text and text.rstrip().endswith("Z") is False  # instant sits mid-sentence
+    stamp = text.split("as of ", 1)[1].split()[0].rstrip(";,)")
+    assert stamp.endswith("Z") and len(stamp) == len("2026-11-11T16:45:40.940Z")
+    assert stamp == q.iso_ns(err.as_of_ns), "the printed instant must be the stamped one"
+
+
+def test_a_refusal_never_reports_ANOTHER_STORES_COUNT(tmp_path):
+    """The pairing defect, pinned: the store named is the store counted, per target.
+
+    Two homes, each saturated for a DIFFERENT target. A refusal measured in one may not carry
+    the other's count or path, and a target that is empty in a home must not refuse because a
+    different target is full in it -- that is how "2 of 32" was assembled from two objects.
+    """
+    home_a, home_b = tmp_path / "a", tmp_path / "b"
+    home_a.mkdir(); home_b.mkdir()
+    for n in range(1, 33):
+        _admit(home_a, n, sender=f"a-{n}", target="alpha")
+        _admit(home_b, n, sender=f"b-{n}", target="bravo")
+
+    with pytest.raises(q.QueueFullError) as exc_a:
+        q.check_capacity(home_a, target_profile="alpha", sender_profile="late")
+    with pytest.raises(q.QueueFullError) as exc_b:
+        q.check_capacity(home_b, target_profile="bravo", sender_profile="late")
+    err_a, err_b = exc_a.value, exc_b.value
+
+    assert err_a.store == str(q.delivery_root(home_a))
+    assert err_b.store == str(q.delivery_root(home_b))
+    assert err_a.measured == err_b.measured == 32
+    assert str(q.delivery_root(home_b)) not in str(err_a)
+    assert str(q.delivery_root(home_a)) not in str(err_b)
+
+    # the pairing that produced the false reading: a full target elsewhere is NOT this target
+    q.check_capacity(home_a, target_profile="bravo", sender_profile="late")   # 0 here: no raise
+    assert q.queue_depth(home_a, target_profile="bravo") == 0
+    assert q.queue_depth(home_a, target_profile="alpha") == 32
+
+
+def test_the_gateway_persists_the_whole_observation_not_just_the_cap():
+    """The durable row is what a later reader has; the exception text dies with the process."""
+    err = q.QueueFullError(
+        "bravo", limit_kind=q.LIMIT_PER_PROFILE, limit=32,
+        producer="tools.bot_delivery_queue:check_capacity",
+        measured=31, store="/tmp/home/runtime/bot_delivery", as_of_ns=1794415539568475000,
+    )
+    evidence = q.queue_full_evidence(err)
+    assert evidence == {
+        "limit_kind": q.LIMIT_PER_PROFILE,
+        "limit": 32,
+        "producer": "tools.bot_delivery_queue:check_capacity",
+        "measured": 31,
+        "store": "/tmp/home/runtime/bot_delivery",
+        "as_of_ns": 1794415539568475000,
+    }
+
+
+def test_a_bare_error_carries_no_invented_evidence():
+    """A gate that measured nothing says so; no field is filled in with a plausible default."""
+    err = q.QueueFullError("bravo")
+    assert err.measured is None and err.store is None and err.as_of_ns is None
+    assert "measured" not in str(err) and "as of" not in str(err)

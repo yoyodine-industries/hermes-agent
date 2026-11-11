@@ -31,6 +31,17 @@ from typing import Any, Dict, List, Optional, Tuple
 _PROFILE_REJECTED = object()
 
 
+def _queue_full_evidence(exc: Any) -> dict[str, Any]:
+    """Persist the observation with the record: see ``tools.bot_delivery_queue.queue_full_evidence``.
+
+    The exception text dies with the process; the durable row is what a later reader has, so the
+    cap, the measured count, the store it was measured in and the instant all ride the record.
+    """
+    from tools.bot_delivery_queue import queue_full_evidence
+
+    return queue_full_evidence(exc)
+
+
 def _prefix_names_served_profile(profile: str) -> bool:
     """True when a /p/<profile>/ prefix names the profile this gateway serves. Fail closed: a
     single-profile gateway answering /p/<x>/ served the owner's toolsets under another URL."""
@@ -3480,9 +3491,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     {"delivery_status": delivery_queue.STATUS_FAILED,
                      "reason": "queue_full", "created_at": time.time(),
                      # VERIFICATION D6: name the cap that actually fired (per-sender
-                     # vs per-profile), not the historical per-profile default.
-                     "limit_kind": getattr(exc, "limit_kind", None),
-                     "limit": getattr(exc, "limit", None)},
+                     # vs per-profile), not the historical per-profile default -- and carry the
+                     # whole observation (producer, measured count, store, instant), because the
+                     # record is what a later reader has, not the exception text.
+                     **_queue_full_evidence(exc)},
                     delivery_id=delivery_id, idempotency_key=idempotency_key,
                     target_profile=target_profile, sender_profile=sender_profile,
                     session_id=session_id)))
@@ -3545,9 +3557,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     {"delivery_status": delivery_queue.STATUS_FAILED,
                      "reason": "queue_full", "created_at": time.time(),
                      # VERIFICATION D6: name the cap that actually fired (per-sender
-                     # vs per-profile), not the historical per-profile default.
-                     "limit_kind": getattr(exc, "limit_kind", None),
-                     "limit": getattr(exc, "limit", None)},
+                     # vs per-profile), not the historical per-profile default -- and carry the
+                     # whole observation (producer, measured count, store, instant), because the
+                     # record is what a later reader has, not the exception text.
+                     **_queue_full_evidence(exc)},
                     delivery_id=delivery_id, idempotency_key=idempotency_key,
                     target_profile=target_profile, sender_profile=sender_profile,
                     session_id=session_id)))

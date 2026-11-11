@@ -652,6 +652,36 @@ def expiry_classification(
     return REASON_QUEUED_EXPIRED, expired_detail(ttl_seconds)
 
 
+def queue_full_evidence(exc: "QueueFullError") -> dict[str, Any]:
+    """The OBSERVATION a ``queue_full`` refusal was measured with, ready to PERSIST.
+
+    A bare ``queue_full`` is not reversible: two gates emit it (the sender-side queue and the
+    receiver's admission path), a count means nothing without the store it was taken from, and
+    the store means nothing without the instant. Measured 2026-11-11 on this host: one store read
+    ``0 queued / 0 claimed`` at 16:45Z and ``queue 3 / claimed 1`` hours later with no refusal in
+    between -- so a count and a store can be paired from different objects, and can be right and
+    still unreconcilable when the instant is missing.
+
+    Lives HERE, beside the exception, because the shape is the queue's own vocabulary: the
+    gateway persists it and a notification/census reader reconstructs it, and three copies of
+    these five field names would be the vocabulary defect this module already fought.
+    """
+    return {
+        "limit_kind": getattr(exc, "limit_kind", None),
+        "limit": getattr(exc, "limit", None),
+        "producer": getattr(exc, "producer", None),
+        "measured": getattr(exc, "measured", None),
+        "store": getattr(exc, "store", None),
+        "as_of_ns": getattr(exc, "as_of_ns", None),
+    }
+
+
+def iso_ns(ns: int | float) -> str:
+    """UTC ISO-8601 to the millisecond from a nanosecond stamp (no tz database needed)."""
+    seconds, frac = divmod(int(ns), 1_000_000_000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + ".%03dZ" % (frac // 1_000_000)
+
+
 def queue_full_detail(
     per_profile: int | None = None,
     retry_after: float | None = None,
@@ -661,6 +691,7 @@ def queue_full_detail(
     producer: str | None = None,
     measured: int | None = None,
     store: str | None = None,
+    as_of_ns: int | None = None,
 ) -> str:
     """Name the cap that actually refused the send (VERIFICATION D6), and WHO measured it.
 
@@ -683,13 +714,22 @@ def queue_full_detail(
     after = QUEUE_FULL_RETRY_AFTER_SECONDS if retry_after is None else retry_after
     scope = "per profile" if limit_kind == LIMIT_PER_PROFILE else "pending from this sender"
     evidence = ""
-    if producer is not None or measured is not None or store is not None:
+    if (producer is not None or measured is not None or store is not None
+            or as_of_ns is not None):
         parts = []
         parts.append(f"measured {int(measured)}/{cap}" if measured is not None else f"cap {cap}")
         if producer is not None:
             parts.append(f"at {producer}")
         if store is not None:
             parts.append(f"in {store}")
+        # A COUNT WITHOUT AN INSTANT CANNOT BE RECONCILED WITH A STORE. In-flight records move
+        # minute to minute (measured 2026-11-11: one host store read `0 queued / 0 claimed` at
+        # 16:45Z and `queue 3 / claimed 1` hours later, with no refusal in between), so "measured
+        # 0/32 in <store>" and the same store reading 32 later are not a contradiction -- they are
+        # two instants. The observation therefore carries WHEN it was taken, in UTC, to the
+        # millisecond: a reader can then tell a false number from a stale one.
+        if as_of_ns is not None:
+            parts.append(f"as of {iso_ns(as_of_ns)}")
         evidence = "; " + " ".join(parts)
     return (
         f"queue full ({cap} {scope}{evidence}); no reservation was taken — "
@@ -747,6 +787,7 @@ class QueueFullError(RuntimeError):
         producer: str | None = None,
         measured: int | None = None,
         store: str | None = None,
+        as_of_ns: int | None = None,
     ) -> None:
         self.profile = profile
         self.limit_kind = limit_kind
@@ -754,6 +795,7 @@ class QueueFullError(RuntimeError):
         self.producer = producer
         self.measured = measured
         self.store = store
+        self.as_of_ns = as_of_ns
         self.retry_after_seconds = (
             QUEUE_FULL_RETRY_AFTER_SECONDS
             if retry_after_seconds is None
@@ -761,7 +803,8 @@ class QueueFullError(RuntimeError):
         )
         super().__init__(
             message or queue_full_detail(limit_kind=limit_kind, limit=limit,
-                                         producer=producer, measured=measured, store=store)
+                                         producer=producer, measured=measured, store=store,
+                                         as_of_ns=as_of_ns)
         )
 
 
@@ -1008,6 +1051,7 @@ def admit(
                 producer="tools.bot_delivery_queue:admit",
                 measured=pending_target,
                 store=str(root),
+                as_of_ns=now_ns,
             )
         pending_sender = _pending(root, target_profile=target_profile,
                                   sender_profile=sender_profile)
@@ -1019,6 +1063,7 @@ def admit(
                 producer="tools.bot_delivery_queue:admit",
                 measured=pending_sender,
                 store=str(root),
+                as_of_ns=now_ns,
             )
 
         sequence = max(int(sequence_hint or 0), _high_water(root) + 1)
@@ -1803,6 +1848,7 @@ def check_capacity(
     without :func:`admit`'s write.
     """
     with _locked(home) as root:
+        now_ns = time.time_ns()
         pending_target = _pending(root, target_profile=target_profile)
         if pending_target >= max_per_profile():
             raise QueueFullError(
@@ -1812,6 +1858,7 @@ def check_capacity(
                 producer="tools.bot_delivery_queue:check_capacity",
                 measured=pending_target,
                 store=str(root),
+                as_of_ns=now_ns,
             )
         pending_sender = _pending(root, target_profile=target_profile,
                                   sender_profile=sender_profile)
@@ -1823,6 +1870,7 @@ def check_capacity(
                 producer="tools.bot_delivery_queue:check_capacity",
                 measured=pending_sender,
                 store=str(root),
+                as_of_ns=now_ns,
             )
 
 
