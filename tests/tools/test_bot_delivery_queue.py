@@ -74,10 +74,14 @@ def _settled_path(home, n):
 
 # ---------------------------------------------------------------- vocabulary
 def test_no_target_busy_in_vocabulary():
-    assert len(q.STATUSES) == 7
+    # 8 since t-76be5e4334: `deferred` is a first-class state (a retryable refusal waiting out
+    # its backoff), and `target_busy` is still NOT a status -- contention is expressed as
+    # `queued` + a status_detail, which is why the count is 8 and not 9.
+    assert len(q.STATUSES) == 8
     assert "target_busy" not in q.STATUSES
     assert set(q.STATUSES) == {
         "queued",
+        "deferred",
         "running",
         "delivered",
         "failed",
