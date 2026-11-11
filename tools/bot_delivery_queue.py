@@ -658,11 +658,21 @@ def queue_full_detail(
     *,
     limit_kind: str = LIMIT_PER_PROFILE,
     limit: int | None = None,
+    producer: str | None = None,
+    measured: int | None = None,
+    store: str | None = None,
 ) -> str:
-    """Name the cap that actually refused the send (VERIFICATION D6).
+    """Name the cap that actually refused the send (VERIFICATION D6), and WHO measured it.
 
     A send refused by the per-sender cap was previously reported as
     ``queue full (32 per profile)`` -- an operator would raise the wrong limit.
+
+    The producer half answers a second, worse confusion (t-472882212f): ``queue_full`` is emitted by
+    more than one gate, and a bare "queue full" is read as "this sender queue is full" even when the
+    gate that refused is the receiver's admission path and this queue is empty. So when the refusal
+    knows them, it carries the producer (``module:function``), the MEASURED count against the cap,
+    and the store path it was measured in -- a reader can then tell "measured 31/32 here" from
+    "something else said a word containing full".
     """
     if limit is not None:
         cap = int(limit)
@@ -672,8 +682,17 @@ def queue_full_detail(
         cap = int(per_profile)
     after = QUEUE_FULL_RETRY_AFTER_SECONDS if retry_after is None else retry_after
     scope = "per profile" if limit_kind == LIMIT_PER_PROFILE else "pending from this sender"
+    evidence = ""
+    if producer is not None or measured is not None or store is not None:
+        parts = []
+        parts.append(f"measured {int(measured)}/{cap}" if measured is not None else f"cap {cap}")
+        if producer is not None:
+            parts.append(f"at {producer}")
+        if store is not None:
+            parts.append(f"in {store}")
+        evidence = "; " + " ".join(parts)
     return (
-        f"queue full ({cap} {scope}); no reservation was taken — "
+        f"queue full ({cap} {scope}{evidence}); no reservation was taken — "
         f"safe to retry with the same idempotency_key after {int(after)}s"
     )
 
@@ -705,10 +724,14 @@ def build_notification_text(record: dict[str, Any]) -> str:
 # errors
 # --------------------------------------------------------------------------
 class QueueFullError(RuntimeError):
-    """Raised by :func:`admit` when the per-profile or per-sender cap is met.
+    """Raised when a delivery is refused for capacity -- and it says WHICH capacity.
 
-    ``QUEUE_FULL`` is the only new failure reason; there is no ``target_busy``
-    reason anywhere in the vocabulary.
+    ``QUEUE_FULL`` is the reason code, but it is not a diagnosis: the sender's queue and the
+    receiver's admission path both refuse in its name, and a reader who assumes the sender's queue
+    raises the wrong limit or waits on a gate that is not the one that fired. So the error carries
+    ``producer`` (``module:function``), ``measured`` (the count the producer compared against the
+    cap) and ``store`` (where it was measured). Target-side pressure is a DIFFERENT concept --
+    see :data:`STATUS_DETAIL_TARGET_BUSY` -- and a target backlog must not travel as this reason.
     """
 
     reason = "queue_full"
@@ -721,17 +744,24 @@ class QueueFullError(RuntimeError):
         limit: int | None = None,
         message: str | None = None,
         retry_after_seconds: float | None = None,
+        producer: str | None = None,
+        measured: int | None = None,
+        store: str | None = None,
     ) -> None:
         self.profile = profile
         self.limit_kind = limit_kind
         self.limit = limit
+        self.producer = producer
+        self.measured = measured
+        self.store = store
         self.retry_after_seconds = (
             QUEUE_FULL_RETRY_AFTER_SECONDS
             if retry_after_seconds is None
             else float(retry_after_seconds)
         )
         super().__init__(
-            message or queue_full_detail(limit_kind=limit_kind, limit=limit)
+            message or queue_full_detail(limit_kind=limit_kind, limit=limit,
+                                         producer=producer, measured=measured, store=store)
         )
 
 
@@ -969,20 +999,26 @@ def admit(
         if existing is not None:
             return dict(existing)
 
-        if _pending(root, target_profile=target_profile) >= max_per_profile():
+        pending_target = _pending(root, target_profile=target_profile)
+        if pending_target >= max_per_profile():
             raise QueueFullError(
                 target_profile,
                 limit_kind=LIMIT_PER_PROFILE,
                 limit=max_per_profile(),
+                producer="tools.bot_delivery_queue:admit",
+                measured=pending_target,
+                store=str(root),
             )
-        if (
-            _pending(root, target_profile=target_profile, sender_profile=sender_profile)
-            >= max_per_sender()
-        ):
+        pending_sender = _pending(root, target_profile=target_profile,
+                                  sender_profile=sender_profile)
+        if pending_sender >= max_per_sender():
             raise QueueFullError(
                 target_profile,
                 limit_kind=LIMIT_PER_SENDER,
                 limit=max_per_sender(),
+                producer="tools.bot_delivery_queue:admit",
+                measured=pending_sender,
+                store=str(root),
             )
 
         sequence = max(int(sequence_hint or 0), _high_water(root) + 1)
@@ -1767,20 +1803,26 @@ def check_capacity(
     without :func:`admit`'s write.
     """
     with _locked(home) as root:
-        if _pending(root, target_profile=target_profile) >= max_per_profile():
+        pending_target = _pending(root, target_profile=target_profile)
+        if pending_target >= max_per_profile():
             raise QueueFullError(
                 target_profile,
                 limit_kind=LIMIT_PER_PROFILE,
                 limit=max_per_profile(),
+                producer="tools.bot_delivery_queue:check_capacity",
+                measured=pending_target,
+                store=str(root),
             )
-        if (
-            _pending(root, target_profile=target_profile, sender_profile=sender_profile)
-            >= max_per_sender()
-        ):
+        pending_sender = _pending(root, target_profile=target_profile,
+                                  sender_profile=sender_profile)
+        if pending_sender >= max_per_sender():
             raise QueueFullError(
                 target_profile,
                 limit_kind=LIMIT_PER_SENDER,
                 limit=max_per_sender(),
+                producer="tools.bot_delivery_queue:check_capacity",
+                measured=pending_sender,
+                store=str(root),
             )
 
 

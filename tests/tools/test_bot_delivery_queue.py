@@ -165,10 +165,58 @@ def test_capacity_per_profile_is_32(tmp_path):
     with pytest.raises(q.QueueFullError) as excinfo:
         _admit(tmp_path, 99, sender="sender-99")
     assert excinfo.value.reason == "queue_full"
-    assert "queue full (32 per profile)" in str(excinfo.value)
+    assert "queue full (32 per profile" in str(excinfo.value)
     assert excinfo.value.retry_after_seconds == 60.0
     # no reservation was taken: the 33rd delivery left nothing behind
     assert q.queue_depth(tmp_path, target_profile="bravo") == 32
+
+
+def test_the_refusal_names_its_producer_and_its_measurement(tmp_path):
+    """t-472882212f (1): ``queue_full`` has more than one producer, so the refusal names which.
+
+    A reader who is told only "queue full" cannot tell a saturated sender queue from a gate that
+    lives in another module and refuses a different thing, and the remedies differ (drain vs raise a
+    cap vs retry). The evidence travels IN the refusal: producer, the count actually measured, and
+    the store it was measured in.
+    """
+    for n in range(1, 33):
+        _admit(tmp_path, n, sender=f"sender-{n}")
+    with pytest.raises(q.QueueFullError) as excinfo:
+        _admit(tmp_path, 99, sender="sender-99")
+    err = excinfo.value
+    assert err.producer == "tools.bot_delivery_queue:admit"
+    assert err.measured == 32
+    assert err.store == str(q.delivery_root(tmp_path))
+    text = str(err)
+    assert "measured 32/32" in text
+    assert "at tools.bot_delivery_queue:admit" in text
+    assert str(q.delivery_root(tmp_path)) in text
+    # the cap is still named, and the retry advice is unchanged for a sender-side refusal
+    assert "32 per profile" in text and "safe to retry" in text
+
+
+def test_check_capacity_names_itself_not_admit(tmp_path):
+    """The pre-write check is a DISTINCT producer and must not be read as ``admit``'s refusal.
+
+    ``check_capacity`` refuses before any reservation exists; folding both into one name would
+    restore exactly the ambiguity this card is about -- two gates, one string.
+    """
+    for n in range(1, 33):
+        _admit(tmp_path, n, sender=f"sender-{n}")
+    with pytest.raises(q.QueueFullError) as excinfo:
+        q.check_capacity(tmp_path, target_profile="bravo", sender_profile="late")
+    err = excinfo.value
+    assert err.producer == "tools.bot_delivery_queue:check_capacity"
+    assert err.measured == 32
+    assert "tools.bot_delivery_queue:check_capacity" in str(err)
+
+
+def test_a_bare_detail_prints_no_dangling_evidence():
+    """Back-compat: a caller that knows no producer still gets a clean sentence (no ``; `` stub)."""
+    text = q.queue_full_detail()
+    assert text.startswith("queue full (")
+    assert "measured" not in text and " at " not in text
+    assert "; ; " not in text and "();" not in text
 
 
 def test_capacity_per_sender_is_8(tmp_path):
