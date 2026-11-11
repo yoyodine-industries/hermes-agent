@@ -226,17 +226,36 @@ REASON_NEVER_OFFERED = "never_offered"
 #: unrelated to ``retry_action()`` (agent auto-retry) -- never derive one from
 #: the other.
 #:
-#: A reason belongs here only if something DRAINS it. ``queue_full`` does not:
-#: 39 of 39 refusals in one measured hour carried attempts=1 at a queue depth of
-#: ZERO -- a FALSE ADMISSION REFUSAL, an in-code defect rather than capacity
-#: (ruling t-76be5e4334 §1). Auto-retrying it turns a loud defect into silent
-#: delay and multiplies the log volume, so ``runtime_offline`` is the only member
-#: until a refusal at depth < cap is impossible.
+#: A reason belongs in this set only if something DRAINS it. That is the whole rule, and
+#: membership has never been more than DESCRIBE-ONLY: measured on this module,
+#: ``RETRYABLE_REASONS`` is consumed at exactly two call sites -- :func:`retryable` and
+#: :func:`build_envelope` -- :func:`retryable` has NO caller outside the tests, and
+#: ``retry_after_seconds`` is written onto a refusal record and read by nothing but the
+#: envelope's own echo of it (no sender and no drain acts on it). So removing a reason here
+#: changes what a payload SAYS, never what production DOES.
+#:
+#: ``queue_full`` is not a member because nothing drains it. The story that put it out is
+#: motivation, not the rule: 39 of 39 refusals in one measured hour carried attempts=1 at a
+#: queue depth of ZERO -- a FALSE ADMISSION REFUSAL, an in-code defect rather than capacity
+#: (ruling t-76be5e4334) -- and the payload's advice ("safe to retry ... after 60s") was the
+#: lie, not the refusal itself.
+#:
+#: WHEN PART 2 LANDS the store-side deferral, a ``queue_full`` refusal IS drained -- and then
+#: this set must either take ``queue_full`` BACK or be RETIRED as a legacy describe-only
+#: surface. A describe-only set that contradicts the store is the same lie this set exists to
+#: prevent, one layer down. Do not leave both.
+#:
+#: SCOPE OF THAT CLAIM: "describe-only" is measured INSIDE THIS REPO. The drain lives outside
+#: it (``claim_next`` has no production caller; ``bot_mode_dm.py`` records that the Desktop
+#: drains), so what an EXTERNAL reader does with ``retryable: false`` is unobservable from
+#: here. That is exactly why part 2 must enforce the deferral in the STORE (status
+#: ``deferred`` + ``not_before_ns``) rather than in this flag: then no external reader can see
+#: a deferred record early, whatever it believes about the boolean.
 RETRYABLE_REASONS = frozenset({"runtime_offline"})
 
-#: Kept for the refusal path that REPORTS capacity (``queue_full_detail``) and for
-#: the drain that will honour it (PR B). Deliberately NOT advertised on a refusal:
-#: no actor reads it yet, and a wait nobody honours is a lie in a payload.
+#: Kept for the refusal path that REPORTS capacity (``queue_full_detail``) and for the drain
+#: that will honour it (PR B). Deliberately NOT advertised on a refusal: no actor reads it
+#: yet, and a wait nobody honours is a lie in a payload.
 QUEUE_FULL_RETRY_AFTER_SECONDS = 60.0
 
 _DELIVERY_ID_RE = re.compile(r"[0-9a-f]{32,64}")
