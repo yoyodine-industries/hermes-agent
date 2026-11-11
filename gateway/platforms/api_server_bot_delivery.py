@@ -235,6 +235,12 @@ def _settle_bot_chat_turn(
         reply=None,
         error=error,
         reason=reason,
+        # The cap that fired rides on the receipt, stamped by the refusal site that caught it
+        # (``admit_peer_turn``); settle() persists it so the row can never carry a queue_full
+        # reason with no budget (t-37b8e0c562 a).
+        limit_kind=receipt.get("limit_kind"),
+        limit=receipt.get("limit"),
+        limit_class=receipt.get("limit_class"),
     )
     adapter._bot_send_record_status(
         delivery_id, settled, result=delivery_queue.RESULT_FAILED, error=error
@@ -297,13 +303,20 @@ async def run_record(
     except Exception as exc:  # noqa: BLE001 - any turn failure settles the record
         logger.exception("[api_server] peer delivery turn failed: %s", delivery_id)
         error = str(exc) or exc.__class__.__name__
+        reason = _failure_reason(error)
         settled = delivery_queue.settle(
             home,
             delivery_id,
             status=delivery_queue.STATUS_FAILED,
             reply=None,
             error=error,
-            reason=_failure_reason(error),
+            reason=reason,
+            # A refusal carries the cap on the exception itself (QueueFullError.limit_kind for a
+            # delivery cap, RuntimeStoreError.field for a session budget); a turn that failed for
+            # any other reason passes neither and settle() persists none.
+            limit_kind=getattr(exc, "limit_kind", None),
+            limit=getattr(exc, "limit", None),
+            limit_class=getattr(exc, "field", None) if reason == "queue_full" else None,
         )
         adapter._bot_send_record_status(
             delivery_id, settled, result=delivery_queue.RESULT_FAILED, error=error

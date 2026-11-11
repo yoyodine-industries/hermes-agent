@@ -33,6 +33,7 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -203,6 +204,26 @@ STATUS_DETAIL_AMBIGUOUS_LEASE = (
 #: Which cap :func:`check_capacity`/:func:`admit` refused on (VERIFICATION D6).
 LIMIT_PER_PROFILE = "per_profile"
 LIMIT_PER_SENDER = "per_sender"
+
+#: The version a queue_full refusal row declares in its own ``schema`` key (t-37b8e0c562 a).
+#: v1 is EVERY row written before this change: it carries no ``limit_kind``, so the cap that
+#: refused it is unrecoverable and no reader may re-derive one -- the census counts those rows
+#: as the pre-fix window and the envelope names them ``cap unknown``.
+REFUSAL_SCHEMA_V2 = "bot_delivery/refusal/2"
+
+#: The kinds an ENVELOPE may name. Exactly these two: a refusal that names any other budget
+#: (the admission FIFO classes ``automation_fifo``/``interactive_fifo``, which a session budget
+#: caps, not a delivery cap) is recorded under ``limit_class`` and renders ``cap unknown`` --
+#: naming it a delivery cap would send the operator to raise the wrong limit, twice.
+RENDERABLE_LIMIT_KINDS = (LIMIT_PER_PROFILE, LIMIT_PER_SENDER)
+
+#: The three literals the queue_full envelope may print, and nothing else (t-37b8e0c562 b).
+#: The third says what is TRUE of the row: no ``limit_kind`` was persisted when it was written.
+CAP_UNKNOWN_LITERAL = "cap unknown (field not persisted at write)"
+
+#: The census's name for a queue_full row that persisted NO kind at all -- i.e. every v1 row,
+#: and any v2 row whose writer named neither a delivery cap nor a class.
+REFUSAL_SCHEMA_V1_UNKINDED = "unrecorded"
 
 REASON_QUEUED_EXPIRED = "queued_expired"
 #: A claim whose lease ran out: the turn it was taken for never
@@ -652,28 +673,58 @@ def expiry_classification(
     return REASON_QUEUED_EXPIRED, expired_detail(ttl_seconds)
 
 
+def queue_full_cap_literal(record: dict[str, Any] | None = None, *,
+                           limit_kind: str | None = None,
+                           limit: int | None = None) -> str:
+    """The ONE cap phrase a queue_full surface may print (t-37b8e0c562 b).
+
+    Exactly three literals, and none is derived from ABSENCE:
+
+      * ``cap per_profile (<n>)``  — the record persisted ``limit_kind = per_profile``
+      * ``cap per_sender (<n>)``   — the record persisted ``limit_kind = per_sender``
+      * ``cap unknown (field not persisted at write)`` — it persisted no ``limit_kind``
+
+    An old row carries no kind, and defaulting it to ``per_profile`` is the defect this
+    replaces: a specific value is worse than "unknown" because it is actionable, and it sent
+    the operator to raise the wrong limit. A row whose refusal names a NON-delivery budget
+    (the admission FIFO classes) is ``cap unknown`` too, by design: that budget is not the
+    per-profile or per-sender delivery cap, and naming it as one would misdirect the same way.
+    ``limit`` is the cap VALUE: taken from the record when it persisted one, else the live
+    configured cap for that kind -- the kind itself is never inferred.
+    """
+    source = record or {}
+    kind = limit_kind if limit_kind is not None else source.get("limit_kind")
+    kind = "" if kind is None else str(kind).strip()
+    value = limit if limit is not None else source.get("limit")
+    if kind == LIMIT_PER_PROFILE:
+        cap = max_per_profile() if value is None else int(value)
+        return f"cap per_profile ({cap})"
+    if kind == LIMIT_PER_SENDER:
+        cap = max_per_sender() if value is None else int(value)
+        return f"cap per_sender ({cap})"
+    return CAP_UNKNOWN_LITERAL
+
+
 def queue_full_detail(
     per_profile: int | None = None,
     retry_after: float | None = None,
     *,
-    limit_kind: str = LIMIT_PER_PROFILE,
+    limit_kind: str | None = None,
     limit: int | None = None,
 ) -> str:
     """Name the cap that actually refused the send (VERIFICATION D6).
 
     A send refused by the per-sender cap was previously reported as
-    ``queue full (32 per profile)`` -- an operator would raise the wrong limit.
+    ``queue full (32 per profile)`` -- an operator would raise the wrong limit. The KIND now
+    has no default either: a caller that does not know it renders the ``cap unknown`` literal
+    rather than the historical per-profile one (t-37b8e0c562 b).
     """
-    if limit is not None:
-        cap = int(limit)
-    elif per_profile is None:
-        cap = max_per_profile()
-    else:
-        cap = int(per_profile)
+    if limit is None and per_profile is not None and limit_kind == LIMIT_PER_PROFILE:
+        limit = int(per_profile)
+    cap = queue_full_cap_literal(limit_kind=limit_kind, limit=limit)
     after = QUEUE_FULL_RETRY_AFTER_SECONDS if retry_after is None else retry_after
-    scope = "per profile" if limit_kind == LIMIT_PER_PROFILE else "pending from this sender"
     return (
-        f"queue full ({cap} {scope}); no reservation was taken — "
+        f"{cap}; no reservation was taken — "
         f"safe to retry with the same idempotency_key after {int(after)}s"
     )
 
@@ -1215,11 +1266,28 @@ def settle(
     error: str | None = "",
     reason: str | None = "",
     status_detail: str | None = None,
+    limit_kind: str | None = None,
+    limit: int | None = None,
+    limit_class: str | None = None,
     now_ns: int | None = None,
 ) -> dict[str, Any]:
-    """Move a claimed record to ``settled/`` with a terminal status."""
+    """Move a claimed record to ``settled/`` with a terminal status.
+
+    A ``queue_full`` settlement is a REFUSAL ROW and must say which budget refused it
+    (t-37b8e0c562 a): one of ``limit_kind`` (a delivery cap: ``per_profile`` / ``per_sender``)
+    or ``limit_class`` (a session budget's own class field, e.g. ``automation_fifo``) has to be
+    given -- neither the record's absence nor this signature supplies a default, because a
+    refusal row that names the wrong cap is worse than one that names none. The row is stamped
+    ``schema = bot_delivery/refusal/2`` so a reader can count v1 (no kind, unrecoverable) apart
+    from v2 rows.
+    """
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"status must be terminal, got {status!r}")
+    if reason == STATUS_DETAIL_QUEUE_FULL and not (limit_kind or limit_class):
+        raise ValueError(
+            "a queue_full settlement must persist the cap that fired: pass limit_kind "
+            "(per_profile/per_sender) or limit_class (the refusal's own class field)"
+        )
     key_id = validate_delivery_id(delivery_id)
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     with _locked(home) as root:
@@ -1248,6 +1316,20 @@ def settle(
             updated["error"] = error
         if reason not in (None, ""):
             updated["reason"] = reason
+        if reason == STATUS_DETAIL_QUEUE_FULL:
+            # The refusal's own facts, taken from the caller or from the record the refusal
+            # site stamped -- never inferred from which one is missing.
+            kind = limit_kind if limit_kind is not None else record.get("limit_kind")
+            klass = limit_class if limit_class is not None else record.get("limit_class")
+            cap = limit if limit is not None else record.get("limit")
+            updated["limit_kind"] = kind if kind in RENDERABLE_LIMIT_KINDS else None
+            if kind and kind not in RENDERABLE_LIMIT_KINDS:
+                updated["limit_class"] = str(kind)
+            if klass:
+                updated["limit_class"] = str(klass)
+            if cap is not None:
+                updated["limit"] = int(cap)
+            updated["schema"] = REFUSAL_SCHEMA_V2
         entry = _open_attempt(updated)
         if entry is not None:
             entry["ended_at"] = now_ns
@@ -1744,6 +1826,96 @@ def strand_census(root_home: str | os.PathLike[str], *,
     }
 
 
+def refusal_kind_census(home: str | os.PathLike[str]) -> dict[str, Any]:
+    """The queue_full REFUSAL population of one spool, counted by what its rows persisted.
+
+    ``schema = bot_delivery/refusal/2`` rows carry the cap that fired; every row written before
+    that version carries none and can never be recovered, so it is counted as the PRE-FIX
+    WINDOW with its own first/last instants. Persisting the field reaches none of them -- which
+    is exactly why this is a permanent line and not a migration (t-37b8e0c562 d).
+    """
+    root = delivery_root(home)
+    rows = [r for r in _list(root, SETTLED_DIR) if r.get("reason") == STATUS_DETAIL_QUEUE_FULL]
+    by_kind: dict[str, int] = {}
+    persisted = 0
+    window: list[int] = []
+    for record in rows:
+        kind = record.get("limit_kind")
+        if kind in RENDERABLE_LIMIT_KINDS:
+            persisted += 1
+            by_kind[str(kind)] = by_kind.get(str(kind), 0) + 1
+        else:
+            klass = record.get("limit_class")
+            key = f"class:{klass}" if klass else REFUSAL_SCHEMA_V1_UNKINDED
+            by_kind[key] = by_kind.get(key, 0) + 1
+            window.append(int(record.get("updated_at") or record.get("created_at") or 0))
+    return {
+        "queue_full": len(rows),
+        "limit_kind_persisted": persisted,
+        "cap_unknown": len(rows) - persisted,
+        "pre_fix_first_ns": min(window) if window else None,
+        "pre_fix_last_ns": max(window) if window else None,
+        "by_kind": dict(sorted(by_kind.items())),
+    }
+
+
+def refusal_kind_census_line(census: dict[str, Any]) -> str:
+    """The PERMANENT one-line census (t-37b8e0c562 d), never a bare total.
+
+    ``queue_full N · limit_kind persisted k · cap-unknown (pre-fix window) N-k, first .. last``
+    -- so the reader can always tell how much of N is a fact and how much is a window.
+    """
+    total = int(census.get("queue_full") or 0)
+    persisted = int(census.get("limit_kind_persisted") or 0)
+    unknown = int(census.get("cap_unknown") or 0)
+    if unknown:
+        first = _iso_instant(census.get("pre_fix_first_ns"))
+        last = _iso_instant(census.get("pre_fix_last_ns"))
+        window = f"first {first} .. last {last}"
+    else:
+        window = "no window"
+    return (f"queue_full {total} · limit_kind persisted {persisted} · "
+            f"cap-unknown (pre-fix window) {unknown}, {window}")
+
+
+def _iso_instant(ns: Any) -> str:
+    if not ns:
+        return "unknown"
+    return datetime.fromtimestamp(int(ns) / 1e9, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def fleet_refusal_census(root_home: str | os.PathLike[str]) -> dict[str, Any]:
+    """Every spool's refusal census, summed -- the numbers the permanent line prints."""
+    total = 0
+    persisted = 0
+    firsts: list[int] = []
+    lasts: list[int] = []
+    by_kind: dict[str, int] = {}
+    for _seat, home in spool_homes(root_home):
+        seat = refusal_kind_census(home)
+        total += int(seat["queue_full"])
+        persisted += int(seat["limit_kind_persisted"])
+        if seat.get("pre_fix_first_ns"):
+            firsts.append(int(seat["pre_fix_first_ns"]))
+        if seat.get("pre_fix_last_ns"):
+            lasts.append(int(seat["pre_fix_last_ns"]))
+        for key, count in (seat.get("by_kind") or {}).items():
+            by_kind[key] = by_kind.get(key, 0) + int(count)
+    return {
+        "queue_full": total,
+        "limit_kind_persisted": persisted,
+        "cap_unknown": total - persisted,
+        "pre_fix_first_ns": min(firsts) if firsts else None,
+        "pre_fix_last_ns": max(lasts) if lasts else None,
+        "by_kind": dict(sorted(by_kind.items())),
+    }
+
+
+def fleet_refusal_census_line(root_home: str | os.PathLike[str]) -> str:
+    """The PERMANENT fleet-wide refusal census line (t-37b8e0c562 d)."""
+    return refusal_kind_census_line(fleet_refusal_census(root_home))
+
+
 def stranded_breakdown(census: dict[str, Any]) -> str:
     """``seat:stranded`` for every seat with a non-zero count, sorted, or ``none``."""
     parts = [
@@ -1869,13 +2041,13 @@ def build_envelope(
     elif status == STATUS_AMBIGUOUS:
         detail = unknown_detail(record.get("idempotency_key"))
     elif reason == "queue_full":
-        # Report the cap that ACTUALLY refused the send (VERIFICATION D6): the
-        # per-sender cap (8) used to be reported as the per-profile cap (32), so an
-        # operator would raise the wrong limit. Absent the fired limit, the
-        # per-profile reading is the historical one.
+        # Report the cap that ACTUALLY refused the send (VERIFICATION D6), and ONLY from what
+        # the record persisted: a row with no ``limit_kind`` renders ``cap unknown (field not
+        # persisted at write)``. It used to fall back to the per-profile reading -- a specific
+        # value derived from absence, and the reason an operator raised the wrong limit twice
+        # (t-37b8e0c562).
         detail = queue_full_detail(
-            limit_kind=str(record.get("limit_kind") or LIMIT_PER_PROFILE),
-            limit=record.get("limit"))
+            limit_kind=record.get("limit_kind"), limit=record.get("limit"))
     elif result == RESULT_RECEIPT:
         detail = DETAIL_RECEIPT
     else:
