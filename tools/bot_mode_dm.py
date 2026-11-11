@@ -523,6 +523,94 @@ def _unavailable_payload(dm_file: str, exc: LiveTargetUnavailableError) -> str:
                        "error": f"{exc} — the message was NOT sent; it is safe to resend {exc.resend}."})
 
 
+#: Fallback for the queue's own retry interval when it cannot be read (the classification is the
+#: queue's; this is only the wording's clock).
+_RETRYABLE_RETRY_AFTER_SECONDS = 60.0
+
+#: Where a refused admission is REMEMBERED. The ack's ``evidence_file`` is a prunable temp path,
+#: so a refusal recorded only there has a shelf life of hours; this log outlives it.
+_DELIVERY_ATTEMPT_LOG_ENV = "HERMES_DELIVERY_LOG_DIR"
+
+
+def _delivery_attempt_log() -> Path:
+    """The sender-side attempt log (durable), not the temp evidence file."""
+    root = os.environ.get(_DELIVERY_ATTEMPT_LOG_ENV)
+    base = Path(root) if root else Path.home() / ".hermes" / "state"
+    return base / "bot_delivery_attempts.jsonl"
+
+
+def _retryable_reason(exc: BaseException) -> str:
+    """The retryable reason carried by an admission failure, or "" when it is final.
+
+    The module that KNOWS the classification is bot_delivery_queue (RETRYABLE_REASONS); read it
+    from there rather than restating the set here, so a new retryable reason lands in one place.
+    """
+    try:
+        from tools import bot_delivery_queue as delivery_queue
+        retryable = delivery_queue.RETRYABLE_REASONS
+    except Exception:  # pragma: no cover - the queue module is always importable in the agent
+        return ""
+    text = str(exc)
+    for reason in sorted(retryable):
+        if reason and reason in text:
+            return reason
+    return ""
+
+
+def _record_admission_attempt(dm_file: str, exc: BaseException, *, reason: str,
+                              author: Optional[dict]) -> int:
+    """Append this refusal to the durable log and return its attempt number for this delivery."""
+    delivery_id = _dm_delivery_id(dm_file)
+    path = _delivery_attempt_log()
+    attempt = 1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if row.get("delivery_id") == delivery_id:
+                        attempt += 1
+        row = dict(at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   delivery_id=delivery_id, reason=reason or None,
+                   retryable=bool(reason), attempt=attempt,
+                   error=str(exc), author=author)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+    except OSError as log_exc:  # the ack must still be produced when the log is unwritable
+        _log("delivery_attempt_log_failed", error=str(log_exc), delivery_id=delivery_id)
+    return attempt
+
+
+def _refused_admission_payload(dm_file: str, exc: BaseException, *,
+                               author: Optional[dict] = None) -> str:
+    """The ack for an admission whose outcome is unknown.
+
+    An admission failure is genuinely ambiguous - the send may or may not have been admitted - so
+    the instruction matters more than the status word. "Do not resend" is only true when the reason
+    is FINAL; when it is in RETRYABLE_REASONS the honest instruction is to resend under the SAME
+    idempotency key, with the attempt counted, and the attempt is written to a durable log.
+    """
+    reason = _retryable_reason(exc)
+    attempt = _record_admission_attempt(dm_file, exc, reason=reason, author=author)
+    payload: dict[str, Any] = dict(status="ambiguous", delivery_id=_dm_delivery_id(dm_file),
+                                   evidence_file=dm_file)
+    if reason:
+        retry_at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                 time.gmtime(time.time() + _RETRYABLE_RETRY_AFTER_SECONDS))
+        payload.update(reason=reason, retryable=True, attempt=attempt, retry_at=retry_at)
+        payload["error"] = (f"Live delivery admission could not be confirmed: {exc}. "
+                            f"{reason} is retryable - resend with the SAME idempotency key, "
+                            f"attempt {attempt}, not before {retry_at}.")
+    else:
+        payload.update(retryable=False, attempt=attempt)
+        payload["error"] = (f"Live delivery admission could not be confirmed: {exc}. Do not resend.")
+    return json.dumps(payload)
+
+
 def _settled_no_send(dm_file: str, exc: LiveTargetUnavailableError) -> str:
     """The answer to a definite no-send, for both the tool and its runner: first the payload and
     any pinned intent go, so nothing local can rebuild or replay the delivery. A file that is still
@@ -788,9 +876,9 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
         except LiveTargetUnavailableError as exc:
             return _settled_no_send(dm_file, exc)
         except Exception as exc:
-            return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
-                "evidence_file": dm_file})
+            # A bare handler told senders not to resend a RETRYABLE refusal (queue_full), which is
+            # how 20 peer briefs were lost with attempts=1. Classify, count, and record durably.
+            return _refused_admission_payload(dm_file, exc, author=author)
         if record is not None:
             command = _delivery_command(argv, dm_file, stdin_file=False, profile_home=profile_home, author=author)
             notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent))
