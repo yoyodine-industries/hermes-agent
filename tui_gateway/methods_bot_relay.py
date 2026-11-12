@@ -64,8 +64,33 @@ def _(rid, params: dict, _root=_relay_root) -> dict:
         return _err(rid, 5091, str(e))
 
 
+def _refusal_data(exc: BaseException, reason: str) -> dict:
+    """The ``data`` of a refusal: the typed ``reason`` plus the holder when one is known (§2/§3.7).
+
+    ``data.reason`` is the only field the Desktop forwards to the sending agent, so a busy
+    profile's holder must ride BESIDE it (additive - a client that ignores it loses nothing) or
+    the sender can only retry blind against the same stuck turn. An exception that names no
+    holder (or has no ``holder_payload``) yields the bare ``{"reason": ...}`` of before.
+
+    Re-carried from the fork after the overrides/live merge took upstream's file whole: the
+    merged refusal arm answered a flat 5094 ``runtime_unavailable`` for every failure, so a
+    target_busy refusal stopped naming the process that held the seat.
+    """
+    data: dict = {"reason": reason}
+    payload = getattr(exc, "holder_payload", None)
+    if not callable(payload):
+        return data
+    try:
+        holder = payload()
+    except Exception:  # pragma: no cover - defensive
+        return data
+    if isinstance(holder, dict) and holder:
+        data["holder"] = holder
+    return data
+
+
 @method("bot_relay.deliver")
-def _(rid, params: dict, _root=_relay_root) -> dict:
+def _(rid, params: dict, _root=_relay_root, _data=_refusal_data) -> dict:
     """Legacy transport bridge only: canonical admission or an explicit refusal."""
     from tools.bot_live_delivery import _delivery_id, authority_delivery
     from tools.bot_relay import _HANDLE_RE
@@ -117,9 +142,19 @@ def _(rid, params: dict, _root=_relay_root) -> dict:
         return _ok(rid, authority_delivery(home, {**forwarded, 'profile': resolved}))
     except Exception as exc:
         # Boundary: every way the target authority can be unreachable (discovery, ticket, WS,
-        # RPC refusal) is the same typed ``runtime_unavailable`` refusal the sender retries on.
+        # RPC refusal) is a typed refusal the sender retries on - and the CODE says which kind,
+        # because the Desktop forwards only ``data.reason``: a busy seat answers 5096 with the
+        # holder beside its reason (``_data``), a timed-out turn answers 5093, and only an
+        # unknown failure is the flat 5094. The merged file had collapsed all three into 5094,
+        # so a target_busy refusal stopped naming the process holding the seat.
+        from tools.bot_failure_reasons import DELIVERY_TIMEOUT, delivery_failure_reason
         logging.getLogger(__name__).debug("bot_relay.deliver to %s refused", resolved, exc_info=True)
-        return _err(rid, 5094, str(exc), data={'reason': 'runtime_unavailable'})
+        try:
+            reason = delivery_failure_reason(exc)
+        except Exception:  # pragma: no cover - defensive: an unclassifiable failure is unknown
+            reason = "unknown"
+        code = 5096 if reason == "target_busy" else (5093 if reason == DELIVERY_TIMEOUT else 5094)
+        return _err(rid, code, str(exc), data=_data(exc, reason))
 
 
 @method("bot_relay.reply")

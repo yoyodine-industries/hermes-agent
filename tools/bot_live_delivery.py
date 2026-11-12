@@ -43,6 +43,26 @@ def _bot_chat_tip(home: Path) -> str | None:
         db.close()
 
 
+def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
+    """Return the exact Bot Chat tip's lease entry, including unsupported CLI owners.
+
+    Re-carried from the fork after the overrides/live merge dropped it (it took upstream's
+    file whole): the authority door answers *can* this delivery go, and this answers *who is
+    holding it* - the surface, session, pid and start time a refusal or a held receipt has to
+    name beside its reason. Built on ``_bot_chat_tip`` so the store is read through one helper.
+    """
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    home = Path(profile_home).resolve()
+    session_id = _bot_chat_tip(home)
+    if not session_id:
+        return None
+    for entry in active_session_registry_snapshot(registry_home=home):
+        if entry["session_id"] == session_id:
+            return {**entry, "profile_home": str(home)}
+    return None
+
+
 def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
     """Discover the profile authority and its exact Bot Chat without acquiring a lease.
 
@@ -452,11 +472,6 @@ def public_delivery_record(record: dict[str, Any] | None) -> dict[str, Any] | No
     public = dict(record)
     public["status"] = public_delivery_status(record.get("status"))
     return public
-
-
-def read_public_delivery_result(profile_home: Path | str, delivery_id: str) -> dict[str, Any] | None:
-    """Sender-facing read: :func:`read_delivery_result` with ENUM B status words (§4.8)."""
-    return public_delivery_record(read_delivery_result(profile_home, delivery_id))
 
 
 def read_delivery_result(profile_home: Path | str, delivery_id: str) -> dict[str, Any] | None:
