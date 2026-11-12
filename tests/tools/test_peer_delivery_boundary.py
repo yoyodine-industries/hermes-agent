@@ -30,20 +30,20 @@ def test_public_status_maps_only_the_storage_words():
 def test_public_read_translates_without_touching_storage(tmp_path, owner):
     delivery_id = "b" * 32
     mailbox.deliver_to_live_owner(tmp_path, owner, "hello", delivery_id=delivery_id)
-    assert mailbox.public_delivery_record(mailbox.read_delivery_result(tmp_path, delivery_id))["status"] == "queued"
+    assert mailbox.read_public_delivery_result(tmp_path, delivery_id)["status"] == "queued"
 
     assert mailbox.claim_pending_delivery(tmp_path, owner) is not None
     assert mailbox.read_delivery_result(tmp_path, delivery_id)["status"] == "claimed"
-    public = mailbox.public_delivery_record(mailbox.read_delivery_result(tmp_path, delivery_id))
+    public = mailbox.read_public_delivery_result(tmp_path, delivery_id)
     assert public["status"] == "running" and public["message"] == "hello"
 
     mailbox.complete_delivery(tmp_path, delivery_id, status="settled", reply="answer")
     assert mailbox.read_delivery_result(tmp_path, delivery_id)["status"] == "settled"
-    public = mailbox.public_delivery_record(mailbox.read_delivery_result(tmp_path, delivery_id))
+    public = mailbox.read_public_delivery_result(tmp_path, delivery_id)
     assert public["status"] == "delivered" and public["reply"] == "answer"
     # storage keeps its own word, and the caller's copy is a copy
     assert mailbox.read_delivery_result(tmp_path, delivery_id)["status"] == "settled"
-    assert mailbox.public_delivery_record(mailbox.read_delivery_result(tmp_path, "c" * 32)) is None
+    assert mailbox.read_public_delivery_result(tmp_path, "c" * 32) is None
 
 
 def test_wait_live_dm_prints_enum_b_while_disk_keeps_the_storage_word(

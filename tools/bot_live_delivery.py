@@ -474,6 +474,18 @@ def public_delivery_record(record: dict[str, Any] | None) -> dict[str, Any] | No
     return public
 
 
+def read_public_delivery_result(profile_home: Path | str, delivery_id: str) -> dict[str, Any] | None:
+    """Sender-facing read: :func:`read_delivery_result` with ENUM B status words (§4.8).
+
+    The two-call composition it wraps is public too, and a caller that already holds a record uses
+    ``public_delivery_record`` directly - but a SENDER asking "what happened to my delivery" has one
+    sanctioned entry point, and it stays: `t-e481b242eb` requires this surface to carry the
+    three-state verdict and its receipt path, so withdrawing it here would delete the door a
+    sender-facing fix is filed against.
+    """
+    return public_delivery_record(read_delivery_result(profile_home, delivery_id))
+
+
 def read_delivery_result(profile_home: Path | str, delivery_id: str) -> dict[str, Any] | None:
     """Read admission/claim/terminal state without waiting or deleting its receipt."""
     key = _delivery_id(delivery_id)
