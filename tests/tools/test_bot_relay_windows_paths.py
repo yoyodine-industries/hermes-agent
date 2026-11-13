@@ -26,7 +26,6 @@ import pytest
 
 from tools import bot_mode_dm
 from tools import bot_relay
-import pytest
 
 
 ENV = {"id": "d" * 32, "target_handle": "researcher", "target_connection": "ssh-vps"}

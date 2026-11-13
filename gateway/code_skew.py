@@ -15,7 +15,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from hermes_cli._startup_fast import project_root_str
+
+_PROJECT_ROOT = Path(project_root_str())
 _boot_fingerprint: str | None = None
 
 
