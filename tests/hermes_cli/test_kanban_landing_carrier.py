@@ -902,7 +902,7 @@ def _archived_carrier(conn, *, key=None, title=None, body=None) -> str:
         initial_status="running",
         idempotency_key=key,
     )
-    assert kb.archive_task(conn, card) is True
+    assert kb.archive_task(conn, card, reason="superseded") is True
     assert _status(conn, card) == "archived"
     return card
 
@@ -986,7 +986,7 @@ def test_an_archived_linked_child_naming_the_pr_still_carries(conn, forge):
         conn, title="carry the landing", body=f"lands {PR_URL}", initial_status="running",
     )
     kb.link_tasks(conn, task_id, child)
-    assert kb.archive_task(conn, child) is True
+    assert kb.archive_task(conn, child, reason="superseded") is True
 
     assert kb.complete_task(
         conn, task_id, summary="carried", metadata={"published_pr": PR_URL},
