@@ -107,22 +107,29 @@ def _fake_spawn(*args, **kwargs) -> int:
 # ---------------------------------------------------------------------------
 
 
-def test_effective_priority_credits_one_rung_per_hour_up_to_a_cap():
+def test_effective_priority_credits_one_rung_per_hour_up_to_the_ordinary_ceiling():
+    """The unit of the credit is a RUNG on the live ladder, not one point.
+
+    Card t_a0678a13: the cap was SIX POINTS against a ladder spaced 10 000
+    points per tier, so waiting time could never move a card across a band. It is
+    now one rung (10 000 points) per hour, clamped per card at
+    ``kanban_priority_policy.ORDINARY_MAX`` — so a band buys a head start in
+    HOURS and age decides after it.
+    """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_priority_policy as policy
 
     now = 1_000_000.0
-    # One rung per hour of waiting.
-    assert kb.effective_priority(0, now - 3600, now=now) == 1
-    assert kb.effective_priority(0, now - 2 * 3600, now=now) == 2
-    # A bottom-rung card that has waited three hours TIES a fresh top-rung card
-    # (0 + 3 == 3 + 0) and the tie breaks on created_at, so the waiter wins.
-    assert kb.effective_priority(0, now - 3 * 3600, now=now) == kb.effective_priority(
-        3, now, now=now
-    )
-    # Clamped: past the cap, priority differences are erased and it is pure FIFO.
-    assert kb.priority_age_bonus(now - 99 * 3600, now=now) == kb.PRIORITY_AGE_BONUS_CAP
+    ceiling = int(policy.ORDINARY_MAX)
+    # One rung per hour of waiting, and a rung spans a sub-band.
+    assert kb.PRIORITY_AGE_CREDIT_RUNG_SECONDS == 3600
+    assert kb.effective_priority(890_000, now - 3600, now=now) == ceiling
+    assert kb.priority_age_bonus(now - 2 * 3600, now=now) == 2 * kb.PRIORITY_AGE_CREDIT_RUNG_POINTS
+    # A card that has climbed to the ceiling stops banking credit it cannot spend.
+    assert kb.priority_age_credit(890_000, now - 99 * 3600, now=now) == 10_000
+    assert kb.effective_priority(890_000, now - 99 * 3600, now=now) == ceiling
     # Fresh (or future-dated) cards rank on their declared priority alone.
-    assert kb.effective_priority(2, now, now=now) == 2
+    assert kb.effective_priority(ceiling, now, now=now) == ceiling
     assert kb.priority_age_bonus(now + 60, now=now) == 0
     assert kb.priority_age_bonus(None, now=now) == 0
 
@@ -137,10 +144,10 @@ def test_waited_bottom_rung_card_is_claimed_before_a_fresh_top_rung_card(
     with _open() as conn:
         _board(conn)
         fresh_top = kb.create_task(
-            conn, title="fresh P0", assignee="platform-coder", priority=3
+            conn, title="fresh top band", assignee="platform-coder", priority=900_000
         )
         waited_bottom = kb.create_task(
-            conn, title="waited P3", assignee="platform-coder", priority=0
+            conn, title="waited lower band", assignee="platform-coder", priority=890_000
         )
     _age_card(waited_bottom, 4 * 3600)
     assert fresh_top != waited_bottom
@@ -165,9 +172,9 @@ def test_declared_priority_still_wins_within_the_same_age(kanban_home):
 
     with _open() as conn:
         _board(conn)
-        low = kb.create_task(conn, title="P3", priority=0)
-        high = kb.create_task(conn, title="P0", priority=3)
-        mid = kb.create_task(conn, title="P1", priority=2)
+        low = kb.create_task(conn, title="lower band", priority=800_000)
+        high = kb.create_task(conn, title="top band", priority=900_000)
+        mid = kb.create_task(conn, title="near top", priority=890_000)
         # All three are the same age, so declared priority alone decides. (The
         # priority a card is BORN with is the per-board birth policy's call and
         # is deliberately not pinned here — ruling t_d76922e9.)

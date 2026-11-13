@@ -423,10 +423,18 @@ def test_the_lane_picks_the_ask_ahead_of_the_card_that_used_to_outrank_it(
             conn, title="the ask", body=STAMP, assignee="platform-worker",
             created_by="platform-worker", priority=ORDINARY_MAX,
         )
-        # The legacy state: the plain card held the higher number and was picked first.
+        # The legacy state: the plain card held the higher number AND was filed
+        # earlier, so it was picked first.
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET priority = 1100000 WHERE id = ?", (plain,))
             conn.execute("UPDATE tasks SET priority = 1100000 WHERE id = ?", (ask,))
+            # Stamp the filing order: at equal priority and equal second the order
+            # falls through to ``id ASC`` (the total-order tie-break the age-aware
+            # dispatch order needs — card t_a0678a13), so the "it was picked first"
+            # precondition has to rest on age, not on the random id.
+            conn.execute(
+                "UPDATE tasks SET created_at = created_at - 60 WHERE id = ?", (plain,)
+            )
         pre = [row["id"] for row in dispatch._lane_rows(conn, "ready")]
         assert pre.index(plain) < pre.index(ask), pre       # the defect, reproduced
 
