@@ -161,7 +161,17 @@ def _mark_exited_quietly(exit_code: int, reason: str) -> None:
     the lifecycle ledger (so the next boot names the watchdog, not SIGKILL/OOM) and
     ``gateway_state.json`` (so ``hermes gateway status`` and every other reader of that file stop
     seeing ``running`` for a process the watchdog killed — #113372). The runtime-status write goes
-    LAST: it is the record housekeeping refreshes, so nothing may overwrite it after we stamp it."""
+    LAST: it is the record housekeeping refreshes, so nothing may overwrite it after we stamp it.
+
+    The UPDATE receipt is stamped FIRST (R2 item 1, t_3cd65f01): ``os._exit`` gives the update's own
+    writer no chance to finalize, so a run killed by this watchdog would keep ``outcome: running``
+    forever. Closing it here writes the terminal ``interrupted`` outcome — reason, exit code and the
+    last stage the run recorded — fsync'd before the process disappears."""
+    with contextlib.suppress(Exception):
+        from hermes_cli.update_receipt import close_open_run_from_outside
+        close_open_run_from_outside(
+            reason=f"gateway shutdown watchdog forced exit ({reason}) after its drain timeout",
+            exit_code=int(exit_code), writer="shutdown_watchdog")
     with contextlib.suppress(Exception):
         from gateway.lifecycle_ledger import mark_exited
         mark_exited(exit_code, reason=reason)
