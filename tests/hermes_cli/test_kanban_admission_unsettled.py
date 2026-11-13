@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import os
 import sqlite3
@@ -37,6 +38,14 @@ from tests.hermes_cli.test_kanban_managed_worker_loss import (  # noqa: F401  (p
 )
 
 PARAMS = {"board": "default", "task_id": "t_u", "run_id": 7, "claim_lock": "yoyodine:4242"}
+
+
+def _sync(coro_fn):
+    """Run one async body without pytest-asyncio: the door's shared venv does not carry it."""
+    @functools.wraps(coro_fn)
+    def _test(*args, **kwargs):
+        return asyncio.run(coro_fn(*args, **kwargs))
+    return _test
 
 
 # ---------------------------------------------------------------------------------------------
@@ -87,7 +96,7 @@ async def _fast(monkeypatch):
     return clock
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_an_admission_that_commits_after_the_answer_budget_is_adopted(monkeypatch, capsys):
     """The owner's answer budget expires, the retry's admission commits, and the worker completes."""
     await _fast(monkeypatch)
@@ -102,7 +111,7 @@ async def test_an_admission_that_commits_after_the_answer_budget_is_adopted(monk
     assert "owner refused" not in out
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_an_unknown_receipt_that_settles_on_a_reread_is_adopted(monkeypatch, capsys):
     """``unknown`` is re-read: the owner resolves it, and the attempt's own verdict stands."""
     await _fast(monkeypatch)
@@ -115,7 +124,7 @@ async def test_an_unknown_receipt_that_settles_on_a_reread_is_adopted(monkeypatc
     assert "the late result" in capsys.readouterr().out
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_an_unknown_receipt_ends_on_the_workers_own_result_not_a_refusal(monkeypatch, capsys):
     """A lost worker that RAN: its own exit code and last words end the log, not "owner refused"."""
     await _fast(monkeypatch)
@@ -129,7 +138,7 @@ async def test_an_unknown_receipt_ends_on_the_workers_own_result_not_a_refusal(m
     assert "owner refused" not in out
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_an_unknown_receipt_with_only_a_loss_note_names_the_loss(monkeypatch, capsys):
     """No result, but the owner recorded WHAT it lost: that is the sentence the run must carry."""
     await _fast(monkeypatch)
@@ -144,7 +153,7 @@ async def test_an_unknown_receipt_with_only_a_loss_note_names_the_loss(monkeypat
     assert "owner refused" not in out
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_an_admission_nothing_ever_bound_names_itself_and_the_owner(monkeypatch):
     """Nothing ran and nothing was lost: the class is the OWNER's, and it says so."""
     await _fast(monkeypatch)
