@@ -1284,6 +1284,7 @@ def _pull_updates(
             # (`carry-lost`) on every clean abort. Measure the tree; never infer it from the exit.
             if not update_succeeded and auto_stash_ref is not None \
                     and _tree_clean_at(git_cmd, pre_pull_sha, _m().PROJECT_ROOT):
+                print("  → The update aborted with the checkout intact — putting your local changes back.")
                 restored = _m()._restore_stashed_changes(
                     git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn, checkout_move=_moves_for(_windows_gateway_resume))

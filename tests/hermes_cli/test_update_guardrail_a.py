@@ -388,3 +388,26 @@ def test_a_torn_tree_still_keeps_the_stash_parked(conflicting_custom_branch, mon
     assert (checkout / "carrier.txt").read_text(encoding="utf-8") == "half applied\n"
     assert _stash_count(checkout) == 1, "a torn tree must keep the stash: the state is unknown"
     assert cleared, "a torn tree still clears the pointer, as before"
+
+
+def test_a_clean_abort_says_the_checkout_is_intact_before_the_restore(conflicting_custom_branch,
+                                                                     monkeypatch, capsys):
+    """The abort line comes FIRST, because nothing was updated (t_c54b589f).
+
+    ``_restore_stashed_changes`` reuses its success line from the moved-tree path — 'restored on top
+    of the updated codebase'. After a clean abort the codebase was never updated, so a reader who
+    sees only that line concludes the update landed. The abort's own sentence must precede it.
+    """
+    checkout, _pre_pull, stash_ref = conflicting_custom_branch
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", checkout)
+
+    with pytest.raises(SystemExit):
+        _run_pull(checkout, stash_ref)
+
+    out = capsys.readouterr().out
+    abort_line = "The update aborted with the checkout intact"
+    restore_line = "restored on top of the updated codebase"
+    assert abort_line in out, "a clean abort must say the checkout was left intact"
+    assert restore_line in out, "the restore still reports itself"
+    assert out.index(abort_line) < out.index(restore_line), (
+        "the abort sentence must come BEFORE the restore line, or the pair reads as a completed update")
