@@ -160,11 +160,31 @@ def _process_create_time(pid: Optional[int] = None) -> Optional[float]:
 
 @functools.lru_cache(maxsize=1)
 def _live_boot_id() -> Optional[str]:
-    """The kernel's id for the running boot (Linux); ``None`` elsewhere or when unreadable."""
+    """The kernel's id for the running boot; ``None`` when the platform cannot tell us.
+
+    Linux reads ``/proc/sys/kernel/random/boot_id``. macOS has no such file, but
+    ``kern.boottime`` is the boot's wall-clock second: constant for the life of the boot and
+    distinct across reboots, which is exactly the identity a stale claim needs (R1,
+    t_38413d8f). Cached: one ``sysctl`` per process, never per marker probe. A platform that
+    cannot name its boot records no id at all, so its claims fall back to the age ceiling
+    instead of comparing ``None`` to ``None``.
+    """
     try:
         return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip() or None
     except OSError:
-        return None
+        pass
+    if sys.platform == "darwin":
+        with suppress(Exception):
+            out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+                                 text=True, timeout=3, check=False).stdout
+            digits = "".join(ch for ch in (out.partition("sec = ")[2].partition(",")[0]) if ch.isdigit())
+            return f"mac:{digits}" if digits else None
+    return None
+
+
+def live_boot_id() -> Optional[str]:
+    """Public spelling of :func:`_live_boot_id` for claim/liveness readers (update marker)."""
+    return _live_boot_id()
 
 
 # No live process has a negative boot_start, so an entry from an earlier boot never matches.

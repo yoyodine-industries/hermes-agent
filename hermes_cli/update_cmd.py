@@ -261,15 +261,32 @@ def _record_snapshot_stage(args, snapshot_id) -> None:
         **({"snapshot_id": str(snapshot_id)} if snapshot_id else {}))
 
 
+_RESUME_ANNOUNCED = False
+
+
 def _resumable_stage() -> dict:
     """The stage the previous run started and never finished (``{}`` when there is none).
 
     Read AFTER ``_begin_update_receipt_and_plan``: opening the receipt reconciles the dead run and
     keeps its unfinished stage, so this is the one place a resume decision may come from.
     """
+    global _RESUME_ANNOUNCED
     with suppress(Exception):
         from hermes_cli.update_receipt import resumable_stage
-        return resumable_stage() or {}
+        stage = resumable_stage() or {}
+        if stage and not _RESUME_ANNOUNCED:
+            # R2 item 3 (t_3cd65f01): a resume is a NAMED event on the new run, announced once —
+            # `resumed_at_stage` — so "this update continued what the killed one started" is a fact
+            # in the record, not an inference from the absence of a refusal.
+            _RESUME_ANNOUNCED = True
+            with suppress(Exception):
+                from hermes_cli.update_receipt import record_event
+                record_event("resumed_at_stage",
+                             stage=str(stage.get("name") or ""),
+                             snapshot_id=str(stage.get("snapshot_id") or ""),
+                             target_sha=str(stage.get("target_sha") or ""),
+                             resumed_update_id=str(stage.get("update_id") or ""))
+        return stage
     return {}
 
 
@@ -370,6 +387,31 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return result.stdout.strip() or None
     except (subprocess.CalledProcessError, OSError):
         return None
+
+
+def _tree_clean_at(git_cmd, sha: str | None, cwd) -> bool:
+    """True when HEAD is exactly *sha* and no tracked path is modified — git's own proof that an
+    aborted move left the worktree whole (R4, t_3cd65f01 remainder).
+
+    ``merge --abort`` (and every refusal that fires before git writes) lands the checkout back on
+    the pre-pull tip with a clean index, so the tree state is KNOWN after those aborts. Only an
+    interrupt that tore the move leaves it unknown — and that is exactly what this measures, so no
+    exit path has to be trusted by name. Untracked files are not counted: git's abort does not
+    touch them, and the ones the autostash parked belong to the restore that follows.
+    """
+    if not sha:
+        return False
+    if _capture_head_sha(git_cmd, cwd) != sha:
+        return False
+    try:
+        from hermes_cli.update_custody import run_git
+
+        status = run_git(git_cmd, ["status", "--porcelain", "--untracked-files=no"], cwd=cwd,
+                         capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         check=True)
+        return not (status.stdout or "").strip()
+    except (subprocess.CalledProcessError, OSError):
+        return False
 
 
 # Files that define the editable install. A pull that touches none of them
@@ -1233,11 +1275,28 @@ def _pull_updates(
         update_succeeded = True
     finally:
         if auto_stash_ref is not None:
-            # No stash restore if the update failed — tree state is unknown.
-            if not update_succeeded:
+            # R4 (t_3cd65f01 remainder): "no restore if the update failed — tree state is unknown"
+            # was only half true. It IS unknown when the move tore (a kill, a Ctrl-C that reached
+            # git), and then the stash must stay parked. But every ABORT git completed — the
+            # divergence path's `merge --abort`, a refused commit point, an unresolved target —
+            # leaves HEAD on pre_pull_sha with a clean index: the user's edits have one obvious
+            # home, and clearing the pending pointer there manufactured a SECOND, unrelated stop
+            # (`carry-lost`) on every clean abort. Measure the tree; never infer it from the exit.
+            if not update_succeeded and auto_stash_ref is not None \
+                    and _tree_clean_at(git_cmd, pre_pull_sha, _m().PROJECT_ROOT):
+                print("  → The update aborted with the checkout intact — putting your local changes back.")
+                restored = _m()._restore_stashed_changes(
+                    git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=prompt_for_restore,
+                    input_fn=gw_input_fn, checkout_move=_moves_for(_windows_gateway_resume))
+                if not restored:
+                    # The restore itself conflicted: the stash and the pending pointer both STAY —
+                    # clearing the pointer is forbidden on a clean abort, or the carry is lost.
+                    print(f"  ℹ️  Local changes are still parked in the stash (ref: {auto_stash_ref})")
+                    print("  Resolve the conflicts above, then: git stash drop")
+            elif not update_succeeded:
                 print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
                 print("  Restore manually with: git stash apply")
-                _clear_pending_autostash()  # named just above; a later boundary must not repeat it
+                _clear_pending_autostash()  # the tree is TORN; a later boundary must not re-apply it
             elif discard_local_changes:
                 # Non-interactive + updates.non_interactive_local_changes: discard.
                 _m()._discard_stashed_changes(git_cmd, _m().PROJECT_ROOT, auto_stash_ref)
