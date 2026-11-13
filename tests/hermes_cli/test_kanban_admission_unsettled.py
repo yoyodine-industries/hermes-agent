@@ -172,7 +172,12 @@ async def test_an_admission_nothing_ever_bound_names_itself_and_the_owner(monkey
 
 
 def test_submit_prints_an_unsettled_admission_without_calling_it_a_refusal(monkeypatch, capsys):
-    """End to end through ``_submit``: the run's log line is the class, not a refusal claim."""
+    """End to end through ``_submit``: the run's log line is the class, not a refusal claim.
+
+    ``_submit`` deliberately SCRUBS the worker's identity out of ``os.environ`` before it hands
+    the owner a startup (task, run, claim lock, session source), so the whole environment is
+    restored here: a leak would disarm the dispatch identity of every later test in the process.
+    """
     awaitables = []
 
     def _run(coro):
@@ -180,13 +185,18 @@ def test_submit_prints_an_unsettled_admission_without_calling_it_a_refusal(monke
         coro.close()
         raise kwc._AdmissionUnsettled("ADMISSION_UNSETTLED owner pid 4242: nothing ran")
 
-    monkeypatch.setattr(kwc.asyncio, "run", _run)
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_u")
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
-    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "yoyodine:4242")
-    monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/board.db")
-    assert kwc._submit() == 1
+    before = dict(os.environ)
+    try:
+        monkeypatch.setattr(kwc.asyncio, "run", _run)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_u")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "yoyodine:4242")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/board.db")
+        assert kwc._submit() == 1
+    finally:
+        os.environ.clear()
+        os.environ.update(before)
     assert capsys.readouterr().err.startswith("ADMISSION_UNSETTLED")
 
 
