@@ -1154,6 +1154,11 @@ class DispatchResult:
     read from the worker's own last output. Released to ``ready`` WITHOUT counting a
     failure and spaced by ``check_respawn_guard``'s ``substrate_cooldown``; the lane
     actor names the tree artifact. The VISIBILITY surface for this class."""
+    admission_unsettled: list[str] = field(default_factory=list)
+    """Task ids released to ``ready`` WITHOUT counting a failure because the owner never settled
+    the attempt's admission and no worker ever bound to it (``ADMISSION_UNSETTLED``): nothing of
+    the card ran. The VISIBILITY surface for this class — the run table used to book it as a
+    worker crash."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1541,6 +1546,10 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             # A card looping on a contended state store: this counter is the whole
             # visibility surface for the class, so it must never be silent.
             counts["storage_locked"] = counts.get("storage_locked", 0) + len(res.storage_locked)
+        if res.admission_unsettled:
+            # The owner never settled these admissions and nothing ran: without this
+            # counter an owner-side fault reads as an idle tick.
+            counts["admission_unsettled"] = counts.get("admission_unsettled", 0) + len(res.admission_unsettled)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.skipped_board_disabled:
@@ -2834,6 +2843,11 @@ class _DeadWorker:
     the spawn seam uses."""
     substrate_signature: Optional[str] = None
     """``substrate_import:<provider-relpath>:<symbol>`` -- the lane actor's dedupe key."""
+    admission_unsettled: bool = False
+    """No worker ever bound to this attempt and the owner's admission was still ``queued``/
+    ``unknown``: nothing of the card ran, so the run is booked ``admission_unsettled`` and NEVER
+    counted against the breaker. The class the run table used to mis-book as "managed worker
+    lost", which sent every reader into the admission handshake for an owner-side fault."""
 
     @property
     def run_outcome(self) -> str:
@@ -2851,6 +2865,11 @@ class _DeadWorker:
             # ``substrate_cooldown`` branch and the lane actor already counts those events. One
             # vocabulary, one cooldown ladder -- never a second one beside it.
             return "spawn_failed"
+        if self.admission_unsettled:
+            # The OWNER's timing, recorded under its own name: never ``crashed``, because the
+            # card's work was never attempted and an accusation against the worker is
+            # unappealable by the next reader.
+            return "admission_unsettled"
         return "crashed"
 
 
@@ -2864,7 +2883,7 @@ def _is_unexplained_death(dead: _DeadWorker) -> bool:
     """
     return dead.event_kind == "crashed" and not (
         dead.rate_limited or dead.storage_locked or dead.protocol_violation
-        or dead.terminal_provider
+        or dead.terminal_provider or dead.admission_unsettled
     )
 
 
@@ -3017,6 +3036,11 @@ class _CrashSweep:
     substrate_deferred: list[str] = field(default_factory=list)
     # The distinct signatures those deaths carried: the lane actor's input, filed after the txn.
     substrate_signatures: list[str] = field(default_factory=list)
+    # Requeued WITHOUT counting a failure because the owner never settled the attempt's admission
+    # and no worker ever bound to it (``ADMISSION_UNSETTLED``): nothing of the card ran, so the
+    # death is the OWNER's. Held apart from ``crash_details`` for the same reason as
+    # ``storage_locked``.
+    admission_unsettled: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -3218,6 +3242,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                     terminal_provider=dead.terminal_provider,
                     rate_limited=dead.rate_limited,
                     substrate_import=dead.substrate_import,
+                    admission_unsettled=dead.admission_unsettled,
                     claim_lock=row["claim_lock"],
                 )
                 for row, pid, dead, _ in pending
@@ -3290,7 +3315,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "retry_status": retry_status,
             })
             if (dead.rate_limited or dead.storage_locked or dead.protocol_violation
-                    or dead.substrate_import):
+                    or dead.substrate_import or dead.admission_unsettled):
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a storage-locked requeue shows it its own transient kind;
@@ -3321,6 +3346,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.substrate_deferred.append(row["id"])
                 if dead.substrate_signature:
                     sweep.substrate_signatures.append(dead.substrate_signature)
+            elif dead.admission_unsettled:
+                # NEVER crash_details: nothing of the card ran, so an owner that never settled an
+                # admission must not spend the card's retry budget. The run's own error names the
+                # owner and the budget it outlasted.
+                sweep.admission_unsettled.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -3442,6 +3472,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
         detect_crashed_workers._last_rate_limited = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_storage_locked = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_substrate_import = []  # type: ignore[attr-defined]
+        detect_crashed_workers._last_admission_unsettled = []  # type: ignore[attr-defined]
         return []
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
@@ -3452,6 +3483,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
     detect_crashed_workers._last_storage_locked = sweep.storage_locked  # type: ignore[attr-defined]
     detect_crashed_workers._last_substrate_import = sweep.substrate_deferred  # type: ignore[attr-defined]
+    detect_crashed_workers._last_admission_unsettled = sweep.admission_unsettled  # type: ignore[attr-defined]
     # The LANE half of a post-spawn substrate death, filed only now (it needs its own write txn)
     # and idempotent per signature: the card keeps its retry budget, and the tree artifact is
     # counted for the design authority instead of the lane going silently dead card by card.
@@ -6767,6 +6799,7 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.storage_locked.extend(getattr(detect_crashed_workers, "_last_storage_locked", []))
     result.substrate_import.extend(getattr(detect_crashed_workers, "_last_substrate_import", []))
+    result.admission_unsettled.extend(getattr(detect_crashed_workers, "_last_admission_unsettled", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
     # Door 3 of the above-tranche guard (t_6ce41549, restored by card t_2e107499): a row ABOVE

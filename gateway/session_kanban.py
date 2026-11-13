@@ -375,6 +375,34 @@ def worker_exit_code(path, params):
     return worker_result(path, params).get('exit_code', 1)
 
 
+def worker_loss(path, params):
+    """The owner's run-scoped loss note for the dispatcher's exact attempt, or ``{}``.
+
+    ``worker_lost`` is written by the OWNER, and it is written BEFORE the owner settles the
+    admission ``unknown`` (``session_managed_worker._settle_lost``: "the note comes first"). So a
+    submitter that reads ``unknown`` can say what was lost instead of reporting the silence.
+    """
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+        row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND task_id=? AND kind='worker_lost' ORDER BY id DESC LIMIT 1",
+            (params['run_id'], params['task_id'])).fetchone()
+        loss = json.loads(row[0]) if row else {}
+        return loss if isinstance(loss, dict) and loss.get('claim_lock') == params['claim_lock'] else {}
+
+
+def owner_marker(path, params):
+    """The owner's ``owner_admitted`` marker for the exact attempt (its pid and ledger), or ``{}``.
+
+    The marker is run-scoped and carries no claim lock: it is the owner's own pointer written in
+    the claim-check transaction, so it names WHO was asked even when nothing answered.
+    """
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+        row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND task_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
+            (params['run_id'], params['task_id'])).fetchone()
+        marker = json.loads(row[0]) if row else {}
+        return marker if isinstance(marker, dict) else {}
+
+
+
 # Who wrote a card attempt's prompts: the dispatcher, never the operator, so memory providers do not
 # file "work kanban task t_..." and the worker's progress notes as the human's own turns (#137406).
 # Not a ``bot:<profile>`` id: a Bot Mode profile named ``kanban`` would share its memory key.

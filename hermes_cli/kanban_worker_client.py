@@ -15,6 +15,8 @@ import sys
 import time
 from typing import Optional
 
+from hermes_cli.gateway_client import GatewayClientError, GatewayUnavailableError
+
 # A worker that loses its owner (a dropped socket, a restart, `hermes update` draining it or a new
 # owner still starting) waits for it instead of exiting: the condition is the host's, not the card's,
 # and a failed exit here spends the card's failure budget and lets the owner end the turn. Asking
@@ -34,6 +36,11 @@ _RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_contro
                                       'invalid_control_response'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
+# A settled ``unknown`` is re-read this many times (``UNKNOWN_REREAD_S`` apart) before the attempt
+# ends on it: the owner resolves a fenced admission at boot, and the attempt's result may land
+# beside the settlement. Bounded, so the worker never holds a host slot on a guess.
+UNKNOWN_REREADS = 3
+UNKNOWN_REREAD_S = 0.5
 
 
 def admission_answer_budget():
@@ -141,19 +148,74 @@ async def _await_receipt(client, params, board_db, claim):
         await asyncio.sleep(.2)
         receipt = await _receipt(client, claim)
         claim.answered = time.monotonic()
+    if receipt['status'] == 'unknown':
+        receipt = await _confirm_unknown(client, claim, receipt)
     return receipt
 
 
+async def _confirm_unknown(client, claim, receipt):
+    """Re-read a settled ``unknown`` a bounded number of times before believing it.
+
+    ``unknown`` is not a timeout — the owner writes it AFTER it records the loss of a bound
+    managed worker — but it is not always the attempt's last word either: boot recovery resolves
+    a fenced admission (``unknown`` -> ``terminal``), and the attempt's own result can land beside
+    the settlement. Reading once would end the attempt on the owner's first draft.
+    """
+    for _ in range(UNKNOWN_REREADS):
+        await asyncio.sleep(UNKNOWN_REREAD_S)
+        try:
+            receipt = await _receipt(client, claim)
+        except (GatewayClientError, GatewayUnavailableError, OSError, TimeoutError):
+            break
+        claim.answered = time.monotonic()
+        if receipt['status'] != 'unknown':
+            break
+    return receipt
+
+
+class _AdmissionUnsettled(GatewayClientError):
+    """The owner never settled this attempt's admission: a class of its own, never a "refusal"."""
+
+
+def _unsettled_message(board_db, params):
+    """Name the OWNER and the wait that expired, so the next reader is not sent into worker code."""
+    from gateway.session_kanban import owner_marker
+    marker = owner_marker(board_db, params)
+    owner = f"owner pid {marker['pid']}" if marker.get('pid') else 'owner unnamed (no admission marker)'
+    if marker.get('db'):
+        owner += f" ({Path(str(marker['db'])).name})"
+    try:
+        budget = f'{admission_answer_budget():.0f}s'
+    except Exception:
+        budget = 'unknown'
+    return (f'ADMISSION_UNSETTLED {owner}: no worker ever bound to this attempt and no result was '
+            f'recorded, while the admission stayed unsettled past the {budget} answer budget. '
+            f'Nothing of the card ran: this is an owner-side fault, not a worker crash.')
+
+
 def _exit_code(receipt, params, board_db):
-    from hermes_cli.gateway_client import GatewayClientError
-    if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
-    from gateway.session_kanban import worker_result
+    """The attempt's own verdict, read from the record the owner kept.
+
+    ``unknown`` says only "a managed worker was lost", so the BOARD decides rather than the
+    receipt: a recorded ``worker_result`` is the attempt's own exit code and last words and
+    outranks the owner's uncertainty, and a ``worker_lost`` note names what was lost. Reading
+    ``unknown`` as a refusal instead sent every reader of 71 of 80 crashes into the admission
+    handshake for what the board had already recorded as a worker's own death.
+    """
+    from gateway.session_kanban import worker_loss, worker_result
     result = worker_result(board_db, params)
-    # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
-    if result.get('last_output'):
-        print(result['last_output'])
-    return result.get('exit_code', 1)
+    if result:
+        # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
+        if result.get('last_output'):
+            print(result['last_output'])
+        return result.get('exit_code', 1)
+    if receipt['status'] == 'unknown':
+        loss = worker_loss(board_db, params)
+        if loss:
+            print(f"managed worker lost: {str(loss.get('reason') or 'unspecified')[:80]}")
+            return 1
+        raise _AdmissionUnsettled(_unsettled_message(board_db, params))
+    return 1
 
 
 async def _receipt(client, claim):
@@ -186,7 +248,13 @@ def _submit():
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
     except (KeyError, ValueError, OSError) as exc:
-        print(f'Kanban owner refused: {exc}', file=sys.stderr)
+        if isinstance(exc, _AdmissionUnsettled):
+            # Not a refusal, so it must not wear a refusal's words: the owner never settled this
+            # attempt and nothing of the card ran. A reader seeing "owner refused" here would look
+            # for a rejected command instead of an admission the OWNER left unsettled.
+            print(str(exc), file=sys.stderr)
+        else:
+            print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1
 
 
