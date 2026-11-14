@@ -275,6 +275,35 @@ def queue_ttl_seconds() -> float:
     return float(_cfg("delivery_queue_ttl_seconds"))
 
 
+#: The ACTIONABLE window for settled ``expired`` records (card t_330bee02, platform-stl
+#: ruling 2026-11-14). ``expired`` is a settled TERMINAL status: the record is closed,
+#: nothing can drain it and no retention sweep removes it, so counting the total made
+#: ``stranded`` monotonic by construction -- the count could never return to zero, which
+#: made recovery unreachable and the recurrence guard one-shot. Only an expiry whose
+#: TERMINAL WRITE falls inside this window is an actionable strand; everything older is
+#: HISTORY: still counted in ``expired``, printed beside the window, and never added to
+#: ``stranded``.
+EXPIRE_WINDOW_SECONDS = 86400
+
+
+def expire_window_seconds() -> float:
+    """The expire window in seconds: ``HERMES_STRAND_EXPIRE_WINDOW_SECONDS`` or 24 h.
+
+    Read at call time so the meter can be re-measured with a different window without
+    re-importing the module, and so the window every printed number names is the one
+    that produced it. A malformed or negative override falls back to the default: a
+    broken knob must never be able to silence the meter.
+    """
+    raw = os.environ.get("HERMES_STRAND_EXPIRE_WINDOW_SECONDS")
+    if raw is None or not str(raw).strip():
+        return float(EXPIRE_WINDOW_SECONDS)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(EXPIRE_WINDOW_SECONDS)
+    return value if value >= 0 else float(EXPIRE_WINDOW_SECONDS)
+
+
 def max_per_profile() -> int:
     return int(_cfg("delivery_queue_max_per_profile"))
 
@@ -1613,7 +1642,8 @@ def queued_target_profiles(home: str | os.PathLike[str]) -> list[str]:
 #: lease ran out is a strand that ``pending_over_ttl`` structurally could not see
 #: (an open attempt froze its reading), so it is counted on its own -- never merely
 #: inferred from the over-TTL term.
-_CENSUS_COUNT_KEYS = ("queued", "pending_over_ttl", "claimed_stuck", "expired", "ambiguous",
+_CENSUS_COUNT_KEYS = ("queued", "pending_over_ttl", "claimed_stuck", "expired",
+                      "expired_within_window", "expired_undated", "ambiguous",
                       "failed", "delivered", "stranded")
 _CENSUS_AGE_KEYS = ("oldest_age_seconds", "oldest_delivery_id", "oldest_path")
 
@@ -1646,14 +1676,46 @@ def _note_oldest(seat: dict[str, Any], record: dict[str, Any], path: Path, *,
         seat["oldest_path"] = str(path)
 
 
+def _terminal_write_ns(record: dict[str, Any]) -> int | None:
+    """When a settled record was CLOSED, in ns: ``updated_at`` then ``created_at``.
+
+    ``None`` means the record carries no clock at all. That is not treated as "just
+    now" (which would hide a decades-old record inside the window) and not as "old"
+    by assumption (which would hide it outside it): the census reports it as
+    ``expired_undated`` so a missing clock is visible rather than swallowed.
+    """
+    for key in ("updated_at", "created_at"):
+        raw = record.get(key)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def seat_strand_census(home: str | os.PathLike[str], *, now_ns: int | None = None) -> dict[str, Any]:
     """One home's stranded-delivery census, read WITHOUT taking the spool lock.
 
-    The count is the rule the peer-delivery project ruled (card t_703af8d1):
+    The count is the rule the peer-delivery project ruled (card t_703af8d1) as
+    amended by the monotonicity fix (card t_330bee02, platform-stl 2026-11-14):
 
         stranded = queued records that waited past the queue TTL
-                 + settled ``expired`` records (accepted and never delivered)
                  + CLAIMS WHOSE LEASE WAS LOST (``claimed_stuck``)
+                 + settled ``expired`` records whose TERMINAL WRITE is inside the
+                   expire window (``expired_within_window``)
+
+    The window is why recovery is reachable at all. ``expired`` is a SETTLED
+    terminal status: the record is closed, nothing can drain it and no retention
+    sweep removes it, so adding the total made ``stranded`` monotonic by
+    construction -- 1192 dead records on 2026-11-14, 973 of them over a week old --
+    and ``stranded == 0`` could never happen. Only an expiry that is still recent
+    enough to describe a live failure is actionable; the rest is HISTORY, reported
+    as ``expired`` (and, when it carries no clock, ``expired_undated``) and never
+    added to ``stranded``. Window size: :func:`expire_window_seconds`.
 
     ``claimed_stuck`` is a claim recovered by :func:`lease_lost`: an attempt nobody
     ended, older than ``2 x`` the TTL, with no live holder. It is counted there and
@@ -1670,6 +1732,7 @@ def seat_strand_census(home: str | os.PathLike[str], *, now_ns: int | None = Non
     now_ns = time.time_ns() if now_ns is None else int(now_ns)
     root = delivery_root(home)
     ttl = queue_ttl_seconds()
+    window_ns = int(expire_window_seconds() * 1e9)
     seat = _empty_census_seat()
     for sub in (QUEUE_DIR, CLAIMED_DIR):
         for record in _list(root, sub):
@@ -1689,12 +1752,18 @@ def seat_strand_census(home: str | os.PathLike[str], *, now_ns: int | None = Non
         if status in seat:
             seat[status] += 1
         if status == STATUS_EXPIRED:
+            write_ns = _terminal_write_ns(record)
+            if write_ns is None:
+                seat["expired_undated"] += 1
+            elif now_ns - write_ns <= window_ns:
+                seat["expired_within_window"] += 1
             _note_oldest(
                 seat, record,
                 root / SETTLED_DIR / f"{record.get('delivery_id')}.json", now_ns=now_ns,
             )
     seat["stranded"] = (
-        int(seat["pending_over_ttl"]) + int(seat["expired"]) + int(seat["claimed_stuck"])
+        int(seat["pending_over_ttl"]) + int(seat["claimed_stuck"])
+        + int(seat["expired_within_window"])
     )
     return seat
 
@@ -1738,6 +1807,7 @@ def strand_census(root_home: str | os.PathLike[str], *,
     return {
         "root": str(Path(root_home)),
         "ttl_seconds": queue_ttl_seconds(),
+        "window_seconds": expire_window_seconds(),
         "now_ns": now_ns,
         "seats": seats,
         "totals": _sum_census_seats(seats),

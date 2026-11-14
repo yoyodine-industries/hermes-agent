@@ -13,8 +13,12 @@ must interpret, and nothing that depends on a human noticing.
 The design ruled on card t_703af8d1 (platform-stl), implemented here as written:
 
 * **the count** is :func:`tools.bot_delivery_queue.strand_census` -- over-TTL queued
-  records plus settled ``expired`` records, read LIVE from every spool. It is
-  reproducible by one command (this module's ``__main__`` prints exactly it).
+  records, plus claims whose lease was lost, plus settled ``expired`` records whose
+  TERMINAL WRITE is inside the expire window (default 24 h,
+  ``HERMES_STRAND_EXPIRE_WINDOW_SECONDS``). The expired TOTAL is history and is never
+  added to it (card t_330bee02: counting it made the meter monotonic, so recovery was
+  unreachable and this guard went one-shot). Read LIVE from every spool, reproducible
+  by one command (this module's ``__main__`` prints exactly it).
 * **it runs in PROD**, inside the drainer's own 30s sweep: no shadow runner, no
   sandbox checkout, no new daemon, no cron shim pointing at a working tree.
 * **it acts on GROWTH**, not on a fixed threshold: a steady backlog that is being
@@ -23,7 +27,9 @@ The design ruled on card t_703af8d1 (platform-stl), implemented here as written:
 * **one card per INCIDENT**, idempotency-keyed, so a sustained or growing backlog
   can never flood the board: a repeat attempt returns the SAME card id and writes
   no second row. An incident opens on a growth and closes when the count returns to
-  zero; recovery CANCELS and REOPENS nothing.
+  zero; recovery CANCELS and REOPENS nothing. The ledger also READS its own card:
+  when the card is closed on the board while the backlog stands, the generation
+  advances and a fresh card is filed, so the guard cannot silence itself.
 * **one log line per evaluation**, either way.
 
 The card BODY carries the raw counts, the per-seat breakdown, the oldest stranded
@@ -77,6 +83,30 @@ STRAND_ALERT_TITLE = (
 STATE_FILENAME = "bot_delivery_strand_alert.json"
 STATE_VERSION = 1
 
+#: A card in one of these states is CLOSED: the incident it recorded is over on the
+#: board while the backlog it recorded stands. The ledger must not keep pointing at it
+#: -- that is how the recurrence guard went one-shot: generation stayed 0 forever, so
+#: the key ``peer-strand-alert:0`` stayed pinned to one terminal card and the next
+#: growth could only return that closed card or be refused as a duplicate-closed-key.
+STRAND_ALERT_TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled"})
+
+
+def _read_card_status(card_id: str, *, board: Optional[str] = None) -> Optional[str]:
+    """One card's status through the board seam, or ``None`` when the row is ABSENT.
+
+    The ONE seam the tests stub for the ledger's self-check. A board read that RAISES
+    is deliberately not swallowed here: :func:`evaluate` owns that decision, because a
+    hiccup must never mint a duplicate card and must never clear a live ``card_id``.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing(board=board or STRAND_ALERT_BOARD) as conn:
+        task = kb.get_task(conn, card_id)
+    if task is None:
+        return None
+    return str(getattr(task, "status", "") or "")
+
 
 # --------------------------------------------------------------------------
 # the incident ledger
@@ -125,7 +155,9 @@ def write_state(path: str | os.PathLike[str], state: dict[str, Any]) -> None:
 def evaluate(root_home: str | os.PathLike[str], *,
              state_path: str | os.PathLike[str] | None = None,
              census: Optional[dict[str, Any]] = None,
-             now_ns: Optional[int] = None) -> dict[str, Any]:
+             now_ns: Optional[int] = None,
+             board: Optional[str] = None,
+             read_card: Optional[Callable[..., Optional[str]]] = None) -> dict[str, Any]:
     """The census plus the growth verdict for this evaluation.
 
     ``grown_seats`` is the whole growth test: a seat whose stranded count is HIGHER
@@ -134,6 +166,20 @@ def evaluate(root_home: str | os.PathLike[str], *,
     been alerted and is exactly what nothing else watches. An incident closes only
     when the count is back to zero, which bumps ``generation`` so the NEXT incident
     gets its own card.
+
+    ``stranded`` is the ACTIONABLE, windowed count (see
+    ``bot_delivery_queue.seat_strand_census``), so "back to zero" now means what it
+    says: nothing over TTL, no stuck claim, and nothing expired inside the expire
+    window. That is DoD 8's sustained clause, and no second threshold is needed.
+
+    THE LEDGER'S SELF-CHECK (ruling D3, card t_330bee02). While ``stranded > 0`` and a
+    ``card_id`` is recorded, the card is READ: a card whose row is gone or is CLOSED
+    (``done``/``archived``/``cancelled``) means the incident ended on the board while
+    the backlog stands, so ``generation`` is bumped, ``card_id`` cleared, and the next
+    filing gets a fresh key. A read that RAISES changes nothing -- the current
+    ``card_id`` is kept and nothing is filed -- because a board hiccup must never mint
+    a duplicate card. The one-card-per-generation guarantee is the idempotency KEY;
+    this read only notices a closure.
     """
     path = Path(state_path) if state_path is not None else alert_state_path(root_home)
     census = delivery_queue.strand_census(root_home, now_ns=now_ns) if census is None else census
@@ -146,6 +192,23 @@ def evaluate(root_home: str | os.PathLike[str], *,
     recovery = bool(prev_total > 0 and total == 0)
     generation = int(state.get("generation") or 0) + (1 if recovery else 0)
     card_id = None if recovery else (str(state.get("card_id") or "") or None)
+    closed_card: Optional[str] = None
+    card_read_failed = False
+    if total > 0 and card_id:
+        reader = read_card or _read_card_status
+        try:
+            status = reader(card_id, board=board)
+        except Exception as exc:
+            card_read_failed = True
+            logger.warning(
+                "[bot_delivery] strand alert could not read card %s -- keeping it, "
+                "filing nothing this evaluation: %s", card_id, exc,
+            )
+        else:
+            if status is None or str(status) in STRAND_ALERT_TERMINAL_CARD_STATUSES:
+                closed_card = card_id
+                generation += 1
+                card_id = None
     return {
         "state_path": str(path),
         "census": census,
@@ -157,6 +220,8 @@ def evaluate(root_home: str | os.PathLike[str], *,
         "recovery": recovery,
         "generation": generation,
         "card_id": card_id,
+        "closed_card": closed_card,
+        "card_read_failed": card_read_failed,
     }
 
 
@@ -218,27 +283,64 @@ def _age_text(seconds: Any) -> str:
     return f"{total / 86400:.1f}d"
 
 
+def _count(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _window_text(value: Any) -> str:
+    """A window in seconds, printed as an int when it is one (``86400``, not ``86400.0``)."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    return str(int(seconds)) if seconds == int(seconds) else f"{seconds:g}"
+
+
 def build_card_body(verdict: dict[str, Any], *, idempotency_key: str,
                     priority_note: str = "") -> str:
-    """The card body: every number a reader needs, and no other tooling."""
+    """The card body: every number a reader needs, and no other tooling.
+
+    The ``stranded`` line DECOMPOSES into its three terms, the expired line prints
+    ``total / within window``, and both name the window and the read instant --
+    because a bare total is what made 1192 dead records look like an incident
+    (ruling D4, card t_330bee02).
+    """
     census = verdict["census"]
     totals = census["totals"]
     seats = census["seats"]
     grown = verdict["grown_seats"]
     oldest = totals.get("oldest_age_seconds")
     ttl = census.get("ttl_seconds")
+    window = census.get("window_seconds")
+    if window is None:
+        window = delivery_queue.expire_window_seconds()
+    window_text = _window_text(window)
+    over_ttl = _count(totals.get("pending_over_ttl"))
+    stuck = _count(totals.get("claimed_stuck"))
+    expired = _count(totals.get("expired"))
+    within = _count(totals.get("expired_within_window"))
+    undated = _count(totals.get("expired_undated"))
+    read_at = census.get("now_ns")
+    read_text = f"{int(read_at) / 1e9:.3f}" if read_at else "unknown"
     rows = [
-        "| seat | stranded | over-TTL queued | claimed stuck | expired | ambiguous | failed | delivered | oldest |",
-        "|---|---|---|---|---|---|---|---|---|",
+        f"| seat | stranded | over-TTL queued | claimed stuck | expired in {window_text}s "
+        "| expired (total) | expired undated | ambiguous | failed | delivered | oldest |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for seat in sorted(seats):
         data = seats[seat]
         rows.append(
-            f"| `{seat}` | {int(data.get('stranded') or 0)} "
-            f"| {int(data.get('pending_over_ttl') or 0)} "
-            f"| {int(data.get('claimed_stuck') or 0)} | {int(data.get('expired') or 0)} "
-            f"| {int(data.get('ambiguous') or 0)} | {int(data.get('failed') or 0)} "
-            f"| {int(data.get('delivered') or 0)} | {_age_text(data.get('oldest_age_seconds'))} |"
+            f"| `{seat}` | {_count(data.get('stranded'))} "
+            f"| {_count(data.get('pending_over_ttl'))} "
+            f"| {_count(data.get('claimed_stuck'))} "
+            f"| {_count(data.get('expired_within_window'))} "
+            f"| {_count(data.get('expired'))} "
+            f"| {_count(data.get('expired_undated'))} "
+            f"| {_count(data.get('ambiguous'))} | {_count(data.get('failed'))} "
+            f"| {_count(data.get('delivered'))} | {_age_text(data.get('oldest_age_seconds'))} |"
         )
     lines = [
         "## Observed -- the stranded peer-delivery count GREW",
@@ -250,13 +352,18 @@ def build_card_body(verdict: dict[str, Any], *, idempotency_key: str,
         "hand on 2026-10-14 (project `peer-delivery`).",
         "",
         f"- **stranded: {verdict['fleet_total']}** (was {verdict['previous_total']}) -- "
-        "the count is over-TTL queued records PLUS settled `expired` records PLUS "
-        "claims whose lease was lost (`claimed_stuck`)",
-        f"- claimed stuck: {int(totals.get('claimed_stuck') or 0)} -- a claim older than "
-        "2x the TTL that no live holder stands behind: a delivery nobody is running and "
-        "nothing was counting",
+        f"= {over_ttl} over-TTL queued + {stuck} claimed stuck + {within} expired in the "
+        f"last {window_text}s. These three terms are the whole count: every one of them",
+        "  describes something that could still be a live failure",
+        f"- claimed stuck: {stuck} -- claims whose lease was lost (`claimed_stuck`): a "
+        f"claim older than 2x the TTL (TTL {ttl}s) that no live holder stands behind, a "
+        "delivery nobody is running and nothing was counting",
+        f"- expired: {expired} total / {within} within the last {window_text}s -- "
+        f"`expired_undated`: {undated}. The TOTAL is HISTORY: `expired` is a settled",
+        "  terminal status, nothing drains it and no sweep reaps it, so only the window is",
+        "  added to `stranded`. A month-old record is not a message lost yesterday.",
+        f"- read at: {read_text} (epoch seconds; expire window {window_text}s, queue TTL {ttl}s)",
         f"- grew on seat(s): {', '.join(f'`{s}`' for s in grown) or '(new backlog, no seat named)'}",
-        f"- queue TTL: {ttl}s",
         f"- oldest stranded record: {_age_text(oldest)} old"
         f" -- `{totals.get('oldest_path')}` (delivery_id `{totals.get('oldest_delivery_id')}`)",
         f"- root home: `{census.get('root')}`",
@@ -277,7 +384,10 @@ def build_card_body(verdict: dict[str, Any], *, idempotency_key: str,
         "### The recurrence guard",
         "",
         f"- idempotency key: `{idempotency_key}` (one row per INCIDENT -- while this backlog",
-        "  stands, a repeat evaluation returns THIS card id and writes no second row)",
+        "  stands, a repeat evaluation returns THIS card id and writes no second row). The",
+        "  key advances only when the count returns to zero, or when this card is CLOSED on",
+        "  the board while the backlog stands (the ledger reads it and re-opens the incident",
+        "  under the next generation, so the guard cannot go one-shot)",
         "- filed by `bot-delivery-drainer` from the gateway's delivery sweep: deterministic,",
         "  no model consulted.",
     ]
@@ -317,24 +427,32 @@ def alert(root_home: str | os.PathLike[str], *,
           create: Optional[Callable[..., str]] = None,
           census: Optional[dict[str, Any]] = None,
           now_ns: Optional[int] = None,
-          log_fn: Optional[Callable[..., None]] = None) -> dict[str, Any]:
+          log_fn: Optional[Callable[..., None]] = None,
+          read_card: Optional[Callable[..., Optional[str]]] = None) -> dict[str, Any]:
     """One evaluation: census, ONE log line, and -- on growth -- ONE keyed card.
 
     Never raises on the board's account, and never lets a filing failure hide the
     evaluation: the log line is emitted either way, with `card=-` when nothing was
     filed. Returns the verdict plus ``card_id`` / ``filed`` / ``priority``.
+
+    A board READ that fails files nothing this evaluation (ruling D3): the recorded
+    ``card_id`` is kept untouched, so a hiccup can neither duplicate a card nor
+    orphan one.
     """
     log = log_fn or delivery_queue._log
     board = board or STRAND_ALERT_BOARD
     assignee = assignee or STRAND_ALERT_ASSIGNEE
     path = Path(state_path) if state_path is not None else alert_state_path(root_home)
-    verdict = evaluate(root_home, state_path=path, census=census, now_ns=now_ns)
+    verdict = evaluate(root_home, state_path=path, census=census, now_ns=now_ns,
+                       board=board, read_card=read_card)
     card_id = verdict["card_id"]
     filed = False
     priority: Optional[int] = None
     # ACT on growth -- and on a first sighting of a non-zero backlog with no card
-    # recorded yet, which is a filing that FAILED last tick, not a new incident.
-    if verdict["grown_seats"] or (verdict["fleet_total"] > 0 and not card_id):
+    # recorded yet, which is a filing that FAILED last tick, not a new incident. A
+    # failed board read suppresses BOTH arms (D3): nothing is filed blind.
+    if not verdict.get("card_read_failed") and (
+            verdict["grown_seats"] or (verdict["fleet_total"] > 0 and not card_id)):
         priority, priority_note = _band_priority(
             board, assignee=assignee, title=STRAND_ALERT_TITLE,
             body=build_card_body(verdict, idempotency_key=(
@@ -346,12 +464,19 @@ def alert(root_home: str | os.PathLike[str], *,
             filed = not card_id
             card_id = filed_id
     totals = verdict["census"]["totals"]
+    census_dict = verdict["census"]
+    window = census_dict.get("window_seconds")
+    if window is None:
+        window = delivery_queue.expire_window_seconds()
     log("strand_alert", None,
         stranded=verdict["fleet_total"],
         previous=verdict["previous_total"],
         grown=len(verdict["grown_seats"]),
         seats=delivery_queue.stranded_breakdown(verdict["census"]),
         expired=int(totals.get("expired") or 0),
+        expired_within_window=int(totals.get("expired_within_window") or 0),
+        expired_undated=int(totals.get("expired_undated") or 0),
+        window_seconds=int(window),
         over_ttl=int(totals.get("pending_over_ttl") or 0),
         claimed_stuck=int(totals.get("claimed_stuck") or 0),
         ambiguous=int(totals.get("ambiguous") or 0),
@@ -402,12 +527,19 @@ def _main(argv: Optional[list[str]] = None) -> int:
     root = _hermes_root(Path(args[0])) if args else _hermes_root(Path(_default_home()))
     census = delivery_queue.strand_census(root)
     verdict = evaluate(root, census=census)
+    window = census.get("window_seconds")
+    if window is None:
+        window = delivery_queue.expire_window_seconds()
     print(json.dumps({
         "root": census["root"],
         "ttl_seconds": census["ttl_seconds"],
+        "window_seconds": window,
+        "read_at": round(int(census["now_ns"]) / 1e9, 3),
         "stranded": census["totals"]["stranded"],
         "claimed_stuck": census["totals"]["claimed_stuck"],
         "expired": census["totals"]["expired"],
+        "expired_within_window": census["totals"]["expired_within_window"],
+        "expired_undated": census["totals"]["expired_undated"],
         "pending_over_ttl": census["totals"]["pending_over_ttl"],
         "ambiguous": census["totals"]["ambiguous"],
         "failed": census["totals"]["failed"],
@@ -415,6 +547,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
         "oldest_age_seconds": census["totals"]["oldest_age_seconds"],
         "oldest_path": census["totals"]["oldest_path"],
         "seats": {seat: {"stranded": data["stranded"], "expired": data["expired"],
+                         "expired_within_window": data["expired_within_window"],
+                         "expired_undated": data["expired_undated"],
                          "pending_over_ttl": data["pending_over_ttl"],
                          "claimed_stuck": data["claimed_stuck"],
                          "ambiguous": data["ambiguous"], "failed": data["failed"],

@@ -28,6 +28,19 @@ def _pin_config(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _board_read_says_live(monkeypatch):
+    """The ledger's self-check defaults to "the card is alive" in these unit tests.
+
+    The real seam opens the board (``hermes_cli.kanban_db``); a unit test must not, and
+    a board that does not exist here would read as a FAILED read and suppress filing.
+    The two tests that exercise the self-check pass their own ``read_card``.
+    """
+    monkeypatch.setattr(alert, "_read_card_status", lambda card_id, **kw: "todo",
+                        raising=False)
+    yield
+
+
 def _did(n: int) -> str:
     return "%032x" % n
 
@@ -319,3 +332,181 @@ def test_the_one_command_census_prints_the_same_number_the_alarm_logs(fleet, mon
     printed = json.loads(capsys.readouterr().out)
     assert printed["stranded"] == q.strand_census(fleet)["totals"]["stranded"] == 1
     assert printed["seats"]["default"]["stranded"] == 1
+
+
+# ---------------------------------------------------------------------------
+# the windowed count (card t_330bee02, platform-stl ruling 2026-11-14): the meter
+# must be able to reach zero, or recovery is unreachable and the guard is one-shot
+# ---------------------------------------------------------------------------
+HOUR_NS = int(3600 * 1e9)
+WINDOW = 86400          # the ruling's default; the knob is exercised separately
+
+
+def test_expired_history_outside_the_window_is_reported_but_not_stranded(fleet):
+    """The 1192-record case: old settled records are HISTORY, not strands."""
+    _spool(fleet, 1, status="expired", waited_ns=8 * 86400 * int(1e9))
+    _spool(fleet, 2, status="expired", waited_ns=59 * 86400 * int(1e9))
+    seat = q.seat_strand_census(fleet)
+    assert (seat["stranded"], seat["expired"], seat["expired_within_window"]) == (0, 2, 0)
+
+
+def test_one_expired_record_inside_the_window_is_stranded_once(fleet):
+    _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)
+    seat = q.seat_strand_census(fleet)
+    assert seat["expired_within_window"] == 1
+    assert seat["expired"] == 1
+    assert seat["stranded"] == 1, "counted twice?"
+    assert seat["pending_over_ttl"] == 0 and seat["claimed_stuck"] == 0
+
+
+def test_stranded_is_the_windowed_sum_of_its_three_terms(fleet):
+    _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)                 # inside window
+    _spool(fleet, 2, status="expired", waited_ns=30 * 86400 * int(1e9))   # history
+    _spool(fleet, 3, status="queued", waited_ns=TTL_NS * 3)               # over TTL
+    seat = q.seat_strand_census(fleet)
+    assert seat["stranded"] == (seat["pending_over_ttl"] + seat["claimed_stuck"]
+                                + seat["expired_within_window"]) == 2
+    assert seat["expired"] == 2
+
+
+def test_an_expired_record_with_no_clock_is_reported_and_never_hidden(fleet):
+    path = _spool(fleet, 1, status="expired")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record.pop("updated_at", None)
+    record.pop("created_at", None)
+    path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    seat = q.seat_strand_census(fleet)
+    assert seat["expired_undated"] == 1
+    assert seat["expired"] == 1
+    assert seat["stranded"] == 0, "an undated record must not be guessed into the window"
+
+
+def test_the_expire_window_is_the_env_knob(fleet, monkeypatch):
+    monkeypatch.setenv("HERMES_STRAND_EXPIRE_WINDOW_SECONDS", "60")
+    _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)
+    seat = q.seat_strand_census(fleet)
+    assert (seat["stranded"], seat["expired_within_window"]) == (0, 0)
+    assert q.strand_census(fleet)["window_seconds"] == 60.0
+
+
+def test_the_window_makes_recovery_reachable(fleet, monkeypatch):
+    """The same record, aged past the window: the count returns to zero on its own.
+
+    Today's code cannot pass this: ``expired`` was terminal and permanent, so the
+    ledger's incident could never close and ``generation`` never advanced.
+    """
+    _log_lines(monkeypatch)
+    board = FakeBoard()
+    path = _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)
+
+    first = alert.alert(fleet, create=board)
+    assert (first["fleet_total"], first["generation"], first["recovery"]) == (1, 0, False)
+
+    record = json.loads(path.read_text(encoding="utf-8"))
+    aged = time.time_ns() - 2 * 86400 * int(1e9)
+    record["created_at"] = record["updated_at"] = aged
+    path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+
+    after = alert.alert(fleet, create=board)
+    assert after["fleet_total"] == 0
+    assert after["recovery"] is True
+    assert after["generation"] == 1 and after["card_id"] is None
+    assert len(board.calls) == 1, "recovery filed a card"
+    assert after["census"]["totals"]["expired"] == 1, "history stopped being reported"
+
+
+def test_a_card_closed_on_the_board_reopens_the_incident(fleet, monkeypatch):
+    """D3: a terminal card must not silence the ledger while the backlog stands."""
+    _log_lines(monkeypatch)
+    board = FakeBoard()
+    _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)
+    first = alert.alert(fleet, create=board)
+
+    statuses = {first["card_id"]: "archived"}
+
+    def reader(card_id, **_kw):
+        return statuses.get(card_id, "todo")
+
+    second = alert.alert(fleet, create=board, read_card=reader)
+    assert second["closed_card"] == first["card_id"]
+    assert second["generation"] == 1 and second["card_read_failed"] is False
+    assert board.calls[-1]["idempotency_key"] == "peer-strand-alert:1"
+    assert second["card_id"] not in (None, first["card_id"])
+
+    third = alert.alert(fleet, create=board, read_card=reader)
+    assert third["card_id"] == second["card_id"]
+    assert len(board.rows) == 2, "a repeat evaluation minted a second row for generation 1"
+
+
+def test_a_card_row_that_is_gone_is_the_same_as_a_closed_one(fleet, monkeypatch):
+    _log_lines(monkeypatch)
+    board = FakeBoard()
+    _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)
+    first = alert.alert(fleet, create=board)
+
+    second = alert.alert(fleet, create=board, read_card=lambda card_id, **_kw: None)
+    assert second["closed_card"] == first["card_id"]
+    assert second["generation"] == 1
+    assert board.calls[-1]["idempotency_key"] == "peer-strand-alert:1"
+
+
+def test_a_failing_board_read_files_nothing_and_keeps_the_card(fleet, monkeypatch):
+    """D3: a board hiccup must never mint a duplicate card or orphan the live one."""
+    lines = _log_lines(monkeypatch)
+    board = FakeBoard()
+    _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)
+    first = alert.alert(fleet, create=board)
+    calls_before = len(board.calls)
+
+    _spool(fleet, 2, status="expired", waited_ns=HOUR_NS)      # the backlog GREW
+
+    def boom(card_id, **_kw):
+        raise RuntimeError("the board is locked")
+
+    second = alert.alert(fleet, create=board, read_card=boom)
+    assert second["card_read_failed"] is True
+    assert second["card_id"] == first["card_id"], "a failed read orphaned the live card"
+    assert len(board.calls) == calls_before, "a failed read filed blind"
+    assert second["fleet_total"] == 2
+    assert [event for event, _ in lines][-1] == "strand_alert"
+    assert lines[-1][1]["stranded"] == 2
+
+
+def test_the_card_body_names_the_window_its_terms_and_the_instant(fleet, monkeypatch):
+    board = FakeBoard()
+    _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)                # inside window
+    _spool(fleet, 2, status="expired", waited_ns=30 * 86400 * int(1e9))  # history
+    _spool(fleet, 3, status="queued", waited_ns=TTL_NS * 3)              # over TTL
+
+    verdict = alert.alert(fleet, create=board)
+    body = board.calls[0]["body"]
+    assert verdict["fleet_total"] == 2
+    assert f"expired in the last {WINDOW}s" in body
+    assert f"= 1 over-TTL queued + 0 claimed stuck + 1 expired in the last {WINDOW}s" in body
+    assert f"expired: 2 total / 1 within the last {WINDOW}s" in body
+    assert "`expired_undated`: 0" in body
+    assert "read at: " in body and "epoch seconds" in body
+    assert f"window {WINDOW}s" in body
+
+
+def test_the_log_line_carries_the_windowed_terms(fleet, monkeypatch):
+    lines = _log_lines(monkeypatch)
+    _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)
+    _spool(fleet, 2, status="expired", waited_ns=30 * 86400 * int(1e9))
+    alert.alert(fleet, create=FakeBoard())
+    fields = lines[0][1]
+    assert (fields["stranded"], fields["expired"], fields["expired_within_window"]) == (1, 2, 1)
+    assert fields["expired_undated"] == 0
+    assert fields["window_seconds"] == WINDOW
+
+
+def test_the_one_command_census_prints_its_window(fleet, capsys):
+    _spool(fleet, 1, status="expired", waited_ns=HOUR_NS)
+    _spool(fleet, 2, status="expired", waited_ns=30 * 86400 * int(1e9))
+    assert alert._main([str(fleet)]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["stranded"] == 1
+    assert printed["expired"] == 2 and printed["expired_within_window"] == 1
+    assert printed["window_seconds"] == WINDOW
+    assert printed["seats"]["default"]["expired_within_window"] == 1
+    assert printed["read_at"] > 0
