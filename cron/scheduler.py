@@ -1594,15 +1594,37 @@ def _run_no_agent_job(
 
     # Pass workdir as subprocess cwd; never os.chdir() (leaks into concurrent gateway sessions).
     _job_workdir = _resolve_job_workdir(job, job_id)
+    exit_code: Optional[int] = None
     try:
-        ok, output = _run_job_script_with_claim_heartbeat(
+        result = _run_job_script_with_claim_heartbeat(
             job, script_path, workdir=_job_workdir, cancel_event=cancel_event)
+        ok, output = result
+        # ``None`` when nothing ran to completion (bad path, timeout, cancel, exception): those are
+        # never a declared stand-down, whatever the job declares.
+        exit_code = getattr(result, "exit_code", None)
     except Exception as exc:
         logger.exception("Job '%s': script execution raised unexpectedly", job_id)
         ok, output = False, f"Script execution failed: {exc}"
 
     now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
+
+    if not ok and exit_code is not None and exit_code in declared_benign_exit_codes(job):
+        # A DECLARED stand-down: the script decided this tick owed nothing and said so with an exit
+        # code the job itself declares benign (the diddler carriers exit 2 when their seats are held,
+        # in backoff, or there was no work). It is neither a pass nor a failure, so it gets its own
+        # status and its own (silent) run: the failure counter, the sticky last_failure stamp and the
+        # "script failed" alert are all wrong for it — and that alert is exactly what made a healthy
+        # stood-down carrier indistinguishable from a real clock failure. stdout/stderr are kept in
+        # the saved output document, which is where the departure line lives.
+        logger.info(
+            "Job '%s' (no_agent): stood down (exit %s, declared benign)", job_id, exit_code)
+        # The status is booked from this marker by cron.scheduler_bookkeeping.finish_completed_run,
+        # which reads the SAME job dict this call was handed (a transient key, like
+        # ``_model_unreachable``/``_quota_hold_seconds``: never persisted).
+        job["_stood_down"] = {"exit_code": exit_code}
+        return (True, f"{header}**Status:** stood down (exit {exit_code}, declared benign)\n\n"
+                      f"{output}\n", SILENT_MARKER, None)
 
     if not ok:
         # Deliver the error: a silently broken watchdog is the worst-case outcome.
@@ -4485,6 +4507,7 @@ from cron.scheduler_delivery import (
 )
 from cron.scheduler_script import (
     _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
+    declared_benign_exit_codes,
 )
 from cron.scheduler_prompt import (
     _PROMPT_FRAME, _PROMPT_HEADING, _PROMPT_SEPARATOR, _RESPONSE_FRAME, _RESPONSE_HEADING,

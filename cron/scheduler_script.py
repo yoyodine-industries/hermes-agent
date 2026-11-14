@@ -34,6 +34,65 @@ if TYPE_CHECKING:
 logger = logging.getLogger("cron.scheduler")
 
 
+class ScriptRunResult:
+    """One script run: ``(success, output)`` for every existing caller, plus the measured exit code.
+
+    The boolean alone cannot express "the script chose this code deliberately": a job that declares a
+    benign exit code (``benign_exit_codes``) needs the CODE to tell its stand-down from a real failure,
+    and the fold into ``False`` loses it. The object still unpacks as the 2-tuple every caller and test
+    of this module already expects, so nothing that only wants success/output has to change.
+    """
+
+    __slots__ = ("success", "output", "exit_code")
+
+    def __init__(self, success: bool, output: str, exit_code: Optional[int] = None) -> None:
+        self.success = bool(success)
+        self.output = output
+        # None means "no code was measured" (resolution/argv/timeout/cancel/exception), which is
+        # never benign: only a real, completed process can stand down.
+        self.exit_code = exit_code
+
+    def __iter__(self):
+        yield self.success
+        yield self.output
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, index):
+        return (self.success, self.output)[index]
+
+    def __repr__(self) -> str:
+        return f"ScriptRunResult(success={self.success!r}, exit_code={self.exit_code!r})"
+
+
+def declared_benign_exit_codes(job: Optional[Mapping[str, Any]]) -> frozenset[int]:
+    """The exit codes THIS job declares benign (``benign_exit_codes``), never code 0.
+
+    0 is already success, so a job that lists it gains nothing and the reader need not reason about a
+    "benign success". The read path tolerates junk on purpose: a hand-edited jobs.json must not crash a
+    tick, so an unparsable entry is skipped here and REFUSED by the write path (cron.jobs) instead.
+    """
+    raw = (job or {}).get("benign_exit_codes")
+    if not raw:
+        return frozenset()
+    if isinstance(raw, (str, int)):
+        raw = [raw]
+    try:
+        values = list(raw)
+    except TypeError:
+        return frozenset()
+    codes = set()
+    for value in values:
+        try:
+            code = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= code <= 255:
+            codes.add(code)
+    return frozenset(codes)
+
+
 def _positive_int(raw) -> Optional[int]:
     """``int(float(raw))`` when > 0, else None; raises on unparsable input."""
     timeout = int(float(raw))
@@ -480,9 +539,10 @@ def _run_job_script(
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
     identity: Optional[Mapping[str, str]] = None,
     job: Optional[Mapping[str, Any]] = None,
-) -> tuple[bool, str]:
-    """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
-    error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
+) -> ScriptRunResult:
+    """Execute a cron job's script and return a :class:`ScriptRunResult` — ``(success, output)`` for
+    every existing caller, plus the measured exit code. On failure *output* is the error message for
+    the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
     §2.3). ``workdir`` sets the subprocess cwd only; the Python process cwd is NEVER mutated (an
     ``os.chdir()`` would leak into concurrent gateway sessions).
 
@@ -498,7 +558,7 @@ def _run_job_script(
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
-        return False, err
+        return ScriptRunResult(False, err)
     # Upstream's call shape is ``_get_script_timeout()`` and its stubs are 0-arg; the row's
     # per-job rung takes an OPTIONAL job. Pass the job only when there is one, so a no-job run
     # keeps the upstream call shape and both stub signatures hold (t_a97bae7e).
@@ -506,7 +566,7 @@ def _run_job_script(
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
-            return False, err
+            return ScriptRunResult(False, err)
         from tools.environments.local import build_subprocess_env
         # The decode pin lives at the READER (the Popen call below), NOT in ``**popen_kwargs``:
         # a splat is invisible to the AST decode guard, and a second ``encoding=`` in the dict
@@ -557,7 +617,7 @@ def _run_job_script(
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
                 from cron.cancellation import cancel_reason
-                return False, f"Script cancelled: {cancel_reason(cancel_event)}"
+                return ScriptRunResult(False, f"Script cancelled: {cancel_reason(cancel_event)}")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_cron_script_tree(proc)
@@ -568,7 +628,7 @@ def _run_job_script(
                 # / #59549). agent.deadline.kill_process_tree snapshots the descendant set via psutil BEFORE
                 # signalling, so own-session grandchildren are reached too — the unified deadline layer's
                 # tree-kill (#85147, d6a5cb9725).
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                return ScriptRunResult(False, f"Script timed out after {script_timeout}s: {path}")
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
@@ -593,10 +653,13 @@ def _run_job_script(
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
-            return False, "\n".join(parts)
-        return True, stdout
+            # The CODE rides out with the report: ``benign_exit_codes`` is a property of the JOB, not
+            # of this runner, so the policy decision stays in the caller and this module keeps
+            # reporting exactly what the process did.
+            return ScriptRunResult(False, "\n".join(parts), exit_code=proc.returncode)
+        return ScriptRunResult(True, stdout, exit_code=0)
     except Exception as exc:
-        return False, f"Script execution failed: {exc}"
+        return ScriptRunResult(False, f"Script execution failed: {exc}")
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:
@@ -616,7 +679,7 @@ def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.
 def _run_job_script_with_claim_heartbeat(
     job: dict, script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
-) -> tuple[bool, str]:
+) -> ScriptRunResult:
     """Run a cron script while heartbeating its owned one-shot claim. A long script can outlive
     the stale-claim TTL; without a heartbeat another scheduler would re-dispatch the one-shot.
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from
@@ -628,7 +691,7 @@ def _run_job_script_with_claim_heartbeat(
     # identify their ledger row — see cron/execution_identity.py).
     identity = cron_execution_env(job)
 
-    def run() -> tuple[bool, str]:
+    def run() -> ScriptRunResult:
         # Every call site forwards ``job`` so the job's own script_timeout_seconds is honoured on
         # this path too — the heartbeat wrapper is the ONLY entry point the scheduler uses.
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,

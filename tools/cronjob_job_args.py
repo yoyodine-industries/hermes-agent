@@ -471,7 +471,7 @@ def _validate_context_from_refs(refs: list[Any]) -> Optional[str]:
 _FORMAT_JOB_OPTIONAL_KEYS = (
     "script", "reasoning_effort", "monitor_script", "monitor_url",
     "monitor_state", "no_agent", "enabled_toolsets", "workdir", "interpreter",
-    "script_timeout_seconds")
+    "script_timeout_seconds", "benign_exit_codes")
 
 
 def _format_job(job: dict[str, Any]) -> dict[str, Any]:
