@@ -530,6 +530,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     window = census.get("window_seconds")
     if window is None:
         window = delivery_queue.expire_window_seconds()
+    window = int(window) if float(window) == int(window) else window
     print(json.dumps({
         "root": census["root"],
         "ttl_seconds": census["ttl_seconds"],
