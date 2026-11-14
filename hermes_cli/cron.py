@@ -212,6 +212,11 @@ def _last_run_display(job: dict[str, Any]) -> str:
     last_status = job["last_status"]
     if last_status == "ok":
         return color("ok", Colors.GREEN)
+    if last_status == "stood_down":
+        # A DECLARED stand-down (the job's own benign exit code, e.g. a carrier whose seats are held):
+        # healthy and nothing owed — neither the green of a pass nor the red of a failure, and no
+        # failure streak to show. Dim, so a fleet of carriers standing down does not read as alarm.
+        return color("stood down — nothing owed (declared benign exit code)", Colors.DIM)
     if last_status == "delivery_queued":
         return color("finished; delivery is still in progress", Colors.YELLOW)
     if last_status == "delivery_failed":
@@ -779,6 +784,7 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
                     ("script_timeout_seconds", "script_timeout_seconds"),
+                    ("benign_exit_codes", "benign_exit_codes"),
                     ("interpreter", "interpreter"), ("timezone", "timezone"),
                     ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"))
 
@@ -795,6 +801,8 @@ _JOB_DETAIL_LINES = (
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
     ("script_timeout_seconds", "  Script timeout: {}s (per-job override)"),
+    ("benign_exit_codes",
+     "  Stand-down exit codes: {} (declared benign — booked 'stood down', never a failure)"),
     ("timezone", "  Timezone: {} (schedule runs on this zone's wall clock)"),
     ("workdir", "  Workdir: {}"),
     ("interpreter", "  Python: {}"))
@@ -803,8 +811,11 @@ _JOB_DETAIL_LINES = (
 def _print_job_details(job_data: dict[str, Any]) -> None:
     """Print the optional Script/Monitor/Mode/Continuity/Workdir lines of a job record."""
     for key, template in _JOB_DETAIL_LINES:
-        if job_data.get(key):
-            print(template.format(job_data[key]))
+        value = job_data.get(key)
+        if isinstance(value, list):
+            value = ", ".join(str(item) for item in value)
+        if value:
+            print(template.format(value))
 
 
 def cron_create(args):

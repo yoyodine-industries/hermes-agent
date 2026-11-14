@@ -18,6 +18,20 @@ def _catch_up_flag(value: str) -> bool:
     return value == "on"
 
 
+def _exit_code_list(value: str):
+    """``"2"`` / ``"2,3"`` -> ``[2, 3]``; an empty value -> ``[]`` (clear the declaration on edit).
+
+    ``None`` (flag absent) means "leave the job's declaration alone", so only an explicitly empty
+    value clears. The grammar is validated again by ``cron.jobs._normalize_benign_exit_codes``
+    before storing — this only spares the operator a traceback for a trailing comma.
+    """
+    items = [part for part in value.replace(",", " ").split() if part]
+    try:
+        return [int(part) for part in items]
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected exit codes, e.g. --benign-exit-codes 2 or 2,75")
+
+
 def _add_catch_up(parser) -> None:
     parser.add_argument(
         "--catch-up", dest="catch_up", type=_catch_up_flag, metavar="{on,off}",
@@ -106,6 +120,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "job in the profile keeps the global cap). Must be a positive "
             "integer; the script is killed and reported as timed out past it. "
             "Omit to follow the global/env chain.")
+    cron_create.add_argument("--benign-exit-codes", dest="benign_exit_codes",
+        type=_exit_code_list, metavar="CODES",
+        help="Comma-separated NON-ZERO exit codes this no-agent job's script may return to "
+            "DECLARE a stand-down (e.g. 2). Such a run is booked 'stood down' — its own status, "
+            "no failure stamp, no alert — instead of 'script failed'. Omit for none (default).")
     cron_create.add_argument("--timezone",
         help="IANA zone for this job's schedule (e.g. Asia/Hong_Kong), so the cron "
             "expression is read as THAT zone's wall clock whatever the profile's timezone "
@@ -190,6 +209,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "cron.script_timeout_seconds for THIS job ONLY. Must be a positive "
             "integer. Pass empty string to clear the override and follow the "
             "global/env chain again.")
+    cron_edit.add_argument("--benign-exit-codes", dest="benign_exit_codes",
+        type=_exit_code_list, metavar="CODES",
+        help="Comma-separated NON-ZERO exit codes this no-agent job's script may return to "
+            "DECLARE a stand-down (booked 'stood down', not a failure). Pass empty string to "
+            "clear the declaration.")
     cron_edit.add_argument("--timezone",
         help="IANA zone for this job's schedule. Pass empty string to clear the pin "
             "(back to the profile timezone); next_run_at is recomputed in the new zone.")

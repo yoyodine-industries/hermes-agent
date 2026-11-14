@@ -1871,6 +1871,35 @@ def _normalize_job_script_timeout(value: Any) -> Optional[int]:
 
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
+def _normalize_benign_exit_codes(value: Any) -> Optional[list[int]]:
+    """Exit codes this job's script may exit with to DECLARE a stand-down, or None.
+
+    ``benign_exit_codes`` is how a job says "these non-zero codes mean the tick had nothing to do",
+    which the scheduler books as ``stood_down`` rather than a failure (diddler's carriers exit 2 when
+    their seats are held, in backoff, or there is no work). Refused rather than guessed at write
+    time: a typo that silently WIDENS the set turns real failures green — the exact defect the field
+    exists to remove. Code 0 is rejected because it is already success, so listing it would only
+    describe something the scheduler never reports as a stand-down.
+    """
+    if value is None or value is False or (isinstance(value, str) and not value.strip()):
+        return None
+    values = [value] if isinstance(value, (int, str)) else list(value)
+    codes: list[int] = []
+    for item in values:
+        try:
+            code = int(str(item).strip())
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid benign_exit_codes entry {item!r}. Expected an integer exit code (1-255).")
+        if not 1 <= code <= 255:
+            raise ValueError(
+                f"Invalid benign_exit_codes entry {item!r}. Expected a NON-ZERO exit code (1-255); "
+                "0 is already a successful run.")
+        if code not in codes:
+            codes.append(code)
+    return sorted(codes)
+
+
 def _normalize_catch_up(value: Any) -> Optional[bool]:
     """``catch_up``: True runs one catch-up for missed slots, False skips them, None = default."""
     if value is None or isinstance(value, bool):
@@ -1895,6 +1924,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
     "script_timeout_seconds": _normalize_job_script_timeout,
+    "benign_exit_codes": _normalize_benign_exit_codes,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1910,6 +1940,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
     "script_timeout_seconds": _normalize_job_script_timeout,
+    "benign_exit_codes": _normalize_benign_exit_codes,
 }
 
 
@@ -1959,6 +1990,7 @@ def create_job(
     failure_deliver: Optional[str] = None,
     catch_up: Optional[bool] = None,
     script_timeout_seconds: Optional[int | str] = None,
+    benign_exit_codes: Optional[list[int] | int | str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: bool = False,
@@ -1976,6 +2008,9 @@ def create_job(
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
     script_timeout_seconds: per-job budget for the ``script`` (beats cron.script_timeout_seconds
     for THIS job only; positive int or numeric string, invalid values raise before storing).
+    benign_exit_codes: non-zero exit codes the ``script`` may return to DECLARE a stand-down (the
+    tick owed nothing): the run is booked ``stood_down`` — its own status, no failure stamp, no
+    alert — instead of "script failed". Default None, so no existing job changes behaviour.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
@@ -2005,6 +2040,12 @@ def create_job(
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
 
     _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
+    if f["benign_exit_codes"] and not f["no_agent"]:
+        # An agent job's ``script`` is a WAKE GATE, not the run's verdict, so a stand-down code would
+        # be silently ignored there. Refuse instead of storing a knob that does nothing.
+        raise ValueError(
+            "benign_exit_codes only applies to no_agent jobs: the script IS the run there. An agent "
+            "job's script is a wake gate, so a stand-down exit code would be ignored.")
     validate_schedule_knobs(parsed_schedule, f["timezone"], f["grace_minutes"])
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
@@ -2084,6 +2125,7 @@ def create_job(
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
         ("catch_up", f["catch_up"]),
         ("script_timeout_seconds", f["script_timeout_seconds"]),
+        ("benign_exit_codes", f["benign_exit_codes"]),
     ):
         if value is not None:
             job[key] = value
@@ -2287,6 +2329,10 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
                 _normalize_job_optional_text(updated.get("script")))
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
+        if ({"benign_exit_codes", "no_agent"}.intersection(updates)
+                and updated.get("benign_exit_codes") and not updated.get("no_agent")):
+            raise ValueError(
+                "benign_exit_codes only applies to no_agent jobs: the script IS the run there.")
         if {"timezone", "grace_minutes"}.intersection(updates):
             validate_schedule_knobs(
                 updated.get("schedule") or {}, updated.get("timezone"),

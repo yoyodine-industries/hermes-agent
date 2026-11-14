@@ -84,6 +84,11 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
+    if job.pop("_stood_down", None):
+        # A declared stand-down (a no_agent script exiting its job-declared benign code): its OWN
+        # status. success=True keeps the failure streak at zero and _record_run_outcome's success
+        # branch suppresses the last_failure stamp, so a healthy stood-down carrier never reads red.
+        mark_kwargs["status"] = "stood_down"
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
     marked = scheduler.self_removal_delivery_allowed(job["id"]) or scheduler.mark_job_run(
         job["id"], d.success, d.error, **mark_kwargs)

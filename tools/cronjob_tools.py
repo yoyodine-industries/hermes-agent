@@ -735,6 +735,7 @@ def _action_create(a: dict[str, Any]) -> str:
             # CLI-only lane, same reasoning: a model must not extend its own script budget. The
             # value is validated by cron.jobs._normalize_job_script_timeout before storing.
             script_timeout_seconds=a["script_timeout_seconds"],
+            benign_exit_codes=a["benign_exit_codes"] or None,
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             catch_up=a["catch_up"],
@@ -925,6 +926,10 @@ def _update_script_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[
         # CLI-only lane; update_job validates, empty string clears the override. Grouped with the
         # script knobs because it bounds only the job's `script`.
         updates["script_timeout_seconds"] = a["script_timeout_seconds"]
+    if a["benign_exit_codes"] is not None:
+        # CLI-only lane, same reasoning as the budget above: a model must not be able to widen the set
+        # of exit codes its own job calls a stand-down. [] clears; update_job validates the grammar.
+        updates["benign_exit_codes"] = a["benign_exit_codes"] or None
     if monitor_url is not None:
         updates["monitor_url"] = _normalize_optional_job_value(monitor_url) if monitor_url else None
     if (monitor_script is not None or monitor_url is not None) and (
@@ -1085,6 +1090,7 @@ def cronjob(
     failure_deliver: Optional[str | list[str]] = None,
     catch_up: Optional[bool] = None,
     script_timeout_seconds: Optional[int | str] = None,
+    benign_exit_codes: Optional[list[int] | int | str] = None,
     task_id: str | None = None,
     session_id: Optional[str] = None,
     paused: bool = False,
