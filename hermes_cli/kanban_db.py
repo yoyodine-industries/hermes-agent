@@ -365,6 +365,7 @@ def notify_task_updated(
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+    "admission_unsettled",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable", "skipped_self_review",
 )
@@ -4463,7 +4464,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
+        "'admission_unsettled' "
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
@@ -4793,7 +4795,9 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
+    from hermes_cli.kanban_owner_recovery import (
+        owner_attempt_never_ran, owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error,
+    )
     for row in stale:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -4821,12 +4825,16 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
+        unsettled = None
         with write_txn(conn):
             # Again under the write lock: an interpreter that bound since the check above
             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
             retry_status, error = _retry_status_for_run(conn, row["id"]), reclaim_error(conn, row["id"], row["claim_lock"])
+            # The owner never settled the attempt and no worker ever bound to it: nothing of the
+            # card ran, so this is the OWNER's fault and the card is not charged for it below.
+            unsettled = owner_attempt_never_ran(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -4841,6 +4849,7 @@ def release_stale_claims(
             run_id = _record_reclaim(
                 conn, row["id"], termination,
                 error=error,
+                outcome="admission_unsettled" if unsettled else "reclaimed",
                 payload={
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
@@ -4850,18 +4859,28 @@ def release_stale_claims(
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
                     "retry_status": retry_status,
+                    **({"admission_unsettled": unsettled} if unsettled else {}),
                 },
             )
             reclaimed += 1
-        # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
-        # the run ended without a verdict, so it counts toward the breaker and a
-        # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
-        _record_task_failure(
-            conn, row["id"], error,
-            outcome="reclaimed", failure_limit=failure_limit,
-            release_claim=False, end_run=False,
-            event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
-        )
+        if unsettled:
+            # ADMISSION_UNSETTLED: the owner never settled this attempt and nothing of the card
+            # ran. The error is stamped for ``check_respawn_guard``, but NOT charged — the card's
+            # failure budget is for its own failures, and an owner-timing fault repeats
+            # identically on every retry.
+            with write_txn(conn):
+                conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                             (error[:500], row["id"]))
+        else:
+            # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
+            # the run ended without a verdict, so it counts toward the breaker and a
+            # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
+            _record_task_failure(
+                conn, row["id"], error,
+                outcome="reclaimed", failure_limit=failure_limit,
+                release_claim=False, end_run=False,
+                event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
+            )
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
             _fire_kanban_lifecycle_hook(
@@ -4874,14 +4893,20 @@ def release_stale_claims(
 
 def _record_reclaim(
     conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
+    outcome: str = "reclaimed",
 ) -> Optional[int]:
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
-    (payload merged with the termination report). Caller holds the txn."""
+    (payload merged with the termination report). Caller holds the txn.
+
+    ``outcome`` exists for the ONE class that is not the reclaim's own: an attempt the owner
+    never settled and no worker ever bound (``admission_unsettled``). Whichever path ticks
+    first — this one or the crash sweep — the run carries the class, so a reader is never sent
+    into the worker's code for the owner's timing."""
     run_id = _end_run(
-        conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
+        conn, task_id, outcome=outcome, status=outcome, error=error, metadata=termination,
     )
     payload.update(termination)
-    _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+    _append_event(conn, task_id, outcome, payload, run_id=run_id)
     return run_id
 
 
