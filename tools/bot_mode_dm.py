@@ -743,6 +743,40 @@ def _home_from_runner_argv(argv: list[str]) -> Path | None:
     return None
 
 
+def _target_admission(delivery_id: str, target_home) -> dict | None:
+    """The TARGET home's admission row for this delivery - the only witness that says "admitted".
+
+    Read in the RECIPIENT's store, never the caller's: measured 2026-11-15, delivery 42f38288 was
+    DELIVERED with its admission row under the platform-stl home and NOTHING under the sender's,
+    and ecd838ab likewise under the default home. A sender-side lookup answers "never admitted"
+    for a message that arrived, which is a second false assurance wearing the fix's clothes.
+
+    The admission row is also the EARLIER witness: it is written before the dial returns, while
+    ``runtime/bot_live_delivery`` is written by the drain, so in the window between them only this
+    row can answer.
+    """
+    if not target_home:
+        return None
+    import sqlite3
+
+    db = Path(target_home) / "state.db"
+    if not db.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT admission_id, status, outcome FROM session_admissions"
+                " WHERE request_id = ? LIMIT 1", (f"bot:{delivery_id}",)).fetchone()
+        finally:
+            conn.close()
+    except Exception:  # an unreadable witness is uncertainty, never a verdict
+        return None
+    if not row:
+        return None
+    return {"admission_id": row[0], "status": row[1], "outcome": row[2]}
+
+
 def _iso(epoch_seconds: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch_seconds))
 
@@ -764,11 +798,17 @@ def _live_outcome_unknown(dm_file: str, cause: object, *, profile_home: Path | N
     intent = _intent_payload(dm_file) or {}
     home = profile_home or (intent.get("owner") or {}).get("profile_home")
     rung = _ambiguous_rung(dm_file, cause)
+    # An empty cause must still NAME something (measured: the ambiguous population printed
+    # "Live admission outcome unknown: . Do not resend." with an empty string where the cause
+    # belongs, and an empty field reads as "no problem" to every reader and every parser).
+    cause_text = str(cause).strip() or "<no admission row in target home>"
+    admission = _target_admission(delivery_id, home)
     receipt: dict[str, Any] = {
         "status": "ambiguous",
         "delivery_id": delivery_id,
         "rung": rung,
-        "error": f"Live admission outcome unknown at the {rung} gate: {cause}.",
+        "admission": admission,
+        "error": f"Live admission outcome unknown at the {rung} gate: {cause_text}.",
         "evidence_file": dm_file,
         "retained": None,
     }
@@ -797,11 +837,18 @@ def _live_outcome_unknown(dm_file: str, cause: object, *, profile_home: Path | N
         receipt["temp_copy_expires_at"] = expires_at
     # The advice is only as good as the record behind it: "do not resend" is asserted where a
     # copy survives, and refused where none does -- the old text promised it unconditionally.
-    if receipt["retained"]:
-        receipt["error"] += " Do not resend: the receipt is retained."
+    # "Do not resend" is a property of the LOOKUP, not of the verdict (rev 3, A2): the receipt
+    # says it in both cases and the cases are opposite. Only an admission row in the TARGET home
+    # licenses it; without one, not resending loses the message permanently.
+    if admission:
+        receipt["error"] += (f" Do not resend: admitted in the target home as"
+                             f" {admission['status']}/{admission['outcome']}.")
+    elif receipt["retained"]:
+        receipt["error"] += (" NEVER ADMITTED: RE-SEND - the payload is preserved at "
+                             f"{receipt['retained'][3:]}.")
     else:
-        receipt["error"] += (" Do NOT rely on this id alone: no durable record could be written"
-                             " from here, so the message may be unrecoverable.")
+        receipt["error"] += (" NEVER ADMITTED and no durable record could be written from here:"
+                             " RE-SEND, and the payload may already be unrecoverable.")
     return json.dumps(receipt)
 
 

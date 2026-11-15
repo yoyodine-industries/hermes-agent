@@ -137,7 +137,10 @@ def test_delivery_runner_that_cannot_activate_after_live_admission_stays_ambiguo
     payload = json.loads(result.stdout)
     assert payload["status"] == "ambiguous"
     assert payload["delivery_id"] == _dm_delivery_id(str(dm_file))
-    assert "Do not resend" in payload["error"]
+    # rev 3 (t-e481b242eb): "Do not resend" is licensed by an ADMISSION ROW in the target home,
+    # not by the verdict. This fixture has no admission row, so the honest advice is RE-SEND.
+    assert "Do not resend" not in payload["error"], payload["error"]
+    assert "NEVER ADMITTED: RE-SEND" in payload["error"], payload["error"]
     assert dm_file.exists() and intent.exists()
 
 

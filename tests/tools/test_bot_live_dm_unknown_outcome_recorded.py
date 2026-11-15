@@ -112,3 +112,70 @@ def test_a_discovery_pin_that_never_arrived_still_leaves_a_readable_record(tmp_p
     from tools import bot_live_delivery
     assert bot_live_delivery._scan_read(Path(receipt["retained"][3:])) is not None, \
         "a ticket the scans cannot read is the hole this closes"
+
+
+def _admit(home: Path, delivery_id: str, status="terminal", outcome="completed") -> None:
+    """Write the TARGET home's admission row — the witness the receipt must consult (A1)."""
+    import sqlite3
+
+    db = home / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE session_admissions (seq INTEGER PRIMARY KEY, admission_id TEXT,"
+                 " request_id TEXT, status TEXT, outcome TEXT)")
+    conn.execute("INSERT INTO session_admissions (admission_id, request_id, status, outcome)"
+                 " VALUES (?,?,?,?)", ("4605958e67f64d409af5a012e9208800",
+                                       f"bot:{delivery_id}", status, outcome))
+    conn.commit()
+    conn.close()
+
+
+def test_no_admission_row_in_the_target_home_means_re_send_not_dont_resend(tmp_path):
+    """A2: the advice is a property of the LOOKUP. Absent row => not resending LOSES the message."""
+    dm_file = _dm(tmp_path)
+    receipt = json.loads(bot_mode_dm._live_outcome_unknown(
+        dm_file, QueueFullError("platform-stl", limit=32), profile_home=tmp_path))
+
+    assert receipt["admission"] is None
+    assert "Do not resend" not in receipt["error"], "the advice is inverted without an admission row"
+    assert "NEVER ADMITTED: RE-SEND" in receipt["error"]
+    assert receipt["retained"], "the payload path must be carried so a re-send is possible"
+
+
+def test_an_admission_row_in_the_target_home_licenses_do_not_resend(tmp_path):
+    dm_file = _dm(tmp_path)
+    delivery_id = bot_mode_dm._dm_delivery_id(dm_file)
+    _admit(tmp_path, delivery_id)
+
+    receipt = json.loads(bot_mode_dm._live_outcome_unknown(
+        dm_file, RuntimeError("dial died"), profile_home=tmp_path))
+
+    assert receipt["admission"] == {"admission_id": "4605958e67f64d409af5a012e9208800",
+                                    "status": "terminal", "outcome": "completed"}
+    assert "Do not resend" in receipt["error"]
+    assert "terminal/completed" in receipt["error"], "the row's own words, not a paraphrase"
+
+
+def test_the_lookup_reads_the_target_home_not_the_callers(tmp_path):
+    """A5d: the case that produced the amendment — caller home has nothing, target home has the row."""
+    caller, target = tmp_path / "caller", tmp_path / "target"
+    target.mkdir()
+    dm_file = _dm(caller)
+    delivery_id = bot_mode_dm._dm_delivery_id(dm_file)
+    _admit(target, delivery_id)
+
+    receipt = json.loads(bot_mode_dm._live_outcome_unknown(
+        dm_file, QueueFullError("platform-stl", limit=8), profile_home=target))
+
+    assert receipt["admission"]["admission_id"] == "4605958e67f64d409af5a012e9208800"
+    assert "Do not resend" in receipt["error"]
+    assert bot_mode_dm._target_admission(delivery_id, caller) is None, \
+        "a sender-side lookup answers 'never admitted' for a delivered message"
+
+
+def test_an_empty_cause_is_named_never_blank(tmp_path):
+    dm_file = _dm(tmp_path)
+    receipt = json.loads(bot_mode_dm._live_outcome_unknown(dm_file, "", profile_home=tmp_path))
+
+    assert receipt["error"].strip(), "an empty error reads as 'no problem'"
+    assert ": ." not in receipt["error"] and "unknown: ." not in receipt["error"]
+    assert "<no admission row in target home>" in receipt["error"], receipt["error"]
