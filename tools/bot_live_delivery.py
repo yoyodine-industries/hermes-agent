@@ -43,6 +43,19 @@ def _bot_chat_tip(home: Path) -> str | None:
         db.close()
 
 
+class AuthorityNotReady(ValueError):
+    """The profile authority was discovered but is not ready to accept a delivery.
+
+    Carries ``state`` because the refusal reason a sender needs is WHICH state the discovery
+    found (``starting``, ``draining``, ``stale``, ...) — the same bare "not ready" for every
+    state made an authority refusal indistinguishable from a full queue in the receipt.
+    """
+
+    def __init__(self, state: str) -> None:
+        self.state = str(state)
+        super().__init__(f"authority_not_ready({self.state}): profile authority is not ready")
+
+
 def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
     """Discover the profile authority and its exact Bot Chat without acquiring a lease.
 
@@ -54,7 +67,7 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     home = Path(profile_home).resolve()
     discovery = discover_gateway_endpoint(home, timeout=5)
     if discovery.state != 'ready' or discovery.endpoint is None:
-        raise ValueError('profile authority is not ready')
+        raise AuthorityNotReady(discovery.state)
     if not (home / 'state.db').is_file():
         return None
     tip = _bot_chat_tip(home)
@@ -328,6 +341,101 @@ def _next_sequence(root: Path) -> int:
 
 def _write(path: Path, record: dict[str, Any]) -> None:
     atomic_json_write(path, record, indent=None, sort_keys=True, fsync_dir=True, mode=0o600)
+
+
+_OWNER_SENTINEL = "unverified"
+
+
+def record_ambiguous(
+    profile_home: Path | str,
+    *,
+    delivery_id: str,
+    payload: str,
+    owner: dict[str, Any] | None,
+    rung: str,
+    cause: str,
+    source_path: str,
+    author: dict[str, Any] | None = None,
+    temp_copy_expires_at: str | None = None,
+) -> dict[str, Any]:
+    """Persist an unknown-outcome delivery as a ticket, BEFORE anyone is sold "retained".
+
+    The ambiguous branch used to return a JSON string and write nothing: the only copy of the
+    message lived in a TMPDIR file that ``cleanup_bot_dm_cache`` prunes after 24 h and the id was
+    a fingerprint of that path, so once the file was gone the delivery was neither recoverable nor
+    even searchable. "Do not resend; the receipt is retained" is only honest if the record outlives
+    the temp file, so the record is the receipt.
+
+    An incomplete discovery pin is written anyway, with a sentinel: a shape-broken ticket is
+    skipped by the scans as uninspectable, which would leave the record present and unreadable —
+    the exact hole this function closes.
+    """
+    home = Path(profile_home).resolve()
+    pin: dict[str, Any] = {k: v for k, v in (owner or {}).items() if isinstance(v, str) and v}
+    verified = bool(owner) and all(pin.get(k) for k in _OWNER_KEYS)
+    if not verified:
+        pin = {**_OWNER_SENTINEL_DICT, **pin}
+    pin["verified"] = verified
+    with _locked(home) as root:
+        record = {
+            "id": _delivery_id(delivery_id),
+            "delivery_id": _delivery_id(delivery_id),
+            "status": "ambiguous",
+            "created_at": int(time.time()),
+            "sequence": _next_sequence(root),
+            "owner": pin,
+            "payload": payload,
+            "rung": rung,
+            "cause": cause,
+            "source_path": source_path,
+            "temp_copy_expires_at": temp_copy_expires_at,
+        }
+        if author:
+            record["author"] = author
+        path = root / f"{record['delivery_id']}.json"
+        _write(path, record)
+    return dict(record, path=str(path))
+
+
+_OWNER_SENTINEL_DICT = {key: _OWNER_SENTINEL for key in _OWNER_KEYS}
+
+
+def census(profile_home: Path | str) -> dict[str, Any]:
+    """What the store can and cannot prove, including the IDs it cannot account for.
+
+    Two writers share this directory and only one writes a clock, so a ``clockless`` count above
+    zero means ordering cannot be proven from the store at all. ``ambiguous_unresolved`` is the
+    message-loss assertion: an ambiguous ticket whose id does not resolve through
+    :func:`read_delivery_result` is a receipt a sender was told not to resend and nobody can now
+    find — it is returned as an ID LIST, because a count would hide which deliveries died.
+    """
+    root = _root(profile_home)
+    statuses: dict[str, int] = {}
+    clockless: list[str] = []
+    ambiguous: list[str] = []
+    unreadable: list[str] = []
+    if root.is_dir():
+        for path in sorted(root.glob("*.json")):
+            record = _scan_read(path)
+            if record is None:
+                unreadable.append(path.stem)
+                continue
+            statuses[str(record.get("status"))] = statuses.get(str(record.get("status")), 0) + 1
+            if not (isinstance(record.get("created_at"), int) and isinstance(record.get("sequence"), int)):
+                clockless.append(path.stem)
+            if record.get("status") == "ambiguous":
+                ambiguous.append(path.stem)
+    unresolved = [rid for rid in ambiguous if read_delivery_result(profile_home, rid) is None]
+    return {
+        "records": sum(statuses.values()),
+        "statuses": statuses,
+        "clockless": len(clockless),
+        "clockless_ids": clockless,
+        "ambiguous": len(ambiguous),
+        "ambiguous_ids": ambiguous,
+        "ambiguous_unresolved": unresolved,
+        "unreadable_ids": unreadable,
+    }
 
 
 def deliver_to_live_owner(

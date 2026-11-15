@@ -694,11 +694,115 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
     return dict(_roster(_hermes_root(Path(_default_home())))).get(argv[2])
 
 
-def _live_outcome_unknown(dm_file: str, cause: object) -> str:
-    """The runner's stdout when a live admission may have happened but its outcome is unknown."""
-    return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                       "error": f"Live admission outcome unknown: {cause}. Do not resend.",
-                       "evidence_file": dm_file})
+def _intent_payload(dm_file: str) -> dict | None:
+    """The pinned live-delivery intent beside a DM file, if it is still readable.
+
+    It is the last place the message text and the discovery pin survive: the DM file is a TMPDIR
+    file with a 24 h pruner behind it, so a receipt written only about that file expires too.
+    """
+    try:
+        payload = json.loads(Path(_live_intent_file(dm_file)).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _ambiguous_rung(dm_file: str, cause: object) -> str:
+    """Name the gate that refused, with its evidence — one bare string used to serve both.
+
+    ``queue_full`` (raise a cap, or wait for room) and an authority that is not ready (wait for
+    the gateway) have different remedies, so "outcome unknown: queue full" told an operator which
+    ceiling to raise only when they already knew the answer.
+    """
+    from tools.bot_delivery_queue import QueueFullError, queue_depth
+
+    if isinstance(cause, QueueFullError):
+        cap = getattr(cause, "limit", None)
+        home = ((_intent_payload(dm_file) or {}).get("owner") or {}).get("profile_home")
+        try:
+            depth = queue_depth(home, getattr(cause, "profile", None)) if home else None
+        except Exception:  # the rung must still print when the depth cannot be read
+            depth = None
+        return f"queue_full({depth if depth is not None else '?'}/{cap if cap is not None else '?'})"
+    state = getattr(cause, "state", None)
+    if isinstance(state, str) and state:
+        return f"authority_not_ready({state})"
+    return f"unattributed_rung({type(cause).__name__})"
+
+
+def _home_from_runner_argv(argv: list[str]) -> Path | None:
+    """The profile home the runner was launched for, when the boot failure is all we have.
+
+    A runner that cannot activate still knows its target: ``--profile-home`` rides its own argv,
+    so the unknown-outcome record can be written for the right profile even with no intent left
+    to read a pin from.
+    """
+    for index, part in enumerate(argv[:-1]):
+        if part == "--profile-home":
+            return Path(argv[index + 1]).resolve()
+    return None
+
+
+def _iso(epoch_seconds: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch_seconds))
+
+
+def _live_outcome_unknown(dm_file: str, cause: object, *, profile_home: Path | None = None,
+                          author: Optional[dict] = None) -> str:
+    """The runner's stdout when a live admission may have happened but its outcome is unknown.
+
+    The record is written BEFORE the answer. The answer's whole promise is retention — "do not
+    resend, the receipt is retained" — and that promise is true only once a copy exists somewhere
+    the temp-file sweep cannot reach. The id stays the DM file's fingerprint so the dispatch ack,
+    the pinned intent and this record all name the same delivery, but it is now a STORED KEY: the
+    ticket is found by id in the store, not by reconstructing a path that no longer exists.
+    """
+    from tools import bot_live_delivery as store
+
+    dm_file = os.fspath(dm_file)  # a Path here would fail the receipt's own json.dumps
+    delivery_id = _dm_delivery_id(dm_file)
+    intent = _intent_payload(dm_file) or {}
+    home = profile_home or (intent.get("owner") or {}).get("profile_home")
+    rung = _ambiguous_rung(dm_file, cause)
+    receipt: dict[str, Any] = {
+        "status": "ambiguous",
+        "delivery_id": delivery_id,
+        "rung": rung,
+        "error": f"Live admission outcome unknown at the {rung} gate: {cause}.",
+        "evidence_file": dm_file,
+        "retained": None,
+    }
+    try:
+        message = intent.get("message")
+        if not isinstance(message, str):
+            message = Path(dm_file).read_text(encoding="utf-8-sig")
+    except OSError:
+        message = None
+    expires_at = _iso(time.time() + _DM_STALE_SECONDS)
+    if home and message is not None:
+        try:
+            record = store.record_ambiguous(
+                home, delivery_id=delivery_id, payload=message, owner=intent.get("owner"),
+                rung=rung, cause=str(cause), source_path=str(dm_file),
+                author=author or intent.get("author"), temp_copy_expires_at=expires_at)
+        except Exception as exc:  # never claim retention that did not happen
+            receipt["retention_error"] = f"the durable record could not be written: {exc}"
+        else:
+            receipt["retained"] = f"at {record['path']}"
+            receipt["retention"] = ("durable; the store is not subject to the 24 h temp-file sweep")
+            receipt["retained_created_at"] = record["created_at"]
+            receipt["retained_sequence"] = record["sequence"]
+    if os.path.lexists(dm_file):
+        receipt["temp_copy"] = dm_file
+        receipt["temp_copy_expires_at"] = expires_at
+    # The advice is only as good as the record behind it: "do not resend" is asserted where a
+    # copy survives, and refused where none does -- the old text promised it unconditionally.
+    if receipt["retained"]:
+        receipt["error"] += " Do not resend: the receipt is retained."
+    else:
+        receipt["error"] += (" Do NOT rely on this id alone: no durable record could be written"
+                             " from here, so the message may be unrecoverable.")
+    return json.dumps(receipt)
 
 
 def _runner_argv(args: list[str]) -> tuple[Optional[str], str, str, list[str]] | None:
@@ -737,7 +841,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 print(_unavailable_payload(dm_file, exc))
                 return 1
             except Exception as exc:
-                print(_live_outcome_unknown(dm_file, exc))
+                print(_live_outcome_unknown(dm_file, exc, profile_home=home, author=author))
                 return 1
             if record is not None:
                 return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
@@ -788,9 +892,8 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
         except LiveTargetUnavailableError as exc:
             return _settled_no_send(dm_file, exc)
         except Exception as exc:
-            return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
-                "evidence_file": dm_file})
+            # The same unknown outcome as the runner's: one writer, one receipt, one record.
+            return _live_outcome_unknown(dm_file, exc, profile_home=profile_home, author=author)
         if record is not None:
             command = _delivery_command(argv, dm_file, stdin_file=False, profile_home=profile_home, author=author)
             notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent))
@@ -1053,6 +1156,7 @@ if __name__ == "__main__":  # pragma: no cover - exercised as a background proce
             parsed = _runner_argv(sys.argv[1:])
             if not booted and parsed and os.path.exists(_live_intent_file(parsed[2])):
                 print(_live_outcome_unknown(parsed[2], "the delivery runner could not activate "
-                                                       "Hermes dependencies (see stderr)"))
+                                                       "Hermes dependencies (see stderr)",
+                                            profile_home=_home_from_runner_argv(parsed[3])))
             raise
     raise SystemExit(_delivery_main(sys.argv[1:]))
