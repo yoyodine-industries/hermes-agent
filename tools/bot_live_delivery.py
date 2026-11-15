@@ -54,7 +54,7 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     home = Path(profile_home).resolve()
     discovery = discover_gateway_endpoint(home, timeout=5)
     if discovery.state != 'ready' or discovery.endpoint is None:
-        raise ValueError('profile authority is not ready')
+        raise _not_ready_error(discovery)
     if not (home / 'state.db').is_file():
         return None
     tip = _bot_chat_tip(home)
@@ -66,7 +66,34 @@ class PreDialError(ValueError):
     """The authority call died before its RPC reached the socket: nothing was admitted, so
     this is a definite no-send the sender may safely retry — never the ambiguous
     post-admission state that orders 'do not resend' (#139303). A ``ValueError`` like the
-    "authority is not ready" refusals it wraps, so existing ``except ValueError`` callers hold."""
+    "authority is not ready" refusals it wraps, so existing ``except ValueError`` callers hold.
+
+    ``payload`` carries what the wrapped exception knew. An ABSENT payload stays ``None`` and
+    is therefore distinguishable from an EMPTY one (``{}``); the door's own refusals pass
+    ``{'which': ..., 'endpoint_present': ...}`` so a reader never reconstructs which fact
+    failed out of the message text."""
+
+    def __init__(self, message, payload=None):
+        super().__init__(message)
+        self.payload = payload
+
+
+def _not_ready_error(discovery) -> 'PreDialError':
+    """The pre-dial refusal with BOTH facts tested SEPARATELY: ``state != 'ready'`` and
+    ``endpoint is None`` can hold at once, and one sentence for both loses which one fired
+    (and used to lose the endpoint fact entirely). ``which`` names every cause that held."""
+    state = getattr(discovery, 'state', None)
+    endpoint_present = getattr(discovery, 'endpoint', None) is not None
+    causes = []
+    if state != 'ready':
+        causes.append('state')
+    if not endpoint_present:
+        causes.append('endpoint')
+    which = '+'.join(causes) or 'unknown'
+    return PreDialError(
+        f'profile authority is not ready (which={which} '
+        f'endpoint_present={endpoint_present} state={state!r})',
+        payload={'which': which, 'endpoint_present': endpoint_present, 'state': state})
 
 
 def authority_delivery(home, params):
@@ -93,7 +120,7 @@ def _authority_rpc(home, method, params):
         nonlocal rpc_started
         discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=5)
         if discovery.state != 'ready' or discovery.endpoint is None:
-            raise ValueError('profile authority is not ready')
+            raise _not_ready_error(discovery)
         endpoint = discovery.endpoint
         ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
@@ -116,7 +143,8 @@ def _authority_rpc(home, method, params):
         return _run_async(request())
     except Exception as exc:
         if not rpc_started:
-            raise PreDialError(str(exc)) from exc
+            raise PreDialError(f'{type(exc).__name__}: {exc}',
+                               payload=getattr(exc, 'payload', None)) from exc
         raise
 
 

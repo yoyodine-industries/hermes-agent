@@ -654,12 +654,12 @@ def _refused_admission_payload(dm_file: str, exc: BaseException, *,
         retry_at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                  time.gmtime(time.time() + _RETRYABLE_RETRY_AFTER_SECONDS))
         payload.update(reason=reason, retryable=True, attempt=attempt, retry_at=retry_at)
-        payload["error"] = (f"Live delivery admission could not be confirmed: {exc}. "
+        payload["error"] = (f"Live delivery admission could not be confirmed: {type(exc).__name__}: {exc}. "
                             f"{reason} is retryable - resend with the SAME idempotency key, "
                             f"attempt {attempt}, not before {retry_at}.")
     else:
         payload.update(retryable=False, attempt=attempt)
-        payload["error"] = (f"Live delivery admission could not be confirmed: {exc}. Do not resend.")
+        payload["error"] = (f"Live delivery admission could not be confirmed: {type(exc).__name__}: {exc}. Do not resend.")
     return json.dumps(payload)
 
 
@@ -837,7 +837,7 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
 def _live_outcome_unknown(dm_file: str, cause: object) -> str:
     """The runner's stdout when a live admission may have happened but its outcome is unknown."""
     return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                       "error": f"Live admission outcome unknown: {cause}. Do not resend.",
+                       "error": f"Live admission outcome unknown: {type(cause).__name__}: {cause}. Do not resend.",
                        "evidence_file": dm_file})
 
 
