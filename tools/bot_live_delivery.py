@@ -62,6 +62,25 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
                 lease_id=discovery.endpoint.instance_id, live_session_id=tip or '')
 
 
+def _self_source_sha256() -> str:
+    """sha256 of this module's source, computed ONCE at import.
+
+    CPython validates a ``.pyc`` against ``(source size, source mtime)``, so an equal-size edit
+    with a preserved mtime is served STALE while the on-disk hash still reads true. Recording the
+    hash AT IMPORT is the only one of the three deploy facts that lets a running process report
+    the bytes it actually loaded — a process start time proves a restart, not which code is live.
+    """
+    import hashlib
+    try:
+        with open(__file__, 'rb') as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:      # an unreadable source must not stop the transport from importing
+        return ''
+
+
+SOURCE_SHA256 = _self_source_sha256()
+
+
 class PreDialError(ValueError):
     """The authority call died before its RPC reached the socket: nothing was admitted, so
     this is a definite no-send the sender may safely retry — never the ambiguous
