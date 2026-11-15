@@ -5668,10 +5668,33 @@ def _not_completable_refusal(conn: sqlite3.Connection, task_id: str) -> Completi
     )
 
 
+@dataclass
+class Retirement:
+    """A close that is NOT a completion: the card was archived, and nothing was counted as work.
+
+    ``complete_task`` returns this instead of ``True`` so the RECEIPT stops saying
+    "Completed" one layer below the status. Ruling ESC-36b70d83894494d2: "a row that
+    renders as superseded but emits a DONE event leaves the same false green one layer
+    down". Truthy, so every ``if not complete_task(...)`` caller keeps its meaning.
+    """
+
+    task_id: str
+    reason: str
+    destination: Any = None
+
+    def __bool__(self) -> bool:                       # noqa: D105 - truthiness is the contract
+        return True
+
+    def receipt(self) -> str:
+        where = f"; the work is carried by {self.destination}" if self.destination else ""
+        return (f"Retired {self.task_id} — archived as '{self.reason}'{where}; "
+                f"NOT counted as done")
+
+
 def _retire_not_complete(
     conn: sqlite3.Connection, task_id: str, claim: dict[str, str], *,
     supersede_ack: Any = None, actor: str = "",
-) -> bool | CompletionRefusal:
+) -> bool | CompletionRefusal | Retirement:
     """Answer a RETIREMENT claim with the retirement door, never with ``done``.
 
     Two outcomes, both explicit:
@@ -5718,7 +5741,7 @@ def _retire_not_complete(
                 "not_running",
                 f"{task_id} is unknown or already archived; this retirement changed nothing",
             )
-        return True
+        return Retirement(task_id, reason, supersede_ack)
     with write_txn(conn):
         _append_event(conn, task_id, "completion_blocked_retire", {
             "phrase": claim["phrase"],
@@ -5807,7 +5830,7 @@ def complete_task(
     fire_lifecycle_hook: bool = True, force: bool = False,
     deferred_children: Optional[Mapping[str, Any]] = None,
     supersede_ack: Any = None, actor: str = "",
-) -> bool | CompletionRefusal:
+) -> bool | CompletionRefusal | Retirement:
     """``running|ready|blocked|review -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
@@ -5889,7 +5912,11 @@ def complete_task(
     if isinstance(proof_refusal, CompletionRefusal):
         return proof_refusal
     if proof_record is not None:
-        metadata = {**(metadata if isinstance(metadata, dict) else {}), "proof": proof_record}
+        # ``close_proof`` and NOT ``proof``: ``metadata.proof`` is the ``landed`` contract's own
+        # vocabulary (the deploy-proof gate refuses it on any other card), so the close proof is
+        # a separate, additive record that cannot be confused with a landed claim.
+        metadata = {**(metadata if isinstance(metadata, dict) else {}),
+                    "close_proof": proof_record}
         if proof_record.get("kind"):
             # Echo the DECLARED proof only: an unproven close is marked on the run row, not
             # dressed up in the result as though something had been checked.
@@ -6068,10 +6095,10 @@ def complete_task(
         if run_id is None and (summary or metadata or result or prior_status == "review"):
             synth_summary, synth_metadata = handoff_summary, metadata
             # A close proof record is EVIDENCE, not a handoff: an approval that carries only
-            # ``proof`` is still "approved without additional evidence", and the note must
+            # ``close_proof`` is still "approved without additional evidence", and the note must
             # survive beside the record (the proof clause runs before this synth branch).
             _only_proof = (isinstance(synth_metadata, dict) and bool(synth_metadata)
-                           and set(synth_metadata) <= {"proof"})
+                           and set(synth_metadata) <= {"close_proof"})
             if prior_status == "review" and not synth_summary and (
                     not synth_metadata or _only_proof):
                 synth_summary = _REVIEW_APPROVED_NOTE
@@ -8607,7 +8634,7 @@ def _proof_split(conn: sqlite3.Connection) -> dict[str, int]:
              JOIN task_runs r ON r.id = (
                    SELECT MAX(id) FROM task_runs WHERE task_id = t.id)
             WHERE t.status = 'done'
-              AND r.metadata LIKE '%"proof"%'
+              AND r.metadata LIKE '%"close_proof"%'
               AND r.metadata LIKE '%"verified": true%') AS proven
         """
     ).fetchone()

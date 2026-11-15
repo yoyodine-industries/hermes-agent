@@ -163,7 +163,8 @@ def test_supersede_ack_archives_the_duplicate_and_leaves_the_successor_open(conn
         supersede_ack=f"{board}/{successor}", actor="platform-coder",
     )
 
-    assert out is True
+    assert isinstance(out, kb.Retirement)
+    assert out.reason == "duplicate"
     assert kb.get_task(conn, dup).status == "archived"
     assert kb.get_task(conn, successor).status == "ready"
     # The rehome key is written on the destination — the record a completion never wrote.
@@ -266,9 +267,9 @@ def test_passing_cmd_proof_closes_records_and_echoes(conn, tmp_path):
     assert task.status == "done"
     assert "[proof rc=0 cmd=test -f" in task.result
     meta = _run_meta(conn, t)
-    assert meta["proof"]["verified"] is True
-    assert meta["proof"]["kind"] == "cmd"
-    assert meta["proof"]["rc"] == 0
+    assert meta["close_proof"]["verified"] is True
+    assert meta["close_proof"]["kind"] == "cmd"
+    assert meta["close_proof"]["rc"] == 0
     split = kb.board_stats(conn)["proof_split"]
     assert split["done"] == 1 and split["proven"] == 1 and split["unproven"] == 0
 
@@ -292,8 +293,8 @@ def test_path_proof_requires_a_match_of_the_minimum_size(conn, tmp_path):
     target.write_text('{"ok": true}\n', encoding="utf-8")
     assert kb.complete_task(conn, t, summary="report written") is True
     meta = _run_meta(conn, t)
-    assert meta["proof"]["verified"] is True
-    assert meta["proof"]["kind"] == "path"
+    assert meta["close_proof"]["verified"] is True
+    assert meta["close_proof"]["kind"] == "path"
     assert "[proof matches=1" in kb.get_task(conn, t).result
 
 
@@ -346,8 +347,8 @@ def test_operator_force_waives_a_missing_declaration_but_records_it(conn):
     t = kb.create_task(conn, title="must prove it", body="proof_required: true\n")
     assert kb.complete_task(conn, t, summary="closed by operator", force=True) is True
     meta = _run_meta(conn, t)
-    assert meta["proof"]["verified"] is False
-    assert "waived" in meta["proof"]
+    assert meta["close_proof"]["verified"] is False
+    assert "waived" in meta["close_proof"]
 
 
 def test_force_does_not_waive_a_failed_proof(conn, tmp_path):
@@ -378,7 +379,7 @@ def test_counts_carry_done_proven_unproven_retired(conn):
 # The CLI surface: the refusal's remedy is a real, accepted flag
 # ---------------------------------------------------------------------------
 
-def test_cli_complete_supersede_ack_performs_the_archive(conn):
+def test_cli_complete_supersede_ack_performs_the_archive(conn, capsys):
     successor = kb.create_task(conn, title="real")
     dup = kb.create_task(conn, title="dup")
     board = kb._archive_source_board(conn)
@@ -388,6 +389,10 @@ def test_cli_complete_supersede_ack_performs_the_archive(conn):
     assert rc == 0
     assert kb.get_task(conn, dup).status == "archived"
     assert kb.get_task(conn, successor).status == "ready"
+    # The RECEIPT must not say "Completed": the close archived the card and counted no work.
+    printed = capsys.readouterr().out
+    assert "Retired" in printed and "Completed" not in printed
+    assert "NOT counted as done" in printed
 
 
 def test_cli_complete_without_ack_exits_nonzero_and_names_the_remedy(conn, capsys):

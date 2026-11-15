@@ -1066,6 +1066,16 @@ def _handle_complete(args: dict, **kw) -> str:
             _check(False, kb.live_row_refusal(
                 conn, tid, caller_run_id=_worker_run_id(tid), verb="complete"))
         run = kb.latest_run(conn, tid)
+        # A retirement must not answer "ok: done": the card is ARCHIVED, nothing was counted as
+        # work, and the successor carries it. The tool receipt says that in as many words
+        # (ruling ESC-36b70d83894494d2 -- a false green one layer down is still a false green).
+        retirement: dict[str, Any] = {}
+        if isinstance(ok, kb.Retirement):
+            retirement = {
+                "status": "archived", "retired": True, "receipt": ok.receipt(),
+                "note": "RETIRED, not completed: the card is archived (excluded from done "
+                        "counts) and its work is carried by the successor. Do not report it as work.",
+            }
         # Artifact staging is atomic with the completion write, so a worker that
         # read `kanban_attachments` before completing saw an empty list and has
         # no way to observe what its completion just registered (#117360).
@@ -1073,7 +1083,8 @@ def _handle_complete(args: dict, **kw) -> str:
         return _ok(task_id=tid, run_id=run.id if run else None,
                    attachments=[
                        _fields(a, _ATTACHMENT_FIELDS)
-                       for a in kb.list_attachments(conn, tid)])
+                       for a in kb.list_attachments(conn, tid)],
+                   **retirement)
 
 
 @_kanban_handler("kanban_block")

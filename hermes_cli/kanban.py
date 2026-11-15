@@ -1181,6 +1181,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     "inherits the work). Close the duplicate on its own, or use "
                     "`kanban archive <id>... --reason duplicate --destination <board>/<card>`.", 2)
     fail_msg: dict[str, str] = {}
+    retirements: dict[str, "kb.Retirement"] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
             gate_err = _goal_gate_error(
@@ -1228,9 +1229,17 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
                     fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
+            if isinstance(done, kb.Retirement):
+                retirements[tid] = done
             return done
 
-        return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+        def ok_line(tid: str) -> str:
+            # A retirement must not print "Completed": the status is archived and nothing was
+            # counted as work, so the receipt says exactly that (ruling ESC-36b70d83894494d2).
+            retired = retirements.get(tid)
+            return retired.receipt() if retired is not None else f"Completed {tid}"
+
+        return _bulk_apply(ids, op, ok_line, fail_msg.__getitem__)
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
