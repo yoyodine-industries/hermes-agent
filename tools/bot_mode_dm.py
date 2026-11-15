@@ -649,17 +649,17 @@ def _refused_admission_payload(dm_file: str, exc: BaseException, *,
     reason = _retryable_reason(exc)
     attempt = _record_admission_attempt(dm_file, exc, reason=reason, author=author)
     payload: dict[str, Any] = dict(status="ambiguous", delivery_id=_dm_delivery_id(dm_file),
-                                   evidence_file=dm_file)
+                                   evidence_file=dm_file, script_sha256=_live_script_sha256())
     if reason:
         retry_at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                  time.gmtime(time.time() + _RETRYABLE_RETRY_AFTER_SECONDS))
         payload.update(reason=reason, retryable=True, attempt=attempt, retry_at=retry_at)
-        payload["error"] = (f"Live delivery admission could not be confirmed: {exc}. "
+        payload["error"] = (f"Live delivery admission could not be confirmed: {type(exc).__name__}: {exc}. "
                             f"{reason} is retryable - resend with the SAME idempotency key, "
                             f"attempt {attempt}, not before {retry_at}.")
     else:
         payload.update(retryable=False, attempt=attempt)
-        payload["error"] = (f"Live delivery admission could not be confirmed: {exc}. Do not resend.")
+        payload["error"] = (f"Live delivery admission could not be confirmed: {type(exc).__name__}: {exc}. Do not resend.")
     return json.dumps(payload)
 
 
@@ -834,11 +834,24 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
     return dict(_roster(_hermes_root(Path(_default_home())))).get(argv[2])
 
 
+def _live_script_sha256() -> str:
+    """The LIVE transport module's own import-time source hash, or '' if it cannot be read.
+
+    Carried on every ambiguous receipt so the record names the bytes the process LOADED rather
+    than the bytes someone believes are on disk.
+    """
+    try:
+        from tools.bot_live_delivery import SOURCE_SHA256
+        return SOURCE_SHA256
+    except Exception:
+        return ''
+
+
 def _live_outcome_unknown(dm_file: str, cause: object) -> str:
     """The runner's stdout when a live admission may have happened but its outcome is unknown."""
     return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                       "error": f"Live admission outcome unknown: {cause}. Do not resend.",
-                       "evidence_file": dm_file})
+                       "error": f"Live admission outcome unknown: {type(cause).__name__}: {cause}. Do not resend.",
+                       "evidence_file": dm_file, "script_sha256": _live_script_sha256()})
 
 
 def _runner_argv(args: list[str]) -> tuple[Optional[str], str, str, list[str]] | None:

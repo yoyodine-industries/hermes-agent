@@ -84,3 +84,86 @@ def test_ambiguous_without_a_record_is_reported_honestly(tmp_path, monkeypatch, 
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "ambiguous"
     assert "Do not resend" in payload["detail"], "an unknown outcome is never a licence to resend"
+
+
+# ------------------------------------------------------- the pre-dial door (t-8e280ed8c3)
+# Deliberately in THIS file, beside the boundary rules: both answer "what is the sender told",
+# and the door's receipt is where the boundary layer is read from a live process.
+
+from types import SimpleNamespace
+
+
+def _door(state, endpoint):
+    return SimpleNamespace(state=state, endpoint=endpoint)
+
+
+def test_door_names_the_state_fact_and_keeps_the_endpoint_fact():
+    err = mailbox._not_ready_error(_door('stopped', object()))
+    assert err.payload['which'] == 'state'
+    assert err.payload['endpoint_present'] is True
+    assert 'endpoint_present=True' in str(err)
+
+
+def test_door_names_the_endpoint_fact_when_state_is_ready():
+    err = mailbox._not_ready_error(_door('ready', None))
+    assert err.payload['which'] == 'endpoint'
+    assert err.payload['endpoint_present'] is False
+
+
+def test_door_names_both_facts_when_both_hold():
+    err = mailbox._not_ready_error(_door('stopped', None))
+    assert err.payload['which'] == 'state+endpoint'
+    assert err.payload['state'] == 'stopped'
+
+
+def test_absent_payload_is_not_an_empty_payload():
+    assert mailbox.PreDialError('x').payload is None
+    assert mailbox.PreDialError('x', payload={}).payload == {}
+
+
+def test_door_refusal_is_still_a_value_error():
+    assert isinstance(mailbox._not_ready_error(_door('ready', None)), ValueError)
+
+
+def test_pre_dial_wrap_carries_the_wrapped_payload(monkeypatch):
+    import hermes_cli.gateway_client as gateway_client
+    import hermes_cli.gateway_runtime as gateway_runtime
+
+    class Bone(Exception):
+        payload = {'which': 'endpoint', 'endpoint_present': False}
+
+    monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
+                        lambda home, timeout=None: _door('ready', object()))
+    monkeypatch.setattr(gateway_client, '_session_ticket',
+                        lambda home, endpoint: (_ for _ in ()).throw(Bone('ticket died')))
+    with pytest.raises(mailbox.PreDialError) as caught:
+        mailbox._authority_rpc('/tmp/does-not-matter', 'bot_relay.deliver', {})
+    assert caught.value.payload == {'which': 'endpoint', 'endpoint_present': False}
+    assert 'ticket died' in str(caught.value)
+
+
+def test_empty_str_exception_names_its_class(monkeypatch):
+    import hermes_cli.gateway_client as gateway_client
+    import hermes_cli.gateway_runtime as gateway_runtime
+
+    monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
+                        lambda home, timeout=None: _door('ready', object()))
+    monkeypatch.setattr(gateway_client, '_session_ticket',
+                        lambda home, endpoint: (_ for _ in ()).throw(TimeoutError()))
+    with pytest.raises(mailbox.PreDialError) as caught:
+        mailbox._authority_rpc('/tmp/does-not-matter', 'bot_relay.deliver', {})
+    assert str(caught.value).startswith('TimeoutError:')
+
+
+def test_self_source_hash_matches_the_file_on_disk():
+    import hashlib
+    import pathlib
+    source = pathlib.Path(mailbox.__file__).read_bytes()
+    assert mailbox.SOURCE_SHA256 == hashlib.sha256(source).hexdigest()
+
+
+def test_ambiguous_receipts_carry_the_loaded_source_hash():
+    out = json.loads(bot_mode_dm._live_outcome_unknown('/tmp/evidence', TimeoutError()))
+    assert out['script_sha256'] == mailbox.SOURCE_SHA256
+    assert 'TimeoutError' in out['error']
+    assert 'unknown: .' not in out['error']
