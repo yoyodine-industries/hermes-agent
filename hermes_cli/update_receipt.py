@@ -170,6 +170,19 @@ class UpdateReceipt:
     def stage(self, name: str, outcome: str, **facts: str) -> None:
         # Stage END marks: a stage's duration is the gap since the previous mark (or started_at).
         self.data.setdefault("stages", []).append({"name": name, "outcome": outcome, "at": _utc_now_iso(), **facts})
+        # A stage that ENDED is no longer unfinished: drop its start mark so a run killed LATER
+        # never reports a completed stage as the debt to resume.
+        starts = [mark for mark in self.data.get("stage_starts") or []
+                  if not (isinstance(mark, dict) and mark.get("name") == name)]
+        if starts:
+            self.data["stage_starts"] = starts
+        else:
+            self.data.pop("stage_starts", None)
+
+    def begin_stage(self, name: str, **facts: str) -> None:
+        # Stage START marks are kept apart from the END marks: they are debt, not duration, and a
+        # caller can act on the one stage a killed run never finished without parsing prose.
+        self.data.setdefault("stage_starts", []).append({"name": name, "at": _utc_now_iso(), **facts})
 
     def fact(self, key: str, value: Any) -> None:
         self.data[key] = value
@@ -317,6 +330,35 @@ def _owner_alive(record: dict[str, Any]) -> bool:
                for pid, create_time in identities.items())
 
 
+#: Stage starts that a killed run never ended, newest first — the residue a next run resumes from.
+_INTERRUPTED: list[dict[str, Any]] = []
+
+
+def resumable_stage() -> dict[str, Any] | None:
+    """The one stage the last interrupted update STARTED and never finished, or ``None``.
+
+    Read it after ``begin_update_receipt``/``reconcile_interrupted_runs``: the stage name plus the
+    facts its start mark carried (``target_sha`` for ``apply``, and the run's captured snapshot id)
+    are the resume contract — a caller completes that stage instead of firing a fresh one.
+    """
+    for record in _INTERRUPTED:
+        starts = [mark for mark in record.get("stage_starts") or () if isinstance(mark, dict)]
+        if not starts:
+            continue
+        stage = dict(starts[-1])
+        if stage.get("snapshot_id") is None:
+            # The id is a fact of the run once the backup returned; the snapshot stage's own END
+            # mark carries it too, so a kill during `apply` still reuses the same snapshot.
+            stage["snapshot_id"] = record.get("pre_update_snapshot_id")
+            for mark in reversed(record.get("stages") or ()):
+                if isinstance(mark, dict) and mark.get("name") == "snapshot" and mark.get("snapshot_id"):
+                    stage["snapshot_id"] = mark["snapshot_id"]
+                    break
+        stage["update_id"] = record.get("update_id")
+        return stage
+    return None
+
+
 def reconcile_interrupted_runs() -> list[dict[str, Any]]:
     """Mark ``running`` records whose processes are gone as ``interrupted``; returns them.
 
@@ -325,6 +367,7 @@ def reconcile_interrupted_runs() -> list[dict[str, Any]]:
     whatever ran before it. Never raises.
     """
     interrupted: list[dict[str, Any]] = []
+    _INTERRUPTED.clear()
     with suppress(Exception):
         from hermes_cli.runtime_state import _atomic_bytes
 
@@ -337,13 +380,18 @@ def reconcile_interrupted_runs() -> list[dict[str, Any]]:
                     continue
                 stages = record.get("stages") or []
                 last = stages[-1].get("name") if stages and isinstance(stages[-1], dict) else None
+                # The stage that STARTED and never ended is the real debt: the last END mark alone
+                # cannot say whether the next stage ran to completion, half of it, or not at all.
+                unfinished = [mark for mark in record.get("stage_starts") or () if isinstance(mark, dict)]
+                where = f"{unfinished[-1].get('name')} (unfinished)" if unfinished else (last or "start")
                 record.update(outcome="interrupted", interrupted_detected_at=_utc_now_iso(),
-                              stop_reason=f"process exited during the update (last stage: {last or 'start'})")
+                              stop_reason=f"process exited during the update (last stage: {where})")
                 payload = (json.dumps(record, indent=2, default=str) + "\n").encode("utf-8")
                 _atomic_bytes(path, payload)
                 if latest.get("update_id") == record.get("update_id"):
                     _write_latest(payload)
                 interrupted.append(record)
+    _INTERRUPTED.extend(reversed(interrupted))
     for record in interrupted:
         print(f"⚠ The previous update ({record.get('started_at')}) was interrupted before it finished "
               f"({record.get('stop_reason')}); this update completes the work it still owed.")
@@ -505,6 +553,18 @@ def record_stage(name: str, outcome: str, **facts: str) -> None:
     """Mark the END of a pipeline stage (``success``/``failed``/``skipped``) with a timestamp."""
     _record("stage", f"update stage {name}", name, outcome, **facts)
     # Each stage boundary refreshes the durable running record (a kill names its last stage).
+    persist_running_receipt()
+
+
+def begin_stage(name: str, **facts: str) -> None:
+    """Mark the START of a pipeline stage, durably, so a kill leaves structured debt.
+
+    ``record_stage`` alone only says which stage LAST FINISHED: a run killed inside a stage is
+    indistinguishable from one killed between stages, and the next run cannot tell whether the
+    work has to be redone or merely completed. The start mark carries what a resume needs (the
+    ``apply`` target commit, the captured ``snapshot`` id), and ``resumable_stage`` hands it back.
+    """
+    _record("begin_stage", f"update stage {name} start", name, **facts)
     persist_running_receipt()
 
 

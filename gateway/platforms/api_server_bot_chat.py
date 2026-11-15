@@ -157,6 +157,17 @@ async def admit_peer_turn(runner, session_id, message, author):
     except RuntimeStoreError as exc:
         reason, error = _refusal(authority, tip, exc)
         record = {'status': 'failed', 'delivery_id': key, 'reason': reason, 'error': error}
+        if reason == 'queue_full':
+            # THE REFUSAL SITE (t-37b8e0c562 a): a queue_full refusal must carry the budget that
+            # fired, or the settled row states a reason with no cap and every later reader is
+            # free to invent one. ``exc.field`` is that budget's own class; ``exc.limit`` the cap
+            # value where the store names it. Persisted as ``limit_class`` -- the admission FIFO
+            # classes are NOT the per-profile/per-sender delivery caps, so they are recorded and
+            # never rendered as one.
+            record['limit_class'] = str(getattr(exc, 'field', '') or '') or None
+            limit = getattr(exc, 'limit', None)
+            if limit is not None:
+                record['limit'] = int(limit)
     return home, record
 
 

@@ -294,13 +294,18 @@ class SweepClosure:
     carries its evidence (provider path, hash), so it is not an unexplained death. Counting it
     would refuse the sweep on a fault that recurs every tick, freezing the rows as ``running``
     with dead pids instead of releasing them spaced."""
+    admission_unsettled: bool = False
+    """The owner never settled the attempt and no worker ever bound to it: nothing of the card
+    ran, so this is an owner-side fault — not an unexplained death of a worker, and (like the
+    substrate class) it repeats every tick while the owner stays unsettled, so counting it would
+    freeze every such row as ``running``."""
     claim_lock: Optional[str] = None
 
     @property
     def is_unexplained_death(self) -> bool:
         """True when this closure is the class a bad liveness evaluation can forge."""
         if (self.protocol_violation or self.terminal_provider or self.rate_limited
-                or self.substrate_import):
+                or self.substrate_import or self.admission_unsettled):
             return False
         return self.kind in UNEXPLAINED_DEATH_KINDS
 

@@ -453,6 +453,89 @@ def test_update_skips_and_warns_on_dirty_parked_branch(
     assert stashes == ""
 
 
+def test_owed_branch_with_unmerged_commits_refuses_instead_of_switching(
+    repo_pair, monkeypatch, capsys, tmp_path
+):
+    """Card t_391ae86c requirement 2: the parked OVERRIDE SET is owed work.
+
+    ``overrides/live`` (the default ``updates.owed_branches`` entry) carries commits main does not
+    have. The update must NOT switch the checkout to main and carry on: it must exit non-zero,
+    leave the tree exactly where it was, and name every commit that is still unapplied. This is
+    the 2026-11-06 incident shape (289 fork commits stopped running, nothing refused).
+    """
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "load_config", dict)  # no config -> the code default
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    _git(repo_pair, "branch", "-m", "old-feature", "overrides/live")
+    (repo_pair / "feature.txt").write_text("fork work\n", encoding="utf-8")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "fork override commit")
+    owed_sha = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    _patch_update_flow(monkeypatch, repo_pair)
+    args = SimpleNamespace(branch=None, yes=True, force=False, force_venv=False,
+                           switch_branch=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "CODE UPDATE REFUSED" in out
+    assert "overrides/live" in out
+    assert "fork override commit" in out          # the unapplied commit is NAMED
+    assert "✓ Code updated!" not in out
+    # The checkout never moved off the owed branch, and nothing was stashed.
+    assert _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "overrides/live"
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == owed_sha
+    assert _git(repo_pair, "stash", "list").stdout.strip() == ""
+    # The full list is persisted somewhere an operator can read it back.
+    listing = tmp_path / "home" / "state" / "update-unapplied-commits.txt"
+    assert listing.is_file()
+    assert "fork override commit" in listing.read_text(encoding="utf-8")
+
+
+def test_owed_branch_switch_branch_flag_still_switches(repo_pair, monkeypatch, capsys):
+    """``hermes update --switch-branch`` is an explicit operator decision: it still switches."""
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "load_config", dict)
+    _git(repo_pair, "branch", "-m", "old-feature", "overrides/live")
+    (repo_pair / "feature.txt").write_text("fork work\n", encoding="utf-8")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "fork override commit")
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    class _StopFlow(Exception):
+        pass
+
+    monkeypatch.setattr(
+        update_cmd, "_complete_source_update",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False,
+                           switch_branch=True)
+
+    with pytest.raises(_StopFlow):
+        hermes_main.cmd_update(args)
+
+    out = capsys.readouterr().out
+    assert "CODE UPDATE REFUSED" not in out
+    assert _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
+
+
+def test_owed_branches_default_and_opt_out():
+    """The default protects the override set; an explicit [] opts out; junk keeps the default."""
+    from hermes_cli.update_cmd_git import DEFAULT_OWED_BRANCHES, owed_branch
+
+    assert "overrides/live" in DEFAULT_OWED_BRANCHES
+    assert owed_branch("overrides/live", {}) is True
+    assert owed_branch("overrides/live", {"owed_branches": []}) is False
+    assert owed_branch("overrides/live", {"owed_branches": "garbage"}) is True
+    assert owed_branch("feature/x", {"owed_branches": ["feature/x"]}) is True
+    assert owed_branch("main", {}) is False
+
+
 def test_update_switches_unmerged_parked_branch_with_kept_notice(
     repo_pair, monkeypatch, capsys
 ):

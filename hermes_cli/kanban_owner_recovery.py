@@ -208,8 +208,68 @@ def owner_attempt_note(conn, task_id, lost=None) -> str:
 
 def reclaim_error(conn, task_id, claim_lock) -> str:
     """A stale-lock reclaim's run error, naming how the attempt ended when the owner recorded it."""
+    unsettled = admission_unsettled_error(conn, task_id)
+    if unsettled:
+        return f"{unsettled} [stale_lock={claim_lock}]"
     note = owner_attempt_note(conn, task_id)
     return f"stale_lock={claim_lock}" + (f" [{note}]" if note else "")
+
+
+def owner_attempt_never_ran(conn, task_id):
+    """The unsettled admission's facts when an owner attempt never became an execution, else None.
+
+    ``ADMISSION_UNSETTLED`` is the class the reclaim paths used to collapse into "managed worker
+    lost": the owner took the claim and left the admission ``queued``/``unknown`` while the run
+    recorded no ``worker_bound``, ``worker_result`` or ``worker_lost``. Nothing of the card ran,
+    so the fault is the OWNER's: the card must not spend its failure budget on it.
+    """
+    for kind in ('worker_bound', 'worker_result', 'worker_lost'):
+        if _latest_run_event(conn, task_id, kind):
+            return None
+    receipt = _owner_receipt(conn, task_id)
+    if receipt is None:
+        return None
+    admission = _admission_row(receipt)
+    if admission is None or admission[0] not in ('queued', 'unknown'):
+        return None
+    return {
+        'owner_pid': receipt.get('pid'),
+        'owner_db': receipt.get('db'),
+        'admission_status': admission[0],
+        'answer_budget_seconds': answer_budget_seconds(),
+    }
+
+
+def admission_unsettled_error(conn, task_id) -> str:
+    """The run error for an attempt nothing ever executed: class first, then owner, then budget.
+
+    ``ADMISSION_UNSETTLED`` leads so the class is greppable and the next reader is not sent into
+    the worker's code for the owner's timing.
+    """
+    facts = owner_attempt_never_ran(conn, task_id)
+    return _unsettled_text(facts) if facts else ""
+
+
+def _unsettled_text(facts) -> str:
+    owner = (f"owner pid {facts['owner_pid']}" if facts.get('owner_pid')
+             else "owner unnamed (no admission marker)")
+    if facts.get('owner_db'):
+        owner += f" ({Path(str(facts['owner_db'])).name})"
+    budget = facts.get('answer_budget_seconds')
+    budget_text = f"{budget:.0f}s" if isinstance(budget, (int, float)) else "unknown"
+    return (f"ADMISSION_UNSETTLED {owner}: the admission was '{facts.get('admission_status')}' and no "
+            f"worker ever bound to this attempt (no worker_bound, worker_result or worker_lost on its "
+            f"run), so nothing of the card ran. Answer budget {budget_text}: the OWNER never settled "
+            f"it — this is not a worker crash, and the card is not charged for it.")
+
+
+def answer_budget_seconds():
+    """The submitter's own ``kanban.run`` answer budget: the wait the owner outlasted."""
+    try:
+        from hermes_cli.kanban_worker_client import admission_answer_budget
+        return round(admission_answer_budget(), 1)
+    except Exception:
+        return None
 
 
 def apply_attempt_note(conn, task_id, pid, dead) -> None:
@@ -219,7 +279,22 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     lost reads as a protocol violation. The owner's ``worker_lost`` evidence outranks it: the
     turn never finished, so it books as a crash and charges the breaker, and the
     protocol-violation streak (which reads the persisted payload) does not count it.
+
+    An attempt with NO worker evidence at all is a different death: the owner left the admission
+    unsettled, nothing of the card ran, and the run is re-booked ``admission_unsettled`` so the
+    class never reads as "managed worker lost".
     """
+    facts = owner_attempt_never_ran(conn, task_id)
+    if facts:
+        from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
+        _, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)
+        dead.admission_unsettled = True
+        dead.protocol_violation = False
+        dead.event_payload.pop("protocol_violation", None)
+        dead.event_kind = "admission_unsettled"
+        dead.event_payload["admission_unsettled"] = facts
+        dead.error_text = f"{_unsettled_text(facts)}{sep}{output}"
+        return
     lost = _latest_run_event(conn, task_id, "worker_lost")
     note = owner_attempt_note(conn, task_id, lost)
     if not note:
