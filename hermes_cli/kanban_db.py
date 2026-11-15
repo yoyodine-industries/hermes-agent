@@ -2488,6 +2488,54 @@ def _apply_board_priority_policy(
     return policy.clamp_to_domain(verdict.applied, verdict.record, floor)
 
 
+def priority_receipt(conn, task_id: str, stored: Optional[int] = None) -> dict:
+    """The priority trail *task_id* carries, read from its OWN events - never recomputed.
+
+    Two facts, and they are not the same fact:
+
+    * ``birth`` - the ``priority_policy`` record the create door wrote, i.e. what was ASKED and
+      what was APPLIED when the card was born. Absent on a card the policy left alone (the key
+      is written only when the value moved) and on a board with no policy.
+    * ``moved`` - the latest ``reprioritized`` record, kept only when it is the one that
+      produced *stored*. A re-rank record that names some other number is history, not the
+      current value's cause.
+
+    A reader that re-derived either decision could disagree with the row the card holds, and
+    then two numbers would exist for one filing - which is the defect this receipt exists to
+    end. ``stored`` is the row's current priority; pass it so ``moved`` can be reconciled.
+    """
+    def _payload(row):
+        if row is None or not row[0]:
+            return None
+        try:
+            return json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+
+    birth = None
+    moved = None
+    try:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        payload = _payload(row)
+        if isinstance(payload, dict) and isinstance(payload.get("priority_policy"), dict):
+            birth = payload["priority_policy"]
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'reprioritized' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        payload = _payload(row)
+        if isinstance(payload, dict) and (stored is None or payload.get("priority") == stored):
+            moved = payload
+    except sqlite3.Error:
+        # An unreadable event log is not a reason to lose the row's own priority: the caller
+        # prints `priority=<stored>` regardless and this receipt stays empty.
+        return {"birth": birth, "moved": moved}
+    return {"birth": birth, "moved": moved}
+
+
 # --------------------------------------------------------------------------------------------
 # THE GATE INVARIANT - a card must never rank below a card it gates.
 #
