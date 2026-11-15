@@ -20,6 +20,23 @@ def all_assignees_spawnable(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_kanban_store_pin(monkeypatch):
+    """Drop the dispatcher's ambient board pinning for every test in this suite.
+
+    A worker started by the kanban dispatcher runs with ``HERMES_KANBAN_DB`` (and
+    ``HERMES_KANBAN_BOARD`` / ``HERMES_KANBAN_WORKSPACES_ROOT`` / ``HERMES_KANBAN_WORKSPACE``)
+    exported, and those beat ``HERMES_HOME`` when the store path is resolved. So a test that
+    sets ``HERMES_HOME`` to a tmp dir and then calls ``dispatch_once`` still opens the LIVE
+    board: measured on this host, one such run claimed every ready card on the platform board
+    (2 761 rows moved to ``running`` with a fake worker pid) in a single tick. Tests that want
+    a pinned store set these variables themselves; the environment never supplies one.
+    """
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_WORKSPACE"):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _suppress_concurrent_hermes_gate(request, monkeypatch):
     """Default ``_detect_concurrent_hermes_instances`` to ``[]`` for every test.
 
