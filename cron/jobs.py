@@ -1190,12 +1190,22 @@ def get_timezone_migration_catchup_stats() -> dict[str, Any]:
 
 def compute_next_run(
     schedule: dict[str, Any], last_run_at: Optional[str] = None, *, timezone: Any = None,
+    started_at: Optional[str] = None,
 ) -> Optional[str]:
     """Compute the next run time for a schedule as an ISO string, or None if no more runs.
 
     *timezone* is the job's pinned IANA zone (a job record or a bare zone name); None inherits
     the profile's configured zone. Every caller that advances a job's ``next_run_at`` must pass
-    it, or a pinned job is computed in the wrong zone and jumps a slot."""
+    it, or a pinned job is computed in the wrong zone and jumps a slot.
+
+    *started_at* is when the run that is finishing STARTED. For ``kind == "interval"`` a cadence
+    is a promise about DEPARTURES, so the interval lattice is anchored on that stamp rather than
+    on the completion stamp in *last_run_at*: anchoring on completion stretches every gap by the
+    pass duration (a 90-minute row over a 55-85 minute pass delivers 145-175 minute gaps while
+    still displaying "every 90m"). Callers that do not know the start keep the old behaviour.
+    The next fire is the first lattice point STRICTLY after *last_run_at*, so a run longer than
+    its interval skips the slots it overran instead of re-firing the instant it finishes.
+    """
     now = _hermes_now()
     if not isinstance(schedule, dict):
         return None
@@ -1211,7 +1221,20 @@ def compute_next_run(
         if minutes is None:
             return None
         # Add in UTC so an interval keeps its duration when the profile's UTC offset changes.
-        next_run = base_time.astimezone(UTC) + timedelta(minutes=minutes)
+        span = timedelta(minutes=minutes)
+        anchor = _parse_aware(started_at) if started_at else None
+        if anchor is not None and span > timedelta(0):
+            # START-ANCHORED LATTICE (see the docstring): the first start+k*interval that is
+            # strictly after this run's completion. `int(elapsed / span) + 1` is exactly that k,
+            # and it is what keeps an interval shorter than the runtime from busy-looping:
+            # the fire lands a full slot after the overrun, not on the completion stamp.
+            anchor_utc = anchor.astimezone(UTC)
+            completion_utc = base_time.astimezone(UTC)
+            elapsed = completion_utc - anchor_utc
+            steps = max(1, int(elapsed / span) + 1)
+            next_run = anchor_utc + span * steps
+            return next_run.astimezone(base_time.tzinfo).isoformat()
+        next_run = base_time.astimezone(UTC) + span
         return next_run.astimezone(base_time.tzinfo).isoformat()
     if kind == "cron":
         expr = schedule.get("expr")
@@ -2620,8 +2643,16 @@ def _advance_after_run(job: dict[str, Any], now: str, *, ladder_rung: bool = Fal
             _complete_job_record(job)
             return
 
+    # THE SCHEDULE REPORTS THE RUN, SO AN INTERVAL COUNTS DEPARTURES (card t_f7d817aa C): the
+    # dispatch stamp is when THIS occurrence STARTED, and it is the anchor an interval must use.
+    # Only a dispatch writes it (`_due_scan`), so a manual run or a resumed job hands over the
+    # last dispatched start - still the last departure, which is what a cadence counts.
+    dispatch = job.get("last_dispatch")
+    started_at = None
+    if isinstance(dispatch, dict):
+        started_at = str(dispatch.get("dispatched_at") or "") or None
     job["next_run_at"] = compute_next_run(
-        job["schedule"], now, timezone=job.get("timezone"))
+        job["schedule"], now, timezone=job.get("timezone"), started_at=started_at)
     if job["next_run_at"] is not None:
         if job.get("state") != "paused":
             job["state"] = "scheduled"
