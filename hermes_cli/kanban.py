@@ -1175,6 +1175,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     metadata, rc = _parse_metadata_flag(raw_meta)
     if rc:
         return rc
+    supersede_ack = getattr(args, "supersede_ack", None)
+    if supersede_ack and len(ids) > 1:
+        return _err("kanban complete: --supersede-ack is per-card (it names the ONE card that "
+                    "inherits the work). Close the duplicate on its own, or use "
+                    "`kanban archive <id>... --reason duplicate --destination <board>/<card>`.", 2)
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
@@ -1189,7 +1194,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                                        force=bool(getattr(args, "force", False)),
+                                        supersede_ack=supersede_ack,
+                                        actor=_profile_author())
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
@@ -1655,6 +1662,16 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     print("By status:")
     for k in kanban_workflow.DEFAULT_WORKFLOW.keys():
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
+    # Ruling ESC-36b70d83894494d2 §6: a completion count that reports ``done`` alone is
+    # unreadable -- "18,929 done" hides 0s supersede-closes and says nothing about whether any
+    # artifact was checked. The four numbers travel together, always.
+    split = stats.get("proof_split") or {}
+    if split:
+        print("\nCloses:")
+        print(f"  {'done':8s}  {split.get('done', 0)}")
+        print(f"  {'proven':8s}  {split.get('proven', 0)}")
+        print(f"  {'unproven':8s}  {split.get('unproven', 0)}")
+        print(f"  {'retired':8s}  {split.get('retired', 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
         for who, counts in sorted(stats["by_assignee"].items()):

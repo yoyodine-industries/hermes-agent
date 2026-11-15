@@ -427,6 +427,12 @@ _SPECS = [
                   "claim with no measurement) and records the waiver on the card. It does "
                   "NOT bypass PR acceptance, the landing-carrier fence or the deploy "
                   "proof: those still judge the card's own evidence."),
+        _arg("--supersede-ack", dest="supersede_ack", metavar="<board>/<card>",
+             help="A handoff that says superseded/duplicate/folded-into AND names a card is a "
+                  "RETIREMENT, and `complete` refuses it. Pass the card that inherits the work "
+                  "here to perform the archive in this same call instead (the destination must "
+                  "be open: a done or archived card inherits nothing). Same as "
+                  "`kanban archive <id> --reason <token> --destination <board>/<card>`."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,

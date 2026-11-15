@@ -945,6 +945,8 @@ def _handle_complete(args: dict, **kw) -> str:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
                 created_cards=created_cards, deferred_children=deferred_children,
+                supersede_ack=args.get("supersede_ack"),
+                actor=os.environ.get("HERMES_PROFILE") or "",
                 expected_run_id=_worker_run_id(tid))
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
@@ -1046,6 +1048,13 @@ def _handle_complete(args: dict, **kw) -> str:
             # blind, and a blind re-run dirties the same tree again.
             if isinstance(ok, kb.CompletionRefusal) and ok.cause == "dirty_unit_checkout":
                 raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
+            # Retirement and the declared proof both answer with the exact artifact, command
+            # and remedy in ``detail`` (ruling ESC-36b70d83894494d2). A worker told only that
+            # "the close was refused" retries the same sentence; these two must be readable.
+            if isinstance(ok, kb.CompletionRefusal) and ok.cause in (
+                    "retire_is_not_a_completion", "supersede_ack_refused",
+                    "proof_failed", "proof_missing"):
+                raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail}")
             # A reopened or never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.
             blockers = kb.unsatisfied_parents(conn, tid)

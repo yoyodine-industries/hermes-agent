@@ -161,6 +161,17 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "task in-flight so you can fix the path and retry."
             ),
         },
+        "supersede_ack": _prop("string", (
+                "Only for a card you are RETIRING rather than completing. A "
+                "summary/result that says superseded / duplicate of / folded "
+                "into / replaced by AND names another card id is a retirement "
+                "claim, and the close is refused with "
+                "``retire_is_not_a_completion``. Pass that successor as "
+                "\"<board>/<card>\" to perform the archive in this same call "
+                "(the successor must be open — a done or archived card "
+                "inherits nothing). The card lands in ``archived``, which the "
+                "board does not count as work."
+        )),
     },
     [],
 )
