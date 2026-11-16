@@ -1084,6 +1084,10 @@ class SessionAuthority:
         async with live.claim_gate, live.mutation_lock:
             pending = list_session_admissions(self.db, session_id=ref.session_id)
             if any(row['status'] == 'unknown' for row in pending):
+                # The freeze is the safety property (an unsettled turn must not be overtaken), but it
+                # used to be SILENT: every lane kept accepting admissions behind it and nobody was told.
+                # Report the census and file the lane's card, then refuse as before.
+                self._report_blocked_drain(ref)
                 raise RuntimeStoreError('unknown_execution')
             first = next((row for row in pending if row['status'] == 'queued'), None)
             from gateway.config import Platform
@@ -1180,6 +1184,22 @@ class SessionAuthority:
                                           event_type='message.start')
                 self._publish_pending(ref)
         return row
+
+    def _report_blocked_drain(self, ref):
+        """A lane that cannot claim anything SAYS SO: census line to the log, one board card.
+
+        Called where a drain finds a head it may not claim. The freeze itself is never lifted here -
+        an ``unknown`` execution must not be overtaken, and only its owner may settle it - but a lane
+        that stopped accepting work must not do so silently while its queue keeps growing.
+        """
+        try:
+            from hermes_state_admission_frontier import lane_blocked
+            lane_blocked(self.db, ref.session_id)
+        except Exception:  # health: allow BLE001 -- reporting must never turn a wedge into a crash:
+            # the drain's own outcome (refusal or pause) is decided by the caller either way.
+            import logging
+            logging.getLogger(__name__).warning('Could not report the blocked drain of %s',
+                                                ref.session_id, exc_info=True)
 
     def _drain_stopping(self, ref, live):
         """A drain about to wait (storage retry, classic slot) exits instead when the runtime drains,
@@ -1328,6 +1348,7 @@ class SessionAuthority:
             if row is None and first is not None:
                 # A live worker (or a claim this drain does not own) blocks the head: the same
                 # pause episode, so its notice is not repeated for every message queued behind it.
+                self._report_blocked_drain(ref)
                 self._pause(ref, 'session_busy')
                 return
             # The FIFO is moving again (or empty): the next pause is a new episode.

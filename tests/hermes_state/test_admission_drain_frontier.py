@@ -167,3 +167,98 @@ def test_the_lane_card_is_filed_once_and_refreshed_by_key(tmp_path, monkeypatch)
     assert calls[0] == ('create', CARD_KEY_PREFIX + 'platform-stl')
     assert [call[0] for call in calls] == ['create', 'comment', 'create', 'comment']
     assert 'stranded=3' in calls[-1][2] and 'oldest=9493' in calls[-1][2]
+
+
+def _mark(db, admission_id, status):
+    """Put a row in a given status directly: the states a crash or a boot recovery leaves behind."""
+    db._execute_write(lambda conn: conn.execute(
+        'UPDATE session_admissions SET status=? WHERE admission_id=?', (status, admission_id)))
+
+
+def test_a_lane_that_cannot_advance_says_so_with_its_census_and_one_card(tmp_path):
+    """An ``unknown`` row freezes the FIFO by design; the freeze must never be SILENT.
+
+    Production shape (measured on four lanes): one lost turn sits ``unknown`` at a low seq, every
+    later admission keeps counting as queued behind it, and the drain refuses every pass without a
+    word. The lane is not fixed here - only its owner may settle an unknown execution - but the pass
+    now reports it and files the lane's card.
+    """
+    from hermes_state_admission_frontier import blocking_rows, lane_blocked
+
+    db, epoch = _store(tmp_path)
+    rows = [_admit(db, epoch, f'r{n}') for n in range(4)]
+    _settle_all(db, epoch)
+    _requeue_legacy(db, rows[0]['admission_id'])           # stranded shape, as an older release left it
+    _requeue_legacy(db, rows[2]['admission_id'])
+    _mark(db, rows[1]['admission_id'], 'unknown')          # the lost turn that pins the lane
+
+    lines, cards = [], []
+
+    def filer(report):
+        cards.append(report)
+        return 'card-1'
+
+    line = lane_blocked(db, 's', filer=filer, out=lines.append, now=1000.0)
+
+    assert line and 'blocked=unknown@2' in line
+    assert 'stranded=2' in line and 'oldest=1' in line, line   # the census, not a log line alone
+    assert len(lines) == 1 and cards and cards[0].blocked == 'unknown@2'
+
+    # Same blocker, same interval: the card is refreshed but the log is not spammed per arriving message.
+    lane_blocked(db, 's', filer=filer, out=lines.append, now=1030.0)
+    assert len(lines) == 1 and len(cards) == 2
+    # A DIFFERENT blocker reports at once - it is new information.
+    _mark(db, rows[1]['admission_id'], 'terminal')   # the owner settled the lost turn
+    _mark(db, rows[2]['admission_id'], 'unknown')
+    lane_blocked(db, 's', filer=filer, out=lines.append, now=1035.0)
+    assert len(lines) == 2 and 'blocked=unknown@3' in lines[-1]
+
+    # Once nothing pins the lane, there is nothing to report and the drain claims the OLDEST row
+    # first - the stranded rows are retried, never skipped.
+    _mark(db, rows[2]['admission_id'], 'queued')
+    assert lane_blocked(db, 's', filer=filer, out=lines.append, now=1040.0) is None
+    seen = []
+    drain_pass(db, epoch=epoch, session_id='s', run=lambda row: seen.append(row['seq']), filer=False,
+               out=lines.append)
+    assert seen == [1, 3], seen
+
+
+def test_the_claim_path_reports_a_wedge_instead_of_freezing_silently():
+    """The reporter must be ON the refusal paths, not merely available to them.
+
+    A unit test of ``lane_blocked`` proves the census; this proves the drain calls it where the
+    freeze happens, for both blockers (an ``unknown`` row raising, and an unowned head pausing).
+    """
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / 'gateway' / 'session_authority.py'
+    tree = ast.parse(source.read_text())
+
+    def method(name):
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return node
+        raise AssertionError(f'{name} not found')
+
+    def called(node, attr):
+        return [n.lineno for n in ast.walk(node)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == attr]
+
+    claim = method('_claim_next')
+    refused = [n.lineno for n in ast.walk(claim)
+               if isinstance(n, ast.Raise) and 'unknown_execution' in ast.dump(n)]
+    assert refused, 'the unknown-row refusal is gone: has the freeze been removed entirely?'
+    reports = called(claim, '_report_blocked_drain')
+    assert reports and min(reports) < min(refused), (reports, refused)
+
+    drain = method('_drain')
+    pauses = [n.lineno for n in ast.walk(drain)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == '_pause'
+              and 'session_busy' in ast.dump(n)]
+    assert pauses, 'the busy pause is gone from the drain'
+    reports = called(drain, '_report_blocked_drain')
+    assert reports and reports[0] < min(pauses), (reports, pauses)
+
+    helper = method('_report_blocked_drain')
+    assert 'lane_blocked' in ast.dump(helper)

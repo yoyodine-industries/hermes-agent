@@ -61,12 +61,16 @@ class DrainReport:
     frontier_after: int = 0
     stranded: Stranded = field(default_factory=Stranded)
     card: Optional[str] = None
+    #: ``<status>@<seq>`` of the row that stops the lane claiming anything at all, when one does.
+    blocked: Optional[str] = None
 
     def line(self) -> str:
         """The pass's one report line: every number read from the store, never inferred."""
         parts = [f'lane={self.lane}', f'settled={len(self.settled)}',
                  f'frontier={self.frontier_before}->{self.frontier_after}',
                  f'stranded={self.stranded.count}']
+        if self.blocked:
+            parts.append(f'blocked={self.blocked}')
         if self.stranded:
             parts += [f'oldest={self.stranded.oldest_seq}', f'above={self.stranded.above_seq}',
                       f'age={self.stranded.age_seconds:.0f}s']
@@ -203,12 +207,20 @@ def file_lane_card(report: DrainReport, *, board: Optional[str] = None) -> str:
     from hermes_cli import kanban_db
     from hermes_cli.kanban_db_connect import connect_closing
 
-    title = f'DM drain stranded on {report.lane}'
+    title = (f'DM drain BLOCKED on {report.lane}' if report.blocked
+             else f'DM drain stranded on {report.lane}')
     body = (f'`{report.lane}` has {report.stranded.count} queued admission(s) below its terminal '
             f'frontier. Oldest seq={report.stranded.oldest_seq}, terminal seq above it '
             f'={report.stranded.above_seq}, stranded for {report.stranded.age_seconds:.0f}s.\n\n'
-            f'Drain line: `{report.line()}`\n\nThe drain retries the pinned row first each pass; '
-            f'settle it (or cancel it) and the row stops pinning the frontier.')
+            f'Drain line: `{report.line()}`\n\n')
+    if report.blocked:
+        body += (f'The lane cannot claim ANY row while `{report.blocked}` is unsettled: the FIFO may '
+                 f'not be overtaken past an execution whose outcome the runtime does not know. '
+                 f'Resolve that row (``hermes state resolve-unknown``) or cancel it; the pass retries '
+                 f'the head on the next turn. This card is the report - nothing else would say so.\n\n')
+    else:
+        body += (f'The drain retries the pinned row first each pass; settle it (or cancel it) and the '
+                 f'row stops pinning the frontier.\n\n')
     card = f'[{report.line()}]'
     with connect_closing(board=board) as conn:
         task_id = kanban_db.create_task(conn, title=title, body=body, created_by='dm-drain',
@@ -216,3 +228,80 @@ def file_lane_card(report: DrainReport, *, board: Optional[str] = None) -> str:
                                         initial_status='blocked', board=board)
         kanban_db.add_comment(conn, task_id, 'dm-drain', card)
     return task_id
+
+
+# --------------------------------------------------------------------------- #
+# a lane that cannot advance at all
+# --------------------------------------------------------------------------- #
+#: ``state_meta`` key holding when the lane's blocker was last reported (the log throttle).
+BLOCKED_REPORTED_PREFIX = 'gateway.admission.blocked_reported.v1.'
+
+#: Seconds between two reports of the same blocker. The claim path runs this on every pass; a lane
+#: wedged for hours must be visible without writing one log line per arriving message.
+BLOCKED_REPORT_INTERVAL_S = 300.0
+
+
+def blocking_rows(conn, session_id: str) -> list[dict]:
+    """The lane's non-terminal rows that are not claimable FIFO heads, oldest first.
+
+    ``queued`` is claimable; ``started`` and ``unknown`` are what pin a lane. ``unknown`` is the
+    harder case: the runtime does not know whether that turn is still running, so the FIFO may not
+    be advanced past it - the freeze is the safety property. What was missing is that the freeze was
+    silent while messages kept queueing behind it.
+    """
+    rows = conn.execute("SELECT seq, status, admission_id, generation FROM session_admissions "
+                        "WHERE target_session_id=? AND status IN ('started','unknown') ORDER BY seq",
+                        (session_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _report_due(db, session_id: str, blocker: dict, *, now: Optional[float]) -> bool:
+    """True once per ``BLOCKED_REPORT_INTERVAL_S`` for the SAME blocker (a new one reports at once)."""
+    key = BLOCKED_REPORTED_PREFIX + session_id
+    now = time.time() if now is None else now
+
+    def write(conn):
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+        if saved is not None:
+            try:
+                last = json.loads(saved[0])
+            except ValueError:
+                last = {}
+            if (last.get('admission_id') == blocker['admission_id']
+                    and now - float(last.get('at') or 0) < BLOCKED_REPORT_INTERVAL_S):
+                return False
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+                     'SET value=excluded.value',
+                     (key, json.dumps({'admission_id': blocker['admission_id'], 'at': now})))
+        return True
+    return db._execute_write(write)
+
+
+def lane_blocked(db, session_id: str, *, filer=None, now: Optional[float] = None,
+                 out: Callable[[str], Any] = print) -> Optional[str]:
+    """A lane whose FIFO cannot advance SAYS SO: census line to ``out`` and one card. The line.
+
+    Called from the claim path, where the lane has just found a non-claimable head. Returns None
+    when nothing is blocking (the caller's freeze had another cause). The freeze itself is never
+    lifted here: an unsettled execution must not be overtaken, and only its owner may settle it.
+    """
+    with db._read_ctx() as conn:
+        blockers = blocking_rows(conn, session_id)
+    if not blockers:
+        return None
+    census = stranded(db, session_id, now=now)
+    report = DrainReport(lane=session_id, frontier_before=_frontier_now(db, session_id),
+                         stranded=census, blocked=f"{blockers[0]['status']}@{blockers[0]['seq']}")
+    if _report_due(db, session_id, blockers[0], now=now):
+        out(report.line() + f' blocker_admission={blockers[0]["admission_id"]}'
+                            f' blockers={len(blockers)}')
+    if filer is not False:
+        try:
+            report.card = (filer or file_lane_card)(report)
+        except Exception:  # health: allow BLE001 -- a board that cannot be written must not turn a
+            # reporting path into a second failure; the log line above already carries the census.
+            import logging
+            logging.getLogger(__name__).warning(
+                'Could not file the blocked-drain card for %s; the census line above carries the '
+                'evidence', session_id, exc_info=True)
+    return report.line()
