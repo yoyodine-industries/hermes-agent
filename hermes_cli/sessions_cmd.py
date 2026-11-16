@@ -1367,6 +1367,11 @@ def _cmd_discard(args):
     return cmd_discard(args)
 
 
+def _cmd_retire(args):
+    from hermes_cli.sessions_retire import cmd_retire
+    return cmd_retire(args)
+
+
 def _cmd_adopt(args):
     from hermes_cli.sessions_adopt import cmd_adopt
     return cmd_adopt(args)
@@ -1377,6 +1382,7 @@ _PRE_DB_HANDLERS = {
     "repair-profiles": _cmd_repair_profiles,  # opens every profile's store itself
     "set-journal-mode": _cmd_set_journal_mode,  # offline: must not open the store it converts
     "discard": _cmd_discard,  # a gateway control (prompt.resolve_unknown), never a direct store write
+    "retire": _cmd_retire,  # a gateway control (prompt.retire_orphaned), never a direct store write
     "adopt": _cmd_adopt,  # native resumes on the owner; reads its own store read-only
 }
 _OBSERVATIONAL_DB_ACTIONS = frozenset({"list", "stats", "pinned"})

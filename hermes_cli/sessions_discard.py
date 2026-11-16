@@ -1,10 +1,21 @@
 """``hermes sessions discard``: acknowledge a turn lost across a gateway crash, without a REPL.
 
-After an owner restart mid-turn, the session's ``started`` admission is fenced ``unknown`` and
-everything queued behind it waits. A finite ``hermes chat --resume <id> -q`` refuses (exit 3)
-rather than queue behind it. Interactively, ``/discard <admission>`` clears it. This is the same
-fenced control (``prompt.resolve_unknown`` with the generation the owner stamped) for scripts.
-The lost input is not replayed; it stays in the transcript to resend.
+This control accepts ``unknown`` admissions ONLY, and only for the session it names. A row left
+``started`` by a turn whose process is gone is a DIFFERENT state and has its own control:
+``hermes sessions retire <session> --admission <id> --generation <n>`` (``prompt.retire_orphaned``),
+which retires the row only when no turn lease is unexpired and no worker execution is
+registered/running, and names the holder when one is.
+
+Do NOT read a restart as the fence that produces ``unknown``: an earlier version of this docstring
+claimed an owner restart fences ``started`` into ``unknown``, and no startup fencing of
+``session_admissions`` exists in the tree (measured 2026-11-16: a ``started`` row survived a restart
+carrying the CURRENT epoch and the newest generation). ``unknown`` comes from a turn whose settlement
+could not be recorded, not from a restart.
+
+A finite ``hermes chat --resume <id> -q`` refuses (exit 3) rather than queue behind a blocked head.
+Interactively, ``/discard <admission>`` clears an ``unknown`` row. This is the same fenced control
+(``prompt.resolve_unknown`` with the generation the owner stamped) for scripts. The lost input is
+not replayed; it stays in the transcript to resend.
 """
 from __future__ import annotations
 

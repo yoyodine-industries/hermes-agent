@@ -26,6 +26,7 @@ from hermes_state_runtime import (
     STEERING, RuntimeStoreError, admit_session_input, begin_runtime_epoch,
     cancel_session_input, claim_session_input, get_session_admission,
     list_session_admissions, recover_session_inputs, resolve_unknown_session_input,
+    retire_orphaned_session_input,
 )
 
 # Capped backoff for a claim refused by transient storage (writer lock, full disk).
@@ -877,6 +878,36 @@ class SessionAuthority:
         self.authorize(actor, ref, 'session:control')
         await self.receipt(actor, ref, admission_id)
         return await self.resolve_unknown_as_owner(ref, admission_id, generation)
+
+    async def retire_orphaned(self, actor, ref, admission_id, generation):
+        """Retire a ``started`` admission that NO LIVE OWNER holds, so the FIFO behind it resumes.
+
+        The gap this closes, measured on 2026-11-16: ``claim_session_input`` refuses the head while
+        any row of the session is ``started``, and operator acknowledgement (``resolve_unknown``)
+        accepts only ``unknown`` - so a ``started`` row left by a turn whose process is gone blocked
+        a lane's whole DM inbox with nothing lawful to run. 55 messages sat behind one such row.
+
+        Fenced, not guessed: the caller names the admission AND its generation, and the state verb
+        REFUSES while a turn lease is unexpired or a worker execution is registered/running,
+        naming the holder. Nothing is requeued and no input is replayed."""
+        self.authorize(actor, ref, 'session:control')
+        await self.receipt(actor, ref, admission_id)
+        return await self.retire_orphaned_as_owner(ref, admission_id, generation)
+
+    async def retire_orphaned_as_owner(self, ref, admission_id, generation):
+        """``retire_orphaned`` past authorization: the same call the control makes once the actor
+        has been authorized and the row has been shown to them."""
+        from gateway.session_runtime_workers import tracked_write
+        return await tracked_write(self, partial(
+            retire_orphaned_session_input, self.db, epoch=self.epoch, session_id=ref.session_id,
+            admission_id=admission_id, generation=generation),
+            then=partial(self._retired_orphan, ref, admission_id))
+
+    async def _retired_orphan(self, ref, admission_id, row):
+        """The row is terminal; the lane re-reads its head. A paused drain (or a lane that never had
+        one, because its only event was the row that blocked it) needs a fresh pass to notice."""
+        self._schedule(ref)
+        return row
 
     async def resolve_unknown_as_owner(self, ref, admission_id, generation, *, notice=None):
         """``resolve_unknown`` past authorization: also the owner's own call when the last viewer
