@@ -327,7 +327,12 @@ def test_the_cadence_does_not_quarantine_a_STARTED_head(tmp_path):
 
 
 # --------------------------------------------------- R7: a live turn is a turn, not a wedge
-def _lease(db, *, expires_in=600.0, holder='pid=35864:turn=local:platform=cli', session='s'):
+def _lease(db, *, expires_in=600.0, pid=None, session='s'):
+    """A live turn's lease. The holder names a pid, and `lease_liveness` PROBES it, so the default
+    is this very process - a fixture that named an arbitrary number would measure a dead one."""
+    import os
+    pid = os.getpid() if pid is None else pid
+    holder = f'pid={pid}:turn=local:platform=cli'
     now = time.time()
     db._execute_write(lambda conn: conn.execute(
         'INSERT INTO session_turn_leases (conversation_id, holder, acquired_at, expires_at) '
@@ -355,7 +360,8 @@ def test_a_LIVE_started_head_is_printed_as_started_live_and_is_never_quarantined
 
     liveness = lease_liveness(db, 's', owner_epoch=head['owner_epoch'], now=t0)
     assert liveness['state'] == 'live', liveness
-    assert 'pid=35864' in (liveness['holder'] or ''), liveness
+    assert f"pid={__import__('os').getpid()}" in (liveness['holder'] or ''), liveness
+    assert liveness['holder_alive'] is True, liveness
 
     census = _lane_census(db, 's', now=t0)
     assert census['blocked'].startswith('started(live)@'), census
@@ -369,20 +375,26 @@ def test_a_LIVE_started_head_is_printed_as_started_live_and_is_never_quarantined
     assert lines == [], 'and the pass says nothing about it'
 
 
-def test_an_OLDER_epoch_wins_over_a_leaked_lease(tmp_path):
-    """A lease row left by a dead run proves nothing: the epoch it recorded is the discriminator."""
-    from hermes_state_admission_frontier import lease_liveness
+def test_a_LEAKED_lease_is_not_observed_live__the_epoch_decides(tmp_path, monkeypatch):
+    """A lease row left by a dead run proves nothing, and the pid probe is what says so: its pid
+    does not answer, so the epoch - which DIFFERS - is the discriminator."""
+    import hermes_state_admission_frontier as frontier
+
+    monkeypatch.setattr(frontier, '_pid_alive', lambda pid: False)   # the process behind it is gone
+    lease_liveness = frontier.lease_liveness
 
     db, epoch = _store(tmp_path)
     head = _claim(db, epoch)
-    _lease(db, expires_in=7200.0)          # leaked by the run that died
+    _lease(db, expires_in=7200.0, pid=999999)   # leaked by the run that died
     db._execute_write(lambda conn: conn.execute(
         "UPDATE session_admissions SET owner_epoch=? WHERE admission_id=?",
         (epoch - 1, head['admission_id'])))
 
     liveness = lease_liveness(db, 's', owner_epoch=epoch - 1, now=time.time())
     assert liveness['state'] == 'orphan', liveness
-    assert 'older than the store epoch' in liveness['reason'], liveness
+    assert liveness['holder_alive'] is False, liveness
+    assert f'differs: row={epoch - 1} store={epoch}' in liveness['reason'], liveness
+    assert 'pid=999999, which does not answer' in liveness['reason'], liveness
 
 
 def test_ONE_cadence_pass_quarantines_an_ORPHANED_started_head_and_delivers_behind_it(tmp_path):
@@ -443,3 +455,154 @@ def test_age_ALONE_never_quarantines_a_started_head(tmp_path):
     assert _quarantine_rows(db) == [], 'young and orphaned is still not retired'
     assert _row(db, head['admission_id'])['status'] == 'started'
     assert _lane_census(db, 's', now=t0)['blocked'].startswith('started(orphan)@')
+
+
+# ------------------------------------------------- r7 corrections, measured at the store
+
+
+def test_an_OBSERVED_live_holder_beats_a_stale_epoch(tmp_path, monkeypatch):
+    """OBSERVED beats INFERRED. A pid that answers cannot be a claim left by a dead run, while the
+    epoch is inferred from what the store advanced to - so the epoch must not kill a live turn.
+
+    This is the kill-a-live-turn failure arriving through the epoch arm instead of the age arm:
+    a stale `owner_epoch` beside a live, unexpired lease held by a `running` process.
+    """
+    import os
+
+    import hermes_state_admission_frontier as frontier
+
+    monkeypatch.setattr(frontier, '_pid_alive', lambda pid: pid == os.getpid())
+
+    db, epoch = _store(tmp_path)
+    head = _claim(db, epoch)
+    _lease(db, expires_in=7200.0)                       # this turn is holding its lease
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE session_admissions SET owner_epoch=? WHERE admission_id=?",
+        (epoch - 1, head['admission_id'])))
+
+    liveness = frontier.lease_liveness(db, 's', owner_epoch=epoch - 1, now=time.time())
+    assert liveness['state'] == 'live', liveness
+    assert 'pid=' in liveness['reason'] and 'answers' in liveness['reason'], liveness
+
+    census = frontier._lane_census(db, 's')
+    assert census['blocked'].startswith('started(live)@'), census
+    assert f'epoch_differs={epoch - 1}!={epoch}' in census['blocked'], census   # both values, printed
+    assert 'holder=pid:' in census['blocked'] and 'live' in census['blocked'], census
+
+
+def test_the_pid_probe_answers_for_this_process_and_for_a_reaped_child():
+    """The probe is a real syscall, not a hardcoded verdict: alive here, dead for a reaped child."""
+    import os
+    import subprocess
+
+    from hermes_state_admission_frontier import _holder_pid, _pid_alive
+
+    assert _pid_alive(os.getpid()) is True
+    import sys
+
+    child = subprocess.Popen([sys.executable, '-c', 'pass'])
+    child.wait()
+    assert _pid_alive(child.pid) is False, f'reaped child {child.pid} still answers'
+    assert _holder_pid('pid=35864:turn=local:platform=cli') == 35864
+    assert _holder_pid('turn=local:platform=cli') is None
+
+
+def test_a_LIVE_head_is_NEVER_woken__zero_calls_no_stamp_and_no_quarantine_line(tmp_path):
+    """THE BLOCKING ONE. A live head fell through to `wake()` on every floor - the cadence becoming
+    the siren it was written to silence, on every busy lane, forever.
+
+    A live turn ends, and `wake_after_worker` schedules the drain behind it; the cadence owes it
+    nothing. Without this assertion the regression is invisible, because the failure looks like
+    activity.
+    """
+    import asyncio
+
+    import pytest
+
+    from hermes_state_admission_frontier import (
+        _observed_since_key,
+        admission_cadence_loop,
+    )
+
+    db, epoch = _store(tmp_path)
+    head = _claim(db, epoch)
+    _lease(db, expires_in=7200.0)
+    t0 = time.time()
+
+    woke, lines = [], []
+
+    async def sleep(_seconds):
+        if lines:
+            raise SystemExit
+        await asyncio.sleep(0)
+
+    def wake(session_id):
+        woke.append(session_id)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(admission_cadence_loop(db, lambda: ['s'], wake, interval_s=CADENCE_INTERVAL_S,
+                                           sleep=sleep, now=lambda: t0, out=lines.append))
+
+    assert woke == [], f'a live head was woken: {woke}'
+    assert not [l for l in lines if l.startswith('quarantine:')], lines
+    assert _row(db, head['admission_id'])['status'] == 'started'
+    assert _quarantine_rows(db) == []
+    with db._read_ctx() as conn:
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                             (_observed_since_key('started', head['admission_id']),)).fetchone()
+    assert saved is None, 'a live head must not even be stamped as observed'
+    assert any(l.startswith('frontier') or 'queued_status=' in l for l in lines), lines
+
+
+def test_the_UNKNOWN_and_STARTED_clocks_do_not_spend_each_other(tmp_path):
+    """ONE CLOCK, TWO POPULATIONS: the clocks used to be keyed by session, so a pass of one kind
+    reset the other kind's `first_seen` and NEITHER population ever reached the threshold - a silent
+    non-repair that looks like the cadence working.
+    """
+    from hermes_state_admission_frontier import quarantine_started, quarantine_unknown
+
+    db, epoch = _store(tmp_path)
+    unknown = _admit(db, epoch, 'r-unknown')
+    _make_unknown(db, unknown['admission_id'])
+    t0 = time.time()
+
+    assert quarantine_unknown(db, 's', store='x', now=t0, out=lambda line: None) is None  # stamps t0
+
+    # a STARTED head exists and is orphaned: its pass runs between two passes of the unknown path.
+    # Stated in the store rather than claimed, because a claim is exactly what an `unknown` row
+    # refuses - and the clock is what this test measures, not the claim.
+    started = _admit(db, epoch, 'r-head')
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE session_admissions SET status='started', owner_epoch=?, generation=1 "
+        "WHERE admission_id=?", (epoch, started['admission_id'])))
+    assert quarantine_started(db, 's', store='x', now=t0 + 600, out=lambda line: None) is None
+
+    lines = []
+    moved = quarantine_unknown(db, 's', store='x', now=t0 + QUARANTINE_AGE_S + 1, out=lines.append)
+    assert moved is not None, 'the unknown clock was reset by the started pass'
+    assert moved['admission_id'] == unknown['admission_id']
+    assert f'since={__import__("datetime").datetime.fromtimestamp(t0, __import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}' in lines[0], lines[0]
+
+
+def test_the_PRINTED_age_NAMES_its_origin(tmp_path):
+    """The number is the OBSERVER's age, not the row's: `session_admissions` carries no claim
+    instant. A line reading `age=1801s` is read by every following reader as the turn's age, so the
+    label names the origin and the instant is printed beside it.
+    """
+    from hermes_state_admission_frontier import quarantine_unknown
+
+    db, epoch = _store(tmp_path)
+    row = _admit(db, epoch, 'r-unknown')
+    _make_unknown(db, row['admission_id'])
+    t0 = time.time()
+    lines = []
+
+    assert quarantine_unknown(db, 's', store='x', now=t0, out=lines.append) is None
+    assert quarantine_unknown(db, 's', store='x', now=t0 + QUARANTINE_AGE_S + 5,
+                              out=lines.append) is not None
+
+    line = lines[-1]
+    assert 'observed_age=' in line and 'since=' in line, line
+    assert ' age=' not in line, f'the observer\'s age is printed under the row\'s name: {line}'
+    assert 'since=' + __import__('datetime').datetime.fromtimestamp(
+        t0, __import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ') in line, line

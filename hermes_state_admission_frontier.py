@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -328,13 +330,22 @@ def _lane_census(db, session_id: str, *, now: Optional[float] = None) -> dict:
             workers = _live_workers(conn, session_id)
     kind = None
     if blocked is not None:
-        if blocked['status'] == 'started':
+        if blocked is not None and blocked['status'] == 'started':
             owner_epoch = blocked['owner_epoch']
             stale_epoch = (owner_epoch is not None and current is not None
                            and int(owner_epoch) != int(current))
-            state = ('live' if (not stale_epoch and (holder is not None or workers))
-                     else 'orphan')
-            kind = (f"started({state})@{blocked['seq']} epoch={owner_epoch} current={current}")
+            holder_pid = _holder_pid((holder or {}).get('holder'))
+            holder_alive = holder is not None and _pid_alive(holder_pid)
+            # OBSERVED BEATS INFERRED: a pid that answers is live even when the epoch differs,
+            # because a live holder cannot be a claim left by a dead run - while the epoch is
+            # inferred. The epoch is still PRINTED, so a reader sees both facts.
+            state = 'live' if (holder_alive or workers) else 'orphan'
+            epoch_note = (f" epoch_differs={owner_epoch}!={current}" if stale_epoch else '')
+            holder_note = (f" holder=pid:{holder_pid}:{'live' if holder_alive else 'dead'}"
+                           if holder is not None else '')
+            worker_note = f" workers={len(workers)}" if workers else ''
+            kind = (f"started({state})@{blocked['seq']} epoch={owner_epoch} current={current}"
+                    f"{epoch_note}{holder_note}{worker_note}")
         else:
             kind = f"unknown@{blocked['seq']}"
     queued_status = int((row['queued_status'] if row else 0) or 0)
@@ -374,11 +385,22 @@ def lease_liveness(db, session_id: str, *, owner_epoch: Optional[int],
     and delivered its queue behind an answer still being written. So liveness is decided FIRST, from
     what a running turn actually holds, and age is only the second rung:
 
-      * ``orphan`` when ``owner_epoch`` is an OLDER epoch than the store's current one - the run that
-        wrote the claim is dead, whatever the clock says;
-      * ``live`` when the owner's own probe answers: an unexpired ``session_turn_leases`` row for the
-        session, or a ``worker_executions`` row in (registered, running);
+      * ``live`` when something is OBSERVED to hold the claim - an unexpired
+        ``session_turn_leases`` row whose ``pid`` ANSWERS (``kill(pid, 0)``), or a
+        ``worker_executions`` row in (registered, running). **Observed beats inferred**: a live
+        holder wins even when ``owner_epoch`` differs, because a pid that answers cannot be a
+        claim left by a dead run, while an epoch is only ever inferred from what the store has
+        advanced to. Arriving at this the other way round is how a live turn is killed through the
+        epoch arm instead of the age arm;
+      * ``orphan`` when ``owner_epoch`` DIFFERS from the store's current one and nothing is
+        observed - the run that wrote the claim is dead, whatever the clock says. The reason prints
+        both values: a bare inequality is a verdict with no measurement behind it;
       * ``orphan`` when the probe answers ABSENT at the current epoch - claimed, and nothing holds it.
+
+    A lease row whose pid does NOT answer is a LEAK, not evidence: the process is gone, so the
+    epoch decides, and the reason says which pid failed to answer. A recycled pid can only ever
+    produce a false ``live``, which merely leaves a stuck row stuck - the direction a retirement
+    verb must fail in.
 
     The epoch compared is returned with the verdict, so a reader can see which rung fired.
     """
@@ -387,14 +409,50 @@ def lease_liveness(db, session_id: str, *, owner_epoch: Optional[int],
         current = _current_epoch(conn)
         holder = _lease_holder(conn, session_id, now=now)
         workers = _live_workers(conn, session_id)
+    holder_pid = _holder_pid((holder or {}).get('holder'))
+    holder_alive = holder is not None and _pid_alive(holder_pid)
     verdict = {'epoch': owner_epoch, 'current_epoch': current,
-               'holder': (holder or {}).get('holder'), 'workers': workers}
+               'holder': (holder or {}).get('holder'), 'holder_pid': holder_pid,
+               'holder_alive': holder_alive, 'workers': workers}
+    if holder_alive:
+        return dict(verdict, state='live',
+                    reason=f'a live turn holds the claim: pid={holder_pid} answers')
+    if workers:
+        return dict(verdict, state='live',
+                    reason=f'a registered worker holds the claim: {",".join(workers)}')
+    leak = ''
+    if holder is not None:
+        leak = (f' (the lease names pid={holder_pid}, which does not answer)'
+                if holder_pid is not None else ' (the lease names no pid, so it cannot be probed)')
     if owner_epoch is not None and current is not None and int(owner_epoch) != int(current):
-        return dict(verdict, state='orphan', reason='owner_epoch is older than the store epoch')
-    if holder is not None or workers:
-        return dict(verdict, state='live', reason='a live turn holds the claim')
+        return dict(verdict, state='orphan',
+                    reason=f'owner_epoch differs: row={owner_epoch} store={current}, and nothing '
+                           f'observed holds the claim{leak}')
     return dict(verdict, state='orphan',
-                reason='no unexpired turn lease and no registered worker at the current epoch')
+                reason=f'no unexpired turn lease and no registered worker at the current '
+                       f'epoch {current}{leak}')
+
+
+def _holder_pid(holder) -> Optional[int]:
+    """The pid inside a lease ``holder`` (``pid=35864:turn=…:platform=cli``), or None."""
+    match = re.search(r'(?:^|:)pid=(\d+)', str(holder or ''))
+    return int(match.group(1)) if match else None
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    """Does this pid ANSWER on this host? Errs toward ALIVE: a retirement must never take a turn
+    that might still be running, and a false ``alive`` only leaves a stuck row stuck."""
+    if pid is None:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # it exists; it simply is not ours to signal
+    except OSError:
+        return True          # cannot tell -> assume the live one
+    return True
 
 
 def _frontier_now(db, session_id: str) -> int:
@@ -594,13 +652,64 @@ def _ensure_quarantine_table(conn) -> None:
                  'age_seconds REAL NOT NULL, store TEXT NOT NULL, resolution TEXT)')
 
 
-def _unknown_since_key(session_id: str) -> str:
+def _observed_since_key(kind: str, admission_id: str) -> str:
+    """The clock of ONE hour-glass: its KIND and its ROW.
+
+    These used to be keyed by session alone, shared by ``unknown`` and ``started``, and every path
+    that found no row of ITS OWN kind forgot the other kind's clock. A lane whose head alternates
+    between the two - or merely has an ``unknown`` row waiting while a ``started`` pass runs -
+    therefore reset ``first_seen`` on every pass and NEITHER population ever reached the threshold.
+    That is a silent non-repair: the cadence looks busy and nothing ages out.
+    """
+    return f"{UNKNOWN_SINCE_PREFIX}{kind}:{admission_id}"
+
+
+def _legacy_since_key(session_id: str) -> str:
+    """The pre-split key, read-only: adopted on first sight so a live clock is not restarted."""
     return UNKNOWN_SINCE_PREFIX + session_id
 
 
-def _forget_unknown_since(db, session_id: str) -> None:
-    key = _unknown_since_key(session_id)
-    db._execute_write(lambda conn: conn.execute('DELETE FROM state_meta WHERE key=?', (key,)))
+def _forget_observation(db, kind: str, admission_id: str) -> None:
+    """Forget ONLY the clock this path set. Never another kind's, never another row's."""
+    db._execute_write(lambda conn: conn.execute(
+        'DELETE FROM state_meta WHERE key=?', (_observed_since_key(kind, admission_id),)))
+
+
+def _observe_since(db, *, kind: str, session_id: str, row: dict, now: float) -> float:
+    """Stamp (or re-read) this row's first observation, and return the instant FIRST seen."""
+    key = _observed_since_key(kind, row['admission_id'])
+    legacy = _legacy_since_key(session_id)
+
+    def stamp(conn):
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+        for candidate in ([saved] if saved is not None else []) + [
+                conn.execute('SELECT value FROM state_meta WHERE key=?', (legacy,)).fetchone()]:
+            if candidate is None:
+                continue
+            try:
+                last = json.loads(candidate[0])
+            except ValueError:
+                continue
+            if last.get('admission_id') == row['admission_id']:
+                first = float(last.get('first_seen') or now)
+                if candidate is not saved:      # adopted: keep the instant, move it to the new key
+                    conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) '
+                                 'DO UPDATE SET value=excluded.value',
+                                 (key, json.dumps({'admission_id': row['admission_id'],
+                                                   'first_seen': first})))
+                return first
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+                     'SET value=excluded.value',
+                     (key, json.dumps({'admission_id': row['admission_id'], 'first_seen': now})))
+        return float(now)
+
+    return float(db._execute_write(stamp))
+
+
+def _observed_since_iso(now: float, first_seen: float) -> str:
+    """The instant this module first SAW the row - the origin of the number, printed with it."""
+    return datetime.datetime.fromtimestamp(first_seen, datetime.timezone.utc).strftime(
+        '%Y-%m-%dT%H:%M:%SZ')
 
 
 def quarantine_unknown(db, session_id: str, *, threshold_s: float = QUARANTINE_AGE_S,
@@ -622,27 +731,12 @@ def quarantine_unknown(db, session_id: str, *, threshold_s: float = QUARANTINE_A
         row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND "
                            "status='unknown' ORDER BY seq LIMIT 1", (session_id,)).fetchone()
     if row is None:
-        _forget_unknown_since(db, session_id)
+        # NOTHING TO FORGET: an empty pass of THIS kind says nothing about the other kind's clock.
+        # Forgetting here is what made two populations share one hour-glass and neither fill.
         return None
     row = dict(row)
 
-    key = _unknown_since_key(session_id)
-
-    def stamp(conn):
-        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
-        if saved is not None:
-            try:
-                last = json.loads(saved[0])
-            except ValueError:
-                last = {}
-            if last.get('admission_id') == row['admission_id']:
-                return float(last.get('first_seen') or now)
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
-                     'SET value=excluded.value',
-                     (key, json.dumps({'admission_id': row['admission_id'], 'first_seen': now})))
-        return float(now)
-
-    first_seen = float(db._execute_write(stamp))
+    first_seen = _observe_since(db, kind='unknown', session_id=session_id, row=row, now=now)
     age = max(0.0, now - first_seen)
     if age < threshold_s:
         return None
@@ -668,9 +762,10 @@ def quarantine_unknown(db, session_id: str, *, threshold_s: float = QUARANTINE_A
     moved = dict(db._execute_write(move))
     mark_epoch_quarantined(db, session_id, moved.get('owner_epoch'), by='quarantine_unknown',
                            row_id=moved['admission_id'])
-    _forget_unknown_since(db, session_id)
+    _forget_observation(db, 'unknown', moved['admission_id'])
     out(f"quarantine: {QUARANTINE_OUTCOME_PREFIX}{moved['seq']} lane={session_id} "
-        f"age={moved['age_seconds']:.0f}s unit=seconds threshold={threshold_s:.0f}s unit=seconds "
+        f"observed_age={moved['age_seconds']:.0f}s since={_observed_since_iso(now, first_seen)} "
+        f"unit=seconds threshold={threshold_s:.0f}s unit=seconds "
         f"store={store} admission={moved['admission_id']}")
     return moved
 
@@ -717,28 +812,10 @@ def quarantine_skipped(db, session_id: str, *, threshold_s: float = QUARANTINE_A
             "             WHERE t.target_session_id=? AND t.status='terminal') ORDER BY q.seq LIMIT 1",
             (session_id, session_id)).fetchone()
     if blocker is not None or row is None:
-        if row is None:
-            _forget_skipped_since(db, session_id)
-        return None
+        return None                      # nothing watched this pass: spend nobody else's clock
     row = dict(row)
 
-    key = _skipped_since_key(session_id)
-
-    def stamp(conn):
-        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
-        if saved is not None:
-            try:
-                last = json.loads(saved[0])
-            except ValueError:
-                last = {}
-            if last.get('admission_id') == row['admission_id']:
-                return float(last.get('first_seen') or now)
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
-                     'SET value=excluded.value',
-                     (key, json.dumps({'admission_id': row['admission_id'], 'first_seen': now})))
-        return float(now)
-
-    first_seen = float(db._execute_write(stamp))
+    first_seen = _observe_since(db, kind='skipped_queued', session_id=session_id, row=row, now=now)
     age = max(0.0, now - first_seen)
     if age < threshold_s:
         return None
@@ -764,21 +841,19 @@ def quarantine_skipped(db, session_id: str, *, threshold_s: float = QUARANTINE_A
     moved = dict(db._execute_write(move))
     mark_epoch_quarantined(db, session_id, moved.get('owner_epoch'), by='quarantine_skipped',
                            row_id=moved['admission_id'])
-    _forget_skipped_since(db, session_id)
+    _forget_observation(db, 'skipped_queued', moved['admission_id'])
     out(f"quarantine: {SKIPPED_QUEUED_PREFIX}{moved['seq']} lane={session_id} "
         f"status_at_quarantine=queued below_frontier=yes "
-        f"age={moved['age_seconds']:.0f}s unit=seconds threshold={threshold_s:.0f}s unit=seconds "
+        f"observed_age={moved['age_seconds']:.0f}s since={_observed_since_iso(now, first_seen)} "
+        f"unit=seconds threshold={threshold_s:.0f}s unit=seconds "
         f"store={store} admission={moved['admission_id']} principal={row['principal_id']}")
     return moved
 
 
 def _skipped_since_key(session_id: str) -> str:
-    return f"admission_skipped_since:{session_id}"
-
-
-def _forget_skipped_since(db, session_id: str) -> None:
-    key = _skipped_since_key(session_id)
-    db._execute_write(lambda conn: conn.execute('DELETE FROM state_meta WHERE key=?', (key,)))
+    """Retired: kept so a caller of the old name fails loudly rather than silently mis-keyed."""
+    raise RuntimeError('_skipped_since_key was keyed by SESSION and shared by every skipped row; '
+                       'use _observed_since_key("skipped_queued", admission_id)')
 
 
 STARTED_ORPHAN_PREFIX = "started_orphaned:"
@@ -808,31 +883,14 @@ def quarantine_started(db, session_id: str, *, threshold_s: float = QUARANTINE_A
         row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND "
                            "status='started' ORDER BY seq LIMIT 1", (session_id,)).fetchone()
     if row is None:
-        _forget_unknown_since(db, session_id)
-        return None
+        return None                      # an empty pass does not spend another kind's clock
     row = dict(row)
     liveness = lease_liveness(db, session_id, owner_epoch=row.get('owner_epoch'), now=now)
     if liveness['state'] != 'orphan':
         # A live turn is a TURN, not a wedge. Never overtaken, and never even stamped as stranded.
         return None
 
-    key = _unknown_since_key(session_id)
-
-    def stamp(conn):
-        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
-        if saved is not None:
-            try:
-                last = json.loads(saved[0])
-            except ValueError:
-                last = {}
-            if last.get('admission_id') == row['admission_id']:
-                return float(last.get('first_seen') or now)
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
-                     'SET value=excluded.value',
-                     (key, json.dumps({'admission_id': row['admission_id'], 'first_seen': now})))
-        return float(now)
-
-    first_seen = float(db._execute_write(stamp))
+    first_seen = _observe_since(db, kind='started', session_id=session_id, row=row, now=now)
     age = max(0.0, now - first_seen)
     if age < threshold_s:
         return None
@@ -858,11 +916,12 @@ def quarantine_started(db, session_id: str, *, threshold_s: float = QUARANTINE_A
     moved = dict(db._execute_write(move))
     epoch = mark_epoch_quarantined(db, session_id, moved.get('owner_epoch'),
                                    by='quarantine_started', row_id=moved['admission_id'])
-    _forget_unknown_since(db, session_id)
+    _forget_observation(db, 'started', moved['admission_id'])
     out(f"quarantine: {STARTED_ORPHAN_PREFIX}{moved['seq']} lane={session_id} "
-        f"age={moved['age_seconds']:.0f}s unit=seconds threshold={threshold_s:.0f}s unit=seconds "
+        f"observed_age={moved['age_seconds']:.0f}s since={_observed_since_iso(now, first_seen)} "
+        f"unit=seconds threshold={threshold_s:.0f}s unit=seconds "
         f"epoch={liveness['epoch']} current_epoch={liveness['current_epoch']} "
-        f"liveness='{liveness['reason']}' age_s={moved['age_seconds']:.0f} "
+        f"liveness='{liveness['reason']}' "
         f"principal={moved.get('principal_id')} epoch_rows={epoch['rows']} "
         f"store={store} admission={moved['admission_id']}")
     return moved
@@ -953,6 +1012,11 @@ async def admission_cadence_loop(db, lanes, wake, *, interval_s: float = CADENCE
     THIS IS THE CALLER OF THE QUARANTINE. When the lane's blocker is ``unknown``, the pass first
     calls :func:`quarantine_unknown` - the freeze expires into its named quarantine - and then wakes
     the lane unconditionally, so the same pass that retires the blocker delivers what was behind it.
+
+    A ``started(live)`` head is the one case that gets NO wake and NO quarantine: the turn is
+    running, it will end, and ``wake_after_worker`` schedules the drain behind it. Falling through
+    to ``wake`` here would make the cadence the siren it exists to silence - waking every busy lane
+    on every floor into a drain that must refuse it, forever.
     Without this, the cadence is a siren: it wakes the lane every floor into a refusal that names a
     blocker nothing will ever move. ``tick`` cannot be this place, because it takes ``run`` and a
     cadence has no turn to run.
@@ -991,6 +1055,11 @@ async def admission_cadence_loop(db, lanes, wake, *, interval_s: float = CADENCE
                     # R7: liveness FIRST, age SECOND - quarantine_started refuses a live owner.
                     moved = quarantine_started(db, session_id, store=_store_label(db),
                                                now=pass_now, out=out) is not None
+                elif blocked.startswith('started(live)@'):
+                    # A LIVE TURN NEEDS NO WAKE: it ends, and `wake_after_worker` schedules the
+                    # drain that follows it. Waking here is the siren this loop was written to
+                    # silence - every floor, every busy lane, into a drain that must refuse it.
+                    continue
                 if moved:
                     census = _lane_census(db, session_id, now=pass_now)   # the head MOVED
                     if not census['queued'] and not census['blocked']:
