@@ -264,6 +264,13 @@ def test_the_claim_path_reports_a_wedge_instead_of_freezing_silently():
     assert 'lane_blocked' in ast.dump(helper)
 
 
+def _claimed_generation(db, admission_id):
+    """`claim_session_input(head=...)` answers a boolean; the generation it stamped is on the row."""
+    with db._read_ctx() as conn:
+        return conn.execute('SELECT generation FROM session_admissions WHERE admission_id=?',
+                            (admission_id,)).fetchone()['generation']
+
+
 # ============================ platform-stl's item 4 (card t-76c210202a) ========================
 def test_the_FRONTIER_LINE_distinguishes_empty_from_ignored_and_tells_waiting_from_a_hole(tmp_path):
     """A line without `oldest` cannot distinguish "queue empty" from "queue ignored" - and this
@@ -272,14 +279,21 @@ def test_the_FRONTIER_LINE_distinguishes_empty_from_ignored_and_tells_waiting_fr
     from hermes_state_admission_frontier import _frontier_line
 
     db, epoch = _store(tmp_path)
-    empty = _frontier_line(db, 's', now=1000.0)
-    assert empty == ("queued=0 oldest=-@epoch=- live_epoch=%s skipped_since=- started=-" % epoch), empty
+    # THE RULED SHAPE (platform-stl, t-76c210202a): the SELECTOR's population is `queued_status`,
+    # `below_frontier` is the count a frontier-derived predicate cannot express, and both are
+    # printed with the store and the instant - a count without those is not a measurement.
+    empty = _frontier_line(db, 's', now=1000.0, store='X')
+    assert empty.startswith("queued_status=0 below_frontier=0 seq=-..- blocked=- store=X "
+                            "instant=1970-01-01T00:16:40Z"), empty
+    assert empty.endswith("oldest=-@epoch=- live_epoch=%s skipped_since=- started=-" % epoch), empty
 
     first = _admit(db, epoch, 'r1')
     second = _admit(db, epoch, 'r2')
-    line = _frontier_line(db, 's', now=1000.0)
-    assert line == (f"queued=2 oldest={first['seq']}@epoch={epoch} live_epoch={epoch} "
-                    f"skipped_since={first['seq']}@0s started=-"), line
+    line = _frontier_line(db, 's', now=1000.0, store='X')
+    assert line.startswith(f"queued_status=2 below_frontier=0 seq={first['seq']}..{second['seq']} "
+                           "blocked=- store=X"), line
+    assert line.endswith(f"oldest={first['seq']}@epoch={epoch} live_epoch={epoch} "
+                         f"skipped_since={first['seq']}@0s started=-"), line
 
     # same head, a minute later: the AGE rises on an unchanged seq - waiting, visible as a number
     later = _frontier_line(db, 's', now=1060.0)
@@ -341,3 +355,73 @@ def test_a_pass_claims_the_FIFO_HEAD_not_any_row(tmp_path):
                         out=lambda line: None)
     assert claimed == [r['seq'] for r in rows], (claimed, [r['seq'] for r in rows])
     assert report.line(), "the pass states its frontier"
+
+
+def test_a_SKIPPED_queued_row_is_counted_below_the_frontier_and_expires_only_after_the_wake(tmp_path):
+    """The row that does not announce itself (platform-stl, t-76c210202a item 2).
+
+    `status='queued'` below the highest terminal seq is the 32-row shape: a frontier-derived
+    predicate reports the queue as empty while deliverable rows sit in it, so `below_frontier` is a
+    printed count - and the row gets the SAME quarantine entry as an `unknown`, with two guards: it
+    never expires while the lane is blocked, and the wake has first refusal.
+    """
+    from hermes_state_admission_frontier import (QUARANTINE_AGE_S, _frontier_line,
+                                                 quarantine_skipped)
+
+    db, epoch = _store(tmp_path)
+    r1 = _admit(db, epoch, 'r1')          # seq 1 - the one that will be skipped
+    r2 = _admit(db, epoch, 'r2')
+    r3 = _admit(db, epoch, 'r3')
+
+    # an OUT-OF-SEQUENCE completion: a later row reaches terminal, so the frontier moves ABOVE r1
+    # while r1 is still queued. This is written directly because `claim_session_input` is FIFO by
+    # construction (it refuses a non-head) - the state is reachable by event ordering, not by claim.
+    def complete_later(conn):
+        conn.execute("UPDATE session_admissions SET status='terminal', outcome='ok' "
+                     "WHERE admission_id=?", (r2['admission_id'],))
+
+    db._execute_write(complete_later)
+    with db._read_ctx() as conn:
+        r2_seq = conn.execute('SELECT seq FROM session_admissions WHERE admission_id=?',
+                              (r2['admission_id'],)).fetchone()['seq']
+    assert r2_seq > r1['seq']
+
+    line = _frontier_line(db, 's', now=1000.0, store='X')
+    assert 'queued_status=2' in line, line
+    assert 'below_frontier=1' in line, line        # r1 is below the frontier, r3 above it
+
+    # GUARD 1: while the lane is BLOCKED the queued row is waiting, not skipped - nothing expires
+    claimed = rt.claim_session_input(db, epoch=epoch, session_id='s', head=r1['admission_id'])
+    assert isinstance(claimed, dict) and claimed['admission_id'] == r1['admission_id'], claimed
+    assert quarantine_skipped(db, 's', store='X', now=1000.0, out=lambda l: None) is None
+    assert quarantine_skipped(db, 's', store='X', now=1000.0 + QUARANTINE_AGE_S + 60,
+                              out=lambda l: None) is None
+    with db._read_ctx() as conn:
+        assert conn.execute("SELECT status FROM session_admissions WHERE admission_id=?",
+                            (r1['admission_id'],)).fetchone()['status'] == 'started'
+    # the block clears and the row is queued again - claimable, and a pass has had its chance to
+    # take it, which is the only condition under which "skipped" is a fact about the DRAIN
+    def requeue(conn):
+        conn.execute("UPDATE session_admissions SET status='queued', outcome=NULL "
+                     "WHERE admission_id=?", (r1['admission_id'],))
+
+    db._execute_write(requeue)
+    line = _frontier_line(db, 's', now=1000.0, store='X')
+    assert 'below_frontier=1' in line and 'blocked=-' in line, line
+
+    # GUARD 2: the first pass only STAMPS the age - a fresh skip is not an expired one
+    t0 = 5000.0
+    assert quarantine_skipped(db, 's', store='X', now=t0, out=lambda l: None) is None
+    lines = []
+    moved = quarantine_skipped(db, 's', store='X', now=t0 + QUARANTINE_AGE_S + 1,
+                               out=lines.append)
+
+    assert moved is not None and moved['status_at_quarantine'] == 'queued', moved
+    with db._read_ctx() as conn:
+        live = conn.execute("SELECT status, outcome FROM session_admissions WHERE admission_id=?",
+                            (r1['admission_id'],)).fetchone()
+    assert live['status'] == 'terminal' and live['outcome'] == f"skipped_queued:{r1['seq']}", live
+    assert lines and 'status_at_quarantine=queued' in lines[0], lines
+    assert 'below_frontier=yes' in lines[0] and 'unit=seconds' in lines[0], lines
+    # and the count is back to zero: the alarm is answered by the same act that repairs it
+    assert 'below_frontier=0' in _frontier_line(db, 's', now=t0 + QUARANTINE_AGE_S + 2, store='X')

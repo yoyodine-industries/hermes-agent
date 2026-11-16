@@ -19,6 +19,7 @@ store and reports the status it read. Nothing here calls a row sent on the stren
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import time
 from dataclasses import dataclass, field
@@ -224,23 +225,32 @@ def drain_pass(db, *, epoch: int, session_id: str, run: Callable[[dict], Any], f
 FRONTIER_KEY = 'frontier:{session}'
 
 
-def _frontier_line(db, session_id: str, *, now: Optional[float] = None,
-                   live_epoch: Optional[int] = None) -> str:
-    """The line printed on EVERY pass: ``queued=<n> oldest=<seq>@epoch=<e> live_epoch=<E>
-    skipped_since=<seq>@<age>s started=<seq>``.
+def _iso(now: float) -> str:
+    """The instant, in the one spelling the rest of the fleet prints: a count without its instant is
+    a number that cannot be compared with the next one."""
+    return datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    A line without ``oldest`` cannot distinguish "queue empty" from "queue ignored" - and this store
-    has no per-row instant at all (``session_admissions`` carries no timestamp), so a queue's AGE is
-    only knowable from what a pass records about it. ``skipped_since`` is therefore this module's own
-    durable observation: the oldest queued seq, and how long it has been the oldest. A head that keeps
-    not being taken shows up as a rising age on an unchanged seq, which is the only way a reader can
-    tell waiting from a hole.
+
+def _frontier_line(db, session_id: str, *, now: Optional[float] = None,
+                   live_epoch: Optional[int] = None, store: str = '') -> str:
+    """The line printed on EVERY pass, in the ruled shape:
+
+        queued_status=<n> below_frontier=<m> seq=<min>..<max> blocked=<status>@<seq>
+        store=<path> instant=<Z> oldest=<seq>@epoch=<e> live_epoch=<E>
+        skipped_since=<seq>@<age>s started=<seq>
+
+    ``queued_status`` is the SELECTOR's population (``status='queued'``, ordered by ``seq``);
+    ``below_frontier`` counts the queued rows sitting BELOW the highest terminal seq - the rows a
+    frontier-derived predicate cannot express and therefore reports as absent. ``m > 0`` is the
+    alarm: it is the shape of a skip, and it reads 32 on the store that produced this ruling.
+
+    ``skipped_since`` is this module's own durable observation, because ``session_admissions``
+    carries no timestamp at all: an unchanged head shows a RISING age (waiting), a taken head moves
+    the seq (progress), and the two are distinguishable only because a pass writes it down.
     """
     now = time.time() if now is None else now
+    census = _lane_census(db, session_id, now=now)
     with db._read_ctx() as conn:
-        row = conn.execute("SELECT COUNT(*) AS n, MIN(seq) AS lo FROM session_admissions "
-                           "WHERE target_session_id=? AND status='queued'",
-                           (session_id,)).fetchone()
         oldest = conn.execute("SELECT seq, owner_epoch FROM session_admissions WHERE "
                               "target_session_id=? AND status='queued' ORDER BY seq LIMIT 1",
                               (session_id,)).fetchone()
@@ -258,7 +268,7 @@ def _frontier_line(db, session_id: str, *, now: Optional[float] = None,
                 last = json.loads(saved[0])
             except ValueError:
                 last = {}
-            if last.get('oldest_seq') == oldest_seq and oldest_seq is not None:
+            if oldest_seq is not None and last.get('oldest_seq') == oldest_seq:
                 return float(last.get('first_seen') or now)
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
                      'SET value=excluded.value',
@@ -267,8 +277,11 @@ def _frontier_line(db, session_id: str, *, now: Optional[float] = None,
 
     first_seen = float(db._execute_write(stamp))
     age = 0.0 if oldest_seq is None else max(0.0, now - first_seen)
-    queued = int((row['n'] or 0) if row else 0)
-    return (f"queued={queued} "
+    span = ('-' if census['seq_min'] is None else census['seq_min'],
+            '-' if census['seq_max'] is None else census['seq_max'])
+    return (f"queued_status={census['queued_status']} below_frontier={census['below_frontier']} "
+            f"seq={span[0]}..{span[1]} blocked={census['blocked'] or '-'} "
+            f"store={store or _store_label(db)} instant={_iso(now)} "
             f"oldest={'-' if oldest_seq is None else oldest_seq}@epoch="
             f"{'-' if oldest is None else oldest['owner_epoch']} "
             f"live_epoch={'-' if live_epoch is None else live_epoch} "
@@ -286,9 +299,24 @@ def _lane_census(db, session_id: str, *, now: Optional[float] = None) -> dict:
     """
     now = time.time() if now is None else now
     with db._read_ctx() as conn:
-        row = conn.execute("SELECT SUM(status='queued') AS queued, MIN(seq) AS lo, MAX(seq) AS hi "
-                           "FROM session_admissions WHERE target_session_id=? AND status!='terminal'",
-                           (session_id,)).fetchone()
+        # THE SELECTION PREDICATE IS `status='queued'` ORDERED BY `seq`, FULL STOP (platform-stl,
+        # card t-76c210202a). A frontier-derived predicate - "queued means seq > max(terminal)" -
+        # cannot express a row that was SKIPPED: it stays status='queued' below the frontier for
+        # ever, and the predicate reports the queue as empty while 32 deliverable rows sit in it.
+        # `below_frontier` is therefore a REPORTING metric, printed beside the status count because
+        # the difference between them IS the defect signature.
+        row = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM session_admissions WHERE target_session_id=? "
+            "        AND status='queued') AS queued_status, "
+            "       (SELECT COUNT(*) FROM session_admissions q WHERE q.target_session_id=? "
+            "        AND q.status='queued' AND q.seq < (SELECT COALESCE(MAX(t.seq),0) FROM "
+            "            session_admissions t WHERE t.target_session_id=? AND t.status='terminal')) "
+            "        AS below_frontier, "
+            "       (SELECT MIN(seq) FROM session_admissions WHERE target_session_id=? "
+            "        AND status='queued') AS lo, "
+            "       (SELECT MAX(seq) FROM session_admissions WHERE target_session_id=? "
+            "        AND status='queued') AS hi",
+            (session_id, session_id, session_id, session_id, session_id)).fetchone()
         blocked = conn.execute("SELECT status, seq, owner_epoch FROM session_admissions WHERE "
                                "target_session_id=? AND status IN ('started','unknown') "
                                "ORDER BY seq LIMIT 1", (session_id,)).fetchone()
@@ -309,7 +337,11 @@ def _lane_census(db, session_id: str, *, now: Optional[float] = None) -> dict:
             kind = (f"started({state})@{blocked['seq']} epoch={owner_epoch} current={current}")
         else:
             kind = f"unknown@{blocked['seq']}"
-    return {'queued': int((row['queued'] if row else 0) or 0),
+    queued_status = int((row['queued_status'] if row else 0) or 0)
+    below = int((row['below_frontier'] if row else 0) or 0)
+    return {'queued': queued_status,          # the count the SELECTOR uses
+            'queued_status': queued_status,
+            'below_frontier': below,          # the count that is > 0 when the drain is skipping
             'seq_min': None if not row or row['lo'] is None else int(row['lo']),
             'seq_max': None if not row or row['hi'] is None else int(row['hi']),
             'blocked': kind}
@@ -643,6 +675,112 @@ def quarantine_unknown(db, session_id: str, *, threshold_s: float = QUARANTINE_A
     return moved
 
 
+SKIPPED_QUEUED_PREFIX = "skipped_queued:"
+
+
+def quarantine_skipped(db, session_id: str, *, threshold_s: float = QUARANTINE_AGE_S,
+                       store: str = '', now: Optional[float] = None,
+                       out: Callable[[str], Any] = print) -> Optional[dict]:
+    """MOVE a SKIPPED queued row into the same named quarantine - the disease that does not
+    announce itself (platform-stl, t-76c210202a item 2).
+
+    ``quarantine_unknown`` catches the rows that say they are broken. A skipped row says nothing: it
+    is ``status='queued'``, it sits BELOW the highest terminal seq, and a predicate derived from the
+    frontier cannot see it at all - so a drain built that way reports an empty queue while
+    deliverable messages sit in it (32 of them on the store that produced the ruling). It is the
+    same disease with a different status and it needs the same entry, or only the loud half of the
+    population is ever repaired.
+
+    TWO GUARDS, because these rows are DELIVERABLE MESSAGES and quarantine is the last resort:
+
+      * the lane must be UNBLOCKED - while a ``started``/``unknown`` row exists, a queued row below
+        the frontier is legitimately waiting behind a claim, not skipped, and expiring it would
+        quarantine the queue itself;
+      * the caller runs the WAKE first, so a row that a pass has just claimed is already delivered
+        and never reaches here. What expires is a row that stayed queued THROUGH a pass that had
+        every opportunity to take it - which is the only condition under which "skipped" is a fact
+        about the drain rather than about the lane's traffic.
+
+    The copy is verbatim with ``status_at_quarantine='queued'``; the live row becomes ``terminal``
+    with outcome ``skipped_queued:<seq>`` so the FIFO can never loop over it again, and the age is
+    measured from this module's own durable observation because ``session_admissions`` carries no
+    timestamp at all.
+    """
+    now = time.time() if now is None else now
+    with db._read_ctx() as conn:
+        blocker = conn.execute("SELECT status, seq FROM session_admissions WHERE target_session_id=? "
+                               "AND status IN ('started','unknown') ORDER BY seq LIMIT 1",
+                               (session_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM session_admissions q WHERE q.target_session_id=? AND q.status='queued' "
+            "AND q.seq < (SELECT COALESCE(MAX(t.seq),0) FROM session_admissions t "
+            "             WHERE t.target_session_id=? AND t.status='terminal') ORDER BY q.seq LIMIT 1",
+            (session_id, session_id)).fetchone()
+    if blocker is not None or row is None:
+        if row is None:
+            _forget_skipped_since(db, session_id)
+        return None
+    row = dict(row)
+
+    key = _skipped_since_key(session_id)
+
+    def stamp(conn):
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+        if saved is not None:
+            try:
+                last = json.loads(saved[0])
+            except ValueError:
+                last = {}
+            if last.get('admission_id') == row['admission_id']:
+                return float(last.get('first_seen') or now)
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+                     'SET value=excluded.value',
+                     (key, json.dumps({'admission_id': row['admission_id'], 'first_seen': now})))
+        return float(now)
+
+    first_seen = float(db._execute_write(stamp))
+    age = max(0.0, now - first_seen)
+    if age < threshold_s:
+        return None
+
+    def move(conn):
+        _ensure_quarantine_table(conn)
+        conn.execute(f'INSERT OR IGNORE INTO {QUARANTINE_TABLE} (seq, admission_id, request_id, '
+                     'principal_id, target_session_id, lineage_json, payload_json, payload_digest, '
+                     'intent, status_at_quarantine, outcome, owner_epoch, generation, '
+                     'quarantined_at, age_seconds, store, resolution) '
+                     'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)',
+                     (row['seq'], row['admission_id'], row['request_id'], row['principal_id'],
+                      row['target_session_id'], row['lineage_json'], row['payload_json'],
+                      row['payload_digest'], row['intent'], 'queued', row.get('outcome'),
+                      row.get('owner_epoch'), row.get('generation'), now, age, store))
+        conn.execute('UPDATE session_admissions SET status=?, outcome=? WHERE admission_id=? '
+                     'AND status=?',
+                     ('terminal', f"{SKIPPED_QUEUED_PREFIX}{row['seq']}", row['admission_id'],
+                      'queued'))
+        return conn.execute(f'SELECT * FROM {QUARANTINE_TABLE} WHERE admission_id=?',
+                            (row['admission_id'],)).fetchone()
+
+    moved = dict(db._execute_write(move))
+    mark_epoch_quarantined(db, session_id, moved.get('owner_epoch'), by='quarantine_skipped',
+                           row_id=moved['admission_id'])
+    _forget_skipped_since(db, session_id)
+    out(f"quarantine: {SKIPPED_QUEUED_PREFIX}{moved['seq']} lane={session_id} "
+        f"status_at_quarantine=queued below_frontier=yes "
+        f"age={moved['age_seconds']:.0f}s unit=seconds threshold={threshold_s:.0f}s unit=seconds "
+        f"store={store} admission={moved['admission_id']} principal={row['principal_id']}")
+    return moved
+
+
+def _skipped_since_key(session_id: str) -> str:
+    return f"admission_skipped_since:{session_id}"
+
+
+def _forget_skipped_since(db, session_id: str) -> None:
+    key = _skipped_since_key(session_id)
+    db._execute_write(lambda conn: conn.execute('DELETE FROM state_meta WHERE key=?', (key,)))
+
+
 STARTED_ORPHAN_PREFIX = "started_orphaned:"
 
 
@@ -858,6 +996,13 @@ async def admission_cadence_loop(db, lanes, wake, *, interval_s: float = CADENCE
                     if not census['queued'] and not census['blocked']:
                         continue
                 wake(session_id)
+                # THE SKIPPED ROWS GET THEIR CHANCE HERE AND NOWHERE ELSE: the wake has just had
+                # first refusal, so a row still queued below the frontier after it is one a pass
+                # could not take, not one that is merely waiting. Until it expires, `below_frontier`
+                # on the next line is the number that says the drain is skipping.
+                if quarantine_skipped(db, session_id, store=_store_label(db), now=pass_now,
+                                      out=out) is not None:
+                    out(_frontier_line(db, session_id, now=pass_now))
             except Exception:  # health: allow BLE001 -- one unbounded lane must not stop the rest;
                 # the exception is never swallowed silently, it is logged with the lane.
                 if log is not None:
