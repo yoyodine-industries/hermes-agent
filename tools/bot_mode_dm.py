@@ -510,9 +510,47 @@ class LiveTargetHeldError(LiveTargetUnavailableError):
         return HELD_NOT_SENT
 
 
+class LiveTargetBusyError(LiveTargetUnavailableError):
+    """The lane's FIFO is full: refused at the queue cap, BEFORE ``admit`` reserved an idempotency
+    row, so nothing was admitted and the sender may retry. It carries ``retry_after`` and is never
+    reported as "do not resend" - that label belongs only to an admission that may have happened."""
+
+    reason = "queue_full"
+
+    def __init__(self, message: str, *, retry_after: float):
+        super().__init__(message)
+        self.retry_after = float(retry_after)
+        self.resend = f"in {self.retry_after:.0f}s (the lane's queue is full, nothing was admitted)"
+
+
+def _capacity_retry_after(exc: object) -> float | None:
+    """``retry_after`` of a refusal that reserved nothing, or None for any other failure."""
+    from hermes_state_runtime import ADMISSION_RETRY_AFTER_SECONDS
+
+    if str(exc) != "queue_full":
+        return None
+    value = getattr(exc, "retry_after", None)
+    if value is None:
+        data = getattr(exc, "data", None)
+        value = data.get("retry_after") if isinstance(data, dict) else None
+    return float(value) if isinstance(value, (int, float)) and value > 0 else ADMISSION_RETRY_AFTER_SECONDS
+
+
+def _describe(exc: object) -> str:
+    """A failure's name for a human message: never an empty cause (a bare refusal used to read
+    "Live admission outcome unknown: . Do not resend", which names neither the cause nor the rule)."""
+    text = str(exc).strip()
+    return text or f"{type(exc).__name__} with no message"
+
+
 def _unavailable_payload(dm_file: str, exc: LiveTargetUnavailableError) -> str:
-    return json.dumps({"reason": exc.reason, "delivery_id": _dm_delivery_id(dm_file),
-                       "error": f"{exc} — the message was NOT sent; it is safe to resend {exc.resend}."})
+    payload: dict[str, Any] = {"reason": exc.reason, "delivery_id": _dm_delivery_id(dm_file),
+                               "error": f"{_describe(exc)} - the message was NOT sent; it is safe to resend {exc.resend}."}
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is not None:
+        # Nothing was reserved, so this refusal is retryable and says when.
+        payload.update(retryable=True, retry_after=retry_after)
+    return json.dumps(payload)
 
 
 def _settled_no_send(dm_file: str, exc: LiveTargetUnavailableError) -> str:
@@ -581,6 +619,14 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
         try:
             record = deliver_to_live_owner(home, intent["owner"], intent["message"], **identity)
         except GatewayRPCError as exc:
+            retry_after = _capacity_retry_after(exc)
+            if retry_after is not None:
+                # Refused at the lane's queue cap, before admit() reserved its idempotency row:
+                # nothing was admitted anywhere, so this refusal is retryable and says when.
+                detail = exc.data.get("detail") if isinstance(exc.data, dict) else None
+                raise LiveTargetBusyError(
+                    f"the lane's queue is full ({detail or 'no queued slot'})",
+                    retry_after=retry_after) from exc
             if str(exc) != HELD_NOT_SENT or exc.data.get("admitted") is not False:
                 raise
             # Nothing was admitted while that refusal held the owner's lock, but a same-id attempt
@@ -679,8 +725,9 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
 
 def _live_outcome_unknown(dm_file: str, cause: object) -> str:
     """The runner's stdout when a live admission may have happened but its outcome is unknown."""
+    text = cause if isinstance(cause, str) else _describe(cause)
     return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                       "error": f"Live admission outcome unknown: {cause}. Do not resend.",
+                       "error": f"Live admission outcome unknown: {text}. Do not resend.",
                        "evidence_file": dm_file})
 
 
@@ -770,8 +817,13 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
         except LiveTargetUnavailableError as exc:
             return _settled_no_send(dm_file, exc)
         except Exception as exc:
+            retry_after = _capacity_retry_after(exc)
+            if retry_after is not None:
+                detail = getattr(exc, "detail", None) or _describe(exc)
+                return _unavailable_payload(dm_file, LiveTargetBusyError(
+                    f"the lane's queue is full ({detail})", retry_after=retry_after))
             return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
+                "error": f"Live delivery admission could not be confirmed: {_describe(exc)}. Do not resend.",
                 "evidence_file": dm_file})
         if record is not None:
             if wake == "none":
