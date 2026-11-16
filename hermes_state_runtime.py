@@ -25,11 +25,19 @@ class RuntimeStoreError(ValueError):
     string); ``field`` and ``detail`` name the check that fired and why, so a client and the gateway
     log can tell the reasons' many checks apart instead of reporting the bare code."""
 
-    def __init__(self, reason: str, *, field: str | None = None, detail: str | None = None):
+    def __init__(self, reason: str, *, field: str | None = None, detail: str | None = None,
+                 retry_after: float | None = None):
         self.reason = reason
         self.field = _one_line(field, 80)
         self.detail = _one_line(detail, 160)
+        # A refusal that reserved NOTHING (no idempotency row, no place in the FIFO) is retryable:
+        # ``retry_after`` is the honest answer, and callers must not label it "do not resend".
+        self.retry_after = retry_after
         super().__init__(reason)
+
+    @property
+    def retryable(self) -> bool:
+        return self.retry_after is not None
 
 
 #: The one ``admission_conflict`` that proves the request was already admitted: this principal's
@@ -127,6 +135,9 @@ def begin_runtime_epoch(db, *, instance_id: str) -> int:
 # The cap is PER DELIVERY CLASS, never shared: one FIFO carries two kinds of input with wildly
 # different value, and a backlog of hints must never refuse a fact (t_0b41230f).
 ADMISSION_QUEUE_MAX = 32
+#: How long a ``queue_full`` refusal asks the sender to wait. The cap is a FIFO length, not a
+#: reservation: nothing was written, so the refusal is retryable and carries this.
+ADMISSION_RETRY_AFTER_SECONDS = 30.0
 
 #: The automation class: a notice the seat may read later (a liveness tick, a completion batch, a
 #: kanban/loop wake). It is the class a full FIFO may hold back.
@@ -226,10 +237,23 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             WHERE principal_id=? AND target_session_id=? AND request_id=?''', (principal_id, session_id, request_id)).fetchone()
         if old is not None:
             if old['payload_digest'] != digest:
-                raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
+                raise RuntimeStoreError('admission_conflict',
+                                        field=ADMITTED_REQUEST_CONFLICT['field'],
+                                        detail=ADMITTED_REQUEST_CONFLICT['detail'])
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)
+        queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
+            AND status='queued' ''', (session_id,)).fetchone()[0]
+        # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
+        # input after Discard, so it must not grow without bound while nobody resolves it.
+        if queued >= ADMISSION_QUEUE_MAX:
+            # Refused BEFORE the INSERT: no idempotency row was reserved and nothing joined the
+            # FIFO, so this is retryable and says so (``do not resend`` would be a lie).
+            raise RuntimeStoreError('queue_full', field='queue',
+                                    detail=f'{queued}/{ADMISSION_QUEUE_MAX} queued; nothing was '
+                                           f'reserved - retry after {ADMISSION_RETRY_AFTER_SECONDS:.0f}s',
+                                    retry_after=ADMISSION_RETRY_AFTER_SECONDS)
         if _authorize_write is not None:
             # Ahead of the cap: a replacement retires the queued row it supersedes in this same
             # transaction, so at a full FIFO it frees the slot it takes. Checked first, a
@@ -460,13 +484,44 @@ def check_replaced_input(conn, admission_id: str, binding: str) -> None:
         raise RuntimeStoreError('admission_conflict')
 
 
+def release_session_input(db, *, epoch: int, admission_id: str, generation: int) -> bool:
+    """Hand an unstarted claim back to its FIFO place: ``started`` -> ``queued`` at its own seq.
+
+    A drain that claimed a row and could not do the work releases it rather than settling it. The
+    row then pins the frontier at its own seq and is the first row the next pass retries, so no
+    later row can be claimed past it. Only the claim's own owner and generation may release it.
+    """
+    def write(conn):
+        _epoch(conn, epoch)
+        row = _admission(conn, admission_id)
+        if row['status'] != 'started' or row['owner_epoch'] != epoch:
+            return False
+        if type(generation) is not int or row['generation'] != generation:
+            return False
+        changed = conn.execute("UPDATE session_admissions SET status='queued',generation=NULL "
+                               "WHERE admission_id=? AND status='started' AND owner_epoch=? "
+                               "AND generation=?", (admission_id, epoch, generation))
+        if changed.rowcount != 1:
+            return False
+        conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?',
+                     (row['target_session_id'],))
+        return True
+    return db._execute_write(write)
+
+
 def rehome_queued_inputs(db, *, epoch: int, old_session_id: str, new_session_id: str,
                          principal_prefix: str) -> list[str]:
     """Re-target the old owner's still-queued ``principal_prefix*`` admissions onto
-    ``new_session_id`` in one transaction (the compression-exhaustion auto-reset). Each row keeps
-    its admission id, request id and seq, so FIFO order and retry dedupe survive; the digest is
-    re-keyed to the new target. Nothing moves while the old FIFO holds an ``unknown`` row (the
-    operator's to resume). Returns the moved admission ids in FIFO order."""
+    ``new_session_id`` in one transaction (the compression-exhaustion auto-reset).
+
+    Each row keeps its admission id and request id (so retry dedupe survives) and takes a seq at
+    the NEW inbox's TAIL, above whatever frontier that lane has already drained. Keeping the old
+    seq instead would land the rows *behind* the target's frontier, where a drain that resumes from
+    it never returns: a queued row stranded below a terminal one while still counting as queued.
+    The moved rows keep their FIFO order among themselves. The digest is re-keyed to the new
+    target. Nothing moves while the old FIFO holds an ``unknown`` row (the operator's to resume).
+    Returns the moved admission ids in FIFO order.
+    """
     for value in (old_session_id, new_session_id, principal_prefix):
         _text(value)
     def write(conn):
@@ -478,13 +533,20 @@ def rehome_queued_inputs(db, *, epoch: int, old_session_id: str, new_session_id:
         rows = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' "
                             "AND substr(principal_id,1,?)=? ORDER BY seq",
                             (old_session_id, len(principal_prefix), principal_prefix)).fetchall()
-        for row in rows:
+        tail = conn.execute("SELECT COALESCE(MAX(seq),0) FROM session_admissions "
+                            "WHERE target_session_id=?", (new_session_id,)).fetchone()[0]
+        for offset, row in enumerate(rows, start=1):
             digest = admission_fingerprint(canonical_target=new_session_id, payload={
                 'input': json.loads(row['payload_json']), 'intent': row['intent']})
-            conn.execute("UPDATE session_admissions SET target_session_id=?,lineage_json=?,payload_digest=? "
-                         "WHERE admission_id=? AND status='queued'",
-                         (new_session_id, json.dumps([new_session_id]), digest, row['admission_id']))
+            conn.execute("UPDATE session_admissions SET target_session_id=?,lineage_json=?,payload_digest=?,"
+                         "seq=? WHERE admission_id=? AND status='queued'",
+                         (new_session_id, json.dumps([new_session_id]), digest, int(tail) + offset,
+                          row['admission_id']))
         if rows:
+            # An explicit seq above the AUTOINCREMENT high-water must raise the sequence too, or
+            # the next admitted row would collide with the tail we just wrote.
+            conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq, ?) WHERE name='session_admissions'",
+                         (int(tail) + len(rows),))
             for sid in (old_session_id, new_session_id):
                 conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (sid,))
         return [row['admission_id'] for row in rows]
