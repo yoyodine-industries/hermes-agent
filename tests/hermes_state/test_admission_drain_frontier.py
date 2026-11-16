@@ -136,3 +136,34 @@ def test_rehomed_rows_take_a_seq_above_the_target_frontier(tmp_path):
     # The AUTOINCREMENT high-water moved with them: the next admission cannot collide.
     later = _admit(db, epoch, 'z', session_id='new')
     assert later['seq'] == frontier_before + 3
+
+
+def test_the_lane_card_is_filed_once_and_refreshed_by_key(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_connect
+    from hermes_state_admission_frontier import (CARD_KEY_PREFIX, DrainReport, Stranded,
+                                                 file_lane_card)
+
+    calls = []
+
+    class _Conn:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(kanban_db_connect, 'connect_closing', lambda **kwargs: _Conn())
+    monkeypatch.setattr(kanban_db, 'create_task',
+                        lambda conn, **kwargs: calls.append(('create', kwargs['idempotency_key']))
+                        or 'card-1')
+    monkeypatch.setattr(kanban_db, 'add_comment',
+                        lambda conn, task_id, author, body: calls.append(('comment', task_id, body)))
+
+    report = DrainReport(lane='platform-stl', stranded=Stranded(3, 9493, 10083, 754.0),
+                         frontier_before=9492, frontier_after=9492)
+    assert file_lane_card(report) == 'card-1'
+    assert file_lane_card(report) == 'card-1'  # the second pass refreshes, it does not re-file
+    assert calls[0] == ('create', CARD_KEY_PREFIX + 'platform-stl')
+    assert [call[0] for call in calls] == ['create', 'comment', 'create', 'comment']
+    assert 'stranded=3' in calls[-1][2] and 'oldest=9493' in calls[-1][2]
