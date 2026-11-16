@@ -528,6 +528,23 @@ class GatewayGoalsMixin:
         # Viewers swap the countdown for "running now" (or re-anchor it after a slash tick settled).
         await self._publish_local_control(source)
 
+    async def _admission_cadence_watcher(self) -> None:
+        """A lane whose blocker was settled resumes on a FLOOR, with no inbound event (card
+        t-76c210202a, ruling 2).
+
+        The drain path is event-driven: a lane frozen behind an unsettled execution is re-entered
+        only when somebody sends it another message, so one lost turn becomes an indefinite outage
+        while its queue grows. This watcher is the cadence that ends that: one pass per lane per
+        floor, asking the authority's own ``wake_after_worker`` - the same call a finished worker
+        makes - to look again. It runs no turn, adds no second drain, and is silent when a lane has
+        nothing waiting."""
+        from hermes_state_admission_frontier import admission_cadence_loop
+        authority = getattr(self, 'session_authority', None)
+        if authority is None:
+            return
+        await admission_cadence_loop(authority.db, lambda: list(authority.sessions),
+                                     authority.wake_after_worker)
+
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops
         (SessionDB ``loop:*`` rows) and injects each due prompt via the synthetic-message path.

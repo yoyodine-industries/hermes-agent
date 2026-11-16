@@ -18,6 +18,7 @@ store and reports the status it read. Nothing here calls a row sent on the stren
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -63,11 +64,18 @@ class DrainReport:
     card: Optional[str] = None
     #: ``<status>@<seq>`` of the row that stops the lane claiming anything at all, when one does.
     blocked: Optional[str] = None
+    #: The lane's census at the moment the pass looked: queued rows and their seq span. Printed on
+    #: EVERY pass, because the frontier alone cannot distinguish "empty" from "55 waiting".
+    queued: int = 0
+    seq_min: Optional[int] = None
+    seq_max: Optional[int] = None
 
     def line(self) -> str:
         """The pass's one report line: every number read from the store, never inferred."""
+        span = (f'seq={self.seq_min}..{self.seq_max}' if self.seq_min is not None else 'seq=none')
         parts = [f'lane={self.lane}', f'settled={len(self.settled)}',
                  f'frontier={self.frontier_before}->{self.frontier_after}',
+                 f'queued={self.queued}', span,
                  f'stranded={self.stranded.count}']
         if self.blocked:
             parts.append(f'blocked={self.blocked}')
@@ -165,9 +173,22 @@ def drain_pass(db, *, epoch: int, session_id: str, run: Callable[[dict], Any], f
     creates) never go unreported: the pass prints them and files/refreshes the lane's card through
     ``filer`` (``None``: :func:`file_lane_card`, ``False``: card filing disabled).
     """
-    report = DrainReport(lane=session_id, frontier_before=_frontier_now(db, session_id))
+    census = _lane_census(db, session_id)
+    report = DrainReport(lane=session_id, frontier_before=_frontier_now(db, session_id),
+                         queued=census['queued'], seq_min=census['seq_min'],
+                         seq_max=census['seq_max'], blocked=census['blocked'])
     while True:
-        row = claim_session_input(db, epoch=epoch, session_id=session_id)
+        try:
+            row = claim_session_input(db, epoch=epoch, session_id=session_id)
+        except Exception as exc:  # health: allow BLE001 -- the claim's own refusal is evidence:
+            # an `unknown` head makes the runtime refuse to claim AT ALL (RuntimeStoreError
+            # 'unknown_execution'). That refusal is the blocker the pass must REPORT, not an
+            # exception it may leak into the turn loop: the lane is frozen, the census line says
+            # by which row, and the quarantine (below) is what ends the outage.
+            if getattr(exc, 'reason', None) not in {'unknown_execution', 'session_busy'}:
+                raise
+            report.blocked = census['blocked'] or f"refused:{getattr(exc, 'reason', 'unknown')}"
+            break
         if not isinstance(row, dict):
             break  # nothing queued (None) or the FIFO moved under us (False): re-read next pass
         try:
@@ -187,10 +208,32 @@ def drain_pass(db, *, epoch: int, session_id: str, run: Callable[[dict], Any], f
                                'status': read['status'], 'outcome': read['outcome']})
     report.frontier_after = _frontier_now(db, session_id)
     report.stranded = stranded(db, session_id, now=now)
-    out(report.line())
+    after = _lane_census(db, session_id)
+    report.queued, report.seq_min, report.seq_max = after['queued'], after['seq_min'], after['seq_max']
+    report.blocked = after['blocked']
+    # A PASS THAT FINDS NOTHING IS SILENT (ruling on t-76c210202a). The cadence calls this pass on a
+    # timer, so a line per tick would become the flood that hides the next blocker; a line is written
+    # when the pass has something a reader must act on - settled work, a blocker, a strand, a pin.
+    if report.settled or report.blocked or report.stranded or report.stopped_at is not None:
+        out(report.line())
     if report.stranded and filer is not False:
         report.card = (filer or file_lane_card)(report)
     return report
+
+
+def _lane_census(db, session_id: str) -> dict:
+    """``queued`` count and seq span of the lane's non-terminal rows, plus its first blocker."""
+    with db._read_ctx() as conn:
+        row = conn.execute("SELECT SUM(status='queued') AS queued, MIN(seq) AS lo, MAX(seq) AS hi "
+                           "FROM session_admissions WHERE target_session_id=? AND status!='terminal'",
+                           (session_id,)).fetchone()
+        blocked = conn.execute("SELECT status, seq FROM session_admissions WHERE "
+                               "target_session_id=? AND status IN ('started','unknown') "
+                               "ORDER BY seq LIMIT 1", (session_id,)).fetchone()
+    return {'queued': int((row['queued'] if row else 0) or 0),
+            'seq_min': None if not row or row['lo'] is None else int(row['lo']),
+            'seq_max': None if not row or row['hi'] is None else int(row['hi']),
+            'blocked': (f"{blocked['status']}@{blocked['seq']}" if blocked else None)}
 
 
 def _frontier_now(db, session_id: str) -> int:
@@ -305,3 +348,220 @@ def lane_blocked(db, session_id: str, *, filer=None, now: Optional[float] = None
                 'Could not file the blocked-drain card for %s; the census line above carries the '
                 'evidence', session_id, exc_info=True)
     return report.line()
+
+
+# --------------------------------------------------------------------------- #
+# the cadence: a settled blocker must not need an inbound event (ruling 2)
+# --------------------------------------------------------------------------- #
+#: ``state_meta`` key holding the lane's last cadence pass.
+CADENCE_PREFIX = 'gateway.admission.cadence.v1.'
+
+#: The floor between two passes for ONE lane. A floor, not a period: a busy turn loop may call
+#: :func:`tick` as often as it likes and the store is read at most once per interval per lane.
+CADENCE_INTERVAL_S = 30.0
+
+
+def cadence_due(db, session_id: str, *, interval_s: float = CADENCE_INTERVAL_S,
+                now: Optional[float] = None) -> bool:
+    """True when this lane may take a pass now, and durably marks the pass as taken.
+
+    Idempotent by construction: the stamp and the answer are written in ONE write, so two callers
+    that race on the same lane cannot both be told ``True``. The stamp is the floor, which is what
+    keeps a cadence owned by the turn loop from becoming a spin.
+    """
+    key = CADENCE_PREFIX + session_id
+    now = time.time() if now is None else now
+
+    def write(conn):
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+        if saved is not None:
+            try:
+                last = float(json.loads(saved[0]).get('at') or 0.0)
+            except (ValueError, TypeError):
+                last = 0.0
+            if now - last < interval_s:
+                return False
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+                     'SET value=excluded.value', (key, json.dumps({'at': now})))
+        return True
+    return bool(db._execute_write(write))
+
+
+def tick(db, *, epoch: int, session_id: str, run: Callable[[dict], Any], filer=None,
+         interval_s: float = CADENCE_INTERVAL_S, now: Optional[float] = None,
+         out: Callable[[str], Any] = print) -> Optional[DrainReport]:
+    """One bounded cadence tick for ``session_id``: no inbound event required.
+
+    Called from the turn loop, so the answer to "may I pass now" is stored, not remembered: the
+    process may be restarted, and a lane whose blocker was settled elsewhere must resume on the
+    next tick without anybody sending it a message. Returns ``None`` when this lane is not due, or
+    when the pass found nothing at all - a tick that says nothing is the normal case.
+    """
+    if not cadence_due(db, session_id, interval_s=interval_s, now=now):
+        return None
+    census = _lane_census(db, session_id)
+    if not census['queued'] and not census['blocked']:
+        return None
+    report = drain_pass(db, epoch=epoch, session_id=session_id, run=run, filer=filer, now=now,
+                        out=out)
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# the quarantine: a freeze must expire into a NAMED state (ruling 1)
+# --------------------------------------------------------------------------- #
+#: Table holding quarantined admissions, byte for byte, for their owner.
+QUARANTINE_TABLE = 'session_admission_quarantine'
+
+#: ``state_meta`` key holding when this lane's oldest ``unknown`` row was first seen unknown.
+UNKNOWN_SINCE_PREFIX = 'gateway.admission.unknown_since.v1.'
+
+#: The STATED AGE after which an ``unknown`` row is quarantined and its lane resumes. Seconds, and
+#: the unit is carried in every line that prints it, because a number without its unit is the next
+#: defect: 1,800 s = 30 min of messages queued behind one lost turn.
+QUARANTINE_AGE_S = 1800.0
+
+QUARANTINE_OUTCOME_PREFIX = 'unknown_quarantined:'
+
+
+def _ensure_quarantine_table(conn) -> None:
+    conn.execute(f'CREATE TABLE IF NOT EXISTS {QUARANTINE_TABLE} ('
+                 'seq INTEGER PRIMARY KEY, admission_id TEXT NOT NULL UNIQUE, request_id TEXT, '
+                 'principal_id TEXT, target_session_id TEXT, lineage_json TEXT, payload_json TEXT, '
+                 'payload_digest TEXT, intent TEXT, status_at_quarantine TEXT, outcome TEXT, '
+                 'owner_epoch INTEGER, generation INTEGER, quarantined_at REAL NOT NULL, '
+                 'age_seconds REAL NOT NULL, store TEXT NOT NULL, resolution TEXT)')
+
+
+def _unknown_since_key(session_id: str) -> str:
+    return UNKNOWN_SINCE_PREFIX + session_id
+
+
+def _forget_unknown_since(db, session_id: str) -> None:
+    key = _unknown_since_key(session_id)
+    db._execute_write(lambda conn: conn.execute('DELETE FROM state_meta WHERE key=?', (key,)))
+
+
+def quarantine_unknown(db, session_id: str, *, threshold_s: float = QUARANTINE_AGE_S,
+                       store: str = '', now: Optional[float] = None,
+                       out: Callable[[str], Any] = print) -> Optional[dict]:
+    """MOVE this lane's oldest ``unknown`` admission into quarantine once it is old enough.
+
+    The FREEZE IS NOT LIFTED: unruly nothing is delivered out of order, nothing is settled on the
+    owner's behalf, and the row is never re-emitted as a fresh turn. What expires is the OUTAGE -
+    the lane stops being held hostage by one turn whose outcome this runtime will never learn.
+
+    The copy is verbatim (every column, plus ``store`` and the age it was quarantined at), the live
+    row becomes ``terminal`` with outcome ``unknown_quarantined:<seq>`` so the FIFO may advance and
+    the ledger still names where the row went, and the owner's later resolution makes the copy
+    ELIGIBLE (see :func:`mark_quarantine_eligible`) - never automatic, never silent.
+    """
+    now = time.time() if now is None else now
+    with db._read_ctx() as conn:
+        row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND "
+                           "status='unknown' ORDER BY seq LIMIT 1", (session_id,)).fetchone()
+    if row is None:
+        _forget_unknown_since(db, session_id)
+        return None
+    row = dict(row)
+
+    key = _unknown_since_key(session_id)
+
+    def stamp(conn):
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+        if saved is not None:
+            try:
+                last = json.loads(saved[0])
+            except ValueError:
+                last = {}
+            if last.get('admission_id') == row['admission_id']:
+                return float(last.get('first_seen') or now)
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+                     'SET value=excluded.value',
+                     (key, json.dumps({'admission_id': row['admission_id'], 'first_seen': now})))
+        return float(now)
+
+    first_seen = float(db._execute_write(stamp))
+    age = max(0.0, now - first_seen)
+    if age < threshold_s:
+        return None
+
+    def move(conn):
+        _ensure_quarantine_table(conn)
+        conn.execute(f'INSERT OR IGNORE INTO {QUARANTINE_TABLE} (seq, admission_id, request_id, '
+                     'principal_id, target_session_id, lineage_json, payload_json, payload_digest, '
+                     'intent, status_at_quarantine, outcome, owner_epoch, generation, '
+                     'quarantined_at, age_seconds, store, resolution) '
+                     'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)',
+                     (row['seq'], row['admission_id'], row['request_id'], row['principal_id'],
+                      row['target_session_id'], row['lineage_json'], row['payload_json'],
+                      row['payload_digest'], row['intent'], row['status'], row.get('outcome'),
+                      row.get('owner_epoch'), row.get('generation'), now, age, store))
+        conn.execute('UPDATE session_admissions SET status=?, outcome=?, owner_epoch=NULL, '
+                     'generation=NULL WHERE admission_id=? AND status=?',
+                     ('terminal', f"{QUARANTINE_OUTCOME_PREFIX}{row['seq']}",
+                      row['admission_id'], 'unknown'))
+        return conn.execute(f'SELECT * FROM {QUARANTINE_TABLE} WHERE admission_id=?',
+                            (row['admission_id'],)).fetchone()
+
+    moved = dict(db._execute_write(move))
+    _forget_unknown_since(db, session_id)
+    out(f"quarantine: {QUARANTINE_OUTCOME_PREFIX}{moved['seq']} lane={session_id} "
+        f"age={moved['age_seconds']:.0f}s unit=seconds threshold={threshold_s:.0f}s unit=seconds "
+        f"store={store} admission={moved['admission_id']}")
+    return moved
+
+
+def mark_quarantine_eligible(db, admission_id: str, *, by: str) -> bool:
+    """An owner has resolved the quarantined turn: it becomes ELIGIBLE, and nothing else happens.
+
+    Eligible is a state a human may act on; it is not a re-emission. Nothing is delivered, no new
+    admission row is created, and the quarantined copy stays byte for byte what it was.
+    """
+    def write(conn):
+        _ensure_quarantine_table(conn)
+        cur = conn.execute(f'UPDATE {QUARANTINE_TABLE} SET resolution=? WHERE admission_id=? '
+                           'AND resolution IS NULL', (by, admission_id))
+        return cur.rowcount > 0
+    return bool(db._execute_write(write))
+
+
+async def admission_cadence_loop(db, lanes, wake, *, interval_s: float = CADENCE_INTERVAL_S,
+                                 sleep=None, now=None, log=None) -> None:
+    """The per-lane cadence owned by the turn loop: a lane resumes with NO inbound event.
+
+    A blocker settled elsewhere (its owner resolving an ``unknown`` turn, a worker ending) leaves
+    messages queued behind a lane that nothing will touch again until somebody sends it another
+    message. This loop closes that hole: every ``interval_s`` it asks each live lane whether the
+    floor has passed, and if that lane has work it calls ``wake(session_id)`` - the runner's own
+    ``wake_after_worker``, which schedules the drain that already exists. It adds no second turn
+    loop and runs no turn itself.
+
+    Bounded and idempotent: the interval is a FLOOR per lane (``cadence_due`` stamps it durably in
+    the same write that answers), so a wake that finds nothing costs one read, and two loop
+    instances cannot both pass a lane in one window. A lane with an empty queue and no blocker is
+    skipped silently: a cadence that logs every tick is the flood that hides the next blocker.
+    """
+    sleep = sleep or asyncio.sleep
+    while True:
+        await sleep(interval_s)  # the floor first: at startup the platforms have not connected yet
+        try:
+            session_ids = list(lanes())
+        except Exception:  # health: allow BLE001 -- a lane list that cannot be read must not kill
+            # the cadence: the next tick tries again, and the loop's own liveness is the evidence.
+            if log is not None:
+                log('admission cadence: could not list lanes; retrying next tick')
+            continue
+        for session_id in session_ids:
+            try:
+                if not cadence_due(db, session_id, interval_s=interval_s,
+                                   now=None if now is None else now()):
+                    continue
+                census = _lane_census(db, session_id)
+                if not census['queued'] and not census['blocked']:
+                    continue
+                wake(session_id)
+            except Exception:  # health: allow BLE001 -- one unbounded lane must not stop the rest;
+                # the exception is never swallowed silently, it is logged with the lane.
+                if log is not None:
+                    log(f'admission cadence: wake of {session_id} failed', )
