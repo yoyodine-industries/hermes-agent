@@ -526,8 +526,15 @@ def mark_quarantine_eligible(db, admission_id: str, *, by: str) -> bool:
     return bool(db._execute_write(write))
 
 
+def _store_label(db) -> str:
+    """The lane's own store path, printed with every quarantined row: a line that names an age
+    without the store it was measured in is the next defect."""
+    path = getattr(db, 'db_path', None)
+    return str(path) if path else ''
+
+
 async def admission_cadence_loop(db, lanes, wake, *, interval_s: float = CADENCE_INTERVAL_S,
-                                 sleep=None, now=None, log=None) -> None:
+                                 sleep=None, now=None, log=None, out=print) -> None:
     """The per-lane cadence owned by the turn loop: a lane resumes with NO inbound event.
 
     A blocker settled elsewhere (its owner resolving an ``unknown`` turn, a worker ending) leaves
@@ -541,6 +548,13 @@ async def admission_cadence_loop(db, lanes, wake, *, interval_s: float = CADENCE
     the same write that answers), so a wake that finds nothing costs one read, and two loop
     instances cannot both pass a lane in one window. A lane with an empty queue and no blocker is
     skipped silently: a cadence that logs every tick is the flood that hides the next blocker.
+
+    THIS IS THE CALLER OF THE QUARANTINE. When the lane's blocker is ``unknown``, the pass first
+    calls :func:`quarantine_unknown` - the freeze expires into its named quarantine - and then wakes
+    the lane unconditionally, so the same pass that retires the blocker delivers what was behind it.
+    Without this, the cadence is a siren: it wakes the lane every floor into a refusal that names a
+    blocker nothing will ever move. ``tick`` cannot be this place, because it takes ``run`` and a
+    cadence has no turn to run.
     """
     sleep = sleep or asyncio.sleep
     while True:
@@ -560,6 +574,12 @@ async def admission_cadence_loop(db, lanes, wake, *, interval_s: float = CADENCE
                 census = _lane_census(db, session_id)
                 if not census['queued'] and not census['blocked']:
                     continue
+                if str(census['blocked'] or '').startswith('unknown@'):
+                    quarantine_unknown(db, session_id, store=_store_label(db),
+                                       now=None if now is None else now(), out=out)
+                    census = _lane_census(db, session_id)   # the quarantine MOVED the head
+                    if not census['queued'] and not census['blocked']:
+                        continue
                 wake(session_id)
             except Exception:  # health: allow BLE001 -- one unbounded lane must not stop the rest;
                 # the exception is never swallowed silently, it is logged with the lane.

@@ -228,3 +228,99 @@ def test_the_cadence_loop_says_nothing_for_a_lane_with_nothing_waiting(tmp_path)
         asyncio.run(admission_cadence_loop(db, lambda: ['s'], wakes.append, interval_s=30.0,
                                            sleep=sleep))
     assert wakes == [], wakes
+
+
+# ------------------------------------------------ ruling 1's CALLER (the cadence, not a docstring)
+def test_ONE_cadence_pass_quarantines_an_aged_unknown_head_and_delivers_what_was_behind_it(tmp_path):
+    """The acceptance the review set: the quarantine has a CALLER, and the same pass drains.
+
+    Without this the cadence is a siren - it wakes the lane every floor into a refusal that names a
+    blocker nothing will ever move, and the queued rows behind it never move either.
+    """
+    import asyncio
+    import pytest
+
+    from hermes_state_admission_frontier import admission_cadence_loop, quarantine_unknown
+
+    db, epoch = _store(tmp_path)
+    stuck = _admit(db, epoch, 'r-stuck')
+    behind = _admit(db, epoch, 'r-behind')
+    _make_unknown(db, stuck['admission_id'])
+    before = _row(db, stuck['admission_id'])
+
+    t0 = time.time()
+    # the row is ALREADY older than the threshold: one earlier look stamped its age, which is what
+    # "a synthetic unknown row older than 1,800 s" means - the age lives in the store, not the test
+    quarantine_unknown(db, 's', store=str(tmp_path / 'state.db'),
+                       now=t0 - QUARANTINE_AGE_S - 1, out=lambda line: None)
+
+    woke, lines = [], []
+
+    async def sleep(_seconds):
+        if woke:   # exactly ONE cadence pass, then leave the loop
+            raise SystemExit
+        await asyncio.sleep(0)
+
+    def wake(session_id):
+        woke.append(session_id)
+        # the runner's wake, in miniature: the drain that follows the pass claims the next row
+        db._execute_write(lambda conn: None)
+        claimed = rt.claim_session_input(db, epoch=epoch, session_id=session_id)
+        woke.append(claimed['admission_id'] if claimed else None)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(admission_cadence_loop(db, lambda: ['s'], wake, interval_s=CADENCE_INTERVAL_S,
+                                           sleep=sleep, now=lambda: t0, out=lines.append))
+
+    # 1. the row MOVED, verbatim, with the store and the age it was moved at
+    [copy] = _quarantine_rows(db)
+    for column in ('seq', 'admission_id', 'request_id', 'principal_id', 'target_session_id',
+                   'lineage_json', 'payload_json', 'payload_digest', 'intent', 'outcome',
+                   'generation', 'owner_epoch'):
+        assert copy[column] == before[column], (column, copy[column], before[column])
+    assert copy['status_at_quarantine'] == 'unknown', copy
+    assert copy['store'] == str(tmp_path / 'state.db'), copy
+    assert copy['age_seconds'] >= QUARANTINE_AGE_S, copy
+
+    # 2. the live row says where it went, and the FIFO may advance past it
+    live = _row(db, stuck['admission_id'])
+    assert live['status'] == 'terminal', live
+    assert live['outcome'] == f"unknown_quarantined:{stuck['seq']}", live
+
+    # 3. the SAME pass delivered what was behind it
+    assert woke == ['s', behind['admission_id']], woke
+
+    # 4. and the line that reports it carries the unit and the store
+    assert lines, 'the quarantine line must be printed'
+    line = lines[0]
+    assert line.startswith('quarantine: unknown_quarantined:'), line
+    assert 'unit=seconds' in line and 'store=' in line, line
+
+
+def test_the_cadence_does_not_quarantine_a_STARTED_head(tmp_path):
+    """A `started` head is a different state with its own verb (t-3040729271); the cadence must
+    wake and report, never retire it."""
+    import asyncio
+    import pytest
+
+    from hermes_state_admission_frontier import admission_cadence_loop
+
+    db, epoch = _store(tmp_path)
+    claimed = rt.claim_session_input(db, epoch=epoch, session_id='s') if _admit(db, epoch, 'r1') else None
+    assert claimed and claimed['status'] == 'started', claimed
+    t0 = time.time()
+    woke = []
+
+    async def sleep(_seconds):
+        if woke:
+            raise SystemExit
+        await asyncio.sleep(0)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(admission_cadence_loop(db, lambda: ['s'], woke.append,
+                                           interval_s=CADENCE_INTERVAL_S, sleep=sleep,
+                                           now=lambda: t0 + QUARANTINE_AGE_S * 5,
+                                           out=lambda line: None))
+    assert woke == ['s'], woke                      # woken, and the blocker reported
+    assert _quarantine_rows(db) == []               # but NOT retired by this path
+    assert _row(db, claimed['admission_id'])['status'] == 'started'
