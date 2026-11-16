@@ -1648,7 +1648,8 @@ class GatewayStartupMixin:
         "_kanban_notifier_watcher", "_kanban_dispatcher_watcher",
     )
     _POST_RECONNECT_WATCHERS = (
-        "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_profile_reconcile_watcher",
+        "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher",
+        "_profile_reconcile_watcher", "_admission_cadence_watcher",
     )
 
     def _start_spawn_background_watchers(self) -> None:
