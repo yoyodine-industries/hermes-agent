@@ -221,19 +221,92 @@ def drain_pass(db, *, epoch: int, session_id: str, run: Callable[[dict], Any], f
     return report
 
 
-def _lane_census(db, session_id: str) -> dict:
-    """``queued`` count and seq span of the lane's non-terminal rows, plus its first blocker."""
+def _lane_census(db, session_id: str, *, now: Optional[float] = None) -> dict:
+    """``queued`` count, seq span, and the first blocker AS A RESOLVABLE KIND.
+
+    R7: a ``started`` head is printed ``started(live)`` or ``started(orphan)`` with the epoch it was
+    compared against, because the two resolve by DIFFERENT ACTS - one by finishing, one by the
+    quarantine - and a census that prints them the same way invites the second act on the first row.
+    """
+    now = time.time() if now is None else now
     with db._read_ctx() as conn:
         row = conn.execute("SELECT SUM(status='queued') AS queued, MIN(seq) AS lo, MAX(seq) AS hi "
                            "FROM session_admissions WHERE target_session_id=? AND status!='terminal'",
                            (session_id,)).fetchone()
-        blocked = conn.execute("SELECT status, seq FROM session_admissions WHERE "
+        blocked = conn.execute("SELECT status, seq, owner_epoch FROM session_admissions WHERE "
                                "target_session_id=? AND status IN ('started','unknown') "
                                "ORDER BY seq LIMIT 1", (session_id,)).fetchone()
+        current = _current_epoch(conn)
+        holder = None
+        workers: list = []
+        if blocked is not None and blocked['status'] == 'started':
+            holder = _lease_holder(conn, session_id, now=now)
+            workers = _live_workers(conn, session_id)
+    kind = None
+    if blocked is not None:
+        if blocked['status'] == 'started':
+            owner_epoch = blocked['owner_epoch']
+            stale_epoch = (owner_epoch is not None and current is not None
+                           and int(owner_epoch) != int(current))
+            state = ('live' if (not stale_epoch and (holder is not None or workers))
+                     else 'orphan')
+            kind = (f"started({state})@{blocked['seq']} epoch={owner_epoch} current={current}")
+        else:
+            kind = f"unknown@{blocked['seq']}"
     return {'queued': int((row['queued'] if row else 0) or 0),
             'seq_min': None if not row or row['lo'] is None else int(row['lo']),
             'seq_max': None if not row or row['hi'] is None else int(row['hi']),
-            'blocked': (f"{blocked['status']}@{blocked['seq']}" if blocked else None)}
+            'blocked': kind}
+
+
+def _current_epoch(conn) -> Optional[int]:
+    row = conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()
+    return int(row['epoch']) if row is not None else None
+
+
+def _lease_holder(conn, session_id: str, *, now: float):
+    row = conn.execute('SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id=? '
+                       'AND expires_at>?', (session_id, now)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _live_workers(conn, session_id: str) -> list:
+    return [r['execution_id'] for r in conn.execute(
+        "SELECT execution_id FROM worker_executions WHERE session_id=? AND status IN "
+        "('registered','running') ORDER BY execution_id", (session_id,))]
+
+
+def lease_liveness(db, session_id: str, *, owner_epoch: Optional[int],
+                   now: Optional[float] = None) -> dict:
+    """R7: is this ``started`` claim held by a LIVE turn, or by one that is demonstrably GONE?
+
+    A ``started`` row held by a live turn and a ``started`` row held by a dead one are
+    indistinguishable in a census built on AGE - the lane that prompted this ruling was running the
+    very turn the census called a blocker, and an age rule alone would have expired it mid-flight
+    and delivered its queue behind an answer still being written. So liveness is decided FIRST, from
+    what a running turn actually holds, and age is only the second rung:
+
+      * ``orphan`` when ``owner_epoch`` is an OLDER epoch than the store's current one - the run that
+        wrote the claim is dead, whatever the clock says;
+      * ``live`` when the owner's own probe answers: an unexpired ``session_turn_leases`` row for the
+        session, or a ``worker_executions`` row in (registered, running);
+      * ``orphan`` when the probe answers ABSENT at the current epoch - claimed, and nothing holds it.
+
+    The epoch compared is returned with the verdict, so a reader can see which rung fired.
+    """
+    now = time.time() if now is None else now
+    with db._read_ctx() as conn:
+        current = _current_epoch(conn)
+        holder = _lease_holder(conn, session_id, now=now)
+        workers = _live_workers(conn, session_id)
+    verdict = {'epoch': owner_epoch, 'current_epoch': current,
+               'holder': (holder or {}).get('holder'), 'workers': workers}
+    if owner_epoch is not None and current is not None and int(owner_epoch) != int(current):
+        return dict(verdict, state='orphan', reason='owner_epoch is older than the store epoch')
+    if holder is not None or workers:
+        return dict(verdict, state='live', reason='a live turn holds the claim')
+    return dict(verdict, state='orphan',
+                reason='no unexpired turn lease and no registered worker at the current epoch')
 
 
 def _frontier_now(db, session_id: str) -> int:
@@ -512,6 +585,89 @@ def quarantine_unknown(db, session_id: str, *, threshold_s: float = QUARANTINE_A
     return moved
 
 
+STARTED_ORPHAN_PREFIX = "started_orphaned:"
+
+
+def quarantine_started(db, session_id: str, *, threshold_s: float = QUARANTINE_AGE_S,
+                       store: str = '', now: Optional[float] = None,
+                       out: Callable[[str], Any] = print) -> Optional[dict]:
+    """R7: an ORPHANED ``started`` head expires into the same named quarantine - and ONLY when its
+    owner is DEMONSTRABLY GONE. Age is never the sole rung.
+
+    The counterexample that produced this ruling: a lane whose ``started`` head was the turn being
+    run at that moment. An age rule alone would have expired it mid-flight, quarantined a live
+    claim, and delivered the queue behind an answer that was still being written - overtaking a live
+    turn, which is the one thing the freeze exists to prevent. So:
+
+      * liveness FIRST (:func:`lease_liveness`): a row whose owner is alive is RETURNED UNTOUCHED and
+        the pass prints nothing about it;
+      * age SECOND, measured from this module's own durable observation (a lane blocked since T has
+        been blocked for now - T, which is a fact of the store rather than a guess);
+      * the copy is verbatim into the same quarantine table with ``status_at_quarantine='started'``,
+        the live row becomes ``terminal`` with ``started_orphaned:<seq>``, and the line names the
+        epoch it compared, so a reader can see which rung fired.
+    """
+    now = time.time() if now is None else now
+    with db._read_ctx() as conn:
+        row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND "
+                           "status='started' ORDER BY seq LIMIT 1", (session_id,)).fetchone()
+    if row is None:
+        _forget_unknown_since(db, session_id)
+        return None
+    row = dict(row)
+    liveness = lease_liveness(db, session_id, owner_epoch=row.get('owner_epoch'), now=now)
+    if liveness['state'] != 'orphan':
+        # A live turn is a TURN, not a wedge. Never overtaken, and never even stamped as stranded.
+        return None
+
+    key = _unknown_since_key(session_id)
+
+    def stamp(conn):
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+        if saved is not None:
+            try:
+                last = json.loads(saved[0])
+            except ValueError:
+                last = {}
+            if last.get('admission_id') == row['admission_id']:
+                return float(last.get('first_seen') or now)
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+                     'SET value=excluded.value',
+                     (key, json.dumps({'admission_id': row['admission_id'], 'first_seen': now})))
+        return float(now)
+
+    first_seen = float(db._execute_write(stamp))
+    age = max(0.0, now - first_seen)
+    if age < threshold_s:
+        return None
+
+    def move(conn):
+        _ensure_quarantine_table(conn)
+        conn.execute(f'INSERT OR IGNORE INTO {QUARANTINE_TABLE} (seq, admission_id, request_id, '
+                     'principal_id, target_session_id, lineage_json, payload_json, payload_digest, '
+                     'intent, status_at_quarantine, outcome, owner_epoch, generation, '
+                     'quarantined_at, age_seconds, store, resolution) '
+                     'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)',
+                     (row['seq'], row['admission_id'], row['request_id'], row['principal_id'],
+                      row['target_session_id'], row['lineage_json'], row['payload_json'],
+                      row['payload_digest'], row['intent'], row['status'], row.get('outcome'),
+                      row.get('owner_epoch'), row.get('generation'), now, age, store))
+        conn.execute('UPDATE session_admissions SET status=?, outcome=?, owner_epoch=NULL, '
+                     'generation=NULL WHERE admission_id=? AND status=?',
+                     ('terminal', f"{STARTED_ORPHAN_PREFIX}{row['seq']}",
+                      row['admission_id'], 'started'))
+        return conn.execute(f'SELECT * FROM {QUARANTINE_TABLE} WHERE admission_id=?',
+                            (row['admission_id'],)).fetchone()
+
+    moved = dict(db._execute_write(move))
+    _forget_unknown_since(db, session_id)
+    out(f"quarantine: {STARTED_ORPHAN_PREFIX}{moved['seq']} lane={session_id} "
+        f"age={moved['age_seconds']:.0f}s unit=seconds threshold={threshold_s:.0f}s unit=seconds "
+        f"epoch={liveness['epoch']} current_epoch={liveness['current_epoch']} "
+        f"liveness='{liveness['reason']}' store={store} admission={moved['admission_id']}")
+    return moved
+
+
 def mark_quarantine_eligible(db, admission_id: str, *, by: str) -> bool:
     """An owner has resolved the quarantined turn: it becomes ELIGIBLE, and nothing else happens.
 
@@ -574,10 +730,18 @@ async def admission_cadence_loop(db, lanes, wake, *, interval_s: float = CADENCE
                 census = _lane_census(db, session_id)
                 if not census['queued'] and not census['blocked']:
                     continue
-                if str(census['blocked'] or '').startswith('unknown@'):
-                    quarantine_unknown(db, session_id, store=_store_label(db),
-                                       now=None if now is None else now(), out=out)
-                    census = _lane_census(db, session_id)   # the quarantine MOVED the head
+                pass_now = None if now is None else now()
+                blocked = str(census['blocked'] or '')
+                moved = False
+                if blocked.startswith('unknown@'):
+                    moved = quarantine_unknown(db, session_id, store=_store_label(db),
+                                               now=pass_now, out=out) is not None
+                elif blocked.startswith('started(orphan)@'):
+                    # R7: liveness FIRST, age SECOND - quarantine_started refuses a live owner.
+                    moved = quarantine_started(db, session_id, store=_store_label(db),
+                                               now=pass_now, out=out) is not None
+                if moved:
+                    census = _lane_census(db, session_id, now=pass_now)   # the head MOVED
                     if not census['queued'] and not census['blocked']:
                         continue
                 wake(session_id)

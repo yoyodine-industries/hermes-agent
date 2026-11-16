@@ -324,3 +324,122 @@ def test_the_cadence_does_not_quarantine_a_STARTED_head(tmp_path):
     assert woke == ['s'], woke                      # woken, and the blocker reported
     assert _quarantine_rows(db) == []               # but NOT retired by this path
     assert _row(db, claimed['admission_id'])['status'] == 'started'
+
+
+# --------------------------------------------------- R7: a live turn is a turn, not a wedge
+def _lease(db, *, expires_in=600.0, holder='pid=35864:turn=local:platform=cli', session='s'):
+    now = time.time()
+    db._execute_write(lambda conn: conn.execute(
+        'INSERT INTO session_turn_leases (conversation_id, holder, acquired_at, expires_at) '
+        'VALUES (?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET holder=excluded.holder,'
+        'acquired_at=excluded.acquired_at,expires_at=excluded.expires_at',
+        (session, holder, now, now + expires_in)))
+
+
+def _claim(db, epoch, request_id='r-head', session_id='s'):
+    _admit(db, epoch, request_id, session_id=session_id)
+    row = rt.claim_session_input(db, epoch=epoch, session_id=session_id)
+    assert row and row['status'] == 'started', row
+    return row
+
+
+def test_a_LIVE_started_head_is_printed_as_started_live_and_is_never_quarantined(tmp_path):
+    """The counterexample this ruling came from: the head IS the turn being run, and an age rule
+    would have expired it mid-flight."""
+    from hermes_state_admission_frontier import _lane_census, lease_liveness, quarantine_started
+
+    db, epoch = _store(tmp_path)
+    head = _claim(db, epoch)
+    _lease(db, expires_in=7200.0)          # this turn is holding its lease
+    t0 = time.time()
+
+    liveness = lease_liveness(db, 's', owner_epoch=head['owner_epoch'], now=t0)
+    assert liveness['state'] == 'live', liveness
+    assert 'pid=35864' in (liveness['holder'] or ''), liveness
+
+    census = _lane_census(db, 's', now=t0)
+    assert census['blocked'].startswith('started(live)@'), census
+    assert f"epoch={epoch} current={epoch}" in census['blocked'], census
+
+    lines = []
+    assert quarantine_started(db, 's', store='x', now=t0 + QUARANTINE_AGE_S * 5,
+                              out=lines.append) is None
+    assert _quarantine_rows(db) == [], 'a LIVE turn must never be quarantined'
+    assert _row(db, head['admission_id'])['status'] == 'started'
+    assert lines == [], 'and the pass says nothing about it'
+
+
+def test_an_OLDER_epoch_wins_over_a_leaked_lease(tmp_path):
+    """A lease row left by a dead run proves nothing: the epoch it recorded is the discriminator."""
+    from hermes_state_admission_frontier import lease_liveness
+
+    db, epoch = _store(tmp_path)
+    head = _claim(db, epoch)
+    _lease(db, expires_in=7200.0)          # leaked by the run that died
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE session_admissions SET owner_epoch=? WHERE admission_id=?",
+        (epoch - 1, head['admission_id'])))
+
+    liveness = lease_liveness(db, 's', owner_epoch=epoch - 1, now=time.time())
+    assert liveness['state'] == 'orphan', liveness
+    assert 'older than the store epoch' in liveness['reason'], liveness
+
+
+def test_ONE_cadence_pass_quarantines_an_ORPHANED_started_head_and_delivers_behind_it(tmp_path):
+    """R7's second rung: liveness says the owner is gone, and only then does age decide."""
+    import asyncio
+    import pytest
+
+    from hermes_state_admission_frontier import admission_cadence_loop, quarantine_started
+
+    db, epoch = _store(tmp_path)
+    head = _claim(db, epoch)
+    behind = _admit(db, epoch, 'r-behind')
+    before = _row(db, head['admission_id'])
+    t0 = time.time()
+
+    # no lease, no worker: the probe answers ABSENT at the current epoch -> orphan
+    quarantine_started(db, 's', store=str(tmp_path / 'state.db'),
+                       now=t0 - QUARANTINE_AGE_S - 1, out=lambda line: None)   # stamps the age
+    woke, lines = [], []
+
+    async def sleep(_seconds):
+        if woke:
+            raise SystemExit
+        await asyncio.sleep(0)
+
+    def wake(session_id):
+        woke.append(session_id)
+        claimed = rt.claim_session_input(db, epoch=epoch, session_id=session_id)
+        woke.append(claimed['admission_id'] if claimed else None)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(admission_cadence_loop(db, lambda: ['s'], wake, interval_s=CADENCE_INTERVAL_S,
+                                           sleep=sleep, now=lambda: t0, out=lines.append))
+
+    [copy] = _quarantine_rows(db)
+    assert copy['status_at_quarantine'] == 'started', copy
+    for column in ('seq', 'admission_id', 'request_id', 'payload_json', 'payload_digest',
+                   'generation', 'owner_epoch'):
+        assert copy[column] == before[column], (column, copy[column], before[column])
+    live = _row(db, head['admission_id'])
+    assert live['status'] == 'terminal' and live['outcome'] == f"started_orphaned:{head['seq']}"
+    assert woke == ['s', behind['admission_id']], woke
+    line = lines[0]
+    assert line.startswith('quarantine: started_orphaned:'), line
+    assert 'unit=seconds' in line and 'current_epoch=' in line and 'store=' in line, line
+
+
+def test_age_ALONE_never_quarantines_a_started_head(tmp_path):
+    """R7: age is the second rung. An orphan younger than the floor is reported, not retired."""
+    from hermes_state_admission_frontier import _lane_census, quarantine_started
+
+    db, epoch = _store(tmp_path)
+    head = _claim(db, epoch)
+    t0 = time.time()
+
+    lines = []
+    assert quarantine_started(db, 's', store='x', now=t0, out=lines.append) is None
+    assert _quarantine_rows(db) == [], 'young and orphaned is still not retired'
+    assert _row(db, head['admission_id'])['status'] == 'started'
+    assert _lane_census(db, 's', now=t0)['blocked'].startswith('started(orphan)@')
