@@ -4,6 +4,7 @@ No execution, transport, or authority objects live here. Every mutation uses the
 SessionDB transaction owner, including its inode guard and SQLite retry policy.
 """
 import json
+import time
 import uuid
 from typing import NamedTuple, Optional
 
@@ -691,6 +692,102 @@ def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generati
                      (outcome, admission_id))
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
         return _row(_admission(conn, admission_id))
+    return db._execute_write(write)
+
+
+def _live_turn_lease(conn, session_id, *, now):
+    """The turn loop's RENEWING lease: presence with an unexpired ``expires_at``.
+
+    An expired row is a leak from a turn that died - the store is full of them - so presence alone
+    proves nothing and expiry is compared, never presence. This is the same test
+    ``hermes_state_local_migration`` already applies to decide whether a turn is over.
+    """
+    return conn.execute('SELECT holder, acquired_at, expires_at FROM session_turn_leases '
+                        'WHERE conversation_id=? AND expires_at>?', (session_id, now)).fetchone()
+
+
+def _live_workers(conn, session_id):
+    return conn.execute("SELECT execution_id FROM worker_executions WHERE session_id=? AND "
+                        "status IN ('registered','running') ORDER BY execution_id",
+                        (session_id,)).fetchall()
+
+
+def orphaned_lease_evidence(conn, row, *, now=None) -> dict:
+    """PROOF OF LIFE for a ``started`` admission, taken from the objects a running turn holds.
+
+    A ``started`` row is indistinguishable from a live turn in its OWN COLUMNS: the orphan measured
+    on 2026-11-16 (seq 10110) carried ``owner_epoch`` equal to the CURRENT epoch and the newest
+    ``generation`` in the store, because nothing fences ``started`` at owner startup and the epoch
+    it recorded was the epoch it really ran in. So liveness is never inferred from the admission -
+    a predicate built on epoch or generation would either refuse the real orphan forever or kill a
+    slow turn. It is taken from what a live turn actually holds:
+
+      * ``session_turn_leases`` for that session with ``expires_at > now`` - the heartbeat the turn
+        loop renews; the holder string names the owner (``pid=<pid>:turn=...:platform=<surface>``);
+      * ``worker_executions`` for that session in ``('registered','running')`` - a child/cron/kanban
+        execution the session is waiting on.
+
+    Returns ``{'orphaned': False, 'holder': ..., 'expires_at': ...}`` when something alive owns the
+    row, else ``{'orphaned': True, 'evidence': [...]}``. A timeout on the admission is deliberately
+    NOT part of this: a timeout is how a slow turn gets killed.
+    """
+    now = time.time() if now is None else now
+    session_id = row['target_session_id']
+    lease = _live_turn_lease(conn, session_id, now=now)
+    if lease is not None:
+        return {'orphaned': False, 'holder': lease['holder'], 'expires_at': lease['expires_at']}
+    workers = [w['execution_id'] for w in _live_workers(conn, session_id)]
+    if workers:
+        return {'orphaned': False, 'holder': 'worker_executions:' + ','.join(workers),
+                'workers': workers}
+    return {'orphaned': True, 'evidence': [
+        f"no session_turn_leases row for {session_id} with expires_at>{now:.3f}",
+        f"no worker_executions row for {session_id} in (registered, running)"]}
+
+
+def retire_orphaned_session_input(db, *, epoch: int, session_id: str, admission_id: str,
+                                  generation: int, now: float | None = None) -> dict:
+    """Retire a ``started`` admission that NO LIVE OWNER holds, so its session's FIFO advances.
+
+    The gap this closes: ``claim_session_input`` refuses the head while ANY row of the session is
+    ``started``, and the sanctioned control (``resolve_unknown_session_input``) accepts only
+    ``unknown``, so a ``started`` row left by a turn whose process is gone blocks the whole inbox
+    with nothing lawful to run. 55 messages sat behind one such row.
+
+    Fenced exactly like the unknown control, and fenced the way a slow turn stays safe:
+
+      * the caller must name the session, the admission AND the generation it is retiring - a stale
+        generation is refused, so a row that was claimed again is never retired by a stale intent;
+      * the row must still be ``started`` (``unknown`` keeps its own control, ``terminal`` is done);
+      * the session must match, so no admission is retired through another session's name;
+      * PROOF OF LIFE from ``orphaned_lease_evidence``: if a lease is unexpired or a worker is
+        registered/running, the call REFUSES and names the holder.
+
+    The lost input is not replayed and nothing is requeued: the row becomes ``terminal`` with the
+    outcome ``orphan_retired:<seq>``, which keeps the pointer the ledger needs, and the session's
+    runtime revision is bumped so the drain re-reads its head.
+    """
+    def write(conn):
+        _epoch(conn, epoch)
+        row = _admission(conn, admission_id)
+        if row['target_session_id'] != session_id:
+            raise RuntimeStoreError('session_mismatch')
+        if row['status'] == 'terminal' and row['outcome'] == f"orphan_retired:{row['seq']}":
+            return dict(_row(row), verdict='retired', replay=True)
+        if row['status'] != 'started':
+            raise RuntimeStoreError('not_started')
+        if type(generation) is not int or row['generation'] != generation:
+            raise RuntimeStoreError('stale_generation')
+        evidence = orphaned_lease_evidence(conn, row, now=now)
+        if not evidence['orphaned']:
+            raise RuntimeStoreError('lease_live:' + str(evidence.get('holder')))
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,owner_epoch=NULL,"
+                     "generation=NULL WHERE admission_id=? AND status='started'",
+                     (f"orphan_retired:{row['seq']}", admission_id))
+        _retire_admission_workers(conn, row, row['owner_epoch'])
+        conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?',
+                     (row['target_session_id'],))
+        return dict(_row(_admission(conn, admission_id)), verdict='retired', evidence=evidence['evidence'])
     return db._execute_write(write)
 
 

@@ -97,6 +97,7 @@ _END_REASON = re.compile(r'[a-z][a-z_]{0,31}')
 # Verbs whose param sets are closed and never carried a ``profile`` key.
 _PROFILE_IMPLICIT = frozenset({'session.create', 'session.list', 'session.info', 'session.resume', 'session.detach',
                                'prompt.submit', 'prompt.receipt', 'prompt.cancel', 'prompt.resolve_unknown',
+                               'prompt.retire_orphaned',
                                'prompt.steer_queued', 'prompt.replace_queued',
                                'session.interrupt', 'session.events.since', 'session.mutate', 'session.stats',
                                'approval.respond', 'clarify.respond'})
@@ -240,6 +241,7 @@ class AuthorityConnection:
                     'prompt.submit': self.submit,
                     'prompt.receipt': self.receipt, 'prompt.cancel': self.cancel,
                     'prompt.resolve_unknown': self.resolve_unknown,
+                    'prompt.retire_orphaned': self.retire_orphaned,
                     'session.interrupt': self.interrupt, 'session.events.since': self.events_since,
                     'approval.respond': self.respond, 'clarify.respond': self.respond_clarify}
         from gateway.session_busy_controls import handlers as busy_handlers

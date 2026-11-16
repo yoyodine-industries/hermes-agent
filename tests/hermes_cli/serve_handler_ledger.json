@@ -5,7 +5,7 @@
    "undecided": 345
   },
   "rpc": {
-   "authority": 108,
+   "authority": 109,
    "keep-host-wide": 1,
    "undecided": 182
   },
@@ -561,6 +561,7 @@
   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.receipt", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.replace_queued", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.resolve_unknown", "kind": "rpc", "ref": ""},
+  {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.retire_orphaned", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.steer_queued", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "prompt.submit", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "reload.env", "kind": "rpc", "ref": ""},
