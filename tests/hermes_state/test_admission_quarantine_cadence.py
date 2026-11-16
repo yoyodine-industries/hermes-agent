@@ -292,7 +292,7 @@ def test_ONE_cadence_pass_quarantines_an_aged_unknown_head_and_delivers_what_was
 
     # 4. and the line that reports it carries the unit and the store
     assert lines, 'the quarantine line must be printed'
-    line = lines[0]
+    line = next(l for l in lines if l.startswith('quarantine:'))
     assert line.startswith('quarantine: unknown_quarantined:'), line
     assert 'unit=seconds' in line and 'store=' in line, line
 
@@ -425,7 +425,7 @@ def test_ONE_cadence_pass_quarantines_an_ORPHANED_started_head_and_delivers_behi
     live = _row(db, head['admission_id'])
     assert live['status'] == 'terminal' and live['outcome'] == f"started_orphaned:{head['seq']}"
     assert woke == ['s', behind['admission_id']], woke
-    line = lines[0]
+    line = next(l for l in lines if l.startswith('quarantine:'))
     assert line.startswith('quarantine: started_orphaned:'), line
     assert 'unit=seconds' in line and 'current_epoch=' in line and 'store=' in line, line
 

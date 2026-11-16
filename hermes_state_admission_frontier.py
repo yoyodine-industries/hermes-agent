@@ -221,6 +221,62 @@ def drain_pass(db, *, epoch: int, session_id: str, run: Callable[[dict], Any], f
     return report
 
 
+FRONTIER_KEY = 'frontier:{session}'
+
+
+def _frontier_line(db, session_id: str, *, now: Optional[float] = None,
+                   live_epoch: Optional[int] = None) -> str:
+    """The line printed on EVERY pass: ``queued=<n> oldest=<seq>@epoch=<e> live_epoch=<E>
+    skipped_since=<seq>@<age>s started=<seq>``.
+
+    A line without ``oldest`` cannot distinguish "queue empty" from "queue ignored" - and this store
+    has no per-row instant at all (``session_admissions`` carries no timestamp), so a queue's AGE is
+    only knowable from what a pass records about it. ``skipped_since`` is therefore this module's own
+    durable observation: the oldest queued seq, and how long it has been the oldest. A head that keeps
+    not being taken shows up as a rising age on an unchanged seq, which is the only way a reader can
+    tell waiting from a hole.
+    """
+    now = time.time() if now is None else now
+    with db._read_ctx() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n, MIN(seq) AS lo FROM session_admissions "
+                           "WHERE target_session_id=? AND status='queued'",
+                           (session_id,)).fetchone()
+        oldest = conn.execute("SELECT seq, owner_epoch FROM session_admissions WHERE "
+                              "target_session_id=? AND status='queued' ORDER BY seq LIMIT 1",
+                              (session_id,)).fetchone()
+        started = conn.execute("SELECT seq FROM session_admissions WHERE target_session_id=? AND "
+                               "status='started' ORDER BY seq LIMIT 1", (session_id,)).fetchone()
+        if live_epoch is None:
+            live_epoch = _current_epoch(conn)
+    key = FRONTIER_KEY.format(session=session_id)
+    oldest_seq = None if oldest is None else int(oldest['seq'])
+
+    def stamp(conn):
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+        if saved is not None:
+            try:
+                last = json.loads(saved[0])
+            except ValueError:
+                last = {}
+            if last.get('oldest_seq') == oldest_seq and oldest_seq is not None:
+                return float(last.get('first_seen') or now)
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+                     'SET value=excluded.value',
+                     (key, json.dumps({'oldest_seq': oldest_seq, 'first_seen': now})))
+        return float(now)
+
+    first_seen = float(db._execute_write(stamp))
+    age = 0.0 if oldest_seq is None else max(0.0, now - first_seen)
+    queued = int((row['n'] or 0) if row else 0)
+    return (f"queued={queued} "
+            f"oldest={'-' if oldest_seq is None else oldest_seq}@epoch="
+            f"{'-' if oldest is None else oldest['owner_epoch']} "
+            f"live_epoch={'-' if live_epoch is None else live_epoch} "
+            f"skipped_since="
+            f"{'-' if oldest_seq is None else '%d@%.0fs' % (oldest_seq, age)} "
+            f"started={'-' if started is None else started['seq']}")
+
+
 def _lane_census(db, session_id: str, *, now: Optional[float] = None) -> dict:
     """``queued`` count, seq span, and the first blocker AS A RESOLVABLE KIND.
 
@@ -578,6 +634,8 @@ def quarantine_unknown(db, session_id: str, *, threshold_s: float = QUARANTINE_A
                             (row['admission_id'],)).fetchone()
 
     moved = dict(db._execute_write(move))
+    mark_epoch_quarantined(db, session_id, moved.get('owner_epoch'), by='quarantine_unknown',
+                           row_id=moved['admission_id'])
     _forget_unknown_since(db, session_id)
     out(f"quarantine: {QUARANTINE_OUTCOME_PREFIX}{moved['seq']} lane={session_id} "
         f"age={moved['age_seconds']:.0f}s unit=seconds threshold={threshold_s:.0f}s unit=seconds "
@@ -660,12 +718,61 @@ def quarantine_started(db, session_id: str, *, threshold_s: float = QUARANTINE_A
                             (row['admission_id'],)).fetchone()
 
     moved = dict(db._execute_write(move))
+    epoch = mark_epoch_quarantined(db, session_id, moved.get('owner_epoch'),
+                                   by='quarantine_started', row_id=moved['admission_id'])
     _forget_unknown_since(db, session_id)
     out(f"quarantine: {STARTED_ORPHAN_PREFIX}{moved['seq']} lane={session_id} "
         f"age={moved['age_seconds']:.0f}s unit=seconds threshold={threshold_s:.0f}s unit=seconds "
         f"epoch={liveness['epoch']} current_epoch={liveness['current_epoch']} "
-        f"liveness='{liveness['reason']}' store={store} admission={moved['admission_id']}")
+        f"liveness='{liveness['reason']}' age_s={moved['age_seconds']:.0f} "
+        f"principal={moved.get('principal_id')} epoch_rows={epoch['rows']} "
+        f"store={store} admission={moved['admission_id']}")
     return moved
+
+
+QUARANTINE_EPOCH_TABLE = 'session_quarantine_epochs'
+
+
+def _ensure_quarantine_epoch_table(conn) -> None:
+    conn.execute(f'CREATE TABLE IF NOT EXISTS {QUARANTINE_EPOCH_TABLE} ('
+                 'session_id TEXT NOT NULL, owner_epoch INTEGER NOT NULL, '
+                 'first_row TEXT, rows INTEGER NOT NULL DEFAULT 0, marked_at REAL NOT NULL, '
+                 'marked_by TEXT NOT NULL, PRIMARY KEY (session_id, owner_epoch))')
+
+
+def mark_epoch_quarantined(db, session_id: str, owner_epoch, *, by: str,
+                           row_id: str = '') -> dict:
+    """Record that a WHOLE EPOCH is quarantined, which is the unit eligibility is decided in.
+
+    Eligibility per ROW is what lets a quarantined row come back: the row returns to the queue (a
+    requeued steer lands at its own seq), is claimed, fails the same way, and is quarantined again -
+    an emission per pass, for ever, from a defect nothing is learning from. The epoch is the run that
+    wrote these claims; when that run is gone every claim it left is suspect, so one record per
+    (session, epoch) makes the thousandth row a COUNT rather than a new alarm.
+    """
+    def write(conn):
+        _ensure_quarantine_epoch_table(conn)
+        conn.execute(f'INSERT INTO {QUARANTINE_EPOCH_TABLE} '
+                     '(session_id, owner_epoch, first_row, rows, marked_at, marked_by) '
+                     'VALUES (?,?,?,1,?,?) ON CONFLICT(session_id, owner_epoch) DO UPDATE SET '
+                     'rows=rows+1, first_row=COALESCE(first_row, excluded.first_row)',
+                     (session_id, int(owner_epoch), row_id or None, time.time(), by))
+        return dict(conn.execute(f'SELECT * FROM {QUARANTINE_EPOCH_TABLE} WHERE session_id=? '
+                                 'AND owner_epoch=?', (session_id, int(owner_epoch))).fetchone())
+    return db._execute_write(write)
+
+
+def epoch_quarantined(db, session_id: str, owner_epoch):
+    """The existing record for this epoch, or None. Read BEFORE acting, so a pass can be silent."""
+    if owner_epoch is None:
+        return None
+    with db._read_ctx() as conn:
+        try:
+            row = conn.execute(f'SELECT * FROM {QUARANTINE_EPOCH_TABLE} WHERE session_id=? AND '
+                               'owner_epoch=?', (session_id, int(owner_epoch))).fetchone()
+        except Exception:
+            return None
+    return dict(row) if row is not None else None
 
 
 def mark_quarantine_eligible(db, admission_id: str, *, by: str) -> bool:
@@ -728,6 +835,12 @@ async def admission_cadence_loop(db, lanes, wake, *, interval_s: float = CADENCE
                                    now=None if now is None else now()):
                     continue
                 census = _lane_census(db, session_id)
+                # THE FRONTIER, ON EVERY PASS (platform-stl, t-76c210202a). One line with the
+                # oldest queued seq, its epoch against the live epoch, how long it has been the
+                # oldest, and the started row if any: "queue empty" and "queue ignored" print
+                # differently here, which a count alone cannot do. A symptom described once and a
+                # frontier printed every pass are not the same instrument.
+                out(_frontier_line(db, session_id, now=None if now is None else now()))
                 if not census['queued'] and not census['blocked']:
                     continue
                 pass_now = None if now is None else now()

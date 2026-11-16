@@ -262,3 +262,82 @@ def test_the_claim_path_reports_a_wedge_instead_of_freezing_silently():
 
     helper = method('_report_blocked_drain')
     assert 'lane_blocked' in ast.dump(helper)
+
+
+# ============================ platform-stl's item 4 (card t-76c210202a) ========================
+def test_the_FRONTIER_LINE_distinguishes_empty_from_ignored_and_tells_waiting_from_a_hole(tmp_path):
+    """A line without `oldest` cannot distinguish "queue empty" from "queue ignored" - and this
+    store carries no per-row instant at all, so a queue's age is only knowable from what a pass
+    records about it."""
+    from hermes_state_admission_frontier import _frontier_line
+
+    db, epoch = _store(tmp_path)
+    empty = _frontier_line(db, 's', now=1000.0)
+    assert empty == ("queued=0 oldest=-@epoch=- live_epoch=%s skipped_since=- started=-" % epoch), empty
+
+    first = _admit(db, epoch, 'r1')
+    second = _admit(db, epoch, 'r2')
+    line = _frontier_line(db, 's', now=1000.0)
+    assert line == (f"queued=2 oldest={first['seq']}@epoch={epoch} live_epoch={epoch} "
+                    f"skipped_since={first['seq']}@0s started=-"), line
+
+    # same head, a minute later: the AGE rises on an unchanged seq - waiting, visible as a number
+    later = _frontier_line(db, 's', now=1060.0)
+    assert f"skipped_since={first['seq']}@60s" in later, later
+    # the head is TAKEN and the frontier moves to the next row: a hole would look like the age
+    # climbing on the SAME seq, which is the distinction this line exists to make
+    rt.claim_session_input(db, epoch=epoch, session_id='s', head=first['admission_id'])
+    moved = _frontier_line(db, 's', now=1120.0)
+    assert f"oldest={second['seq']}@epoch={epoch}" in moved and "@0s " in moved, moved
+    assert f"started={first['seq']}" in moved, moved
+
+
+def test_eligibility_is_recorded_PER_EPOCH_so_a_returning_row_cannot_re_emit_for_ever(tmp_path):
+    """Eligibility per ROW lets a quarantined row come back (a requeued steer lands at its own
+    seq), fail the same way and be quarantined again: one emission per pass, for ever."""
+    from hermes_state_admission_frontier import (QUARANTINE_AGE_S, epoch_quarantined,
+                                                 mark_epoch_quarantined, quarantine_unknown)
+
+    db, epoch = _store(tmp_path)
+    assert epoch_quarantined(db, 's', epoch) is None
+
+    first = _admit(db, epoch, 'r1')
+    second = _admit(db, epoch, 'r2')
+    rt.claim_session_input(db, epoch=epoch, session_id='s')
+    # an UNKNOWN head: the writer that claimed it is gone (its epoch is older), so the row's own
+    # outcome is unknown and the census reports it as such
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE session_admissions SET status='unknown' WHERE admission_id=?",
+        (first['admission_id'],)))
+    t0 = time.time()
+    quarantine_unknown(db, 's', store='x', now=t0, out=lambda line: None)   # stamps the age
+    q1 = quarantine_unknown(db, 's', store='x', now=t0 + QUARANTINE_AGE_S + 1,
+                            out=lambda line: None)
+    assert q1 is not None
+    record = epoch_quarantined(db, 's', epoch)
+    assert record is not None and record['rows'] == 1, record
+    assert record['marked_by'] == 'quarantine_unknown', record
+
+    # the SAME epoch again: the second row is a COUNT on one record, not a new alarm
+    mark_epoch_quarantined(db, 's', epoch, by='quarantine_unknown', row_id=second['admission_id'])
+    record = epoch_quarantined(db, 's', epoch)
+    assert record['rows'] == 2, record
+    assert record['first_row'] == first['admission_id'], record
+
+
+def test_a_pass_claims_the_FIFO_HEAD_not_any_row(tmp_path):
+    """181-taken-32-left in one band is what a pass that takes any row produces. The pass claims
+    min(seq) per session: the OLDEST queued row is the one that runs, or the queue is a lottery."""
+    from hermes_state_admission_frontier import drain_pass
+
+    db, epoch = _store(tmp_path)
+    rows = [_admit(db, epoch, 'r%d' % n) for n in range(3)]
+    claimed = []
+
+    def run(row):
+        claimed.append(row['seq'])
+
+    report = drain_pass(db, epoch=epoch, session_id='s', run=run, now=time.time,
+                        out=lambda line: None)
+    assert claimed == [r['seq'] for r in rows], (claimed, [r['seq'] for r in rows])
+    assert report.line(), "the pass states its frontier"
