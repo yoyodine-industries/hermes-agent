@@ -388,17 +388,23 @@ def annotate_local_lineages(sessions, heads):
 
 
 def local_receipt(db, session_id):
+    key = POLICY_PREFIX + session_id
     with db._read_ctx() as conn:
-        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
+        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
     if row is None:
-        raise RuntimeStoreError('storage_unavailable')
+        # The store ANSWERED — it holds no receipt row for this session — so this is ``not_found``,
+        # never ``storage_unavailable``: a retry cannot conjure the row, and naming absence an outage
+        # sent an operator to the disk while the session id existed in no store at all. The detail
+        # carries the exact key so the next reader does not have to search nine stores to learn it.
+        raise RuntimeStoreError('not_found', field='receipt', detail=f'no state_meta row {key}')
     try:
         value = json.loads(row[0])
         if not isinstance(value, dict):
             raise ValueError('invalid receipt')
         return value
     except (TypeError, ValueError) as exc:
-        raise RuntimeStoreError('storage_unavailable') from exc
+        raise RuntimeStoreError('storage_unavailable', field='receipt',
+                                detail=f'unreadable state_meta row {key}') from exc
 
 
 def end_idle_local_session(db, *, epoch, session_id, target_id, reason):

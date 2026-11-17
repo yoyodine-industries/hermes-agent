@@ -113,12 +113,16 @@ async def test_local_lineage_transitions_preserve_owner_or_roll_back(tmp_path, m
     db.create_session('unrelated-fork', source='gui', parent_session_id='compressed-again',
                       model_config={'_branched_from': 'compressed-again'}, chat_id=live.source.chat_id,
                       user_id=actor.subject, session_key=live.route)
-    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
+    with pytest.raises(RuntimeStoreError, match='not_found'):  # no receipt at all: absence, not an outage
         await restarted.attach(actor, SessionRef('fixture', 'unrelated-fork'))
-    # Copying the receipt onto a fork does not turn it into the canonical owner.
+    # Copying the receipt onto a fork does not turn it into the canonical owner. The absent receipt
+    # made the fork TERMINAL on `restarted` (absence is not a retryable outage, #t_0b90f1db), so a
+    # fresh owner is where the copied receipt's identity is judged.
     db.set_meta('gateway.local_policy.v1:unrelated-fork', json.dumps(local_receipt(db, ref.session_id)))
+    fifth = runner()
+    fresh = await initialize_session_authority(fifth, profile_id='fixture', instance_id='fifth')
     with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
-        await restarted.attach(actor, SessionRef('fixture', 'unrelated-fork'))
+        await fresh.attach(actor, SessionRef('fixture', 'unrelated-fork'))
     # Route reuse by a native reset must not pick a departed logical owner's generation.
     from gateway.run_turn_runner import TurnRunner
     from gateway.session import SessionSource

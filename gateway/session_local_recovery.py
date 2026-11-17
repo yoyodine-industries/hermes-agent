@@ -3,6 +3,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 
 from gateway.config import Platform
@@ -53,7 +55,8 @@ def local_source(authority, chat_id, user_id):
 def _refused_check(exc):
     """``<reason or error> at <function>:<line>``: where a receipt check raised, and why, followed
     through every chained ``__cause__`` (``restore_policy`` and ``local_receipt`` wrap the check
-    that failed into a bare ``storage_unavailable``)."""
+    that failed into a reason — ``not_found`` for an absent receipt row, ``storage_unavailable``
+    for one the store could not read)."""
     import traceback
     frames = traceback.extract_tb(exc.__traceback__)
     cause = exc.reason if isinstance(exc, RuntimeStoreError) else f'{type(exc).__name__}: {exc}'
@@ -68,6 +71,99 @@ class _ReceiptRefused(RuntimeStoreError):
 
 class _CatchUpPending(RuntimeStoreError):
     """The receipt's compression catch-up is committing in a worker; this restore is refused."""
+
+
+#: Bounded recovery of a local session whose receipt cannot be read (#t_0b90f1db). A receipt the store
+#: says does not exist is TERMINAL at once — waiting cannot conjure the row — and a receipt the store
+#: cannot serve is retried with exponential backoff up to ``RECOVERY_MAX_ATTEMPTS`` and then GIVEN UP
+#: with a terminal record. An unbounded 2-6 s retry against a store read hot-loops the owner loop and
+#: farms one log line per client retry (188 lines in 20 minutes, same session id, no terminal action).
+RECOVERY_MAX_ATTEMPTS = 5
+RECOVERY_BACKOFF_BASE_S = 2.0
+RECOVERY_BACKOFF_CAP_S = 60.0
+#: Refusal reasons that will never heal by retrying: the store answered, and the answer is "no row".
+TERMINAL_RECOVERY_REASONS = frozenset({'not_found'})
+
+
+def _monotonic():
+    return time.monotonic()
+
+
+def _recovery_state(authority):
+    state = getattr(authority, '_local_recovery_state', None)
+    if state is None:
+        state = authority._local_recovery_state = {'lock': threading.Lock(), 'sessions': {}}
+    return state
+
+
+def local_recovery_record(authority, sid):
+    """What the bounded retry knows about *sid*: ``terminal``, ``attempts``, ``reason``, the
+    ``state_meta`` key looked up and the store path — or ``None`` when this owner never refused it.
+
+    Read-only, and the record ops and tests read: the give-up is not a log line whose meaning a
+    reader has to infer."""
+    record = _recovery_state(authority)['sessions'].get(sid)
+    return dict(record) if record is not None else None
+
+
+def clear_local_recovery_record(authority, sid):
+    """*sid* restored: drop its retry record, so a session that heals carries no failure state."""
+    state = _recovery_state(authority)
+    with state['lock']:
+        state['sessions'].pop(sid, None)
+
+
+def _recovery_gate(authority, sid):
+    """Refuse a restore that must not touch the store: a session already given up, or one inside its
+    backoff window. Both raise the recorded reason; neither reads the store nor logs again."""
+    record = _recovery_state(authority)['sessions'].get(sid)
+    if record is None:
+        return
+    if record['terminal']:
+        raise _ReceiptRefused(record['reason'], field='recovery_terminal',
+                              detail=f'gave up after {record["attempts"]} attempt(s); key={record["key"]}')
+    if _monotonic() < record['next_at']:
+        raise _ReceiptRefused(record['reason'], field='recovery_backoff',
+                              detail=f'attempt {record["attempts"]} refused; next try in '
+                                     f'{record["next_at"] - _monotonic():.1f}s')
+
+
+def _record_recovery_refusal(authority, sid, exc, reason):
+    """Count one refused restore and log it with the evidence a reader needs: the session id, the
+    ``state_meta`` key looked up, the store path, the attempt count and the failing check.
+
+    Returns ``(terminal, record)``. ``terminal`` means this session will never restore on this owner:
+    the caller is refused AT ONCE from now on, without another store read and without another line.
+    """
+    now = _monotonic()
+    key = POLICY_PREFIX + sid
+    store = str(getattr(authority.db, 'db_path', '?'))
+    state = _recovery_state(authority)
+    with state['lock']:
+        record = state['sessions'].get(sid)
+        if record is not None and record['terminal']:
+            return True, dict(record)
+        if record is None:
+            record = state['sessions'][sid] = {
+                'sid': sid, 'key': key, 'store': store, 'attempts': 0, 'first_at': now,
+                'next_at': now, 'reason': reason, 'detail': None, 'terminal': False}
+        record['attempts'] += 1
+        record['reason'] = reason
+        record['detail'] = _refused_check(exc)
+        record['terminal'] = reason in TERMINAL_RECOVERY_REASONS or record['attempts'] >= RECOVERY_MAX_ATTEMPTS
+        delay = min(RECOVERY_BACKOFF_BASE_S * (2 ** (record['attempts'] - 1)), RECOVERY_BACKOFF_CAP_S)
+        record['next_at'] = now + delay
+        snapshot = dict(record)
+    if snapshot['terminal']:
+        logging.getLogger(__name__).error(
+            'Local session %s: recovery GIVEN UP after %d attempt(s) — %s; key=%s store=%s: '
+            'no further restore is attempted and no retry is scheduled',
+            sid, snapshot['attempts'], snapshot['detail'], key, store)
+    else:
+        logging.getLogger(__name__).warning(
+            'Local session %s receipt refused — %s; attempt %d/%d, next try in %.1fs; key=%s store=%s',
+            sid, snapshot['detail'], snapshot['attempts'], RECOVERY_MAX_ATTEMPTS, delay, key, store)
+    return snapshot['terminal'], snapshot
 
 
 def _with_untracked_compression(authority, sid, receipt):
@@ -154,6 +250,7 @@ def restore_local_session(authority, sid):
     from gateway.session_authority import LiveSession
     from gateway.session_local import LocalSessionAdapter
     from gateway.session_policy import restore_policy
+    _recovery_gate(authority, sid)
     try:
         # The catch-up writes, so the receipt as stored must already be this owner's (#140060).
         receipt, source, route, entry = owned_receipt(authority, sid)
@@ -169,11 +266,14 @@ def restore_local_session(authority, sid):
     except _CatchUpPending:
         raise
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
-        # The client only sees the bounded code: gateway.log names the check that refused (#140099).
-        logging.getLogger(__name__).warning('Local session %s receipt refused: %s', sid, _refused_check(exc))
-        if isinstance(exc, RuntimeStoreError):
-            raise _ReceiptRefused(exc.reason, field=exc.field, detail=exc.detail) from exc
-        raise _ReceiptRefused('storage_unavailable') from exc
+        # The client only sees the bounded code: gateway.log names the check that refused (#140099),
+        # and a refusal that can never heal (an absent receipt) ends the recovery instead of retrying.
+        reason = exc.reason if isinstance(exc, RuntimeStoreError) else 'storage_unavailable'
+        terminal, record = _record_recovery_refusal(authority, sid, exc, reason)
+        field = 'recovery_terminal' if terminal else (exc.field if isinstance(exc, RuntimeStoreError) else None)
+        detail = (f'gave up after {record["attempts"]} attempt(s); key={record["key"]}'
+                  if terminal else getattr(exc, 'detail', None))
+        raise _ReceiptRefused(reason, field=field, detail=detail) from exc
     adapter = local_adapter(authority)
     if not isinstance(adapter, LocalSessionAdapter) or adapter.authority is not authority:
         raise RuntimeStoreError('runtime_draining')
@@ -223,6 +323,7 @@ def restore_local_session(authority, sid):
                 raise RuntimeStoreError('admission_conflict')
             else:
                 current.session_id = target
+    clear_local_recovery_record(authority, sid)
     return SessionRef(authority.profile_id, sid)
 
 
@@ -455,7 +556,14 @@ def local_receipt_ids(authority):
 
 def recover_local_sessions(authority, *, schedule=False):
     orphans = []
+    given_up = []
     for sid in local_receipt_ids(authority):
+        record = local_recovery_record(authority, sid)
+        if record is not None and record['terminal']:
+            # Already given up on this owner: its retry budget is spent, so this pass neither reads
+            # the store again nor logs again — a second recovery pass is NOT scheduled for it.
+            given_up.append(sid)
+            continue
         try:
             ref = restore_local_session(authority, sid)
             pending = list_session_admissions(authority.db, session_id=sid)
@@ -464,10 +572,15 @@ def recover_local_sessions(authority, *, schedule=False):
             if schedule and pending:
                 authority._schedule(ref)
             orphans.append(sid)
-        except (_ReceiptRefused, _CatchUpPending):
+        except (_ReceiptRefused, _CatchUpPending) as exc:
+            if isinstance(exc, _ReceiptRefused) and exc.field == 'recovery_terminal':
+                given_up.append(sid)
             continue  # logged: the check that refused it, or the catch-up handed to a worker
         except RuntimeStoreError as exc:
             logging.getLogger(__name__).warning('Local session %s paused: %s', sid, exc.reason)
+    if given_up:
+        logging.getLogger(__name__).error(
+            'Local recovery: %d local session(s) given up and NOT scheduled: %s', len(given_up), ', '.join(given_up))
     if schedule:
         # A last-viewer close the previous owner stopped before completing (#134889 LC-6b).
         from gateway.session_viewer_close import rearm_persisted_closes, settle_viewer_close
