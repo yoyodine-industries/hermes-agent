@@ -174,6 +174,9 @@ def test_policy_clamps_the_card_at_birth(conn, home):
         "clamped": True,
         "reason": "outside the band",
         "status": "done",
+        # The one field the seam adds (card t_4301046d): three rules can place a card and the
+        # number cannot say which, so the record says it.
+        "decision": "clamped",
     }
     assert _created_payload(conn, tid)["status"] == "ready"
 
@@ -1407,8 +1410,9 @@ def test_the_clamp_admits_only_the_boundary_floor_and_nothing_else():
     assert kpp.clamp_to_domain(995000, None, kpp.TRANCHE_FLOOR)[0] == kpp.ORDINARY_MAX
     # a floor that is not the boundary does not buy a tranche value anything, even if it matches
     assert kpp.clamp_to_domain(995000, None, 995000)[0] == kpp.ORDINARY_MAX
-    # in-domain values are untouched whatever the floor is
-    assert kpp.clamp_to_domain(123, {"applied": 123}, kpp.TRANCHE_FLOOR) == (123, {"applied": 123})
+    # in-domain values are untouched whatever the floor is (plus the rule that placed them)
+    assert kpp.clamp_to_domain(123, {"applied": 123}, kpp.TRANCHE_FLOOR) == (
+        123, {"applied": 123, "decision": "asked"})
 
 
 def test_the_reader_accepts_the_boundary_and_refuses_the_rest_of_the_tranche(home):

@@ -2189,7 +2189,7 @@ def create_task(
     # silently absorb (and hide) an over-claim (card t_2e107499).
     requested_priority = int(priority)
     priority, policy_provenance = _apply_board_priority_policy(
-        priority, assignee=assignee, board=dest_board, title=title, body=body,
+        priority, assignee=assignee, board=dest_board, title=title, body=body, conn=conn,
     )
 
     # THE OPERATOR-ASK SEAM (card t_8ca4b5a0, operator ask 2026-09-27) AND ITS ASK-HOME DOOR
@@ -2278,6 +2278,39 @@ def create_task(
                 # ``_text``) instead of each deciding for itself.
                 ask_pair = ask_ref.for_card(task_id) if ask_ref is not None else None
                 card_body = apply_stamp(body, *ask_pair) if ask_pair else normalise_body(body)
+                # DESIGNATION AT BIRTH (card t_4301046d). A card the board policy lifted into
+                # the reserved tranche on its OWN severity declaration must CARRY that
+                # admission in the ledger the storage guard reads, or the guard aborts the
+                # INSERT (an abort inside the dispatcher's reclaim phase dispatches nothing at
+                # all) and the row would be the only tranche value on the board without the
+                # evidence the tranche is defined by. Written here, in the filing's own txn,
+                # BEFORE the INSERT, because the trigger reads it: a row that fails to land
+                # takes its designation row with it. The ledger keeps the card's ORDINARY
+                # value, so revoking the designation returns it to the domain edge rather than
+                # to a value re-derived afterwards - the same restore contract the designation
+                # door keeps. Only a SEV admission writes one: an ask-stamped card already
+                # satisfies the guard on its own text and is not designated by this seam.
+                _admitted = ((policy_provenance or {}).get("domain") or {}).get("admitted")
+                if _admitted in ("sev1", "sev-token") and _policy_module().in_tranche(priority):
+                    _restore = _policy_module().clamp_to_domain(priority, None, None)[0]
+                    conn.execute(
+                        "INSERT INTO priority_designations "
+                        "(task_id, board, priority, authority, reason, designated_at, revoked_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, NULL) "
+                        "ON CONFLICT(task_id) DO UPDATE SET board = excluded.board, "
+                        "priority = excluded.priority, authority = excluded.authority, "
+                        "reason = excluded.reason, designated_at = excluded.designated_at, "
+                        "revoked_at = NULL",
+                        (
+                            task_id, dest_board, int(_restore), "declared-sev",
+                            "declared %s at birth (%s evidence): a severity is an admission, so "
+                            "the row enters the reserved tranche designated instead of "
+                            "undesignated" % (
+                                _declared_sev_rank(title, card_body).upper() or "SEV",
+                                _admitted),
+                            now,
+                        ),
+                    )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -2426,7 +2459,7 @@ def _board_meta_for(board: Optional[str]) -> dict:
 
 def _apply_board_priority_policy(
     requested: int, *, assignee: Optional[str], board: Optional[str],
-    title: str, body: Optional[str],
+    title: str, body: Optional[str], conn: Optional[sqlite3.Connection] = None,
 ) -> tuple[int, Optional[dict]]:
     """``(priority, provenance)`` for a card being created, policy applied at birth.
 
@@ -2485,7 +2518,21 @@ def _apply_board_priority_policy(
             floor = policy.board_floor(spec, board or get_current_board())
         except Exception:
             floor = None
-    return policy.clamp_to_domain(verdict.applied, verdict.record, floor)
+    # ... and the card's OWN reserved-tranche evidence rides the same clamp, for the one defect
+    # the floor exemption could not reach (card t_4301046d): a policy that DERIVES a severity
+    # value out of the ordinary domain had it clamped back to the domain edge, i.e. stored level
+    # with routine work, so a SEV1 was ordered behind ordinary cards by construction. The marker
+    # is read from the row's own text with the same predicate the storage guard implements, so
+    # the two cannot disagree about what a declaration is; a read that fails degrades to ``""``
+    # (today's behaviour) because this seam is fail-open by contract.
+    marker = ""
+    if conn is not None:
+        try:
+            marker = tranche_entitlement(
+                conn, board=board or "", title=title or "", body=body or "")
+        except Exception:
+            marker = ""
+    return policy.clamp_to_domain(verdict.applied, verdict.record, floor, marker=marker)
 
 
 # --------------------------------------------------------------------------------------------
@@ -3348,6 +3395,12 @@ SEV1_VALUES = ("sev[- ]?1", "critical")
 SEV1_DECLARATION_RE = re.compile(
     r"(?im)^[ \t>*\-]*({})[ \t]*[:=][ \t]*({})\b".format("|".join(SEV1_LABELS), "|".join(SEV1_VALUES)))
 
+#: The severity TOKEN convention: ``SEV1 [flow] ...`` as the title's PREFIX, optionally behind
+#: indentation or leading punctuation. Byte-for-byte the policy module's own reader
+#: (``kanban_priority_bands.SEV_TITLE_PREFIX_RE``) because the two must agree on what a
+#: declaration IS: the policy raises the card, this one decides whether it may hold the value.
+SEV_TOKEN_PREFIX_RE = re.compile(r"(?i)^\s*[\[('\*\-]*\s*sev[ \t_\-]?([123])\b")
+
 #: The SEV1 line as the STORAGE GUARD reads it (``_sql_tranche_entitlement``): upper-cased
 #: prefixes and values, in the same order. Fewer terms than the regex's alternatives because
 #: GLOB is a wildcard match - ``SEV`` reaches ``SEVERITY`` through the wildcard after it, and
@@ -3365,6 +3418,24 @@ _ASK_STAMP_RE = re.compile(r"^[ \t]*Operator-ask:[ \t]*(\S+)[ \t]*$", re.MULTILI
 def sev1_declared(text: Optional[str]) -> bool:
     """Is a SEV1 DECLARED on a labelled line in *text*? (the fleet's SEV marker)"""
     return bool(SEV1_DECLARATION_RE.search(text or ""))
+
+
+def sev_token_rank(title: Optional[str]) -> str:
+    """The severity RANK declared by a TITLE TOKEN (``"sev1"``/``"sev2"``/``"sev3"``), or ``""``.
+
+    The fleet's second SEV convention, and the one its machine filers actually use: every
+    failure emitter writes ``SEV1 [<flow>] <run> failed ...`` as the title's PREFIX, and the
+    board's own band policy reads that prefix as a severity declaration
+    (``kanban_priority_bands.SEV_TITLE_PREFIX_RE``, which this mirrors character for
+    character). Reading only the labelled ``Severity: SEV1`` line here rejected every one of
+    those cards the policy had just raised, and the create clamp then stored them level with
+    routine work (card t_4301046d: 420 SEV1 filings asked 900000).
+
+    A prefix only: the same words in the middle of a title are prose. The policy module makes
+    that same distinction for the same reason (it would re-band ~500 cards otherwise).
+    """
+    m = SEV_TOKEN_PREFIX_RE.match(title or "")
+    return "sev%s" % m.group(1) if m else ""
 
 
 def tranche_entitlement(
@@ -3389,7 +3460,9 @@ def tranche_entitlement(
     A row that carries no stamp of its own therefore carries no ask.
 
     Returns the marker's NAME, in the resolver's order, so the record says which evidence
-    admitted the row: ``"operator-ask-stamp"``, ``"designation"`` or ``"sev1"``.
+    admitted the row: ``"operator-ask-stamp"``, ``"designation"``, ``"sev1"`` (the labelled
+    ``Severity: SEV1`` line) or ``"sev-token"`` (the ``SEV1 <title>`` prefix the fleet's
+    failure emitters write).
     """
     if _ASK_STAMP_RE.search(body or ""):
         return "operator-ask-stamp"
@@ -3397,6 +3470,8 @@ def tranche_entitlement(
         return "designation"
     if sev1_declared("{}\n{}".format(title or "", body or "")):
         return "sev1"
+    if sev_token_rank(title):
+        return "sev-token"
     return ""
 
 
@@ -3845,6 +3920,46 @@ def _refuse_above_tranche(
     )
 
 
+def _declared_sev_rank(title: Optional[str], body: Optional[str] = "") -> str:
+    """The severity RANK the card's OWN text declares - ``"sev1"``/``"sev2"``/``"sev3"``, or ``""``.
+
+    Both fleet conventions, in the order the entitlement resolver reads them: the title TOKEN
+    (what every machine filer writes) and the labelled ``Severity: SEV1`` line.
+    """
+    token = sev_token_rank(title)
+    if token:
+        return token
+    if sev1_declared("{}\n{}".format(title or "", body or "")):
+        return "sev1"
+    return ""
+
+
+class SeverityContradiction(ValueError):
+    """Raised when a filing's ASK contradicts the severity its own text declares.
+
+    A ``ValueError`` like every other refusal at this seam, and deliberately not clamped over:
+    the two readings of one card disagree, and only the filer can say which was meant.
+    """
+
+
+def _refuse_sev_contradiction(
+    *, rank: str, asked: int, board: Optional[str], lane: Optional[str],
+    title: Optional[str],
+) -> SeverityContradiction:
+    """Build the named refusal. No deviation row: the caller is standing at the card."""
+    policy = _policy_module()
+    return SeverityContradiction(
+        "refused: this card declares %s and asks priority %d. A declared severity DERIVES its "
+        "priority - the board policy places it at the severity tip, above every routine band - "
+        "so an ask cannot decide it, and an ask BELOW the ordinary top (%d) contradicts the "
+        "declaration outright. File it with no priority at all (the declaration decides), with "
+        "the severity floor %d (what the fleet's filers ask), or drop the %s declaration if "
+        "this is routine work. Filing lane: %s; board: %s; title: %r."
+        % (rank.upper(), int(asked), int(policy.ORDINARY_MAX), int(policy.ORDINARY_MAX),
+           rank.upper(), lane or "?", board or "?", (title or "")[:120])
+    )
+
+
 def apply_above_tranche_guard(
     conn: sqlite3.Connection, requested: int, applied: int, *, board: Optional[str] = None,
     lane: Optional[str] = None, title: Optional[str] = "", body: Optional[str] = "",
@@ -3856,10 +3971,22 @@ def apply_above_tranche_guard(
     silently absorb an over-claim, and runs for every board - the ceiling is not a board's
     property, it is the scale's. A clean filing comes back with the applied value and ``None``,
     so a correctly filed card keeps today's byte-identical event.
+
+    It judges a SECOND contradiction for the same reason (card t_4301046d): a card whose own
+    text declares a severity may not ALSO ask a priority from below the ordinary top. The board
+    policy derives such a card's value from the declaration (that is what makes ``sev1`` a
+    severity), so the ask and the value can only disagree - and the pre-fix behaviour was to
+    silently keep the bet the ask happened to place. ``0..9`` is exempt because that is the
+    CLI's default and the retired ordinal scale, i.e. no ask at all; everything else under the
+    ordinary top is a real, explicit, contradicting number and is refused by name.
     """
     policy = _policy_module()
     ceiling = int(policy.MAX_PRIORITY)
     asked = int(requested)
+    rank = _declared_sev_rank(title, body)
+    if rank and 10 <= asked < int(policy.ORDINARY_MAX):
+        raise _refuse_sev_contradiction(
+            rank=rank, asked=asked, board=board, lane=lane, title=title)
     if asked <= ceiling:
         return int(applied), None
     marker = above_tranche_marker(

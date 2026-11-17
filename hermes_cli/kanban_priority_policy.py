@@ -99,6 +99,7 @@ __all__ = [
     "Verdict", "ORDINARY_MIN", "ORDINARY_MAX", "MAX_BAND_TOP", "TRANCHE_FLOOR", "TRANCHE_TOP",
     "DESIGNATED_PRIORITY", "MAX_PRIORITY",
     "in_ordinary", "in_tranche", "board_is_wired", "domain_reason", "clamp_to_domain",
+    "decision",
     "normalize_spec", "load_module", "load_callable", "priority_for_create", "board_floor",
 ]
 
@@ -205,14 +206,54 @@ def domain_reason(value: int) -> str:
     return "below the documented floor (%d)" % ORDINARY_MIN
 
 
-def clamp_to_domain(applied: int, record: Optional[dict], floor: Optional[int] = None) -> tuple:
+def decision(value: Any, record: Optional[dict], fallback: str = "clamped") -> str:
+    """Which rule produced *value*: ``"derived"``, ``"asked"`` or ``"clamped"``.
+
+    Carried in the ``created`` event's ``priority_policy`` because the number alone cannot say
+    which rule won, and the three are not interchangeable:
+
+    * ``"derived"`` - the card's OWN declaration (its severity, via the policy's
+      ``sev_priority``) produced the value. The ask did not decide, so an ask that pointed
+      somewhere else is overridden rather than honoured;
+    * ``"asked"``  - the value is the one the caller asked for;
+    * ``"clamped"`` - a band/domain projection moved the ask, so the value encodes the TIER
+      and not the urgency.
+
+    Measured before this field existed (card t_4301046d): 237 SEV1 ``created`` payloads
+    carried ``sev_priority`` 999000 beside ``applied`` 900000 and no field saying which of the
+    two the card was actually ordered at, so a reader could not tell a lifted card from a
+    clamped one - or from one whose ask happened to already be right.
+    """
+    if not record:
+        return fallback
+    sev = record.get("sev_priority")
+    if sev is not None:
+        try:
+            if int(sev) == int(value):
+                return "derived"
+        except (TypeError, ValueError):
+            pass
+    asked = record.get("asked")
+    if asked is None:
+        # The policy recorded no ask: only the caller knows whether it moved the value, so the
+        # seam that called this says which reading applies.
+        return fallback
+    try:
+        return "asked" if int(asked) == int(value) else "clamped"
+    except (TypeError, ValueError):
+        return fallback
+
+
+def clamp_to_domain(applied: int, record: Optional[dict], floor: Optional[int] = None,
+                    marker: str = "") -> tuple:
     """``(priority, record)`` with ``priority`` inside the ordinary domain.
 
     The create door's half of the domain. A value outside the ordinary domain is brought to
     the domain edge and the clamp is merged into the record the ``created`` event carries
     under ``priority_policy``, because a clamp the filer cannot see is how a board fills with
-    values no guard ever produced. An in-domain value comes back with the record untouched,
-    so a card the policy placed correctly keeps today's byte-identical event.
+    values no guard ever produced. An in-domain value keeps its value and gains only the
+    ``decision`` key, so a card the policy placed correctly keeps the event it has always
+    written plus the one field that says WHICH rule placed it (:func:`decision`).
 
     ``floor`` is the board's declared floor (``kanban_priority_policy.board_floor``), when the
     caller has it, and it buys exactly ONE value the domain would otherwise clamp: a ``floor``
@@ -221,12 +262,45 @@ def clamp_to_domain(applied: int, record: Optional[dict], floor: Optional[int] =
     clamp. A floor inside the ordinary domain changes nothing here (such a value is in-domain
     already), and every other out-of-domain value is still clamped and recorded. Defaulting
     ``floor`` to ``None`` keeps every caller that has no floor byte-identical.
+
+    ``marker`` is the card's OWN reserved-tranche evidence - the marker name
+    ``kanban_db.tranche_entitlement`` answers (``"sev1"``, ``"sev-token"``,
+    ``"operator-ask-stamp"``) - and it is the defect this door used to cause (card t_4301046d):
+    a severity the policy DERIVED below the domain edge was clamped back to the domain edge,
+    i.e. stored level with routine work, so a SEV1 was ordered behind ordinary cards BY
+    CONSTRUCTION. The domain edge is a claim about DESIGNATION, and a card that declares its
+    own severity is not claiming a designation it lacks: ``sev1: true`` with an applied value
+    under the routine band is a severity field that lies. With a marker and a tranche value the
+    value stands and the record names the evidence that admitted it. Without one the clamp is
+    unchanged, and the record now says the evidence was absent.
     """
     value = int(applied)
     if in_ordinary(value):
-        return value, record
+        if record is None:
+            return value, record
+        # Nothing moved it: the record gains the ``decision`` key and nothing else.
+        merged = dict(record)
+        merged["decision"] = decision(value, merged, fallback="asked")
+        return value, merged
     if floor is not None and value == int(floor) == TRANCHE_FLOOR:
         return value, record
+    if marker and in_tranche(value):
+        merged = dict(record or {})
+        merged["applied"] = value
+        merged["clamped"] = False
+        merged["domain"] = {
+            "requested": value,
+            "applied": value,
+            "bounds": [ORDINARY_MIN, ORDINARY_MAX],
+            "admitted": marker,
+            "reason": (
+                "in the reserved tranche %d-%d on the card's own %s evidence: the severity "
+                "decides the band, so the value is not pulled down to the domain edge %d"
+                % (TRANCHE_FLOOR, TRANCHE_TOP, marker, ORDINARY_MAX)
+            ),
+        }
+        merged["decision"] = decision(value, merged, fallback="asked")
+        return value, merged
     clamped = ORDINARY_MAX if value > ORDINARY_MAX else ORDINARY_MIN
     merged = dict(record or {})
     merged["applied"] = clamped
@@ -237,6 +311,7 @@ def clamp_to_domain(applied: int, record: Optional[dict], floor: Optional[int] =
         "bounds": [ORDINARY_MIN, ORDINARY_MAX],
         "reason": domain_reason(value),
     }
+    merged["decision"] = decision(clamped, merged)
     return clamped, merged
 
 
