@@ -224,7 +224,7 @@ def _insert_decomposed_child(
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event, _apply_board_priority_policy,
-        board_for_connection,
+        _designate_declared_sev_at_birth, board_for_connection,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
@@ -249,6 +249,19 @@ def _insert_decomposed_child(
     priority, policy_provenance = _apply_board_priority_policy(
         0, assignee=child_assignee, board=board_for_connection(conn),
         title=child["title"].strip(), body=body if isinstance(body, str) else None,
+        # THE CONNECTION IS PART OF THE SEAM (card t_4301046d, review round 1): without it the
+        # child's own severity declaration could not be read, so a SEV1-titled child was stored
+        # at the top of the ordinary domain (measured: 900000, decision=clamped, no
+        # designation) while the same card filed through ``create_task`` derived 999000.
+        conn=conn,
+    )
+    # ... and the SAME birth-designation write the filing seam performs, BEFORE this INSERT:
+    # the storage guard aborts a tranche value with no live designation, so a fan-out that
+    # skipped it would either lose the tranche or abort every child. One helper, both writers.
+    _designate_declared_sev_at_birth(
+        conn, task_id=new_id, board=board_for_connection(conn), priority=priority,
+        title=child["title"].strip(), body=body if isinstance(body, str) else None,
+        provenance=policy_provenance, now=now,
     )
     conn.execute(
         "INSERT INTO tasks "
