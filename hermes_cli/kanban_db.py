@@ -2219,6 +2219,9 @@ def create_task(
     priority, above_tranche_record = apply_above_tranche_guard(
         conn, requested_priority, priority, board=dest_board, lane=created_by, title=title,
         body=body, ask_ref=ask_ref, tenant=tenant,
+        # Whether a declared severity was DERIVED decides the contradiction rule: only a board
+        # that can lift the card has a value for the ask to contradict (see the guard).
+        derived_sev=bool((policy_provenance or {}).get("sev_priority")),
     )
     policy_provenance = _merge_policy_record(policy_provenance, above_tranche_record)
 
@@ -2283,34 +2286,19 @@ def create_task(
                 # admission in the ledger the storage guard reads, or the guard aborts the
                 # INSERT (an abort inside the dispatcher's reclaim phase dispatches nothing at
                 # all) and the row would be the only tranche value on the board without the
-                # evidence the tranche is defined by. Written here, in the filing's own txn,
-                # BEFORE the INSERT, because the trigger reads it: a row that fails to land
-                # takes its designation row with it. The ledger keeps the card's ORDINARY
-                # value, so revoking the designation returns it to the domain edge rather than
-                # to a value re-derived afterwards - the same restore contract the designation
-                # door keeps. Only a SEV admission writes one: an ask-stamped card already
-                # satisfies the guard on its own text and is not designated by this seam.
-                _admitted = ((policy_provenance or {}).get("domain") or {}).get("admitted")
-                if _admitted in ("sev1", "sev-token") and _policy_module().in_tranche(priority):
-                    _restore = _policy_module().clamp_to_domain(priority, None, None)[0]
-                    conn.execute(
-                        "INSERT INTO priority_designations "
-                        "(task_id, board, priority, authority, reason, designated_at, revoked_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, NULL) "
-                        "ON CONFLICT(task_id) DO UPDATE SET board = excluded.board, "
-                        "priority = excluded.priority, authority = excluded.authority, "
-                        "reason = excluded.reason, designated_at = excluded.designated_at, "
-                        "revoked_at = NULL",
-                        (
-                            task_id, dest_board, int(_restore), "declared-sev",
-                            "declared %s at birth (%s evidence): a severity is an admission, so "
-                            "the row enters the reserved tranche designated instead of "
-                            "undesignated" % (
-                                _declared_sev_rank(title, card_body).upper() or "SEV",
-                                _admitted),
-                            now,
-                        ),
-                    )
+                # evidence the tranche is defined by. The ONE write lives in
+                # ``_designate_declared_sev_at_birth`` because the DECOMPOSER is the second
+                # row-creation seam and needs the identical row: two copies of this write is
+                # how the fan-out came to store a SEV1 child at the ordinary top (review
+                # round 1). The ledger keeps the card's ORDINARY value, so revoking the
+                # designation returns it to the domain edge rather than to a value re-derived
+                # afterwards - the same restore contract the designation door keeps. Only a
+                # severity admission writes one: an ask-stamped card already satisfies the
+                # guard on its own text and is not designated by this seam.
+                _designate_declared_sev_at_birth(
+                    conn, task_id=task_id, board=dest_board, priority=priority,
+                    title=title, body=card_body, provenance=policy_provenance, now=now,
+                )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -2483,14 +2471,29 @@ def _apply_board_priority_policy(
     """
     policy = _policy_module()
 
+    def _floor_for(spec: Any) -> Optional[int]:
+        """The board's declared floor, when it is wired and readable - ``None`` otherwise."""
+        if spec is None or not policy.board_is_wired(spec):
+            return None
+        try:
+            return policy.board_floor(spec, board or get_current_board())
+        except Exception:
+            return None
+
     try:
         spec = _board_meta_for(board).get(policy.POLICY_KEY)
     except Exception:
         # A board whose metadata cannot be read has no policy to honour; the
         # ``project_id``/``default_workdir`` reads degrade the same way.
-        return requested, None
+        spec = None
     if spec is None:
-        return requested, None
+        # NO LADDER, BUT THE DECLARATION STILL RANKS (card t_4301046d, review round 1): on a
+        # board with no ``priority_policy`` - or one whose module maps no severity - there is no
+        # tip to derive, and refusing the card into nonexistence is worse than the defect. A
+        # declared severity is stored at the top of the ordinary domain that board admits, and
+        # the decision is RECORDED. ``None`` for an ordinary card keeps the seam inert, byte
+        # for byte, on every board that never opted in.
+        return _severity_floor(requested, board=board, title=title, body=body) or (requested, None)
     verdict = policy.priority_for_create(
         requested,
         assignee=assignee or "",
@@ -2500,7 +2503,7 @@ def _apply_board_priority_policy(
         spec=spec,
     )
     if verdict is None:
-        return requested, None
+        return _severity_floor(requested, board=board, title=title, body=body) or (requested, None)
     # R1: the domain bounds every wired board, whatever the policy answered - including a
     # policy that could not be used, whose verdict is the filer's own value. The clamp is
     # merged into that same record, so the event carries it and no second provenance key is
@@ -2512,12 +2515,23 @@ def _apply_board_priority_policy(
     # It is read here, once; a floor that cannot be read degrades to ``None`` because this seam
     # is fail-open by contract (no create may fail on a policy's account) and a missing floor
     # only costs the boundary lift its exemption - the card still lands, in-domain.
-    floor = None
-    if policy.board_is_wired(spec):
-        try:
-            floor = policy.board_floor(spec, board or get_current_board())
-        except Exception:
-            floor = None
+    floor = _floor_for(spec)
+    record = verdict.record
+    applied = int(verdict.applied)
+    # THE DECLARATION OUTRANKS A LADDER THAT DECLINED THE ASK. The band module's ladder exempts
+    # a negative ask before it reads the severity ("below every band: never touched"), so a
+    # SEV1 filed at -1 came back applied=-1 with sev_priority=999000 beside it - the same
+    # two-numbers-one-field lie this card exists to end. Where the policy recorded a severity
+    # tip, a lower applied value is replaced by the tip (upward only, so an operator-ask card
+    # above the tip keeps its higher admission) and the ladder's own answer is kept in
+    # ``ladder_applied`` rather than lost.
+    sev_tip = policy._int_or_none((record or {}).get("sev_priority"))
+    if sev_tip is not None and applied < sev_tip:
+        record = dict(record or {})
+        record.setdefault("ladder_applied", applied)
+        record["applied"] = sev_tip
+        record["decision"] = "derived"
+        applied = sev_tip
     # ... and the card's OWN reserved-tranche evidence rides the same clamp, for the one defect
     # the floor exemption could not reach (card t_4301046d): a policy that DERIVES a severity
     # value out of the ordinary domain had it clamped back to the domain edge, i.e. stored level
@@ -2532,7 +2546,131 @@ def _apply_board_priority_policy(
                 conn, board=board or "", title=title or "", body=body or "")
         except Exception:
             marker = ""
-    return policy.clamp_to_domain(verdict.applied, verdict.record, floor, marker=marker)
+    priority, record = policy.clamp_to_domain(applied, record, floor, marker=marker)
+    if not (record or {}).get("sev_priority"):
+        # A wired board whose module maps no severity (an older policy, a broken one): same
+        # fallback as an unwired board - store the declaration at the ordinary top and say so.
+        lifted = _severity_floor(priority, board=board, title=title, body=body, floor=floor)
+        if lifted:
+            return lifted
+    return priority, record
+
+
+def _severity_floor(
+    requested: int, *, board: Optional[str], title: Optional[str], body: Optional[str],
+    floor: Optional[int] = None,
+) -> Optional[tuple]:
+    """``(priority, record)`` for a declared severity on a board that cannot derive its tip.
+
+    THE ANTI-REFUSAL FLOOR (card t_4301046d, review round 1). The wired band module derives
+    SEV1/SEV2/SEV3; a board with no ``priority_policy``, an unusable one, or one written before
+    the severity ladder has no tip to derive - and there the two measured failure modes met:
+    a refused card (22 cards across 3 boards declare a severity with a sub-900000 priority) and
+    a card left under routine work. Neither is acceptable: the declaration still says the card
+    is an incident, so it is stored at the TOP of the ordinary domain the board admits - its
+    ``ORDINARY_MAX``, or its declared floor when that is higher, because a floored board cannot
+    store anything below it - and the record NAMES the rule that did it.
+
+    ``None`` when the card declares no severity or already sits at/above that top: an ordinary
+    card keeps the inert seam, and a severity card that asked high enough is not moved down.
+    """
+    policy = _policy_module()
+    rank = declared_sev_rank(title, body, board=board)
+    if not rank:
+        return None
+    asked = int(requested)
+    top = int(policy.ORDINARY_MAX)
+    if floor is not None:
+        try:
+            top = max(top, int(floor))
+        except (TypeError, ValueError):
+            pass
+    if asked >= top:
+        return None
+    record = {
+        "asked": asked,
+        "applied": top,
+        "clamped": True,
+        "decision": "derived",
+        "sev": rank,
+        "sev_priority": None,
+        "derived_by": "sev-floor",
+        "overridden_ask": asked,
+        "overridden_reason": (
+            "the ask %d is below %d - the board's no-ask vocabulary - so nothing was asked "
+            "and the declaration decides" % (asked, policy.NO_ASK_BELOW)
+            if not policy.is_ask(asked) else
+            "the declared severity decides the band; the ask %d does not decide it" % asked
+        ),
+        "reason": (
+            "declared %s and this board carries no severity ladder to derive its tip: stored "
+            "at the top of the ordinary domain this board admits (%d), never refused and never "
+            "left level with routine work" % (rank.upper(), top)
+        ),
+    }
+    return top, record
+
+
+#: Every evidence NAME that admits a card into the reserved tranche ON A DECLARED SEVERITY.
+#: ``"sev-token"`` is the fleet's title prefix; the rank names are labelled declaration lines.
+SEV_ENTITLEMENT_MARKERS = ("sev-token", "sev1", "sev2", "sev3")
+
+
+def _designate_declared_sev_at_birth(
+    conn: sqlite3.Connection, *, task_id: str, board: Optional[str], priority: int,
+    title: Optional[str], body: Optional[str], provenance: Optional[dict], now: object,
+) -> bool:
+    """Write the designation a reserved-tranche birth needs, in the CALLER's open txn.
+
+    THE ONE BIRTH-DESIGNATION WRITE (card t_4301046d, review round 1). Both row-creation seams
+    call it - ``create_task`` and ``kanban_db_graph._insert_decomposed_child`` - because the
+    storage guard aborts an INSERT of a reserved-tranche value whose id has no live designation,
+    and the decomposer previously passed no connection at all, so a SEV1-titled child was stored
+    at the top of the ordinary domain with no admission and no record. A copy of this write per
+    seam is exactly how those two drifted.
+
+    Ordered BEFORE the INSERT: the trigger reads the ledger row for the id being written, and a
+    row that fails to land must take its designation with it (the caller's txn rolls both back).
+
+    Returns ``True`` when a designation was written. It never raises for the fail-open reason the
+    whole seam keeps: a policy that cannot answer leaves the value where the clamp put it, which
+    is the pre-fix behaviour rather than a failed filing.
+    """
+    admitted = ((provenance or {}).get("domain") or {}).get("admitted")
+    if not admitted:
+        # THE SECOND ADMISSION DOOR NAMES ITS EVIDENCE THE SAME WAY (card t_4301046d, round 2):
+        # an ask ABOVE the scale's top is admitted at the ceiling by ``apply_above_tranche_guard``,
+        # whose record names the marker under ``above_tranche``. A severity admitted there is the
+        # same admission as one derived by the ladder, and the storage guard cannot tell them
+        # apart: its SQL reads a ``label: value`` line, so a title-token card carries no readable
+        # evidence and the INSERT aborts unless this ledger row exists.
+        admitted = ((provenance or {}).get("above_tranche") or {}).get("marker")
+    if admitted not in SEV_ENTITLEMENT_MARKERS:
+        return False
+    policy = _policy_module()
+    if not policy.in_tranche(int(priority)):
+        return False
+    restore = int(policy.clamp_to_domain(int(priority), None, None)[0])
+    rank = declared_sev_rank(title, body, board=board)
+    conn.execute(
+        "INSERT INTO priority_designations "
+        "(task_id, board, priority, authority, reason, designated_at, revoked_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, NULL) "
+        "ON CONFLICT(task_id) DO UPDATE SET board = excluded.board, "
+        "priority = excluded.priority, authority = excluded.authority, "
+        "reason = excluded.reason, designated_at = excluded.designated_at, "
+        "revoked_at = NULL",
+        (
+            task_id, board, restore, "declared-sev",
+            "declared %s at birth (%s evidence): a severity is an admission, so the row enters "
+            "the reserved tranche designated instead of undesignated" % (
+                (rank or admitted).upper(), admitted),
+            # the ledger's stamp columns are TEXT, so the door's ISO form is the one write;
+            # an epoch int (create_task's ``now``) would make the two seams disagree.
+            _designation_stamp(now if isinstance(now, str) else None),
+        ),
+    )
+    return True
 
 
 # --------------------------------------------------------------------------------------------
@@ -3396,19 +3534,36 @@ SEV1_DECLARATION_RE = re.compile(
     r"(?im)^[ \t>*\-]*({})[ \t]*[:=][ \t]*({})\b".format("|".join(SEV1_LABELS), "|".join(SEV1_VALUES)))
 
 #: The severity TOKEN convention: ``SEV1 [flow] ...`` as the title's PREFIX, optionally behind
-#: indentation or leading punctuation. Byte-for-byte the policy module's own reader
-#: (``kanban_priority_bands.SEV_TITLE_PREFIX_RE``) because the two must agree on what a
-#: declaration IS: the policy raises the card, this one decides whether it may hold the value.
-SEV_TOKEN_PREFIX_RE = re.compile(r"(?i)^\s*[\[('\*\-]*\s*sev[ \t_\-]?([123])\b")
+#: indentation or leading punctuation. Copied CHARACTER FOR CHARACTER from the wired band
+#: module (``kanban_priority_bands.SEV_TITLE_PREFIX_RE``), including the ``"`` in the leading
+#: punctuation class - the first cut of this reader omitted it, so a card titled ``"SEV1" [x]``
+#: was raised to 999000 by the policy and then refused the value by this one (card t_4301046d,
+#: review round 1).
+SEV_TITLE_PREFIX_RE = re.compile(r'(?i)^\s*[\[(\'"*\-]*\s*sev[ \t_\-]?([123])\b')
 
-#: The SEV1 line as the STORAGE GUARD reads it (``_sql_tranche_entitlement``): upper-cased
+#: The LABELLED declaration line at every rank the ladder maps (``Severity: SEV1`` /
+#: ``sev: 2`` / ``priority-class: critical``), copied from the wired module's
+#: ``SEV_DECLARATION_RE``. The SEV1-only line above (``SEV1_DECLARATION_RE``) is kept because the
+#: SQL guard's GLOB is built from the same data; :func:`_kernel_sev_ranks` reads BOTH, exactly as
+#: the wired ``sev_ranks`` does.
+SEV_DECLARATION_RANK_RE = re.compile(
+    r"(?im)^[ \t>*\-]*(severity|sev|priority[ \-]class)[ \t]*[:=][ \t]*"
+    r"(?:sev[ \t_\-]?)?([123]|critical)\b")
+
+#: The severity line as the STORAGE GUARD reads it (``_sql_tranche_entitlement``): upper-cased
 #: prefixes and values, in the same order. Fewer terms than the regex's alternatives because
 #: GLOB is a wildcard match - ``SEV`` reaches ``SEVERITY`` through the wildcard after it, and
 #: ``PRIORITY`` covers ``priority[- ]class`` the same way. Wider on both axes is deliberate: a
 #: guard that admits MORE than the doors write costs nothing (see that function), and a guard
 #: that admits less is an aborted dispatcher tick.
-_SQL_SEV1_LABELS = ("SEV", "CRITICAL", "PRIORITY")
-_SQL_SEV1_VALUES = ("SEV1", "SEV-1", "SEV 1", "CRITICAL")
+#:
+#: EVERY RANK THE LADDER MAPS (card t_4301046d, review round 1): the wired band module derives
+#: SEV1->999000, SEV2->995000 and SEV3->992000, so all three can arrive at the tranche. A guard
+#: that read only SEV1 would abort the INSERT of a SEV2/SEV3 row the door had just admitted -
+#: the guard-vs-door disagreement that stops a dispatcher tick.
+_SQL_SEV_LABELS = ("SEV", "CRITICAL", "PRIORITY")
+_SQL_SEV_VALUES = ("SEV1", "SEV-1", "SEV 1", "SEV2", "SEV-2", "SEV 2",
+                   "SEV3", "SEV-3", "SEV 3", "CRITICAL")
 
 #: The ``Operator-ask: <register>/<ask>`` line the register writes
 #: (``kanban_register._STAMP_RE``): one line, no matter how long the body is.
@@ -3420,22 +3575,83 @@ def sev1_declared(text: Optional[str]) -> bool:
     return bool(SEV1_DECLARATION_RE.search(text or ""))
 
 
-def sev_token_rank(title: Optional[str]) -> str:
-    """The severity RANK declared by a TITLE TOKEN (``"sev1"``/``"sev2"``/``"sev3"``), or ``""``.
+def _kernel_sev_ranks(title: Optional[str], body: Optional[str] = "") -> list:
+    """Every severity rank the card's own text declares, most severe first.
 
-    The fleet's second SEV convention, and the one its machine filers actually use: every
-    failure emitter writes ``SEV1 [<flow>] <run> failed ...`` as the title's PREFIX, and the
-    board's own band policy reads that prefix as a severity declaration
-    (``kanban_priority_bands.SEV_TITLE_PREFIX_RE``, which this mirrors character for
-    character). Reading only the labelled ``Severity: SEV1`` line here rejected every one of
-    those cards the policy had just raised, and the create clamp then stored them level with
-    routine work (card t_4301046d: 420 SEV1 filings asked 900000).
-
-    A prefix only: the same words in the middle of a title are prose. The policy module makes
-    that same distinction for the same reason (it would re-band ~500 cards otherwise).
+    A faithful copy of the wired band module's ``sev_ranks`` (same two regexes, same order, same
+    final SEV1-line check), kept ONLY for a board that has no wired module to ask - an unwired
+    board, or a policy that predates ``sev_rank``. Where a wired reader exists, ITS answer is the
+    answer (:func:`declared_sev_rank`): one reading of "this card declares a severity", so the
+    seam that raises a card and the seam that decides whether it may hold the value cannot
+    disagree.
     """
-    m = SEV_TOKEN_PREFIX_RE.match(title or "")
-    return "sev%s" % m.group(1) if m else ""
+    ranks: list = []
+    for m in SEV_TITLE_PREFIX_RE.finditer(title or ""):
+        rank = "sev" + m.group(1)
+        if rank not in ranks:
+            ranks.append(rank)
+    for part in (title or "", body or ""):
+        for m in SEV_DECLARATION_RANK_RE.finditer(part):
+            rank = "sev1" if m.group(2).lower() == "critical" else "sev" + m.group(2)
+            if rank not in ranks:
+                ranks.append(rank)
+    if sev1_declared("{}\n{}".format(title or "", body or "")) and "sev1" not in ranks:
+        ranks.append("sev1")
+    ranks.sort(key=lambda r: int(r[3:]))
+    return ranks
+
+
+def _as_text(value: Optional[object]) -> str:
+    """*value* as text for the declaration readers: ``create_task`` accepts a bytes body and the
+    severity predicates run BEFORE the body is normalised for storage."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return value if isinstance(value, str) else ("" if value is None else str(value))
+
+
+def wired_sev_rank(
+    board: Optional[str] = None, title: Optional[str] = "", body: Optional[str] = "",
+) -> Optional[str]:
+    """The rank the BOARD'S OWN policy module reads, or ``None`` when it has no reader.
+
+    ``None`` and ``""`` are different answers on purpose: ``None`` means this board cannot read
+    severities at all (no policy, an unusable one, or one written before ``sev_rank`` existed) and
+    the kernel's copy must answer; ``""`` means the wired module - the one the birth policy
+    itself consulted - says the card declares nothing, and that is the answer.
+    """
+    policy = _policy_module()
+    try:
+        spec = policy.normalize_spec(
+            _board_meta_for(board or get_current_board()).get(policy.POLICY_KEY))
+        if spec is None:
+            return None
+        fn = getattr(policy.load_module(spec), "sev_rank", None)
+        if not callable(fn):
+            return None
+        rank = fn(title or "", body or "") or ""
+    except Exception:
+        # Fail-open by contract (no filing may fail on a policy's account): an unreadable module
+        # degrades to the kernel's copy, which is byte-equal to the wired reader.
+        return None
+    return rank if rank in ("sev1", "sev2", "sev3") else ""
+
+
+def declared_sev_rank(
+    title: Optional[str], body: Optional[str] = "", board: Optional[str] = None,
+) -> str:
+    """The severity rank the card's own text declares - ``"sev1"``/``"sev2"``/``"sev3"`` or ``""``.
+
+    ONE reading, in the wired module's own vocabulary: the wired reader answers when the board has
+    one, and the kernel copy answers only where it has none. Two readings of one declaration was
+    the review finding (card t_4301046d): the kernel's first cut omitted ``"`` from the title
+    token's punctuation class and read no label but SEV1, so a policy-lifted card was then denied
+    its value here - and the disagreement was invisible because both sides "read severities".
+    """
+    rank = wired_sev_rank(board, _as_text(title), _as_text(body))
+    if rank is not None:
+        return rank
+    ranks = _kernel_sev_ranks(_as_text(title), _as_text(body))
+    return ranks[0] if ranks else ""
 
 
 def tranche_entitlement(
@@ -3451,7 +3667,7 @@ def tranche_entitlement(
     6.5 hours).
 
     Why the card's OWN evidence, and nothing inherited. The marker is "the card's own
-    evidence: an operator-ask ref, a live designation, or a declared SEV1 line", and a
+    evidence: an operator-ask ref, a live designation, or a declared severity", and a
     database trigger can only read the row it is about to write: it cannot walk a parent
     chain, cannot resolve a register reference that lives on another board, and cannot
     re-derive anything. The one inherited form the wider resolver also accepts - an ask
@@ -3460,19 +3676,40 @@ def tranche_entitlement(
     A row that carries no stamp of its own therefore carries no ask.
 
     Returns the marker's NAME, in the resolver's order, so the record says which evidence
-    admitted the row: ``"operator-ask-stamp"``, ``"designation"``, ``"sev1"`` (the labelled
-    ``Severity: SEV1`` line) or ``"sev-token"`` (the ``SEV1 <title>`` prefix the fleet's
-    failure emitters write).
+    admitted the row: ``"operator-ask-stamp"``, ``"designation"``, or the severity RANK the
+    card declares (``"sev1"``/``"sev2"``/``"sev3"``, read by :func:`declared_sev_rank` - the
+    wired policy module's own ``sev_rank``).
     """
     if _ASK_STAMP_RE.search(body or ""):
         return "operator-ask-stamp"
     if task_id and is_priority_designated(conn, task_id, board=board):
         return "designation"
-    if sev1_declared("{}\n{}".format(title or "", body or "")):
-        return "sev1"
-    if sev_token_rank(title):
+    return _sev_marker(title, body, board=board)
+
+
+def _sev_marker(title: Optional[str], body: Optional[str] = "", board: Optional[str] = None) -> str:
+    """The card's severity EVIDENCE name, or ``""`` when it declares no severity.
+
+    Two conventions, two names, and the rank is read ONCE (:func:`declared_sev_rank`, i.e. the
+    wired policy module's own ``sev_rank``): ``"sev-token"`` for the fleet's title PREFIX
+    (``SEV1 [flow] ...`` - what every machine filer writes) and the rank itself
+    (``"sev1"``/``"sev2"``/``"sev3"``) for a labelled declaration line (``Severity: SEV2``).
+    Naming the EVIDENCE rather than only the severity is what lets a reader of the ``created``
+    payload tell which text admitted the row; the rank is carried beside it by the policy's
+    record (``sev``/``sev_priority``).
+    """
+    rank = declared_sev_rank(title, body, board=board)
+    if not rank:
+        return ""
+    # The LABELLED line is the stronger evidence - it states the severity in words - so it keeps
+    # its rank as the marker name; the title PREFIX is the fleet's machine convention and is
+    # named for what it is. A card carrying both is named by the labelled line.
+    if SEV_DECLARATION_RANK_RE.search(_as_text(body)):
+        return rank
+    if SEV_TITLE_PREFIX_RE.search(_as_text(title)):
         return "sev-token"
-    return ""
+    # the wired reader's own evidence (a board-defined convention): named by its rank.
+    return rank
 
 
 def _sql_tranche_entitlement(ident: str, title: str, body: str) -> str:
@@ -3504,10 +3741,10 @@ def _sql_tranche_entitlement(ident: str, title: str, body: str) -> str:
     designation = (f"EXISTS (SELECT 1 FROM priority_designations d WHERE d.task_id = {ident} "
                    "AND d.revoked_at IS NULL)")
     stamp = f"INSTR(COALESCE({body}, ''), 'Operator-ask:') > 0"
-    sev1 = " OR ".join(
+    sev = " OR ".join(
         f"{framed} GLOB ('*{label}*[:=]*{value}{word_end}')"
-        for label in _SQL_SEV1_LABELS for value in _SQL_SEV1_VALUES)
-    return f"(({stamp}) OR ({designation}) OR ({sev1}))"
+        for label in _SQL_SEV_LABELS for value in _SQL_SEV_VALUES)
+    return f"(({stamp}) OR ({designation}) OR ({sev}))"
 
 
 def priority_tranche_trigger_ddl(floor: Optional[int] = None) -> tuple:
@@ -3763,9 +4000,7 @@ def above_tranche_marker(
         return "operator-ask-stamp"
     if task_id and is_priority_designated(conn, task_id, board=board):
         return "designation"
-    if sev1_declared("{}\n{}".format(title or "", body or "")):
-        return "sev1"
-    return ""
+    return _sev_marker(title, body, board=board)
 
 
 ABOVE_TRANCHE_ALTERNATIVES = (
@@ -3920,18 +4155,18 @@ def _refuse_above_tranche(
     )
 
 
-def _declared_sev_rank(title: Optional[str], body: Optional[str] = "") -> str:
-    """The severity RANK the card's OWN text declares - ``"sev1"``/``"sev2"``/``"sev3"``, or ``""``.
+def _declared_sev_rank(title: Optional[str], body: Optional[str] = "",
+                       board: Optional[str] = None) -> str:
+    """The severity rank the card's OWN text declares - ``"sev1"``/``"sev2"``/``"sev3"``, or ``""``.
 
-    Both fleet conventions, in the order the entitlement resolver reads them: the title TOKEN
-    (what every machine filer writes) and the labelled ``Severity: SEV1`` line.
+    ONE reading (card t_4301046d, review round 1): the wired policy module's own ``sev_rank``,
+    the same predicate the band module used to DERIVE the value, with the kernel's byte-equal
+    copy answering only where no wired reader exists. The first cut read the kernel's copy
+    unconditionally, and its two gaps - a missing ``"`` in the title token's punctuation class,
+    and no sev2/sev3 labelled form - made the seam that raises a card and the seam that decides
+    whether it may hold the value disagree about what a declaration is.
     """
-    token = sev_token_rank(title)
-    if token:
-        return token
-    if sev1_declared("{}\n{}".format(title or "", body or "")):
-        return "sev1"
-    return ""
+    return declared_sev_rank(title, body, board=board)
 
 
 class SeverityContradiction(ValueError):
@@ -3964,6 +4199,7 @@ def apply_above_tranche_guard(
     conn: sqlite3.Connection, requested: int, applied: int, *, board: Optional[str] = None,
     lane: Optional[str] = None, title: Optional[str] = "", body: Optional[str] = "",
     ask_ref: Optional[Any] = None, tenant: Optional[str] = None,
+    derived_sev: bool = False,
 ) -> tuple[int, Optional[dict]]:
     """The create seam's above-tranche half: ``(priority, record)``.
 
@@ -3973,18 +4209,28 @@ def apply_above_tranche_guard(
     so a correctly filed card keeps today's byte-identical event.
 
     It judges a SECOND contradiction for the same reason (card t_4301046d): a card whose own
-    text declares a severity may not ALSO ask a priority from below the ordinary top. The board
-    policy derives such a card's value from the declaration (that is what makes ``sev1`` a
-    severity), so the ask and the value can only disagree - and the pre-fix behaviour was to
-    silently keep the bet the ask happened to place. ``0..9`` is exempt because that is the
-    CLI's default and the retired ordinal scale, i.e. no ask at all; everything else under the
-    ordinary top is a real, explicit, contradicting number and is refused by name.
+    text declares a severity may not ALSO ask a band-scale priority from below the ordinary
+    top. The board policy derives such a card's value from the declaration (that is what makes
+    ``sev1`` a severity), so the ask and the value can only disagree - and the pre-fix
+    behaviour was to silently keep the bet the ask happened to place.
+
+    THE REFUSAL IS SCOPED BY TWO MEASUREMENTS (review round 1):
+
+    * a SUB-THOUSAND ask is the board's no-ask vocabulary, not a band ask
+      (``kanban_priority_policy.NO_ASK_BELOW``): 997 live platform filings ask 10..999 and 7 of
+      those declare a severity, so those filers reach for "very urgent" on the retired ordinal
+      scale rather than stating a contradiction. They are DERIVED and the ignored ask is
+      RECORDED (``overridden_ask``), never refused;
+    * the refusal needs a board that CAN derive. Where the policy has no severity ladder (an
+      unwired board, or a module that maps none) there is no contradicting value to lift to, so
+      the card is stored at the top of the ordinary domain that board admits, with
+      ``decision: "derived"`` - a declared severity is never refused into nonexistence.
     """
     policy = _policy_module()
     ceiling = int(policy.MAX_PRIORITY)
     asked = int(requested)
-    rank = _declared_sev_rank(title, body)
-    if rank and 10 <= asked < int(policy.ORDINARY_MAX):
+    rank = _declared_sev_rank(title, body, board=board)
+    if (rank and policy.is_ask(asked) and asked < int(policy.ORDINARY_MAX) and derived_sev):
         raise _refuse_sev_contradiction(
             rank=rank, asked=asked, board=board, lane=lane, title=title)
     if asked <= ceiling:
@@ -4001,6 +4247,9 @@ def apply_above_tranche_guard(
             "requested": asked,
             "applied": ceiling,
             "marker": marker,
+            # The ask was moved DOWN to the scale's top: the value is not the one asked for,
+            # so the rule is named rather than left to be inferred from the arithmetic.
+            "decision": "clamped",
             "reason": (
                 f"carries the {marker} marker: admitted into the reserved tranche at its top "
                 f"({ceiling}); the scale ends there"
@@ -4024,6 +4273,12 @@ def _merge_policy_record(record: Optional[dict], extra: Optional[dict]) -> Optio
     if "above_tranche" in merged:
         merged["applied"] = merged["above_tranche"]["applied"]
         merged["clamped"] = True
+        # THE CEILING IS THE LAST RULE THAT MOVED THE CARD, so it is the one the field names:
+        # keeping an earlier ``derived`` would say the severity produced the stored value when
+        # in fact the ceiling capped it (card t_4301046d: 999000 derived, 999999 stored, and the
+        # reader told the severity decided 999999). The derived value stays legible beside it in
+        # ``sev_priority``, so both numbers and the rule that chose between them are readable.
+        merged["decision"] = "clamped"
         merged.pop("domain", None)
     return merged
 

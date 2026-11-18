@@ -55,6 +55,72 @@ def band_birth(requested, assignee, board, title, body):
             "reason": "the board tier"}
 '''
 
+#: The same policy with the wired module's OWN punctuation class, ``"`` included.
+SEV_BAND_QUOTED = r'''
+import re
+
+SEV = re.compile(r'(?i)^\s*[\[(\'"*\-]*\s*sev[ \t_\-]?([123])\b')
+TIPS = {"1": 999000, "2": 995000, "3": 992000}
+
+
+def band_birth(requested, assignee, board, title, body):
+    m = SEV.match(title or "")
+    if m:
+        tip = TIPS[m.group(1)]
+        return {"asked": requested, "applied": tip, "clamped": tip != int(requested),
+                "sev": "sev%s" % m.group(1), "sev_priority": tip, "reason": "declared severity"}
+    applied = min(max(int(requested), 600000), 900000)
+    return {"asked": requested, "applied": applied, "clamped": applied != int(requested),
+            "reason": "the board tier"}
+'''
+
+#: The wired ladder's ORDER, which is the point: a negative ask is exempted BEFORE the severity
+#: is read, so ``applied`` comes back -1 while ``sev_priority`` is 999000.
+SEV_BAND_EXEMPTS_NEGATIVES = r'''
+import re
+
+SEV = re.compile(r'(?i)^\s*[\[(\'\*\-]*\s*sev[ \t_\-]?([123])\b')
+TIPS = {"1": 999000, "2": 995000, "3": 992000}
+
+
+def band_birth(requested, assignee, board, title, body):
+    asked = int(requested or 0)
+    m = SEV.match(title or "")
+    rank = "sev%s" % m.group(1) if m else ""
+    if asked < 0:
+        return {"asked": asked, "applied": asked, "clamped": False, "sev": rank,
+                "sev_priority": TIPS[m.group(1)] if m else None,
+                "reason": "below every band: exempt, never touched"}
+    if rank:
+        tip = TIPS[m.group(1)]
+        return {"asked": asked, "applied": tip, "clamped": tip != asked, "sev": rank,
+                "sev_priority": tip, "reason": "declared severity"}
+    applied = min(max(asked, 600000), 900000)
+    return {"asked": asked, "applied": applied, "clamped": applied != asked,
+            "reason": "the board tier"}
+'''
+
+#: A board whose OWN reader decides what a declaration is: text the kernel's copy does not
+#: recognise at all (``PAGER``) is a SEV1 here.
+WIRED_READER = r'''
+TIPS = {"sev1": 999000}
+
+
+def sev_rank(title, body=""):
+    return "sev1" if "PAGER" in (title or "") else ""
+
+
+def band_birth(requested, assignee, board, title, body):
+    rank = sev_rank(title, body)
+    if rank:
+        tip = TIPS[rank]
+        return {"asked": requested, "applied": tip, "clamped": tip != int(requested),
+                "sev": rank, "sev_priority": tip, "reason": "the wired reader declared it"}
+    applied = min(max(int(requested), 600000), 800000)
+    return {"asked": requested, "applied": applied, "clamped": applied != int(requested),
+            "reason": "the board tier"}
+'''
+
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
@@ -191,7 +257,6 @@ def test_the_armed_storage_guard_admits_the_sev1_birth_and_still_refuses_a_bare_
             "INSERT INTO tasks (id, title, body, assignee, status, priority, created_by) "
             "VALUES ('bare', 'just a card', NULL, 'coder', 'ready', 999000, 'test')")
 
-
 # --- 4. the contradiction is named, not clamped over --------------------------------------
 
 def test_a_sev1_ask_that_contradicts_the_declaration_is_refused_by_name(conn, home):
@@ -243,8 +308,13 @@ def test_decision_names_the_rule_that_placed_the_card():
     assert kpp.decision(999000, derived) == "derived"
     assert kpp.decision(799998, clamped) == "clamped"
     assert kpp.decision(799998, asked) == "asked"
-    assert kpp.decision(123, None) == "clamped"          # the default fallback
-    assert kpp.decision(123, None, fallback="asked") == "asked"
+    # 423 of 461 SEV filings ask 900000 - the tier top AND the dominant ask - so equality with
+    # the ask is NOT evidence that nothing moved. Only the CLAMP FACT may say "clamped".
+    assert kpp.decision(900000, {"asked": 900000, "applied": 900000},
+                        domain_clamped=True) == "clamped"
+    # with no record and no clamp fact, "asked" is the caller's fallback: nothing recorded a move
+    assert kpp.decision(123, None) == "asked"
+    assert kpp.decision(123, None, fallback="clamped") == "clamped"
     # a record that states no ask cannot say more than the caller already knows
     assert kpp.decision(123, {"applied": 123}, fallback="asked") == "asked"
     assert kpp.decision(900000, {"applied": 123}) == "clamped"
@@ -258,3 +328,186 @@ def test_the_clamp_admits_a_tranche_value_only_with_a_marker():
     assert admitted == 999000
     assert record["domain"]["admitted"] == "sev-token"
     assert record["clamped"] is False
+
+
+# --- 7. the SECOND row-creation seam: the decomposer (review round 1, gap 1) ---------------
+
+def test_a_decomposed_sev1_child_is_derived_and_the_armed_guard_admits_it(conn, home):
+    """The fan-out is a filing: a SEV1-titled child must not land at the ordinary top.
+
+    Measured before the fix: ``_insert_decomposed_child`` called the policy without ``conn=``,
+    so a SEV1-titled child was stored at 900000 (``decision=clamped``, no designation) while
+    the same card filed through ``create_task`` derived 999000. Wiring the connection alone
+    would have ABORTED the fan-out (the guard refuses a tranche value with no ledger row), so
+    the designation write had to become one helper both seams call.
+    """
+    from hermes_cli import kanban_db_graph as kbg
+
+    _wire(home)
+    root = kb.create_task(conn, title="decompose me", assignee="default", triage=True)
+    kb.arm_priority_tranche_guard("default")
+    children = kbg.decompose_triage_task(
+        conn, root, root_assignee="default",
+        children=[{"title": "SEV1 [gateway] child run failed", "assignee": "platform-coder"},
+                  {"title": "SEV1 [gateway] second child", "assignee": "platform-coder"}],
+    )
+    assert children and len(children) == 2
+    for cid in children:
+        assert _priority(conn, cid) == 999000
+        assert _designation(conn, cid) is not None
+        record = _created_payload(conn, cid)["priority_policy"]
+        assert record["decision"] == "derived"
+        assert record["domain"]["admitted"] == "sev-token"
+
+
+# --- 8. every rank the ladder maps, and the guard that must agree (gap 2) ------------------
+
+def test_sev2_and_sev3_titles_derive_their_own_tip_and_the_armed_guard_admits_them(conn, home):
+    """The band module maps SEV1/SEV2/SEV3 to 999000/995000/992000, so all three can be stored
+    in the tranche. A guard that read only SEV1 would abort the INSERT of the other two."""
+    _wire(home)
+    kb.arm_priority_tranche_guard("default")
+    sev2 = kb.create_task(conn, title="[SEV2] gateway latency", assignee="default", priority=0)
+    sev3 = kb.create_task(conn, title="SEV3 host slow", assignee="default", priority=0)
+    assert _priority(conn, sev2) == 995000
+    assert _priority(conn, sev3) == 992000
+    assert _designation(conn, sev2) is not None and _designation(conn, sev3) is not None
+    assert _created_payload(conn, sev2)["priority_policy"]["decision"] == "derived"
+
+
+def test_the_quoted_title_token_derives_and_is_admitted(conn, home):
+    """``"SEV1" [x]`` - the ``"`` the kernel's first reader omitted from its punctuation class.
+
+    A card the wired module raises to 999000 was then denied the value by the kernel's copy, so
+    the INSERT landed at the ordinary edge with ``decision=clamped``.
+    """
+    _wire(home, SEV_BAND_QUOTED)
+    tid = kb.create_task(conn, title='"SEV1" [gateway] down', assignee="default", priority=900000)
+    assert _priority(conn, tid) == 999000
+    assert _created_payload(conn, tid)["priority_policy"]["domain"]["admitted"] == "sev-token"
+
+
+# --- 9. the single reading: the WIRED module answers (gap 2) -------------------------------
+
+def test_the_kernel_copy_does_not_decide_what_a_declaration_is(conn, home):
+    """``sev_rank`` on the board's module is the ONE reading.
+
+    Review round 1: the kernel's copy omitted the ``"`` in the title token's punctuation class
+    and read no sev2/sev3 labelled form, so the seam that raised a card and the seam that
+    decided whether it may hold the value disagreed. Here the board's own reader declares a
+    severity on text the kernel's copy does not recognise at all (``PAGER``): the card must
+    still derive, be admitted, and be designated - the wired reader decides.
+    """
+    path = home / "band_policy_reader.py"
+    path.write_text(WIRED_READER, encoding="utf-8")
+    kb.write_board_metadata("default", priority_policy={"module": str(path),
+                                                       "function": "band_birth"})
+    kb.arm_priority_tranche_guard("default")
+    assert kb.wired_sev_rank("default", "PAGER: gateway down") == "sev1"
+    assert kb.declared_sev_rank("PAGER: gateway down", board="default") == "sev1"
+    tid = kb.create_task(conn, title="PAGER: gateway down", assignee="default", priority=0)
+    assert _priority(conn, tid) == 999000
+    assert _designation(conn, tid) is not None
+    assert _created_payload(conn, tid)["priority_policy"]["domain"]["admitted"] == "sev1"
+
+
+def test_the_kernel_copy_still_reads_the_quoted_token_where_no_wired_reader_exists(conn, home):
+    """The kernel's copy is byte-equal to the wired reader, ``"`` included."""
+    assert kb.declared_sev_rank('"SEV1" [gateway] down') == "sev1"
+    assert kb.declared_sev_rank("[SEV2] latency") == "sev2"
+    assert kb.declared_sev_rank("x", "severity: SEV3") == "sev3"
+    assert kb.declared_sev_rank("x", "priority-class: critical") == "sev1"
+    assert kb.declared_sev_rank("cards are orderable BELOW SEV1 work") == ""
+
+
+def test_sev2_can_ask_above_the_ceiling_and_the_ceiling_decision_is_recorded(conn, home):
+    """The above-ceiling path emitted no ``decision`` at all (review round 1, gap 2)."""
+    applied, record = kb.apply_above_tranche_guard(
+        conn, 1000001, 999999, board="default", title="SEV2 [x] y",
+        body="Operator-ask: default/1\n")
+    assert applied == 999999
+    assert record["above_tranche"]["decision"] == "clamped"
+    merged = kb._merge_policy_record({"asked": 1000001, "applied": 999999},
+                                     record)
+    assert merged["decision"] == "clamped"
+
+
+def test_a_title_token_sev1_above_the_ceiling_files_and_carries_its_designation(conn, home):
+    """The above-ceiling door admitted a title-token SEV1 but wrote no designation.
+
+    Its marker is read from the title, while the storage guard's SQL reads a
+    ``label: value`` line - so the admission was invisible to the guard and the INSERT aborted
+    with a raw ``IntegrityError`` instead of filing the incident. The birth-designation helper
+    reads the above-ceiling record's marker too, so the row and its ledger admission are one.
+    """
+    _wire(home)
+    kb.arm_priority_tranche_guard("default")
+    tid = kb.create_task(conn, title="SEV1 [x] y", assignee="default", priority=1000001)
+    assert _priority(conn, tid) == 999999
+    payload = _created_payload(conn, tid)["priority_policy"]
+    assert payload["above_tranche"]["decision"] == "clamped"
+    assert payload["decision"] == "clamped"
+    assert _designation(conn, tid) is not None
+
+
+# --- 10. the refusal's vocabulary and the board that cannot derive (gap 3) -----------------
+
+@pytest.mark.parametrize("asked", [10, 45, 999])
+def test_a_sub_thousand_ask_is_no_ask_and_is_derived_not_refused(conn, home, asked):
+    """997 live platform filings ask 10..999; 7 of those declare a severity.
+
+    Those filers reach for "very urgent" on the retired ordinal scale, so refusing them at
+    create would delete an incident card to protect a distinction nobody made. Derived, with
+    the ignored ask RECORDED (``overridden_ask``).
+    """
+    _wire(home)
+    tid = kb.create_task(conn, title="SEV1 [x] y", assignee="default", priority=asked)
+    assert _priority(conn, tid) == 999000
+    record = _created_payload(conn, tid)["priority_policy"]
+    assert record["decision"] == "derived"
+    assert record["overridden_ask"] == asked
+    assert "no-ask vocabulary" in record["overridden_reason"]
+
+
+def test_a_negative_ask_cannot_leave_a_sev1_below_routine_work(conn, home):
+    """The wired ladder exempts a negative ask BEFORE it reads the severity, returning
+    applied=-1 with sev_priority=999000 beside it - the same lie this card exists to end."""
+    _wire(home, SEV_BAND_EXEMPTS_NEGATIVES)
+    tid = kb.create_task(conn, title="SEV1 [x] y", assignee="default", priority=-1)
+    assert _priority(conn, tid) == 999000
+    record = _created_payload(conn, tid)["priority_policy"]
+    assert record["decision"] == "derived"
+    assert record["ladder_applied"] == -1
+
+
+def test_an_unwired_board_stores_a_declared_sev1_at_the_ordinary_top_not_refused(conn, home):
+    """No policy: there is no tip to derive, and a refusal there deletes the card.
+
+    22 cards across 3 boards declare a severity with a sub-900000 priority; defcon has no
+    ``priority_policy`` at all, so on that board the pre-fix rule had no derive path and the
+    card would simply never exist.
+    """
+    tid = kb.create_task(conn, title="SEV1 [x] y", assignee="default", priority=699000)
+    assert _priority(conn, tid) == kpp.ORDINARY_MAX
+    record = _created_payload(conn, tid)["priority_policy"]
+    assert record["decision"] == "derived"
+    assert record["derived_by"] == "sev-floor"
+    assert record["applied"] == kpp.ORDINARY_MAX
+    assert _task_count(conn) == 1
+
+
+def test_an_unwired_board_still_leaves_ordinary_work_untouched(conn, home):
+    """The fallback is scoped to a DECLARED severity: an ordinary ask keeps today's bytes."""
+    tid = kb.create_task(conn, title="Reconcile the board", assignee="default", priority=699000)
+    assert _priority(conn, tid) == 699000
+    assert "priority_policy" not in _created_payload(conn, tid)
+
+
+def test_the_birth_designation_carries_an_iso_stamp(conn, home):
+    """``designated_at`` is the ledger's TEXT stamp, the same one the designation door writes."""
+    _wire(home)
+    tid = kb.create_task(conn, title="SEV1 [x] y", assignee="default", priority=0)
+    stamp = conn.execute(
+        "SELECT designated_at FROM priority_designations WHERE task_id = ?", (tid,)
+    ).fetchone()[0]
+    assert isinstance(stamp, str) and stamp.endswith("Z") and "T" in stamp

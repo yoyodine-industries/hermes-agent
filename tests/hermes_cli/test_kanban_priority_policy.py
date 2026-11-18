@@ -185,8 +185,10 @@ def test_a_card_inside_its_band_is_not_clamped(conn, home):
     _wire(home, BAND)
     tid = kb.create_task(conn, title="normal", assignee="coder", priority=500)
     assert _priority(conn, tid) == 500
-    # Unmoved: no key at all, rather than a record saying nothing moved.
-    assert "priority_policy" not in _created_payload(conn, tid)
+    # Unmoved, but the event still NAMES the rule (card t_4301046d, review round 1 gap 2): a
+    # decision absent on the untouched path was the one reading a card could not carry.
+    record = _created_payload(conn, tid)["priority_policy"]
+    assert record["decision"] == "asked" and record["applied"] == 500
 
 
 def test_the_policy_runs_exactly_once_per_filing(conn, home):
@@ -284,13 +286,14 @@ def test_a_filing_with_no_board_takes_its_policy_from_the_connections_board(home
         assert _priority(other_conn, tid) == 800000
         assert _created_payload(other_conn, tid)["priority_policy"]["applied"] == 800000
         # Negative control on the SAME connection and board: a value the policy does not
-        # move keeps today's event shape (no key at all), so the assertions above are
-        # about WHICH board's policy ran, not about every filing carrying a record.
+        # move still carries the decision (card t_4301046d, review round 1 gap 2), and it
+        # says "asked" - which is only meaningful because the moved case above says otherwise.
         still = kb.create_task(
             other_conn, title="already there", assignee="coder", priority=800000,
         )
         assert _priority(other_conn, still) == 800000
-        assert "priority_policy" not in _created_payload(other_conn, still)
+        still_record = _created_payload(other_conn, still)["priority_policy"]
+        assert still_record["decision"] == "asked" and still_record["applied"] == 800000
 
 
 def test_a_boards_own_connection_names_its_slug(conn):
@@ -888,10 +891,10 @@ def test_birth_lift_on_a_floored_board(conn, home):
         record = _created_payload(conn, tid)["priority_policy"]
         assert record["floor"] == 900000
         assert "900000" in record["reason"] and "below" in record["reason"]
-    # At the floor: the card is not moved, so the event keeps today's shape.
+    # At the floor: the card is not moved, but the decision is still recorded.
     tid = kb.create_task(conn, title="at the floor", assignee="coder", priority=900000)
     assert _priority(conn, tid) == 900000
-    assert "priority_policy" not in _created_payload(conn, tid)
+    assert _created_payload(conn, tid)["priority_policy"]["decision"] == "asked"
 
 
 def test_the_lift_cannot_reach_the_tranche(conn, home):
@@ -1557,24 +1560,36 @@ def test_the_floor_ddl_is_byte_identical_without_a_boundary_and_differs_only_the
     """
     base = _baseline_ddl()
     ent = kb._sql_tranche_entitlement("NEW.id", "NEW.title", "NEW.body")
+    # THE ONE DELIBERATE DIFFERENCE FROM THE CAPTURE (card t_4301046d, review round 1 gap 2):
+    # the guard now reads every rank the ladder writes (SEV2/SEV3 as well as SEV1), because the
+    # wired module derives 995000/992000 for those and a guard that admitted only SEV1 would
+    # abort their INSERT. Drop those alternatives to recover the PRE-CHANGE clause, so this
+    # comparison still fails on any OTHER byte of drift.
+    widened = ("SEV2", "SEV-2", "SEV 2", "SEV3", "SEV-3", "SEV 3")
+    old_ent = " OR ".join(t for t in ent.split(" OR ") if not any(w in t for w in widened))
+    assert old_ent != ent and len(old_ent) < len(ent)
     old_clause = "NEW.priority BETWEEN %d AND %d AND NOT (%s)" % (
-        kpp.TRANCHE_FLOOR, kpp.TRANCHE_TOP, ent)
+        kpp.TRANCHE_FLOOR, kpp.TRANCHE_TOP, old_ent)
     boundary_clause = old_clause + " AND NEW.priority <> %d" % kpp.TRANCHE_FLOOR
     # no floor, and a floor inside the ordinary domain: the pre-change literal, byte for byte.
     for floor in (None, 900000):
         key = "None" if floor is None else str(floor)
         new_insert, new_update = kb.priority_tranche_trigger_ddl(floor)
-        assert new_insert == base[key]["insert"]
-        assert new_update == base[key]["update"]
+        assert new_insert.replace(ent, old_ent) == base[key]["insert"]
+        assert new_update.replace(ent, old_ent) == base[key]["update"]
         assert "NEW.priority <> %d" % int(floor if floor is not None else 0) not in new_insert
     # the old rendering of the boundary floor is the ordinary one with only the number changed.
     assert base["990000"]["insert"] == base["900000"]["insert"].replace("900000", "990000")
     assert base["990000"]["update"] == base["900000"]["update"].replace("900000", "990000")
     # the new rendering differs from that pre-change literal ONLY by the boundary clause.
     new_insert, new_update = kb.priority_tranche_trigger_ddl(kpp.TRANCHE_FLOOR)
-    assert new_insert == base["990000"]["insert"].replace(old_clause, boundary_clause)
-    assert new_update == base["990000"]["update"].replace(old_clause, boundary_clause)
+    assert new_insert.replace(ent, old_ent) == base["990000"]["insert"].replace(
+        old_clause, boundary_clause)
+    assert new_update.replace(ent, old_ent) == base["990000"]["update"].replace(
+        old_clause, boundary_clause)
     for statement in (new_insert, new_update):
-        assert statement.count(boundary_clause) == 1
+        assert statement.count(
+            "NEW.priority BETWEEN %d AND %d AND NOT (%s) AND NEW.priority <> %d" % (
+                kpp.TRANCHE_FLOOR, kpp.TRANCHE_TOP, ent, kpp.TRANCHE_FLOOR)) == 1
         assert statement.count("NEW.priority <> %d" % kpp.TRANCHE_FLOOR) == 1
         assert "NEW.priority < %d" % kpp.TRANCHE_FLOOR in statement

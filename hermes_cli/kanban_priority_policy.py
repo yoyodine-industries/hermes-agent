@@ -99,7 +99,7 @@ __all__ = [
     "Verdict", "ORDINARY_MIN", "ORDINARY_MAX", "MAX_BAND_TOP", "TRANCHE_FLOOR", "TRANCHE_TOP",
     "DESIGNATED_PRIORITY", "MAX_PRIORITY",
     "in_ordinary", "in_tranche", "board_is_wired", "domain_reason", "clamp_to_domain",
-    "decision",
+    "decision", "NO_ASK_BELOW", "is_ask",
     "normalize_spec", "load_module", "load_callable", "priority_for_create", "board_floor",
 ]
 
@@ -206,8 +206,34 @@ def domain_reason(value: int) -> str:
     return "below the documented floor (%d)" % ORDINARY_MIN
 
 
-def decision(value: Any, record: Optional[dict], fallback: str = "clamped") -> str:
-    """Which rule produced *value*: ``"derived"``, ``"asked"`` or ``"clamped"``.
+#: Below this, an ask is NOT an ask. The board's own filings settle the vocabulary: 997 platform
+#: creations asked a value in ``10..999`` (10, 12, 15, 20, 25, 30, 40, 42, 45, 48, 50, 55, 60,
+#: 62-66, 70, 75, 80, 84, 85, 90, 95, 900, 950, ...), and 7 of those DECLARED a severity - a
+#: filer reaching for "very urgent" through the retired ordinal scale, not stating a contradiction
+#: in band terms. Treating those as a deliberate band ask would refuse an incident card at create
+#: (measured, card t_4301046d), so a sub-thousand ask is recorded as an IGNORED ask and the
+#: declaration decides.
+NO_ASK_BELOW = 1000
+
+
+def is_ask(value: Any) -> bool:
+    """Is *value* a real priority ASK (``>= NO_ASK_BELOW``) rather than a no-ask placeholder?"""
+    try:
+        return int(value) >= NO_ASK_BELOW
+    except (TypeError, ValueError):
+        return False
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def decision(value: Any, record: Optional[dict], *, domain_clamped: bool = False,
+             fallback: str = "asked") -> str:
+    """Which rule produced *value*: ``"derived"``, ``"clamped"`` or ``"asked"``.
 
     Carried in the ``created`` event's ``priority_policy`` because the number alone cannot say
     which rule won, and the three are not interchangeable:
@@ -215,33 +241,35 @@ def decision(value: Any, record: Optional[dict], fallback: str = "clamped") -> s
     * ``"derived"`` - the card's OWN declaration (its severity, via the policy's
       ``sev_priority``) produced the value. The ask did not decide, so an ask that pointed
       somewhere else is overridden rather than honoured;
-    * ``"asked"``  - the value is the one the caller asked for;
     * ``"clamped"`` - a band/domain projection moved the ask, so the value encodes the TIER
-      and not the urgency.
+      and not the urgency. Decided by the CLAMP FACT (``domain_clamped`` - the seam that clamped
+      says so) or by the record showing an ask it did not honour, never by the arithmetic
+      coincidence that the clamp target happens to equal the ask;
+    * ``"asked"``  - nothing moved it: the value is the one the caller asked for.
 
     Measured before this field existed (card t_4301046d): 237 SEV1 ``created`` payloads
     carried ``sev_priority`` 999000 beside ``applied`` 900000 and no field saying which of the
-    two the card was actually ordered at, so a reader could not tell a lifted card from a
-    clamped one - or from one whose ask happened to already be right.
+    two the card was actually ordered at. The first cut of this field compared
+    ``sev_priority == value`` and otherwise ``asked == value``, which reported ``"asked"``
+    whenever a clamp target coincided with the ask - and 900000 is both the ordinary top and
+    the dominant SEV ask (423 of 461 filings) - so the field lied in exactly the arm it exists
+    for.
     """
-    if not record:
-        return fallback
-    sev = record.get("sev_priority")
-    if sev is not None:
-        try:
-            if int(sev) == int(value):
-                return "derived"
-        except (TypeError, ValueError):
-            pass
-    asked = record.get("asked")
-    if asked is None:
-        # The policy recorded no ask: only the caller knows whether it moved the value, so the
-        # seam that called this says which reading applies.
-        return fallback
-    try:
-        return "asked" if int(asked) == int(value) else "clamped"
-    except (TypeError, ValueError):
-        return fallback
+    record = record or {}
+    sev = _int_or_none(record.get("sev_priority"))
+    if sev is not None and sev == int(value):
+        return "derived"
+    if domain_clamped:
+        return "clamped"
+    asked = _int_or_none(record.get("asked"))
+    if asked is not None and asked != int(value):
+        return "clamped"
+    applied = _int_or_none(record.get("applied"))
+    if applied is not None and applied != int(value):
+        # the record says what the seam placed and it is not what landed here: the value was
+        # moved again downstream, so the ask did not decide it.
+        return "clamped"
+    return fallback
 
 
 def clamp_to_domain(applied: int, record: Optional[dict], floor: Optional[int] = None,
@@ -263,16 +291,16 @@ def clamp_to_domain(applied: int, record: Optional[dict], floor: Optional[int] =
     already), and every other out-of-domain value is still clamped and recorded. Defaulting
     ``floor`` to ``None`` keeps every caller that has no floor byte-identical.
 
-    ``marker`` is the card's OWN reserved-tranche evidence - the marker name
-    ``kanban_db.tranche_entitlement`` answers (``"sev1"``, ``"sev-token"``,
-    ``"operator-ask-stamp"``) - and it is the defect this door used to cause (card t_4301046d):
-    a severity the policy DERIVED below the domain edge was clamped back to the domain edge,
-    i.e. stored level with routine work, so a SEV1 was ordered behind ordinary cards BY
-    CONSTRUCTION. The domain edge is a claim about DESIGNATION, and a card that declares its
-    own severity is not claiming a designation it lacks: ``sev1: true`` with an applied value
-    under the routine band is a severity field that lies. With a marker and a tranche value the
-    value stands and the record names the evidence that admitted it. Without one the clamp is
-    unchanged, and the record now says the evidence was absent.
+    ``marker`` is the card's OWN reserved-tranche evidence - the severity rank
+    ``kanban_db.tranche_entitlement`` answers (``"sev1"``/``"sev2"``/``"sev3"``, read from the
+    WIRED policy module's own ``sev_rank``) - and it is the defect this door used to cause
+    (card t_4301046d): a severity the policy DERIVED below the domain edge was clamped back to
+    the domain edge, i.e. stored level with routine work, so a SEV1 was ordered behind ordinary
+    cards BY CONSTRUCTION. The domain edge is a claim about DESIGNATION, and a card that
+    declares its own severity is not claiming a designation it lacks: ``sev1: true`` with an
+    applied value under the routine band is a severity field that lies. With a marker and a
+    tranche value the value stands and the record names the evidence that admitted it. Without
+    one the clamp is unchanged, and the record now says the evidence was absent.
     """
     value = int(applied)
     if in_ordinary(value):
@@ -283,7 +311,11 @@ def clamp_to_domain(applied: int, record: Optional[dict], floor: Optional[int] =
         merged["decision"] = decision(value, merged, fallback="asked")
         return value, merged
     if floor is not None and value == int(floor) == TRANCHE_FLOOR:
-        return value, record
+        if record is None:
+            return value, record
+        merged = dict(record)
+        merged["decision"] = decision(value, merged, fallback="asked")
+        return value, merged
     if marker and in_tranche(value):
         merged = dict(record or {})
         merged["applied"] = value
@@ -300,6 +332,21 @@ def clamp_to_domain(applied: int, record: Optional[dict], floor: Optional[int] =
             ),
         }
         merged["decision"] = decision(value, merged, fallback="asked")
+        if merged["decision"] == "derived":
+            # NAME the ask the derivation overrode. A sub-thousand ask is the board's no-ask
+            # vocabulary (see NO_ASK_BELOW), and any other ask here is a number the declaration
+            # decided against - either way the reader must be able to see the number that did
+            # NOT decide, instead of finding it silently replaced.
+            asked = _int_or_none(merged.get("asked"))
+            if asked is not None and asked != value:
+                merged["overridden_ask"] = asked
+                merged["overridden_reason"] = (
+                    "the ask %d is below %d - the board's no-ask vocabulary - so nothing was "
+                    "asked and the declaration decides" % (asked, NO_ASK_BELOW)
+                    if not is_ask(asked) else
+                    "the declared severity derives this value; the ask %d does not decide it"
+                    % asked
+                )
         return value, merged
     clamped = ORDINARY_MAX if value > ORDINARY_MAX else ORDINARY_MIN
     merged = dict(record or {})
@@ -311,7 +358,7 @@ def clamp_to_domain(applied: int, record: Optional[dict], floor: Optional[int] =
         "bounds": [ORDINARY_MIN, ORDINARY_MAX],
         "reason": domain_reason(value),
     }
-    merged["decision"] = decision(clamped, merged)
+    merged["decision"] = decision(clamped, merged, domain_clamped=True)
     return clamped, merged
 
 
@@ -572,9 +619,22 @@ def priority_for_create(
         return _unavailable(requested, where, PolicyError("non-integer 'applied': %s" % exc))
     asked = int(requested)
     if applied == asked:
-        # Nothing moved, so the row and its event stay exactly as they are today: the key
-        # appears only on a card the policy actually placed.
-        return Verdict(applied, None)
+        # Nothing moved, but the event must still say WHICH rule placed the card (card
+        # t_4301046d, DoD bullet 2): a wired board that leaves a filing untouched used to emit
+        # NO ``priority_policy`` key at all, so "asked" - the most common decision on the board -
+        # was the one reading a card could not carry. The payload stays minimal: the two numbers
+        # and the rule, not the policy's whole provenance.
+        quiet = {"asked": asked, "applied": applied, "clamped": False}
+        # ... AND THE DECLARATION RIDES WITH IT. Fielding only the two numbers dropped the
+        # policy's own ``sev_priority`` whenever the ladder left the ask alone - the wired
+        # module exempts a negative ask before it reads the severity, so a SEV1 filed at -1
+        # came back ``applied=-1, sev_priority=999000`` and the quiet path threw the second
+        # number away, i.e. exactly the two-numbers-one-field lie this card exists to end.
+        for key in ("sev", "sev_priority", "sev1"):
+            if record.get(key) not in (None, ""):
+                quiet[key] = record[key]
+        quiet["decision"] = decision(applied, record, fallback="asked")
+        return Verdict(applied, quiet)
     verbatim = dict(record)
     # The record is attached because the value moved, so the flag is a fact about the card
     # rather than a policy's self-description - filled in only if the record omitted it.
