@@ -501,6 +501,10 @@ _SPECS = [
         _approval_flag("a bulk schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
+        _arg("--force", dest="force", action="store_true",
+             help="Override a HUMAN_HOLD (needs_input / sticky / manual hold). IN_FLIGHT and "
+                  "an unreadable PR carrier (UNCHECKED) still refuse: a live run is released "
+                  "by its dispatcher, not overwritten from here."),
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),

@@ -97,7 +97,8 @@ def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
         assert task.status == "blocked"
         assert task.consecutive_failures < 10
 
-        kb.unblock_task(conn, tid)
+        # The OPERATOR door: a sticky breaker trip is exactly what --force exists for.
+        kb.unblock_task(conn, tid, force=True)
         assert kb.get_task(conn, tid).status == "ready"
         kb.recompute_ready(conn, failure_limit=10)
         assert kb.get_task(conn, tid).status == "ready"
