@@ -7,7 +7,7 @@ import psutil
 import pytest
 
 from hermes_cli.process_identity import worker_birth
-from gateway.session_worker_child import reserve_child_execution
+from persistence.sqlite.workers._gateway import reserve_child_execution
 from hermes_state import SessionDB
 import hermes_state_runtime as rt
 

@@ -160,7 +160,7 @@ class SessionRewindMixin:
         pin ``rewind_user_turn`` needs is unnecessary here. Falls back to the newest user turn when no
         usable boundary was supplied.
         """
-        from agent.context_compressor import split_user_originated_turn
+        from session_rules.turns import split_user_originated_turn
         if isinstance(boundary_row_id, int) and boundary_row_id > 0:
             with self._read_ctx() as conn:
                 row = conn.execute(
@@ -240,7 +240,7 @@ class SessionRewindMixin:
         """Every read and check :meth:`rewind_user_turn` makes before its write, with no write: the
         gateway ``/retry`` commits the planned rewind inside its re-send's admission transaction
         (``rewind_in_transaction`` with the plan's pins), so a refused re-send leaves it unapplied."""
-        from agent.context_compressor import (
+        from session_rules.turns import (
             history_before_user_originated_turn, retryable_user_text,
             split_user_originated_turn, user_originated_turn_view)
         from agent.session_persistence import _is_ephemeral_scaffolding

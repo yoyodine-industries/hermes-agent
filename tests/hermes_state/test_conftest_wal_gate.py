@@ -14,7 +14,7 @@ import sqlite3
 
 import pytest
 
-from hermes_state_wal import is_sqlite_wal_reset_vulnerable
+from sqlite_support import is_sqlite_wal_reset_vulnerable
 from tests.conftest import _wal_is_usable
 
 

@@ -24,7 +24,7 @@ import pytest
 
 import hermes_state
 import hermes_state_repair
-import hermes_state_wal
+import sqlite_support
 from hermes_state import SessionDB, is_malformed_db_error
 from hermes_state_repair import repair_state_db_schema
 
@@ -681,7 +681,7 @@ def _configure_journal_mode(monkeypatch, tmp_path, mode) -> None:
         yaml.safe_dump({"database": {"journal_mode": mode}}), encoding="utf-8",
     )
     monkeypatch.setattr(
-        hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda **kwargs: False,
+        sqlite_support, "is_sqlite_wal_reset_vulnerable", lambda **kwargs: False,
     )
 
 
@@ -732,7 +732,7 @@ def test_repair_restore_matches_canonical_on_vulnerable_sqlite(
     db_path = tmp_path / "state.db"
     _configure_journal_mode(monkeypatch, tmp_path, "wal")
     monkeypatch.setattr(
-        hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda **kwargs: True
+        sqlite_support, "is_sqlite_wal_reset_vulnerable", lambda **kwargs: True
     )
     _build_healthy_db(db_path)
     conn = sqlite3.connect(str(db_path))
@@ -800,7 +800,7 @@ def test_repair_restore_failure_is_nonfatal(
         raise sqlite3.OperationalError("database is locked")
 
     with (
-        patch.object(hermes_state_wal, "apply_wal_with_fallback", _refused),
+        patch.object(sqlite_support, "apply_wal_with_fallback", _refused),
         caplog.at_level(logging.WARNING, logger="hermes_state"),
     ):
         report = repair_state_db_schema(db_path)

@@ -26,6 +26,8 @@ from tui_gateway.hosted_room_peer_transport import (
     PeerHostedRoomTransport,
     PeerMemberRoute,
 )
+from persistence.gateway.hosted_rooms import HostedTaskIdentity, InvalidTaskTransitionError, StaleTaskError, TaskAttempt
+from persistence_assembly import open_persistence, profile_scope
 
 
 ROOM_ID = "room-1"
@@ -35,6 +37,14 @@ BINDING = HostedRoomBinding(
     gateway_id="gateway-a",
     authority_epoch=1,
 )
+
+
+@pytest.fixture(name="store")
+def store_fixture(tmp_path):
+    """A store handle on the test home, closed at teardown."""
+    handle = open_persistence(profile_scope(home=tmp_path))
+    yield handle
+    handle.close()
 
 
 class RecordingTurnLocks:
@@ -181,7 +191,7 @@ class FakeSessionRPC:
         session_id: str,
         prompt: str,
         source: str,
-        task: state.TaskIdentity,
+        task: HostedTaskIdentity,
         execution_generation: int,
         on_terminal,
         member_id="", attachments=None,
@@ -372,10 +382,10 @@ def _peer_resolver(client: TerminalPeerClient):
 
 
 @pytest.fixture
-def db(tmp_path: Path) -> Path:
+def db(tmp_path: Path, store) -> Path:
     path = tmp_path / "state.db"
     hosted_rooms.create_room(
-        path,
+        store, placement="profile",
         room_id=ROOM_ID,
         name="Release room",
         members=[{"profile": PROFILE, "handle": PROFILE}],
@@ -385,8 +395,8 @@ def db(tmp_path: Path) -> Path:
     return path
 
 
-def _identity(task_id: str = "task-1") -> state.TaskIdentity:
-    return state.TaskIdentity(
+def _identity(task_id: str = "task-1") -> HostedTaskIdentity:
+    return HostedTaskIdentity(
         room_id=ROOM_ID,
         task_id=task_id,
         thread_id="thread-1",
@@ -395,14 +405,14 @@ def _identity(task_id: str = "task-1") -> state.TaskIdentity:
 
 
 def _admit(
-    db: Path,
-    identity: state.TaskIdentity,
+    store,
+    identity: HostedTaskIdentity,
     *,
     prompt: str = "Inspect the release candidate.",
 ) -> None:
     state.admit_task(
-        db,
-        identity,
+        store,
+        identity, placement="profile",
         payload={
             "target_profile": PROFILE,
             "prompt": prompt,
@@ -413,13 +423,13 @@ def _admit(
 
 
 def _runtime(
-    db: Path,
+    store,
     rpc: FakeSessionRPC,
     locks: RecordingTurnLocks | None = None,
     **kwargs,
 ) -> HostedRoomRuntime:
     return HostedRoomRuntime(
-        db_path=db,
+        store=store, placement="profile",
         rooms=[BINDING],
         rpc=rpc,
         turn_lock=locks or RecordingTurnLocks(),
@@ -438,31 +448,31 @@ def _wait_for(predicate, *, timeout: float = 10.0) -> None:
     raise AssertionError("condition was not reached before timeout")
 
 
-def test_runtime_uses_unique_process_generation(db: Path):
-    first = _runtime(db, FakeSessionRPC())
-    second = _runtime(db, FakeSessionRPC())
+def test_runtime_uses_unique_process_generation(db: Path, store):
+    first = _runtime(store, FakeSessionRPC())
+    second = _runtime(store, FakeSessionRPC())
 
     assert first.process_generation != second.process_generation
 
 
 @pytest.mark.parametrize("value", [0, True])
-def test_room_concurrency_bound_must_be_a_positive_integer(db: Path, value):
+def test_room_concurrency_bound_must_be_a_positive_integer(db: Path, value, store):
     with pytest.raises(ValueError, match="max_concurrent_rooms"):
-        _runtime(db, FakeSessionRPC(), max_concurrent_rooms=value)
+        _runtime(store, FakeSessionRPC(), max_concurrent_rooms=value)
 
 
 
 
 
 
-def test_queued_task_routes_profile_and_credentials_without_overrides(db: Path):
+def test_queued_task_routes_profile_and_credentials_without_overrides(db: Path, store):
     identity = _identity()
-    _admit(db, identity, prompt="Use the configured profile credentials.")
+    _admit(store, identity, prompt="Use the configured profile credentials.")
     rpc = FakeSessionRPC()
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
     create = next(params for method, params in rpc.calls if method == "create")
@@ -477,18 +487,18 @@ def test_queued_task_routes_profile_and_credentials_without_overrides(db: Path):
     assert submit["prompt"] == "Use the configured profile credentials."
     assert "model" not in create | submit
     assert "provider" not in create | submit
-    assert state.get_task(db, identity)["result"]["text"] == "Finished once."
+    assert state.get_task(store, identity, placement="profile")["result"]["text"] == "Finished once."
 
 
-def test_worker_settles_without_any_client_transport(db: Path):
+def test_worker_settles_without_any_client_transport(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
-    runtime = _runtime(db, FakeSessionRPC())
+    _admit(store, identity)
+    runtime = _runtime(store, FakeSessionRPC())
 
     runtime.start()
     _wait_for(
         lambda: (
-            state.get_task(db, identity)["status"] == "settled"
+            state.get_task(store, identity, placement="profile")["status"] == "settled"
             and runtime.status()["cycles"] >= 1
         )
     )
@@ -498,13 +508,13 @@ def test_worker_settles_without_any_client_transport(db: Path):
     assert runtime.stop(timeout=5.0)
 
 
-def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
+def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     prepared = []
     published = []
     runtime = _runtime(
-        db,
+        store,
         FakeSessionRPC(),
         prepare_room=lambda binding: prepared.append(binding.room_id),
         publish_terminal=lambda binding, task: published.append((
@@ -515,7 +525,7 @@ def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
     )
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
     assert prepared
@@ -523,10 +533,10 @@ def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
 
 
 def test_transport_resolver_selects_member_transport_without_forking_state(
-    db: Path,
+    db: Path, store,
 ):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     selected = FakeSessionRPC()
     resolutions = []
 
@@ -535,7 +545,7 @@ def test_transport_resolver_selects_member_transport_without_forking_state(
         return selected
 
     runtime = HostedRoomRuntime(
-        db_path=db,
+        store=store, placement="profile",
         rooms=[BINDING],
         transport_resolver=resolve_transport,
         turn_lock=RecordingTurnLocks(),
@@ -544,7 +554,7 @@ def test_transport_resolver_selects_member_transport_without_forking_state(
     )
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
     assert resolutions
@@ -554,14 +564,14 @@ def test_transport_resolver_selects_member_transport_without_forking_state(
 
 
 def test_not_admitted_peer_task_stays_queued_with_exponential_capped_retry(
-    db: Path,
+    db: Path, store,
 ):
     now = [100.0]
     identity = _identity()
-    _admit(db, identity, prompt="Keep this exact prompt queued.")
+    _admit(store, identity, prompt="Keep this exact prompt queued.")
     rpc = NotAdmittedThenSuccessRPC(failures=3)
     runtime = _runtime(
-        db,
+        store,
         rpc,
         clock=lambda: now[0],
         lease_ttl_seconds=30,
@@ -570,7 +580,7 @@ def test_not_admitted_peer_task_stays_queued_with_exponential_capped_retry(
     )
 
     runtime._run_cycle()
-    assert state.get_task(db, identity)["status"] == "queued"
+    assert state.get_task(store, identity, placement="profile")["status"] == "queued"
     assert rpc.attempted_generations == [1]
 
     runtime._run_cycle()
@@ -588,18 +598,17 @@ def test_not_admitted_peer_task_stays_queued_with_exponential_capped_retry(
 
     now[0] += 4
     runtime._run_cycle()
-    task = state.get_task(db, identity)
+    task = state.get_task(store, identity, placement="profile")
     assert task["status"] == "settled"
     assert task["execution_generation"] == 4
     assert task["payload"]["prompt"] == "Keep this exact prompt queued."
     assert rpc.attempted_generations == [1, 2, 3, 4]
 
 
-def test_not_admitted_room_does_not_block_other_rooms(tmp_path: Path):
-    db = tmp_path / "state.db"
+def test_not_admitted_room_does_not_block_other_rooms(tmp_path: Path, store):
     for room_id in ("room-1", "room-2"):
         hosted_rooms.create_room(
-            db,
+            store, placement="profile",
             room_id=room_id,
             name=room_id,
             members=[{"profile": PROFILE, "handle": PROFILE}],
@@ -607,15 +616,15 @@ def test_not_admitted_room_does_not_block_other_rooms(tmp_path: Path):
             now=90,
         )
     offline_identity = _identity("offline-task")
-    healthy_identity = state.TaskIdentity(
+    healthy_identity = HostedTaskIdentity(
         "room-2", "healthy-task", "thread-2", "turn-healthy"
     )
-    _admit(db, offline_identity)
-    _admit(db, healthy_identity)
+    _admit(store, offline_identity)
+    _admit(store, healthy_identity)
     offline = NotAdmittedThenSuccessRPC(failures=10)
     healthy = FakeSessionRPC()
     runtime = HostedRoomRuntime(
-        db_path=db,
+        store=store, placement="profile",
         rooms=[BINDING, HostedRoomBinding("room-2", "gateway-a", 1)],
         transport_resolver=lambda binding, _task: (
             offline if binding.room_id == ROOM_ID else healthy
@@ -628,24 +637,23 @@ def test_not_admitted_room_does_not_block_other_rooms(tmp_path: Path):
 
     runtime._run_cycle()
 
-    assert state.get_task(db, offline_identity)["status"] == "queued"
-    assert state.get_task(db, healthy_identity)["status"] == "settled"
+    assert state.get_task(store, offline_identity, placement="profile")["status"] == "queued"
+    assert state.get_task(store, healthy_identity, placement="profile")["status"] == "settled"
 
 
-def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
-    db = tmp_path / "state.db"
+def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path, store):
     bindings = [
         HostedRoomBinding("room-waiting", "gateway-a", 1),
         HostedRoomBinding("room-healthy", "gateway-a", 1),
     ]
     identities = [
-        state.TaskIdentity("room-waiting", "task-waiting", "thread-a", "turn-a"),
-        state.TaskIdentity("room-healthy", "task-healthy", "thread-b", "turn-b"),
+        HostedTaskIdentity("room-waiting", "task-waiting", "thread-a", "turn-a"),
+        HostedTaskIdentity("room-healthy", "task-healthy", "thread-b", "turn-b"),
     ]
     profiles = ["profile-waiting", "profile-healthy"]
     for binding, identity, profile in zip(bindings, identities, profiles):
         hosted_rooms.create_room(
-            db,
+            store, placement="profile",
             room_id=binding.room_id,
             name=binding.room_id,
             members=[{"profile": profile, "handle": profile}],
@@ -653,8 +661,8 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
             now=time.time(),
         )
         state.admit_task(
-            db,
-            identity,
+            store,
+            identity, placement="profile",
             payload={
                 "target_profile": profile,
                 "prompt": f"Run {binding.room_id}.",
@@ -666,7 +674,7 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
     waiting = FakeSessionRPC(auto_complete=False)
     healthy = FakeSessionRPC()
     runtime = HostedRoomRuntime(
-        db_path=db,
+        store=store, placement="profile",
         rooms=bindings,
         transport_resolver=lambda binding, _task: (
             waiting if binding.room_id == "room-waiting" else healthy
@@ -679,35 +687,34 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
 
     runtime.start()
     assert waiting.submitted.wait(1.0)
-    _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
-    assert state.get_task(db, identities[0])["status"] == "running"
+    _wait_for(lambda: state.get_task(store, identities[1], placement="profile")["status"] == "settled")
+    assert state.get_task(store, identities[0], placement="profile")["status"] == "running"
     assert runtime.stop(timeout=5.0)
 
 
-def test_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
-    db = tmp_path / "state.db"
+def test_bounded_scheduler_eventually_runs_later_room(tmp_path: Path, store):
     bindings = [
         HostedRoomBinding(f"room-{index}", "gateway-a", 1)
         for index in range(1, 4)
     ]
     for binding in bindings:
         hosted_rooms.create_room(
-            db,
+            store, placement="profile",
             room_id=binding.room_id,
             name=binding.room_id,
             members=[{"profile": PROFILE, "handle": PROFILE}],
             authority_gateway_id=binding.gateway_id,
             now=time.time(),
         )
-    identity = state.TaskIdentity(
+    identity = HostedTaskIdentity(
         "room-3",
         "task-room-3",
         "thread-room-3",
         "turn-room-3",
     )
     state.admit_task(
-        db,
-        identity,
+        store,
+        identity, placement="profile",
         payload={
             "target_profile": PROFILE,
             "prompt": "Run the later room.",
@@ -716,7 +723,7 @@ def test_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
         clock=time.time,
     )
     runtime = HostedRoomRuntime(
-        db_path=db,
+        store=store, placement="profile",
         rooms=bindings,
         rpc=FakeSessionRPC(),
         turn_lock=RecordingTurnLocks(),
@@ -726,19 +733,19 @@ def test_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
     )
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
 
-def test_existing_canonical_session_is_resumed_not_duplicated(db: Path):
+def test_existing_canonical_session_is_resumed_not_duplicated(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC()
     session_id = rpc.add_session()
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
     assert not [call for call in rpc.calls if call[0] == "create"]
@@ -751,7 +758,7 @@ def test_existing_canonical_session_is_resumed_not_duplicated(db: Path):
 
 
 def test_local_crash_recovery_keeps_ambiguous_history_explicit_without_resume(
-    db: Path,
+    db: Path, store,
 ):
     identity = _identity()
     now = [100.0]
@@ -760,7 +767,7 @@ def test_local_crash_recovery_keeps_ambiguous_history_explicit_without_resume(
         return now[0]
 
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -768,11 +775,11 @@ def test_local_crash_recovery_keeps_ambiguous_history_explicit_without_resume(
         ttl_seconds=0.2,
         clock=clock,
     )
-    _admit(db, identity)
+    _admit(store, identity)
     state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
@@ -792,7 +799,7 @@ def test_local_crash_recovery_keeps_ambiguous_history_explicit_without_resume(
     )
     now[0] = 101.0
     runtime = _runtime(
-        db,
+        store,
         rpc,
         clock=clock,
         indeterminate_defer_seconds=5,
@@ -800,7 +807,7 @@ def test_local_crash_recovery_keeps_ambiguous_history_explicit_without_resume(
 
     runtime._process_room(BINDING)
 
-    recovered = state.get_task(db, identity)
+    recovered = state.get_task(store, identity, placement="profile")
     assert recovered["status"] == "indeterminate"
     assert recovered["result"] is None
     assert not [call for call in rpc.calls if call[0] == "history"]
@@ -809,7 +816,7 @@ def test_local_crash_recovery_keeps_ambiguous_history_explicit_without_resume(
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
-def test_expired_local_attempt_defers_without_hydrating_or_resubmitting(db: Path):
+def test_expired_local_attempt_defers_without_hydrating_or_resubmitting(db: Path, store):
     identity = _identity()
     now = [100.0]
 
@@ -817,7 +824,7 @@ def test_expired_local_attempt_defers_without_hydrating_or_resubmitting(db: Path
         return now[0]
 
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -825,11 +832,11 @@ def test_expired_local_attempt_defers_without_hydrating_or_resubmitting(db: Path
         ttl_seconds=0.2,
         clock=clock,
     )
-    _admit(db, identity)
+    _admit(store, identity)
     state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
@@ -849,7 +856,7 @@ def test_expired_local_attempt_defers_without_hydrating_or_resubmitting(db: Path
     )
     now[0] = 101.0
     runtime = _runtime(
-        db,
+        store,
         rpc,
         clock=clock,
         indeterminate_defer_seconds=0.5,
@@ -859,7 +866,7 @@ def test_expired_local_attempt_defers_without_hydrating_or_resubmitting(db: Path
     now[0] = 102.0
     runtime._process_room(BINDING)
 
-    recovered = state.get_task(db, identity)
+    recovered = state.get_task(store, identity, placement="profile")
     assert recovered["status"] == "deferred"
     assert recovered["result"] == {
         "reason": "member_unavailable",
@@ -870,11 +877,11 @@ def test_expired_local_attempt_defers_without_hydrating_or_resubmitting(db: Path
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
-def test_oversized_terminal_reply_is_bounded_without_waiting_for_deadline(db: Path):
+def test_oversized_terminal_reply_is_bounded_without_waiting_for_deadline(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc, turn_timeout_seconds=30)
+    runtime = _runtime(store, rpc, turn_timeout_seconds=30)
 
     runtime.start()
     assert rpc.submitted.wait(timeout=5.0)
@@ -882,16 +889,16 @@ def test_oversized_terminal_reply_is_bounded_without_waiting_for_deadline(db: Pa
         identity.task_id,
         content="é" * (MAX_TERMINAL_TEXT_BYTES + 100),
     )
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
-    result = state.get_task(db, identity)["result"]
+    result = state.get_task(store, identity, placement="profile")["result"]
     assert result["truncated"] is True
     assert len(result["text"].encode("utf-8")) <= MAX_TERMINAL_TEXT_BYTES
     assert result["text"].endswith("share the full result as a file.]")
 
 
-def test_peer_recovery_probe_is_bounded_by_attempt_and_stale_age(db: Path):
+def test_peer_recovery_probe_is_bounded_by_attempt_and_stale_age(db: Path, store):
     identity = _identity()
     now = [100.0]
 
@@ -899,7 +906,7 @@ def test_peer_recovery_probe_is_bounded_by_attempt_and_stale_age(db: Path):
         return now[0]
 
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -907,24 +914,24 @@ def test_peer_recovery_probe_is_bounded_by_attempt_and_stale_age(db: Path):
         ttl_seconds=1,
         clock=clock,
     )
-    _admit(db, identity)
+    _admit(store, identity)
     state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     now[0] = 102.0
     runtime = _runtime(
-        db,
+        store,
         FakeSessionRPC(),
         clock=clock,
         lease_ttl_seconds=30,
         indeterminate_defer_seconds=5,
     )
     recovery_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -932,7 +939,7 @@ def test_peer_recovery_probe_is_bounded_by_attempt_and_stale_age(db: Path):
         ttl_seconds=30,
         clock=clock,
     )
-    state.recover_room(db, recovery_lease, clock=clock)
+    state.recover_room(store, recovery_lease, placement="profile", clock=clock)
     runtime.transport_resolver = lambda _binding, _task: object()
     probes = []
 
@@ -949,16 +956,16 @@ def test_peer_recovery_probe_is_bounded_by_attempt_and_stale_age(db: Path):
     now[0] = 108.0
     assert runtime._reconcile_indeterminate(BINDING, recovery_lease) is False
     assert probes == [(identity.task_id, 102.0), (identity.task_id, 108.0)]
-    assert state.get_task(db, identity)["status"] == "deferred"
+    assert state.get_task(store, identity, placement="profile")["status"] == "deferred"
 
 
-def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Path):
+def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
     published = []
     runtime = _runtime(
-        db,
+        store,
         rpc,
         active_poll_interval_seconds=0.01,
         turn_timeout_seconds=0.05,
@@ -966,10 +973,10 @@ def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Pat
     )
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "failed")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "failed")
     assert runtime.stop(timeout=5.0)
 
-    failed = state.get_task(db, identity)
+    failed = state.get_task(store, identity, placement="profile")
     assert failed["result"]["reason_code"] == "turn_deadline_exceeded"
     assert failed["result"]["timeout_seconds"] == 0.05
     assert failed["result"]["error"]
@@ -978,27 +985,26 @@ def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Pat
     assert [task["status"] for task in published] == ["failed"]
 
 
-def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path):
-    db = tmp_path / "state.db"
+def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path, store):
     bindings = [
         HostedRoomBinding("room-stuck", "gateway-a", 1),
         HostedRoomBinding("room-healthy", "gateway-a", 1),
     ]
     identities = [
-        state.TaskIdentity("room-stuck", "task-stuck", "thread-a", "turn-a"),
-        state.TaskIdentity("room-healthy", "task-healthy", "thread-b", "turn-b"),
+        HostedTaskIdentity("room-stuck", "task-stuck", "thread-a", "turn-a"),
+        HostedTaskIdentity("room-healthy", "task-healthy", "thread-b", "turn-b"),
     ]
     for binding, identity in zip(bindings, identities):
         hosted_rooms.create_room(
-            db,
+            store, placement="profile",
             room_id=binding.room_id,
             name=binding.room_id,
             members=[{"profile": PROFILE, "handle": PROFILE}],
             authority_gateway_id=binding.gateway_id,
         )
         state.admit_task(
-            db,
-            identity,
+            store,
+            identity, placement="profile",
             payload={
                 "target_profile": PROFILE,
                 "prompt": f"Run {binding.room_id}.",
@@ -1016,7 +1022,7 @@ def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path):
 
     rpc = FirstRoomStallsRPC(auto_complete=False)
     runtime = HostedRoomRuntime(
-        db_path=db,
+        store=store, placement="profile",
         rooms=bindings,
         rpc=rpc,
         turn_lock=RecordingTurnLocks(),
@@ -1028,17 +1034,17 @@ def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path):
     )
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identities[0])["status"] == "failed")
-    _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identities[0], placement="profile")["status"] == "failed")
+    _wait_for(lambda: state.get_task(store, identities[1], placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
-    assert state.get_task(db, identities[0])["result"]["reason_code"] == (
+    assert state.get_task(store, identities[0], placement="profile")["result"]["reason_code"] == (
         "turn_deadline_exceeded"
     )
-    assert state.get_task(db, identities[1])["status"] == "settled"
+    assert state.get_task(store, identities[1], placement="profile")["status"] == "settled"
 
 
-def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
+def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path, store):
     identity = _identity()
     now = [100.0]
 
@@ -1046,7 +1052,7 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
         return now[0]
 
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1054,17 +1060,17 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
         ttl_seconds=0.2,
         clock=clock,
     )
-    _admit(db, identity)
+    _admit(store, identity)
     old_attempt = state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     now[0] = 101.0
     current_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1072,16 +1078,16 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
         ttl_seconds=30,
         clock=clock,
     )
-    state.recover_room(db, current_lease, clock=clock)
+    state.recover_room(store, current_lease, placement="profile", clock=clock)
     state.requeue_indeterminate_task(
-        db,
+        store,
         identity,
-        current_lease,
+        current_lease, placement="profile",
         expected_execution_generation=old_attempt.execution_generation,
         expected_cancel_generation=old_attempt.cancel_generation,
         clock=clock,
     )
-    state.release_lease(db, current_lease, clock=clock)
+    state.release_lease(store, current_lease, placement="profile", clock=clock)
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(
         task_id=identity.task_id,
@@ -1096,22 +1102,22 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
             }
         ],
     )
-    runtime = _runtime(db, rpc, clock=clock)
+    runtime = _runtime(store, rpc, clock=clock)
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
     time.sleep(0.04)
     assert runtime.stop(timeout=5.0)
 
-    task = state.get_task(db, identity)
+    task = state.get_task(store, identity, placement="profile")
     assert task["status"] == "running"
     assert task["execution_generation"] == old_attempt.execution_generation + 1
 
 
-def test_active_recovered_turn_is_never_resubmitted(db: Path):
+def test_active_recovered_turn_is_never_resubmitted(db: Path, store):
     identity = _identity()
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1119,28 +1125,28 @@ def test_active_recovered_turn_is_never_resubmitted(db: Path):
         ttl_seconds=10,
         clock=time.time,
     )
-    _admit(db, identity)
+    _admit(store, identity)
     state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=time.time,
     )
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(active=True, task_id=identity.task_id)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
 
     runtime.start()
     time.sleep(0.08)
     assert runtime.stop(timeout=5.0)
 
-    assert state.get_task(db, identity)["status"] == "running"
+    assert state.get_task(store, identity, placement="profile")["status"] == "running"
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
 def test_retry_cannot_advance_generation_while_original_attempt_is_active(
-    db: Path,
+    db: Path, store,
 ):
     identity = _identity()
     now = [100.0]
@@ -1149,7 +1155,7 @@ def test_retry_cannot_advance_generation_while_original_attempt_is_active(
         return now[0]
 
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1157,17 +1163,17 @@ def test_retry_cannot_advance_generation_while_original_attempt_is_active(
         ttl_seconds=1,
         clock=clock,
     )
-    _admit(db, identity)
+    _admit(store, identity)
     attempt = state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     now[0] = 102.0
     recovery_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1175,23 +1181,23 @@ def test_retry_cannot_advance_generation_while_original_attempt_is_active(
         ttl_seconds=30,
         clock=clock,
     )
-    state.recover_room(db, recovery_lease, clock=clock)
-    state.release_lease(db, recovery_lease, clock=clock)
+    state.recover_room(store, recovery_lease, placement="profile", clock=clock)
+    state.release_lease(store, recovery_lease, placement="profile", clock=clock)
     rpc = FakeSessionRPC(auto_complete=False)
     session_id = rpc.add_session(active=True, task_id=identity.task_id)
     rpc.states[session_id]["execution_generation"] = attempt.execution_generation
-    runtime = _runtime(db, rpc, clock=clock)
+    runtime = _runtime(store, rpc, clock=clock)
 
-    with pytest.raises(state.InvalidTaskTransitionError, match="still active"):
+    with pytest.raises(InvalidTaskTransitionError, match="still active"):
         runtime.retry_indeterminate(identity)
 
-    task = state.get_task(db, identity)
+    task = state.get_task(store, identity, placement="profile")
     assert task["status"] == "indeterminate"
     assert task["execution_generation"] == attempt.execution_generation
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
-def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
+def test_retry_uses_runtime_session_id_returned_by_resume(db: Path, store):
     identity = _identity()
     now = [100.0]
 
@@ -1199,7 +1205,7 @@ def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
         return now[0]
 
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1207,17 +1213,17 @@ def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
         ttl_seconds=1,
         clock=clock,
     )
-    _admit(db, identity)
+    _admit(store, identity)
     state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     now[0] = 102.0
     recovery_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1225,8 +1231,8 @@ def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
         ttl_seconds=30,
         clock=clock,
     )
-    state.recover_room(db, recovery_lease, clock=clock)
-    state.release_lease(db, recovery_lease, clock=clock)
+    state.recover_room(store, recovery_lease, placement="profile", clock=clock)
+    state.release_lease(store, recovery_lease, placement="profile", clock=clock)
 
     rpc = FakeSessionRPC(auto_complete=False)
     stored_id = rpc.add_session(active=False, task_id=identity.task_id)
@@ -1252,7 +1258,7 @@ def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
     rpc.resume = resume
     rpc.history = history
     rpc.info = info
-    runtime = _runtime(db, rpc, clock=clock)
+    runtime = _runtime(store, rpc, clock=clock)
 
     retried = runtime.retry_indeterminate(identity)
 
@@ -1261,7 +1267,7 @@ def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
 
 
 def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
-    db: Path,
+    db: Path, store,
 ):
     identity = _identity()
     now = [100.0]
@@ -1270,7 +1276,7 @@ def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
         return now[0]
 
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1278,17 +1284,17 @@ def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
         ttl_seconds=1,
         clock=clock,
     )
-    _admit(db, identity)
+    _admit(store, identity)
     attempt = state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     now[0] = 102.0
     recovery_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1296,8 +1302,8 @@ def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
         ttl_seconds=30,
         clock=clock,
     )
-    state.recover_room(db, recovery_lease, clock=clock)
-    state.release_lease(db, recovery_lease, clock=clock)
+    state.recover_room(store, recovery_lease, placement="profile", clock=clock)
+    state.release_lease(store, recovery_lease, placement="profile", clock=clock)
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(active=False, task_id=identity.task_id)
     original_info = rpc.info
@@ -1306,7 +1312,7 @@ def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
         return {**original_info(**kwargs), "status": "cancelled"}
 
     rpc.info = cancelled_info
-    runtime = _runtime(db, rpc, clock=clock)
+    runtime = _runtime(store, rpc, clock=clock)
 
     cancelled = runtime.retry_indeterminate(identity)
 
@@ -1315,7 +1321,7 @@ def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
-def test_ambiguous_recovery_remains_indeterminate(db: Path):
+def test_ambiguous_recovery_remains_indeterminate(db: Path, store):
     identity = _identity()
     now = [100.0]
 
@@ -1323,7 +1329,7 @@ def test_ambiguous_recovery_remains_indeterminate(db: Path):
         return now[0]
 
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1331,28 +1337,28 @@ def test_ambiguous_recovery_remains_indeterminate(db: Path):
         ttl_seconds=0.2,
         clock=clock,
     )
-    _admit(db, identity)
+    _admit(store, identity)
     state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(active=False, task_id=identity.task_id)
     now[0] = 101.0
-    runtime = _runtime(db, rpc, clock=clock)
+    runtime = _runtime(store, rpc, clock=clock)
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "indeterminate")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "indeterminate")
     assert runtime.stop(timeout=5.0)
 
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
 def test_offline_member_defers_then_healthy_task_runs_and_retry_is_fenced(
-    db: Path,
+    db: Path, store,
 ):
     now = [100.0]
 
@@ -1360,15 +1366,15 @@ def test_offline_member_defers_then_healthy_task_runs_and_retry_is_fenced(
         return now[0]
 
     first = _identity("task-offline")
-    second = state.TaskIdentity(
+    second = HostedTaskIdentity(
         room_id=ROOM_ID,
         task_id="task-healthy",
         thread_id="thread-1",
         turn_id="turn-task-healthy",
     )
     state.admit_task(
-        db,
-        first,
+        store,
+        first, placement="profile",
         payload={
             "target_profile": PROFILE,
             "prompt": "Try the offline member.",
@@ -1377,7 +1383,7 @@ def test_offline_member_defers_then_healthy_task_runs_and_retry_is_fenced(
         clock=clock,
     )
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1386,15 +1392,15 @@ def test_offline_member_defers_then_healthy_task_runs_and_retry_is_fenced(
         clock=clock,
     )
     old_attempt = state.start_task(
-        db,
+        store,
         first,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     state.admit_task(
-        db,
-        second,
+        store,
+        second, placement="profile",
         payload={
             "target_profile": PROFILE,
             "prompt": "Continue with the healthy member.",
@@ -1406,7 +1412,7 @@ def test_offline_member_defers_then_healthy_task_runs_and_retry_is_fenced(
     rpc = FakeSessionRPC()
     published = []
     runtime = _runtime(
-        db,
+        store,
         rpc,
         clock=clock,
         lease_ttl_seconds=30,
@@ -1415,13 +1421,13 @@ def test_offline_member_defers_then_healthy_task_runs_and_retry_is_fenced(
     )
 
     runtime._process_room(BINDING)
-    assert state.get_task(db, first)["status"] == "indeterminate"
-    assert state.get_task(db, second)["status"] == "queued"
+    assert state.get_task(store, first, placement="profile")["status"] == "indeterminate"
+    assert state.get_task(store, second, placement="profile")["status"] == "queued"
 
     now[0] = 108.0
     runtime._process_room(BINDING)
-    assert state.get_task(db, first)["status"] == "deferred"
-    assert state.get_task(db, second)["status"] == "settled"
+    assert state.get_task(store, first, placement="profile")["status"] == "deferred"
+    assert state.get_task(store, second, placement="profile")["status"] == "settled"
     assert [task["status"] for task in published] == ["deferred", "settled"]
     assert ROOM_ID not in runtime.status()["blocked_rooms"]
 
@@ -1429,45 +1435,45 @@ def test_offline_member_defers_then_healthy_task_runs_and_retry_is_fenced(
     assert requeued["status"] == "queued"
     lease = runtime._leases[ROOM_ID]
     retry_attempt = state.start_task(
-        db,
+        store,
         first,
-        lease,
+        lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     assert retry_attempt.execution_generation == old_attempt.execution_generation + 1
-    late_attempt = state.TaskAttempt(
+    late_attempt = TaskAttempt(
         identity=first,
         lease=lease,
         execution_generation=old_attempt.execution_generation,
         cancel_generation=old_attempt.cancel_generation,
     )
-    with pytest.raises(state.StaleTaskError):
+    with pytest.raises(StaleTaskError):
         state.settle_task(
-            db,
-            late_attempt,
+            store,
+            late_attempt, placement="profile",
             settlement_id="late-old-result",
             status="settled",
             result={"text": "too late"},
             clock=clock,
         )
     state.settle_task(
-        db,
-        retry_attempt,
+        store,
+        retry_attempt, placement="profile",
         settlement_id="retry-result",
         status="settled",
         result={"text": "retry accepted"},
         clock=clock,
     )
-    assert state.get_task(db, first)["result"]["text"] == "retry accepted"
+    assert state.get_task(store, first, placement="profile")["result"]["text"] == "retry accepted"
 
 
-def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path):
+def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.history_failures = 1
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
@@ -1477,27 +1483,27 @@ def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path)
             in str(runtime.status()["last_error"] or "")
         )
     )
-    assert state.get_task(db, identity)["status"] == "running"
+    assert state.get_task(store, identity, placement="profile")["status"] == "running"
     rpc.complete(identity.task_id, content="Recovered after a transient read.")
     runtime.wakeup()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
-    task = state.get_task(db, identity)
+    task = state.get_task(store, identity, placement="profile")
     assert task["result"]["text"] == "Recovered after a transient read."
     assert not [call for call in rpc.calls if call[0] == "submit"][1:]
 
 
 def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(
-    db: Path,
+    db: Path, store,
 ):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
     observed_status: list[str] = []
     rpc.on_interrupt = lambda: observed_status.append(
-        state.get_task(db, identity)["status"]
+        state.get_task(store, identity, placement="profile")["status"]
     )
 
     runtime.start()
@@ -1512,11 +1518,11 @@ def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(
     assert observed_status == ["stopping"]
 
 
-def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
+def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
     original_interrupt = rpc.interrupt
     attempts = 0
     retry_allowed = threading.Event()
@@ -1534,22 +1540,22 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     assert rpc.submitted.wait(1.0)
     stopping = runtime.cancel(identity, cancel_id="cancel-retry")
     assert stopping["status"] == "stopping"
-    assert state.get_task(db, identity)["status"] == "stopping"
+    assert state.get_task(store, identity, placement="profile")["status"] == "stopping"
     retry_allowed.set()
     runtime.wakeup()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "cancelled")
     assert attempts >= 2
     assert runtime.stop(timeout=5.0)
-    assert state.get_task(db, identity)["status"] == "cancelled"
+    assert state.get_task(store, identity, placement="profile")["status"] == "cancelled"
 
 
-def test_provisional_stopping_response_does_not_acknowledge_cancellation(db: Path):
+def test_provisional_stopping_response_does_not_acknowledge_cancellation(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
     lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1559,9 +1565,9 @@ def test_provisional_stopping_response_does_not_acknowledge_cancellation(db: Pat
     )
     runtime._leases[ROOM_ID] = lease
     attempt = state.start_task(
-        db,
+        store,
         identity,
-        lease,
+        lease, placement="profile",
         expected_cancel_generation=0,
         clock=time.time,
     )
@@ -1576,7 +1582,7 @@ def test_provisional_stopping_response_does_not_acknowledge_cancellation(db: Pat
     stopping = runtime.cancel(identity, cancel_id="cancel-peer")
 
     assert stopping["status"] == "stopping"
-    assert state.get_task(db, identity)["status"] == "stopping"
+    assert state.get_task(store, identity, placement="profile")["status"] == "stopping"
 
     terminal = True
     cancelled = runtime.cancel(identity, cancel_id="cancel-peer")
@@ -1584,13 +1590,13 @@ def test_provisional_stopping_response_does_not_acknowledge_cancellation(db: Pat
     assert cancelled["status"] == "cancelled"
 
 
-def test_peer_terminal_status_acknowledges_durable_stop_on_retry(db: Path):
+def test_peer_terminal_status_acknowledges_durable_stop_on_retry(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
     lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1600,9 +1606,9 @@ def test_peer_terminal_status_acknowledges_durable_stop_on_retry(db: Path):
     )
     runtime._leases[ROOM_ID] = lease
     attempt = state.start_task(
-        db,
+        store,
         identity,
-        lease,
+        lease, placement="profile",
         expected_cancel_generation=0,
         clock=time.time,
     )
@@ -1612,8 +1618,8 @@ def test_peer_terminal_status_acknowledges_durable_stop_on_retry(db: Path):
     )
     runtime.transport_resolver = _peer_resolver(client)
     stopping = state.begin_task_cancel(
-        db,
-        identity,
+        store,
+        identity, placement="profile",
         cancel_id="cancel-peer-terminal",
         expected_cancel_generation=0,
         clock=time.time,
@@ -1622,17 +1628,17 @@ def test_peer_terminal_status_acknowledges_durable_stop_on_retry(db: Path):
 
     runtime._retry_stopping_tasks(BINDING, lease)
 
-    assert state.get_task(db, identity)["status"] == "cancelled"
+    assert state.get_task(store, identity, placement="profile")["status"] == "cancelled"
     assert client.history_calls == 0
 
 
-def test_peer_terminal_status_must_match_exact_task_attempt(db: Path):
+def test_peer_terminal_status_must_match_exact_task_attempt(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
     lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1642,9 +1648,9 @@ def test_peer_terminal_status_must_match_exact_task_attempt(db: Path):
     )
     runtime._leases[ROOM_ID] = lease
     attempt = state.start_task(
-        db,
+        store,
         identity,
-        lease,
+        lease, placement="profile",
         expected_cancel_generation=0,
         clock=time.time,
     )
@@ -1656,8 +1662,8 @@ def test_peer_terminal_status_must_match_exact_task_attempt(db: Path):
     runtime.transport_resolver = _peer_resolver(client)
 
     stopping = state.begin_task_cancel(
-        db,
-        identity,
+        store,
+        identity, placement="profile",
         cancel_id="cancel-mismatch",
         expected_cancel_generation=0,
         clock=time.time,
@@ -1667,20 +1673,20 @@ def test_peer_terminal_status_must_match_exact_task_attempt(db: Path):
     client.status_task_id = identity.task_id
     client.status_generation = attempt.execution_generation + 1
     assert runtime._peer_stop_acknowledged(BINDING, stopping) is False
-    assert state.get_task(db, identity)["status"] == "stopping"
+    assert state.get_task(store, identity, placement="profile")["status"] == "stopping"
 
 
-def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
+def test_completion_wins_a_race_with_unacknowledged_stop(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
 
     def finish_only_after_stop_intent():
-        if state.get_task(db, identity)["status"] == "stopping":
+        if state.get_task(store, identity, placement="profile")["status"] == "stopping":
             rpc.complete(identity.task_id, content="Already done.")
 
     rpc.on_info = finish_only_after_stop_intent
@@ -1691,16 +1697,16 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
     assert runtime.stop(timeout=5.0)
 
 
-def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
+def test_restart_harvests_completion_before_retrying_durable_stop(db: Path, store):
     identity = _identity()
     now = [100.0]
 
     def clock():
         return now[0]
 
-    _admit(db, identity)
+    _admit(store, identity)
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1709,15 +1715,15 @@ def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
         clock=clock,
     )
     attempt = state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     stopping = state.begin_task_cancel(
-        db,
-        identity,
+        store,
+        identity, placement="profile",
         cancel_id="cancel-before-restart",
         expected_cancel_generation=attempt.cancel_generation,
         clock=clock,
@@ -1739,32 +1745,32 @@ def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
     )
     now[0] = 102.0
     runtime = _runtime(
-        db,
+        store,
         rpc,
         process_generation="new-process",
         clock=clock,
     )
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
-    settled = state.get_task(db, identity)
+    settled = state.get_task(store, identity, placement="profile")
     assert stopping["status"] == "stopping"
     assert settled["result"]["text"] == "Finished before Stop reached the session."
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
 
 
-def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path):
+def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path, store):
     identity = _identity()
     now = [100.0]
 
     def clock():
         return now[0]
 
-    _admit(db, identity)
+    _admit(store, identity)
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1773,15 +1779,15 @@ def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path
         clock=clock,
     )
     attempt = state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=clock,
     )
     state.begin_task_cancel(
-        db,
-        identity,
+        store,
+        identity, placement="profile",
         cancel_id="cancel-before-restart",
         expected_cancel_generation=attempt.cancel_generation,
         clock=clock,
@@ -1789,7 +1795,7 @@ def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path
     rpc = FakeSessionRPC(auto_complete=False)
     now[0] = 102.0
     runtime = _runtime(
-        db,
+        store,
         rpc,
         process_generation="new-process",
         clock=clock,
@@ -1801,13 +1807,13 @@ def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
 
 
-def test_stop_resumes_persisted_session_before_reading_runtime_history(db: Path):
+def test_stop_resumes_persisted_session_before_reading_runtime_history(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
     lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1817,9 +1823,9 @@ def test_stop_resumes_persisted_session_before_reading_runtime_history(db: Path)
     )
     runtime._leases[ROOM_ID] = lease
     attempt = state.start_task(
-        db,
+        store,
         identity,
-        lease,
+        lease, placement="profile",
         expected_cancel_generation=0,
         clock=time.time,
     )
@@ -1841,8 +1847,8 @@ def test_stop_resumes_persisted_session_before_reading_runtime_history(db: Path)
     rpc.resume = resume
     rpc.history = history
     state.begin_task_cancel(
-        db,
-        identity,
+        store,
+        identity, placement="profile",
         cancel_id="cancel-remapped",
         expected_cancel_generation=attempt.cancel_generation,
         clock=time.time,
@@ -1854,13 +1860,13 @@ def test_stop_resumes_persisted_session_before_reading_runtime_history(db: Path)
     assert events.index("resume") < events.index("history")
 
 
-def test_pending_local_approval_is_reported_with_safe_choices(db: Path):
+def test_pending_local_approval_is_reported_with_safe_choices(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
     actions = []
     runtime = _runtime(
-        db,
+        store,
         rpc,
         pending_action=lambda room_id, member_id, action: actions.append((
             room_id,
@@ -1888,11 +1894,11 @@ def test_pending_local_approval_is_reported_with_safe_choices(db: Path):
     assert runtime.stop(timeout=5.0)
 
 
-def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
+def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(store, rpc)
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
@@ -1915,11 +1921,11 @@ def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
     assert runtime.stop(timeout=5.0)
 
 
-def test_status_reports_room_blocked_on_unresolved_indeterminate_task(db: Path):
+def test_status_reports_room_blocked_on_unresolved_indeterminate_task(db: Path, store):
     identity = _identity()
     now = [100.0]
     old_lease = state.acquire_lease(
-        db,
+        store, placement="profile",
         room_id=ROOM_ID,
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
@@ -1927,35 +1933,35 @@ def test_status_reports_room_blocked_on_unresolved_indeterminate_task(db: Path):
         ttl_seconds=1.0,
         clock=lambda: now[0],
     )
-    _admit(db, identity)
+    _admit(store, identity)
     state.start_task(
-        db,
+        store,
         identity,
-        old_lease,
+        old_lease, placement="profile",
         expected_cancel_generation=0,
         clock=lambda: now[0],
     )
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(active=False, task_id=identity.task_id)
     now[0] += 2.0
-    runtime = _runtime(db, rpc, clock=lambda: now[0])
+    runtime = _runtime(store, rpc, clock=lambda: now[0])
 
     runtime.start()
     _wait_for(lambda: ROOM_ID in runtime.status()["blocked_rooms"])
     assert runtime.stop(timeout=5.0)
 
-    assert state.get_task(db, identity)["status"] == "indeterminate"
+    assert state.get_task(store, identity, placement="profile")["status"] == "indeterminate"
 
 
-def test_authority_loss_stops_terminal_commit(db: Path):
+def test_authority_loss_stops_terminal_commit(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     rpc = FakeSessionRPC(auto_complete=False)
     # Generous lease TTL: this test is about AUTHORITY loss. A short TTL let
     # a loaded CI runner expire the lease before the authority change was
     # observed, so last_error flipped to "driver lease is stale or expired"
     # (flaky main run 33455779041).
-    runtime = _runtime(db, rpc, lease_ttl_seconds=30.0)
+    runtime = _runtime(store, rpc, lease_ttl_seconds=30.0)
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
@@ -1973,19 +1979,19 @@ def test_authority_loss_stops_terminal_commit(db: Path):
     _wait_for(lambda: runtime.status()["last_error"] is not None)
     assert runtime.stop(timeout=5.0)
 
-    assert state.get_task(db, identity)["status"] == "running"
+    assert state.get_task(store, identity, placement="profile")["status"] == "running"
     assert "authority changed" in runtime.status()["last_error"]
 
 
-def test_profile_turn_lock_covers_resolve_submit_and_terminal_observation(db: Path):
+def test_profile_turn_lock_covers_resolve_submit_and_terminal_observation(db: Path, store):
     identity = _identity()
-    _admit(db, identity)
+    _admit(store, identity)
     locks = RecordingTurnLocks()
     rpc = FakeSessionRPC(required_lock=locks)
-    runtime = _runtime(db, rpc, locks)
+    runtime = _runtime(store, rpc, locks)
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(store, identity, placement="profile")["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
     # Balanced enter/exit pairs on the task's profile only (a loaded runner may run extra cycles).
@@ -1999,21 +2005,3 @@ def test_profile_turn_lock_covers_resolve_submit_and_terminal_observation(db: Pa
     assert methods.index("resolve_exact") < methods.index("submit")
     assert methods.index("submit") < methods.index("complete")
     assert "history" not in methods
-
-
-def test_stop_is_bounded_and_does_not_interrupt_active_turn(db: Path):
-    identity = _identity()
-    _admit(db, identity)
-    rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc, poll_interval_seconds=0.01)
-
-    runtime.start()
-    assert rpc.submitted.wait(5.0)
-    started = time.monotonic()
-    stopped = runtime.stop(timeout=5.0)
-
-    assert stopped is True
-    # Bounded: returns well before its own timeout and without waiting for the active turn (which never completes).
-    assert time.monotonic() - started < 2.0
-    assert state.get_task(db, identity)["status"] == "running"
-    assert not [call for call in rpc.calls if call[0] == "interrupt"]

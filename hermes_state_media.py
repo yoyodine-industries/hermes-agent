@@ -22,7 +22,8 @@ def retire_spillover(conn, session_ids):
     """Record the spillover archives the doomed sessions' messages point at, inside the delete
     transaction (the pointers vanish with the rows), as durable candidates (#126351)."""
     from hermes_state_common import _id_chunks, _placeholders
-    from tools.tool_result_storage import SPILLOVER_SQL_FILTER, spillover_names_in_text
+    from persistence.sqlite.conversation._store.rules import SPILLOVER_SQL_FILTER
+    from session_rules.media import spillover_names_in_text
     for chunk in _id_chunks(list(session_ids)):
         for content, api_content in conn.execute(
                 f"SELECT content, api_content FROM messages WHERE session_id IN ({_placeholders(chunk)})"

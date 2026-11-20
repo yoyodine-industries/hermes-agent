@@ -37,10 +37,11 @@ BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
-# The @handle Bot Mode shows for a host's default profile, and the body of the 404 a peer returns for
-# a /p/<profile>/ prefix naming no profile it has (UNKNOWN_PROFILE_ERROR in
+# The @handle Bot Mode shows for a host's default profile, and the 404 a peer returns for a
+# /p/<profile>/ prefix naming no profile it has (UNKNOWN_PROFILE_CODE / UNKNOWN_PROFILE_ERROR in
 # gateway/platforms/api_server_profile_prefix.py; a 'hermes' profile it has but does not serve differs).
 DEFAULT_PROFILE_HANDLE = "hermes"
+_UNKNOWN_PROFILE_CODE = "profile_unknown"
 _UNKNOWN_PROFILE_ERROR = "Unknown or unconfigured profile"
 
 # One synchronous agent turn can legitimately take minutes. This stays the SERVER-budget
@@ -238,12 +239,20 @@ def _request(
     # different origin must not carry the Authorization: Bearer key with it —
     # a compromised/MITM'd peer could otherwise harvest it. open_credentialed_url
     # strips non-safelisted headers across a cross-origin redirect.
-    with open_credentialed_url(req, timeout=timeout) as resp:
-        payload = resp.read().decode("utf-8", "replace")
+    try:
+        with open_credentialed_url(req, timeout=timeout) as resp:
+            payload = resp.read().decode("utf-8", "replace")
+    except http.client.HTTPException as exc:
+        # BadStatusLine / UnknownProtocol carry the peer's raw status line; uncaught, the
+        # traceback prints it to the terminal unsanitized. RemoteDisconnected is also an
+        # OSError: keep it on the callers' "could not reach" transport path.
+        if isinstance(exc, OSError):
+            raise
+        raise RuntimeError(f"Peer sent a malformed HTTP response: {sanitize_display_text(str(exc)[:200])}") from exc
     try:
         parsed = json.loads(payload)
     except ValueError as exc:
-        raise RuntimeError(f"Peer returned non-JSON response: {payload[:200]}") from exc
+        raise RuntimeError(f"Peer returned non-JSON response: {sanitize_display_text(payload[:200])}") from exc
     if not isinstance(parsed, dict):
         raise RuntimeError("Peer returned a non-object JSON response")
     return parsed
@@ -383,9 +392,9 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
         body = exc.read().decode("utf-8", "replace")
         parsed = json.loads(body)
         message = parsed.get("error", {}).get("message") if isinstance(parsed, dict) else None
-        return message or body[:200]
+        return sanitize_display_text(str(message or body[:200]))
     except Exception:
-        return str(exc)
+        return sanitize_display_text(str(exc))
 
 
 def _resolve_peer_target(target: str) -> tuple[str, str | None, dict, str]:
@@ -1283,7 +1292,7 @@ def _emit(args, payload: dict, text_lines: list[str]) -> int:
         print(json.dumps(payload))
     else:
         for line in text_lines:
-            print(line)
+            print(sanitize_display_text(line))
     return 0
 
 
@@ -1381,11 +1390,11 @@ def _peer_run_ctl(args, action: str, peer_name: str, profile: str | None, base: 
     if getattr(args, "json", False):
         print(json.dumps({"peer": peer_name, "profile": profile, **result}))
         return 0
-    print(f"{run_id}: {result.get('status', 'unknown')}")
+    print(f"{run_id}: {sanitize_display_text(str(result.get('status', 'unknown')))}")
     if not stop and result.get("output"):
-        print(result["output"])
+        print(sanitize_display_text(str(result["output"])))
     elif not stop and result.get("error"):
-        print(result["error"], file=sys.stderr)
+        print(sanitize_display_text(str(result["error"])), file=sys.stderr)
     return 0
 
 
@@ -1493,7 +1502,7 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
             idempotency_key=idempotency_key, target=target, message=message,
             base=base, key=key, deadline=deadline, started=started)
     except RuntimeError as exc:
-        print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
+        print(f"Peer '{peer_name}': {sanitize_display_text(str(exc))}", file=sys.stderr)
         return 1
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # A timeout while awaiting the response, once the Bot Chat is known, means the peer took

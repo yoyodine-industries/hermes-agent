@@ -26,8 +26,8 @@ conn.close()
 
 @pytest.fixture
 def delete_mode_db(tmp_path, monkeypatch) -> Path:
-    import hermes_state_wal
-    monkeypatch.setattr(hermes_state_wal, "resolve_journal_mode", lambda: "delete")
+    import sqlite_support
+    monkeypatch.setattr(sqlite_support, "resolve_journal_mode", lambda: "delete")
     db = tmp_path / "state.db"
     handle = SessionDB(db_path=db)
     sid = handle.create_session(session_id=str(uuid.uuid4()), source="cli")
