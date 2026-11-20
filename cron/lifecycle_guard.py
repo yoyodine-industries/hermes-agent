@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import logging
 import os
+import plistlib
 import re
 import shlex
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -93,11 +96,245 @@ _ERE_WILDCARD_ONLY = re.compile(r"^[.*+?$\s]*$")
 _NAME_KILLERS = frozenset({"pkill", "killall", "taskkill", "stop-process"})
 _NAME_ENUMERATORS = frozenset({"pgrep", "pidof", "get-process"})
 _KILL_VERB_RE = re.compile(r"(?i)\b(?:kill|taskkill|stop-process)\b")
-# A `-f` pattern that does not start with the interpreter reaches the gateway cmdline
-# (`python -m hermes_cli.main gateway run` / `hermes gateway run`) only through its own tokens;
-# an unrelated script that merely contains "hermes" (`hermes-polis/run.sh`, `my_hermes_bot.py`)
-# cannot match it. Same hermes+gateway pairing as Branch D, plus the module path.
-_GATEWAY_CMDLINE_TOKEN_RE = re.compile(r"(?i)hermes_cli|\bhermes\b[^\n]*\bgateway\b|\bgateway\b[^\n]*\bhermes\b")
+# ---------------------------------------------------------------------------
+# Gateway identity, DERIVED from the live service inventory.
+#
+# A word list is not an identity. `"hermes" in pattern` cannot see
+# `pkill -f 'python3 gateway'` (one quoted pattern), a bare image name, or a renamed
+# binary — and the check goes stale the moment the invocation is renamed. The gateway is
+# the process that hosts this guard, so its identity is read from the service manager that
+# supervises that process: the launchd job whose running pid is in our own ancestry -> its
+# ProgramArguments -> the token set below. No name is spelled in this module; when the
+# inventory cannot be read the callers FAIL CLOSED (an unprovable pattern is a gateway
+# pattern), because the cost of one refused kill is a retry and the cost of one missed kill
+# is the gateway.
+# ---------------------------------------------------------------------------
+
+_IDENTITY_GLUE = r"0-9a-z_\-"  # a token is free-standing unless glued to these
+_IDENTITY_CACHE_TTL = 60.0
+_IDENTITY_CACHE: dict[str, object] = {}
+
+
+def _process_ancestry() -> tuple[int, ...]:
+    """The pid chain from this process up towards launchd (empty when `ps` is unavailable)."""
+    try:
+        listing = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    parent: dict[int, int] = {}
+    for line in listing.splitlines():
+        columns = line.split()
+        if len(columns) == 2 and columns[0].isdigit() and columns[1].isdigit():
+            parent[int(columns[0])] = int(columns[1])
+    chain: list[int] = []
+    pid = os.getpid()
+    while pid > 0 and pid not in chain and len(chain) < 32:
+        chain.append(pid)
+        pid = parent.get(pid, 0)
+    return tuple(chain)
+
+
+def _launchd_labels(pids: tuple[int, ...]) -> dict[int, str]:
+    """Map pid -> launchd job label for every pid of *pids* that launchd reports as running."""
+    if not pids:
+        return {}
+    try:
+        listing = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    wanted = {str(pid) for pid in pids}
+    labels: dict[int, str] = {}
+    for line in listing.splitlines():
+        columns = line.split("\t")
+        if len(columns) >= 3 and columns[0].strip() in wanted and columns[2].strip():
+            labels[int(columns[0].strip())] = columns[2].strip()
+    return labels
+
+
+def _service_argv(label: str) -> Optional[list[str]]:
+    """ProgramArguments (or Program) of launchd job *label*, read from the service inventory."""
+    for directory in (Path("/Library/LaunchDaemons"), Path.home() / "Library/LaunchAgents"):
+        plist = directory / f"{label}.plist"
+        if not plist.is_file():
+            continue
+        try:
+            with plist.open("rb") as handle:
+                payload = plistlib.load(handle)
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        arguments = payload.get("ProgramArguments")
+        if isinstance(arguments, list) and arguments:
+            return [str(argument) for argument in arguments]
+        program = payload.get("Program")
+        if isinstance(program, str) and program:
+            return [program]
+    return None
+
+
+def _is_service_of_this_install(argv: list[str]) -> bool:
+    """Whether *argv* runs code from this checkout (the module it loads, or the path it starts)."""
+    root = Path(__file__).resolve().parent.parent
+    for token in argv:
+        candidate = token.strip().strip("\"'")
+        if not candidate or candidate.startswith("-"):
+            continue
+        path = Path(candidate).expanduser()
+        if path.is_absolute():
+            try:
+                if path.resolve().is_relative_to(root):
+                    return True
+            except (OSError, ValueError):
+                continue
+            continue
+        module_file = (root / candidate.replace(".", "/")).with_suffix(".py")
+        try:
+            if module_file.is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _qualified(word: str) -> bool:
+    """A qualified name carries a separator; a bare word does not (`hermes_cli.main` vs `run`)."""
+    return any(character in word for character in "._-")
+
+
+def _identity_tokens(
+    argv: list[str], labels: tuple[str, ...]
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Split the gateway's own invocation into (strong, weak) identity tokens.
+
+    STRONG: qualified names — the module (`hermes_cli.main`), its file path, every path
+    component carrying a separator (`hermes-agent`), the launchd label and its component
+    runs (`ai.hermes.gateway`, `hermes-gateway`). A pattern naming one names this service.
+    WEAK: the single bare word the service is invoked by — its image name and the subcommand
+    after the module (`gateway`). Only the invocation word is taken, not every argument:
+    treating ordinary arguments as identity would refuse `pkill -f run.py`.
+    """
+    strong: set[str] = set()
+    weak: set[str] = set()
+
+    def add_path_components(value: str) -> None:
+        for part in re.split(r"[/\\]", value):
+            part = part.strip().lower()
+            if part and _qualified(part):
+                strong.add(part)
+
+    program = argv[0].strip() if argv else ""
+    arguments = argv[1:]
+    module = None
+    for index, token in enumerate(arguments):
+        if token.strip() in ("-m", "--module") and index + 1 < len(arguments):
+            module = arguments[index + 1].strip()
+            break
+    if module:
+        strong.add(module.lower())
+        module_path = module.replace(".", "/").lower()
+        strong.add(module_path)
+        strong.add(module_path + ".py")
+        root = module.split(".", 1)[0].lower()
+        if len(root) >= 4:
+            strong.add(root)
+
+    add_path_components(program)
+    program_name = re.split(r"[/\\]", program)[-1].strip().lower().removesuffix(".exe")
+    if program_name and not _qualified(program_name) and not _is_interpreter_image(program_name):
+        weak.add(program_name)
+
+    subcommand_taken = False
+    for token in arguments:
+        word = token.strip()
+        if not word or word.startswith("-") or (module and word == module):
+            continue
+        if "/" in word or "\\" in word:
+            add_path_components(word)
+            continue
+        if _qualified(word):
+            strong.add(word.lower())
+            continue
+        if not subcommand_taken:
+            weak.add(word.lower())
+            subcommand_taken = True
+
+    for label in labels:
+        components = [part for part in re.split(r"[.\-]", label.lower()) if part]
+        for start in range(len(components)):
+            for end in range(start + 2, len(components) + 1):
+                strong.add(".".join(components[start:end]))
+                strong.add("-".join(components[start:end]))
+    return frozenset(strong), frozenset(weak)
+
+
+def _proc_ancestry_argv(ancestry: tuple[int, ...]) -> Optional[list[str]]:
+    """argv of the topmost ancestor running this checkout, read exactly from /proc (Linux)."""
+    for pid in reversed(ancestry):
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+        if argv and _is_service_of_this_install(argv):
+            return argv
+    return None
+
+
+def _gateway_service_identity() -> Optional[tuple[frozenset[str], frozenset[str]]]:
+    """(strong, weak) identity tokens of the gateway, derived from the live inventory.
+
+    `None` means the inventory could not be read — callers refuse rather than guess.
+    """
+    cached = _IDENTITY_CACHE.get("value")
+    if isinstance(cached, tuple):
+        return cached  # type: ignore[return-value]
+    failed_at = _IDENTITY_CACHE.get("failed_at")
+    if isinstance(failed_at, float) and time.monotonic() - failed_at < _IDENTITY_CACHE_TTL:
+        return None
+    ancestry = _process_ancestry()
+    labelled = _launchd_labels(ancestry)
+    labels: list[str] = []
+    argv: Optional[list[str]] = None
+    # Topmost launchd job first: a cron/turn worker spawned underneath it is not the service.
+    for pid in reversed(ancestry):
+        label = labelled.get(pid)
+        if not label:
+            continue
+        labels.append(label)
+        candidate = _service_argv(label)
+        if candidate and _is_service_of_this_install(candidate):
+            argv = candidate
+            break
+    if argv is None:
+        # No service manager on this host (systemd hosts, containers): the process table is
+        # the inventory, and /proc carries the exact argv.
+        argv = _proc_ancestry_argv(ancestry)
+    if argv is None:
+        _IDENTITY_CACHE["failed_at"] = time.monotonic()
+        return None
+    identity = _identity_tokens(argv, tuple(labels))
+    if not identity[0] and not identity[1]:
+        _IDENTITY_CACHE["failed_at"] = time.monotonic()
+        return None
+    _IDENTITY_CACHE["value"] = identity
+    _IDENTITY_CACHE.pop("failed_at", None)
+    return identity
+
+
+def _pattern_names_identity(text: str, tokens: frozenset[str]) -> bool:
+    """Whether *text* names one of *tokens* as a free-standing token (`not-the-gateway` is not)."""
+    if not text or not tokens:
+        return False
+    escaped = "|".join(sorted((re.escape(token) for token in tokens), key=len, reverse=True))
+    boundary = (
+        rf"(?<![{_IDENTITY_GLUE}])(?:{escaped})(?![{_IDENTITY_GLUE}])"
+    )
+    return bool(re.search(boundary, text, re.IGNORECASE))
 # Rejection text for Branch E, shared by every tool surface that runs the guard so the agent is
 # pointed at the ownership-scoped route (proc_* id / explicit PID) rather than the shell.
 HOST_INTERPRETER_KILL_REJECTION = (
@@ -126,10 +363,14 @@ def _is_interpreter_image(value: str, *, substring: bool = False) -> bool:
 def _pattern_reaches_host_interpreter(pattern: str, *, full_cmdline: bool, exact: bool) -> bool:
     """pkill/pgrep/killall operand semantics: an ERE against the process NAME (or, with `-f`, the full
     command line). `python -m hermes_cli.main …` is the gateway's own cmdline, so a `-f` pattern
-    that names the interpreter and then only wildcards or a `hermes` token reaches it, while
-    `python mt_add.py` (a specific script) does not."""
+    that names the interpreter and then only wildcards or a gateway identity token reaches it, while
+    `python mt_add.py` (a specific script) does not. Without an interpreter head the pattern is a
+    gateway kill only when it names a token of the gateway's own derived identity."""
     core = pattern.strip().strip("\"'").lstrip("^")
     core = core.removesuffix("$")
+    if full_cmdline and _ERE_WILDCARD_ONLY.match(core):
+        # `-f '*'` / `-f '.+'` is an ERE that selects every process, the gateway among them.
+        return True
     head, _, rest = core.partition(" ") if full_cmdline else (core, "", "")
     # A literal interpreter name first (`python3.12`: the dot is a version separator, not an ERE
     # wildcard); only then read the head as an ERE with a metacharacter tail (`python3?`, `python.*`).
@@ -138,8 +379,19 @@ def _pattern_reaches_host_interpreter(pattern: str, *, full_cmdline: bool, exact
         rest = head[match.start():] + " " + rest
         head = head[: match.start()]
     if not _is_interpreter_image(head, substring=not exact):
-        return full_cmdline and bool(_GATEWAY_CMDLINE_TOKEN_RE.search(core))
-    return not rest.strip() or bool(_ERE_WILDCARD_ONLY.match(rest)) or "hermes" in rest.lower()
+        if not full_cmdline:
+            return False
+        identity = _gateway_service_identity()
+        if identity is None:
+            # Fail closed: with no service inventory there is no way to prove this pattern innocent.
+            return bool(core.strip())
+        return _pattern_names_identity(core, identity[0]) or _pattern_names_identity(core, identity[1])
+    if not rest.strip() or _ERE_WILDCARD_ONLY.match(rest):
+        return True
+    identity = _gateway_service_identity()
+    if identity is None:
+        return True
+    return _pattern_names_identity(rest, identity[0]) or _pattern_names_identity(rest, identity[1])
 
 
 def _killer_targets_host_interpreter(name: str, args: list[str]) -> bool:
