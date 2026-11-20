@@ -664,11 +664,83 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     return conn, out
 
 
-def _refuse_dead_board_resurrection(path: Path, board: Optional[str]) -> None:
-    """Refuse to create a fresh DB for a board that is not live.
+def _board_slot_slug(path: Path) -> Optional[str]:
+    """The slug whose BOARD SLOT ``path`` is (``<boards>/<slug>/kanban.db``), else ``None``.
 
-    ``board=None`` (or ``default``) is unaffected — except that a None board
-    can still *resolve* through the current-board context (``--board`` scope,
+    A board store has exactly two resolved shapes: ``<root>/kanban.db`` (the ``default``
+    board, back-compat) and ``<boards>/<slug>/kanban.db``. Only the second is a SLOT — the
+    one directory a board's identity (``board.json``) and its store share. Answering from
+    the PATH rather than the caller's ``board=`` argument is deliberate: an AMBIENT
+    resolution (``board=None``, through ``HERMES_KANBAN_DB`` / the ``current`` pointer)
+    names no board at all, and the slot is the only evidence of which board it landed on.
+    """
+    try:
+        if path.name != "kanban.db":
+            return None
+        if path.parent.parent.resolve() != _kb.boards_root().resolve():
+            return None
+        return _kb._normalize_board_slug(path.parent.name)
+    except (OSError, ValueError):
+        return None
+
+
+#: Directory names that hold PER-CARD trees (checkouts, worker logs, attachments) — never
+#: a board store. A ``kanban.db`` here is a stray, and discovery walks that glob
+#: ``boards/<slug>/kanban.db`` (disk_sweep, completion evidence, the landing carrier) then
+#: have to classify a file that can never be a board.
+_CARD_SIDE_TREES = frozenset({"workspaces", "logs", "attachments"})
+
+
+def _refuse_store_inside_a_card_tree(path: Path) -> None:
+    """Refuse a store path sitting directly inside a per-card tree.
+
+    Measured 2026-10-27 (card t_881d4c5a): zero-byte ``kanban.db`` files sat at
+    ``<boards>/<slug>/workspaces/kanban.db`` on the live host — one of them regenerated
+    by a plain read of a board that had been reaped. ``workspaces/`` holds card
+    checkouts, so a ``.db`` there is indistinguishable from a board root to any discovery
+    walk, and an unreadable one aborts the disk sweep's declared-targets arm (t_8c245f55).
+
+    A store is created/opened at ``<root>/kanban.db`` or ``<boards>/<slug>/kanban.db``;
+    reaching a per-card tree means a resolver was pointed at the wrong root (a harness
+    that treated a board's workspaces dir as its HERMES_KANBAN_HOME, or a pin written
+    there), and the honest answer is to refuse by name rather than to mint it.
+    """
+    parent = path.parent
+    if parent.name in _CARD_SIDE_TREES:
+        raise ValueError(
+            f"refusing to use {path} as a kanban board store: {parent.name}/ holds "
+            f"per-card trees, never a board store — check HERMES_KANBAN_HOME / "
+            f"HERMES_KANBAN_DB, which resolved here"
+        )
+
+
+def _store_carries_the_schema(path: Path) -> bool:
+    """True when an EXISTING store at ``path`` already holds the kanban schema.
+
+    A schema-bearing store is legacy DATA, not a stray: a pre-board-era or imported store
+    predates ``board.json``, and migrating it is legitimate work
+    (``tests/hermes_cli/test_kanban_db_init.py``). A zero-byte file, a foreign file and a
+    store with no ``tasks`` table are all identity-less — the stubs this guard exists for.
+    """
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return False
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    except (OSError, sqlite3.Error):
+        return False
+    try:
+        return _schema_is_present(conn)
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+def _refuse_dead_board_resurrection(path: Path, board: Optional[str]) -> None:
+    """Refuse to create (or ADOPT) a store for a board that is not live.
+
+    ``board=None`` (or ``default``) is unaffected — except that a None board can still
+    *resolve* through the current-board context (``--board`` scope,
     ``HERMES_KANBAN_BOARD``, the ``current`` file) to a named board dir; an
     ``archived`` tombstone in that dir gets the same refusal. For any other
     slug whose DB file does not exist yet, opening it would mkdir the board
@@ -678,38 +750,50 @@ def _refuse_dead_board_resurrection(path: Path, board: Optional[str]) -> None:
     active boards via stale dashboard/gateway read paths (#43243). Creation
     is the job of :func:`kanban_db.create_board` (which writes the metadata
     first); read paths get an actionable error instead of a resurrected board.
+
+    A STORE THAT EXISTS IS NOT PROOF THE BOARD IS LIVE (card t_881d4c5a). Identity is
+    ``board.json`` (:func:`kanban_db_boards._dir_holds_board`): archive and delete both
+    leave the directory without it, so a stray ``kanban.db`` in a dead board's slot — the
+    zero-byte stub a stale read path leaves behind — used to be ADOPTED here, because
+    ``path.exists()`` returned early. The open then inherited the slug and
+    ``init_db()`` minted a full board nobody registered: a board that "came back whenever
+    its name was spoken". So the registration test is asked for EVERY slot, whether the
+    store is there or not.
     """
-    if path.exists():
-        return  # existing DB: a plain open, never a resurrection
-    if board is None:
-        # Default-DB and env-pinned paths never sit under a board dir, so a
-        # board.json here means the current-board context resolved to that
-        # board's dir; refuse only the archived case (a fresh home has no
-        # board.json next to its kanban.db, so creation still self-heals).
-        tombstone = path.parent / "board.json"
-        if tombstone.exists():
-            import json
-            try:
-                raw = json.loads(tombstone.read_text(encoding="utf-8-sig"))
-            except (OSError, ValueError):
-                return
-            if isinstance(raw, dict) and raw.get("archived"):
-                raise ValueError(
-                    f"kanban board {path.parent.name!r} is archived; "
-                    "refusing to recreate its database"
-                )
+    slot = _board_slot_slug(path)
+    slug = slot
+    if slug is None and board:
+        try:
+            slug = _kb._normalize_board_slug(board)
+        except ValueError:
+            return  # malformed slug: let the later open surface the error
+    if slug and slug != _kb.DEFAULT_BOARD:
+        if not _kb.board_metadata_path(slug).exists() and not _store_carries_the_schema(path):
+            raise ValueError(
+                f"kanban board {slug!r} does not exist; create it with "
+                f"`hermes kanban boards create {slug}`"
+            )
+        if _kb.read_board_metadata(slug).get("archived"):
+            raise ValueError(
+                f"kanban board {slug!r} is archived; refusing to recreate its database"
+            )
         return
+    # No board named (a ``default``/custom/pinned store): a fresh home has no
+    # board.json beside its kanban.db, so creation still self-heals. Only an
+    # ``archived`` tombstone next to it is this guard's business.
+    tombstone = path.parent / "board.json"
+    if not tombstone.exists():
+        return
+    import json
     try:
-        slug = _kb._normalize_board_slug(board)
-    except ValueError:
-        return  # malformed slug: let the later open surface the error
-    if not slug or slug == _kb.DEFAULT_BOARD:
+        raw = json.loads(tombstone.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
         return
-    meta = _kb.read_board_metadata(slug)
-    if meta.get("archived"):
-        raise ValueError(f"kanban board {slug!r} is archived; refusing to recreate its database")
-    if not _kb.board_metadata_path(slug).exists():
-        raise ValueError(f"kanban board {slug!r} does not exist; create it with `hermes kanban boards create {slug}`")
+    if isinstance(raw, dict) and raw.get("archived"):
+        raise ValueError(
+            f"kanban board {path.parent.name!r} is archived; "
+            "refusing to recreate its database"
+        )
 
 
 def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> sqlite3.Connection:
@@ -720,6 +804,9 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    # A board store is never created inside a per-card tree. Refused BEFORE the fenced /
+    # read-only branch and before any mkdir, so no door can mint one (card t_881d4c5a).
+    _refuse_store_inside_a_card_tree(path)
     from agent.delegation_context import (
         ancestor_owns_live_kanban_claim,
         child_kanban_write_purpose,
@@ -822,6 +909,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     migration pass — callers that know the on-disk schema may have drifted
     (tests writing legacy event kinds, external upgrades) use it to force it."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    _refuse_store_inside_a_card_tree(path)
     _refuse_dead_board_resurrection(path, board)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Clear the cache entry so connect() re-runs schema + migrations.
