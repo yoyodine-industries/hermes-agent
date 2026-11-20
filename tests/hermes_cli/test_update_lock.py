@@ -33,6 +33,7 @@ from hermes_cli.update_lock import (
     checkout_lock_fds,
     checkout_lock_path,
     describe_holder,
+    live_boot_id,
     process_create_time,
     read_live_update,
     update_in_progress,
@@ -110,7 +111,18 @@ def test_acquire_writes_pid_and_start_time(marker):
     assert float(lines[2].removeprefix("ct:")) == pytest.approx(process_create_time(), abs=0.01), (
         "line 3 is our creation time: readers tell a reused pid from us by it"
     )
-    assert len(lines) == 3
+    # Lines 4+ are the LEASE tags (R1, t_38413d8f). They are tagged lines every existing reader
+    # ignores, and they are what makes liveness a lease: the boot this claim was written in, and a
+    # heartbeat that goes stale on its own when this process dies.
+    rest = lines[3:]
+    boot_tags = [line for line in rest if line.startswith("boot:")]
+    assert boot_tags == ([f"boot:{live_boot_id()}"] if live_boot_id() else []), (
+        "the claim names ITS boot: after a reboot the recorded pid can never be this claim's"
+    )
+    beats = [float(line[3:]) for line in rest if line.startswith("hb:")]
+    assert beats and beats[0] == pytest.approx(time.time(), abs=10), (
+        "a fresh claim carries a heartbeat: a live update proves it is alive without a pid probe"
+    )
 
 
 def test_second_acquire_is_refused_while_the_first_is_live(marker, other_pid):

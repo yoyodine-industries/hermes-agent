@@ -187,6 +187,11 @@ class UpdateReceipt:
     def fact(self, key: str, value: Any) -> None:
         self.data[key] = value
 
+    def event(self, name: str, **facts: Any) -> None:
+        """A NAMED event on the run: something a reader must find by name (e.g.
+        ``resumed_at_stage``), not a prose step to interpret. Append-only, durable."""
+        self.data.setdefault("events", []).append({"event": name, "at": _utc_now_iso(), **facts})
+
     def followup(self, step: str, reason: str) -> None:
         self.data.setdefault("followups", []).append({"step": step, "reason": reason, "at": _utc_now_iso()})
 
@@ -332,6 +337,58 @@ def _owner_alive(record: dict[str, Any]) -> bool:
 
 #: Stage starts that a killed run never ended, newest first — the residue a next run resumes from.
 _INTERRUPTED: list[dict[str, Any]] = []
+
+
+def close_open_run_from_outside(*, reason: str, exit_code: int = 1,
+                                writer: str = "shutdown_watchdog") -> Optional[Path]:
+    """Write the terminal ``interrupted`` outcome for the OPEN run from a process that is not its
+    writer (R2 item 1, t_3cd65f01).
+
+    ``gateway/shutdown_watchdog._hard_exit`` calls ``os._exit`` past every ``except``/``finally``,
+    so the updater never finalizes and its receipt keeps saying ``running`` — the run that most
+    needs a verdict is the one left without one. The killer knows the reason and its own pid and
+    can read the last recorded stage, so it writes them itself: outcome ``interrupted``,
+    ``stop_reason``, ``closed_by``, fsync'd (``_atomic_bytes``), BEFORE the process disappears.
+
+    Two writers, one rule (R2 item 2): when the record is already terminal this writes no second
+    outcome — only ``already_closed_by``, naming who tried. Never raises; returns the path written.
+    """
+    try:
+        latest = read_latest_receipt() or {}
+        if not latest:
+            return None
+        target = _receipt_dir() / "latest.json"
+        record: dict[str, Any] = latest
+        update_id = str(latest.get("update_id") or "")
+        found = read_run_record(update_id) if update_id else None
+        if found is not None:
+            target, record = found
+        now = _utc_now_iso()
+        closed_by = f"{writer}:pid={os.getpid()}@{now}"
+        if record.get("outcome") not in (None, "running") or record.get("finished_at"):
+            # One terminal outcome only: the second writer records that it was already closed.
+            record["already_closed_by"] = closed_by
+        else:
+            stages = record.get("stages") or []
+            starts = [mark for mark in record.get("stage_starts") or () if isinstance(mark, dict)]
+            if starts:
+                where = f"{starts[-1].get('name')} (unfinished)"
+            elif stages and isinstance(stages[-1], dict):
+                where = str(stages[-1].get("name") or "start")
+            else:
+                where = "start"
+            record.update(outcome="interrupted", finished_at=now, exit_code=int(exit_code),
+                          stop_reason=f"{reason} (last stage: {where})", closed_by=closed_by)
+        from hermes_cli.runtime_state import _atomic_bytes
+
+        payload = (json.dumps(record, indent=2, default=str) + "\n").encode("utf-8")
+        _atomic_bytes(target, payload)
+        with suppress(Exception):
+            _write_latest(payload)
+        return target
+    except Exception as exc:  # health: allow BLE001 -- a dying process reports, it never raises
+        logger.debug("Could not close the open update receipt from outside: %s", exc)
+        return None
 
 
 def resumable_stage() -> dict[str, Any] | None:
@@ -571,6 +628,16 @@ def begin_stage(name: str, **facts: str) -> None:
 def record_fact(key: str, value: Any) -> None:
     """Set one top-level receipt field (e.g. ``initiator``)."""
     _record("fact", f"update fact {key}", key, value)
+
+
+def record_event(name: str, **facts: Any) -> None:
+    """Record a NAMED event durably (``events``), for facts that are looked up by name.
+
+    ``resumed_at_stage`` is the first: a re-entered update says in the record that it resumed the
+    stage the killed one started, instead of the reader inferring it from the absence of a refusal.
+    """
+    _record("event", f"update event {name}", name, **facts)
+    persist_running_receipt()
 
 
 def record_gateway_restart(**kwargs: Any) -> None:

@@ -276,7 +276,14 @@ def test_owner_release_hands_the_claim_to_a_live_delegate(tmp_path):
         marker.write_bytes(marker.read_bytes() + f"delegate:{delegate.pid} ct:{ct}\nrun:desk-1\n".encode())
         started = marker.read_text(encoding="utf-8").splitlines()[1]
         lock.release()
-        assert marker.read_text(encoding="utf-8") == f"{delegate.pid}\n{started}\nct:{ct}\nrun:desk-1\n"
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        assert lines[:3] == [str(delegate.pid), started, f"ct:{ct}"], (
+            "the hand-off rewrites the identity, keeping the run")
+        assert "run:desk-1" in lines
+        # R1 (t_38413d8f): the lease tags ride along with the claim. A hand-off that dropped them
+        # would silently demote the delegate's claim to the age ceiling.
+        assert any(line.startswith("boot:") for line in lines), "the hand-off keeps the boot id"
+        assert any(line.startswith("hb:") for line in lines), "the hand-off keeps the heartbeat"
     finally:
         delegate.kill()
         delegate.wait()

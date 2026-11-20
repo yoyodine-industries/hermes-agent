@@ -559,9 +559,15 @@ def sync(token: dict) -> None:
 
 def _live_update_elsewhere() -> bool:
     """A live update other than the one this process belongs to. The update tree holding the
-    checkout lock (this process plus the partner whose marker it adopted) is not "elsewhere"."""
+    checkout lock (this process plus the partner whose marker it adopted) is not "elsewhere".
+
+    R1 item 3 (t_38413d8f): the pause/drain path reconciles FIRST. A killed update's claim is dead
+    even though its marker and the receipt it left `running` survive; closing the run and
+    reclaiming the expired lease here is what lets `hermes pause` succeed after a killed update
+    instead of refusing on a file nobody is holding."""
     from hermes_cli import update_lock
     root = install_root()
+    update_lock.reconcile_interrupted_claim(root)
     return not update_lock.holds_checkout_lock(root) and update_lock.update_in_progress(root)
 
 

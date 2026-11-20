@@ -2366,8 +2366,14 @@ def cmd_update(args):
         UPDATE_EXIT_CONCURRENT,
         UpdateLock,
         describe_holder,
+        reconcile_interrupted_claim,
     )
 
+    # R1 item 3 (t_38413d8f): the window has to be freed BEFORE the lock decides. A killed update
+    # leaves a claim whose pid is dead; the reconciler that closes its receipt and reclaims the
+    # claim used to sit downstream of this acquire, so it was unreachable exactly while the dead
+    # claim refused. Close the interrupted run and reclaim the dead lease here, first.
+    reconcile_interrupted_claim(PROJECT_ROOT)
     _update_lock = UpdateLock(install_root=PROJECT_ROOT)
     if not _update_lock.acquire():
         print(describe_holder(_update_lock.holder))

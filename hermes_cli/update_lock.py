@@ -45,6 +45,23 @@ UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 
 # Clock skew allowed between a recorded and a probed process creation time (C1 rule 3).
 CREATE_TIME_TOLERANCE_SECONDS = 2.0
+
+# --- the lease (R1, t_38413d8f) --------------------------------------------------------------
+# Liveness is a LEASE, not a one-shot verdict: (pid + create time + boot id alive) OR a heartbeat
+# younger than LEASE_TTL. The heartbeat is what lets a claim outlive a probe that cannot prove
+# an identity, and — the other way round — what bounds a SIGKILLed claim: its pid is dead, so
+# nothing refreshes the heartbeat, and once that goes stale the claim is reclaimable with no
+# human action. LEASE_TTL is deliberately short; every live update refreshes it from a daemon
+# thread, so a fresh heartbeat is proof of life and a stale one is proof of death.
+LEASE_TTL_SECONDS = 45.0
+# How long a checkout FLOCK may still bound a dead claim. The flock carries no owner identity and
+# no age, so it may never decide liveness (R1 item 2): after this grace the claim is reclaimed
+# anyway, by name, so a survivor is visible instead of silently blocking the whole fleet. One
+# drain timeout is the ceiling for this value.
+LEASE_GRACE_SECONDS = 90.0
+# The heartbeat cadence: comfortably inside LEASE_TTL even if one write is refused.
+LEASE_HEARTBEAT_INTERVAL_SECONDS = 10.0
+
 # Our own creation time re-probed by the same clock: only the marker's 3-decimal rounding differs,
 # while two processes are at least one scheduler tick (10 ms) apart.
 _OWN_CREATE_TIME_EPSILON = 0.005
@@ -593,6 +610,12 @@ _CT_VALUE = re.compile(r"[0-9]+(?:\.[0-9]+)?", re.ASCII)
 _CT_LINE = re.compile(r"ct:([0-9]+(?:\.[0-9]+)?)", re.ASCII)
 _DELEGATE_LINE = re.compile(r"delegate:([0-9]+) ct:([0-9]+(?:\.[0-9]+)?)", re.ASCII)
 _RUN_LINE = re.compile(r"run:([A-Za-z0-9._-]{1,128})", re.ASCII)
+# The lease tags (R1): the boot the claim was written in, and the epoch of its last heartbeat.
+# Both ride lines 4+ as tagged lines, which every other reader (Rust marker.rs, Electron, the
+# hand-off scripts) already ignores by contract, so the marker stays one format for all of them.
+_BOOT_LINE = re.compile(r"boot:([A-Za-z0-9._:-]{1,96})", re.ASCII)
+_HB_LINE = re.compile(r"hb:([0-9]+(?:\.[0-9]+)?)", re.ASCII)
+
 
 
 @dataclass(frozen=True)
@@ -607,6 +630,8 @@ class _Marker:
     ct_text: str | None = None
     delegate_ct_text: str | None = None
     runs: tuple[str, ...] = ()
+    boot_id: str | None = None      # the boot this claim was written in (R1)
+    heartbeat: float | None = None  # epoch of its last heartbeat (R1)
 
     @property
     def base(self) -> bytes:
@@ -621,13 +646,32 @@ class _Marker:
         now = time.time() if world is None else world.now
         return now - self.started_at if self.started_at is not None else float("inf")
 
+    def heartbeat_age(self, world: _World | None = None) -> float | None:
+        """Seconds since the claim's last heartbeat; ``None`` when it never wrote one."""
+        if self.heartbeat is None:
+            return None
+        now = time.time() if world is None else world.now
+        return now - self.heartbeat
+
+    def lease_live(self, world: _World | None = None) -> bool:
+        """The heartbeat half of the lease: a fresh one proves its run is alive (R1 item 1)."""
+        age = self.heartbeat_age(world)
+        return age is not None and age <= LEASE_TTL_SECONDS
+
+    def boot_matches(self) -> bool:
+        """False when the claim names another BOOT: that identity cannot be alive at all."""
+        recorded, live = self.boot_id, _live_boot_id()
+        return not (recorded and live and recorded != live)
+
     def owner_live(self, world: _World | None = None) -> bool:
-        return self.started_at is not None \
-            and _identity_live(self.pid, self.create_time, self.age(world), world)
+        return self.started_at is not None and self.boot_matches() \
+            and (_identity_live(self.pid, self.create_time, self.age(world), world)
+                 or self.lease_live(world))
 
     def delegate_live(self, world: _World | None = None) -> bool:
-        return self.delegate_pid is not None and self.started_at is not None \
-            and _identity_live(self.delegate_pid, self.delegate_create_time, self.age(world), world)
+        return self.delegate_pid is not None and self.started_at is not None and self.boot_matches() \
+            and (_identity_live(self.delegate_pid, self.delegate_create_time, self.age(world), world)
+                 or self.lease_live(world))
 
     def live_pid(self, world: _World | None = None) -> int | None:
         if self.in_flight:
@@ -636,9 +680,29 @@ class _Marker:
             return self.pid
         return self.delegate_pid if self.delegate_live(world) else None
 
+    def claim_expired(self, world: _World | None = None) -> bool:
+        """The lease on a claim with no live identity has run out: reclaimable without a human.
+
+        A heartbeat bounds it (stale past :data:`LEASE_TTL_SECONDS` + :data:`LEASE_GRACE_SECONDS`);
+        a claim that never wrote one is judged by its age against the same bound, so the flock's
+        grace is the same wherever it applies.
+        """
+        bound = LEASE_TTL_SECONDS + LEASE_GRACE_SECONDS
+        age = self.heartbeat_age(world)
+        return (self.age(world) if age is None else age) > bound
+
     def canonical(self, pid: int, ct_text: str | None) -> bytes:
-        """A rewritten claim (A7 rule 5): ``pid`` owns it from ``started_at`` on; run lines kept."""
+        """A rewritten claim (A7 rule 5): ``pid`` owns it from ``started_at`` on; run lines kept.
+
+        The lease tags ride along: the heartbeat belongs to the RUN — whoever holds the claim
+        refreshes it — so a rewritten claim keeps a fresh lease instead of silently dropping to
+        the age ceiling.
+        """
         body = f"{pid}\n{self.started_at}\n" + (f"ct:{ct_text}\n" if ct_text else "")
+        if self.boot_id:
+            body += f"boot:{self.boot_id}\n"
+        if self.heartbeat is not None:
+            body += f"hb:{self.heartbeat:.3f}\n"
         return (body + "".join(f"run:{run}\n" for run in self.runs)).encode()
 
 
@@ -671,13 +735,16 @@ def _parse_marker(raw: bytes, *, mtime: float | None = None) -> _Marker:
     delegates = ((m, _bounded_int(m.group(1), _U32_MAX)) for m in map(_DELEGATE_LINE.fullmatch, lines[3:]) if m)
     delegate, delegate_pid = next(((m, d) for m, d in delegates if d is not None), (None, None))
     runs = tuple(m.group(1) for m in map(_RUN_LINE.fullmatch, lines[3:]) if m)
+    boots = [m.group(1) for m in map(_BOOT_LINE.fullmatch, lines[3:]) if m]
+    beats = [float(m.group(1)) for m in map(_HB_LINE.fullmatch, lines[3:]) if m]
     in_flight = not raw and mtime is not None and time.time() - mtime < EMPTY_MARKER_GRACE_SECONDS
     return _Marker(
         raw=raw, pid=pid, started_at=started_at, create_time=float(ct.group(1)) if ct else None,
         delegate_pid=delegate_pid,
         delegate_create_time=float(delegate.group(2)) if delegate else None, in_flight=in_flight,
         ct_text=ct.group(1) if ct else None, delegate_ct_text=delegate.group(2) if delegate else None,
-        runs=runs,
+        runs=runs, boot_id=boots[0] if boots else None,
+        heartbeat=beats[-1] if beats else None,
     )
 
 
@@ -914,6 +981,175 @@ def _live_partners(marker: _Marker) -> list[int]:
     return partners
 
 
+# --- the lease: who is alive, and what a dead claim may still hold (R1, t_38413d8f) ----------
+
+def _live_boot_id() -> str | None:
+    """This boot's id (``process_identity`` knows it; unreadable/unsupported → ``None``)."""
+    try:
+        from hermes_cli.process_identity import live_boot_id
+        return live_boot_id()
+    except Exception:  # a partial tree (an -I -S completion child of a stubbed checkout)
+        return None
+
+
+def live_boot_id() -> str | None:
+    """This boot's id as the marker records it (public spelling for probes and tests)."""
+    return _live_boot_id()
+
+
+def _claim_body() -> bytes:
+    """The bytes a claim of OUR process is published with: identity lines, then the lease tags.
+
+    ``boot:`` names the boot the claim was written in — a claim carrying another boot's id
+    cannot be alive, whatever its pid looks like after a reboot. ``hb:`` starts the heartbeat.
+    """
+    body = f"{os.getpid()}\n{int(time.time())}\n{_identity_line()}\n"
+    boot = _live_boot_id()
+    if boot:
+        body += f"boot:{boot}\n"
+    return (body + f"hb:{time.time():.3f}\n").encode()
+
+
+def _names_us(marker: _Marker) -> bool:
+    """This process is (part of) the claim, so it is the one that refreshes the heartbeat."""
+    return marker.pid == os.getpid() or marker.delegate_pid == os.getpid()
+
+
+def touch_heartbeat(path: Path | None = None) -> bool:
+    """Refresh the claim's ``hb:`` line — the lease a live update holds (R1 item 1).
+
+    Only a claim that names this process is touched (owner or delegate): a bystander's probe must
+    never keep a dead update's claim alive. Everything else in the file — lines 1–3, the delegate
+    line, the run ids — is preserved byte-for-byte by the compare-and-swap, so the shared marker
+    contract is untouched. Never raises.
+    """
+    marker = path or update_marker_path()
+    try:
+        raw = _read_bytes(marker)
+        if raw is None:
+            return False
+        parsed = _parse_marker(raw)
+        if not _names_us(parsed):
+            return False
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        beat = f"hb:{time.time():.3f}"
+        for index, line in enumerate(lines[3:], start=3):
+            if _HB_LINE.fullmatch(line.strip()):
+                lines[index] = beat + ("\r\n" if line.endswith("\r\n") else "\n")
+                break
+        else:  # a v1/v2 claim adopted by us: append the tag rather than rewriting its identity
+            if lines and not lines[-1].endswith(("\n", "\r")):
+                lines[-1] += "\n"
+            lines.append(beat + "\n")
+        return _compare_and_swap(marker, raw, "".join(lines).encode("utf-8"))
+    except Exception as exc:  # health: allow BLE001 -- a heartbeat is best-effort liveness, never a failure
+        logger.debug("Could not refresh update heartbeat %s: %s", marker, exc)
+        return False
+
+
+def _lock_fd_holders(path: Path) -> list[int]:
+    """Pids the kernel reports as having the checkout lock file open (``lsof``), [] if unknown.
+
+    This is the only identity a FLOCK has: it names no owner and carries no age. Recording these
+    pids is what turns "some descendant still holds it" into evidence a human can act on.
+    """
+    try:
+        done = subprocess.run(["lsof", "-w", "-t", "--", str(path)],
+                              capture_output=True, text=True, timeout=5, check=False)
+        return sorted({int(token) for token in (done.stdout or "").split() if token.isdigit()})
+    except Exception:  # health: allow BLE001 -- lsof is absent on Windows and may be denied elsewhere
+        return []
+
+
+def _emit_reclaim_event(marker: _Marker, install_root: Path | str | None = None) -> dict:
+    """Record a reclaim BY NAME (R1 item 2): ``reclaimed_dead_lease`` with what was seen.
+
+    A reclaim that leaves only "the marker is gone" is the silence that let a dead claim block the
+    fleet: the event names the dead pid, its heartbeat age and the pids still holding the lock fd,
+    so a SURVIVOR is visible in the record while the next window proceeds. Written to the log and
+    appended (fsync'd) to ``hermes-update-events.jsonl`` beside the checkout lock.
+    """
+    import json
+
+    lock_path = checkout_lock_path(install_root)
+    holders = _lock_fd_holders(lock_path)
+    beat_age = marker.heartbeat_age()
+    event = {
+        "event": "reclaimed_dead_lease",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "marker": str(update_marker_path()),
+        "dead_pid": marker.pid,
+        "started_at": marker.started_at,
+        "boot_id": marker.boot_id,
+        "live_boot_id": _live_boot_id(),
+        "heartbeat_age_s": None if beat_age is None else round(beat_age, 3),
+        "checkout_lock": str(lock_path),
+        "lock_fd_holders": holders,
+        "reclaimed_by_pid": os.getpid(),
+    }
+    try:
+        logger.warning("reclaimed_dead_lease %s", json.dumps(event, default=str))
+    except Exception:  # health: allow BLE001 -- logging a forensic event never fails an update
+        pass
+    try:
+        with open(lock_path.parent / "hermes-update-events.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, default=str) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        logger.debug("Could not append the reclaim event beside %s: %s", lock_path, exc)
+    return event
+
+
+def _descendant_holder(marker: _Marker, install_root: Path | str | None = None,
+                       *, lock_path: Path | None = None) -> UpdateHolder:
+    """The refusal for a DEAD claim whose checkout flock is still held (R1 item 4: never ``pid=0``).
+
+    The marker's own pid is gone, so the process keeping the checkout busy is one it started. The
+    refusal says exactly that, naming the fd holders and the claim's age, instead of a bare
+    ``held=True`` with ``pid=0`` that told nobody anything.
+    """
+    age = max(marker.age(), 0.0) if marker.started_at is not None else 0.0
+    target = lock_path or checkout_lock_path(install_root)
+    holders = [pid for pid in _lock_fd_holders(target) if pid != os.getpid()]
+    named = ",".join(str(pid) for pid in holders) if holders else "unknown"
+    return UpdateHolder(
+        pid=0, age_seconds=age, held=True,
+        reason=(f"a descendant holds the checkout lock, pids={named}, age={age:.0f}s "
+                f"(the update that wrote this claim, pid {marker.pid}, is gone)"))
+
+
+def reconcile_interrupted_claim(install_root: Path | str | None = None) -> dict | None:
+    """Free the next window BEFORE the lock decides whether it may open (R1 item 3).
+
+    ``reconcile_interrupted_runs()`` already knows the rule — a ``running`` receipt whose owner is
+    dead is ``interrupted`` — but its only caller sits DOWNSTREAM of ``UpdateLock.acquire``, so the
+    one function that would close the dead run and free the window was unreachable exactly while
+    the dead claim refused. This is the pre-lock door: close the dead run, then reclaim the dead
+    claim (under the mutex, with its own re-judge). Returns the reclaim event, if one was written.
+    Never raises.
+    """
+    try:
+        from hermes_cli.update_receipt import reconcile_interrupted_runs
+        reconcile_interrupted_runs()
+    except Exception as exc:  # health: allow BLE001 -- ordering must never fail an update
+        logger.debug("Could not reconcile interrupted update receipts: %s", exc)
+    try:
+        marker_path = update_marker_path()
+        parsed = _read_marker(marker_path)
+        if parsed is None or parsed.live_pid() is not None:
+            return None
+        if not parsed.claim_expired() and read_live_update(install_root=install_root) is not None:
+            return None  # a live claim appeared: not ours to touch
+        if _reclaim_dead(marker_path, install_root) == "reclaimed":
+            return {"event": "reclaimed_dead_lease", "dead_pid": parsed.pid,
+                    "heartbeat_age_s": parsed.heartbeat_age()}
+    except Exception as exc:  # health: allow BLE001 -- see above
+        logger.debug("Could not reconcile the update claim: %s", exc)
+    return None
+
+
 def read_live_update(*, path: Path | None = None, install_root: Path | str | None = None) -> UpdateHolder | None:
     """Return the live update holding the marker, or ``None``.
 
@@ -941,8 +1177,9 @@ def read_live_update(*, path: Path | None = None, install_root: Path | str | Non
                 return UpdateHolder(pid=live, age_seconds=parsed.age() if parsed.started_at is not None else 0.0)
             verdict = _reclaim_dead(marker, install_root)
             if verdict == "held":
-                return UpdateHolder(pid=0, held=True,
-                                    age_seconds=max(parsed.age(), 0.0) if parsed.started_at is not None else 0.0)
+                # Never a bare ``pid=0`` (R1 item 4): the refusal names the descendants that keep
+                # the checkout busy, with the claim's age, so it is actionable evidence.
+                return _descendant_holder(parsed, install_root)
             if verdict != "live":
                 break
     except Exception as exc:  # health: allow BLE001 -- never raises: fails open on the marker only; the kernel lock guards (doc)
@@ -951,8 +1188,14 @@ def read_live_update(*, path: Path | None = None, install_root: Path | str | Non
 
 
 def _reclaim_dead(path: Path, install_root: Path | str | None = None) -> str:
-    """Remove a dead marker under the mutex: ``reclaimed`` | ``held`` (dead, but the checkout lock
-    is held, so it is kept) | ``live`` (a claim appeared) | ``absent`` | ``busy``."""
+    """Remove a dead marker under the mutex: ``reclaimed`` | ``held`` | ``live`` | ``absent`` | ``busy``.
+
+    ``held`` is now BOUNDED (R1 item 2): a checkout flock carries no owner identity and no age, so
+    it may keep a dead claim alive only for :data:`LEASE_GRACE_SECONDS` past its stale heartbeat.
+    After that the claim is reclaimed anyway — by name (``reclaimed_dead_lease``, dead pid +
+    heartbeat age + the fd holders) — so a survivor is visible in the record instead of silently
+    blocking every window that follows.
+    """
     try:
         with marker_mutex(path):
             current = _read_marker(path)
@@ -960,8 +1203,11 @@ def _reclaim_dead(path: Path, install_root: Path | str | None = None) -> str:
                 return "absent"
             if current.live_pid() is not None:
                 return "live"
-            if checkout_lock_held(install_root):
+            if checkout_lock_held(install_root) and not current.claim_expired():
                 return "held"
+            # A reclaim is never silent (R1 item 2): name the dead pid, its heartbeat age and the
+            # pids still holding the lock fd, whatever the flock said.
+            _emit_reclaim_event(current, install_root)
             with suppress(FileNotFoundError):
                 path.unlink()
             return "reclaimed"
@@ -993,6 +1239,17 @@ def legacy_profile_claims(root: Path | None = None) -> list[UpdateHolder]:
 
 def describe_holder(holder: UpdateHolder | None) -> str:
     """One-line, user-facing explanation of who holds the update lock."""
+    if holder is not None and holder.held and holder.reason:
+        # A dead claim whose checkout flock survives (R1 item 4): name the descendants instead of
+        # telling the reader to fix permissions on a path that is perfectly writable.
+        return (
+            "✗ The previous update did not finish: a process it started still holds the checkout.\n"
+            f"  {holder.reason}.\n"
+            "\n"
+            "  That process tree still owns the checkout, so a second update could corrupt the\n"
+            "  install. Wait for it to exit (watch `hermes logs`), or stop the pids named above;\n"
+            "  the claim is reclaimed automatically once its lease expires."
+        )
     if holder is not None and holder.reason:
         return (
             f"✗ Cannot lock this install for the update: {holder.reason}.\n"
@@ -1143,13 +1400,15 @@ def _inherited_lock_fd(path: Path) -> int | None:
 def _lock_holder(fd_or_path) -> UpdateHolder:
     """Who holds the checkout lock, from its holder record. A recorded updater that is gone (its
     incarnation is dead) while the lock stays held means a process it started holds it: that is
-    the ``held`` holder, never the dead pid (the marker reader's wording, R6)."""
+    the ``held`` holder, and the refusal NAMES those descendants (R1 item 4) — a bare ``pid=0``
+    hid the only fact that could free the fleet."""
     raw = _read_bytes(fd_or_path) or b""
     parsed = _parse_marker(raw)
     age = parsed.age() if parsed.started_at else 0.0
     if parsed.pid > 0 and incarnation_live(parsed.pid, parsed.create_time) is False:
-        return UpdateHolder(pid=0, age_seconds=age, held=True)
+        return _descendant_holder(parsed, lock_path=Path(fd_or_path))
     return UpdateHolder(pid=max(parsed.pid, 0), age_seconds=age)
+
 
 
 def _open_lock_file(path: Path) -> tuple[int | None, object]:
@@ -1218,7 +1477,7 @@ def _acquire_checkout(install_root: Path) -> UpdateHolder | None:
             return UpdateHolder(pid=0, age_seconds=0.0,
                                 reason=f"{path} is read-only; delete it or fix its permissions")
         if writable is True:
-            record = f"{os.getpid()}\n{int(time.time())}\n{_identity_line()}\n".encode()
+            record = _claim_body()
             os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
             os.write(fd, record)
@@ -1497,6 +1756,39 @@ def _marker_unwritable(path: Path, exc: OSError) -> str:
 # in-process, venv_sync finishing a tail) share one claim, released by the outermost.
 _CLAIMS: dict[str, int] = {}
 
+# One lease-heartbeat thread per claimed marker path in this process (R1 item 1). It refreshes the
+# claim's ``hb:`` line while we hold it, so a live update is provably alive even when its pid
+# cannot be proved, and a killed one goes stale within LEASE_TTL with no help from anyone.
+_HEARTBEATS: dict[str, threading.Event] = {}
+
+
+def _start_heartbeat(path: Path) -> None:
+    """Start (idempotently) the lease heartbeat for ``path``; it stops when the claim is released."""
+    key = str(path)
+    if key in _HEARTBEATS:
+        return
+
+    def _beat() -> None:
+        stop = _HEARTBEATS.get(key)
+        while stop is not None and not stop.wait(LEASE_HEARTBEAT_INTERVAL_SECONDS):
+            touch_heartbeat(path)
+
+    stop = threading.Event()
+    _HEARTBEATS[key] = stop
+    try:
+        threading.Thread(target=_beat, daemon=True,
+                         name=f"update-lease-heartbeat-{os.getpid()}").start()
+    except Exception:  # health: allow BLE001 -- a thread we cannot start must not fail the update
+        _HEARTBEATS.pop(key, None)
+
+
+def _stop_heartbeat(path: Path) -> None:
+    """Stop the heartbeat of ``path`` (the claim it refreshes is gone or no longer ours)."""
+    stop = _HEARTBEATS.pop(str(path), None)
+    if stop is not None:
+        stop.set()
+
+
 
 class UpdateLock:
     """Context manager owning the shared update marker (and, with ``install_root``, the
@@ -1517,15 +1809,28 @@ class UpdateLock:
 
     def __init__(self, *, path: Path | None = None, install_root: Path | str | None = None,
                  checkout_first: bool = True) -> None:
-        self.path = path or update_marker_path()
+        self.path = Path(path) if path is not None else update_marker_path()
         self.install_root = None if install_root is None else Path(install_root)
         self.checkout_first = checkout_first
         self.acquired = False
         self.holder: UpdateHolder | None = None
         self._claimed = False
         self._checkout = False
+        self._reconciled = False
+
+    def _reconcile_before_deciding(self) -> None:
+        """R1 item 3, at the one door every caller passes: close a dead run and reclaim a dead
+        claim BEFORE the lock decides whether this window may open. Without it the function that
+        frees the next window sits behind the very refusal it would lift, and a killed update
+        parks the whole fleet until a human deletes a file."""
+        if self._reconciled:
+            return
+        self._reconciled = True
+        reconcile_interrupted_claim(self.install_root)
 
     def acquire(self) -> bool:
+        if _CLAIMS.get(str(self.path)) is None:
+            self._reconcile_before_deciding()
         if self.install_root is not None and self.checkout_first \
                 and not self.acquire_checkout(self.install_root):
             return False
@@ -1540,6 +1845,7 @@ class UpdateLock:
         key = str(self.path)
         _CLAIMS[key] = _CLAIMS.get(key, 0) + 1
         self._claimed = True
+        _start_heartbeat(self.path)
         return True
 
     def acquire_checkout(self, install_root: Path | str) -> bool:
@@ -1547,6 +1853,7 @@ class UpdateLock:
         that will mutate the checkout under a marker it adopted or claimed calls this first."""
         if self._checkout:
             return True
+        self._reconcile_before_deciding()
         refused = _acquire_checkout(Path(install_root))
         if refused is not None:
             self.holder = refused
@@ -1567,7 +1874,7 @@ class UpdateLock:
             if legacy:
                 self.holder = legacy[0]
                 return False
-        body = f"{os.getpid()}\n{int(time.time())}\n{_identity_line()}\n".encode()
+        body = _claim_body()
         try:
             for _attempt in range(3):
                 # A7 rule 2: an exclusive create needs no mutex — it only succeeds on no marker.
@@ -1580,14 +1887,17 @@ class UpdateLock:
                         continue  # vanished between publish and read: retry
                     if _live_partners(existing):
                         return self._adopt_or_refuse(existing)
-                    if self._checkout_held_elsewhere():
-                        # R6: the marker's owner is dead but a process it started (completion,
-                        # build, git) still holds the checkout. The update is not over: keep
-                        # its marker and refuse as ``held``.
-                        self.holder = UpdateHolder(
-                            pid=0, held=True,
-                            age_seconds=max(existing.age(), 0.0) if existing.started_at is not None else 0.0)
+                    if self._checkout_held_elsewhere() and not existing.claim_expired():
+                        # R6, BOUNDED (R1 item 2): the marker's owner is dead but a process it
+                        # started (completion, build, git) still holds the checkout. The update is
+                        # not over — so the flock may keep the claim for the lease grace, and no
+                        # longer: after that it bounds, it does not decide.
+                        self.holder = _descendant_holder(existing, self.install_root)
                         return False
+                    if self._checkout_held_elsewhere():
+                        # The grace ran out: record what still holds the checkout, by name, and
+                        # take the window anyway rather than blocking the fleet on a dead claim.
+                        _emit_reclaim_event(existing, self.install_root)
                     # Dead or malformed, judged under the mutex: reclaim and claim in one hold.
                     with suppress(FileNotFoundError):
                         self.path.unlink()
@@ -1654,6 +1964,7 @@ class UpdateLock:
                 _CLAIMS[key] = _CLAIMS.get(key, 1) - 1
                 if _CLAIMS[key] <= 0:
                     _CLAIMS.pop(key, None)
+                    _stop_heartbeat(self.path)
                     _release_marker(self.path)
         except OSError as exc:
             logger.debug("Could not release update marker %s: %s", self.path, exc)
