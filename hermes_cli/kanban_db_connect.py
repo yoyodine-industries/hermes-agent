@@ -737,7 +737,14 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     # (``agent.delegation_context.child_kanban_write_allowance``, purpose
     # ``peer-refusal-report``) is here to WRITE, so it opens read-write; the write itself
     # still passes the allowance check at the write seam, which logs every use.
-    if (kanban_path_is_fenced(path) or ancestor_owns_live_kanban_claim(path)) and not child_kanban_write_purpose():
+    # THE SECOND, AND LAST, exception is the operator-ask raise (card t_af03b766): its validated
+    # grant is scoped to one handler call on one board store, and it must reach this door too or
+    # the granted create would open a read-only connection and die on its INSERT. Both exceptions
+    # are named; neither widens the other.
+    from hermes_cli import kanban_operator_ask as _koa
+
+    if ((kanban_path_is_fenced(path) or ancestor_owns_live_kanban_claim(path))
+            and not child_kanban_write_purpose() and not _koa.admits_store(path)):
         # Reads must not enter schema/backfill write transactions. Never create a
         # missing board or migrate on a descendant's behalf; the owner initializes it.
         conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
