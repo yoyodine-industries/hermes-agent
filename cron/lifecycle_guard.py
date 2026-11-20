@@ -376,10 +376,40 @@ def _name_killer_operands(name: str, args: list[str]) -> tuple:
     return operands, full_cmdline, exact
 
 
+# The service word the gateway's own argv carries as a standalone token. A full-command-line
+# pattern that NAMES it selects the live gateway even when the longer phrase it spells does not
+# appear verbatim: `pkill -f gateway` matches outright, and `pkill -f 'python3 gateway'` /
+# `pkill -f 'gateway run'` cannot be told apart from it by the derived identity — so all refuse.
+_SERVICE_WORDS = frozenset({"gateway"})
+
+
+def _service_words_in(text: str) -> tuple:
+    """The service words *text* carries as STANDALONE tokens, in order.
+
+    Tokenized the way the shell and argv-list shapes separate words, so the identity's
+    ``['.../main.py', 'gateway', 'run', '--replace']`` yields ``('gateway',)`` while
+    ``not-the-gateway`` and ``my_gateway`` yield nothing.
+    """
+    if not text:
+        return ()
+    found = []
+    for raw in re.split(r"[\s,]+", text):
+        word = raw.strip("'\"[]()")
+        if word.lower() in _SERVICE_WORDS:
+            found.append(word)
+    return tuple(found)
+
+
+def service_word_tokens(cmdline: str) -> tuple:
+    """Public read of the identity's own service tokens, for a caller that must explain a refusal."""
+    return _service_words_in(cmdline)
+
+
 def _operand_matches_identity(operand: str, identity: tuple, *, full_cmdline: bool, exact: bool) -> bool:
     """pkill/pgrep/killall operand semantics against one resolved process.
 
-    An operand that is not a valid ERE selects no process at all, so it is not a match.
+    An operand that is not a valid ERE selects no process at all, so it is not a match — unless
+    it NAMES the service word, see below.
     """
     _, name, cmdline = identity
     subject = cmdline if full_cmdline else name
@@ -389,10 +419,18 @@ def _operand_matches_identity(operand: str, identity: tuple, *, full_cmdline: bo
     try:
         pattern = re.compile(text)
     except re.error:
-        return False
-    if exact:
-        return pattern.fullmatch(subject) is not None
-    return pattern.search(subject) is not None
+        pattern = None
+    if pattern is not None:
+        if exact:
+            if pattern.fullmatch(subject) is not None:
+                return True
+        elif pattern.search(subject) is not None:
+            return True
+    # The bare service word refuses even where the phrase as written selects nothing. Identity is
+    # resolved from the process's OWN argv, so a pattern naming `gateway` cannot be shown to spare
+    # the live gateway whose argv carries that token — and a guard must not pick the reading that
+    # survives. `python3 gateway` and `gateway run` therefore classify ALIKE to `gateway`.
+    return full_cmdline and bool(_service_words_in(text)) and bool(_service_words_in(cmdline))
 
 
 def _is_bounce_carrier(name: str, args: list[str]) -> bool:

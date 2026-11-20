@@ -138,7 +138,6 @@ def test_name_based_targets_resolving_to_the_live_gateway_are_flagged(command, l
 
 @pytest.mark.parametrize("command", [
     "pkill -f not-the-gateway",
-    "pkill -f 'gateway run'",           # no such substring in the shim's argv: selects nothing
     "pkill -f 'my_hermes_bot'",
     "pkill -x hermes_cli",              # exact-name match against argv[0]
     "killall hermes_cli",
@@ -148,6 +147,33 @@ def test_name_based_targets_resolving_to_the_live_gateway_are_flagged(command, l
 ])
 def test_name_based_targets_that_select_nothing_are_not_flagged(command, live_gateway):
     assert flagged(command) is False
+
+
+# `pkill -f 'gateway run'` sat in the must-allow list above, justified as "no such substring in the
+# shim's argv: selects nothing". WITHDRAWN 2026-11-20 by platform-stl on a measurement of the LIVE
+# gateway's argv — it carries `gateway` as a standalone token, so a full-command-line pattern names
+# the gateway by the word the gateway answers to, and the ERE verdict cannot tell the phrase from
+# the bare word. The allowance is gone; the refusal test below is its replacement.
+
+
+@pytest.mark.parametrize("command", [
+    "pkill -f gateway",                 # matches the argv outright
+    "pkill -f 'python3 gateway'",       # selects nothing as written; indistinguishable by identity
+    "pkill -f 'gateway run'",           # ditto — the withdrawn must-allow control
+])
+def test_a_bare_service_word_refuses_and_says_why(command, live_gateway):
+    """The identity itself proves the pattern names the gateway, so all three classify ALIKE.
+
+    The printed line is the point of the control: a reader must see that the refusal comes from
+    the derived argv carrying the service word, not from the spelling of the pattern.
+    """
+    tokens = lifecycle_guard.service_word_tokens(HOST_CMDLINE)
+    assert tokens == ("gateway",), "the fixture argv must carry the service word as a standalone token"
+    print(
+        f"\n{command!r} -> REFUSED: the derived argv carries {tokens[0]!r} as a standalone token "
+        f"({HOST_CMDLINE.strip()[-80:]!r}), so this pattern cannot be shown to spare the live gateway"
+    )
+    assert flagged(command) is True
 
 
 def test_invalid_ere_operand_is_not_a_match(live_gateway):
