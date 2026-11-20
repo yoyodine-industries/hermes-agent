@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import threading
 import time
 import urllib.error
@@ -766,11 +767,30 @@ def test_peer_add_from_a_profile_writes_the_root_registry(farm, monkeypatch):
     assert not (profile / "config.yaml").exists(), "the registry was forked into a profile copy"
 
 
-# ── a REFUSAL must land where a human reads it ────────────────────────────────
+# ── a REFUSAL must land where a human reads it — but ONLY when it is EVIDENCE ──
 #
-# Measured cost: a fleet-wide DM outage reached only callers' stderr and nobody noticed until
-# the operator asked why DMs were broken. A refusal that means "the DM path is broken" now
-# files ONE idempotency-keyed card on the ops board.
+# Measured cost of silence: a fleet-wide DM outage reached only callers' stderr and nobody
+# noticed until the operator asked why DMs were broken. Measured cost of noise: five refusal
+# cards filed between 2026-10-13 and 2026-11-06 — two named a local profile, one a `local-<64hex>`
+# session id, one a typo, and every one was assigned to a seat that had to disprove it. So the
+# ruled classification files ONE card when the CHANNEL is broken (registry-empty, no-key,
+# http-401/403/404/429) and says everything else on stderr only.
+
+REFUSAL_TARGET = {"board": "default", "assignee": "platform-stl", "priority": 3}
+
+
+@pytest.fixture
+def refusal_writes_allowed(monkeypatch):
+    """Let a test past the servance guard, and keep the board hermetic.
+
+    The guard is real and is tested below: a test process, or any tree that is not the served
+    install, must never write the LIVE board (measured 2026-11-06 — a refusal card appeared
+    with no served tree that could have filed it). A test that EXPECTS a card pins the guard
+    here AND stubs ``_create_card``, so nothing can reach a real store.
+    """
+    monkeypatch.setattr(peer_cmd, "_refusal_filer_blocked", lambda: "")
+    monkeypatch.setattr(peer_cmd, "_refusal_target", lambda: dict(REFUSAL_TARGET))
+    monkeypatch.setattr(peer_cmd, "_existing_refusal_card", lambda db_path, key: "")
 
 
 def _recording_filer(calls, card_id="t_card1234"):
@@ -780,11 +800,18 @@ def _recording_filer(calls, card_id="t_card1234"):
     return filer
 
 
-def test_a_no_peer_refusal_files_one_card_on_the_ops_board(monkeypatch, capsys):
-    """(c) The review gate: one DM failure files a card, and the caller still exits 1."""
+# ── reportable: the channel itself is broken -> ONE card ─────────────────────
+
+
+def test_an_empty_registry_beside_a_root_registry_files_one_card(
+        farm, monkeypatch, capsys, refusal_writes_allowed):
+    """(registry-empty) The 2026-10-13 shape: this session resolves NOTHING while the machine
+    root carries a peer. That is the outage, and stderr alone never reached anyone."""
+    _root, profile = farm
+    (profile / "config.yaml").write_text("bot_peers: {}\n")      # declares an EMPTY registry
+    monkeypatch.setenv("HERMES_HOME", str(profile))
     calls = []
     monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
-    monkeypatch.setattr(peer_cmd, "_load_peers", dict)          # EMPTY registry: the outage
 
     rc = peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="yoyodine/default",
                                            message="hi", json=False))
@@ -792,19 +819,21 @@ def test_a_no_peer_refusal_files_one_card_on_the_ops_board(monkeypatch, capsys):
     assert rc == 1
     assert len(calls) == 1
     call = calls[0]
-    assert call["board"] == peer_cmd.REFUSAL_BOARD
-    assert call["assignee"] == peer_cmd.REFUSAL_ASSIGNEE
-    assert call["idempotency_key"] == "peer-refusal-yoyodine-no-peer"
-    assert "yoyodine" in call["title"] and "no-peer" in call["title"]
-    assert "no-peer" in call["body"]
+    assert call["idempotency_key"] == "peer-refusal-yoyodine-registry-empty"
+    assert call["board"] == "default" and call["assignee"] == "platform-stl"
+    assert "registry-empty" in call["title"]
+    assert "2026-10-13" in call["body"] and "registry-empty" in call["body"]
     err = capsys.readouterr().err
     assert "Reported:" in err and "t_card1234" in err
 
 
-def test_a_missing_key_refusal_files_a_card_keyed_by_class(monkeypatch, capsys):
+def test_a_missing_key_refusal_files_a_card_keyed_by_class(
+        farm, monkeypatch, capsys, refusal_writes_allowed):
+    """(no-key) A REGISTERED peer with no key is a broken control channel, not a typo."""
+    _root, profile = farm
+    monkeypatch.setenv("HERMES_HOME", str(profile))
     calls = []
     monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
-    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"yoyodine": {"url": "http://x"}})
     monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "")
 
     assert peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="yoyodine", message="hi",
@@ -813,22 +842,37 @@ def test_a_missing_key_refusal_files_a_card_keyed_by_class(monkeypatch, capsys):
     assert calls[0]["idempotency_key"] == "peer-refusal-yoyodine-no-key"
 
 
-def test_a_capacity_refusal_files_a_card_keyed_by_status(monkeypatch, capsys):
-    """The 429 the peer's own cap returns (`Too many concurrent runs`) is a control-channel
-    starvation, not a transport blip: it is reported."""
+@pytest.mark.parametrize("code", [401, 403, 404, 429])
+def test_a_peer_own_refusal_status_files_a_card_keyed_by_status(
+        code, monkeypatch, capsys, refusal_writes_allowed):
+    """(http-<code>) 401/403 auth, 404 an unknown endpoint or unserved profile, and the 429 the
+    peer's own cap returns (`Too many concurrent runs`) all mean the DM door is shut."""
     calls = []
     monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
-    err = urllib.error.HTTPError("http://peer/v1/runs", 429, "Too many concurrent runs",
-                                 Message(), None)
+    err = urllib.error.HTTPError("http://peer/v1/runs", code, "refused", Message(), None)
 
     assert peer_cmd._peer_failure("yoyodine", err) == 1
 
-    assert calls[0]["idempotency_key"] == "peer-refusal-yoyodine-http-429"
-    assert "429" in calls[0]["body"]
-    assert "Too many concurrent runs" in calls[0]["body"]
+    assert calls[0]["idempotency_key"] == f"peer-refusal-yoyodine-http-{code}"
+    assert f"`http-{code}`" in calls[0]["body"]
 
 
-def test_a_transport_failure_files_no_card(monkeypatch, capsys):
+def test_a_peer_server_error_files_no_card(monkeypatch, capsys, refusal_writes_allowed):
+    """A 500 is the peer's own trouble, not evidence its DM door is closed: stderr, no card.
+    The card surface is the ruled five rows, never 'any non-200'."""
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+    err = urllib.error.HTTPError("http://peer/v1/runs", 500, "boom", Message(), None)
+
+    assert peer_cmd._peer_failure("yoyodine", err) == 1
+
+    assert calls == []
+    err_text = capsys.readouterr().err
+    assert "HTTP 500" in err_text
+    assert "No refusal card filed (http-500)" in err_text
+
+
+def test_a_transport_failure_files_no_card(monkeypatch, capsys, refusal_writes_allowed):
     """A peer that is briefly unreachable is the reachability probe's business: a card per
     blip is noise, so the reported classes are the DETERMINISTIC refusals only."""
     calls = []
@@ -840,17 +884,103 @@ def test_a_transport_failure_files_no_card(monkeypatch, capsys):
     assert "Could not reach peer" in capsys.readouterr().err
 
 
-def test_a_board_write_failure_never_breaks_the_refusal(monkeypatch, capsys):
+# ── caller errors: stderr only, and they say WHAT was wrong ──────────────────
+
+
+def test_an_unknown_peer_name_files_no_card_and_lists_the_registered_peers(
+        farm, monkeypatch, capsys, refusal_writes_allowed):
+    """(unknown-peer) The registry is intact; the NAME is not in it. That is a caller error, so
+    it is answered on stderr with the names that DO exist — never with a card for a seat."""
+    _root, profile = farm
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setattr(peer_cmd, "_create_card",
+                        _recording_filer([]))
+
+    rc = peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="nosuchpeer", message="hi",
+                                           json=False))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "unknown-peer" in err
+    assert "Registered peers: yoyodine" in err
+    assert "no card filed" in err
+
+
+def test_a_local_profile_passed_as_a_peer_files_no_card_and_names_the_transport(
+        farm, monkeypatch, capsys, refusal_writes_allowed):
+    """(local-lane) `platform-coder` is a seat on THIS host, not a peer. The caller is told
+    which transport works instead of costing a peer seat a card to disprove."""
+    root, profile = farm
+    (root / "profiles" / "default").mkdir()          # the root home's own default seat
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+
+    for target in ("platform-coder", "default"):
+        assert peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target=target,
+                                                 message="hi", json=False)) == 1
+
+    err = capsys.readouterr().err
+    assert calls == []
+    assert err.count("local-lane") == 2
+    assert "hermes -p platform-coder chat" in err
+    assert "hermes peer dm yoyodine/platform-coder" in err
+
+
+def test_a_local_session_id_passed_as_a_peer_files_no_card(
+        farm, monkeypatch, capsys, refusal_writes_allowed):
+    """(local-lane) `local-<64hex>` is a SESSION id — the token one of the five cards named."""
+    _root, profile = farm
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+    session_id = "local-" + "01cf956c" * 8
+
+    rc = peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target=session_id, message="hi",
+                                           json=False))
+
+    assert rc == 1
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "local-lane" in err and "local SESSION id" in err
+    assert "hermes peer reply <peer> --session <id>" in err
+
+
+def test_a_host_with_no_registry_at_all_files_no_card(farm, monkeypatch, capsys,
+                                                      refusal_writes_allowed):
+    """Nothing registered anywhere is a setup fact, not an outage: no peer to reach and no
+    registry that could have been lost, so stderr only."""
+    root, profile = farm
+    (root / "config.yaml").write_text("model: {}\n")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+
+    assert peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="yoyodine", message="hi",
+                                             json=False)) == 1
+
+    assert calls == []
+    assert "no-registry" in capsys.readouterr().err
+
+
+# ── the write itself: safe, idempotent, and never on a tree it does not own ──
+
+
+def test_a_board_write_failure_never_breaks_the_refusal(farm, monkeypatch, capsys,
+                                                        refusal_writes_allowed):
     """Reporting is a side effect of failing: it must never turn one failure into two.
 
     And the reason it prints must be the REAL one -- 'the board write failed' used to be
     printed for a fenced-context refusal, which sent the reader after the wrong problem.
     """
+    _root, profile = farm
+    (profile / "config.yaml").write_text("bot_peers: {}\n")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
     def boom(**kwargs):
         raise RuntimeError("the board is locked")
 
     monkeypatch.setattr(peer_cmd, "_create_card", boom)
-    monkeypatch.setattr(peer_cmd, "_load_peers", dict)
 
     rc = peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="yoyodine", message="hi",
                                            json=False))
@@ -860,23 +990,74 @@ def test_a_board_write_failure_never_breaks_the_refusal(monkeypatch, capsys):
     assert "NOT FILED" in err and "RuntimeError: the board is locked" in err
 
 
-def test_the_idempotency_hit_is_not_reported_as_a_failure(monkeypatch, capsys):
+def test_the_idempotency_hit_is_not_reported_as_a_failure(monkeypatch, capsys,
+                                                          refusal_writes_allowed):
     """Two outcomes, two lines: 'already filed' carries the SAME id and files no second row."""
     calls = []
     monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls, "t_seen0001"))
-    monkeypatch.setattr(peer_cmd, "_existing_refusal_card", lambda board, key: "")
 
-    first = peer_cmd._report_refusal("yoyodine", "no-peer", "detail")
+    first = peer_cmd._report_refusal("yoyodine", "registry-empty", "detail")
     assert first == "t_seen0001"
     assert "filed: card t_seen0001" in capsys.readouterr().err
 
-    monkeypatch.setattr(peer_cmd, "_existing_refusal_card", lambda board, key: "t_seen0001")
-    second = peer_cmd._report_refusal("yoyodine", "no-peer", "detail")
+    monkeypatch.setattr(peer_cmd, "_existing_refusal_card",
+                        lambda db_path, key: "t_seen0001")
+    second = peer_cmd._report_refusal("yoyodine", "registry-empty", "detail")
     err = capsys.readouterr().err
     assert second == "t_seen0001"
     assert "already filed: card t_seen0001" in err
     assert "NOT FILED" not in err
     assert len(calls) == 1, "the idempotency hit filed a second row"
+
+
+def test_a_test_process_never_files_a_real_card(farm, monkeypatch, capsys):
+    """The guard, measured: five trees carried this code and only one is the install, so a
+    suite resolving the REAL HOME would otherwise file a real card from a fixture."""
+    _root, profile = farm
+    (profile / "config.yaml").write_text("bot_peers: {}\n")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setattr(peer_cmd, "_refusal_target", lambda: dict(REFUSAL_TARGET))
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+    assert os.environ.get("PYTEST_CURRENT_TEST"), "not under pytest?"
+
+    card = peer_cmd._report_refusal("yoyodine", "registry-empty", "detail")
+
+    assert card == ""
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "NOT FILED" in err and "test process" in err
+
+
+def test_a_tree_that_is_not_the_served_install_never_files(monkeypatch, capsys):
+    """A lane worktree, an install environment's workspace and a plain clone carry no
+    `install-stamp.json`: none of them may write the live board."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(peer_cmd, "_served_tree_root", lambda: None)
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+
+    card = peer_cmd._report_refusal("yoyodine", "registry-empty", "detail")
+
+    assert card == "" and calls == []
+    err = capsys.readouterr().err
+    assert "NOT FILED" in err and "not the served tree" in err
+
+
+def test_the_served_install_lets_the_report_through(tmp_path, monkeypatch, capsys):
+    """Positive control for the two guards: the served tree, outside a test process, files."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(peer_cmd, "_served_tree_root", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(peer_cmd, "_refusal_target", lambda: dict(REFUSAL_TARGET))
+    monkeypatch.setattr(peer_cmd, "_existing_refusal_card", lambda db_path, key: "")
+    calls = []
+    monkeypatch.setattr(peer_cmd, "_create_card", _recording_filer(calls))
+
+    card = peer_cmd._report_refusal("yoyodine", "http-429", "detail")
+
+    assert card == "t_card1234" and len(calls) == 1
+    assert "filed: card t_card1234" in capsys.readouterr().err
 
 
 def test_the_refusal_write_runs_under_the_reviewed_child_context_allowance(monkeypatch):
@@ -891,7 +1072,7 @@ def test_the_refusal_write_runs_under_the_reviewed_child_context_allowance(monke
 
     monkeypatch.setattr(peer_cmd, "_create_card", filer)
     card, reason = peer_cmd._file_refusal_card(
-        "yoyodine", "no-peer", "detail",
+        "yoyodine", "registry-empty", "detail",
         target={"board": "default", "assignee": "platform-stl", "priority": 3})
 
     assert (card, reason) == ("t_allowed1", "")
@@ -938,20 +1119,24 @@ def test_a_dispatcher_spawned_worker_files_the_refusal_card_and_the_repeat_is_a_
     root = tmp_path / "home"
     (root / "profiles" / "platform-stl").mkdir(parents=True)
     (root / "profiles" / "platform-stl" / "config.yaml").write_text("model: {}\n")
-    monkeypatch.setenv("HERMES_HOME", str(root))
+    (root / "config.yaml").write_text("bot_peers:\n  yoyodine:\n    url: http://x\n")
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "platform-stl"))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.setattr(peer_cmd, "_refusal_target",
                         lambda: {"board": "default", "assignee": "platform-stl", "priority": 3})
+    # The tree this suite runs from is NOT the served install, so the guard is pinned: the
+    # write path itself is what this test measures.
+    monkeypatch.setattr(peer_cmd, "_refusal_filer_blocked", lambda: "")
 
     with kbc.connect_closing(board="default"):     # the owner initializes the store
         pass
     monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(root))   # now: a worker
 
-    first = peer_cmd._report_refusal("yoyodine", "no-peer", "detail")
+    first = peer_cmd._report_refusal("yoyodine", "registry-empty", "detail")
     assert first.startswith("t_"), capsys.readouterr().err
     assert f"filed: card {first}" in capsys.readouterr().err
 
-    second = peer_cmd._report_refusal("yoyodine", "no-peer", "detail")
+    second = peer_cmd._report_refusal("yoyodine", "registry-empty", "detail")
     err = capsys.readouterr().err
     assert second == first, err
     assert f"already filed: card {first}" in err
@@ -959,9 +1144,20 @@ def test_a_dispatcher_spawned_worker_files_the_refusal_card_and_the_repeat_is_a_
     with kbc.connect_closing(board="default") as conn:
         rows = conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
-            (peer_cmd._refusal_key("yoyodine", "no-peer"),)).fetchone()[0]
+            (peer_cmd._refusal_key("yoyodine", "registry-empty"),)).fetchone()[0]
     assert rows == 1
 
+
+def test_the_refusal_target_is_configurable(farm, monkeypatch):
+    """The fleet's own board/owner for these reports is config, not a code change."""
+    root, _profile = farm
+    (root / "config.yaml").write_text(
+        "bot_peers:\n  yoyodine:\n    url: http://127.0.0.1:8644\n"
+        "bot_peer_refusals:\n  board: platform\n  assignee: platform-worker\n  priority: 7\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    assert peer_cmd._refusal_target() == {"board": "platform", "assignee": "platform-worker",
+                                          "priority": 7}
 
 def test_the_refusal_target_is_configurable(farm, monkeypatch):
     """The fleet's own board/owner for these reports is config, not a code change."""
