@@ -51,13 +51,13 @@ def _collect_workspaces(profile: Optional[str], scan: bool) -> dict:
     from tui_gateway import session_workdir as gateway_workdir
 
     # Browsing never bootstraps the owner's session store: a profile whose gateway has not
-    # yet initialized state.db simply contributes no session-derived roots (``db=None``).
+    # yet initialized state.db simply contributes no session-derived roots (``persistence=None``).
     try:
-        db = _open_session_db_for_profile(profile, read_only=True)
+        persistence = _open_session_db_for_profile(profile, read_only=True)
     except HTTPException as exc:
         if exc.status_code != 503:
             raise
-        db = None
+        persistence = None
     try:
         with pdb.connect_closing() as conn:
             policy = gateway_projects._repo_discovery_policy()

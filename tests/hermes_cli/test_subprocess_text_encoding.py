@@ -91,7 +91,10 @@ from pathlib import Path
 
 import pytest
 
+from hermes_agent.compat.paths import current_path
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+HERMES_CLI = Path(__file__).resolve().parents[2] / current_path("hermes_cli")
 
 RUNTIME_TREES = ("hermes_cli", "agent", "cron", "gateway", "plugins", "pm", "tools", "tui_gateway")
 

@@ -31,8 +31,10 @@ _TOPIC_TABLES = ("telegram_dm_topic_mode", "telegram_dm_topic_bindings")
 
 
 def _init_delivery_ledger_schema(conn: sqlite3.Connection) -> None:
-    from gateway.delivery_ledger import _initialize_schema
-    _initialize_schema(conn)
+    # The obligations DDL lives with the store's own delivery-ledger repository now; the gateway
+    # ledger module keeps the verbs only and no longer owns a schema initializer.
+    from persistence.sqlite.gateway._delivery_ledger import _ensure_obligations_table
+    _ensure_obligations_table(conn)
 
 
 # state.db tables created lazily by a gateway module (base ``SessionDB`` never creates them on a fresh

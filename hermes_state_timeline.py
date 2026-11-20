@@ -86,7 +86,7 @@ def _display_rows_sql(conn, session_id, *, users_only=False):
 
 
 def _register_functions(db, conn):
-    from agent.context_compressor import split_user_originated_turn
+    from session_rules.turns import split_user_originated_turn
 
     def identity_content(content, display_kind):
         handoff, live = split_user_originated_turn({

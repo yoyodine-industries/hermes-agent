@@ -204,6 +204,8 @@ class _FakePeer(BaseHTTPRequestHandler):
     run_idempotency_keys: list = []
     auth_seen: list = []
     chat_reply_content: str = "reply from the other machine"
+    run_status: str = "completed"
+    run_output: str = "async reply from the other machine"
 
     def _json(self, payload, status=200):
         body = json.dumps(payload).encode()
@@ -231,9 +233,9 @@ class _FakePeer(BaseHTTPRequestHandler):
             return self._json({
                 "object": "hermes.run",
                 "run_id": "run_1",
-                "status": "completed",
+                "status": type(self).run_status,
                 "session_id": "bc_existing",
-                "output": "async reply from the other machine",
+                "output": type(self).run_output,
             })
         if self.path.startswith("/api/sessions"):
             data = [{"id": s, "title": "Bot Chat"} for s in type(self).sessions]
@@ -291,6 +293,8 @@ def fake_peer_server():
     _FakePeer.run_idempotency_keys = []
     _FakePeer.auth_seen = []
     _FakePeer.chat_reply_content = "reply from the other machine"
+    _FakePeer.run_status = "completed"
+    _FakePeer.run_output = "async reply from the other machine"
     server = HTTPServer(("127.0.0.1", 0), _FakePeer)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
