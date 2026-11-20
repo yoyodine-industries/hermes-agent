@@ -138,7 +138,6 @@ def test_name_based_targets_resolving_to_the_live_gateway_are_flagged(command, l
 
 @pytest.mark.parametrize("command", [
     "pkill -f not-the-gateway",
-    "pkill -f 'gateway run'",           # no such substring in the shim's argv: selects nothing
     "pkill -f 'my_hermes_bot'",
     "pkill -x hermes_cli",              # exact-name match against argv[0]
     "killall hermes_cli",
@@ -148,6 +147,56 @@ def test_name_based_targets_resolving_to_the_live_gateway_are_flagged(command, l
 ])
 def test_name_based_targets_that_select_nothing_are_not_flagged(command, live_gateway):
     assert flagged(command) is False
+
+
+# `pkill -f 'gateway run'` sat in the must-allow list above, justified as "no such substring in the
+# shim's argv: selects nothing". WITHDRAWN 2026-11-20 by platform-stl on a measurement of the LIVE
+# gateway's argv — it carries `gateway` as a standalone token, so a full-command-line pattern names
+# the gateway by the word the gateway answers to, and the ERE verdict cannot tell the phrase from
+# the bare word. The allowance is gone; the refusal test below is its replacement.
+
+
+@pytest.mark.parametrize("command", [
+    "pkill -f gateway",                 # matches the argv outright
+    "pkill -f 'python3 gateway'",       # selects nothing as written; indistinguishable by identity
+    "pkill -f 'gateway run'",           # ditto — the withdrawn must-allow control
+])
+def test_a_bare_service_word_refuses_and_says_why(command, live_gateway):
+    """The identity itself proves the pattern names the gateway, so all three classify ALIKE.
+
+    The printed line is the point of the control: a reader must see that the refusal comes from
+    the derived argv carrying the service word, not from the spelling of the pattern.
+    """
+    tokens = lifecycle_guard.service_word_tokens(HOST_CMDLINE)
+    assert tokens == ("gateway",), "the fixture argv must carry the service word as a standalone token"
+    print(
+        f"\n{command!r} -> REFUSED: the derived argv carries {tokens[0]!r} as a standalone token "
+        f"({HOST_CMDLINE.strip()[-80:]!r}), so this pattern cannot be shown to spare the live gateway"
+    )
+    assert flagged(command) is True
+
+
+# THE WIRING PIN (clause (c) of `yaanban/t-e5ad1381b9`). The approval detector does not call the
+# rung by name: it imports `contains_gateway_lifecycle_command` and relies on that ENTRY POINT
+# routing into the rung. `tools/approval_detection.py` at `overrides/live` `f447da03f28` (= this PR's
+# branch base): import `:1605`, call `:1608`. At the live branch tip `82381a07` (2026-11-20) the same
+# two lines are `:1815` / `:1818`. A line number is a claim about one ref, so this one names the ref
+# it read and never calls another ref "the tip".
+# Because the wire is inheritance, a refactor of the entry
+# point could shed the rung while this whole family stayed green — a green that hides its blind spot
+# is the defect this pin exists for, so the test imports the symbol the detector imports and asserts
+# THAT refuses the bare word.
+@pytest.mark.parametrize("command", [
+    "pkill -f gateway",
+    "pkill -f 'python3 gateway'",
+    "pkill -f 'gateway run'",
+])
+def test_the_detector_entry_point_routes_into_the_rung(command, live_gateway):
+    from cron.lifecycle_guard import contains_gateway_lifecycle_command as detector_entry_point
+
+    assert detector_entry_point(command) is True, (
+        f"the production entry point no longer refuses {command!r}: the approval detector imports "
+        f"`contains_gateway_lifecycle_command`, so the rung was shed with no call site changing")
 
 
 def test_invalid_ere_operand_is_not_a_match(live_gateway):
