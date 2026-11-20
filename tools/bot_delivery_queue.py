@@ -257,8 +257,45 @@ REASON_REFUSED_EXHAUSTED = "refused_exhausted"
 #: `retryable(envelope)` is derived from the *envelope reason* only. It is
 #: unrelated to ``retry_action()`` (agent auto-retry) -- never derive one from
 #: the other.
+#:
+#: A reason belongs in this set only if something DRAINS it. That is the whole rule.
+#:
+#: BEFORE the store-side deferral (t-76be5e4334) membership was DESCRIBE-ONLY, and this is the
+#: measurement, not an opinion: ``RETRYABLE_REASONS`` is consumed at exactly two call sites --
+#: :func:`retryable` and :func:`build_envelope` -- :func:`retryable` has NO caller outside the
+#: tests, and ``retry_after_seconds`` is written onto a refusal record and read by nothing but
+#: the envelope's own echo of it. Membership therefore changed what a payload SAID, never what
+#: production DID. That is the ground on which ``queue_full`` was once removed from this set.
+#:
+#: AS OF THE DEFERRAL the membership is LOAD-BEARING, not describe-only: the refusal door
+#: (``gateway/platforms/api_server_bot_delivery.py``) reads this set to decide whether a record
+#: DEFERS with backoff or settles failed. ``queue_full`` is therefore IN the set, because the
+#: deferral DRAINS it -- the choice the part-1 commit left open ("either take ``queue_full`` back
+#: or retire the set as a legacy describe-only surface") is answered here by taking it back,
+#: because retiring it would turn every capacity refusal into the silent settle the deferral
+#: exists to end.
+#:
+#: The false-admission story stays as MOTIVATION, not as the rule: 39 of 39 refusals in one
+#: measured hour carried ``attempts=1`` at a queue depth of ZERO -- a FALSE ADMISSION REFUSAL, an
+#: in-code defect rather than capacity (ruling t-76be5e4334) -- and the payload's advice ("safe
+#: to retry ... after 60s") was the lie, not the refusal itself.
+#:
+#: WHAT STAYS TRUE ACROSS BOTH: membership is a fact about the DRAIN, but the WAIT is a fact
+#: about the RECORD. ``deferral_delay_seconds`` writes the actual delay onto the deferred row
+#: (60 s doubling to a 900 s cap), so a payload that reports the flat constant contradicts the
+#: store it was built from.
+#:
+#: SCOPE OF THAT CLAIM: "describe-only" was measured INSIDE THIS REPO. The drain lives outside it
+#: (``claim_next`` has no production caller; ``bot_mode_dm.py`` records that the Desktop drains),
+#: so what an EXTERNAL reader does with ``retryable: false`` is unobservable from here. That is
+#: exactly why the deferral is enforced in the STORE (status ``deferred`` + ``not_before_ns``)
+#: rather than in this flag: then no external reader can see a deferred record early, whatever
+#: it believes about the boolean.
 RETRYABLE_REASONS = frozenset({"queue_full", "runtime_offline"})
-
+#: The deferral's BASE delay (``deferral_delay_seconds`` doubles it to a 900 s cap), used by the
+#: store when it defers a refusal. Deliberately NOT printed by the refusal path: the wait that
+#: matters is the one the store records on the row, so the envelope reports
+#: ``record["retry_after_seconds"]`` instead of this constant.
 QUEUE_FULL_RETRY_AFTER_SECONDS = 60.0
 #: The retry budget of a retryable refusal, and the shape of its backoff (ruling on
 #: t-76be5e4334). ``not_before = now + min(60 * 2**reoffer_count, 900)``: a FLAT 60 s against a
@@ -746,10 +783,14 @@ def queue_full_detail(
     if limit is None and per_profile is not None and limit_kind == LIMIT_PER_PROFILE:
         limit = int(per_profile)
     cap = queue_full_cap_literal(limit_kind=limit_kind, limit=limit)
-    after = QUEUE_FULL_RETRY_AFTER_SECONDS if retry_after is None else retry_after
+    # The wait is named ONLY when a caller passes one -- and the deferral does pass one: it
+    # writes ``deferral_delay_seconds(reoffer_count)`` (60 s doubling to a 900 s cap) onto the
+    # record. A flat 60 s here was the first step of that curve presented as the whole answer
+    # (ruling t-76be5e4334): the refusal message must not invent a wait the store will not use.
+    wait = "" if retry_after is None else f" after {int(retry_after)}s"
     return (
         f"{cap}; no reservation was taken — "
-        f"safe to retry with the same idempotency_key after {int(after)}s"
+        f"safe to retry with the same idempotency_key{wait}"
     )
 
 
@@ -801,9 +842,10 @@ class QueueFullError(RuntimeError):
         self.limit_kind = limit_kind
         self.limit = limit
         self.retry_after_seconds = (
-            QUEUE_FULL_RETRY_AFTER_SECONDS
-            if retry_after_seconds is None
-            else float(retry_after_seconds)
+            # None means the refusal promises NO wait (ruling t-76be5e4334 §1):
+            # nothing drains a queue_full, so the old 60.0 default taught senders to
+            # poll a defect. A wait is only ever named when a drain records one.
+            None if retry_after_seconds is None else float(retry_after_seconds)
         )
         super().__init__(
             message or queue_full_detail(limit_kind=limit_kind, limit=limit)
@@ -2300,11 +2342,19 @@ def build_envelope(
     result = _result_for_status(status)
     reason = record.get("reason")
     is_retryable = result == RESULT_FAILED and reason in RETRYABLE_REASONS
-    retry_after: float | None = None
-    if is_retryable and reason == "queue_full":
-        retry_after = QUEUE_FULL_RETRY_AFTER_SECONDS
-    elif is_retryable:
-        retry_after = record.get("retry_after_seconds")
+    # The wait is a fact about THIS record, never a constant attached to a reason:
+    # ``record["retry_after_seconds"]`` is written by the drain that will actually re-offer
+    # the send, so its absence reads as "no known wait", never "60s".
+    #
+    # A DEFERRED record reports its wait too, even though its result is a receipt and it is
+    # not "retryable" in the sender's sense: the store already holds it and the promoter will
+    # re-offer it, so the sender must NOT resend -- and still deserves to know when the send
+    # becomes eligible. Silence here would read as "gone".
+    retry_after: float | None = (
+        record.get("retry_after_seconds")
+        if (is_retryable or status == STATUS_DEFERRED)
+        else None
+    )
 
     if record.get("status_detail") == STATUS_DETAIL_LIVE_OWNER:
         detail: str | None = DETAIL_HELD_LIVE
