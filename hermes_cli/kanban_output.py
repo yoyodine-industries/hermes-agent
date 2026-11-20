@@ -12,6 +12,10 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_workflow
 
 _STATUS_ICONS = {c.key: c.icon for c in kanban_workflow.DEFAULT_WORKFLOW} | {kanban_workflow.ARCHIVED: "—"}
+#: A status the workflow does not define gets its own marker: it must never be
+#: drawn with a live column's icon, because that is what made the stranded row
+#: invisible ("it renders as ?" reads like a display quirk, not a defect).
+_UNMODELLED_ICON = "!"
 
 _TASK_DICT_FIELDS = (
     "id", "title", "body", "assignee", "status", "priority", "tenant",
@@ -83,10 +87,11 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
 
 
 def _fmt_task_line(t: kb.Task) -> str:
-    icon = _STATUS_ICONS.get(t.status, "?")
+    icon = _STATUS_ICONS.get(t.status, _UNMODELLED_ICON)
+    label = kanban_workflow.render_status(t.status)
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    return f"{icon} {t.id}  {label:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:

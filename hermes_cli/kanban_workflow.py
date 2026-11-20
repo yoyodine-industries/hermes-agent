@@ -140,3 +140,64 @@ DEFAULT_WORKFLOW.validate()
 
 # Every value ``tasks.status`` can hold under the default workflow.
 DEFAULT_STATUSES = frozenset(DEFAULT_WORKFLOW.keys()) | {ARCHIVED}
+
+# --- Vocabulary guards ------------------------------------------------------
+#
+# ``tasks.status`` has one vocabulary on this host, and three vocabularies that
+# share the word "status" elsewhere (``tools/todo_tool.py`` VALID_STATUSES,
+# ``escalation_ledger.py`` DISPOSITION_STATES, ``sdlc_nodes.py`` SESSION_STAGES
+# all carry ``in_progress``). Nothing normalised at the boundary, so a writer
+# carrying a sibling vocabulary produced a row the board could neither render
+# nor move. These helpers are the one place the board's vocabulary is checked:
+# write seams call :func:`validate_status` for a message that names the value,
+# and the DB triggers installed by ``kanban_db_connect`` call the same set for
+# writers that never touch a seam.
+
+#: The label a status outside :data:`DEFAULT_STATUSES` renders as. Deliberately
+#: not a column name: an unmodelled value must never be drawn into, or counted
+#: with, a live column.
+UNMODELLED = "unmodelled"
+
+
+class InvalidStatus(ValueError):
+    """A write tried to store a status the workflow does not model."""
+
+    def __init__(self, value, *, where: str = "kanban",
+                 allowed: frozenset[str] | None = None) -> None:
+        self.value = value
+        self.allowed = frozenset(DEFAULT_STATUSES if allowed is None else allowed)
+        self.where = where
+        super().__init__(
+            f"{where}: {value!r} is not a modelled kanban status; "
+            f"legal values are {sorted(self.allowed)}"
+        )
+
+
+def validate_status(value, *, where: str = "kanban",
+                    allowed: frozenset[str] | None = None) -> str:
+    """Return ``value`` if it is a modelled status, else raise :class:`InvalidStatus`.
+
+    ``allowed`` narrows the check (``create_task`` accepts only the two initial
+    states); the message still names the value and the legal set it was held to.
+    """
+    legal = frozenset(DEFAULT_STATUSES if allowed is None else allowed)
+    if not isinstance(value, str) or value not in legal:
+        raise InvalidStatus(value, where=where, allowed=legal)
+    return value
+
+
+def is_modelled(value) -> bool:
+    """True when ``value`` is a status this workflow defines."""
+    return isinstance(value, str) and value in DEFAULT_STATUSES
+
+
+def render_status(value) -> str:
+    """Render a status for a human: a modelled one verbatim, an unmodelled one quoted.
+
+    An unmodelled value is *not* silently mapped onto a column - the reader is
+    told the board cannot place the row.
+    """
+    if is_modelled(value):
+        return value
+    return f"{UNMODELLED} {value!r}"
+
