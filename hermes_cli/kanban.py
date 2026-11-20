@@ -454,6 +454,41 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _priority_receipt_lines(trail, stored):
+    """The create receipt, every number taken FROM the card's own records.
+
+    Two things a reader must be able to tell without diffing two numbers by hand: whether the
+    value was CLAMPED or honoured (the birth record says so, in words), and whether the value
+    the card now holds is still the one it was born with. The second matters because a card can
+    be re-ranked after birth by the gate invariant, and a birth record printed as if it were the
+    current value would be a second, wrong number for one filing.
+    """
+    birth = (trail or {}).get("birth") or {}
+    moved = (trail or {}).get("moved") or {}
+    if not birth:
+        return []
+
+    def num(value):
+        return "-" if value is None else value
+
+    tier = (birth.get("queue_tier") or birth.get("target_band")
+            or birth.get("tier_from_assignee") or "-")
+    lines = ["priority record: asked %s -> born %s | tier %s | clamped %s | rule %s | %s" % (
+        num(birth.get("asked")), num(birth.get("applied")), tier,
+        "yes" if birth.get("clamped") else "no", birth.get("rule") or "policy",
+        birth.get("reason") or birth.get("error") or "-")]
+    born = birth.get("applied")
+    if born is not None and stored is not None and str(born) != str(stored):
+        if moved:
+            lines.append("priority moved after birth: %s -> %s (cause %s, gate %s at %s)" % (
+                num(born), num(stored), moved.get("cause") or "-", moved.get("gate") or "-",
+                num(moved.get("gate_priority"))))
+        else:
+            lines.append("priority moved after birth: %s -> %s (NO RECORD of the move: the "
+                         "stored value is unaccounted for)" % (num(born), num(stored)))
+    return lines
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -546,14 +581,25 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     print(f"filing policy: {record.get('policy', '-')}", file=sys.stderr)
                 return 3
             task = kb.get_task(conn, task_id)
+            # Read the decision the door ALREADY wrote, inside the same connection: the receipt
+            # is the record, and a reader must never have to re-derive it from two numbers.
+            priority_trail = kb.priority_receipt(conn, task_id, task.priority)
     except InboxRefusal as exc:
         # A usage refusal, not a board fault: rc 2 so a shell can tell "the provenance could
         # not be proved" from "the card said no", and nothing was written.
         return _err(f"kanban: --from-inbox: {exc}", 2)
     if getattr(args, "json", False):
-        _print_json({**_task_to_dict(task), **kb.receipt_fields(outcome)})
+        payload = {**_task_to_dict(task), **kb.receipt_fields(outcome)}
+        if priority_trail.get("birth") or priority_trail.get("moved"):
+            payload["priority_receipt"] = priority_trail
+        _print_json(payload)
     else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        # The STORED priority on every create, even when it equals the ask: "Created" is never
+        # the whole story about a field the caller set.
+        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'}, "
+              f"priority={task.priority})")
+        for line in _priority_receipt_lines(priority_trail, task.priority):
+            print("  " + line)
         # Same words as `hermes kanban link`: a card FILED behind a parent nobody will finish
         # is the same silent park, and stderr keeps `Created <id>` parsable on stdout.
         if outcome.parents:
