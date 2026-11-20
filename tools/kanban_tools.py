@@ -945,6 +945,8 @@ def _handle_complete(args: dict, **kw) -> str:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
                 created_cards=created_cards, deferred_children=deferred_children,
+                supersede_ack=args.get("supersede_ack"),
+                actor=os.environ.get("HERMES_PROFILE") or "",
                 expected_run_id=_worker_run_id(tid))
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
@@ -1046,6 +1048,13 @@ def _handle_complete(args: dict, **kw) -> str:
             # blind, and a blind re-run dirties the same tree again.
             if isinstance(ok, kb.CompletionRefusal) and ok.cause == "dirty_unit_checkout":
                 raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail} Nothing changed.")
+            # Retirement and the declared proof both answer with the exact artifact, command
+            # and remedy in ``detail`` (ruling ESC-36b70d83894494d2). A worker told only that
+            # "the close was refused" retries the same sentence; these two must be readable.
+            if isinstance(ok, kb.CompletionRefusal) and ok.cause in (
+                    "retire_is_not_a_completion", "supersede_ack_refused",
+                    "proof_failed", "proof_missing"):
+                raise _Reject(f"could not complete {tid} [{ok.cause}]: {ok.detail}")
             # A reopened or never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.
             blockers = kb.unsatisfied_parents(conn, tid)
@@ -1057,6 +1066,16 @@ def _handle_complete(args: dict, **kw) -> str:
             _check(False, kb.live_row_refusal(
                 conn, tid, caller_run_id=_worker_run_id(tid), verb="complete"))
         run = kb.latest_run(conn, tid)
+        # A retirement must not answer "ok: done": the card is ARCHIVED, nothing was counted as
+        # work, and the successor carries it. The tool receipt says that in as many words
+        # (ruling ESC-36b70d83894494d2 -- a false green one layer down is still a false green).
+        retirement: dict[str, Any] = {}
+        if isinstance(ok, kb.Retirement):
+            retirement = {
+                "status": "archived", "retired": True, "receipt": ok.receipt(),
+                "note": "RETIRED, not completed: the card is archived (excluded from done "
+                        "counts) and its work is carried by the successor. Do not report it as work.",
+            }
         # Artifact staging is atomic with the completion write, so a worker that
         # read `kanban_attachments` before completing saw an empty list and has
         # no way to observe what its completion just registered (#117360).
@@ -1064,7 +1083,8 @@ def _handle_complete(args: dict, **kw) -> str:
         return _ok(task_id=tid, run_id=run.id if run else None,
                    attachments=[
                        _fields(a, _ATTACHMENT_FIELDS)
-                       for a in kb.list_attachments(conn, tid)])
+                       for a in kb.list_attachments(conn, tid)],
+                   **retirement)
 
 
 @_kanban_handler("kanban_block")
