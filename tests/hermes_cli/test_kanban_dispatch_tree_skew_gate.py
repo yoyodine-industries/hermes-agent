@@ -136,6 +136,12 @@ def _isolate_boot_state(monkeypatch):
     tf.reset_boot()
     tf._content_memo.clear()
     monkeypatch.setattr(code_skew, "_boot_fingerprint", None)
+    # The acting-board resolution latches are process-global too (one ERROR, one boot line, one
+    # dispatch=false INFO per process). A test that inherited another test's latch would silently
+    # assert on logs that never fired.
+    monkeypatch.setattr(kbd, "_ACTOR_BOARD_INVALID_LOGGED", False, raising=False)
+    monkeypatch.setattr(kbd, "_ACTOR_BOARD_ANNOUNCED", False, raising=False)
+    monkeypatch.setattr(kbd, "_ACTOR_BOARD_DISPATCH_OFF_LOGGED", set(), raising=False)
     yield
     tf.reset_boot()
     tf._content_memo.clear()
@@ -1965,3 +1971,277 @@ def test_a_guard_the_kernel_keeps_refusing_GIVES_UP_once_instead_of_warning_fore
         "a card that gave up must not be re-attempted tick after tick"
     )
     assert _actor_status(task_id) == "todo", "a refused card keeps its status"
+
+
+# =============================================================================================
+# THE ACTOR BOARD IS RESOLVED, NOT INHERITED (card t_5cf2d9fd)
+#
+# The destination used to be a module constant read ONCE at import from
+# ``$HERMES_KANBAN_TICK_YIELD_BOARD`` -- with ``migrations`` hard-coded as the fallback. The
+# destination was therefore a property of one process's launch environment, the fallback was a
+# board the one-board cutover had husked (``dispatch: false``), and the guard card landed where no
+# worker would claim it. The tests below pin the three defects:
+#
+#   * a WRONG BOARD (``migrations`` / a husk) carrying the fleet's guard card;
+#   * a SILENT fallback (a warning line, then one card per ticking board);
+#   * a DESTINATION THAT ISN'T ONE (config/env/override disagreeing between processes).
+#
+# Every case drives a REAL tick and asserts on the CARD (the deliverable), not on a helper's
+# return value alone.
+# =============================================================================================
+
+
+def _declare_config(monkeypatch, slug: str) -> None:
+    """``kanban.actor_board = slug`` through the SHIPPED config reader, stubbed at its own name."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {kbd.TICK_YIELD_ACTOR_BOARD_CONFIG_KEY: slug}},
+    )
+
+
+def _undeclare(monkeypatch) -> None:
+    """No override, no env, no config: the DEFAULT branch is what runs."""
+    monkeypatch.setattr(kbd, "TICK_YIELD_ACTOR_BOARD", None, raising=False)
+    monkeypatch.delenv(kbd.TICK_YIELD_ACTOR_BOARD_ENV, raising=False)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"kanban": {}})
+
+
+def _board_rows(slug: str):
+    conn = kbc.connect(board=slug)
+    try:
+        return _rows(conn)
+    finally:
+        conn.close()
+
+
+def _refuse(conn, times=None):
+    """Drive refusals until the acting card exists; returns the refusal results."""
+    return [_tick(conn) for _ in range(times or kbd.TICK_YIELD_ACTOR_THRESHOLD)]
+
+
+def test_the_actor_board_is_the_CONFIG_declaration_not_the_husked_fallback(
+    board, tree, monkeypatch,
+):
+    """Defect 1: the guard card used to land on ``migrations`` (a husk) -- never again.
+
+    ``migrations`` is created here as a REGISTERED, dispatch-enabled board, so the test cannot pass
+    by the old fallback accidentally being absent: config must beat it.
+    """
+    _undeclare(monkeypatch)
+    kb.create_board("migrations", dispatch=True)
+    kb.create_board("config-board", dispatch=True)
+    _declare_config(monkeypatch, "config-board")
+    tf.record_boot()
+    _edit(tree)
+
+    _refuse(board)
+
+    assert len(_board_rows("config-board")) == 1, "the configured board carries the guard"
+    assert _board_rows("migrations") == [], "the husked fallback must never carry it"
+    assert _ticking_rows(board) == [], "and neither does the board that merely ticked"
+
+
+def test_the_actor_board_is_the_ENV_declaration_when_one_is_set(
+    board, tree, monkeypatch,
+):
+    """Env outranks config: an acceptance surface pointing the seam wins over the durable key."""
+    _undeclare(monkeypatch)
+    kb.create_board("platform", dispatch=True)
+    _declare_config(monkeypatch, "platform")
+    monkeypatch.setenv(kbd.TICK_YIELD_ACTOR_BOARD_ENV, OPS_BOARD)
+    tf.record_boot()
+    _edit(tree)
+
+    _refuse(board)
+
+    assert len(_board_rows(OPS_BOARD)) == 1
+    assert _board_rows("platform") == []
+    resolved = kbd.resolve_actor_board(board)
+    assert (resolved.slug, resolved.source, resolved.verdict) == (OPS_BOARD, "env", "ok")
+
+
+def test_the_actor_board_defaults_to_PLATFORM(board, tree, monkeypatch):
+    """Nothing declares one: the cutover survivor, and the only dispatch:true board on the estate."""
+    _undeclare(monkeypatch)
+    kb.create_board("platform", dispatch=True)
+    tf.record_boot()
+    _edit(tree)
+
+    _refuse(board)
+
+    assert len(_board_rows("platform")) == 1, "the DEFAULT board must carry the guard"
+    resolved = kbd.resolve_actor_board(board)
+    assert (resolved.slug, resolved.source, resolved.verdict) == ("platform", "default", "ok")
+
+
+def test_a_board_with_NO_metadata_is_INVALID_and_falls_back_to_the_CURRENT_board(
+    board, tree, monkeypatch, caplog,
+):
+    """A slug that is not a registered board must not silently receive the fleet's cards."""
+    _undeclare(monkeypatch)
+    _declare_config(monkeypatch, "no-such-board")
+    tf.record_boot()
+    _edit(tree)
+
+    _refuse(board)
+
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    invalid = [line for line in errors if line.startswith("kanban dispatcher: ACTOR BOARD INVALID")]
+    assert len(invalid) == 1, errors
+    assert "no-such-board" in invalid[0] and "no board.json" in invalid[0]
+    assert "FALLBACK board" in invalid[0], "the reader must be told where the cards went"
+
+    resolved = kbd.resolve_actor_board(board)
+    assert resolved.verdict == "fallback"
+    assert resolved.slug == kb.get_current_board(), (
+        "the fallback is the CURRENT board -- ONE destination, not one per ticking board"
+    )
+    assert len(_ticking_rows(board)) == 1, "the guard is still filed, on the fallback"
+
+
+def test_a_DISPATCH_FALSE_board_is_INVALID_for_CONFIG_and_falls_back(
+    board, tree, monkeypatch, caplog,
+):
+    """A husk is not a legal target for a durable declaration; the failure names the condition."""
+    _undeclare(monkeypatch)
+    _declare_config(monkeypatch, OPS_BOARD)  # the fixture registers it dispatch=False
+    tf.record_boot()
+    _edit(tree)
+
+    _refuse(board)
+
+    invalid = [
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("kanban dispatcher: ACTOR BOARD INVALID")
+    ]
+    assert len(invalid) == 1
+    assert "dispatch=false" in invalid[0], invalid[0]
+    assert kbd.resolve_actor_board(board).verdict == "fallback"
+    assert _board_rows(OPS_BOARD) == [], "a husk must not receive the guard card"
+
+
+def test_a_DISPATCH_FALSE_board_is_HONOURED_when_OVERRIDE_or_ENV_declares_it(
+    board, tree, monkeypatch,
+):
+    """The seam's own sources may point at a scratch board -- honoured, and said at INFO."""
+    kb.create_board("platform", dispatch=True)
+    tf.record_boot()
+    _edit(tree)
+
+    _refuse(board)
+
+    resolved = kbd.resolve_actor_board(board)
+    assert (resolved.slug, resolved.source, resolved.verdict) == (OPS_BOARD, "override", "ok")
+    assert len(_actor_rows()) == 1, "the override board is where the gate tests expect the card"
+
+
+def test_an_ARCHIVED_board_is_INVALID_and_falls_back(board, tree, monkeypatch, caplog):
+    """An archived board is a retired board, whatever its dispatch flag says."""
+    _undeclare(monkeypatch)
+    kb.create_board("retired-board", dispatch=True)
+    kb.write_board_metadata("retired-board", archived=True)
+    _declare_config(monkeypatch, "retired-board")
+    tf.record_boot()
+    _edit(tree)
+
+    _refuse(board)
+
+    invalid = [
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("kanban dispatcher: ACTOR BOARD INVALID")
+    ]
+    assert len(invalid) == 1 and "ARCHIVED" in invalid[0], invalid
+    assert kbd.resolve_actor_board(board).verdict == "fallback"
+    assert _board_rows("retired-board") == []
+
+
+def test_ACTOR_BOARD_INVALID_is_ONE_error_and_the_boot_line_ONE_INFO_per_process(
+    board, tree, monkeypatch, caplog,
+):
+    """A wall of warnings is not a signal: five ticks, one ERROR and one boot line."""
+    caplog.set_level("INFO")
+    _undeclare(monkeypatch)
+    _declare_config(monkeypatch, "no-such-board")
+
+    for _ in range(5):
+        _tick(board)
+
+    errors = [
+        r.getMessage() for r in caplog.records
+        if r.levelname == "ERROR" and r.getMessage().startswith("kanban dispatcher: ACTOR BOARD INVALID")
+    ]
+    assert len(errors) == 1, f"ONE error per process, got {len(errors)}"
+
+    boots = [
+        r.getMessage() for r in caplog.records
+        if "ops actor board=" in r.getMessage()
+    ]
+    assert len(boots) == 1, f"ONE boot line per process, got {len(boots)}"
+    assert boots[0] == (
+        "kanban dispatcher: ops actor board=default source=config dispatch=yes verdict=fallback"
+    ), boots[0]
+
+
+def test_the_invalid_episode_escalates_ONCE_across_ticks_and_a_RELOAD_does_not_re_page(
+    board, tree, monkeypatch, _escalation_door,
+):
+    """DEC-2's door, ONCE per invalid episode -- the status record's ref and the episode bound it."""
+    _undeclare(monkeypatch)
+    _declare_config(monkeypatch, "no-such-board")
+    tf.record_boot()
+    _edit(tree)
+
+    _refuse(board)
+    _tick(board)
+    _tick(board)
+
+    registers = [
+        call for call in _ledger_calls(_escalation_door, "register")
+        if str(call.get("source_id", "")).startswith("actor-board:")
+    ]
+    assert len(registers) == 1, f"ONE escalation per invalid episode, got {len(registers)}"
+    assert "no-such-board" in registers[0].get("reason", "")
+    assert "source=config" in registers[0].get("reason", "")
+    assert registers[0].get("source_kind") == kbd.TICK_YIELD_ESCALATION_SOURCE_KIND
+    assert registers[0].get("owner_lane") == kbd.TICK_YIELD_ESCALATION_ASSIGNEE
+    assert registers[0].get("board") == "default", "the row names the board the cards ride"
+
+    _path, record = _status_record()
+    carried = (record or {}).get(kbd.TICK_YIELD_ACTOR_BOARD_ESCALATION_KEY)
+    assert carried and carried.get("ref") == registers[0]["ref"], (
+        f"the ref must ride the tick-yield status record; got {carried}"
+    )
+    assert carried.get("episode") == registers[0]["source_id"], (
+        "and the record must name the same episode the registry row does"
+    )
+    assert carried.get("state") == "sent", "and it must say the door carried it"
+
+    # A RELOAD: new process, same declaration. The record's ref is what stops the re-page.
+    monkeypatch.setattr(kbd, "_ACTOR_BOARD_INVALID_LOGGED", False, raising=False)
+    monkeypatch.setattr(kbd, "_ACTOR_BOARD_ANNOUNCED", False, raising=False)
+    _tick(board)
+
+    registers = [
+        call for call in _ledger_calls(_escalation_door, "register")
+        if str(call.get("source_id", "")).startswith("actor-board:")
+    ]
+    assert len(registers) == 1, f"a reload must NOT re-page an episode already carried: {registers}"
+
+
+def test_the_RESOLVED_board_is_what_RETIREMENT_compares_against(board, tree, monkeypatch):
+    """DEC-3: the retirement door must use the resolved slug, not the retired constant."""
+    _undeclare(monkeypatch)
+    kb.create_board("config-board", dispatch=True)
+    _declare_config(monkeypatch, "config-board")
+    tf.record_boot()
+    _edit(tree)
+    _refuse(board)
+    assert len(_board_rows("config-board")) == 1
+
+    tf.reset_boot()
+    tf.record_boot()
+    assert _tick(board).tick_yielded == ""
+
+    assert _board_rows("config-board")[0]["status"] == "done", (
+        "a configured board's guard must be retired by the serving tick"
+    )
