@@ -3538,6 +3538,9 @@ explainer:
     corrupt: "這一輪已停止，因為狀態資料庫回報結構損毀（重新啟動後對話紀錄將會遺失）。釋放磁碟空間沒有幫助。復原選項：\n1. 執行 `hermes {profile_arg}doctor --fix`\n2. 停止閘道，然後用以下指令復原：\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   （若回報可復原）hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — 復原會先為損毀的檔案建立快照；切勿對執行中的 state.db 執行 `sqlite3 ... \".recover\"`，有漏洞的 sqlite3 CLI 可能使其損毀得更嚴重\n3. 從 {backups_dir}/ 中的備份還原\n然後再傳送一次訊息。"
     fts_index: "這一輪已停止，因為工作階段搜尋索引（FTS5）已損毀且無法卸離，因此這則訊息未儲存。訊息儲存區本身未受損：不要執行復原工具或還原備份。請執行 `hermes {profile_arg}doctor --fix`（或重新啟動 Hermes，開啟時會修復索引），然後再傳送一次訊息。"
     disk: "Hermes 無法將此對話儲存到磁碟，為避免遺失你的訊息而停止。磁碟可能已滿：請釋放一些空間（或修正 {home}/state.db 的權限），然後再傳送一次訊息。"
+    worker_receipt_timeout: "本回合已停止，未儲存這則訊息：擁有此設定檔工作階段儲存區的程序（閘道）未在其時間預算內確認儲存——該程序的事件迴圈在主機負載過高時發生停頓。沒有任何損壞，也無需修復；這是時序問題，不是儲存問題。訊息保留在儲存區的日誌中並會重試——請重新傳送你的訊息。"
+    worker_receipt_deadline: "本回合已停止，未儲存這則訊息：擁有此設定檔工作階段儲存區的程序（閘道）在整個重播視窗內均無回應，因此儲存從未獲得確認。沒有遺失任何內容：本回合的寫入保留在儲存區的日誌中，並會在下次開啟工作階段時重播——工作階段記錄不會遺失，也無需修復。請在主機負載降低後重新傳送你的訊息。"
+    pending_receipt: "本回合已停止，未儲存這則訊息：此工作階段先前的儲存仍在等待閘道確認，而 Hermes 不會在未確認的寫入之上再疊加新的寫入。沒有任何損壞，也無需修復——先前的寫入保留在儲存區的日誌中並會重播。請在其完成之後重新傳送你的訊息。"
     default: "Hermes 無法儲存此對話，為避免遺失你的訊息而停止。可能原因：磁碟空間不足，或另一個 Hermes 程序正佔用資料庫。請關閉其他 Hermes 視窗，執行 `hermes {profile_arg}doctor` 檢查儲存狀態，然後再傳送一次訊息。"
   file_mutation:
     header: "⚠️ 檔案變更驗證器：本輪有 {count} 個檔案編輯失敗，無論上方文字如何描述皆以此為準。請執行 `git status` 或 `read_file` 確認實際寫入的內容。"
