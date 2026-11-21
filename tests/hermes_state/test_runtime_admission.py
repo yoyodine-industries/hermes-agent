@@ -48,15 +48,14 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         assert new_epoch > epoch
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 0
-        assert rt.get_session_admission(db, admission_id=second['admission_id'])['status'] == 'unknown'
-        with pytest.raises(rt.RuntimeStoreError) as exc:
-            rt.claim_session_input(db, epoch=new_epoch, session_id='s')
-        assert exc.value.reason == 'unknown_execution'
+        abandoned = rt.get_session_admission(db, admission_id=second['admission_id'])
+        assert abandoned['status'] == 'terminal' and abandoned['outcome'] == 'interrupted', \
+            'a stale-epoch turn is terminal-abandoned by the sweep, never left as a permanent latch'
         with pytest.raises(rt.RuntimeStoreError) as exc:
             rt.settle_session_input(db, epoch=epoch, admission_id=running['admission_id'], generation=running['generation'], outcome='completed')
         assert exc.value.reason == 'stale_epoch'
         assert rt.cancel_session_input(db, epoch=new_epoch, admission_id=third['admission_id'])['outcome'] == 'cancelled'
-        assert [r['admission_id'] for r in rt.list_session_admissions(db, session_id='s')] == [second['admission_id']]
+        assert [r['admission_id'] for r in rt.list_session_admissions(db, session_id='s')] == []
         assert db._conn.execute('PRAGMA foreign_keys').fetchone()[0] == 1
         with pytest.raises(sqlite3.IntegrityError):
             db._execute_write(lambda conn: conn.execute("DELETE FROM sessions WHERE id='s'"))
@@ -90,5 +89,37 @@ def test_sqlite_failure_never_acknowledges_or_partially_claims(tmp_path):
                 rt.admit_session_input(db, **(args | {'request_id': 'busy'}))
             peer.rollback()
         assert len(rt.list_session_admissions(db, session_id='s')) == 1
+    finally:
+        db.close()
+
+
+def test_a_stale_epoch_unknown_row_never_latches_the_target(tmp_path):
+    """The live latch, pinned: unknown(owner_epoch=K-1) + queued, runtime_epoch=K."""
+    db = store(tmp_path)
+    import hermes_state_runtime as rt
+    try:
+        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        head = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                                      request_id='dead', payload={'text': 'dead turn'})
+        queued = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                                        request_id='behind', payload={'text': 'stranded'})
+        claimed = rt.claim_session_input(db, epoch=epoch, session_id='s')
+        assert claimed['admission_id'] == head['admission_id']
+        # The bump: the runtime reloads and the in-flight claim keeps the old epoch.
+        new_epoch = rt.begin_runtime_epoch(db, instance_id='reload')
+        assert new_epoch > epoch
+        # A CURRENT-epoch unknown still refuses, but names the seq and what clears it.
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET status='unknown',outcome=NULL WHERE admission_id=?",
+            (head['admission_id'],)))
+        with pytest.raises(rt.RuntimeStoreError) as exc:
+            rt.claim_session_input(db, epoch=new_epoch, session_id='s')
+        assert exc.value.reason == 'unknown_execution'
+        assert f"seq={head['seq']}" in (exc.value.detail or '')
+        assert 'cleared_by=recover_session_inputs' in (exc.value.detail or '')
+        # Stale epoch: the sweep releases it, and the row behind it is claimable in the same pass.
+        assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
+        assert rt.get_session_admission(db, admission_id=head['admission_id'])['status'] == 'terminal'
+        assert rt.claim_session_input(db, epoch=new_epoch, session_id='s')['admission_id'] == queued['admission_id']
     finally:
         db.close()

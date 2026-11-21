@@ -291,13 +291,18 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         if _guard is not None:
             _guard(conn)
         session = _session(conn, session_id)
-        blocked = conn.execute("SELECT status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (session_id,)).fetchall()
-        if any(row[0] == 'unknown' for row in blocked):
-            raise RuntimeStoreError('unknown_execution')
+        blocked = conn.execute("SELECT seq,status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (session_id,)).fetchall()
+        for seq, status in blocked:
+            if status == 'unknown':
+                # Name what is refused and what clears it: a sender must be able to tell
+                # "waiting" from "permanently dead" without reading this file.
+                raise RuntimeStoreError('unknown_execution', field='session_admissions.status',
+                                        detail=f'seq={seq} cleared_by=recover_session_inputs')
         from hermes_state_runtime_workers import worker_states
         workers = worker_states(conn, session_id)
         if 'unknown' in workers:
-            raise RuntimeStoreError('unknown_execution')
+            raise RuntimeStoreError('unknown_execution', field='worker_executions.status',
+                                    detail='cleared_by=recover_session_inputs')
         if blocked or workers:
             return None
         row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' "
@@ -529,16 +534,32 @@ def retarget_local_automation(db, *, epoch: int, session_id: str, principal_id: 
 
 
 def recover_session_inputs(db, *, epoch: int) -> int:
-    """Never replay started work. Live worker adoption is a separate explicit operation."""
+    """Never replay started work. Live worker adoption is a separate explicit operation.
+
+    THE LATCH IS RELEASED HERE, IN THE SAME SWEEP THAT USED TO CREATE IT. A row whose owner
+    epoch is gone can never be settled by anyone, so leaving it ``unknown`` made the target refuse
+    every future claim for ever (``unknown_execution``) with the message behind it stranded. The
+    rule is deterministic and needs no timeout: a stale-epoch turn that produced no completion is
+    terminal-abandoned. Rows of the CURRENT epoch that are ``unknown`` (an owner that captured a
+    result and died before settling) are untouched - those are the owner's to resolve.
+    """
     def write(conn):
         _epoch(conn, epoch)
         from hermes_state_runtime_workers import retire_stale_children
         retire_stale_children(conn, epoch)
-        conn.execute("UPDATE worker_executions SET status='unknown' WHERE status IN ('registered','running') AND owner_epoch!=?", (epoch,))
+        conn.execute("UPDATE worker_executions SET status='terminal' WHERE status='unknown' AND owner_epoch!=?", (epoch,))
         # A steer handed to a lost claim may or may not have reached its agent: never replayed.
         conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE status='terminal' AND outcome=? "
                      "AND owner_epoch!=?", (STEERING, epoch))
-        return conn.execute("UPDATE session_admissions SET status='unknown' WHERE status='started' AND owner_epoch!=?", (epoch,)).rowcount
+        stale = conn.execute("SELECT admission_id,target_session_id FROM session_admissions "
+                             "WHERE status IN ('started','unknown') AND owner_epoch!=?", (epoch,)).fetchall()
+        for row in stale:
+            conn.execute("UPDATE session_admissions SET status='terminal',outcome='interrupted' "
+                         "WHERE admission_id=? AND owner_epoch!=? AND status IN ('started','unknown')",
+                         (row['admission_id'], epoch))
+        for session_id in {row['target_session_id'] for row in stale}:
+            conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (session_id,))
+        return len(stale)
     return db._execute_write(write)
 
 
