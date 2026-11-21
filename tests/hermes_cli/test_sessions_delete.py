@@ -55,7 +55,11 @@ def test_sessions_delete_with_unfinished_turn_points_to_discard(tmp_path, monkey
     rt.admit_session_input(db, epoch=epoch, principal_id='p', session_id='s1', request_id='r', payload={'text': 'x'})
     if status == 'unknown':
         rt.claim_session_input(db, epoch=epoch, session_id='s1')
-        rt.recover_session_inputs(db, epoch=rt.begin_runtime_epoch(db, instance_id='b'))
+        # A CURRENT-epoch unknown is a turn whose result is still owed: the refusal stands and
+        # points the user at discard. A stale-epoch one is abandoned by the bump's sweep instead
+        # (see tests/hermes_state/test_terminal_retirement.py::test_nonterminal_obligations_prevent_any_retirement), so it must not be exercised here.
+        db._execute_write(lambda c: c.execute(
+            "UPDATE session_admissions SET status='unknown',outcome=NULL WHERE target_session_id='s1'"))
     monkeypatch.setattr(hermes_state, 'SessionDB', lambda *args, **kwargs: db)
     monkeypatch.setattr(sys, 'argv', ['hermes', 'sessions', 'delete', 's1', '--yes'])
     with pytest.raises(SystemExit) as exited:

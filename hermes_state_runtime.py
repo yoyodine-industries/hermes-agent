@@ -297,12 +297,12 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
                 # Name what is refused and what clears it: a sender must be able to tell
                 # "waiting" from "permanently dead" without reading this file.
                 raise RuntimeStoreError('unknown_execution', field='session_admissions.status',
-                                        detail=f'seq={seq} cleared_by=recover_session_inputs')
+                                        detail=f'seq={seq} cleared_by=settle_session_input|epoch_sweep')
         from hermes_state_runtime_workers import worker_states
         workers = worker_states(conn, session_id)
         if 'unknown' in workers:
             raise RuntimeStoreError('unknown_execution', field='worker_executions.status',
-                                    detail='cleared_by=recover_session_inputs')
+                                    detail='cleared_by=settle_session_input|epoch_sweep')
         if blocked or workers:
             return None
         row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' "

@@ -116,7 +116,7 @@ def test_a_stale_epoch_unknown_row_never_latches_the_target(tmp_path):
             rt.claim_session_input(db, epoch=new_epoch, session_id='s')
         assert exc.value.reason == 'unknown_execution'
         assert f"seq={head['seq']}" in (exc.value.detail or '')
-        assert 'cleared_by=recover_session_inputs' in (exc.value.detail or '')
+        assert 'cleared_by=settle_session_input|epoch_sweep' in (exc.value.detail or '')
         # Stale epoch: the sweep releases it, and the row behind it is claimable in the same pass.
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
         assert rt.get_session_admission(db, admission_id=head['admission_id'])['status'] == 'terminal'
