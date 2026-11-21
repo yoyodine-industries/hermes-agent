@@ -100,9 +100,11 @@ def _refusal(authority, tip, exc):
             wait = ADMISSION_RETRY_AFTER_SECONDS
         logger.warning('Peer DM into Bot Chat %s refused: queue_full (class=%s cap=%s)',
                        tip['id'], klass, cap)
+        measured = str(getattr(exc, 'detail', '') or '')
         budget = f'the {klass} cap' + (f' of {int(cap)}' if isinstance(cap, int) else '')
-        return reason, (f'Bot Chat admission refused: queue_full (nothing was admitted - {budget} '
-                        f'is full); safe to resend in {float(wait):.0f}s')
+        facts = f'{budget} is full' + (f' ({measured})' if measured else '')
+        return reason, (f'Bot Chat admission refused: queue_full ({facts}); nothing was admitted - '
+                        f'safe to resend in {float(wait):.0f}s')
     return reason, f'Bot Chat admission refused: {reason}'
 
 

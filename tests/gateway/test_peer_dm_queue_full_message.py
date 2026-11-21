@@ -35,6 +35,14 @@ def test_a_queue_full_refusal_says_resending_is_safe_and_never_do_not_resend():
     assert 'do not resend' not in error.lower()
 
 
+def test_a_queue_full_refusal_carries_the_measured_depth_when_the_store_states_it():
+    _, error = _refused(field='automation_fifo',
+                        detail='32/32 queued; nothing was reserved - retry after 30s', retry_after=30)
+    assert 'automation_fifo' in error
+    assert '32/32 queued' in error
+    assert 'safe to resend in 30s' in error
+
+
 def test_a_queue_full_refusal_without_an_owner_retry_after_uses_the_floor():
     _, error = _refused(field='queue')
     assert f'safe to resend in {hermes_state_runtime.ADMISSION_RETRY_AFTER_SECONDS:.0f}s' in error
