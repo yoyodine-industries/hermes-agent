@@ -2259,3 +2259,144 @@ class TestActiveRunsCensusAndFence:
         adapter._sweep_orphaned_runs_once(now + 120)
         assert adapter._run_statuses["run_swept"]["updated_at"] == fenced_at
         assert adapter._run_statuses["run_swept"]["status"] == "interrupted"
+
+
+class _StalledTask:
+    """A run task that is not done and never will be — the shape of the leak (t_2fd3bc0b28)."""
+
+    def __init__(self) -> None:
+        self.cancelled = False
+        self._done = False
+
+    def done(self) -> bool:
+        return self._done
+
+    def cancel(self) -> bool:
+        self.cancelled = True
+        self._done = True
+        return True
+
+
+class TestStalledRunReap:
+    """A slot held by a task that never returns must be reaped, never absorbed by the ceiling.
+
+    Measured on the live gateway before this existed: 16 of 16 slots held ~12h each
+    (holders at 41,978s and 42,000s) while the yoyoflow ledger carried five open runs, and
+    every peer message answered ``Too many concurrent runs (max 16)``. A gateway bounce
+    cleared it, which is why the leak survived: it healed itself only by restart.
+    """
+
+    def _hold(self, adapter, run_id: str, *, created_at: float, updated_at: float | None = None,
+              status: str = "running", session_id: str = "local-deadbeef") -> _StalledTask:
+        task = _StalledTask()
+        adapter._active_run_tasks[run_id] = task
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": status,
+            "session_id": session_id,
+            "created_at": created_at,
+            "updated_at": updated_at if updated_at is not None else created_at,
+        }
+        _hold_live_run(adapter, run_id)
+        return task
+
+    def test_a_run_inside_the_bound_is_never_reaped(self, adapter):
+        from gateway.platforms.api_server_run_reap import API_SERVER_RUN_STALL_REAP_SECONDS
+
+        now = 1_000_000.0
+        task = self._hold(adapter, "run_young", created_at=now - 60)
+
+        result = adapter._sweep_orphaned_runs_once(now)
+
+        assert result is None or result.get("reaped") in (None, [])
+        assert task.cancelled is False
+        assert adapter._run_statuses["run_young"]["status"] == "running"
+        assert API_SERVER_RUN_STALL_REAP_SECONDS >= 600, "the bound must be declared, not tight"
+
+    def test_a_stalled_run_releases_its_slot_and_the_count_drops(self, adapter):
+        from gateway.platforms.api_server_run_reap import (
+            API_SERVER_RUN_STALL_REAP_SECONDS, REAP_ERROR_CODE, reap_stalled_runs,
+        )
+
+        adapter._max_concurrent_runs = 16
+        now = 1_000_000.0
+        stalled = self._hold(adapter, "run_stalled",
+                             created_at=now - API_SERVER_RUN_STALL_REAP_SECONDS - 41_978)
+        live = self._hold(adapter, "run_live", created_at=now - 5, updated_at=now - 2)
+        before = adapter._agent_gate_snapshot()["count"]
+
+        result = reap_stalled_runs(adapter, now=now)
+
+        assert [h["run_id"] for h in result["reaped"]] == ["run_stalled"]
+        assert result["before"] == before
+        assert result["after"] == before - 1, "the reap must free exactly the stalled slot"
+        assert stalled.cancelled is True
+        assert live.cancelled is False, "live work is not killed"
+        assert "run_stalled" not in adapter._active_run_tasks
+        row = adapter._run_statuses["run_stalled"]
+        assert row["status"] == "failed"
+        assert row["error_code"] == REAP_ERROR_CODE
+        assert "no progress" in row["error"]
+
+    def test_a_run_waiting_on_a_human_is_not_reaped(self, adapter):
+        from gateway.platforms.api_server_run_reap import (
+            API_SERVER_RUN_STALL_REAP_SECONDS, reap_stalled_runs,
+        )
+
+        now = 1_000_000.0
+        task = self._hold(adapter, "run_approval", created_at=now - API_SERVER_RUN_STALL_REAP_SECONDS * 5,
+                          status="waiting_for_approval")
+
+        result = reap_stalled_runs(adapter, now=now)
+
+        assert result["reaped"] == []
+        assert task.cancelled is False, "an approval gate may idle for hours by design"
+        assert adapter._run_statuses["run_approval"]["status"] == "waiting_for_approval"
+
+    def test_progress_resets_the_bound(self, adapter):
+        from gateway.platforms.api_server_run_reap import (
+            API_SERVER_RUN_STALL_REAP_SECONDS, reap_stalled_runs,
+        )
+
+        now = 1_000_000.0
+        # Started long ago, but the run moved a moment ago: a slow run is not a stalled run.
+        task = self._hold(adapter, "run_slow", created_at=now - API_SERVER_RUN_STALL_REAP_SECONDS * 3,
+                          updated_at=now - 30)
+
+        result = reap_stalled_runs(adapter, now=now)
+
+        assert result["reaped"] == []
+        assert task.cancelled is False
+
+    def test_the_sweep_carries_the_reap_and_the_ceiling_is_untouched(self, adapter):
+        from gateway.platforms.api_server_run_reap import API_SERVER_RUN_STALL_REAP_SECONDS
+
+        adapter._max_concurrent_runs = 16
+        now = 1_000_000.0
+        self._hold(adapter, "run_stalled", created_at=now - API_SERVER_RUN_STALL_REAP_SECONDS - 10)
+
+        adapter._sweep_orphaned_runs_once(now)
+
+        assert "run_stalled" not in adapter._active_run_tasks
+        assert adapter._run_statuses["run_stalled"]["status"] == "failed"
+        assert adapter._max_concurrent_runs == 16, "the defect is a leak; raising the ceiling is not the repair"
+
+    def test_the_census_names_every_holder_without_mutating_anything(self, adapter):
+        from gateway.platforms.api_server_run_reap import (
+            API_SERVER_RUN_STALL_REAP_SECONDS, stalled_run_holders,
+        )
+
+        now = 1_000_000.0
+        self._hold(adapter, "run_a", created_at=now - API_SERVER_RUN_STALL_REAP_SECONDS - 42_000,
+                   session_id="local-649f955b")
+        self._hold(adapter, "run_b", created_at=now - 30)
+        statuses_before = dict(adapter._run_statuses)
+
+        holders = stalled_run_holders(adapter, now=now)
+
+        assert [h["run_id"] for h in holders] == ["run_a"]
+        assert holders[0]["session_id"] == "local-649f955b"
+        assert holders[0]["idle_seconds"] > API_SERVER_RUN_STALL_REAP_SECONDS
+        assert adapter._run_statuses == statuses_before, "the census is read-only"
+        assert "run_a" in adapter._active_run_tasks, "the census reaps nothing"
