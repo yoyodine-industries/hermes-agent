@@ -230,6 +230,22 @@ dropped silently. The mechanics, in the order the due scan applies them
    re-warn a resume already reported and a failed write is retried rather than
    consumed. The file keeps its newest half past 5,000 rows.
 
+### De-dup keys are consumed only after the effect reports success
+
+A de-dup key exists so a condition is reported **once**, never so it is reported
+**first**. Consuming the key before the effect — writing the row, sending the
+notice, filing the finding — makes a *failed* effect permanently invisible: the
+next tick compares its key against one already spent and stays silent, so the
+finding is lost for the life of the record instead of being reported again.
+
+Consume it after. The shape that enforces this is a reporting function that
+returns `True` when the effect landed and `False` when it did not, with the
+caller writing the key only on `True`. A helper that swallows the failure and
+returns `None` is the shape that hides it: the caller cannot tell "reported" from
+"tried", the key is spent either way, and the only trace is a log line nobody
+reads. The stale-resume `reported_at` stamp above is this rule applied to one
+key; it is the rule for every key.
+
 The same store fields drive every topology: a standalone `hermes -p X gateway
 run` and a profile served by the host gateway (`_start_multiplex` ticks each
 home under `_profile_cron_scope`) evaluate the identical record. One gateway
