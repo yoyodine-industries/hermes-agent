@@ -278,6 +278,47 @@ def test_a_wholly_superseded_batch_speaks_the_snapshot(tmp_path, monkeypatch):
     assert "ready" in joined, joined
 
 
+def test_a_done_card_names_its_approval_even_outside_the_batch(tmp_path, monkeypatch):
+    """The delayed-notice case: the completion was already delivered, a later crash
+    record is claimed on its own. The row says done, so the notice says done and
+    names the approval the row's ledger holds — it does not read the crash as state.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "replay-late.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="late crash record after an approval", assignee="platform-stl",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            chat_type="dm", delivery_mode="notify+wake",
+        )
+        assert kb.complete_task(conn, tid, summary=APPROVAL_SUMMARY) is True
+    finally:
+        conn.close()
+
+    first = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(first)))
+    assert any(APPROVAL_SUMMARY in w for w in _wake_texts(first)), _wake_texts(first)
+
+    # A crash record lands afterwards and is claimed in a batch of its own.
+    conn = kbc.connect()
+    try:
+        kb._append_event(conn, tid, "crashed", {"pid": 95921, "exit_code": 1})
+    finally:
+        conn.close()
+    late = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(late)))
+
+    wakes = _wake_texts(late)
+    assert wakes, "the late event must not go silent"
+    for text in wakes:
+        assert "done" in text, wakes
+        assert "crashed" not in text, wakes
+
+
 def test_an_archived_card_still_reports_how_it_ended(tmp_path, monkeypatch):
     """Archive is the last tick before the sub is dropped: the completion must land."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "replay-archived.db"))
