@@ -87,6 +87,15 @@ def _refusal(authority, tip, exc):
         logger.warning('Peer DM into Bot Chat %s refused: %s (not_found: field=%s detail=%s)',
                        tip['id'], reason, exc.field, exc.detail)
         return reason, f"Bot Chat admission refused: {reason} (this profile's 'Bot Chat' is not a local chat; {hint})"
+    if reason == 'queue_full':
+        # A full FIFO is the ordinary admission refusal, and the one refusal whose outcome is KNOWN:
+        # the cap is checked before the queued insert, so nothing entered the queue and the sender
+        # may retry once it drains. Name the check and its measurement, and never let it read as the
+        # ambiguous outcome that applies "do not resend" to a message that was never admitted.
+        measured = '; '.join(part for part in (exc.field, exc.detail) if part)
+        suffix = f' ({measured})' if measured else ''
+        return reason, (f'Bot Chat admission refused: {reason}{suffix} — the lane FIFO is full, nothing was '
+                        'admitted, so retry this turn once it drains instead of dropping it')
     return reason, f'Bot Chat admission refused: {reason}'
 
 

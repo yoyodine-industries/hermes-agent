@@ -91,7 +91,12 @@ def admit_session_input(holder, *, epoch: int, principal_id: str, session_id: st
         # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
         # input after Discard, so it must not grow without bound while nobody resolves it.
         if queued >= ADMISSION_QUEUE_MAX:
-            raise AuthorityRefusal('queue_full')
+            # A full FIFO is a REFUSAL the sender can act on, so it names the check that fired and
+            # its measurement: the cap is read before the queued insert, which is why "nothing was
+            # admitted" follows from this reason alone (t-8ff0ed888d).
+            raise AuthorityRefusal('queue_full', field='admission_queue',
+                                   detail=f'{queued} queued inputs of a cap of {ADMISSION_QUEUE_MAX} '
+                                          'on the target session; the refusal precedes any admission')
         raise_gate(gate)
         authorize_admission(holder, conn, epoch=epoch, principal_id=principal_id, session_id=session_id,
                             request_id=request_id, replaces=replaces, supersedes=supersedes,

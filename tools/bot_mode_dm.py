@@ -537,9 +537,57 @@ class LiveTargetHeldError(LiveTargetUnavailableError):
         return HELD_NOT_SENT
 
 
+#: The reason code the admission store raises at its queue cap (``ADMISSION_QUEUE_MAX``).
+QUEUE_FULL = "queue_full"
+#: The wait a ``queue_full`` refusal asks for when the owner names none: a floor, not a promise —
+#: the FIFO admits one turn at a time and drains only as that turn completes.
+QUEUE_FULL_RETRY_SECONDS = 30.0
+
+
+class LiveTargetBusyError(LiveTargetUnavailableError):
+    """The lane's admission FIFO is full: the owner refused at its queue cap, and the cap is read
+    BEFORE the queued insert, so nothing was admitted under any id. That makes it a definite
+    no-send the sender may retry — never the ambiguous post-admission state, and never a "do not
+    resend" answer to a message that never entered the queue."""
+
+    reason = "queue_full"
+
+    def __init__(self, message: str, *, retry_after: float = QUEUE_FULL_RETRY_SECONDS):
+        super().__init__(message)
+        self.retry_after = float(retry_after)
+
+    @property
+    def resend(self) -> str:
+        return f"in {self.retry_after:g}s, once the lane's queue drains"
+
+
+def _queue_full_reason(cause: object) -> bool:
+    """Does this failure name a ``queue_full`` refusal? The reason code is the failure's own
+    identity (``str(exc)`` for a ``GatewayRPCError``), so it is read from the value, never
+    re-derived from prose."""
+    if str(cause).strip() == QUEUE_FULL or getattr(cause, "reason", None) == QUEUE_FULL:
+        return True
+    data = getattr(cause, "data", None)
+    return isinstance(data, dict) and data.get("reason") == QUEUE_FULL
+
+
+def _queue_full_retry_after(cause: object) -> float:
+    """The wait a ``queue_full`` refusal asks for: the owner's own ``retry_after`` when it sends
+    one, else the local floor."""
+    data = getattr(cause, "data", None)
+    value = data.get("retry_after") if isinstance(data, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return QUEUE_FULL_RETRY_SECONDS
+    return float(value)
+
+
 def _unavailable_payload(dm_file: str, exc: LiveTargetUnavailableError) -> str:
-    return json.dumps({"reason": exc.reason, "delivery_id": _dm_delivery_id(dm_file),
-                       "error": f"{exc} — the message was NOT sent; it is safe to resend {exc.resend}."})
+    payload = {"reason": exc.reason, "delivery_id": _dm_delivery_id(dm_file),
+               "error": f"{exc} — the message was NOT sent; it is safe to resend {exc.resend}."}
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is not None:
+        payload["retry_after"] = retry_after
+    return json.dumps(payload)
 
 
 def _settled_no_send(dm_file: str, exc: LiveTargetUnavailableError) -> str:
@@ -608,6 +656,14 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
         try:
             record = deliver_to_live_owner(home, intent["owner"], intent["message"], **identity)
         except GatewayRPCError as exc:
+            if _queue_full_reason(exc):
+                # The cap is read BEFORE the queued insert, so this refusal admitted nothing: a
+                # definite no-send and a retry. Left unclassified it fell through to the generic
+                # except and was answered "outcome unknown ... Do not resend" — false twice, since
+                # the outcome IS known and the message never entered the queue (t-8ff0ed888d b).
+                raise LiveTargetBusyError(
+                    "the lane's admission FIFO is full; the owner refused before admitting anything",
+                    retry_after=_queue_full_retry_after(exc)) from exc
             if str(exc) != HELD_NOT_SENT or exc.data.get("admitted") is not False:
                 raise
             # Nothing was admitted while that refusal held the owner's lock, but a same-id attempt
@@ -705,7 +761,17 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
 
 
 def _live_outcome_unknown(dm_file: str, cause: object) -> str:
-    """The runner's stdout when a live admission may have happened but its outcome is unknown."""
+    """The runner's stdout when a live admission may have happened but its outcome is unknown.
+
+    ``queue_full`` is the one failure whose outcome is NOT unknown: the cap is read before the
+    queued insert, so the refusal admitted nothing and the sender may retry. Formatted as ambiguous
+    it applied "do not resend" to a message that never entered the queue (t-8ff0ed888d b), so it
+    gets the named refusal and its remedy instead.
+    """
+    if _queue_full_reason(cause):
+        return _unavailable_payload(dm_file, LiveTargetBusyError(
+            "the lane's admission FIFO is full; the owner refused before admitting anything",
+            retry_after=_queue_full_retry_after(cause)))
     return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
                        "error": f"Live admission outcome unknown: {cause}. Do not resend.",
                        "evidence_file": dm_file})
