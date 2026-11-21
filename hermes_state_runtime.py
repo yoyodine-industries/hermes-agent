@@ -614,14 +614,26 @@ def admission_strand_census(db) -> dict:
     """
     from datetime import datetime, timezone
     with db._read_ctx() as conn:
-        row = conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()
-        epoch = row[0] if row else None
-        unknown = conn.execute(
-            "SELECT seq,target_session_id,owner_epoch,admission_id FROM session_admissions "
-            "WHERE status='unknown' ORDER BY seq").fetchall()
-        queued = conn.execute(
-            "SELECT seq,target_session_id FROM session_admissions WHERE status='queued' "
-            "ORDER BY seq").fetchall()
+        # The census sweeps EVERY store, and a store this runtime never booted (the control-plane
+        # profile carries session_admissions but no runtime_epoch) must report its latch, not abort
+        # the sweep. A missing table is a fact the census states (epoch None / no admissions), never
+        # an exception: an unattended sweep that dies on store one reports nothing for all of them.
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('runtime_epoch','session_admissions')")}
+        epoch = None
+        if 'runtime_epoch' in tables:
+            row = conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()
+            epoch = row[0] if row else None
+        if 'session_admissions' not in tables:
+            unknown, queued = [], []
+        else:
+            unknown = conn.execute(
+                "SELECT seq,target_session_id,owner_epoch,admission_id FROM session_admissions "
+                "WHERE status='unknown' ORDER BY seq").fetchall()
+            queued = conn.execute(
+                "SELECT seq,target_session_id FROM session_admissions WHERE status='queued' "
+                "ORDER BY seq").fetchall()
     targets: dict = {}
     for entry in unknown:
         targets.setdefault(entry['target_session_id'], {'unknown': [], 'queued': [], 'stranded': 0}

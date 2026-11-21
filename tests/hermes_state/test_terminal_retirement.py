@@ -97,11 +97,17 @@ def test_nonterminal_obligations_prevent_any_retirement(tmp_path):
                     with pytest.raises(rt.RuntimeStoreError, match='unknown_execution') as exc:
                         db._execute_write(lambda c: delete_in_transaction(db, c, status, {}))
                     assert 'seq=' in (exc.value.detail or '')
-                    # A STALE-epoch unknown is abandoned by the bump's sweep, so no obligation is
+                    # A STALE-epoch unknown is abandoned by the bump ITSELF, so no obligation is
                     # left behind: retirement proceeds and the abandonment stays as terminal evidence.
+                    # The bump is the release edge (clause 7); the later sweep has nothing to do.
                     admission_id = rt.list_session_admissions(db, session_id=status)[0]['admission_id']
                     epoch = rt.begin_runtime_epoch(db, instance_id='next')
-                    assert rt.recover_session_inputs(db, epoch=epoch) == 1
+                    abandoned = rt.get_session_admission(db, admission_id=admission_id)
+                    assert abandoned is not None
+                    assert (abandoned['status'], abandoned['outcome']) == ('terminal', 'interrupted'), \
+                        'the bump must abandon the stale-epoch unknown in its own transaction'
+                    assert rt.recover_session_inputs(db, epoch=epoch) == 0, \
+                        'the sweep is a no-op once the bump has released the row'
                     db._execute_write(lambda c: delete_in_transaction(db, c, status, {}))
                     assert db.get_session(status) is None
                     tombstone = rt.get_session_admission(db, admission_id=admission_id)

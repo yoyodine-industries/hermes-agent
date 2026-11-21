@@ -241,3 +241,42 @@ def test_the_strand_alert_never_raises_on_the_board_account(tmp_path):
         assert lines, 'the evaluation must leave one log line either way'
     finally:
         db.close()
+
+
+def test_a_store_with_no_epoch_table_still_censuses_its_latch(tmp_path):
+    """The census runs over EVERY store, so a store that is not the runtime's must not kill it.
+
+    The control-plane store (``~/.hermes/profiles/default/state.db``) carries
+    ``session_admissions`` but has never been booted through ``begin_runtime_epoch``, so it has no
+    ``runtime_epoch`` table at all. An unattended sweep that raises on the first such store reports
+    nothing for any store -- the census would be silent exactly where a latch is loudest. No epoch
+    to report is a fact (``None``), not an error.
+    """
+    db = store(tmp_path)
+    import hermes_state_runtime as rt
+    try:
+        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        head = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                                      request_id='dead', payload={'text': 'dead turn'})
+        stranded = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                                          request_id='behind', payload={'text': 'stranded'})
+        rt.claim_session_input(db, epoch=epoch, session_id='s')
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET status='unknown',outcome=NULL WHERE admission_id=?",
+            (head['admission_id'],)))
+        # The pre-epoch store shape: the runtime never booted here.
+        db._execute_write(lambda conn: conn.execute('DROP TABLE runtime_epoch'))
+
+        census = rt.admission_strand_census(db)
+        assert census['epoch'] is None, 'no epoch is a fact about the store, not a crash'
+        assert census['read_at']
+        assert census['latched_targets'] == 1 and census['stranded'] == 1
+        assert [r['seq'] for r in census['targets']['s']['queued']] == [stranded['seq']]
+        assert rt.admission_strand_key(census).startswith('admission-strand:None:')
+
+        # And a store that has not even the admission table is an empty census, not a failure.
+        db._execute_write(lambda conn: conn.execute('DROP TABLE session_admissions'))
+        empty = rt.admission_strand_census(db)
+        assert (empty['latched_targets'], empty['stranded'], empty['targets']) == (0, 0, {})
+    finally:
+        db.close()
