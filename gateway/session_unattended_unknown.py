@@ -26,6 +26,15 @@ def is_unattended(row) -> bool:
     if principal == CRON_PRINCIPAL_ID or principal.startswith('automation:'):
         return True
     payload = row.get('payload') or {}
+    # A FINITE turn is a one-shot execution with no interactive continuation: `admit_finite`
+    # refuses `unattended` unless `finite` is true, and the finite runner is the one-shot/API/
+    # automation path. Measured 2026-11-21: every unknown admission on this host (16 rows across
+    # 5 stores) was a seat-diddler pass submitted as `{"finite": true, ...}` with NO
+    # `unattended` key, so this predicate answered "attended" for the whole population and the
+    # release edge skipped every row it existed for. The marker that is always present is
+    # `finite`; requiring the caller to also remember `unattended` made the edge unreachable.
+    if payload.get('finite') is True:
+        return True
     native = payload.get('native_text_v1') or {}
     # A webhook delivery: the provider already got its 202 and nobody can be asked to resend it.
     # A Kanban card attempt (#134889 KB-8): the dispatcher's marker, committed only by
@@ -53,6 +62,7 @@ def settle_recovered_unattended(db, epoch) -> int:
         try:
             resolve_unknown_session_input(
                 db, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'],
+                _edge='boot',
                 _terminal_write=lambda conn, lost: close_discarded_turn(db, conn, lost, AUTOMATION_INTERRUPTED_NOTICE))
         except RuntimeStoreError as exc:
             logger.warning('Lost automation admission %s left unknown: %s', row['admission_id'], exc.reason)

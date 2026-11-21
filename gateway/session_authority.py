@@ -894,7 +894,7 @@ class SessionAuthority:
         from gateway.session_runtime_workers import tracked_write
         return await tracked_write(self, partial(
             resolve_unknown_session_input, self.db, epoch=self.epoch, admission_id=admission_id,
-            generation=generation, _captured=prepared,
+            generation=generation, _captured=prepared, _edge='claim',
             # ``notice`` says the turn was interrupted: only when that is the outcome, never beside a
             # captured result this resolution commits as the turn's own answer.
             _terminal_write=lambda conn, lost: close_discarded_turn(self.db, conn, lost, None if (
