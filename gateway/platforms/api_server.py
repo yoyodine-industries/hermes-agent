@@ -191,6 +191,10 @@ API_SERVER_GATE_LATCH_SUSPECT_SECONDS = 1800.0
 # Bound on the gate's attribution registry. Diagnostics only -- the count is DERIVED
 # from the three terms, never from this registry, so a lost entry cannot latch the gate.
 API_SERVER_GATE_HOLDER_LIMIT = 256
+# A /v1/runs task whose own run status is TERMINAL is finished work, whatever the task
+# object still does. It is released from the gate's live count (and logged once), because
+# a terminal run that keeps a slot is a latch over work that can never resume (t-2fd3bc0b28).
+_GATE_TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -1258,16 +1262,55 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _live_run_task_count(self) -> int:
         """/v1/runs tasks still open. A task whose state cannot be read is NOT counted: a
-        terminated run must leave the gate (the latch this instrument exists to prevent)."""
+        terminated run must leave the gate (the latch this instrument exists to prevent).
+
+        A task that is still pending while its OWN run status is terminal is also released:
+        the run is over (it answered, failed, or was interrupted) and nothing behind that
+        task can become work again, so counting it latches the gate over a finished run --
+        the shape measured on 2026-11-21 (8/16 slots held up to 5.4h by runs of one session,
+        every holder past the latch threshold). The release is logged once per run id with
+        the slot count before and after, so a reap is auditable and a recurring latch shows
+        up as its own line instead of a silent over-count.
+        """
         tasks = getattr(self, "_active_run_tasks", None) or {}
+        run_statuses = getattr(self, "_run_statuses", None) or {}
+        before = 0
         live = 0
-        for task in tasks.values():
+        released: list[str] = []
+        for run_id, task in list(tasks.items()):
             try:
-                if not task.done():
-                    live += 1
+                if task.done():
+                    continue
             except Exception:  # noqa: BLE001 - an unreadable task is not live work
                 continue
+            before += 1
+            status = run_statuses.get(run_id) or {}
+            if str(status.get("status") or "").lower() in _GATE_TERMINAL_RUN_STATUSES:
+                released.append(str(run_id))
+                continue
+            live += 1
+        if released:
+            self._note_gate_released_runs(released, before, live)
         return live
+
+    def _note_gate_released_runs(self, released: list[str], before: int, after: int) -> None:
+        """One WARNING per released run id: the reap names what it took off the count.
+
+        Logged once per id (a held set), because the heartbeat re-measures every cycle: the
+        same release must not turn the log into a counter that grows with uptime.
+        """
+        seen = getattr(self, "_gate_released_run_ids", None)
+        if seen is None:
+            seen = set()
+            self._gate_released_run_ids = seen
+        fresh = [run_id for run_id in released if run_id not in seen]
+        if not fresh:
+            return
+        seen.update(fresh)
+        logger.warning(
+            "[api_server] agent-work gate released %d finished run task(s) still pending: "
+            "live_runs %d -> %d (run_ids=%s)",
+            len(fresh), before, after, ",".join(fresh[:8]))
 
     def _agent_work_terms(self) -> dict[str, int]:
         """The three counted terms, measured NOW.
@@ -1330,6 +1373,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             except Exception:  # noqa: BLE001 - unreadable task is already uncounted
                 continue
             status = run_statuses.get(run_id) or {}
+            if str(status.get("status") or "").lower() in _GATE_TERMINAL_RUN_STATUSES:
+                # Finished work holds no slot: the same release _live_run_task_count applies,
+                # so the published count and the published holders can never disagree.
+                continue
             created = float(status.get("created_at") or 0.0)
             held = round(max(0.0, now - created), 3) if created else 0.0
             holders.append({
