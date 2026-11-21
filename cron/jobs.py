@@ -119,6 +119,12 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
+# Resume re-derivation (card t-dd76635fb1). The persisted finding stamp lives on the job record so
+# a later reader can see it; the in-memory set makes the report ONE per resume rather than one per
+# tick, keyed by (job id, resume instant) because the instant is what identifies the resume.
+_RESUME_STALE_KEY = "resume_stale"
+_resume_stale_reported: set[tuple[str, str]] = set()
+
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -2367,44 +2373,142 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, A
     })
 
 
+def _resume_stale_finding(job: dict[str, Any], carried: Optional[str],
+                          derived: Optional[str], now: datetime) -> Optional[dict[str, Any]]:
+    """The NAMED finding for a resume whose carried slot is more than one interval stale.
+
+    A resume re-derives the slot (card t-dd76635fb1), so a job paused for hours no longer fires
+    at the operator's minute — but the re-anchoring must not be SILENT either: how far out of
+    date the stored instant was is the only evidence of how long the pause really lasted, and a
+    silent correction destroys it. One interval is the threshold because a slot is expected to
+    elapse while paused (the job was paused across it); MORE than one means the stored instant
+    no longer describes this job's cadence at all.
+
+    Returns None when there is nothing to report: no carried slot, a future one, a one-shot (whose
+    own grace rule governs), or an unknown cadence (croniter missing) — an unmeasurable lateness
+    is not a finding, or every resume on a box without croniter would page someone.
+    """
+    if job["schedule"].get("kind") not in {"cron", "interval"} or not carried:
+        return None
+    carried_dt = _parse_aware(carried)
+    if carried_dt is None or not _instant_at_or_before(carried_dt, now):
+        return None
+    cadence = _schedule_cadence_seconds(job["schedule"])
+    late = (now - carried_dt).total_seconds()
+    if not cadence or late <= cadence:
+        return None
+    return {
+        "carried_next_run_at": carried,
+        "derived_next_run_at": derived,
+        "resumed_at": now.isoformat(),
+        "late_seconds": round(late, 1),
+        "cadence_seconds": cadence,
+        "intervals_late": round(late / cadence, 2) if cadence else None,
+    }
+
+
+def _record_resume_pair(job: dict[str, Any], carried: Optional[str],
+                        derived: Optional[str], finding: Optional[dict[str, Any]]) -> None:
+    """Append the ``carried -> derived`` pair for one resume, stale or not.
+
+    Recorded on EVERY resume, because the pair is the receipt for clause (a) and a reader cannot
+    reconstruct it afterwards: the stored instant is overwritten by the very operation being
+    accounted for. ``stale`` marks the row that also raised a finding.
+    """
+    entry = {
+        "job_id": job.get("id"),
+        "name": job.get("name") or job.get("id"),
+        "carried_next_run_at": carried,
+        "derived_next_run_at": derived,
+        "resumed_at": _hermes_now().isoformat(),
+        "stale": bool(finding),
+    }
+    if finding:
+        entry.update({k: finding[k] for k in ("late_seconds", "cadence_seconds", "intervals_late")})
+    try:
+        _append_telemetry_record("cron_resumes.jsonl", entry, [])
+    except Exception as exc:                      # telemetry must never break a resume
+        logger.debug("Could not record cron resume pair: %s", exc)
+
+
+def report_resume_stale(job: dict[str, Any], now: Optional[datetime] = None) -> None:
+    """Raise the resume finding ONCE, on the first tick after the job was resumed.
+
+    Clause (c) of card t-dd76635fb1: the re-derivation happens at resume, but the reader who
+    needs to know is the operator watching the SCHEDULE, and the tick is where a schedule is
+    read. De-duplicated per (job, resume instant) in memory, so a job cannot page every tick for
+    one stale resume; the persisted stamp stays on the record for a later reader, and the
+    telemetry row keeps the measurement.
+    """
+    finding = job.get(_RESUME_STALE_KEY)
+    if not isinstance(finding, dict):
+        return
+    key = (str(job.get("id")), str(finding.get("resumed_at")))
+    if key in _resume_stale_reported:
+        return
+    _resume_stale_reported.add(key)
+    if len(_resume_stale_reported) > 512:
+        _resume_stale_reported.clear()
+        _resume_stale_reported.add(key)
+    logger.warning(
+        "Cron job '%s' resumed %.0f MINUTES late (%s intervals of %ss): carried %s, derived %s "
+        "at the resume. The stored instant was more than one interval stale, so this is a NAMED "
+        "finding and not a catch-up (card t-dd76635fb1).",
+        job.get("name") or job.get("id"),
+        (finding.get("late_seconds") or 0) / 60.0, finding.get("intervals_late"),
+        finding.get("cadence_seconds"), finding.get("carried_next_run_at"),
+        finding.get("derived_next_run_at"))
+    _append_telemetry_record("cron_resume_stale.jsonl",
+                             dict(finding, job_id=job.get("id"),
+                                  name=job.get("name") or job.get("id"),
+                                  observed_at=(now or _hermes_now()).isoformat()),
+                             [])
+
+
 def resume_job(job_id: str) -> Optional[dict[str, Any]]:
     """Resume a paused job. Accepts a job ID or name.
 
-    A recurring job paused across one of its slots must not lose that slot silently: the stored
-    ``next_run_at`` (already past) survives resume as the due instant, and the ordinary late /
-    catch-up / ``cron.catch_up_missed`` policy in the due scan decides what happens to it — one
-    fire or a logged skip, never a silent re-anchor past it (#113603). One-shots and future
-    instants recompute from now as before.
+    THE SLOT IS ALWAYS RE-DERIVED FROM THE JOB'S OWN SCHEDULE, in this operation (card
+    t-dd76635fb1). A paused job used to resume carrying the instant it was paused across, so a
+    job due 10.5h ago fired at whatever minute the operator resumed it — the departure then
+    proved the hand and not the schedule, the same shape as a launcher reporting its own status.
+
+    Clause (b): the derived instant is the NEXT occurrence of the job's own expression, so a
+    stale job never fires at the resume minute. A catch-up is a decision, never an accident of
+    when someone typed `resume`. Clause (c): a carried instant more than one interval behind the
+    resume is a NAMED finding on the first post-resume tick (``report_resume_stale``), so the
+    re-anchoring is measured rather than silent. Clause (a): the pair carried -> derived is
+    appended to ``cron_resumes.jsonl`` for every resume.
+
+    One-shots keep their own rule: a `once` job whose time has passed the grace window can never
+    fire and raises, because there is no expression to derive the next occurrence from.
     """
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    stored_next = job.get("next_run_at")
-    stored_dt = _parse_aware(stored_next) if stored_next else None
-    if (
-        job["schedule"].get("kind") in {"cron", "interval"}
-        and stored_dt is not None
-        and _instant_at_or_before(stored_dt, _hermes_now())
-    ):
-        next_run_at = stored_next
-        logger.info(
-            "Job '%s' resumed with occurrence %s that elapsed while paused kept due; the next "
-            "tick fires it (late/catch-up) or logs the skip.",
-            job.get("name", job["id"]), stored_next)
-    else:
-        next_run_at = compute_next_run(job["schedule"], timezone=job.get("timezone"))
+    carried = job.get("next_run_at")
+    now = _hermes_now()
+    next_run_at = compute_next_run(job["schedule"], timezone=job.get("timezone"))
     if next_run_at is None and job["schedule"].get("kind") == "once":
         run_at = job["schedule"].get("run_at", "unknown")
         raise ValueError(
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire.")
-    return update_job(job["id"], {
+    finding = _resume_stale_finding(job, carried, next_run_at, now)
+    update: dict[str, Any] = {
         "enabled": True,
         "state": "scheduled",
         "paused_at": None,
         "paused_reason": None,
         "next_run_at": next_run_at,
-    })
+    }
+    if finding:
+        update[_RESUME_STALE_KEY] = finding
+    elif _RESUME_STALE_KEY in job:
+        update[_RESUME_STALE_KEY] = None
+    resumed = update_job(job["id"], update)
+    _record_resume_pair(job, carried, next_run_at, finding)
+    return resumed
 
 
 def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[dict[str, Any]]:
@@ -3371,6 +3475,11 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     recurring jobs; then once due: re-anchor stale cron instants, fast-forward missed recurring
     runs, retire/guard one-shots, and finally stamp the run claim / dispatch record."""
     now = scan.now
+    # Clause (c) of t-dd76635fb1: a resume that re-anchored a slot more than one interval stale
+    # raises its NAMED finding HERE, on the first tick the job is seen after the resume - the
+    # schedule is read at the tick, so the tick is where a re-anchoring has to be legible.
+    if job.get(_RESUME_STALE_KEY):
+        report_resume_stale(job, now)
     # Cross-process guard: another process's live one-shot run_claim (younger than TTL) — do NOT
     # re-dispatch. Malformed/future-dated claims (clock/TZ skew) count as stale, never eternally
     # fresh.

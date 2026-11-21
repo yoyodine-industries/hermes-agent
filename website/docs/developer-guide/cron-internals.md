@@ -210,11 +210,16 @@ dropped silently. The mechanics, in the order the due scan applies them
    diagnostic, never resurrected.
 6. **Paused / disabled / terminal jobs never fire**; the due scan drops them
    before any of the above, and pause/resume clears any pending slot. A
-   recurring occurrence that came due *while paused* is not lost, though:
-   `resume_job` keeps a past stored `next_run_at` as the due instant instead of
-   re-anchoring from now (and logs that it did), so the first tick after
-   resume applies rules 3–5 to it — one late/catch-up run, or a logged skip.
-   One-shots and future instants recompute from now on resume.
+   `resume_job` **re-derives** `next_run_at` from the job's own cron/interval
+   expression in the same operation and never re-arms the instant it carried,
+   so a job resumed after a long pause schedules to the NEXT occurrence rather
+   than firing at the resume minute (re-arming made the departure prove the
+   operator's hand and not the schedule). Every resume appends the
+   `carried → derived` pair to `cron/cron_resumes.jsonl`; a carried instant more
+   than one cadence interval behind the resume raises a named finding on the
+   first tick after it (`cron/cron_resume_stale.jsonl`, once per resume) instead
+   of correcting silently. One-shots recompute from `run_at` and refuse past
+   their grace window.
 
 The same store fields drive every topology: a standalone `hermes -p X gateway
 run` and a profile served by the host gateway (`_start_multiplex` ticks each
