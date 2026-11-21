@@ -300,12 +300,24 @@ class SweepClosure:
     substrate class) it repeats every tick while the owner stays unsettled, so counting it would
     freeze every such row as ``running``."""
     claim_lock: Optional[str] = None
+    kernel_absent: bool = False
+    """The KERNEL's process table proves this pid unoccupied: ``_pid_liveness(pid)`` answered
+    ``WORKER_DEAD`` (ESRCH, or a zombie), and that verdict is decided BEFORE any fingerprint is
+    read. No witness was consulted, so no witness bug can forge this closure.
+
+    The valve exists for the class a broken liveness evaluation can INVENT -- a live pid declared a
+    stranger. A missing process-table entry is not that class, and counting it freezes the row as
+    ``running`` with a dead pid, which is the backlog the next tick counts again. Exempt from the
+    count; released spaced at ``max(0, threshold - 1)`` per tick instead."""
+    claim_expires: Optional[int] = None
+    """The row's claim expiry, used ONLY to order the spaced release deterministically (oldest
+    first, then ``task_id``). Not a liveness fact and never compared."""
 
     @property
     def is_unexplained_death(self) -> bool:
         """True when this closure is the class a bad liveness evaluation can forge."""
         if (self.protocol_violation or self.terminal_provider or self.rate_limited
-                or self.substrate_import or self.admission_unsettled):
+                or self.substrate_import or self.admission_unsettled or self.kernel_absent):
             return False
         return self.kind in UNEXPLAINED_DEATH_KINDS
 
@@ -335,6 +347,16 @@ class SweepAssessment:
     """Task ids whose read/write identity shapes are incomparable -- not reclaimed, not counted."""
     held_shapes: tuple[str, ...] = ()
     """Distinct ``"<read->write>"`` shape pairs behind :attr:`held`, for the evidence line."""
+    releasable: tuple[str, ...] = ()
+    """Kernel-proven closures (:attr:`SweepClosure.kernel_absent`) this tick MUST book, capped at
+    ``max(0, threshold - 1)`` and ordered oldest ``claim_expires`` first, then ``task_id``.
+
+    This is the release the valve has to allow even while it refuses the witness leg: it is the
+    only act that decays the backlog the count is built from. Empty when the guard is disabled
+    (``threshold < 2``), because then every closure writes on the normal pass anyway."""
+    spaced_deferred: tuple[str, ...] = ()
+    """Kernel-proven closures held back to a LATER tick by the same cap: the release is spaced, so
+    a genuine mass death still departs over ticks instead of all at one instant."""
 
     @property
     def refusal_needed(self) -> bool:
@@ -384,6 +406,13 @@ def assess_sweep(
     sweep is refused in full at ``>= threshold`` (R4). A threshold below 2 disables only the count
     guard -- the per-row hold still applies, because an incomparable comparison is a fact about the
     values, not a policy setting.
+
+    The count is the WITNESS leg only. A closure whose pid the process table proves unoccupied
+    (:attr:`SweepClosure.kernel_absent`) cannot be forged by a broken witness, so it is never
+    counted -- and because a refusal must not freeze the very rows it counted, it is released
+    spaced at ``max(0, threshold - 1)`` per tick (:attr:`SweepAssessment.releasable`), the same
+    bound the operator's own override would allow. The remainder is
+    :attr:`SweepAssessment.spaced_deferred`.
     """
     effective = mass_crash_threshold() if threshold is None else int(threshold)
     ended_at = int(time.time() if now is None else now)
@@ -392,6 +421,7 @@ def assess_sweep(
     held: list[str] = []
     pairs: list[str] = []
     counted: list[str] = []
+    kernel_absent: list[SweepClosure] = []
     for closure in closures:
         if closure.incomparable_with(shape):
             held.append(closure.task_id)
@@ -399,10 +429,29 @@ def assess_sweep(
             if pair not in pairs:
                 pairs.append(pair)
             continue
+        if closure.kernel_absent:
+            # Not counted: the kernel decided this, and no witness comparison was consulted.
+            kernel_absent.append(closure)
+            continue
         if closure.is_unexplained_death:
             counted.append(closure.task_id)
 
     abort = bool(effective >= 2 and len(counted) >= effective)
+    # ``threshold < 2`` is the operator's "let it all through": these closures write on the normal
+    # pass, so there is no spaced subset to name -- not a cap, and not a deferral either, or the
+    # caller's deferral skip would hold rows the disabled guard is supposed to release.
+    if effective >= 2:
+        cap = max(0, effective - 1)
+        ordered = sorted(
+            kernel_absent,
+            # A row with no expiry has no urgency fact to sort on: it goes last, deterministically.
+            key=lambda c: (0 if c.claim_expires is not None else 1, c.claim_expires or 0, c.task_id),
+        )
+        releasable = tuple(c.task_id for c in ordered[:cap])
+        deferred = tuple(c.task_id for c in ordered[cap:])
+    else:
+        releasable = ()
+        deferred = ()
     return SweepAssessment(
         verdict=MassCrashVerdict(
             abort=abort,
@@ -414,6 +463,8 @@ def assess_sweep(
         ),
         held=tuple(held),
         held_shapes=tuple(pairs),
+        releasable=releasable,
+        spaced_deferred=deferred,
     )
 
 
@@ -426,11 +477,30 @@ def refusal_lines(assessment: SweepAssessment) -> list[str]:
             f"{MASS_CRASH_SIGNATURE_PREFIX} REFUSING this reclaim sweep: {verdict.count} runs would "
             f"close `crashed` in one tick (threshold {verdict.threshold}, ended_at {verdict.ended_at})."
         )
-        lines.append(
-            "A sweep this size is a host-systemic signature, not N card failures -- a broken liveness "
-            "witness, not N broken cards. NOTHING was written: no run ended, no claim released, no "
-            "failure counted. Cards taken: " + (", ".join(verdict.task_ids) or "(none)") + "."
-        )
+        if assessment.releasable:
+            # The refusal is NOT empty-handed any more: the kernel-proven subset is booked, and the
+            # text has to say so or the card lies about the board it just changed.
+            lines.append(
+                "A sweep this size is a host-systemic signature, not N card failures -- a broken "
+                "liveness witness, not N broken cards. The WITNESS leg was NOT written: those runs "
+                "keep `running` and their workers keep their claims, no failure counted. The "
+                "kernel's own process table proves these pids unoccupied (ESRCH or a zombie; no "
+                "witness was consulted), so they are released spaced rather than frozen -- "
+                "released " + _bullets(assessment.releasable) + "."
+            )
+            if assessment.spaced_deferred:
+                lines.append(
+                    "Deferred to a later tick by the same bound (at most "
+                    f"{max(0, verdict.threshold - 1)} kernel-proven row(s) per tick): "
+                    + _bullets(assessment.spaced_deferred) + "."
+                )
+        else:
+            lines.append(
+                "A sweep this size is a host-systemic signature, not N card failures -- a broken "
+                "liveness witness, not N broken cards. NOTHING was written: no run ended, no claim "
+                "released, no failure counted. Cards taken: "
+                + (", ".join(verdict.task_ids) or "(none)") + "."
+            )
     if assessment.held:
         lines.append(
             f"{MASS_CRASH_SIGNATURE_PREFIX} HOLDING {len(assessment.held)} row(s) whose identity "
@@ -475,15 +545,32 @@ def refusal_body(assessment: SweepAssessment, *, board: Optional[str] = None, tr
         f"- tree: `{resolved_tree}`",
         "",
         f"- cards taken ({len(verdict.task_ids)}): {_bullets(verdict.task_ids)}",
+        f"- kernel-proven releases BOOKED this tick ({len(assessment.releasable)}): "
+        + _bullets(assessment.releasable),
+        f"- kernel-proven releases deferred to a later tick ({len(assessment.spaced_deferred)}): "
+        + _bullets(assessment.spaced_deferred),
         f"- rows held on an incomparable identity shape ({len(assessment.held)}): "
         + _bullets(assessment.held),
         f"- shape pairs held (`<read->write>`): {_bullets(assessment.held_shapes)}",
         "",
         "## What was NOT done",
         "",
-        "No run was ended, no claim released, no failure counted, no circuit breaker tripped. The",
-        "cards keep `running` and their workers keep their claims. A refusal is loud and reversible;",
-        "a silent board mutation is not.",
+        *(
+            [
+                f"No WITNESS-leg run was ended, no witness-leg claim released, no failure counted, no",
+                f"circuit breaker tripped: the {len(verdict.task_ids)} row(s) the valve took keep `running`",
+                f"with their workers' claims. The {len(assessment.releasable)} kernel-proven row(s) named",
+                "above WERE booked -- claim released, run ended, attempt recorded, retry status applied --",
+                "because the kernel's own process table proved those pids unoccupied and no witness was",
+                "consulted. A refusal is loud and reversible; a silent board mutation is not.",
+            ]
+            if assessment.releasable
+            else [
+                "No run was ended, no claim released, no failure counted, no circuit breaker tripped. The",
+                "cards keep `running` and their workers keep their claims. A refusal is loud and reversible;",
+                "a silent board mutation is not.",
+            ]
+        ),
         "",
         "## Operator move",
         "",
@@ -801,6 +888,8 @@ def alert_sweep_guard(
             "threshold": verdict.threshold,
             "ended_at": verdict.ended_at,
             "task_ids": list(verdict.task_ids),
+            "releasable": list(assessment.releasable),
+            "spaced_deferred": list(assessment.spaced_deferred),
             "held": list(assessment.held),
             "held_shapes": list(assessment.held_shapes),
         },

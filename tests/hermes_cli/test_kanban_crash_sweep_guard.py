@@ -77,6 +77,28 @@ def _incomparable_fingerprint() -> str:
     return "bootsession:TEST|179000000000|1234"                  # boot-witness/3, a different family
 
 
+def _witness_dead_fingerprint() -> str:
+    """A LIVING pid's recorded identity that this host's witness contradicts.
+
+    The recorded start is 50 s away from the real one WHILE the boot reference still holds, so the
+    mismatch is a difference and not a moved reference (the 2026-09-27 false dead read). The pid
+    itself is occupied -- ``_pid_liveness`` answers ALIVE -- so the death rests on the WITNESS
+    alone: exactly the class the mass-crash valve exists to count.
+    """
+    parts = kbd._fingerprint_parts(kbd._process_fingerprint(os.getpid()))
+    assert parts is not None, "this host's fingerprint carries no boot reference to contradict"
+    witness, start, reference = parts
+    assert reference is not None and start > 0
+    return f"{witness}|{reference}|{start - 5_000}"
+
+
+def _witness_dead_running(conn, *, claim_expires=None) -> str:
+    """A ``running`` row whose pid is ALIVE and whose recorded identity is a stranger's."""
+    return _claimed_running(
+        conn, pid=os.getpid(), started_at=_witness_dead_fingerprint(), claim_expires=claim_expires,
+    )
+
+
 def _claimed_running(conn, *, pid, started_at, claim_expires=None) -> str:
     """A ``running`` card claimed by a host-local worker whose pid/fingerprint we control."""
     tid = kb.create_task(conn, title="job", assignee="worker")
@@ -480,9 +502,10 @@ def test_witness_symbol_presence_reads_the_executing_module():
 
 def test_a_synthetic_tick_that_would_close_three_runs_writes_nothing_and_alerts(board):
     conn = board
-    fingerprint = _comparable_fingerprint()
-    dead = _dead_pid()
-    ids = [_claimed_running(conn, pid=dead, started_at=fingerprint) for _ in range(3)]
+    # The deaths are WITNESS-derived (an occupied pid whose recorded identity is a stranger's):
+    # that is the class the valve exists for. A kernel-proven (ESRCH) death is the other class and
+    # is released spaced -- see the evidence-class section below.
+    ids = [_witness_dead_running(conn) for _ in range(3)]
     before = {tid: _run_rows(conn, tid) for tid in ids}
 
     crashed = kbd.detect_crashed_workers(conn)
@@ -492,7 +515,7 @@ def test_a_synthetic_tick_that_would_close_three_runs_writes_nothing_and_alerts(
     for tid in ids:
         row = _task_row(conn, tid)
         assert row["status"] == "running", f"{tid} was released by a refused sweep"
-        assert row["worker_pid"] == dead
+        assert row["worker_pid"] == os.getpid()
         assert row["claim_lock"] is not None
         assert _run_rows(conn, tid) == before[tid], f"{tid}'s run was ended by a refused sweep"
     assert kbd.detect_crashed_workers._last_auto_blocked == []
@@ -533,7 +556,7 @@ def test_the_alert_is_idempotent_inside_the_hour_bucket(board, monkeypatch):
     fingerprint = _comparable_fingerprint()
     dead = _dead_pid()
     for _ in range(3):
-        _claimed_running(conn, pid=dead, started_at=fingerprint)
+        _witness_dead_running(conn)
 
     kbd.detect_crashed_workers(conn)
     first = kbd.detect_crashed_workers._last_crash_sweep_abort
@@ -840,12 +863,12 @@ def test_a_held_sweep_alerts_without_claiming_a_refusal(board):
 def test_the_reclaim_reports_the_refusal_on_the_dispatch_result(board, monkeypatch):
     """The tick itself carries the refusal, so a caller never has to read the log."""
     conn = board
-    fingerprint = _comparable_fingerprint()
-    dead = _dead_pid()
+    # The refusal is a WITNESS verdict: the pids below are occupied, the recorded identities are
+    # strangers'. A kernel-proven (ESRCH) sweep is released spaced instead -- see the section below.
     # A claim that has NOT expired, so the sweep reaches the crash path instead of the TTL reclaim.
     future = int(time.time()) + 3600
     for _ in range(3):
-        _claimed_running(conn, pid=dead, started_at=fingerprint, claim_expires=future)
+        _witness_dead_running(conn, claim_expires=future)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
     result = kbd._dispatch_once_locked(conn, ttl_seconds=None, stale_timeout_seconds=0)
@@ -926,3 +949,141 @@ def test_the_tick_alerts_when_the_deployed_generation_moves(
     assert any(
         reason.startswith("witness-bytes-lost:") for reason in result.identity_generation_alerts
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# The EVIDENCE CLASS (ruling t_b7a434a3): the valve bounds the WITNESS leg, not the backlog
+#
+# ``count`` was a backlog: every kernel-proven (ESRCH/zombie) death it counted stayed ``running``
+# because the refusal wrote nothing, so the next tick counted the same rows and the valve could
+# never reopen (measured: 36,307 ``crash_sweep_aborted`` events on board ``platform``). Only a
+# verdict a broken witness can INVENT is counted now; a death the process table proves is released
+# spaced at ``threshold - 1`` per tick, which is the only act that decays the count.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_kernel_proven_closures_are_never_counted_and_release_at_threshold_minus_one():
+    closures = [_closure(f"k{i}", kind="unknown", kernel_absent=True) for i in range(4)]
+    assessment = guard.assess_sweep(closures, write_shape="epoch-cs/2", threshold=3, now=1)
+    assert assessment.verdict.count == 0, "the process table's verdict is not witness-derived"
+    assert assessment.verdict.abort is False
+    assert assessment.releasable == ("k0", "k1")
+    assert assessment.spaced_deferred == ("k2", "k3")
+
+
+def test_the_spaced_release_is_ordered_by_claim_expiry_then_task_id():
+    closures = [
+        _closure("b", kind="unknown", kernel_absent=True, claim_expires=200),
+        _closure("a", kind="unknown", kernel_absent=True, claim_expires=100),
+        _closure("c", kind="unknown", kernel_absent=True, claim_expires=100),
+        _closure("d", kind="unknown", kernel_absent=True, claim_expires=300),
+    ]
+    assessment = guard.assess_sweep(closures, write_shape="epoch-cs/2", threshold=3, now=1)
+    assert assessment.releasable == ("a", "c"), "oldest expiry first, then task_id"
+    assert assessment.spaced_deferred == ("b", "d")
+
+
+def test_a_disabled_threshold_names_no_spaced_release():
+    """``< 2`` keeps its meaning: everything writes, so there is nothing to space."""
+    closures = [_closure(f"k{i}", kind="unknown", kernel_absent=True) for i in range(4)]
+    assessment = guard.assess_sweep(closures, threshold=0, now=1)
+    assert assessment.verdict.abort is False
+    assert assessment.releasable == ()
+    assert assessment.spaced_deferred == ()
+
+
+def test_a_mixed_sweep_counts_only_the_witness_leg_and_still_releases_the_kernel():
+    kernel = [_closure(f"k{i}", kind="unknown", kernel_absent=True) for i in range(2)]
+    witness = [_closure(f"w{i}", kind="unknown") for i in range(3)]
+    assessment = guard.assess_sweep(kernel + witness, write_shape="epoch-cs/2", threshold=3, now=1)
+    assert assessment.verdict.abort is True
+    assert assessment.verdict.count == 3
+    assert assessment.verdict.task_ids == ("w0", "w1", "w2")
+    assert assessment.releasable == ("k0", "k1")
+
+
+def test_the_refusal_text_names_what_was_released_and_what_was_deferred():
+    kernel = [_closure(f"k{i}", kind="unknown", kernel_absent=True) for i in range(4)]
+    witness = [_closure(f"w{i}", kind="unknown") for i in range(3)]
+    assessment = guard.assess_sweep(kernel + witness, write_shape="epoch-cs/2", threshold=3, now=1)
+    text = "\n".join(guard.refusal_lines(assessment))
+    assert "released `k0`, `k1`" in text
+    assert "`k2`" in text and "`k3`" in text
+    assert "NOTHING was written" not in text, "the card must not deny a write it just made"
+
+
+def test_a_kernel_absent_row_is_still_held_on_an_incomparable_shape():
+    """R6 is untouched: the evidence class narrows the COUNT, never the identity hold."""
+    closure = _closure("k", kind="unknown", shape="boot-witness/4", kernel_absent=True)
+    assessment = guard.assess_sweep([closure], write_shape="epoch-cs/2", threshold=3, now=1)
+    assert assessment.held == ("k",)
+    assert assessment.releasable == ()
+    assert assessment.spaced_deferred == ()
+
+
+def test_four_kernel_proven_rows_drain_in_two_ticks(board):
+    conn = board
+    dead = _dead_pid()
+    fingerprint = _comparable_fingerprint()
+    ids = [_claimed_running(conn, pid=dead, started_at=fingerprint) for _ in range(4)]
+
+    first = kbd.detect_crashed_workers(conn)
+    assert len(first) == 2, "at most threshold - 1 kernel-proven rows per tick"
+    assert kbd.detect_crashed_workers._last_crash_sweep_abort is None, "no witness leg, no refusal"
+
+    second = kbd.detect_crashed_workers(conn)
+    assert len(second) == 2
+    assert kbd.detect_crashed_workers._last_crash_sweep_abort is None
+
+    for tid in ids:
+        row = _task_row(conn, tid)
+        assert row["status"] != "running", f"{tid} was left frozen by the valve"
+        assert row["worker_pid"] is None
+        assert row["claim_lock"] is None
+        assert _run_rows(conn, tid)[-1]["ended_at"] is not None
+
+
+def test_a_mixed_tick_refuses_the_witness_leg_and_releases_the_kernel_proven_rows(board):
+    conn = board
+    dead = _dead_pid()
+    fingerprint = _comparable_fingerprint()
+    kernel = [
+        _claimed_running(conn, pid=dead, started_at=fingerprint) for _ in range(2)
+    ]
+    witness = [_witness_dead_running(conn) for _ in range(3)]
+
+    crashed = kbd.detect_crashed_workers(conn)
+
+    abort = kbd.detect_crashed_workers._last_crash_sweep_abort
+    assert abort is not None, "the witness leg must still refuse the sweep"
+    assert abort.count == 3
+    assert sorted(abort.task_ids) == sorted(witness)
+    # ... and the kernel-proven rows were released by the SAME tick, exactly as a normal pass.
+    assert sorted(crashed) == sorted(kernel)
+    for tid in kernel:
+        assert _task_row(conn, tid)["status"] != "running"
+        assert _event_count(conn, tid, guard.MASS_CRASH_ABORT_EVENT) == 0
+    for tid in witness:
+        row = _task_row(conn, tid)
+        assert row["status"] == "running", "a witness-leg row is never written"
+        assert row["worker_pid"] == os.getpid()
+        assert _event_count(conn, tid, guard.MASS_CRASH_ABORT_EVENT) == 1
+
+
+def test_the_actor_card_names_the_released_rows_on_a_refusal(board):
+    conn = board
+    dead = _dead_pid()
+    fingerprint = _comparable_fingerprint()
+    kernel = [_claimed_running(conn, pid=dead, started_at=fingerprint) for _ in range(2)]
+    for _ in range(3):
+        _witness_dead_running(conn)
+
+    kbd.detect_crashed_workers(conn)
+
+    actor = conn.execute(
+        "SELECT body FROM tasks WHERE idempotency_key LIKE 'mass-crash%REFUSED%'",
+    ).fetchone()
+    assert actor is not None
+    for tid in kernel:
+        assert tid in actor["body"], "the card must name what the refusal DID release"
+

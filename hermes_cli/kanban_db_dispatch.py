@@ -3243,6 +3243,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                     rate_limited=dead.rate_limited,
                     substrate_import=dead.substrate_import,
                     admission_unsettled=dead.admission_unsettled,
+                    kernel_absent=(_pid_liveness(pid) == WORKER_DEAD),
+                    claim_expires=_kb._row_get(row, "claim_expires"),
                     claim_lock=row["claim_lock"],
                 )
                 for row, pid, dead, _ in pending
@@ -3250,20 +3252,26 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             write_shape=write_shape,
         )
         sweep.assessment = assessment
-        if assessment.refusal_needed:
-            # REFUSE the whole write. Nothing above wrote; nothing below runs -- not the R1/R2
-            # holds, not one booking.
-            return sweep
-        for event_kind, reason, task_id, claim_lock, extra in withheld:
-            _hold_claim_in_txn(
-                conn, task_id, claim_lock, now,
-                event_kind=event_kind, reason=reason, extra=extra,
-            )
+        # THE ONLY ROWS THAT MAY BOOK. A refusal writes nothing else -- not the witness-leg rows,
+        # not the R1/R2 holds -- but it MUST book the kernel-proven subset: that is the only act
+        # which decays the backlog the count is built from, so a refusal that booked nothing could
+        # never reopen. The subset is already cap-bounded and deterministically ordered.
+        bookable = frozenset(assessment.releasable) if assessment.refusal_needed else None
+        if not assessment.refusal_needed:
+            for event_kind, reason, task_id, claim_lock, extra in withheld:
+                _hold_claim_in_txn(
+                    conn, task_id, claim_lock, now,
+                    event_kind=event_kind, reason=reason, extra=extra,
+                )
         held = frozenset(assessment.held)
+        deferred = frozenset(assessment.spaced_deferred)
         # PASS 2 -- book the survivors. A held row gets NO write: its claim stays, and the loud
-        # path has already reported the shape divergence.
+        # path has already reported the shape divergence. A kernel-proven row the spacing cap
+        # deferred is the same no-write: it is released on a later tick.
         for row, pid, dead, retry_status in pending:
-            if row["id"] in held:
+            if row["id"] in held or row["id"] in deferred:
+                continue
+            if bookable is not None and row["id"] not in bookable:
                 continue
             dead.event_payload["retry_status"] = retry_status
             # The attempt is RECORDED, not discarded: an exit code alone says
@@ -3465,9 +3473,11 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     detect_crashed_workers._last_crash_sweep_held = (  # type: ignore[attr-defined]
         list(sweep.assessment.held) if sweep.assessment is not None else []
     )
-    if sweep.assessment is not None and sweep.assessment.refusal_needed:
-        # The sweep refused itself: NOTHING was closed, so the returned list is empty and the
-        # crash accounting below must not run.
+    if (sweep.assessment is not None and sweep.assessment.refusal_needed
+            and not sweep.crash_details):
+        # The refusal closed NOTHING (the kernel-proven subset was empty): the returned list is
+        # empty and the crash accounting below must not run. When that subset was NON-empty those
+        # runs really were closed, so they fall through to the ordinary accounting and hooks.
         detect_crashed_workers._last_auto_blocked = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_rate_limited = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_storage_locked = []  # type: ignore[attr-defined]
