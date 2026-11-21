@@ -349,6 +349,21 @@ def unseen_events_for_sub(
     return max_id, out
 
 
+def latest_event(conn: sqlite3.Connection, *, task_id: str, kind: str) -> Optional[Event]:
+    """The newest single event of ``kind`` for a card, or ``None``.
+
+    The notifier uses this to name a finished card's outcome when the completing
+    event is not in the claimed batch: the notice then speaks about the ONE
+    instant the card reached its terminal state instead of composing a union of
+    whatever kinds the batch happened to hold (t_2a1e7afe).
+    """
+    row = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    return _kb.Event.from_row(row) if row is not None else None
+
+
 def claim_unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
