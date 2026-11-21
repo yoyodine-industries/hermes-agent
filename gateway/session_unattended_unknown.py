@@ -26,6 +26,14 @@ def is_unattended(row) -> bool:
     if principal == CRON_PRINCIPAL_ID or principal.startswith('automation:'):
         return True
     payload = row.get('payload') or {}
+    # A FINITE turn is a one-shot execution with no interactive continuation: ``admit_finite``
+    # refuses ``unattended`` unless ``finite`` is true, and the finite runner is the one-shot/API/
+    # automation path. This is the marker that is always present on a pass nobody can resend, and
+    # requiring the caller to ALSO set ``unattended`` made the release edge unreachable: a measured
+    # population of lost one-shot passes carried ``finite`` alone, so this returned False for every
+    # one of them, the boot and drain edges skipped them, and each session's FIFO stayed paused.
+    if payload.get('finite') is True:
+        return True
     native = payload.get('native_text_v1') or {}
     # A webhook delivery: the provider already got its 202 and nobody can be asked to resend it.
     # A Kanban card attempt (#134889 KB-8): the dispatcher's marker, committed only by
