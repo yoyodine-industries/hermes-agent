@@ -68,7 +68,11 @@ def _terminal_refusal(command: str, cwd: str) -> str:
             command, env=None, env_type="local", cwd=cwd, workdir=None, session_key=SESSION_KEY,
         )
     payload = json.loads(rejected.value.result_json)
-    assert payload["exit_code"] == 1
+    # A guard refusal is exit 78 + the marker (card t_a487ff8f), never a code a real
+    # command could return: "the command never ran", not "the command failed".
+    assert payload["exit_code"] == 78
+    assert payload["guard_refused"] is True
+    assert payload["error"].startswith("YOD-GUARD-REFUSED:")
     assert payload["status"] == "blocked"
     return payload["error"]
 
