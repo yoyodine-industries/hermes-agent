@@ -47,7 +47,7 @@ def _lift_pause(job_id, pause):
     if (job is not None and job.get('state') == 'paused'
             and (job.get('paused_at'), job.get('paused_reason')) == (pause['paused_at'], pause['reason'])):
         try:
-            resume_job(job_id)
+            resume_job(job_id, door="receipt")
         except ValueError:  # a one-shot whose instant has passed stays paused for the operator
             pass
 

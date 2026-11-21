@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone, UTC
@@ -649,10 +650,15 @@ class TestPauseResumeJob:
         with pytest.raises(ValueError, match="in the past"):
             resume_job("test-resume-past")
 
-    def test_resume_keeps_slot_that_elapsed_while_paused_due(self, tmp_cron_dir, monkeypatch):
-        """A recurring job paused before its slot and resumed after it comes back with that slot
-        still due — the due scan then fires it (late/catch-up) or logs the skip. Re-anchoring
-        from now consumed the occurrence with no run, no ledger row and no log line (#113603)."""
+    def test_resume_re_derives_a_slot_that_elapsed_while_paused(self, tmp_cron_dir, monkeypatch):
+        """A recurring job paused before its slot and resumed after it comes back onto the NEXT
+        occurrence of its OWN expression, never the elapsed instant (card t-dd76635fb1).
+
+        This supersedes the kept-due rule from #113603: re-arming the elapsed instant made the
+        departure prove the operator's hand rather than the schedule — a job due 15.5h ago fired at
+        whatever minute it was resumed. The pair carried -> derived is recorded on every resume and
+        a slot more than one interval stale is a NAMED finding (see test_cron_resume_rederive.py).
+        """
         now = datetime(2026, 9, 16, 17, 0, 0, tzinfo=UTC)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
         job = create_job(prompt="daily pipeline", schedule="30 1 * * *", deliver="local")
@@ -666,8 +672,24 @@ class TestPauseResumeJob:
         assert job["id"] not in {j["id"] for j in get_due_jobs()}
         assert get_job(job["id"])["next_run_at"] == slot
 
-        assert resume_job(job["id"])["next_run_at"] == slot
-        assert job["id"] in {j["id"] for j in get_due_jobs()}
+        resumed = resume_job(job["id"])
+        assert resumed["next_run_at"] != slot
+        assert datetime.fromisoformat(resumed["next_run_at"]) == datetime(
+            2026, 9, 17, 1, 30, 0, tzinfo=UTC)
+        # not due at the resume minute: a catch-up is a decision, never an accident of the clock
+        assert job["id"] not in {j["id"] for j in get_due_jobs()}
+        # 15.5h late against a DAILY cadence is inside one interval, so the re-derivation is not a
+        # finding — only a slot more than one interval stale is (test_cron_resume_rederive.py).
+        assert not resumed.get("resume_stale")
+        # ...but the pair is still recorded: carried quoted beside derived
+        from cron.jobs import _current_cron_store
+        rows = [json.loads(line) for line in
+                (_current_cron_store().cron_dir / "cron_resumes.jsonl").read_text().splitlines()
+                if line.strip()]
+        assert rows[-1]["job_id"] == job["id"]
+        assert rows[-1]["carried_next_run_at"] == slot
+        assert rows[-1]["derived_next_run_at"] == resumed["next_run_at"]
+        assert rows[-1]["stale"] is False
 
     def test_resume_recomputes_future_or_missing_slot_from_now(self, tmp_cron_dir, monkeypatch):
         """Control: a paused job whose stored slot is still ahead, or created ``--paused`` with no

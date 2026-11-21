@@ -1029,7 +1029,7 @@ _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
     "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
-    "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
+    "resume": lambda job, a: _job_state_result(resume_job(job["id"], door="tool")),
     "cancel": _action_cancel,
 }
 

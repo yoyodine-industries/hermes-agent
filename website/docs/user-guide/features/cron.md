@@ -304,7 +304,7 @@ hermes cron tick
 What they do:
 
 - `pause` — keep the job but stop scheduling it
-- `resume` — re-enable the job. A recurring job whose slot came due while it was paused keeps that slot due, so the next tick fires one catch-up run (or logs the skip when `cron.catch_up_missed: false`) instead of silently jumping to the next occurrence; otherwise the next future run is computed
+- `resume` — re-enable the job and **re-derive its next run from the job's own schedule**, in the same operation. A job paused across one of its slots therefore resumes at the next occurrence of its expression, never at the minute you resumed it: a catch-up is a decision, not an accident of the clock. The pair *carried → derived* is logged for every resume, and a stored instant more than one interval behind the resume is reported as a named finding on the first tick after it rather than corrected silently (one-shots still refuse once past their grace window)
 - `run` — trigger the job on the next scheduler tick. A manual run is an extra fire: the scheduled run still happens and the `repeat` count is not spent, so test-firing an `in 30m` reminder keeps the real one (a run once the slot is already due is that scheduled run)
 - `cancel` — stop the job's **current** run (see [Stopping a run in flight](#stopping-a-run-in-flight))
 - `remove` — delete it entirely
@@ -376,8 +376,8 @@ Omit `--paused` to retain normal enabled creation. `--paused-reason` requires
 
 The same `paused` boolean and optional `paused_reason` string are accepted by
 `cron.jobs.create_job`, the cron management tool's `create` action, the gateway
-`POST /api/jobs`, and the dashboard `POST /api/cron/jobs`. Resume schedules the next
-future run. Pausing prevents automatic fires, not operator overrides: existing
+`POST /api/jobs`, and the dashboard `POST /api/cron/jobs`. Resume re-derives the slot from the job's own
+schedule and schedules its next future occurrence (see `resume` above). Pausing prevents automatic fires, not operator overrides: existing
 explicit **Run now** / force-run behavior remains available and can resume and run
 the job. It is not a security boundary against an operator who can run jobs.
 
