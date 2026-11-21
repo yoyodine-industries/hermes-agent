@@ -113,13 +113,50 @@ def _row(row):
     return result
 
 
+def _release_stale_in_flight(conn, epoch) -> int:
+    """Abandon every in-flight row an EARLIER epoch owned, in the caller's transaction.
+
+    One rule, two callers, deliberately: the epoch bump and the boot sweep must not be able to
+    disagree about what a stale epoch means. A row whose owner epoch is gone can never be settled
+    by anyone, so leaving it ``started``/``unknown`` would make the target refuse every future
+    claim for ever (``unknown_execution``) with the message behind it stranded. A stale-epoch turn
+    that produced no completion is terminal-abandoned.
+
+    Returns the number of admissions released.
+    """
+    from hermes_state_runtime_workers import retire_stale_children
+    retire_stale_children(conn, epoch)
+    conn.execute("UPDATE worker_executions SET status='terminal' WHERE status='unknown' AND owner_epoch!=?", (epoch,))
+    # A steer handed to a lost claim may or may not have reached its agent: never replayed.
+    conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE status='terminal' AND outcome=? "
+                 "AND owner_epoch!=?", (STEERING, epoch))
+    stale = conn.execute("SELECT admission_id,target_session_id FROM session_admissions "
+                         "WHERE status IN ('started','unknown') AND owner_epoch!=?", (epoch,)).fetchall()
+    for row in stale:
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome='interrupted' "
+                     "WHERE admission_id=? AND owner_epoch!=? AND status IN ('started','unknown')",
+                     (row['admission_id'], epoch))
+    for session_id in {row['target_session_id'] for row in stale}:
+        conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (session_id,))
+    return len(stale)
+
+
 def begin_runtime_epoch(db, *, instance_id: str) -> int:
-    """Caller MUST hold the profile ownership lock, not merely an endpoint ticket."""
+    """Caller MUST hold the profile ownership lock, not merely an endpoint ticket.
+
+    THE BUMP IS THE EVENT. Rows the previous epoch left in flight are released in the SAME
+    transaction as the increment, so no code path can bump the epoch and return with a claim
+    still latched behind it waiting for a sweep that may never run (the dashboard's offline epoch
+    is one such path). The later boot sweep then finds nothing to do, which is the point: it
+    reconciles, it is not the release edge.
+    """
     _text(instance_id)
     def write(conn):
         conn.execute('''INSERT INTO runtime_epoch(singleton,epoch,instance_id) VALUES(1,1,?)
             ON CONFLICT(singleton) DO UPDATE SET epoch=runtime_epoch.epoch+1, instance_id=excluded.instance_id''', (instance_id,))
-        return conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()[0]
+        epoch = conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()[0]
+        _release_stale_in_flight(conn, epoch)
+        return epoch
     return db._execute_write(write)
 
 
@@ -536,30 +573,14 @@ def retarget_local_automation(db, *, epoch: int, session_id: str, principal_id: 
 def recover_session_inputs(db, *, epoch: int) -> int:
     """Never replay started work. Live worker adoption is a separate explicit operation.
 
-    THE LATCH IS RELEASED HERE, IN THE SAME SWEEP THAT USED TO CREATE IT. A row whose owner
-    epoch is gone can never be settled by anyone, so leaving it ``unknown`` made the target refuse
-    every future claim for ever (``unknown_execution``) with the message behind it stranded. The
-    rule is deterministic and needs no timeout: a stale-epoch turn that produced no completion is
-    terminal-abandoned. Rows of the CURRENT epoch that are ``unknown`` (an owner that captured a
-    result and died before settling) are untouched - those are the owner's to resolve.
+    THE LATCH IS RELEASED AT THE BUMP, NOT HERE. ``begin_runtime_epoch`` releases the rows its
+    own increment made stale in the same transaction, so this sweep is the reconciler: it runs
+    again at boot to catch anything a bump did not own (an imported store, a row written by a
+    path that never bumps) and it returns 0 when the bump already did the work.
     """
     def write(conn):
         _epoch(conn, epoch)
-        from hermes_state_runtime_workers import retire_stale_children
-        retire_stale_children(conn, epoch)
-        conn.execute("UPDATE worker_executions SET status='terminal' WHERE status='unknown' AND owner_epoch!=?", (epoch,))
-        # A steer handed to a lost claim may or may not have reached its agent: never replayed.
-        conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE status='terminal' AND outcome=? "
-                     "AND owner_epoch!=?", (STEERING, epoch))
-        stale = conn.execute("SELECT admission_id,target_session_id FROM session_admissions "
-                             "WHERE status IN ('started','unknown') AND owner_epoch!=?", (epoch,)).fetchall()
-        for row in stale:
-            conn.execute("UPDATE session_admissions SET status='terminal',outcome='interrupted' "
-                         "WHERE admission_id=? AND owner_epoch!=? AND status IN ('started','unknown')",
-                         (row['admission_id'], epoch))
-        for session_id in {row['target_session_id'] for row in stale}:
-            conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (session_id,))
-        return len(stale)
+        return _release_stale_in_flight(conn, epoch)
     return db._execute_write(write)
 
 

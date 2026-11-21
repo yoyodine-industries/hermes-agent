@@ -46,7 +46,8 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         db = SessionDB(db_path=tmp_path / 'state.db')
         new_epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
         assert new_epoch > epoch
-        assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
+        # The bump released the stale claim in its own transaction; the sweep is a no-op.
+        assert rt.get_session_admission(db, admission_id=second['admission_id'])['status'] == 'terminal'
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 0
         abandoned = rt.get_session_admission(db, admission_id=second['admission_id'])
         assert abandoned['status'] == 'terminal' and abandoned['outcome'] == 'interrupted', \
@@ -121,5 +122,35 @@ def test_a_stale_epoch_unknown_row_never_latches_the_target(tmp_path):
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
         assert rt.get_session_admission(db, admission_id=head['admission_id'])['status'] == 'terminal'
         assert rt.claim_session_input(db, epoch=new_epoch, session_id='s')['admission_id'] == queued['admission_id']
+    finally:
+        db.close()
+
+
+def test_the_epoch_bump_itself_releases_the_latch(tmp_path):
+    """Clause 7: the bump is the event that reconciles, not a sweep that may never run.
+
+    The reload path bumps the epoch and then relies on a separate sweep to release the rows it
+    just made stale. Any bump that returns without that sweep (the dashboard's offline epoch is
+    one) leaves an in-flight claim latched, and the message behind it is unclaimable for ever.
+    """
+    db = store(tmp_path)
+    import hermes_state_runtime as rt
+    try:
+        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        head = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                                      request_id='dead', payload={'text': 'dead turn'})
+        queued = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                                        request_id='behind', payload={'text': 'stranded'})
+        assert rt.claim_session_input(db, epoch=epoch, session_id='s')['admission_id'] == head['admission_id']
+        # The bump and NOTHING ELSE: no recover_session_inputs call in this test.
+        new_epoch = rt.begin_runtime_epoch(db, instance_id='reload')
+        assert new_epoch > epoch
+        abandoned = rt.get_session_admission(db, admission_id=head['admission_id'])
+        assert (abandoned['status'], abandoned['outcome']) == ('terminal', 'interrupted'), \
+            'the bump must abandon its own in-flight rows in the same transaction'
+        assert rt.claim_session_input(db, epoch=new_epoch, session_id='s')['admission_id'] == queued['admission_id'], \
+            'a queued row behind a bumped claim is claimable without waiting for a sweep'
+        # The later sweep is a no-op, not the release edge.
+        assert rt.recover_session_inputs(db, epoch=new_epoch) == 0
     finally:
         db.close()
