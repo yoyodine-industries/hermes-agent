@@ -154,3 +154,90 @@ def test_the_epoch_bump_itself_releases_the_latch(tmp_path):
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 0
     finally:
         db.close()
+
+
+def test_a_queued_row_behind_a_live_unknown_is_a_finding_that_acts(tmp_path):
+    """Clause 8: the strand is DETECTED and a deterministic card is RAISED to the owning lane.
+
+    Nothing in the claim path reports a queued row that can never be claimed -- that is why nine
+    latched targets survived until a census looked. The census counts the target, and the alert
+    files exactly one idempotency-keyed card per latch (re-observation returns the same key), so a
+    sustained latch can never flood the board and a new latch gets its own row.
+    """
+    db = store(tmp_path)
+    import hermes_state_runtime as rt
+    try:
+        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        head = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                                      request_id='dead', payload={'text': 'dead turn'})
+        stranded = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                                          request_id='behind', payload={'text': 'stranded'})
+        assert rt.claim_session_input(db, epoch=epoch, session_id='s')['admission_id'] == head['admission_id']
+        # A CURRENT-epoch unknown: the sweep must not release it (a person may resend), so the
+        # queued row behind it is unclaimable until that person acts. That is the finding.
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET status='unknown',outcome=NULL WHERE admission_id=?",
+            (head['admission_id'],)))
+        with pytest.raises(rt.RuntimeStoreError):
+            rt.claim_session_input(db, epoch=epoch, session_id='s')
+
+        census = rt.admission_strand_census(db)
+        assert census['epoch'] == epoch
+        assert census['read_at'], 'the census must timestamp itself: a count with no instant cannot be re-measured'
+        assert census['stranded'] == 1
+        latched = census['targets']['s']
+        assert [row['seq'] for row in latched['unknown']] == [head['seq']]
+        assert [row['seq'] for row in latched['queued']] == [stranded['seq']]
+
+        keys, cards = [], {}
+
+        def create(**kw):
+            # The board's own idempotency: one row per key, and a repeat returns IT.
+            keys.append(kw['idempotency_key'])
+            return cards.setdefault(kw['idempotency_key'], f"card-{len(cards) + 1}")
+
+        first = rt.admission_strand_alert(db, create=create, board='platform', assignee='platform-stl')
+        assert first['card_id'] == 'card-1' and first['filed'] is True
+        assert str(head['seq']) in keys[0] and 's' in keys[0], keys[0]
+        assert 'read_at' in first['body'] and f"| `s` | {head['seq']} |" in first['body']
+        # Re-observed latch: SAME key, so the board returns the same row instead of a second one.
+        second = rt.admission_strand_alert(db, create=create)
+        assert keys[0] == keys[1], 'one card per latch: the key must be stable while the latch stands'
+        assert second['card_id'] == first['card_id'] and len(cards) == 1, 'one card, not two'
+
+        # Cleared latch: nothing to file, and no card id invented.
+        live = rt.get_session_admission(db, admission_id=head['admission_id'])
+        rt.resolve_unknown_session_input(db, epoch=epoch, admission_id=head['admission_id'],
+                                         generation=live['generation'])
+        cleared = rt.admission_strand_alert(db, create=create)
+        assert cleared['card_id'] is None and cleared['stranded'] == 0
+        assert len(keys) == 2
+    finally:
+        db.close()
+
+
+def test_the_strand_alert_never_raises_on_the_board_account(tmp_path):
+    """A board outage must not turn the boot sweep into an outage; the census still reports."""
+    db = store(tmp_path)
+    import hermes_state_runtime as rt
+    try:
+        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        head = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                                      request_id='dead', payload={'text': 'dead turn'})
+        rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                               request_id='behind', payload={'text': 'stranded'})
+        rt.claim_session_input(db, epoch=epoch, session_id='s')
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET status='unknown',outcome=NULL WHERE admission_id=?",
+            (head['admission_id'],)))
+
+        def create(**kw):
+            raise RuntimeError('board unreachable')
+
+        lines = []
+        result = rt.admission_strand_alert(db, create=create, log_fn=lambda *a, **k: lines.append((a, k)))
+        assert result['card_id'] is None and result['stranded'] == 1
+        assert result['error'] and 'board unreachable' in result['error']
+        assert lines, 'the evaluation must leave one log line either way'
+    finally:
+        db.close()

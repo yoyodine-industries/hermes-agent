@@ -4,6 +4,8 @@ No execution, transport, or authority objects live here. Every mutation uses the
 SessionDB transaction owner, including its inode guard and SQLite retry policy.
 """
 import json
+import logging
+import os
 import uuid
 from typing import NamedTuple, Optional
 
@@ -582,6 +584,160 @@ def recover_session_inputs(db, *, epoch: int) -> int:
         _epoch(conn, epoch)
         return _release_stale_in_flight(conn, epoch)
     return db._execute_write(write)
+
+
+# --------------------------------------------------------------------------
+# the admission strand: the finding that ACTS (clause 8)
+# --------------------------------------------------------------------------
+#: The board and the lane a stranded admission is filed on. Deterministic routing: a target that
+#: can never be claimed again is a runtime defect, so the card goes to the platform design owner
+#: whose repair it is -- never to the lane whose conversation happens to be latched, which cannot
+#: fix a claim predicate. Both are env-overridable for a host that names them differently.
+ADMISSION_STRAND_BOARD = os.environ.get('HERMES_ADMISSION_STRAND_BOARD', 'platform')
+ADMISSION_STRAND_ASSIGNEE = os.environ.get('HERMES_ADMISSION_STRAND_ASSIGNEE', 'platform-stl')
+#: A non-profile producer origin, so the card's provenance names the SWEEP, not a lane.
+ADMISSION_STRAND_CREATED_BY = 'state-runtime-sweep'
+ADMISSION_STRAND_IDEMPOTENCY_PREFIX = 'admission-strand:'
+ADMISSION_STRAND_TITLE = ('[state-runtime] a queued admission sits behind an unknown row and can '
+                          'never be claimed')
+_log = logging.getLogger(__name__)
+
+
+def admission_strand_census(db) -> dict:
+    """Per target, the ``unknown`` rows that still refuse it and the ``queued`` rows behind them.
+
+    READ ONLY, and timestamped: a count with no instant cannot be re-measured. ``stranded`` is the
+    number of queued rows whose ``seq`` is after the target's first ``unknown`` row -- ``seq`` is the
+    only ordering this table has (``session_admissions`` carries no timestamp), so it is the only
+    evidence a row is behind another. A target with ``unknown`` rows and no queued row behind them is
+    reported as latched-with-nothing-behind: the door is dead, no message is stranded today.
+    """
+    from datetime import datetime, timezone
+    with db._read_ctx() as conn:
+        row = conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()
+        epoch = row[0] if row else None
+        unknown = conn.execute(
+            "SELECT seq,target_session_id,owner_epoch,admission_id FROM session_admissions "
+            "WHERE status='unknown' ORDER BY seq").fetchall()
+        queued = conn.execute(
+            "SELECT seq,target_session_id FROM session_admissions WHERE status='queued' "
+            "ORDER BY seq").fetchall()
+    targets: dict = {}
+    for entry in unknown:
+        targets.setdefault(entry['target_session_id'], {'unknown': [], 'queued': [], 'stranded': 0}
+                           )['unknown'].append({'seq': entry['seq'], 'owner_epoch': entry['owner_epoch'],
+                                                'admission_id': entry['admission_id']})
+    for entry in queued:
+        data = targets.get(entry['target_session_id'])
+        if data is not None:
+            data['queued'].append({'seq': entry['seq']})
+    total = 0
+    for data in targets.values():
+        first_unknown = min(row['seq'] for row in data['unknown'])
+        data['stranded'] = sum(1 for row in data['queued'] if row['seq'] > first_unknown)
+        total += data['stranded']
+    return {
+        'db_path': str(getattr(db, 'db_path', '')),
+        'epoch': epoch,
+        'read_at': datetime.now(timezone.utc).isoformat(),
+        'targets': targets,
+        'latched_targets': len(targets),
+        'stranded': total,
+    }
+
+
+def admission_strand_key(census: dict) -> str:
+    """The incident key: stable while THIS latch stands, new for a different one.
+
+    Derived from the epoch and the (target, unknown seq) pairs only -- no clock, no ledger, so two
+    evaluations of the same latch produce the same key and the board returns the same row.
+    """
+    parts = [f"{target}:{','.join(str(row['seq']) for row in data['unknown'])}"
+             for target, data in sorted(census['targets'].items())]
+    return f"{ADMISSION_STRAND_IDEMPOTENCY_PREFIX}{census.get('epoch')}:" + '|'.join(parts)
+
+
+def admission_strand_body(census: dict, *, key: str) -> str:
+    """Every number a reader needs to act, and the edge that clears it -- no other tooling."""
+    lines = [
+        '## Observed -- a queued admission can never be claimed',
+        '',
+        'A target session holds an `unknown` admission. :func:`claim_session_input` refuses the whole',
+        'target with `unknown_execution`, so the `queued` rows behind it are unclaimable until that',
+        '`unknown` row is settled. Nothing in the claim path reports this: the sender simply gets no',
+        'delivery, which is the silent-failure class this host rules out.',
+        '',
+        f"- store: `{census['db_path']}`",
+        f"- runtime epoch: {census['epoch']} (read_at {census['read_at']})",
+        f"- latched targets: {census['latched_targets']}",
+        f"- stranded queued rows: {census['stranded']}",
+        '',
+        '| target session | unknown seq | owner epoch | queued seqs behind it |',
+        '|---|---|---|---|',
+    ]
+    for target, data in sorted(census['targets'].items()):
+        unknown = ', '.join(str(row['seq']) for row in data['unknown'])
+        owner = ', '.join(str(row['owner_epoch']) for row in data['unknown'])
+        behind = ', '.join(str(row['seq']) for row in data['queued']) or '(none)'
+        lines.append(f"| `{target}` | {unknown} | {owner} | {behind} |")
+    lines += [
+        '',
+        '### What clears it',
+        '',
+        '- an `unknown` row whose owner epoch is STALE is abandoned by the next epoch bump or boot',
+        '  sweep (`_release_stale_in_flight`), and the row behind it becomes claimable in the same pass;',
+        '- an `unknown` row owned by the CURRENT epoch is a person\'s turn with no known outcome: it is',
+        '  settled by `settle_session_input` (completed) or `resolve_unknown_session_input` (discard),',
+        '  never by the sweep, because replaying it would duplicate the work.',
+        '',
+        'This card is filed by the state runtime sweep itself, deterministically: no model is',
+        'consulted and no backlog is silently tolerated. The key below is one row per LATCH.',
+        '',
+        f'- idempotency key: `{key}`',
+    ]
+    return '\n'.join(lines)
+
+
+def _create_card(*, title: str, body: str, assignee: str, board: str, idempotency_key: str) -> str:
+    """The ONE seam the tests stub: the fork's own board API."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing(board=board) as conn:
+        return str(kb.create_task(conn, title=title, body=body, assignee=assignee,
+                                  created_by=ADMISSION_STRAND_CREATED_BY,
+                                  idempotency_key=idempotency_key) or '')
+
+
+def admission_strand_alert(db, *, board: str | None = None, assignee: str | None = None,
+                           create=None, log_fn=None, census: dict | None = None) -> dict:
+    """One evaluation: the census, ONE log line, and -- on a latch -- ONE keyed card.
+
+    Never raises on the board's account: a board outage must not turn the boot sweep into an
+    outage, and the log line is emitted either way. Returns the census plus ``card_id`` / ``filed``
+    / ``error`` / ``body``.
+    """
+    log = log_fn or (lambda event, record=None, **fields: _log.info('%s %s', event, fields))
+    board = board or ADMISSION_STRAND_BOARD
+    assignee = assignee or ADMISSION_STRAND_ASSIGNEE
+    census = admission_strand_census(db) if census is None else census
+    card_id, filed, error, body = None, False, None, None
+    if census['latched_targets']:
+        key = admission_strand_key(census)
+        body = admission_strand_body(census, key=key)
+        try:
+            card_id = str((create or _create_card)(
+                title=ADMISSION_STRAND_TITLE, body=body, assignee=assignee,
+                board=board, idempotency_key=key) or '') or None
+            filed = card_id is not None
+        except Exception as exc:
+            error = f'{exc.__class__.__name__}: {exc}'
+            _log.warning('admission strand alert could not be filed: %s', error)
+    log('admission_strand', None, latched=census['latched_targets'],
+        stranded=census['stranded'], epoch=census['epoch'], read_at=census['read_at'],
+        card=card_id or '-')
+    return dict(census, card_id=card_id, filed=filed, error=error, body=body,
+                board=board, assignee=assignee)
 
 
 def mutation_receipt_key(principal_id, session_id, request_id, *, operation, payload, expected_revision,
