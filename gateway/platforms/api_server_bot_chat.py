@@ -86,6 +86,23 @@ def _refusal(authority, tip, exc):
         logger.warning('Peer DM into Bot Chat %s refused: %s (not_found: field=%s detail=%s)',
                        tip['id'], reason, exc.field, exc.detail)
         return reason, f"Bot Chat admission refused: {reason} (this profile's 'Bot Chat' is not a local chat; {hint})"
+    if reason == 'queue_full':
+        # THE SENDER'S HALF: the settled row keeps ``limit_class``/``limit`` (t-37b8e0c562 a), but
+        # the sentence the remote sender READS was the bare reason, so it named neither the budget
+        # that fired nor that resending is safe. The cap is read BEFORE the queued insert: nothing
+        # was admitted, so "do not resend" (the label for an admission that may have happened)
+        # would be false here.
+        from hermes_state_runtime import ADMISSION_RETRY_AFTER_SECONDS
+        klass = str(getattr(exc, 'field', '') or '') or 'lane'
+        cap = getattr(exc, 'limit', None)
+        wait = getattr(exc, 'retry_after', None)
+        if not isinstance(wait, (int, float)) or wait <= 0:
+            wait = ADMISSION_RETRY_AFTER_SECONDS
+        logger.warning('Peer DM into Bot Chat %s refused: queue_full (class=%s cap=%s)',
+                       tip['id'], klass, cap)
+        budget = f'the {klass} cap' + (f' of {int(cap)}' if isinstance(cap, int) else '')
+        return reason, (f'Bot Chat admission refused: queue_full (nothing was admitted - {budget} '
+                        f'is full); safe to resend in {float(wait):.0f}s')
     return reason, f'Bot Chat admission refused: {reason}'
 
 
