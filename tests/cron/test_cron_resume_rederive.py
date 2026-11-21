@@ -184,3 +184,120 @@ def test_a_quarter_hour_job_resumed_ten_and_a_half_hours_late_lands_on_the_next_
         assert finding['derived_next_run_at'] == resumed['next_run_at']
         assert finding['cadence_seconds'] == 900.0
         assert finding['intervals_late'] > 40                  # 10.5h is 42 quarter-hours
+
+
+def test_a_failed_append_is_not_a_report_and_keeps_the_finding_reportable(tmp_path, monkeypatch):
+    """Review §1: a telemetry write that failed must not consume the de-dup key.
+
+    The old order added the key BEFORE the append, so one IO error silenced the finding for the
+    life of the process — the instrument reporting its own write instead of the event. Here the
+    append fails once, nothing is stamped, and the next tick reports the SAME finding exactly once.
+    """
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = _paused_job_at(tmp_path, _stale_slot(3.0))
+        resumed = jobs.resume_job(job['id'])
+        assert resumed is not None and resumed['resume_stale']['stale'] is True
+
+        real = jobs._append_telemetry_record
+
+        def _fail_stale_only(filename, entry, recent):
+            if filename == 'cron_resume_stale.jsonl':
+                return False                      # a failed write, exactly as the real one reports
+            return real(filename, entry, recent)
+
+        monkeypatch.setattr(jobs, '_append_telemetry_record', _fail_stale_only)
+        jobs.report_resume_stale(resumed)
+        assert _telemetry('cron_resume_stale.jsonl') == []
+        # nothing consumed THIS finding: no key for it in the process, no stamp on the record
+        assert (job['id'], resumed['resume_stale']['resumed_at']) not in jobs._resume_stale_reported
+        on_record = jobs.get_job(job['id'])
+        assert on_record is not None and 'reported_at' not in (on_record.get('resume_stale') or {})
+
+        monkeypatch.setattr(jobs, '_append_telemetry_record', real)
+        jobs.report_resume_stale(jobs.get_job(job['id']))
+        jobs.report_resume_stale(jobs.get_job(job['id']))
+        rows = _telemetry('cron_resume_stale.jsonl')
+        assert len(rows) == 1, rows              # one report, not zero and not two
+        stamped = jobs.get_job(job['id'])['resume_stale']
+        assert stamped.get('reported_at') == rows[0]['observed_at']
+
+
+def test_the_RECORD_is_the_authority_for_de_dup_not_the_process(tmp_path):
+    """Review §2: a gateway restart must not re-warn a resume that was already reported.
+
+    The set is per-process and cleared past 512 keys; the persisted ``reported_at`` stamp is what
+    makes "already reported" survive a restart, a second caller, and a long-lived install.
+    """
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = _paused_job_at(tmp_path, _stale_slot(3.0))
+        resumed = jobs.resume_job(job['id'])
+        assert resumed is not None
+
+        jobs.report_resume_stale(resumed)
+        assert len(_telemetry('cron_resume_stale.jsonl')) == 1
+
+        # A NEW PROCESS: the in-memory set is gone, the record is re-read from the store.
+        jobs._resume_stale_reported.clear()
+        for _ in range(3):
+            jobs.report_resume_stale(jobs.get_job(job['id']))
+        assert len(_telemetry('cron_resume_stale.jsonl')) == 1
+        assert jobs.get_job(job['id'])['resume_stale'].get('reported_at')
+
+
+def test_an_UNMEASURED_lateness_is_a_row_not_a_finding(tmp_path, monkeypatch):
+    """Review §3: with croniter missing, "nothing to report" must not read as "measured fresh".
+
+    The no-page rule stands — an unmeasurable lateness is not a finding — but the row must say
+    ``measured: false, cadence_seconds: null, reason: cadence_unknown`` so a reader can tell it
+    apart from a resume measured inside one interval.
+    """
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = _paused_job_at(tmp_path, _stale_slot(3.0))
+        monkeypatch.setattr(jobs, '_schedule_cadence_seconds', lambda schedule: None)
+
+        resumed = jobs.resume_job(job['id'])
+        assert resumed is not None
+        assert not resumed.get('resume_stale')          # no page for an unmeasurable lateness
+        rows = _telemetry('cron_resumes.jsonl')
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['measured'] is False
+        assert row['cadence_seconds'] is None
+        assert row['intervals_late'] is None
+        assert row['reason'] == 'cadence_unknown'
+        assert row['stale'] is False
+        assert row['late_seconds'] > 2 * HOUR           # the lateness WAS read, just not scaled
+        assert _telemetry('cron_resume_stale.jsonl') == []
+
+
+def test_every_pair_row_names_the_DOOR_that_resumed(tmp_path):
+    """Review §4: four callers reach resume_job, so the receipt must say which one did it."""
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        for door in ('cli', 'tool', 'gateway', 'receipt'):
+            job = _paused_job_at(tmp_path, (jobs._hermes_now() + timedelta(minutes=5)).isoformat())
+            jobs.resume_job(job['id'], door=door)
+        doors = [row['door'] for row in _telemetry('cron_resumes.jsonl')]
+        assert doors == ['cli', 'tool', 'gateway', 'receipt'], doors
+
+        # the default is the CLI door, so an un-updated caller is legible rather than nameless
+        job = _paused_job_at(tmp_path, (jobs._hermes_now() + timedelta(minutes=5)).isoformat())
+        jobs.resume_job(job['id'])
+        assert _telemetry('cron_resumes.jsonl')[-1]['door'] == 'cli'
+
+
+def test_the_resume_pair_file_is_bounded(tmp_path, monkeypatch):
+    """Review §7: every resume appends a row, so the file rotates instead of growing forever."""
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        path = jobs._current_cron_store().cron_dir / 'cron_resumes.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('\n'.join(json.dumps({'job_id': 'old-%d' % i, 'door': 'cli'})
+                                  for i in range(5)) + '\n')
+        monkeypatch.setattr(jobs, '_RESUME_PAIR_MAX_LINES', 4)
+
+        job = _paused_job_at(tmp_path, (jobs._hermes_now() + timedelta(minutes=5)).isoformat())
+        jobs.resume_job(job['id'])
+
+        rows = _telemetry('cron_resumes.jsonl')
+        assert len(rows) <= 4, len(rows)
+        assert rows[-1]['job_id'] == job['id']          # the NEWEST row survives the rotation
+        assert not path.with_suffix('.jsonl.tmp').exists()

@@ -778,7 +778,7 @@ def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
     try:
         job = (
             rearm_oneshot(ns.job, _hermes_now().isoformat() if ns.run_now else ns.at)
-            if ns.at or ns.run_now else resume_job(ns.job))
+            if ns.at or ns.run_now else resume_job(ns.job, door="cli"))
     except (AmbiguousJobReference, ValueError) as exc:
         raise ConsoleCommandError(str(exc)) from exc
     if not job:

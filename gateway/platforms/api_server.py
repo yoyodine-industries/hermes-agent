@@ -4220,8 +4220,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return await self._job_lookup_or_mutate(request, _cron_pause, notify=True)
 
     async def _handle_resume_job(self, request: web.Request) -> web.Response:
-        """POST /api/jobs/{job_id}/resume — resume a paused cron job."""
-        return await self._job_lookup_or_mutate(request, _cron_resume, notify=True)
+        """POST /api/jobs/{job_id}/resume — resume a paused cron job.
+
+        The door is named in the receipt (``cron_resumes.jsonl``) so a resume typed at the API is
+        distinguishable from one the CLI, the tool, or a verified-receipt lift performed.
+        """
+        return await self._job_lookup_or_mutate(
+            request, lambda job_id: _cron_resume(job_id, door="gateway"), notify=True)
 
     async def _handle_run_job(self, request: web.Request) -> web.Response:
         """POST /api/jobs/{job_id}/run — trigger immediate execution."""

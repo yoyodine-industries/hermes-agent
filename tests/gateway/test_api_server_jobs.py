@@ -326,7 +326,9 @@ class TestResumeJob:
                 data = await resp.json()
                 assert data["job"] == resumed_job
                 assert data["job"]["enabled"] is True
-                mock_resume.assert_called_once_with(VALID_JOB_ID)
+                # the door is named on every resume, so an API resume is distinguishable
+                # from a CLI / tool / verified-receipt lift in the receipt (t-dd76635fb1).
+                mock_resume.assert_called_once_with(VALID_JOB_ID, door="gateway")
 
 
 # ---------------------------------------------------------------------------

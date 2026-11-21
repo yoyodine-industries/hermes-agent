@@ -220,6 +220,15 @@ dropped silently. The mechanics, in the order the due scan applies them
    first tick after it (`cron/cron_resume_stale.jsonl`, once per resume) instead
    of correcting silently. One-shots recompute from `run_at` and refuse past
    their grace window.
+   Every `cron_resumes.jsonl` row names the **`door`** that resumed (`cli`,
+   `tool`, `gateway`, `receipt` for a verified-receipt lift) and carries
+   `measured` + `reason`: `cadence_seconds: null, measured: false,
+   reason: "cadence_unknown"` is a lateness that could NOT be scaled (croniter
+   missing) and is never written as `stale: false`, which would read as measured
+   fresh. The stale finding's de-dup key is the persisted `reported_at` stamp on
+   the record, set only after its row lands, so a gateway restart does not
+   re-warn a resume already reported and a failed write is retried rather than
+   consumed. The file keeps its newest half past 5,000 rows.
 
 The same store fields drive every topology: a standalone `hermes -p X gateway
 run` and a profile served by the host gateway (`_start_multiplex` ticks each

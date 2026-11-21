@@ -1067,12 +1067,14 @@ def _schedule_cadence_seconds(schedule: dict[str, Any]) -> Optional[float]:
     return result
 
 
-def _append_telemetry_record(filename: str, entry: dict[str, Any], recent: list) -> None:
+def _append_telemetry_record(filename: str, entry: dict[str, Any], recent: list) -> bool:
     """Record ``entry`` in the bounded ``recent`` list and append to ``<cron_dir>/<filename>``
-    (best effort — telemetry must never break a tick). Counters stay module-level ints per
-    metric because tests reset them by name."""
-    recent.append(entry)
-    del recent[:-_TELEMETRY_RECENT_HISTORY]
+    (best effort — telemetry must never break a tick). Returns whether the LINE LANDED.
+
+    The return value exists because a caller that needs the row as its report must not consume a
+    de-dup key for a write that failed: "best effort" means the TICK is never broken, not that the
+    caller may not know. Counters stay module-level ints per metric because tests reset them by name.
+    """
     try:
         path = _current_cron_store().cron_dir / filename
         _ensure_cron_dir(path.parent)
@@ -1080,6 +1082,10 @@ def _append_telemetry_record(filename: str, entry: dict[str, Any], recent: list)
             fh.write(json.dumps(entry) + "\n")
     except Exception as exc:
         logger.debug("Could not append %s record: %s", filename, exc)
+        return False
+    recent.append(entry)
+    del recent[:-_TELEMETRY_RECENT_HISTORY]
+    return True
 
 
 def _record_persisted_error_recovery(job: dict[str, Any], previous_next_run: str) -> None:
@@ -2373,83 +2379,149 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, A
     })
 
 
+def _resume_measurement(job: dict[str, Any], carried: Optional[str],
+                        derived: Optional[str], now: datetime) -> dict[str, Any]:
+    """How far out of date the carried slot was at the resume — MEASURED, UNMEASURED, or N/A.
+
+    A resume re-derives the slot (card t-dd76635fb1), so a job paused for hours no longer fires at
+    the operator's minute — but the re-anchoring must not be SILENT either: how far out of date the
+    stored instant was is the only evidence of how long the pause really lasted, and a silent
+    correction destroys it.
+
+    THE UNMEASURED CASE IS ITS OWN STATE (review, t-dd76635fb1 §3). With croniter missing the
+    cadence cannot be computed, and writing ``stale: false`` there is indistinguishable from a
+    resume measured to be inside one interval — "nothing to report" and "nothing could be
+    measured" would share a row. So every row carries ``measured`` and a ``reason``, and the
+    unmeasured row states ``cadence_seconds: null, measured: false, cadence_unknown``. The
+    no-page rule still holds: an unmeasurable lateness is not a FINDING, only an unmeasured row.
+    """
+    measurement: dict[str, Any] = {
+        "carried_next_run_at": carried,
+        "derived_next_run_at": derived,
+        "resumed_at": now.isoformat(),
+        "late_seconds": None,
+        "cadence_seconds": None,
+        "intervals_late": None,
+        "measured": False,
+        "stale": False,
+        "reason": None,
+    }
+    if job["schedule"].get("kind") not in {"cron", "interval"}:
+        measurement["reason"] = "not_a_cadence_schedule"   # a one-shot keeps its own grace rule
+        return measurement
+    if not carried:
+        measurement["reason"] = "no_carried_slot"
+        return measurement
+    carried_dt = _parse_aware(carried)
+    if carried_dt is None:
+        measurement["reason"] = "carried_unparseable"
+        return measurement
+    if not _instant_at_or_before(carried_dt, now):
+        measurement["reason"] = "carried_in_future"
+        return measurement
+    late = (now - carried_dt).total_seconds()
+    measurement["late_seconds"] = round(late, 1)
+    cadence = _schedule_cadence_seconds(job["schedule"])
+    if not cadence:
+        measurement["reason"] = "cadence_unknown"          # croniter missing: NOT "fresh"
+        return measurement
+    measurement.update({
+        "measured": True,
+        "cadence_seconds": cadence,
+        "intervals_late": round(late / cadence, 2),
+        # One interval is expected to elapse while paused (the job was paused across it); MORE
+        # than one means the stored instant stopped describing this job's cadence.
+        "stale": late > cadence,
+        "reason": "stale" if late > cadence else "within_one_interval",
+    })
+    return measurement
+
+
 def _resume_stale_finding(job: dict[str, Any], carried: Optional[str],
                           derived: Optional[str], now: datetime) -> Optional[dict[str, Any]]:
     """The NAMED finding for a resume whose carried slot is more than one interval stale.
 
-    A resume re-derives the slot (card t-dd76635fb1), so a job paused for hours no longer fires
-    at the operator's minute — but the re-anchoring must not be SILENT either: how far out of
-    date the stored instant was is the only evidence of how long the pause really lasted, and a
-    silent correction destroys it. One interval is the threshold because a slot is expected to
-    elapse while paused (the job was paused across it); MORE than one means the stored instant
-    no longer describes this job's cadence at all.
-
-    Returns None when there is nothing to report: no carried slot, a future one, a one-shot (whose
-    own grace rule governs), or an unknown cadence (croniter missing) — an unmeasurable lateness
-    is not a finding, or every resume on a box without croniter would page someone.
+    A thin view over :func:`_resume_measurement`: the finding exists only when the lateness was
+    MEASURED and exceeded one interval. An unmeasured lateness (croniter missing) is a row, never
+    a finding — every resume on a box without croniter would page someone — and a measured-fresh
+    resume is a row with ``reason: within_one_interval``.
     """
-    if job["schedule"].get("kind") not in {"cron", "interval"} or not carried:
-        return None
-    carried_dt = _parse_aware(carried)
-    if carried_dt is None or not _instant_at_or_before(carried_dt, now):
-        return None
-    cadence = _schedule_cadence_seconds(job["schedule"])
-    late = (now - carried_dt).total_seconds()
-    if not cadence or late <= cadence:
-        return None
-    return {
-        "carried_next_run_at": carried,
-        "derived_next_run_at": derived,
-        "resumed_at": now.isoformat(),
-        "late_seconds": round(late, 1),
-        "cadence_seconds": cadence,
-        "intervals_late": round(late / cadence, 2) if cadence else None,
-    }
+    measurement = _resume_measurement(job, carried, derived, now)
+    return measurement if measurement.get("stale") else None
 
 
-def _record_resume_pair(job: dict[str, Any], carried: Optional[str],
-                        derived: Optional[str], finding: Optional[dict[str, Any]]) -> None:
+#: How many resume rows stay in the file before it is rotated. Every resume appends a row, and a
+#: resume is not rare, so this file grows for the life of the install; keep the newest half.
+_RESUME_PAIR_MAX_LINES = 5_000
+
+
+def _rotate_resume_pairs(path: Any) -> None:
+    """Keep the newest half of ``cron_resumes.jsonl`` once it passes the cap (best effort)."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) <= _RESUME_PAIR_MAX_LINES:
+            return
+        keep = lines[-(_RESUME_PAIR_MAX_LINES // 2):]
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as exc:                      # retention must never break a resume
+        logger.debug("Could not rotate %s: %s", path, exc)
+
+
+def _record_resume_pair(job: dict[str, Any], measurement: dict[str, Any], door: str) -> None:
     """Append the ``carried -> derived`` pair for one resume, stale or not.
 
     Recorded on EVERY resume, because the pair is the receipt for clause (a) and a reader cannot
     reconstruct it afterwards: the stored instant is overwritten by the very operation being
-    accounted for. ``stale`` marks the row that also raised a finding.
+    accounted for. The row carries the DOOR that resumed (four callers reach ``resume_job``, and a
+    receipt-path resume must be legible as one) and the measurement, including the unmeasured case.
     """
     entry = {
         "job_id": job.get("id"),
         "name": job.get("name") or job.get("id"),
-        "carried_next_run_at": carried,
-        "derived_next_run_at": derived,
-        "resumed_at": _hermes_now().isoformat(),
-        "stale": bool(finding),
+        "door": door,
     }
-    if finding:
-        entry.update({k: finding[k] for k in ("late_seconds", "cadence_seconds", "intervals_late")})
-    try:
-        _append_telemetry_record("cron_resumes.jsonl", entry, [])
-    except Exception as exc:                      # telemetry must never break a resume
-        logger.debug("Could not record cron resume pair: %s", exc)
+    entry.update(measurement)
+    if _append_telemetry_record("cron_resumes.jsonl", entry, []):
+        try:
+            _rotate_resume_pairs(_current_cron_store().cron_dir / "cron_resumes.jsonl")
+        except Exception:                          # retention is never allowed to break a resume
+            pass
+    return
 
 
 def report_resume_stale(job: dict[str, Any], now: Optional[datetime] = None) -> None:
     """Raise the resume finding ONCE, on the first tick after the job was resumed.
 
-    Clause (c) of card t-dd76635fb1: the re-derivation happens at resume, but the reader who
-    needs to know is the operator watching the SCHEDULE, and the tick is where a schedule is
-    read. De-duplicated per (job, resume instant) in memory, so a job cannot page every tick for
-    one stale resume; the persisted stamp stays on the record for a later reader, and the
-    telemetry row keeps the measurement.
+    Clause (c) of card t-dd76635fb1: the re-derivation happens at resume, but the reader who needs
+    to know is the operator watching the SCHEDULE, and the tick is where a schedule is read.
+
+    THE RECORD IS THE AUTHORITY (review §2). De-dup used to live in a per-process set that cleared
+    past 512 keys, so a gateway restart re-warned a resume already reported, a gateway and a CLI
+    caller each reported the same resume, and after 512 findings every prior key was forgotten.
+    The persisted stamp on the record now carries ``reported_at``, set only after the row LANDED;
+    the in-process set stays as an optimisation and is never the mechanism.
+
+    A WRITE THAT FAILED IS NOT A REPORT (review §1): the row is appended first and the warning,
+    the stamp and the key all follow a successful append, so a failed telemetry write leaves the
+    finding reportable on the next tick instead of consuming its own de-dup key.
     """
     finding = job.get(_RESUME_STALE_KEY)
     if not isinstance(finding, dict):
         return
+    if finding.get("reported_at"):
+        return                                     # already reported, by any process
     key = (str(job.get("id")), str(finding.get("resumed_at")))
-    if key in _resume_stale_reported:
+    if key in _resume_stale_reported:              # in-process optimisation only
         return
-    _resume_stale_reported.add(key)
-    if len(_resume_stale_reported) > 512:
-        _resume_stale_reported.clear()
-        _resume_stale_reported.add(key)
+    observed_at = (now or _hermes_now()).isoformat()
+    row = dict(finding, job_id=job.get("id"), name=job.get("name") or job.get("id"),
+               observed_at=observed_at)
+    if not _append_telemetry_record("cron_resume_stale.jsonl", row, []):
+        logger.debug("Resume-stale row for job %s did not land; it stays unreported for the next "
+                     "tick rather than being consumed here.", job.get("id"))
+        return
     logger.warning(
         "Cron job '%s' resumed %.0f MINUTES late (%s intervals of %ss): carried %s, derived %s "
         "at the resume. The stored instant was more than one interval stale, so this is a NAMED "
@@ -2458,15 +2530,18 @@ def report_resume_stale(job: dict[str, Any], now: Optional[datetime] = None) -> 
         (finding.get("late_seconds") or 0) / 60.0, finding.get("intervals_late"),
         finding.get("cadence_seconds"), finding.get("carried_next_run_at"),
         finding.get("derived_next_run_at"))
-    _append_telemetry_record("cron_resume_stale.jsonl",
-                             dict(finding, job_id=job.get("id"),
-                                  name=job.get("name") or job.get("id"),
-                                  observed_at=(now or _hermes_now()).isoformat()),
-                             [])
+    try:
+        update_job(job.get("id"), {_RESUME_STALE_KEY: dict(finding, reported_at=observed_at)})
+    except Exception as exc:                       # the row exists; a retry would duplicate it
+        logger.debug("Could not stamp reported_at on job %s: %s", job.get("id"), exc)
+    _resume_stale_reported.add(key)
+    if len(_resume_stale_reported) > 512:
+        _resume_stale_reported.clear()
+        _resume_stale_reported.add(key)
 
 
-def resume_job(job_id: str) -> Optional[dict[str, Any]]:
-    """Resume a paused job. Accepts a job ID or name.
+def resume_job(job_id: str, door: str = "cli") -> Optional[dict[str, Any]]:
+    """Resume a paused job. Accepts a job ID or name; ``door`` names the caller that did it.
 
     THE SLOT IS ALWAYS RE-DERIVED FROM THE JOB'S OWN SCHEDULE, in this operation (card
     t-dd76635fb1). A paused job used to resume carrying the instant it was paused across, so a
@@ -2478,7 +2553,7 @@ def resume_job(job_id: str) -> Optional[dict[str, Any]]:
     when someone typed `resume`. Clause (c): a carried instant more than one interval behind the
     resume is a NAMED finding on the first post-resume tick (``report_resume_stale``), so the
     re-anchoring is measured rather than silent. Clause (a): the pair carried -> derived is
-    appended to ``cron_resumes.jsonl`` for every resume.
+    appended to ``cron_resumes.jsonl`` for every resume, with the door and the measurement.
 
     One-shots keep their own rule: a `once` job whose time has passed the grace window can never
     fire and raises, because there is no expression to derive the next occurrence from.
@@ -2494,7 +2569,8 @@ def resume_job(job_id: str) -> Optional[dict[str, Any]]:
         raise ValueError(
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire.")
-    finding = _resume_stale_finding(job, carried, next_run_at, now)
+    measurement = _resume_measurement(job, carried, next_run_at, now)
+    finding = measurement if measurement.get("stale") else None
     update: dict[str, Any] = {
         "enabled": True,
         "state": "scheduled",
@@ -2507,7 +2583,7 @@ def resume_job(job_id: str) -> Optional[dict[str, Any]]:
     elif _RESUME_STALE_KEY in job:
         update[_RESUME_STALE_KEY] = None
     resumed = update_job(job["id"], update)
-    _record_resume_pair(job, carried, next_run_at, finding)
+    _record_resume_pair(job, measurement, door)
     return resumed
 
 
