@@ -49,6 +49,10 @@ async def _restarted_owner_with_unknown_head(tmp_path, monkeypatch, executed):
     follower = await first.submit(actor, Submission('follower', ref, {'text': 'FOLLOWER'}, 'queue'))
     claimed = claim_session_input(db, epoch=first.epoch, session_id='s')
     assert claimed['admission_id'] == head.admission_id
+    # The undecided fence, in the epoch that owns the claim: a settlement that could not commit
+    # leaves this shape (card t-c60889271e - the restart no longer mints `unknown`; it DECIDES).
+    db._execute_write(lambda c: c.execute(
+        "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (head.admission_id,)))
     authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner-2')
     authority.sessions['s'] = LiveSession(source, 's')
     rows = {r['admission_id']: r for r in list_session_admissions(db, session_id='s')}

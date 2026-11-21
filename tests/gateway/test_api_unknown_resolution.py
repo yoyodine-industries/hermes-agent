@@ -104,6 +104,10 @@ async def _restarted_api_runs(tmp_path, monkeypatch, *, idempotent=True):
         rows = list_session_admissions(db, session_id="api-session")
         head = claim_session_input(db, epoch=first.epoch, session_id="api-session")
         assert head["admission_id"] == rows[0]["admission_id"]
+        # The undecided fence in the owning epoch (card t-c60889271e: a restart DECIDES now, so the
+        # `unknown` a resolve has to answer comes from a settlement that could not commit).
+        db._execute_write(lambda c: c.execute(
+            "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (head["admission_id"],)))
 
         restarted = await initialize_session_authority(
             runner, profile_id="default", instance_id="api-owner-2"

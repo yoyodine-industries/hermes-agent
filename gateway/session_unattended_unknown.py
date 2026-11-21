@@ -47,6 +47,67 @@ def _unattended_unknown(rows):
     return [row for row in rows if row['status'] == 'unknown' and is_unattended(row)]
 
 
+def _decided_turns(db, epoch) -> list:
+    """The claims the epoch bump DECIDED, whose transcript boundary has not been written yet.
+
+    Card t-c60889271e: the bump now ends a lost claim in the same transaction it fences it, so the
+    rows never pass through ``unknown`` - and the boot edge below is where the transcript boundary
+    and the media release live. Without this pass a decided turn would vanish from the viewer with
+    nothing said, which is the silent failure the notice exists to prevent.
+    """
+    import json
+
+    from hermes_state_runtime import _INTERRUPTION_KEY
+    with db._read_ctx() as conn:
+        rows = conn.execute("SELECT key,value FROM state_meta WHERE key LIKE ?",
+                            (_INTERRUPTION_KEY.replace('%s', '%'),)).fetchall()
+    pending = []
+    for key, value in rows:
+        try:
+            record = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if record.get('epoch') != epoch or record.get('notified'):
+            continue
+        pending.append(key[len('session_input.interruption.v1.'):])
+    return pending
+
+
+def _close_decided_turns(db, epoch) -> int:
+    """Say, once, that a decided turn is over: the boundary a viewer shows and the media release."""
+    import json as _json
+
+    from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
+    from gateway.session_ingress_media import release_admission_media
+    from gateway.session_results import close_discarded_turn
+    from hermes_state_runtime import _INTERRUPTION_KEY, _row
+
+    closed = 0
+    for admission_id in _decided_turns(db, epoch):
+        def write(conn, admission_id=admission_id):
+            row = conn.execute('SELECT * FROM session_admissions WHERE admission_id=?',
+                               (admission_id,)).fetchone()
+            if row is None:
+                return None
+            row = _row(row)
+            # The hedged copy (`notice=None`) for a person's turn: they may still resend it, and the
+            # boundary must not claim more than we know. Automation gets the explicit notice.
+            close_discarded_turn(db, conn, row, AUTOMATION_INTERRUPTED_NOTICE if is_unattended(row) else None)
+            receipt = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                                   (_INTERRUPTION_KEY % admission_id,)).fetchone()
+            if receipt is not None:
+                record = _json.loads(receipt[0])
+                record['notified'] = True
+                conn.execute('UPDATE state_meta SET value=? WHERE key=?',
+                             (_json.dumps(record, separators=(',', ':')), _INTERRUPTION_KEY % admission_id))
+            return row
+        row = db._execute_write(write)
+        if row is not None:
+            release_admission_media(db, admission_id)
+            closed += 1
+    return closed
+
+
 def settle_recovered_unattended(db, epoch) -> int:
     """Boot recovery, right after ``recover_session_inputs`` fenced lost turns ``unknown`` and before
     any FIFO is scheduled: settle every unattended one. Synchronous; runs off the owner loop."""
@@ -54,6 +115,9 @@ def settle_recovered_unattended(db, epoch) -> int:
     from gateway.session_ingress_media import release_admission_media
     from gateway.session_results import close_discarded_turn
     from hermes_state_runtime import RuntimeStoreError, _row, resolve_unknown_session_input
+    # The bump's own decided rows first: they never pass through `unknown`, and their transcript
+    # boundary is written here (once, guarded by the receipt's `notified` flag).
+    _close_decided_turns(db, epoch)
     with db._read_ctx() as conn:
         rows = [_row(r) for r in conn.execute(
             "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq").fetchall()]

@@ -42,6 +42,43 @@ ADMITTED_REQUEST_CONFLICT = {'field': 'request_id', 'detail': 'this request id w
 #: cleared it and the epoch. The census prints it, so "settled once" is a read, not a memory.
 _RESOLUTION_KEY = 'session_input.resolution.v1.%s'
 
+#: Why a claim was refused, for a DASHBOARD to read. A refusal that exists only as an exception in
+#: a worker's stderr is the silent-failure shape (platform-worker, 2026-11-21): the lane is paused,
+#: and the only record of why is a traceback nobody collects.
+_REFUSAL_KEY = 'session_input.refusal.v1.%s'
+
+#: The provenance of an interrupted claim: which edge decided it, at which epoch, on which row.
+_INTERRUPTION_KEY = 'session_input.interruption.v1.%s'
+
+_REFUSED = object()
+
+
+def _decide_interrupted(conn, row, *, edge, epoch):
+    """End a claim its owner can no longer honour, and say so in the SAME transaction.
+
+    `unknown` is reserved for "we could not decide". A bump is a decision: the owner that claimed
+    this row is gone, so no process holds a result it could still publish, and leaving the row
+    `unknown` minted a permanent per-target refusal out of an outcome already known. The receipt
+    carries the edge, the epochs, the generation and the seq, so the census can print it.
+    """
+    conn.execute("UPDATE session_admissions SET status='terminal', outcome='interrupted' "
+                 "WHERE admission_id=? AND status IN ('started','unknown')", (row['admission_id'],))
+    conn.execute('INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)',
+                 (_INTERRUPTION_KEY % row['admission_id'],
+                  _json({'edge': edge, 'epoch': epoch, 'owner_epoch': row['owner_epoch'],
+                         'generation': row['generation'], 'seq': row['seq'],
+                         'outcome': 'interrupted'})))
+
+
+def _record_refusal(db, *, epoch, session_id, kind, admission_id, seq, detail):
+    """Write the refusal where a reader can find it, then let the caller raise."""
+    def write(conn):
+        conn.execute('INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)',
+                     (_REFUSAL_KEY % admission_id,
+                      _json({'reason': 'unknown_execution', 'field': kind, 'session_id': session_id,
+                             'seq': seq, 'detail': detail, 'epoch': epoch})))
+    return db._execute_write(write)
+
 
 def _resolution_id(admission_id: str, epoch: int, generation: int) -> str:
     """A deterministic settlement id: the same admission settles to the same id, never twice."""
@@ -298,25 +335,43 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
     ``head`` is the admission id the caller's preclaim checks validated (None: it saw nothing
     queued); if the head is another row by the time this write runs, nothing is claimed and False
     tells the caller to re-read and validate the row that is now first."""
+    refusal = {}
+
     def write(conn):
         _epoch(conn, epoch)
         if _guard is not None:
             _guard(conn)
         session = _session(conn, session_id)
-        blocked = conn.execute("SELECT seq,status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown') ORDER BY seq", (session_id,)).fetchall()
+        blocked = conn.execute("SELECT admission_id,seq,status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown') ORDER BY seq", (session_id,)).fetchall()
         stuck = next((row for row in blocked if row['status'] == 'unknown'), None)
         if stuck is not None:
             # NAME THE ROW. The drain settles an unattended unknown and retries; a refusal that
             # only says `unknown_execution` forces the reader to go and find which seq it meant,
             # and `cleared_by=none` says this one is still nobody's clearing - a person owns it.
-            raise RuntimeStoreError('unknown_execution', field='admission',
-                                    detail='seq=%s cleared_by=none' % stuck['seq'])
+            refusal.update(kind='admission', admission_id=stuck['admission_id'], seq=stuck['seq'],
+                           detail='seq=%s cleared_by=none' % stuck['seq'])
+            return _REFUSED
+        # A worker row left `unknown` by a REVOKED assignment must not outlive the decision that
+        # revoked it: the admission it belonged to is now terminal, and a refusal keyed on the
+        # worker alone would keep the lane paused for a turn already decided (card t-c60889271e,
+        # producer census 2026-11-21: the epoch bump terminalises admissions but leaves these rows).
+        stuck_worker = conn.execute(
+            "SELECT w.execution_id FROM worker_executions w "
+            "  JOIN session_admissions a ON a.target_session_id=w.session_id "
+            "                           AND a.generation=w.generation "
+            " WHERE w.session_id=? AND w.status='unknown' "
+            "   AND a.status IN ('started','unknown') LIMIT 1", (session_id,)).fetchone()
+        if stuck_worker is not None:
+            refusal.update(kind='worker', admission_id='worker:' + stuck_worker['execution_id'],
+                           seq=None, detail='execution=%s cleared_by=none' % stuck_worker['execution_id'])
+            return _REFUSED
+        if blocked:
+            return None
         from hermes_state_runtime_workers import worker_states
-        workers = worker_states(conn, session_id)
-        if 'unknown' in workers:
-            raise RuntimeStoreError('unknown_execution', field='worker',
-                                    detail='seq=- cleared_by=none')
-        if blocked or workers:
+        if worker_states(conn, session_id) - {'unknown'}:
+            # A REGISTERED or RUNNING worker still owns this session's compute. A worker left
+            # `unknown` by a revoked assignment was already refused above when its admission was
+            # still undecided; when that admission is now terminal the row is history, not a latch.
             return None
         row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' "
                            "ORDER BY " + _CLAIM_ORDER_SQL + " LIMIT 1", (session_id,)).fetchone()
@@ -335,7 +390,15 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         # tell this turn's own failed-turn boundary from an earlier turn's (#134889 GW-21).
         claimed['transcript_mark'] = conn.execute('SELECT COALESCE(MAX(id), 0) FROM messages').fetchone()[0]
         return claimed
-    return db._execute_write(write)
+    result = db._execute_write(write)
+    if result is _REFUSED:
+        # The receipt is written OUTSIDE the refused transaction (a raise inside `write` rolls it
+        # back), so the refusal survives the refusal: a dashboard reads why the lane is paused.
+        _record_refusal(db, epoch=epoch, session_id=session_id, kind=refusal['kind'],
+                        admission_id=refusal['admission_id'], seq=refusal['seq'],
+                        detail=refusal['detail'])
+        raise RuntimeStoreError('unknown_execution', field=refusal['kind'], detail=refusal['detail'])
+    return result
 
 
 def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, outcome: str,
@@ -556,7 +619,16 @@ def recover_session_inputs(db, *, epoch: int) -> int:
         # A steer handed to a lost claim may or may not have reached its agent: never replayed.
         conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE status='terminal' AND outcome=? "
                      "AND owner_epoch!=?", (STEERING, epoch))
-        return conn.execute("UPDATE session_admissions SET status='unknown' WHERE status='started' AND owner_epoch!=?", (epoch,)).rowcount
+        # THE BUMP IS A DECISION, not an undecided state: the owner that claimed these rows is
+        # gone, so no process holds a result it could still publish. Writing `unknown` here minted
+        # a permanent per-target refusal out of an outcome already known - measured 2026-11-21 at
+        # ~1 row per 35 minutes across 10 stores (platform-worker's census), each one stranding
+        # its sender's queue behind a turn nobody could resend. So the row ends, with provenance.
+        bumped = conn.execute("SELECT admission_id,seq,owner_epoch,generation FROM session_admissions "
+                              "WHERE status='started' AND owner_epoch!=?", (epoch,)).fetchall()
+        for row in bumped:
+            _decide_interrupted(conn, row, edge='epoch-bump', epoch=epoch)
+        return len(bumped)
     return db._execute_write(write)
 
 

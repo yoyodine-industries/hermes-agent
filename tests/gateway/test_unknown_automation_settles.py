@@ -128,16 +128,28 @@ async def test_unknown_automation_settles_interrupted_and_fifo_moves_on(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_a_persons_unknown_turn_still_pauses_the_fifo(tmp_path, monkeypatch):
+async def test_a_persons_lost_turn_ends_interrupted_with_a_boundary_and_the_fifo_moves_on(tmp_path, monkeypatch):
+    """CONTRACT CHANGE (card t-c60889271e, ruled by platform-stl): the bump DECIDES.
+
+    This test used to assert that a person's turn lost across a restart stayed ``unknown`` and
+    paused the FIFO until they discarded it. The bump no longer mints ``unknown``: the owner that
+    held the claim is gone, so no process can still publish its result, and the row ends
+    terminal/interrupted with provenance. The turn is still not replayed, and it is still SAID in
+    the transcript - with the hedged copy, because a person may resend it and we do not know what
+    side effects it had.
+    """
     executed = []
     store, authority, head_id, follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head)
     try:
-        assert _statuses(authority.db)[head_id] == ('unknown', None)
+        assert _statuses(authority.db)[head_id] == ('terminal', 'interrupted')
         authority._schedule(SessionRef('p', 's'))
         live = authority.sessions['s']
-        await async_wait_until(lambda: live.task is not None and live.task.done(), what='drain paused')
-        assert executed == []
-        assert _statuses(authority.db)[follower_id] == ('queued', None)
+        await async_wait_until(lambda: live.task is not None and live.task.done(), what='drain finished')
+        assert executed == ['FOLLOWER']
+        assert _statuses(authority.db)[follower_id] == ('terminal', 'completed')
+        messages = authority.db.get_messages('s')
+        boundaries = [m for m in messages if m.get('display_kind') == 'failed_turn']
+        assert boundaries, messages
     finally:
         store.close_all_db_handles()
 
@@ -180,6 +192,33 @@ async def test_automation_fenced_unknown_in_this_owner_settles_on_the_drain(tmp_
         store.close_all_db_handles()
 
 
+async def _fenced_head_in_this_owner(tmp_path, monkeypatch, executed, admit_head):
+    """A head claimed and then fenced ``unknown`` in THIS owner: the settlement-recovery shape.
+
+    It is the only ``unknown`` a current epoch can still produce (card t-c60889271e): the epoch
+    bump now DECIDES the claims whose owner is gone, so a restart can no longer manufacture the
+    state the pause/discard path exists for. Built explicitly here rather than by a restart.
+    """
+    store, runner = _runner(tmp_path, monkeypatch, executed)
+    db = store._db
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='gw10')
+    db.create_session('s', source='telegram')
+    authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner-1')
+    authority.sessions['s'] = LiveSession(source, 's')
+    ref = SessionRef('p', 's')
+    actor = AuthorityConnection(authority, Peer(), {'user_id': 'human'}).actor
+    authority._real_schedule = authority._schedule
+    authority._schedule = lambda ref: None
+    head_id = await admit_head(authority, actor, ref)
+    claimed = claim_session_input(db, epoch=authority.epoch, session_id='s')
+    assert claimed['admission_id'] == head_id
+    follower = await authority.submit(actor, Submission('follower', ref, {'text': 'FOLLOWER'}, 'queue'))
+    db.append_message('s', 'user', 'HEAD')
+    db._execute_write(lambda c: c.execute(
+        "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (head_id,)))
+    return store, authority, head_id, follower.admission_id
+
+
 @pytest.mark.asyncio
 async def test_messaging_pause_notice_names_discard_and_discard_resumes_the_fifo(tmp_path, monkeypatch):
     """Messaging: the paused notice says why and offers `/discard` in the chat; `/discard` there
@@ -187,12 +226,14 @@ async def test_messaging_pause_notice_names_discard_and_discard_resumes_the_fifo
     from gateway.session_ingress import pause_notice
     from gateway.slash_commands_session import discard_lost_turns
     executed = []
-    store, authority, head_id, _follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head)
+    store, authority, head_id, _follower_id = await _fenced_head_in_this_owner(tmp_path, monkeypatch, executed, _person_head)
     try:
         notice = pause_notice(authority, SessionRef('p', 's'), 'unknown_execution')
         assert '/discard' in notice and 'restarted' in notice, notice
         reply = await discard_lost_turns(authority, 's')
         assert '1' in reply and 'discard' in reply.lower(), reply
+        authority._schedule = authority._real_schedule
+        authority._schedule(SessionRef('p', 's'))
         live = authority.sessions['s']
         await async_wait_until(lambda: live.task is not None and live.task.done(), what='drain finished')
         assert executed == ['FOLLOWER']

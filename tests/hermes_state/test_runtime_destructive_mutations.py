@@ -18,8 +18,11 @@ def test_delete_refuses_outstanding_descendant_obligations(tmp_path, obligation)
             if obligation != 'queued':
                 rt.claim_session_input(db, epoch=epoch, session_id='child')
             if obligation == 'unknown':
-                epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
-                rt.recover_session_inputs(db, epoch=epoch)
+                # The undecided fence in the OWNING epoch (card t-c60889271e): the boot edge now
+                # decides a lost claim, so an `unknown` that can still block a delete is the
+                # settlement-recovery shape, not a restart artifact.
+                db._execute_write(lambda c: c.execute(
+                    "UPDATE session_admissions SET status='unknown' WHERE target_session_id='child'"))
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='delete',
                     expected_revision=0, expected_generation=0, operation='delete', payload={})
         before = db.get_session('child')

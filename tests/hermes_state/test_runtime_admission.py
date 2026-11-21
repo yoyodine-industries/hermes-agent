@@ -1,4 +1,5 @@
 """Transactional contracts against exclusively owned temporary profile databases."""
+import json
 import sqlite3
 
 import pytest
@@ -46,17 +47,29 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         db = SessionDB(db_path=tmp_path / 'state.db')
         new_epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
         assert new_epoch > epoch
+        # CONTRACT CHANGE (card t-c60889271e, ruled by platform-stl): a bump DECIDES. The lost
+        # claim ends terminal/interrupted with provenance in the same transaction, because the
+        # owner that held it is gone and no process can still publish its result. Before this,
+        # the bump minted `unknown` and every later claim on the session was refused - a permanent
+        # pause over an outcome already known.
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 0
-        assert rt.get_session_admission(db, admission_id=second['admission_id'])['status'] == 'unknown'
-        with pytest.raises(rt.RuntimeStoreError) as exc:
-            rt.claim_session_input(db, epoch=new_epoch, session_id='s')
-        assert exc.value.reason == 'unknown_execution'
+        lost = rt.get_session_admission(db, admission_id=second['admission_id'])
+        assert (lost['status'], lost['outcome']) == ('terminal', 'interrupted')
+        receipt = json.loads(db._conn.execute(
+            'SELECT value FROM state_meta WHERE key=?',
+            ('session_input.interruption.v1.%s' % second['admission_id'],)).fetchone()[0])
+        assert receipt['edge'] == 'epoch-bump' and receipt['seq'] == second['seq']
+        assert receipt['owner_epoch'] == epoch and receipt['outcome'] == 'interrupted'
+        # ...and the lane is free again: the queued row claims.
+        reclaimed = rt.claim_session_input(db, epoch=new_epoch, session_id='s')
+        assert reclaimed['admission_id'] == third['admission_id'] and reclaimed['status'] == 'started'
         with pytest.raises(rt.RuntimeStoreError) as exc:
             rt.settle_session_input(db, epoch=epoch, admission_id=running['admission_id'], generation=running['generation'], outcome='completed')
-        assert exc.value.reason == 'stale_epoch'
-        assert rt.cancel_session_input(db, epoch=new_epoch, admission_id=third['admission_id'])['outcome'] == 'cancelled'
-        assert [r['admission_id'] for r in rt.list_session_admissions(db, session_id='s')] == [second['admission_id']]
+        assert exc.value.reason.startswith('stale')
+        rt.settle_session_input(db, epoch=new_epoch, admission_id=third['admission_id'],
+                                generation=reclaimed['generation'], outcome='completed')
+        assert [r['admission_id'] for r in rt.list_session_admissions(db, session_id='s')] == []
         assert db._conn.execute('PRAGMA foreign_keys').fetchone()[0] == 1
         with pytest.raises(sqlite3.IntegrityError):
             db._execute_write(lambda conn: conn.execute("DELETE FROM sessions WHERE id='s'"))

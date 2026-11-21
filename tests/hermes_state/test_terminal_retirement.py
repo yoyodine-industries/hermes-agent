@@ -89,8 +89,10 @@ def test_nonterminal_obligations_prevent_any_retirement(tmp_path):
                 if status != 'queued':
                     rt.claim_session_input(db, epoch=epoch, session_id=status)
                 if status == 'unknown':
-                    epoch = rt.begin_runtime_epoch(db, instance_id='next')
-                    rt.recover_session_inputs(db, epoch=epoch)
+                    # The undecided fence in the OWNING epoch (card t-c60889271e): the boot edge
+                    # DECIDES a lost claim now, so `unknown` is the settlement-recovery shape.
+                    db._execute_write(lambda c: c.execute(
+                        "UPDATE session_admissions SET status='unknown' WHERE target_session_id=?", (status,)))
             reason = 'unknown_execution' if status == 'unknown' else 'session_busy'
             with pytest.raises(rt.RuntimeStoreError, match=reason):
                 db._execute_write(lambda c: delete_in_transaction(db, c, status, {}))

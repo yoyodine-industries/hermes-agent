@@ -217,8 +217,12 @@ def _lose_across_restart(authority, sid):
     db = authority.db
     claimed = claim_session_input(db, epoch=authority.epoch, session_id=sid)
     assert claimed and claimed['status'] == 'started'
+    # The fence, in the epoch that owns the claim (card t-c60889271e: the boot edge DECIDES a lost
+    # claim now, so the unattended-settle path is entered from an in-epoch fence rather than a bump).
+    db._execute_write(lambda c: c.execute(
+        "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (claimed['admission_id'],)))
     epoch = begin_runtime_epoch(db, instance_id='owner-2')
-    assert recover_session_inputs(db, epoch=epoch) == 1
+    assert recover_session_inputs(db, epoch=epoch) == 0
     settle_recovered_unattended(db, epoch)
     [row] = list_session_admissions(db, session_id=sid, pending_only=False)
     return row
@@ -265,7 +269,10 @@ def test_card_admitted_before_the_marker_keeps_pausing_and_retries_cleanly(kanba
             monkeypatch.setattr(authority, 'submit', real_submit)
             assert await run_task(owner.connection, owner.params) == first
             row = _lose_across_restart(authority, first['session_id'])
-            assert row['status'] == 'unknown', row
+            # CONTRACT CHANGE (card t-c60889271e): a pre-marker card used to stay `unknown` and
+            # pause its FIFO. The boot edge now DECIDES a lost claim, so the card's lost attempt
+            # ends terminal/interrupted and the next dispatch retries rather than waits.
+            assert (row['status'], row['outcome']) == ('terminal', 'interrupted'), row
         finally:
             await owner.close()
 
