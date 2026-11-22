@@ -414,7 +414,12 @@ def execute(frame, channel):
             # after execution.finish is a stale_generation write that fails the close-time flush.
             from agent.title_generator import wait_for_title_upgrades
             wait_for_title_upgrades()
-            store.flush_token_counts()
+            # A flush the owner was too busy to acknowledge inside its bounded window reports
+            # False instead of raising. The turn is complete either way: deliver the result and
+            # leave the unacknowledged entries in the outbox for a replay. Exiting here instead
+            # is what turned completed work into a ``worker_lost`` re-dispatch.
+            if not store.flush_token_counts():
+                logger.warning('turn completed with unacknowledged persistence; outbox retained for replay')
             if result.get('final_response') is None and (result.get('interrupted') or result.get('failed')):
                 result['final_response'] = ''
             channel.send('result', result=result_frame(result))

@@ -16,11 +16,54 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
 
 _worker_process = False
+
+# One worker.persist receipt, and the total patience for re-asking it.
+#
+# A missed receipt is not a lost write. The owner stores one receipt per
+# (execution, sequence, payload digest) and answers an exact replay with the stored result
+# (``apply_worker_receipt``), so re-asking the SAME request is idempotent even when the first
+# copy is still being applied. What the single 20s budget actually measures is whether the
+# owner's event loop got round to the socket at all: a stalled loop (host load, a long
+# owner-side call) misses it while the write itself commits and the ACK sits in flight.
+#
+# Before this, ONE miss made the store's failure sticky for the rest of the turn, and the
+# close-time flush turned it into ``worker_receipt_timeout``: the run died at the save step,
+# the owner recorded ``worker_lost``, and the card was re-dispatched as if nothing had run.
+# Re-asking inside a bounded window keeps that trade cheap.
+RECEIPT_BUDGET_SECONDS = 20.0
+RECEIPT_BACKOFF_SECONDS = (1.0, 3.0, 8.0, 15.0)
+# Only a method whose replay the owner dedupes may be re-asked after a missed ACK.
+_REPLAY_SAFE_METHODS = frozenset({'worker.persist'})
+# Failures that mean "the owner is busy", never "this store is broken": a flush reports these
+# as False and keeps the journal (the outbox a later reopen replays), exactly like the
+# in-process SessionDB contract ("False on timeout ... Never raises").
+_TRANSIENT_RECEIPT_FAILURES = frozenset({'worker_receipt_timeout', 'pending_receipt', 'owner_unavailable'})
+
+
+def _env_seconds(name, default):
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+RECEIPT_PATIENCE_SECONDS = _env_seconds('HERMES_WORKER_RECEIPT_PATIENCE', 75.0)
+
+
+def _receipt_is_transient(failure):
+    """True when a failure says the owner was busy, not that the store is unusable."""
+    return isinstance(failure, str) and (
+        failure in _TRANSIENT_RECEIPT_FAILURES
+        or failure.startswith(('ConnectionClosed', 'TimeoutError', 'OSError', 'ConnectionError')))
 
 
 def is_worker_process():
@@ -178,25 +221,43 @@ class WorkerRPC:
             logger.warning('synchronous_rpc_on_event_loop: %s on thread %s; caller: %s',
                            method, threading.current_thread().name, _caller_summary())
             raise WorkerPersistenceError('synchronous_rpc_on_event_loop')
-        from websockets.exceptions import ConnectionClosed
         with self.lock:
             self.request_id += 1
             request_id = self.request_id
             message = json.dumps({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
+            # Only a receipt the owner dedupes by (execution, sequence, digest) may be re-asked.
+            replay_safe = method in _REPLAY_SAFE_METHODS and isinstance(params.get('sequence'), int)
             try:
-                link = self._connection()
-                try:
-                    link.send(request_id, message)
-                except ConnectionClosed:
-                    # websockets raises this from send only before a complete frame is written (closed
-                    # on entry, or the socket write failed): the owner closed the link after the idle
-                    # check and never saw this request, so redial and send it once more.
-                    self._drop()
-                    link = self._connection()
-                    link.send(request_id, message)
-                response = link.receive(20)
+                link = self._send(self._connection(), request_id, message)
+                started = time.monotonic()
+                deadline = started + RECEIPT_PATIENCE_SECONDS
+                attempt = 0
+                while True:
+                    sent = time.monotonic()
+                    try:
+                        response = link.receive(RECEIPT_BUDGET_SECONDS)
+                        break
+                    except TimeoutError:
+                        waited = time.monotonic() - sent
+                        self._drop()
+                        backoff = RECEIPT_BACKOFF_SECONDS[min(attempt, len(RECEIPT_BACKOFF_SECONDS) - 1)]
+                        attempt += 1
+                        if not replay_safe or time.monotonic() + backoff > deadline:
+                            logger.warning(
+                                'worker_receipt_timeout after %.1fs (attempt %d, %.1fs total): the owner did '
+                                'not ACK %s; this receipt is lost, the write it names is not',
+                                waited, attempt, time.monotonic() - started, method)
+                            raise
+                        # A busy owner is waited out, then re-asked: the replay resolves the receipt
+                        # the first copy committed. Never a blind resend - only an idempotent one.
+                        logger.warning(
+                            'worker_receipt_timeout after %.1fs (attempt %d): owner busy (budget %.0fs, '
+                            'patience %.0fs); re-asking %s in %.1fs',
+                            waited, attempt, RECEIPT_BUDGET_SECONDS, RECEIPT_PATIENCE_SECONDS, method, backoff)
+                        time.sleep(backoff)
+                        link = self._send(self._connection(), request_id, message)
             except BaseException:
-                # Outcome unknown once sent: surface the error and never resend; the next call redials.
+                # Every attempt is spent: drop the link and surface the error; the next call redials.
                 self._drop()
                 raise
             if 'error' in response:
@@ -205,6 +266,21 @@ class WorkerRPC:
                 global _worker_process
                 _worker_process = True
             return response['result']
+
+    def _send(self, link, request_id, message):
+        """Send once; a link the owner closed before the frame was written is redialed once."""
+        from websockets.exceptions import ConnectionClosed
+        try:
+            link.send(request_id, message)
+            return link
+        except ConnectionClosed:
+            # websockets raises this from send only before a complete frame is written (closed
+            # on entry, or the socket write failed): the owner closed the link after the idle
+            # check and never saw this request, so redial and send it once more.
+            self._drop()
+            link = self._connection()
+            link.send(request_id, message)
+            return link
 
 
 from agent.runtime_session_compression import RuntimeSessionCompressionMixin
@@ -405,12 +481,54 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self._apply('usage.auxiliary', dict(usage, task=task))
 
     def flush_token_counts(self, timeout=5.0):
+        """Block until everything this turn wrote is acknowledged, inside a bounded window.
+
+        Same contract as the in-process store ("False on timeout ... Never raises"): a busy
+        owner is waited out with a measured backoff and then REPORTED, never raised, so a
+        completed turn is not turned into a ``worker_lost`` by a receipt that is merely late.
+        Whatever stays unacknowledged stays in the journal - the outbox a reopen or an adopt
+        replays - and ``close`` leaves it on disk intact.
+        """
         with self.lock:
-            if self.failure:
+            if self.failure or self.journal['pending']:
+                self._drain_retained_receipts(timeout)
+            if self.failure and not _receipt_is_transient(self.failure):
                 raise WorkerPersistenceError(self.failure)
-            if self.journal['pending']:
-                raise WorkerPersistenceError('pending_receipt')
+            if self.failure or self.journal['pending']:
+                logger.warning('persistence_degraded: %s (%d retained); outbox kept at %s',
+                               self.failure or 'pending_receipt', len(self.journal['pending']), self.path)
+                return False
             return True
+
+    def _drain_retained_receipts(self, timeout):
+        """Re-ask the retained journal inside ``timeout`` of measured backoff.
+
+        A receipt timeout means the owner was too busy to answer, not that the store is
+        broken: replay is idempotent, so waiting is always safe. Past the window - or on a
+        failure that is not about a busy owner - this returns False and leaves the journal
+        on disk; the caller classifies it.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        attempt = 0
+        while True:
+            if not self.journal['pending']:
+                # Nothing to replay: this failure is not a late receipt, and re-asking an empty
+                # journal would clear it (retry_pending's success path) and lose the diagnosis.
+                return False
+            attempt += 1
+            try:
+                self.retry_pending()
+            except Exception:
+                if not _receipt_is_transient(self.failure):
+                    return False
+            else:
+                if attempt > 1:
+                    logger.info('persistence_receipt_recovered after %d attempt(s)', attempt)
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.25 * 2 ** (attempt - 1), 2.0, remaining))
 
     def get_session_title(self, session_id):
         return self.get_session(session_id).get('title')
