@@ -243,6 +243,13 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
         )
     except Exception:
         pass
+    # Per-lane START evidence (claims, failed starts, live profiles). Built once
+    # per compute pass — the stranded rule must never mistake queue depth for a
+    # missing worker; a broken helper degrades to "no evidence", never a 500.
+    try:
+        diag_config["_lane_context"] = kd.build_lane_context(conn)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("lane context unavailable for kanban diagnostics: %s", exc)
     if task_ids is not None:
         rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
     else:
@@ -251,11 +258,13 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
         return {}
     row_ids = [r["id"] for r in rows]
 
-    def _rows_by_task(table: str) -> dict[str, list]:
+    def _rows_by_task(table: str, chunk: int = 500) -> dict[str, list]:
         by_task: dict[str, list] = {tid: [] for tid in row_ids}
-        for row in conn.execute(
-            f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(row_ids)}) ORDER BY id", tuple(row_ids)):
-            by_task.setdefault(row["task_id"], []).append(row)
+        for offset in range(0, len(row_ids), chunk):
+            part = row_ids[offset:offset + chunk]
+            for row in conn.execute(
+                f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(part)}) ORDER BY id", tuple(part)):
+                by_task.setdefault(row["task_id"], []).append(row)
         return by_task
 
     events_by_task = _rows_by_task("task_events")

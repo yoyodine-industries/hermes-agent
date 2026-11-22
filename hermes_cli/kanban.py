@@ -747,7 +747,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if rc:
         return rc
     graph = None
+    lane_ctx = None
     want_json = getattr(args, "json", False)
+    from hermes_cli import kanban_diagnostics as kd
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
@@ -761,6 +763,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         latest_summary = kb.latest_summary(conn, args.task_id)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
+            # Lane START evidence: stranded_in_ready triggers on a failed start or
+            # a dead lane, never on queue depth.
+            lane_ctx = kd.build_lane_context(conn)
 
     if want_json:
         _print_json({
@@ -811,10 +816,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
-    from hermes_cli import kanban_diagnostics as kd
     diags = kd.compute_task_diagnostics(
         task, events, runs, graph=graph,
-    )
+        config={"_lane_context": lane_ctx} if lane_ctx else None)
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -913,12 +917,18 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     )
 
 
-def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
-    """``{task_id: [rows ordered by id]}`` for every id (empty list when none)."""
+def _rows_by_task(conn, table: str, ids: list[str], chunk: int = 500) -> dict[str, list]:
+    """``{task_id: [rows ordered by id]}`` for every id (empty list when none).
+
+    Chunked: a fleet-wide pass over a large board blows SQLite's bound-variable
+    limit (``too many SQL variables``) if every id rides one ``IN (...)``.
+    """
     by = {i: [] for i in ids}
-    placeholders = ",".join(["?"] * len(ids))
-    for row in conn.execute(f"SELECT * FROM {table} WHERE task_id IN ({placeholders}) ORDER BY id", tuple(ids)):
-        by.setdefault(row["task_id"], []).append(row)
+    for offset in range(0, len(ids), chunk):
+        part = ids[offset:offset + chunk]
+        placeholders = ",".join(["?"] * len(part))
+        for row in conn.execute(f"SELECT * FROM {table} WHERE task_id IN ({placeholders}) ORDER BY id", tuple(part)):
+            by.setdefault(row["task_id"], []).append(row)
     return by
 
 
@@ -937,6 +947,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     fleet_mode = not getattr(args, "task", None)
     unresolved_workspaces: list[str] = []
     with kbc.connect_closing() as conn:
+        # Lane START evidence, built once for the whole board (claims, failed
+        # starts, live profiles). Depth is context; a failed start is the trigger.
+        try:
+            diag_config = {**diag_config, "_lane_context": kd.build_lane_context(conn)}
+        except Exception:  # pragma: no cover - defensive
+            pass
         if fleet_mode:
             # A path-less ``worktree`` card anchors on the board's ``default_workdir``, so the
             # workspace rule needs that value to answer for one. Best-effort: a board with no

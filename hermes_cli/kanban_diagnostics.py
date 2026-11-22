@@ -753,12 +753,226 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+# --- Lane start evidence (stranded_in_ready) --------------------------------
+#
+# Queue depth is a BACKLOG signal, never a failed-start signal. On a board that
+# is a net sink (producers outrun the drain several times over) every ready card
+# waits days, so an age-in-queue trigger reports its own arithmetic and calls it
+# "no worker". The trigger here is evidence that a START was attempted and did
+# not produce a working run: a run row with a failed-start outcome inside the
+# evidence window, an assignee with no live profile, or a lane that has claimed
+# nothing at all while the dispatcher is demonstrably running. Depth rides along
+# as context and never as the trigger.
+
+# Run outcomes that mean the start was ATTEMPTED and produced no working run.
+# ``reclaimed``/``blocked``/``review_requested`` are lifecycle outcomes of a
+# claim that DID happen, so they are not failed starts.
+FAILED_START_OUTCOMES = frozenset({"spawn_failed", "crashed", "timed_out", "gave_up", "failed"})
+
+# How far back a failed start still counts as evidence the lane is broken NOW.
+DEFAULT_START_EVIDENCE_WINDOW_SECONDS = 24 * 60 * 60
+
+# A board-wide claim inside this window proves the dispatcher is ticking.
+DEFAULT_DISPATCH_LIVENESS_SECONDS = 15 * 60
+
+# Events in which the dispatcher itself recorded that it could not start this
+# lane's work. Named in a finding so the reader gets the skip reason, not a guess.
+DISPATCH_SKIP_EVENTS = frozenset({
+    "skipped_nonspawnable", "skipped_unassigned", "skipped_per_profile_capped",
+    "spawn_failed", "dispatch_skipped", "claim_failed",
+})
+
+
+def _latest_skip_event(events, since: int):
+    """Newest dispatcher skip/raise event at or after ``since``: (ts, kind) or None."""
+    best = None
+    for event in events or []:
+        kind = str(_task_field(event, "kind", "") or "").lower()
+        ts = int(_task_field(event, "created_at", 0) or 0)
+        if kind in DISPATCH_SKIP_EVENTS and ts >= since and (best is None or ts >= best[0]):
+            best = (ts, kind)
+    return best
+
+
+def _age_str(seconds) -> str:
+    seconds = float(seconds or 0)
+    if seconds >= 86400:
+        return f"{seconds / 86400:.1f}d"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    return f"{int(seconds / 60)}m"
+
+
+def _run_outcome(run) -> str:
+    """``outcome`` (falling back to ``status``) lowercased, or ""."""
+    return str(_task_field(run, "outcome", None) or _task_field(run, "status", "") or "").lower()
+
+
+def _run_started_at(run) -> int:
+    return int(_task_field(run, "started_at", 0) or 0)
+
+
+def _latest_run(runs):
+    """The most recent run row by id (then started_at); None when there are none."""
+    best = None
+    for run in runs or []:
+        key = (int(_task_field(run, "id", 0) or 0), _run_started_at(run))
+        if best is None or key >= best[0]:
+            best = (key, run)
+    return best[1] if best else None
+
+
+def _live_profile_names(assignees: Iterable[str]) -> Optional[set[str]]:
+    """Assignees that resolve to a live (non-tombstoned) profile on this host.
+
+    Returns None when the registry cannot be read, so callers leave the profile
+    check OFF rather than flagging every lane as missing.
+    """
+    names = {a for a in assignees if a and a.strip()}
+    if not names:
+        return set()
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:  # pragma: no cover - defensive
+        return None
+    try:
+        return {name for name in names if profile_exists(name)}
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def build_lane_context(
+    conn,
+    *,
+    now: Optional[int] = None,
+    window_seconds: Optional[int] = None,
+    liveness_seconds: Optional[int] = None,
+    check_profiles: bool = True,
+    known_profiles: Optional[set[str]] = None,
+    dispatcher_running: Optional[bool] = None,
+) -> dict:
+    """Read-only per-assignee START evidence for :func:`_rule_stranded_in_ready`.
+
+    Three cheap aggregate reads over the board (tasks, task_runs), no per-card
+    queries. ``dispatcher_running`` is derived from the board-wide newest claim
+    unless the caller supplies it. ``known_profiles`` (when given) is the live
+    profile set to check assignees against; ``check_profiles=False`` skips the
+    registry entirely (tests, or a caller that has no profile root).
+    """
+    now_ts = int(now if now is not None else time.time())
+    window = int(window_seconds or DEFAULT_START_EVIDENCE_WINDOW_SECONDS)
+    liveness = int(liveness_seconds or DEFAULT_DISPATCH_LIVENESS_SECONDS)
+    since = now_ts - window
+
+    total_ready = 0
+    oldest_ready_age = None
+    depth_by_assignee: dict[str, dict] = {}
+    # Ready depth and the lane's OLDEST ready card (the one card a lane-level
+    # finding is allowed to land on, so one broken lane yields one finding).
+    for row in conn.execute(
+        "SELECT assignee, id, created_at FROM tasks WHERE status = 'ready' ORDER BY created_at ASC, id ASC"
+    ):
+        assignee = row["assignee"] or ""
+        created = int(row["created_at"] or 0)
+        total_ready += 1
+        if oldest_ready_age is None:
+            oldest_ready_age = max(0, now_ts - created)
+        lane = depth_by_assignee.get(assignee)
+        if lane is None:
+            depth_by_assignee[assignee] = {
+                "ready_depth": 1,
+                "oldest_ready_task_id": row["id"],
+                "oldest_ready_age_seconds": max(0, now_ts - created),
+            }
+        else:
+            lane["ready_depth"] += 1
+
+    last_any_row = conn.execute("SELECT MAX(started_at) FROM task_runs").fetchone()
+    last_any_start = int(last_any_row[0] or 0) if last_any_row else 0
+    if dispatcher_running is None:
+        dispatcher_running = bool(last_any_start and last_any_start >= now_ts - liveness)
+
+    failed_ph = ",".join("?" for _ in FAILED_START_OUTCOMES)
+    failed_outcomes = tuple(sorted(FAILED_START_OUTCOMES))
+    starts: dict[str, dict] = {}
+    for row in conn.execute(
+        "SELECT profile, COUNT(*) AS starts, MAX(started_at) AS last_start, "
+        f"SUM(CASE WHEN lower(COALESCE(outcome, status, '')) IN ({failed_ph}) THEN 1 ELSE 0 END) AS failed "
+        "FROM task_runs WHERE started_at >= ? GROUP BY profile",
+        (*failed_outcomes, since),
+    ):
+        profile = row["profile"] or ""
+        started = int(row["starts"] or 0)
+        failed = int(row["failed"] or 0)
+        starts[profile] = {
+            "starts": started,
+            "claims": max(0, started - failed),
+            "failed_starts": failed,
+            "last_start_at": int(row["last_start"] or 0) or None,
+            "last_failure": None,
+        }
+    # Newest failed start per lane inside the window: the reason a reader needs.
+    for row in conn.execute(
+        "SELECT task_id, profile, outcome, error, started_at FROM task_runs "
+        f"WHERE started_at >= ? AND lower(COALESCE(outcome, status, '')) IN ({failed_ph}) "
+        "ORDER BY started_at DESC",
+        (since, *failed_outcomes),
+    ):
+        lane = starts.setdefault(row["profile"] or "", {
+            "starts": 0, "claims": 0, "failed_starts": 0, "last_start_at": None, "last_failure": None,
+        })
+        if lane["last_failure"] is None:
+            lane["last_failure"] = {
+                "task_id": row["task_id"],
+                "outcome": row["outcome"] or "",
+                "error": _error_snippet(row["error"]),
+                "started_at": int(row["started_at"] or 0),
+            }
+
+    assignees = {a for a in (*depth_by_assignee.keys(), *starts.keys()) if a}
+    if known_profiles is not None:
+        existing: Optional[set[str]] = set(known_profiles)
+    else:
+        existing = _live_profile_names(assignees) if check_profiles else None
+
+    lanes: dict[str, dict] = {}
+    for assignee in assignees:
+        lane = dict(depth_by_assignee.get(assignee) or {
+            "ready_depth": 0, "oldest_ready_task_id": None, "oldest_ready_age_seconds": None,
+        })
+        lane.update(starts.get(assignee) or {
+            "starts": 0, "claims": 0, "failed_starts": 0, "last_start_at": None, "last_failure": None,
+        })
+        lane["profile_exists"] = None if existing is None else assignee in existing
+        lanes[assignee] = lane
+
+    return {
+        "now": now_ts,
+        "window_seconds": window,
+        "liveness_seconds": liveness,
+        "dispatcher_running": bool(dispatcher_running),
+        "last_any_start_at": last_any_start or None,
+        "ready_depth": total_ready,
+        "oldest_ready_age_seconds": oldest_ready_age,
+        "profile_check": existing is not None,
+        "lanes": lanes,
+    }
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
-    (default 30 min). Deliberately age-based and identity-agnostic so it
-    catches typo'd assignees, deleted profiles, and down external worker
-    pools alike without a registry to curate. Unassigned tasks are excluded —
-    the dispatcher's ``skipped_unassigned`` already covers them."""
+    """A ``ready`` card whose START was attempted and failed — or whose lane has
+    produced no claim at all while the dispatcher is known to be running.
+
+    Age in the queue is only the noise floor (``stranded_threshold_seconds``,
+    default 30 min): it says the card has been waiting long enough to be worth
+    reporting, never that a worker is missing. Depth is context. The causes this
+    rule exists for — typo'd/deleted assignees, a lane whose pool never claims —
+    are decidable from start evidence: run rows with a failed-start outcome
+    (``spawn_failed``/``crashed``/``timed_out``/``gave_up``), an assignee with no
+    live profile, and a lane with zero claims while another lane keeps claiming.
+    Unassigned tasks stay excluded — the dispatcher's ``skipped_unassigned``
+    covers them.
+    """
     threshold_seconds = float(cfg.get("stranded_threshold_seconds", 30 * 60))
     if _task_field(task, "status") != "ready":
         return []
@@ -768,10 +982,10 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     assignee = _task_field(task, "assignee") or ""
     if not assignee.strip():
         return []
+    task_id = str(_task_field(task, "id", "") or "")
 
     # Most recent event that put the task into ready; with none (old task /
-    # truncated events) fall back to created_at — over-flagging an ancient
-    # task beats missing a stranded one.
+    # truncated events) fall back to created_at.
     last_ready_ts = _latest_event_ts(events, {"created", "promoted", "reclaimed", "unblocked"})
     if last_ready_ts == 0:
         last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
@@ -781,33 +995,126 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     age_seconds = now - last_ready_ts
     if age_seconds < threshold_seconds:
         return []
+    age_str = _age_str(age_seconds)
 
-    age_str = f"{age_seconds / 3600:.1f}h" if age_seconds >= 3600 else f"{int(age_seconds / 60)}m"
-    # Escalate with age: <2x threshold warning, 2x-6x error, >6x critical.
-    if age_seconds >= threshold_seconds * 6:
-        severity = "critical"
-    elif age_seconds >= threshold_seconds * 2:
-        severity = "error"
-    else:
-        severity = "warning"
+    lane_ctx = cfg.get("_lane_context") or {}
+    window = int(lane_ctx.get("window_seconds")
+                 or cfg.get("stranded_evidence_window_seconds")
+                 or DEFAULT_START_EVIDENCE_WINDOW_SECONDS)
+    since = now - window
+    lanes = lane_ctx.get("lanes") or {}
+    lane = lanes.get(assignee)
+
+    # Depth is CONTEXT in every finding this rule emits — never the trigger.
+    depth_bit = ""
+    if lane_ctx:
+        lane_depth = lane.get("ready_depth", 0) if lane else 0
+        lane_oldest = lane.get("oldest_ready_age_seconds") if lane else None
+        board_depth = lane_ctx.get("ready_depth")
+        bits = []
+        if lane_depth:
+            bits.append(f"this lane has {lane_depth} ready card(s), oldest {_age_str(lane_oldest)}")
+        if board_depth:
+            bits.append(f"the board holds {board_depth} ready")
+        if bits:
+            depth_bit = " Depth is context, not the trigger: " + "; ".join(bits) + "."
 
     actions = [
         DiagnosticAction(kind="reassign", label="Reassign to a different worker",
                          payload={"current_assignee": assignee}),
         _cli_hint("Check dispatcher status", "hermes kanban diagnostics"),
     ]
-    return [Diagnostic(
-        kind="stranded_in_ready", severity=severity,
-        title=f"Ready for {age_str} with no worker",
-        detail=f"This task has been ready for {age_str} but nothing has claimed it. Common causes: "
-               f"assignee {assignee!r} is misspelled, the profile was deleted, or the external worker "
-               f"pool for this lane is down. Confirm the assignee is correct and that a worker is "
-               f"actually polling for it.",
-        actions=actions,
-        first_seen_at=last_ready_ts, last_seen_at=last_ready_ts, count=1,
-        data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
-              "assignee": assignee, "threshold_seconds": int(threshold_seconds)},
-    )]
+
+    # (1) THIS card's own last start failed inside the evidence window.
+    last_run = _latest_run(runs)
+    if last_run is not None:
+        started = _run_started_at(last_run)
+        outcome = _run_outcome(last_run)
+        if started >= since and outcome in FAILED_START_OUTCOMES:
+            err = _error_snippet(_task_field(last_run, "error", None))
+            repeat = sum(
+                1 for run in runs or []
+                if _run_started_at(run) >= since and _run_outcome(run) in FAILED_START_OUTCOMES
+            )
+            severity = "error" if repeat >= 2 else "warning"
+            return [Diagnostic(
+                kind="stranded_in_ready", severity=severity,
+                title=f"Ready {age_str} after a failed start ({outcome})",
+                detail=f"This card was claimed {_age_str(now - started)} ago and the start produced no "
+                       f"working run: outcome {outcome!r}"
+                       + (f", error {err!r}" if err else "") +
+                       f". It has been ready for {age_str} since. This is a failed START, not queue depth."
+                       + depth_bit,
+                actions=actions,
+                first_seen_at=started, last_seen_at=started, count=max(1, repeat),
+                data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
+                      "assignee": assignee, "threshold_seconds": int(threshold_seconds),
+                      "trigger": "failed_start", "last_start_outcome": outcome,
+                      "last_start_at": started, "board_ready_depth": lane_ctx.get("ready_depth")},
+            )]
+
+    if not lane_ctx:
+        # No evidence channel (a caller that did not build lane context): the
+        # task's own runs are all we can see, and they show nothing wrong.
+        return []
+    if lane is None:
+        return []
+
+    # Lane-level findings land on the lane's OLDEST ready card only, so a broken
+    # lane yields ONE finding instead of one per queued card.
+    if lane.get("oldest_ready_task_id") != task_id:
+        return []
+
+    # (2) The assignee names no live profile — no claim can ever happen.
+    if lane_ctx.get("profile_check") and lane.get("profile_exists") is False:
+        skip = _latest_skip_event(events, int(lane_ctx.get("last_any_start_at") or 0))
+        skip_bit = f" The dispatcher recorded `{skip[1]}` {_age_str(now - skip[0])} ago." if skip else ""
+        return [Diagnostic(
+            kind="stranded_in_ready", severity="critical",
+            title=f"Assignee {assignee!r} has no live profile",
+            detail=f"Ready for {age_str} and no worker can claim it: no live profile named "
+                   f"{assignee!r} exists on this host (deleted, renamed, or misspelled). The dispatcher "
+                   f"would report this lane as skipped.{skip_bit} Fix the assignee, or recreate the profile."
+                   + depth_bit,
+            actions=actions,
+            first_seen_at=last_ready_ts, last_seen_at=last_ready_ts, count=1,
+            data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
+                  "assignee": assignee, "threshold_seconds": int(threshold_seconds),
+                  "trigger": "profile_missing", "board_ready_depth": lane_ctx.get("ready_depth")},
+        )]
+
+    # (3) The lane claimed NOTHING in the window while the dispatcher is running.
+    if lane.get("claims", 0) <= 0 and lane_ctx.get("dispatcher_running"):
+        skip = _latest_skip_event(events, since)
+        failure = lane.get("last_failure") or {}
+        if failure:
+            reason = f"{failure.get('outcome') or 'failed'} on {failure.get('task_id')}"
+            if failure.get("error"):
+                reason += f": {failure['error']}"
+        elif lane.get("last_start_at"):
+            reason = f"no claim since {_age_str(now - int(lane['last_start_at']))} ago"
+        else:
+            reason = f"no claim in the last {_age_str(window)}"
+        if skip:
+            reason += f"; dispatcher recorded `{skip[1]}` {_age_str(now - skip[0])} ago"
+        return [Diagnostic(
+            kind="stranded_in_ready", severity="critical",
+            title=f"Lane {assignee!r} claimed nothing in {_age_str(window)}",
+            detail=f"Ready work is queued for {assignee!r} and the dispatcher is running (last claim on "
+                   f"the board {_age_str(now - int(lane_ctx.get('last_any_start_at') or now))} ago), but "
+                   f"this lane produced no claim in {_age_str(window)}: {reason}. That is a failed START "
+                   f"for the lane, not queue depth." + depth_bit,
+            actions=actions,
+            first_seen_at=last_ready_ts, last_seen_at=last_ready_ts, count=1,
+            data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
+                  "assignee": assignee, "threshold_seconds": int(threshold_seconds),
+                  "trigger": "no_claim", "reason": reason,
+                  "lane_ready_depth": lane.get("ready_depth"),
+                  "board_ready_depth": lane_ctx.get("ready_depth")},
+        )]
+
+    # (4) The lane is being served: these cards are BACKLOG. No diagnostic.
+    return []
 
 
 def _rule_stale_running(task, events, runs, now, cfg) -> list[Diagnostic]:
