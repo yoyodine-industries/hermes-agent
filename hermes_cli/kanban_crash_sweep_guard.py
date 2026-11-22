@@ -336,6 +336,13 @@ class MassCrashVerdict:
     ended_at: int
     signature: str
     task_ids: tuple[str, ...] = ()
+    released: int = 0
+    """Rows this tick RELEASED one at a time instead of counting them as deaths (settled-row
+    claim residue, plus the kernel-proven subset of a refusal). Printed BESIDE ``count`` so two
+    consecutive refusals are distinguishable: a tick that drained eight pinned cards reads
+    ``count=0 released=8``, the next, genuinely static one reads ``count=0 released=0``. Without
+    it the refusal line cannot tell "nothing changed" from "ten rows just left the board", which
+    is how one constant count got emitted 14,528 times."""
 
 
 @dataclass(frozen=True)
@@ -398,6 +405,7 @@ def assess_sweep(
     write_shape: Optional[str] = None,
     threshold: Optional[int] = None,
     now: Optional[int] = None,
+    released: int = 0,
 ) -> SweepAssessment:
     """Decide, before any write, what this sweep may not do.
 
@@ -413,6 +421,14 @@ def assess_sweep(
     spaced at ``max(0, threshold - 1)`` per tick (:attr:`SweepAssessment.releasable`), the same
     bound the operator's own override would allow. The remainder is
     :attr:`SweepAssessment.spaced_deferred`.
+
+    ``released`` is what the caller already released individually BEFORE this assessment ran --
+    settled-row claim residue (:func:`hermes_cli.kanban_db.release_settled_claims`), one row at a
+    time, on its own expiry. The reclaim leg runs BEFORE the count, so reclaimable rows are gone
+    from ``counted``: a row the system can release one at a time is not a mass death, and the guard
+    must never report the board's own occupancy back as the population it refuses to change. The
+    number rides the verdict (:attr:`MassCrashVerdict.released`) so a tick that drained rows and
+    one that changed nothing are distinguishable in the payload, beside ``count``.
     """
     effective = mass_crash_threshold() if threshold is None else int(threshold)
     ended_at = int(time.time() if now is None else now)
@@ -460,6 +476,9 @@ def assess_sweep(
             ended_at=ended_at,
             signature=sweep_signature(len(counted), ended_at),
             task_ids=tuple(counted),
+            # Beside ``count``: what this tick released one row at a time -- the caller's
+            # settled-row residue plus the kernel-proven spaced subset it is allowed to book.
+            released=int(released) + len(releasable),
         ),
         held=tuple(held),
         held_shapes=tuple(pairs),
@@ -475,7 +494,8 @@ def refusal_lines(assessment: SweepAssessment) -> list[str]:
     if verdict.abort:
         lines.append(
             f"{MASS_CRASH_SIGNATURE_PREFIX} REFUSING this reclaim sweep: {verdict.count} runs would "
-            f"close `crashed` in one tick (threshold {verdict.threshold}, ended_at {verdict.ended_at})."
+            f"close `crashed` in one tick (threshold {verdict.threshold}, ended_at {verdict.ended_at}) "
+            f"-- count={verdict.count} released={verdict.released}."
         )
         if assessment.releasable:
             # The refusal is NOT empty-handed any more: the kernel-proven subset is booked, and the
@@ -497,10 +517,19 @@ def refusal_lines(assessment: SweepAssessment) -> list[str]:
         else:
             lines.append(
                 "A sweep this size is a host-systemic signature, not N card failures -- a broken "
-                "liveness witness, not N broken cards. NOTHING was written: no run ended, no claim "
-                "released, no failure counted. Cards taken: "
+                "liveness witness, not N broken cards. NO counted row was written: no run ended, "
+                "no failure counted. Cards taken: "
                 + (", ".join(verdict.task_ids) or "(none)") + "."
             )
+            if verdict.released:
+                # The refusal is not silent-handed: the reclaim leg ran BEFORE the count, so rows
+                # it could release one at a time are already gone (settled-row residue), and the
+                # kernel-proven subset is booked spaced. Say so, beside the count.
+                lines.append(
+                    f"Released one row at a time beside it (count={verdict.count} "
+                    f"released={verdict.released}): the reclaim leg runs before the count, so "
+                    "reclaimable rows are never part of the population this guard refuses."
+                )
     if assessment.held:
         lines.append(
             f"{MASS_CRASH_SIGNATURE_PREFIX} HOLDING {len(assessment.held)} row(s) whose identity "
@@ -540,6 +569,8 @@ def refusal_body(assessment: SweepAssessment, *, board: Optional[str] = None, tr
         f"- refused: `{verdict.abort}`",
         f"- signature: `{verdict.signature}`",
         f"- counted unexplained-death closures: {verdict.count} (threshold {verdict.threshold})",
+        f"- released one row at a time this tick (settled-row residue + kernel-proven): "
+        f"{verdict.released}",
         f"- tick instant (`ended_at`): {verdict.ended_at}",
         f"- board: `{board or '(current)'}`",
         f"- tree: `{resolved_tree}`",
@@ -824,6 +855,10 @@ def record_refusal_evidence(conn: Any, verdict: MassCrashVerdict) -> None:
     payload = {
         "signature": verdict.signature,
         "count": verdict.count,
+        # BESIDE the count, never inside the signature: ``count`` alone is a constant whenever the
+        # population is static, so a reader could not tell 14,528 identical refusals from one. A
+        # tick that drained pinned rows reads released>0 while the next, static one reads 0.
+        "released": verdict.released,
         "threshold": verdict.threshold,
         "ended_at": verdict.ended_at,
     }

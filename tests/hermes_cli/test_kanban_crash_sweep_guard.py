@@ -120,7 +120,8 @@ def _claimed_running(conn, *, pid, started_at, claim_expires=None) -> str:
 
 def _task_row(conn, tid):
     return conn.execute(
-        "SELECT status, worker_pid, worker_started_at, claim_lock FROM tasks WHERE id = ?", (tid,),
+        "SELECT status, worker_pid, worker_started_at, claim_lock, claim_expires "
+        "FROM tasks WHERE id = ?", (tid,),
     ).fetchone()
 
 
@@ -1087,3 +1088,137 @@ def test_the_actor_card_names_the_released_rows_on_a_refusal(board):
     for tid in kernel:
         assert tid in actor["body"], "the card must name what the refusal DID release"
 
+
+
+# ---------------------------------------------------------------------------------------------
+# Card t_f063edae -- the count must never be the board's own stock
+#
+# Measured on board ``platform`` (2026-11-22 read): 15 rows held a claim_lock while their status
+# was NOT ``running`` (12 ``archived``, 3 ``ready``), every claim LONG expired; 36,743
+# ``crash_sweep_aborted`` events had been emitted over the same defect class, 14,528 of them with
+# the identical ``count=8``. No verb in the system could clear that residue: ``release_stale_claims``
+# and ``_reclaim_dead_workers`` are both scoped ``status='running'``, and ``_claim_and_open_run``
+# requires ``claim_lock IS NULL`` -- so a ``ready`` card carrying residue could never be claimed
+# again. The repair is a per-row release leg that does not consult the mass-crash guard, run BEFORE
+# the count.
+# ---------------------------------------------------------------------------------------------
+
+
+def _settled_with_expired_claim(conn, *, status="ready", expires_in=-3600, worker_pid=None) -> str:
+    """A card in a SETTLED status carrying an expired claim: the residue no reader could clear."""
+    tid = kb.create_task(conn, title="settled residue", assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = ?, claim_expires = ?, worker_pid = ? "
+            "WHERE id = ?",
+            (status, kb._claimer_id(), int(time.time()) + expires_in, worker_pid, tid),
+        )
+    return tid
+
+
+def test_release_settled_claims_is_scoped_to_expired_claims_on_non_running_rows(board):
+    conn = board
+    ready = _settled_with_expired_claim(conn, status="ready")
+    archived = _settled_with_expired_claim(conn, status="archived")
+    # A claim on a settled row that has NOT expired is not residue yet.
+    future = _settled_with_expired_claim(conn, status="done", expires_in=3600)
+    # A claim with no expiry at all carries no expiry fact to release on.
+    never = _settled_with_expired_claim(conn, status="blocked", expires_in=3600)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET claim_expires = NULL WHERE id = ?", (never,))
+    # A ``running`` row's claim is ALIVE: no status flip happened, so nothing may take it away.
+    running = _claimed_running(conn, pid=_dead_pid(), started_at=_comparable_fingerprint())
+
+    released = kb.release_settled_claims(conn)
+
+    assert sorted(released) == sorted([ready, archived])
+    for tid in (ready, archived):
+        row = _task_row(conn, tid)
+        assert row["claim_lock"] is None and row["claim_expires"] is None
+        assert _event_count(conn, tid, "claim_released") == 1
+    # The status the state machine put the card in is NOT rewritten by a claim release.
+    assert _task_row(conn, ready)["status"] == "ready"
+    assert _task_row(conn, archived)["status"] == "archived"
+    assert _task_row(conn, future)["claim_lock"] is not None
+    assert _task_row(conn, never)["claim_lock"] is not None
+    assert _task_row(conn, running)["claim_lock"] is not None
+    assert kb.release_settled_claims(conn) == [], "nothing left to release: never a re-release"
+
+
+def test_eight_settled_claims_drain_in_one_tick_and_never_abort(board):
+    """DoD 3a: 8 reclaimable rows present -> one tick leaves 0 locked and refuses nothing."""
+    conn = board
+    statuses = ["ready", "ready", "review", "done", "blocked", "archived", "todo", "scheduled"]
+    settled = [_settled_with_expired_claim(conn, status=s) for s in statuses]
+    # A live ``running`` claim beside them must survive the tick untouched.
+    alive = _claimed_running(
+        conn, pid=os.getpid(), started_at=kbd._process_fingerprint(os.getpid()),
+    )
+
+    crashed = kbd.detect_crashed_workers(conn)
+
+    assert crashed == []
+    assert kbd.detect_crashed_workers._last_crash_sweep_abort is None, (
+        "a population the run can release one row at a time is not a mass death"
+    )
+    for tid, status in zip(settled, statuses):
+        row = _task_row(conn, tid)
+        assert row["claim_lock"] is None, f"{tid} left pinned"
+        assert row["claim_expires"] is None
+        assert row["status"] == status
+        assert _event_count(conn, tid, guard.MASS_CRASH_ABORT_EVENT) == 0
+        assert _event_count(conn, tid, "claim_released") == 1
+    assert sorted(kbd.detect_crashed_workers._last_settled_released) == sorted(settled)
+    assert _task_row(conn, alive)["claim_lock"] is not None, "a running claim is alive; hands off"
+
+
+def test_eight_unreclaimable_witness_rows_still_abort(board):
+    """DoD 3b: the guard keeps its teeth -- the witness leg still refuses at >= threshold."""
+    conn = board
+    witness = [_witness_dead_running(conn) for _ in range(8)]
+
+    kbd.detect_crashed_workers(conn)
+
+    abort = kbd.detect_crashed_workers._last_crash_sweep_abort
+    assert abort is not None, "8 witness-derived deaths must still refuse the sweep"
+    assert abort.count == 8
+    assert abort.released == 0, "nothing was releasable individually, so nothing was released"
+    assert sorted(abort.task_ids) == sorted(witness)
+    for tid in witness:
+        row = _task_row(conn, tid)
+        assert row["status"] == "running"
+        assert row["claim_lock"] is not None
+        assert _event_count(conn, tid, guard.MASS_CRASH_ABORT_EVENT) == 1
+
+
+def test_two_consecutive_ticks_are_distinguishable_by_released_beside_count(board):
+    """DoD 4: the abort count can no longer be a constant.
+
+    A tick that released eight pinned rows and a tick that changed nothing both report the same
+    witness-leg ``count``. Without ``released`` beside it they are byte-identical, which is how one
+    ``count=8`` was emitted 14,528 times. With it, the two ticks' payloads differ.
+    """
+    conn = board
+    settled = [_settled_with_expired_claim(conn, status="ready") for _ in range(8)]
+    witness = [_witness_dead_running(conn) for _ in range(8)]
+
+    def _latest_abort_payload() -> dict:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE kind = ? ORDER BY id DESC LIMIT 1",
+            (guard.MASS_CRASH_ABORT_EVENT,),
+        ).fetchone()
+        return json.loads(row["payload"])
+
+    kbd.detect_crashed_workers(conn)
+    first = _latest_abort_payload()
+    assert first["count"] == 8
+    assert first["released"] == 8, "the eight settled rows were released on THIS tick"
+    assert all(_task_row(conn, tid)["claim_lock"] is None for tid in settled)
+
+    kbd.detect_crashed_workers(conn)
+    second = _latest_abort_payload()
+    assert second["count"] == 8, "the witness population is genuinely static"
+    assert second["released"] == 0, "nothing was left to release"
+    assert (first["count"], first["released"]) != (second["count"], second["released"]), (
+        "a tick that releases rows must be distinguishable from a tick that changed nothing"
+    )

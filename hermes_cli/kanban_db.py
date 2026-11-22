@@ -4802,6 +4802,73 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
     return run_id
 
 
+def release_settled_claims(
+    conn: sqlite3.Connection, *, now: Optional[int] = None,
+) -> list[str]:
+    """Release an EXPIRED claim on a row whose status is NOT ``running``; returns the ids released.
+
+    A claim outlives the status it was taken in: the attempt settles its card (``done`` /
+    ``review``), an operator blocks or archives it, or another path flips the status while the
+    attempt's claim is still on the row. EVERY reader that can release a claim is scoped
+    ``status = 'running'`` -- :func:`release_stale_claims`, ``_reclaim_dead_workers`` -- and the
+    claim CAS in :func:`_claim_and_open_run` requires ``claim_lock IS NULL``. So the residue is
+    permanent: no verb ever clears it, and the row can never be claimed again (a ``ready`` card
+    with residue is frozen in the queue). On board ``platform`` the 2026-11-22 read found 15 such
+    rows (12 archived, 3 ready), every one carrying an open ``task_runs`` row.
+
+    This is that verb. It is deliberately INDEPENDENT of the mass-crash guard: it releases one row
+    at a time, on that row's own expiry, and counts nothing -- so it can drain pinned cards while a
+    sweep is refusing, and it can never be censused as unexplained deaths. A ``running`` row is
+    untouched: its claim is alive and only the paths that can PROVE a worker dead may take it away.
+    The row's ``status`` is NOT changed -- the state machine put the card where it is, and this
+    function's whole job is to stop the claim from outliving that decision. A leaked open run is
+    closed with it (the ``current_run_id IS NULL <=> run terminal`` invariant).
+
+    The CAS re-states the predicate under the write lock (the exact status, the exact
+    ``claim_lock``, the expiry still past), so a row re-claimed in between keeps its new claim.
+    """
+    now_epoch = int(time.time() if now is None else now)
+    rows = conn.execute(
+        "SELECT id, status, claim_lock, claim_expires, worker_pid "
+        "FROM tasks "
+        "WHERE claim_lock IS NOT NULL AND status <> 'running' "
+        "  AND claim_expires IS NOT NULL AND claim_expires < ?",
+        (now_epoch,),
+    ).fetchall()
+    released: list[str] = []
+    for row in rows:
+        status = row["status"]
+        if status == "running":  # belt and braces: the SELECT already excludes it
+            continue
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "                 worker_pid = NULL, worker_started_at = NULL "
+                "WHERE id = ? AND status = ? AND claim_lock IS ? "
+                "  AND claim_expires IS NOT NULL AND claim_expires < ?",
+                (row["id"], status, row["claim_lock"], now_epoch),
+            )
+            if cur.rowcount != 1:
+                continue
+            _reclaim_dangling_run(
+                conn, row["id"], statuses=(status,), now=now_epoch,
+                note="claim released: expired claim on a settled row",
+            )
+            _append_event(
+                conn, row["id"], "claim_released",
+                {
+                    "reason": "settled_claim_residue",
+                    "stale_lock": row["claim_lock"],
+                    "claim_expires": _to_epoch(row["claim_expires"]),
+                    "worker_pid": _opt_int(row["worker_pid"]),
+                    "status": status,
+                    "now": now_epoch,
+                },
+            )
+            released.append(row["id"])
+    return released
+
+
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
 ) -> int:
