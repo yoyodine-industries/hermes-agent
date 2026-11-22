@@ -634,7 +634,18 @@ def _describe(exc: object) -> str:
 
 
 def _unavailable_payload(dm_file: str, exc: LiveTargetUnavailableError) -> str:
-    payload: dict[str, Any] = {"reason": exc.reason, "delivery_id": _dm_delivery_id(dm_file),
+    """The answer to a DEFINITE no-send: nothing was admitted, so there is no receipt and no
+    delivery key (card t_ffa66b16, leg 2).
+
+    This used to emit ``delivery_id`` = sha256 of the RESOLVED DM FILE PATH. A sender reads that
+    field as an admission receipt, and it proved the opposite of a receipt: it exists in no
+    runtime ledger (nothing was admitted); every retry of the same body carries the SAME value,
+    so N attempts look like one; and two different values mean two DM FILES, not two deliveries
+    of one intent. ``send_status`` states positively that nothing was sent, in a shape no
+    delivered receipt can take. ``dm_file`` stays in the signature for its callers but yields no
+    key — a no-send has nothing to correlate.
+    """
+    payload: dict[str, Any] = {"reason": exc.reason, "send_status": "not_sent",
                                "error": f"{_describe(exc)} - the message was NOT sent; it is safe to resend {exc.resend}."}
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:

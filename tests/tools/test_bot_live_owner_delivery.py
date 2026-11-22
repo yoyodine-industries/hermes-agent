@@ -187,7 +187,8 @@ def test_canonical_owner_is_the_authority_and_follows_compression(tmp_path, monk
 
     monkeypatch.setattr(runtime, "discover_gateway_endpoint",
                         lambda home, timeout: SimpleNamespace(state="absent", endpoint=None))
-    with pytest.raises(ValueError, match="authority"):
+    # A discovery refusal names DISCOVERY, never the target profile's authority (t_ffa66b16).
+    with pytest.raises(ValueError, match="discovery"):
         mailbox.find_canonical_live_owner(tmp_path)
 
     monkeypatch.setattr(runtime, "discover_gateway_endpoint", _ready("authority-1"))
@@ -309,7 +310,7 @@ def test_authority_delivery_dials_from_a_thread_with_a_running_loop(tmp_path, mo
     async def tool_call_on_loop():
         return mailbox.authority_delivery(tmp_path, {"id": "0" * 64, "message": "probe"})
 
-    with pytest.raises(mailbox.PreDialError, match="profile authority is not ready"):
+    with pytest.raises(mailbox.PreDialError, match="discovery"):
         asyncio.run(tool_call_on_loop())
     assert probed == [tmp_path.resolve()]
 
