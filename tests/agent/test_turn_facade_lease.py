@@ -215,6 +215,7 @@ def test_refresh_tick_sqlite_lock_keeps_the_turn(kind):
 
     db.refresh_session_turn_lease = locked
     lease, calls = _active_lease(db, kind)
+    before = len(lease.timer_handles)
 
     # False stops the interval chain (a short one-shot retry takes it over); the lock itself is a
     # missed tick, never a lost lease.

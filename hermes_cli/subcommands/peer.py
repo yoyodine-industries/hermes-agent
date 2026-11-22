@@ -835,6 +835,13 @@ def _emit_pending_delivery(args, *, peer_name: str, profile: str | None, target:
     """
     where = f"session {session_id}, row {row_id}" if row_id is not None else f"session {session_id}"
     after = f" --after {row_id}" if row_id is not None else ""
+    # The session id and the target are peer-supplied (or echoed from the peer's answer), so they
+    # are printed through the sanitizer -- upstream's hardening of this same message, kept here
+    # where the row routes it through _emit_pending_delivery. The JSON payload above keeps the raw
+    # value: json.dumps escapes controls, and a mechanical caller wants the id it can use.
+    safe_session = sanitize_display_text(str(session_id))
+    safe_target = sanitize_display_text(str(target))
+    where = f"session {safe_session}, row {row_id}" if row_id is not None else f"session {safe_session}"
     payload = {
         "peer": peer_name, "profile": profile, "session_id": session_id,
         "after": row_id, "status": "pending",
@@ -854,7 +861,7 @@ def _emit_pending_delivery(args, *, peer_name: str, profile: str | None, target:
           "answered there. The reply cannot come back on this call. Do NOT resend.",
           file=sys.stderr)
     print("Collect it with:", file=sys.stderr)
-    print(f"  hermes peer reply {target} --session {session_id}{after}", file=sys.stderr)
+    print(f"  hermes peer reply {safe_target} --session {safe_session}{after}", file=sys.stderr)
     if row_id is None:
         print("Check that the newest user row `hermes peer reply` prints is yours.", file=sys.stderr)
     return 3

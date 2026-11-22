@@ -1642,7 +1642,11 @@ def test_peer_dm_timeout_message_sanitizes_session_id(monkeypatch, capsys):
     rc = peer_cmd._peer_dm(
         SimpleNamespace(json=False), "hi", "spark", None, "http://x", "k")
 
-    assert rc == 1
+    # The row's exit contract, not upstream's: 3 ("delivered, still running") is deliberately
+    # distinct from 1 ("nothing on the wire") so a caller can tell the two apart mechanically
+    # (_still_running). Upstream's 1 here is the behaviour the row replaced; the property this
+    # test exists for -- the peer-supplied session id is sanitized -- is unchanged below.
+    assert rc == 3
     err = capsys.readouterr().err
     assert "\x1b" not in err
     assert "bc_evil" in err
