@@ -131,7 +131,9 @@ _BOARD_SPECS = [
     ], aliases=["ls"], help="List all boards with task counts"),
     _cmd("create", [
         _arg("slug", help="Board slug (kebab-case, e.g. atm10-server)"),
-        _arg("--name", help="Human-readable display name (defaults to Title Case of slug)"),
+        _arg("--name", help="Human-readable display name (defaults to Title Case of slug) — "
+                           "ONE line, at most 40 characters; a policy sentence is refused "
+                           "(a seal belongs in `boards seal`, a description in --description)"),
         _arg("--description", help="Optional description"),
         _arg("--icon", help="Optional emoji or single-character icon for the dashboard"),
         _arg("--color", help="Optional hex color (e.g. '#8b5cf6') for the dashboard"),
@@ -163,8 +165,20 @@ _BOARD_SPECS = [
         _arg("slug", nargs="?", help="Board to report (default: the current board)"),
         _json_flag(help="Emit the board's metadata as JSON"),
     ], aliases=["current"], help="Report a board's metadata (default: the current board)"),
-    _cmd("rename", [_SLUG, _arg("name", help="New display name")],
+    _cmd("rename", [_SLUG, _arg("name", help="New display name (one line, at most 40 "
+                                               "characters; a policy sentence is refused — "
+                                               "use `boards seal` for that)")],
          help="Change a board's human-readable display name (slug is immutable)"),
+    _cmd("seal", [
+        _SLUG,
+        _arg("--reason", required=True,
+             help="The directive this seal carries, verbatim (board.json sealed_reason). "
+                  "A seal is a FIELD, so the directive is stored here and never in `name`."),
+        _json_flag(),
+    ], help="Mark a board SEALED — not a fleet board — with its directive in a field, "
+            "not in the display name (does not change dispatch)"),
+    _cmd("unseal", [_SLUG, _json_flag()],
+         help="Clear a board's seal and its reason"),
     _cmd("set-default-workdir", [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),

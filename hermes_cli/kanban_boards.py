@@ -95,7 +95,14 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  COUNTS")
     for b in boards:
         marker = "●" if b["is_current"] else " "
-        name = (b.get("name") or "") + (" [archived]" if b.get("archived") else "")
+        # A seal is a FIELD, so it is a MARKER here, never the name (card t_62917d87): the
+        # column states what the board is called and the marker states how it is ruled, and
+        # no reader has to parse a policy sentence out of a display label.
+        name = (b.get("name") or "")
+        if b.get("sealed"):
+            name += " [sealed]"
+        if b.get("archived"):
+            name += " [archived]"
         cell = (_fmt_counts(b["counts"] or {}, "(empty)") if b["counts"] is not None
                 else "(not read — pinned)")
         print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {cell}")
@@ -112,11 +119,16 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     if rc:
         return rc
     already = kb.board_exists(normed) and normed != kb.DEFAULT_BOARD
-    meta = kb.create_board(
-        normed, name=args.name, description=args.description, icon=args.icon, color=args.color,
-        default_workdir=args.default_workdir,
-        dispatch=False if getattr(args, "no_dispatch", False) else None,
-    )
+    try:
+        meta = kb.create_board(
+            normed, name=args.name, description=args.description, icon=args.icon,
+            color=args.color, default_workdir=args.default_workdir,
+            dispatch=False if getattr(args, "no_dispatch", False) else None,
+        )
+    except ValueError as exc:
+        # A refused NAME (empty, multi-line, policy prose) exits 2 with the refusal, and the
+        # board is not created: the writer raises before anything is written (card t_62917d87).
+        return _err(f"kanban boards create: {exc}", 2)
     print(f"Board {meta['slug']!r} {'already exists' if already else 'created'}.\n"
           f"  Display name: {meta.get('name', '')}\n"
           f"  DB path:      {meta['db_path']}")
@@ -218,6 +230,10 @@ def _cmd_boards_show(args: argparse.Namespace) -> int:
         return 0
     label = "Current board" if getattr(args, "slug", None) is None else "Board"
     print(f"{label}: {slug}\n  Display name: {meta.get('name', '')}")
+    if meta.get("sealed"):
+        reason = meta.get("sealed_reason") or ""
+        print("  Sealed:       YES — not a fleet board" + (f": {reason}" if reason else
+                                                          " (no reason recorded)"))
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}\n"
@@ -232,8 +248,52 @@ def _cmd_boards_rename(args: argparse.Namespace) -> int:
     normed, rc = _board_slug_arg(args, "rename", must_exist=True)
     if rc:
         return rc
-    meta = kb.write_board_metadata(normed, name=args.name)
+    try:
+        meta = kb.write_board_metadata(normed, name=args.name)
+    except ValueError as exc:
+        return _err(f"kanban boards rename: {exc}", 2)
     print(f"Board {normed!r} renamed to {meta['name']!r}.")
+    return 0
+
+
+def _cmd_boards_seal(args: argparse.Namespace) -> int:
+    """``hermes kanban boards seal <slug> --reason '<directive>'`` — the seal's OWN door.
+
+    A board that is not a fleet board says so in a FIELD (``board.json:sealed`` +
+    ``sealed_reason``), never in its name (card t_62917d87): ``name`` is a display label at
+    most :data:`kanban_db_boards.MAX_BOARD_NAME_LEN` long, and a policy sentence written
+    into it misinforms every reader of the register. Sealing changes NO admission — the
+    dispatcher reads ``dispatch`` — so a seal is a declaration, and an operator who wants
+    the board undispatchable runs ``set-dispatch <slug> off`` as well.
+    """
+    normed, rc = _board_slug_arg(args, "seal", must_exist=True)
+    if rc:
+        return rc
+    reason = (getattr(args, "reason", None) or "").strip()
+    if not reason:
+        return _err("kanban boards seal: --reason is required — a seal without its directive "
+                    "is a flag nobody can interpret", 2)
+    meta = kb.write_board_metadata(normed, sealed=True, sealed_reason=reason)
+    if _json_out(args, {"board": normed, "sealed": bool(meta.get("sealed")),
+                        "sealed_reason": meta.get("sealed_reason", "")}):
+        return 0
+    print(f"Board {normed!r} sealed: {meta.get('sealed_reason', '')}")
+    if meta.get("dispatch", True) is not False:
+        print("  note: the seal does not change dispatch — this board is still served by the "
+              f"dispatcher. Use `hermes kanban boards set-dispatch {normed} off` if that is "
+              "the intent.")
+    return 0
+
+
+def _cmd_boards_unseal(args: argparse.Namespace) -> int:
+    """``hermes kanban boards unseal <slug>`` — clear the seal and its reason."""
+    normed, rc = _board_slug_arg(args, "unseal", must_exist=True)
+    if rc:
+        return rc
+    meta = kb.write_board_metadata(normed, sealed=False, sealed_reason="")
+    if _json_out(args, {"board": normed, "sealed": bool(meta.get("sealed"))}):
+        return 0
+    print(f"Board {normed!r} unsealed.")
     return 0
 
 
@@ -433,6 +493,8 @@ _BOARD_HANDLERS = {
     "switch": _cmd_boards_switch, "use": _cmd_boards_switch,
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
+    "seal": _cmd_boards_seal,
+    "unseal": _cmd_boards_unseal,
     "set-default-workdir": _cmd_boards_set_default_workdir,
     "set-project": _cmd_boards_set_project,
     "set-dispatch": _cmd_boards_set_dispatch,

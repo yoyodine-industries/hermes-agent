@@ -151,11 +151,130 @@ def board_dispatch_enabled(board: Optional[str] = None) -> bool:
         return True
 
 
+#: The longest a board NAME may be, in characters. The ``boards list`` NAME column is 28
+#: wide and a display label is what the field is for; anything that does not fit a line is
+#: PROSE, and prose about a board belongs in a FIELD (``sealed`` / ``sealed_reason`` /
+#: ``description``), never in the name. Measured: the ``default`` board's name carried
+#: "SEALED - not a fleet board (operator directive 2026-11-04)" (60 chars), so every reader
+#: of the register — the dashboard, the tool list, an operator — was handed a policy
+#: sentence where a name belongs (card t_62917d87).
+MAX_BOARD_NAME_LEN = 40
+
+#: What a refusal says about where the prose DOES belong. One sentence, because the refusal
+#: is the only place a caller learns the field exists.
+_BOARD_NAME_POLICY_HINT = (
+    "A seal or a policy directive is a FIELD, not a name: write "
+    "`hermes kanban boards seal <slug> --reason '<the directive>'` (board.json "
+    "`sealed` + `sealed_reason`), or put it in `description`."
+)
+
+
+def validate_board_name(name: Any) -> str:
+    """The board NAME a write may store, or a ``ValueError`` that REFUSES it.
+
+    A name is a short display label, so this REFUSES rather than truncates: a silently
+    shortened name is a different name, and the caller would never learn the register now
+    says something they did not write. Three refusals, each with its own sentence:
+
+    * empty / whitespace-only — there is no name to store, and substituting one would hide
+      the empty value the caller passed;
+    * a line break or control character — a name is one line, and a ``board.json`` whose
+      name spans lines renders a broken column in every reader;
+    * longer than :data:`MAX_BOARD_NAME_LEN` — that is prose, and
+      :data:`_BOARD_NAME_POLICY_HINT` names the field it belongs in instead.
+
+    Surrounding whitespace is trimmed (the label is what carries meaning), never interior
+    text.
+    """
+    text = str(name).strip()
+    if not text:
+        raise ValueError(
+            "a board name cannot be empty or whitespace-only — pass a display label "
+            "(the default is the title-cased slug), or omit `name` to keep the current one"
+        )
+    control = sorted({ch for ch in text if ch in "\r\n\t" or ord(ch) < 32})
+    if control:
+        shown = ", ".join(repr(ch) for ch in control)
+        raise ValueError(
+            f"board name {text!r} contains a line break or control character ({shown}); "
+            "a name is ONE line. " + _BOARD_NAME_POLICY_HINT
+        )
+    if len(text) > MAX_BOARD_NAME_LEN:
+        raise ValueError(
+            f"board name {text!r} is {len(text)} characters; a name is at most "
+            f"{MAX_BOARD_NAME_LEN}. " + _BOARD_NAME_POLICY_HINT
+        )
+    return text
+
+
+def _stores_as_name(name: Optional[str], slug: str) -> str:
+    """The name a WRITE stores: validated when the caller supplied one, else the default label."""
+    if name is None:
+        return _default_board_display_name(slug)
+    return validate_board_name(name)
+
+
+def _display_name_of(meta: dict, slug: str) -> str:
+    """``meta``'s stored name when it would pass validation, else the title-cased slug.
+
+    Only a LEGACY record needs this (the tombstone ``remove_board`` writes re-stores the name
+    the board already carries, and a name stored before validation existed must not fail an
+    archive). It never invents a different name for a valid one.
+    """
+    try:
+        return validate_board_name(meta.get("name") or "")
+    except ValueError:
+        return _default_board_display_name(slug)
+
+
+def registered_board_slugs() -> list[str]:
+    """Every slug this host has REGISTERED, as a filing may name it: ``default`` first, sorted.
+
+    The registered set is the refusal's remedy (``kanban_db.unregistered_board_refusal``): a
+    caller who names a slug nobody registered is told what IS registered, so the message is
+    actionable instead of an instruction to run a CLI (card t_62917d87). One definition, read
+    by that refusal and by no other enumeration — :func:`list_boards` stays the inventory
+    (it includes archived records and display metadata), and the dispatcher's own set stays
+    :func:`list_dispatch_boards`.
+
+    A slug counts when its directory carries ``board.json`` (registration, not a filing-minted
+    store: :func:`_dir_is_registered`), it is not an archived record, and it is not a
+    resurrected stub. ``default`` is registered by construction and always first.
+    """
+    slugs = [_kb.DEFAULT_BOARD]
+    root = _kb.boards_root()
+    try:
+        children = sorted(root.iterdir(), key=lambda p: p.name.lower()) if root.is_dir() else []
+    except OSError:
+        return slugs
+    for child in children:
+        if not child.is_dir():
+            continue
+        try:
+            normed = _kb._normalize_board_slug(child.name)  # junk dirs are not boards
+        except ValueError:
+            continue
+        if not normed or normed in slugs or not _dir_is_registered(child):
+            continue
+        try:
+            if read_board_metadata(normed).get("archived") or board_is_archived_stub(normed):
+                continue
+        except Exception:
+            continue
+        slugs.append(normed)
+    return slugs
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """``board.json`` merged over defaults, plus ``slug`` and ``db_path``. Never
     raises — a missing/malformed file yields the synthesized entry. The ``dispatch``
     default is applied at read time by :func:`board_dispatch_enabled`, not here: an
-    unrelated write must leave a ``board.json`` that never touched the key alone."""
+    unrelated write must leave a ``board.json`` that never touched the key alone.
+
+    ``sealed``/``sealed_reason`` are the SEAL's home (card t_62917d87): a board that is not
+    a fleet board says so in a field, so ``name`` stays a name in every reader. Both default
+    at READ time (``False`` / ``""``) and are only materialized when a write sets them, the
+    same contract ``dispatch`` has."""
     slug = _kb._slug_or_default(board)
     meta: dict[str, Any] = {
         "slug": slug,
@@ -163,6 +282,8 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "description": "",
         "icon": "",
         "color": "",
+        "sealed": False,
+        "sealed_reason": "",
         "default_workdir": None,
         # Project scope: new tasks inherit it (deterministic worktree + branch).
         "project_id": None,
@@ -189,6 +310,7 @@ def write_board_metadata(
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
     dispatch: Optional[bool] = None, priority_policy: Any = None,
+    sealed: Optional[bool] = None, sealed_reason: Optional[str] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
@@ -210,14 +332,27 @@ def write_board_metadata(
     is the surface that validates, because it is the one with somewhere to report a
     refusal ("nothing written", exit 2). A policy that cannot be loaded must stay
     storeable so the birth seam can be exercised against one and watch it report
-    ``unavailable`` rather than fail the filing."""
+    ``unavailable`` rather than fail the filing.
+
+    ``name`` is the exception: it is VALIDATED here, not normalized (card t_62917d87). A
+    value that is empty, spans a line, or runs past :data:`MAX_BOARD_NAME_LEN` raises
+    ``ValueError`` and NOTHING is written — the refusal names the ``sealed`` /
+    ``sealed_reason`` field a policy sentence belongs in. ``None`` keeps the stored name.
+
+    ``sealed`` / ``sealed_reason`` are the seal's home: ``None`` leaves each as the file
+    holds it, a bool stores it, and ``sealed_reason=""`` removes the key (the seal is the
+    bool; the reason is its prose). Neither changes dispatch admission on its own —
+    ``dispatch: false`` is the flag the dispatcher reads — so sealing a board is a
+    declaration, never a silent change of behaviour."""
     _kb._assert_not_delegated_child_mutation()
     slug = _kb._slug_or_default(board)
     meta = read_board_metadata(slug)
     # db_path is derived on every read; never persist it into board.json.
     meta.pop("db_path", None)
     if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
+        # REFUSES, never truncates (card t_62917d87): see validate_board_name. The raise is
+        # before any mkdir/write below, so a refused name leaves board.json untouched.
+        meta["name"] = validate_board_name(name)
     for key, value in (("description", description), ("icon", icon), ("color", color)):
         if value is not None:
             meta[key] = str(value)
@@ -225,6 +360,14 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if dispatch is not None:
         meta["dispatch"] = bool(dispatch)
+    if sealed is not None:
+        meta["sealed"] = bool(sealed)
+    if sealed_reason is not None:
+        reason = str(sealed_reason).strip()
+        if reason:
+            meta["sealed_reason"] = reason
+        else:
+            meta.pop("sealed_reason", None)
     if priority_policy is not None:
         if isinstance(priority_policy, dict) and not priority_policy:
             priority_policy = ""  # a spec that names nothing is the CLEAR, not a policy
@@ -250,12 +393,17 @@ def create_board(
     slug: str, *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, default_workdir: Optional[str] = None,
     project_id: Optional[str] = None, dispatch: Optional[bool] = None,
+    sealed: Optional[bool] = None, sealed_reason: Optional[str] = None,
 ) -> dict:
     """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata).
 
     ``dispatch=False`` births an ESTATE/scratch board the dispatcher never serves (card
     t_17c9c847): the flag is written into ``board.json`` at creation, so the board is
     undispatchable by construction rather than by a teardown somebody has to remember.
+
+    ``name`` is validated by :func:`write_board_metadata` (a policy sentence, a line break or
+    an empty string is REFUSED, exit 2 at the CLI); ``sealed``/``sealed_reason`` declare a
+    board that is not a fleet board in a FIELD, so ``name`` stays a name (card t_62917d87).
     """
     normed = _kb._require_slug(slug)
     # Explicit creation clears any archived tombstone at this slug (left by
@@ -264,7 +412,7 @@ def create_board(
     meta = write_board_metadata(
         normed, name=name, description=description, icon=icon, color=color,
         default_workdir=default_workdir, project_id=project_id, archived=False,
-        dispatch=dispatch,
+        dispatch=dispatch, sealed=sealed, sealed_reason=sealed_reason,
     )
     # Touch the DB so list_boards() sees it immediately.
     _kb.init_db(board=normed)
@@ -365,12 +513,17 @@ def remove_board(slug: str, *, archive: bool = True, leave_marker: bool = True) 
         if leave_marker:
             write_board_metadata(
                 normed,
-                name=prior_meta.get("name"),
+                # A name stored BEFORE validation existed must not fail the archive: the
+                # tombstone re-stores what the board carries when that still validates, else
+                # the slug's own display label (never a truncation of the old prose).
+                name=_display_name_of(prior_meta, normed),
                 description=prior_meta.get("description"),
                 icon=prior_meta.get("icon"),
                 color=prior_meta.get("color"),
                 default_workdir=prior_meta.get("default_workdir"),
                 project_id=prior_meta.get("project_id"),
+                sealed=True if prior_meta.get("sealed") else None,
+                sealed_reason=(prior_meta.get("sealed_reason") or None),
                 archived=True,
             )
         return {"slug": normed, "action": "archived", "new_path": str(target)}
