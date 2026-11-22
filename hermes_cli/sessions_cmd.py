@@ -852,11 +852,21 @@ def _cmd_prune_or_archive(args, action, *, persistence=None):
         # Machine-readable retention census (card t_0ee10a96). The class carrier reads its
         # numbers from HERE rather than re-typing the predicate: this is the same selection
         # the apply leg runs, so a planned count can never disagree with the acted one.
+        # The census is the OLD store's verb (SessionDB.retention_window_census): this merge does
+        # not port it onto the persistence handle (card A/P3 does that). SessionDB(path) serves
+        # through the SAME registry holder the persistence store has open, so the numbers are the
+        # ones the apply leg acts on, not a second snapshot.
         if not args.dry_run:
             print("Error: --json reports a census; it requires --dry-run (nothing is deleted).",
                   file=sys.stderr)
             return 1
-        census = db.retention_window_census(**filters, whole_lineages=True)
+        from hermes_state import SessionDB
+        from persistence_assembly import store_location
+        db = SessionDB(store_location(persistence.scope))
+        try:
+            census = db.retention_window_census(**filters, whole_lineages=True)
+        finally:
+            db.close()
         census["action"] = action
         census["filters"] = describe_filters(filters)
         print(json.dumps(census, sort_keys=True, default=str))

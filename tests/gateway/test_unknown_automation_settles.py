@@ -59,9 +59,13 @@ async def _lost_head_then_restart(tmp_path, monkeypatch, executed, admit_head):
     actor = AuthorityConnection(first, Peer(), {'user_id': 'human'}).actor
     first._schedule = lambda ref: None
     head_id = await admit_head(first, actor, ref)
-    follower = await first.submit(actor, Submission('follower', ref, {'text': 'FOLLOWER'}, 'queue'))
+    # Claim BEFORE the follower is admitted: a person's fact is claimed ahead of an automation hint
+    # (t_0b41230f), so an automation head that is claimed and then lost is set up while it is the
+    # only queued row -- which is also the production order (an idle FIFO claims the hint, the
+    # person's message arrives while it runs).
     claimed = db.admissions.claim(epoch=first.epoch, session_id='s')
     assert claimed.admission_id == head_id
+    follower = await first.submit(actor, Submission('follower', ref, {'text': 'FOLLOWER'}, 'queue'))
     seed_messages(db, 's', {'role': 'user', 'content': 'HEAD'})  # the lost turn got as far as its user row
     second = await initialize_session_authority(runner, profile_id='p', instance_id='owner-2')
     second.sessions['s'] = LiveSession(source, 's')
@@ -154,9 +158,11 @@ async def test_automation_fenced_unknown_in_this_owner_settles_on_the_drain(tmp_
     actor = AuthorityConnection(authority, Peer(), {'user_id': 'human'}).actor
     authority._schedule = lambda ref: None
     head_id = await _automation_head(authority, actor, ref)
-    follower = await authority.submit(actor, Submission('follower', ref, {'text': 'FOLLOWER'}, 'queue'))
+    # Claimed while it is the only queued row: a person's fact claims ahead of an automation hint,
+    # so the lost-head turn is the one the idle FIFO took (see ``_lost_head_then_restart``).
     claimed = db.admissions.claim(epoch=authority.epoch, session_id='s')
     assert claimed.admission_id == head_id
+    follower = await authority.submit(actor, Submission('follower', ref, {'text': 'FOLLOWER'}, 'queue'))
     # The managed-worker verdict: the claimed row is committed ``unknown`` under this same epoch.
     assert db.admissions.mark_unknown(epoch=authority.epoch, admission_id=head_id, generation=claimed.generation) == 'unknown'
     try:

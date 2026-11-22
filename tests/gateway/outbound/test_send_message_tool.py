@@ -1674,6 +1674,7 @@ def test_not_configured_error_names_default_root_gateway_and_secret_sources(tmp_
 
     from gateway.config import GatewayConfig
     from gateway.outbound.send import _resolve_platform_config
+    from gateway.status import _get_process_start_time
 
     root = tmp_path / "hermes"
     profile = root / "profiles" / "coder"
@@ -1708,8 +1709,8 @@ def test_not_configured_error_ignores_a_foreign_life_gateway_entry(tmp_path, mon
     import os
 
     from gateway.config import GatewayConfig
+    from gateway.outbound.send import _resolve_platform_config
     from gateway.status import _get_process_start_time
-    from tools.send_message_tool import _resolve_platform_config
 
     root = tmp_path / "hermes"
     profile = root / "profiles" / "coder"

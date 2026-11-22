@@ -100,6 +100,9 @@ def _prune_sessions(body: SessionPrune):
         criteria = PruneCriteria(
             started_before=body.started_before, started_after=body.started_after,
             archived=None if body.include_archived else False,
+            # Ruling t_0ee10a96 L1: prune's default reaches the runtime's OWN auto-archive
+            # (bookkeeping) and still spares a human archive (intent).
+            include_auto_archived=not body.include_archived,
             **{f: (getattr(body, f) or None) for f in _PRUNE_STR_FILTERS if f != "source"},
             **{f: getattr(body, f) for f in _PRUNE_NUM_FILTERS})
         skipped_open = store.maintenance.count_open_prune_matches(effective_older_than, source, criteria=criteria)

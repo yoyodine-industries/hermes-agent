@@ -108,6 +108,11 @@ class PruneCriteria:
     include_pinned: bool = False
     lineage_tips_only: bool = False
     include_open: bool = False
+    # Prune only (card t_0ee10a96 L1): ``archived=False`` also reaches the sessions the runtime
+    # archived as BOOKKEEPING (``auto_archived=1``) while still sparing a human archive (intent).
+    # The old store's ``_ARCHIVED_ELIGIBLE_SQL`` carries the same ruling; this is its equivalent
+    # on the persistence criteria, so one row keeps one meaning on both stores.
+    include_auto_archived: bool = False
 
 
 @dataclass(frozen=True, slots=True)

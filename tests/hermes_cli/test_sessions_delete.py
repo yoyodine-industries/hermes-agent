@@ -188,19 +188,19 @@ def test_prune_default_reaches_the_runtime_auto_archive(monkeypatch, capsys):
     auto-archived arm; the preview reads the same filters, so it lists what the prune deletes.
     """
     filters, _out = _run_prune(monkeypatch, capsys, ["--older-than", "7", "--dry-run"])
-    assert filters["archived"] is False
-    assert filters["include_auto_archived"] is True
+    assert filters["criteria"].archived is False
+    assert filters["criteria"].include_auto_archived is True
 
 
 def test_prune_include_archived_still_names_both_arms(monkeypatch, capsys):
     """--include-archived keeps its meaning: the human opted into every archived row."""
     filters, _out = _run_prune(
         monkeypatch, capsys, ["--older-than", "7", "--include-archived", "--dry-run"])
-    assert filters["archived"] is None
-    assert filters["include_auto_archived"] is False
+    assert filters["criteria"].archived is None
+    assert filters["criteria"].include_auto_archived is False
 
 
 def test_archive_never_takes_the_prune_arm(monkeypatch, capsys):
     """Archive is unchanged: re-archiving an already-archived row is a no-op."""
     filters, _out = _run_prune(monkeypatch, capsys, ["--title", "dupes", "--yes"], sub="archive")
-    assert filters["include_auto_archived"] is False
+    assert filters["criteria"].include_auto_archived is False

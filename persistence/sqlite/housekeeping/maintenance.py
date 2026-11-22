@@ -138,9 +138,15 @@ def _not_pinned_sql(alias: str = "s") -> str:
 
 _PRUNE_FILTER_NAMES = frozenset(name for name, _, _ in _PRUNE_FILTERS) | {"archived", "include_pinned", "lineage_tips_only"}
 
+#: ``archived=False`` + ``include_auto_archived`` (prune only, card t_0ee10a96 L1): BOOKKEEPING does
+#: not keep a row, INTENT does. The runtime's auto-archive (``auto_archived=1``) is reclaimed; a
+#: human archive (``auto_archived=0``) is spared. Mirror of the old store's ``_ARCHIVED_ELIGIBLE_SQL``.
+_ARCHIVED_ELIGIBLE_SQL = "(s.archived = 0 OR COALESCE(s.auto_archived, 0) = 1)"
+
 
 def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
                         lineage_tips_only: bool = False, include_open: bool = False,
+                        include_auto_archived: bool = False,
                         **filters) -> tuple[str, list]:
     """Shared WHERE clause for bulk prune/archive selection (alias ``s``): ``_PRUNE_FILTERS``
     AND together, only ended sessions are ever candidates, ``archived`` is tri-state
@@ -167,7 +173,10 @@ def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool
             clauses.extend(new_clauses)
             params.extend(new_params)
     if isinstance(archived, bool):
-        clauses.append(f"s.archived = {int(archived)}")
+        # Ruling t_0ee10a96 L1 (as on the old store): ``archived=False`` on the prune path selects
+        # the unarchived PLUS every session the runtime archived as bookkeeping, never a human one.
+        clauses.append(_ARCHIVED_ELIGIBLE_SQL
+                       if (not archived and include_auto_archived) else f"s.archived = {int(archived)}")
     # Pinned is a durable "keep" flag: bulk prune/delete/archive exclude pinned rows unless opted in.
     if not include_pinned:
         clauses.append(_not_pinned_sql())
