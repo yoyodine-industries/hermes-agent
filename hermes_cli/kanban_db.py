@@ -4822,7 +4822,10 @@ def release_settled_claims(
     untouched: its claim is alive and only the paths that can PROVE a worker dead may take it away.
     The row's ``status`` is NOT changed -- the state machine put the card where it is, and this
     function's whole job is to stop the claim from outliving that decision. A leaked open run is
-    closed with it (the ``current_run_id IS NULL <=> run terminal`` invariant).
+    closed with it AND the row's ``current_run_id`` is cleared in the same write txn, so the
+    ``current_run_id IS NULL <=> run terminal`` invariant every other status flip keeps holds
+    here too -- closing the run while leaving the pointer is a violation, and for an ``archived``
+    row (never re-claimed) it would be permanent.
 
     The CAS re-states the predicate under the write lock (the exact status, the exact
     ``claim_lock``, the expiry still past), so a row re-claimed in between keeps its new claim.
@@ -4850,10 +4853,27 @@ def release_settled_claims(
             )
             if cur.rowcount != 1:
                 continue
+            # ORDER: ``_reclaim_dangling_run`` READS ``tasks.current_run_id``, so the pointer is
+            # captured first and cleared AFTER the run is closed -- clearing first would leave the
+            # run OPEN behind a NULL pointer. The clear is CAS'd on the run just closed and on that
+            # run being terminal, so a row re-claimed (or re-pointed) in between keeps its pointer
+            # (`reopen_task`'s pattern).
+            leaked = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ?", (row["id"],),
+            ).fetchone()
+            leaked_run_id = _opt_int(leaked["current_run_id"]) if leaked else None
             _reclaim_dangling_run(
                 conn, row["id"], statuses=(status,), now=now_epoch,
                 note="claim released: expired claim on a settled row",
             )
+            if leaked_run_id is not None:
+                conn.execute(
+                    "UPDATE tasks SET current_run_id = NULL "
+                    "WHERE id = ? AND current_run_id = ? "
+                    "  AND EXISTS (SELECT 1 FROM task_runs "
+                    "               WHERE id = ? AND ended_at IS NOT NULL)",
+                    (row["id"], leaked_run_id, leaked_run_id),
+                )
             _append_event(
                 conn, row["id"], "claim_released",
                 {

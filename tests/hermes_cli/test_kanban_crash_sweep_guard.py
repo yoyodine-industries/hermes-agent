@@ -120,7 +120,7 @@ def _claimed_running(conn, *, pid, started_at, claim_expires=None) -> str:
 
 def _task_row(conn, tid):
     return conn.execute(
-        "SELECT status, worker_pid, worker_started_at, claim_lock, claim_expires "
+        "SELECT status, worker_pid, worker_started_at, claim_lock, claim_expires, current_run_id "
         "FROM tasks WHERE id = ?", (tid,),
     ).fetchone()
 
@@ -1105,8 +1105,15 @@ def test_the_actor_card_names_the_released_rows_on_a_refusal(board):
 
 
 def _settled_with_expired_claim(conn, *, status="ready", expires_in=-3600, worker_pid=None) -> str:
-    """A card in a SETTLED status carrying an expired claim: the residue no reader could clear."""
+    """A card in a SETTLED status carrying an expired claim: the residue no reader could clear.
+
+    Built the way the live board carries it: a claim OPENS an attempt run
+    (``current_run_id`` -> an open ``task_runs`` row), then the attempt settles its card and the
+    status moves on while the claim and the run are left behind. That leaked open run is what the
+    release verb must close, and its pointer is what the release must clear with it.
+    """
     tid = kb.create_task(conn, title="settled residue", assignee="worker")
+    kb.claim_task(conn, tid)  # the attempt: opens the run, points current_run_id at it
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = ?, claim_expires = ?, worker_pid = ? "
@@ -1136,12 +1143,28 @@ def test_release_settled_claims_is_scoped_to_expired_claims_on_non_running_rows(
         row = _task_row(conn, tid)
         assert row["claim_lock"] is None and row["claim_expires"] is None
         assert _event_count(conn, tid, "claim_released") == 1
+        # The leaked attempt run is CLOSED and the pointer is CLEARED with it, in the same write
+        # txn: ``current_run_id IS NULL <=> run terminal`` is the invariant every other status flip
+        # keeps (`_reclaim_dangling_run`, `reopen_task`), so the release must keep it too. Closing
+        # the run while leaving the pointer would be permanent for an archived row.
+        assert row["current_run_id"] is None, (
+            f"{tid}: the leaked run's pointer must be cleared with the run it closed"
+        )
+        runs = _run_rows(conn, tid)
+        assert len(runs) == 1
+        assert runs[0]["ended_at"] is not None, "the leaked run must be terminal"
+        assert runs[0]["status"] == "reclaimed" and runs[0]["outcome"] == "reclaimed"
     # The status the state machine put the card in is NOT rewritten by a claim release.
     assert _task_row(conn, ready)["status"] == "ready"
     assert _task_row(conn, archived)["status"] == "archived"
     assert _task_row(conn, future)["claim_lock"] is not None
     assert _task_row(conn, never)["claim_lock"] is not None
     assert _task_row(conn, running)["claim_lock"] is not None
+    # Rows the release does NOT touch keep their pointer AND their open run: nothing is closed
+    # behind a row that was never released.
+    for tid in (future, never, running):
+        assert _task_row(conn, tid)["current_run_id"] is not None
+        assert _run_rows(conn, tid)[0]["ended_at"] is None
     assert kb.release_settled_claims(conn) == [], "nothing left to release: never a re-release"
 
 
