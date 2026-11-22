@@ -594,21 +594,55 @@ def mark_completion_delivered(delegation_id: str) -> bool:
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Claim one pending completion across competing consumers/processes."""
+    """Claim one pending completion across competing consumers/processes.
+
+    The delivery budget is enforced HERE, in the predicate of the verb that *increments*
+    ``delivery_attempts``. A cap placed only in ``release_completion_delivery`` bounds the retries a
+    LIVE consumer performs: a consumer that dies holding the claim never reaches its release, so
+    only the claim can bound the retries a DEAD consumer causes — and the dead ones are the only
+    ones that accumulate. A row already at ``_MAX_DELIVERY_ATTEMPTS`` is refused and converged to
+    terminal ``dropped`` in the same transaction, so no path (crash, timeout, or a loop that never
+    releases) can carry the counter past the cap.
+    """
     if remote := worker_ledger():
         return remote.claim(delegation_id, claim_id)
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
+            "SELECT 1 FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
         if row is None:
             return True  # legacy event created before durable dispatch
         cur = conn.execute("""UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_attempts < ?
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - _CLAIM_LEASE_S))
-        return cur.rowcount == 1
+            (claim_id, now, now, delegation_id, _MAX_DELIVERY_ATTEMPTS, now - _CLAIM_LEASE_S))
+        if cur.rowcount == 1:
+            return True
+        _converge_exhausted_claim(conn, delegation_id, now)
+        return False
+
+
+def _converge_exhausted_claim(conn, delegation_id: str, now: float) -> bool:
+    """Converge a still-``pending`` row whose claim was just refused because it is AT the budget.
+
+    Runs inside the claimant's transaction, so the budget test and the convergence cannot be
+    separated by another writer: a claim that passed the test cannot land between them. Only a free
+    or lease-expired claim converges — a claim another consumer still holds is that consumer's to
+    settle, and ``release_completion_delivery`` caps it there.
+    """
+    cur = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+                  delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+           WHERE delegation_id=? AND delivery_state='pending' AND delivery_attempts>=?
+             AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+        (now, delegation_id, _MAX_DELIVERY_ATTEMPTS, now - _CLAIM_LEASE_S))
+    if cur.rowcount == 1:
+        logger.warning("Async delegation %s has used its %d delivery attempts; refusing the claim "
+                       "and marking it terminally dropped (result remains queryable).",
+                       delegation_id, _MAX_DELIVERY_ATTEMPTS)
+        return True
+    return False
 
 
 def is_interim_delegation_event(evt: dict[str, Any]) -> bool:
@@ -689,6 +723,109 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
              AND delivery_claim=?""", (now, now, delegation_id, claim_id))
+
+
+# ── Delivery-budget census ───────────────────────────────────────────────────
+# Why the invariant needs a checker of its own: the defect's signature is a value the code's own
+# guard forbids existing (``delivery_attempts`` above the cap). A census that named such a row
+# "cause unknown" would send the fixer hunting a phantom second writer, so these categories are
+# derived from the row's own accounting and an over-cap value is reported as impossible, not unexplained.
+_DROP_CAUSES = ("dropped_at_boundary", "dropped_owner_gone", "dropped_replay_age", "dropped_unknown_cause")
+_OVER_CAP_NOTE = ("a value the guard forbids, because the guard is post-hoc and the loop outran it")
+
+
+def _drop_cause(attempts: int, dropped_at: Optional[float], age_basis: Optional[float]) -> Optional[str]:
+    """Classify one ``dropped`` row from the evidence it carries; None when the row is over the cap.
+
+    Precedence is evidence-strongest first: a row AT the budget dropped because the cap fired; a row
+    never claimed that sat past ``_MAX_COMPLETION_REPLAY_AGE_S`` dropped on restart replay; a row
+    claimed at least once under the budget dropped while its claimant/target was gone; anything else
+    has no accounting evidence either way and is named ``dropped_unknown_cause`` rather than guessed.
+    """
+    if attempts > _MAX_DELIVERY_ATTEMPTS:
+        return None
+    if attempts >= _MAX_DELIVERY_ATTEMPTS:
+        return "dropped_at_boundary"
+    if attempts <= 0 and age_basis and dropped_at and dropped_at - age_basis >= _MAX_COMPLETION_REPLAY_AGE_S:
+        return "dropped_replay_age"
+    if attempts > 0:
+        return "dropped_owner_gone"
+    return "dropped_unknown_cause"
+
+
+def delivery_drop_census(*, now: Optional[float] = None) -> dict[str, Any]:
+    """Count dropped completions by cause and measure the delivery-budget invariant in this ledger.
+
+    Reads the CURRENT profile's ``state.db`` (callers bind the profile first). ``ok`` is True when no
+    row exceeds ``_MAX_DELIVERY_ATTEMPTS``, False when one does, and None when the ledger cannot be
+    read — an unreadable store is NOT a pass, because a check that silently green-lights what it
+    could not measure is the false green the cap exists to prevent.
+    """
+    cap, store = _MAX_DELIVERY_ATTEMPTS, _db_path()
+    report: dict[str, Any] = {
+        "store": str(store), "cap": cap, "dropped_total": 0, "counts": {c: 0 for c in _DROP_CAUSES},
+        "over_cap": {"count": 0, "max": 0, "rows": []}, "ok": True, "note": "",
+    }
+    if not store.exists():
+        report["note"] = "no ledger at this store (nothing to check)"
+        return report
+    now = time.time() if now is None else now
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            dropped = conn.execute("""SELECT delegation_id, delivery_attempts, updated_at,
+                          completed_at, dispatched_at
+                   FROM async_delegations WHERE delivery_state='dropped'""").fetchall()
+            over = conn.execute("""SELECT delegation_id, delivery_attempts, delivery_state
+                   FROM async_delegations WHERE delivery_attempts>?
+                   ORDER BY delivery_attempts DESC, delegation_id""", (cap,)).fetchall()
+    except sqlite3.OperationalError as exc:
+        report["ok"] = None
+        report["note"] = f"ledger unreadable ({exc}); the invariant is NOT verified"
+        return report
+    report["dropped_total"] = len(dropped)
+    for delegation_id, attempts, dropped_at, completed_at, dispatched_at in dropped:
+        cause = _drop_cause(attempts or 0, dropped_at, completed_at or dispatched_at)
+        if cause is not None:
+            report["counts"][cause] += 1
+    report["over_cap"] = {
+        "count": len(over), "max": max((row[1] or 0 for row in over), default=0),
+        "rows": [{"delegation_id": row[0], "delivery_attempts": row[1], "delivery_state": row[2]} for row in over],
+    }
+    report["ok"] = report["over_cap"]["count"] == 0
+    return report
+
+
+def format_delivery_drop_census(report: dict[str, Any]) -> str:
+    """One census block: every cause on its own line, and an over-cap row named impossible."""
+    lines = [f"async delivery census · store {report['store']} · cap {report['cap']}"]
+    if report.get("note"):
+        lines.append(f"  {report['note']}")
+    if report["dropped_total"] or report["over_cap"]["count"]:
+        lines.append(f"  dropped rows: {report['dropped_total']} "
+                     f"(classified {sum(report['counts'].values())}, "
+                     f"over cap {report['over_cap']['count']})")
+    for cause in _DROP_CAUSES:
+        lines.append(f"  {cause:<24}{report['counts'][cause]}")
+    over = report["over_cap"]
+    if over["count"]:
+        lines.append(f"  OVER CAP: {over['count']} row(s) · max delivery_attempts {over['max']}")
+        for row in over["rows"]:
+            lines.append(f"    {row['delegation_id']} · delivery_attempts {row['delivery_attempts']} "
+                         f"· state {row['delivery_state']} · {_OVER_CAP_NOTE}")
+    return "\n".join(lines)
+
+
+def assert_delivery_attempts_invariant(*, now: Optional[float] = None) -> dict[str, Any]:
+    """Check that no row exceeds the delivery budget; log the census LOUDLY when one does.
+
+    Safe to call from a startup path or an ops check: no writes, and it never raises. Returns the
+    census report; ``report['ok']`` is True (holds), False (violated) or None (could not be measured).
+    """
+    report = delivery_drop_census(now=now)
+    if report["ok"] is not True:
+        logger.error("async delivery budget invariant FAILED at %s:\n%s", report["store"],
+                     format_delivery_drop_census(report))
+    return report
 
 
 def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
@@ -1516,3 +1653,34 @@ def _reset_for_tests() -> None:
         _reoffered_at.clear()
     with _held_lock:
         _held_copies.clear()
+
+
+def _main(argv: Optional[List[str]] = None) -> int:
+    """``python -m tools.async_delegation`` — the delivery ledger's own census and invariant check.
+
+    ``--assert`` is meant for a startup path or an ops check: it exits non-zero when a row carries
+    more delivery attempts than the code allows (or when the ledger cannot be read at all), so the
+    forbidden value is caught where it can no longer be created instead of by a human noticing a
+    five-day-old row.
+    """
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="python -m tools.async_delegation",
+        description="Inspect this profile's durable async-delegation delivery ledger.")
+    parser.add_argument("--census", action="store_true", help="classify dropped completions by cause")
+    parser.add_argument("--assert", dest="check", action="store_true",
+                        help=f"exit non-zero when any delivery_attempts exceeds {_MAX_DELIVERY_ATTEMPTS}")
+    parser.add_argument("--json", action="store_true", help="machine-readable report")
+    args = parser.parse_args(argv)
+    if not (args.census or args.check):
+        parser.error("nothing to do: pass --census and/or --assert")
+    report = delivery_drop_census()
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    if args.census or report["ok"] is not True:
+        print(format_delivery_drop_census(report))
+    return 0 if report["ok"] is True or not args.check else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
