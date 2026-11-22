@@ -378,7 +378,7 @@ def test_native_launchd_checks_loaded_job_before_disk(case, reason, tmp_path, mo
     output = 'gui/' + str(os.getuid()) + '/' + label + ' = {\n\tstate = not running\n\tprogram = ' + argv[0] + '\n\targuments = {\n' + '\n'.join('\t\t' + arg for arg in argv) + '\n\t}\n\tenvironment = {\n\t\tHERMES_HOME => ' + str(loaded_home) + '\n\t\tHERMES_SUPERVISED_CHILD => 1\n\t}\n}'
     peer = tmp_path / 'supervisor.py'
     peer.write_text('import sys\n' + f'output={output!r}\nbootstrap={case == "bootstrap"!r}\n' +
-        'if "print" in sys.argv:\n sys.exit(113) if bootstrap or any(a.startswith("user/") for a in sys.argv) else print(output)\n', encoding='utf-8')
+        'if "print" in sys.argv:\n sys.exit(113) if bootstrap or any(a.startswith(("user/", "system/")) for a in sys.argv) else print(output)\n', encoding='utf-8')
     actual = subprocess.run
     calls = []
     def boundary(argv, **kw):

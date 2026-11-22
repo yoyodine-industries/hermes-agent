@@ -12,6 +12,7 @@ import io
 import os
 from pathlib import Path
 import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -201,6 +202,50 @@ def _s6(home: Path, deadline: float) -> ExistingService | None:
     return ExistingService("s6", (service_name,), manager.is_running(service_name))
 
 
+# ``launchctl print`` exit codes that mean "the job is NOT loaded in the domain I asked": 3 and 113
+# are launchctl's absent-service codes, and 125 ("Domain does not support specified action") means
+# the domain itself cannot be addressed from this process at all — e.g. an Aqua ``gui/<uid>`` probed
+# from a LaunchDaemon's context on macOS 26+. None of the three says anything about the service
+# manager, so each one SKIPS to the next domain: reading 125 as fatal turned "I cannot ask this
+# domain" into "the gateway is gone" and starved every worker on a healthy host (t_484ee879).
+_LAUNCHD_NOT_LOADED_CODES = frozenset({3, 113, 125})
+
+
+def _launchd_domains(uid: int) -> tuple[str, ...]:
+    """Every domain a Hermes gateway job can be loaded into, in probe order (``windows-footgun: ok``
+    — native launchd only): ``gui/<uid>`` (Aqua LaunchAgent), ``user/<uid>`` (Background/SSH
+    LaunchAgent), then ``system`` (a LaunchDaemon, including one whose ``UserName`` is a non-root
+    user). Mirrors ``gateway.restart._launchd_probe_domains``: a probe that only asks the two
+    per-user domains cannot see that daemon at all, and a host that installs one gets no answer."""
+    return (f"gui/{uid}", f"user/{uid}", "system")
+
+
+def _launchd_listed_job(output: str, label: str) -> tuple[int | None, list[str]] | None:
+    """``launchctl list <label>``'s old-style plist as ``(pid, argv)``, or None when it does not
+    report ``label``. That listing answers from the caller's own bootstrap namespace, so it reaches
+    a job loaded in a domain that ``print`` cannot address from here — evidence the service is
+    LOADED, which is never evidence the manager is dead."""
+    if not re.search(rf'^\t"Label" = "?{re.escape(label)}"?;$', output, re.MULTILINE):
+        return None
+    pid = re.search(r'^\t"PID" = (\d+);$', output, re.MULTILINE)
+    block = re.search(r'^\t"ProgramArguments" = \(\n(.*?)^\t\);$', output, re.MULTILINE | re.DOTALL)
+    argv = [item.replace('\\"', '"').replace("\\\\", "\\")
+            for item in re.findall(r'^\t\t"(.*)";$', block.group(1), re.MULTILINE)] if block else []
+    return (int(pid.group(1)) if pid else None), argv
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)  # windows-footgun: ok — reached only from _launchd
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # the process exists; it is just not ours to signal
+    except OSError:
+        return False
+    return True
+
+
 def _launchd(home: Path, deadline: float) -> ExistingService | None:
     import pwd
     suffix = service_suffix(home)
@@ -208,11 +253,13 @@ def _launchd(home: Path, deadline: float) -> ExistingService | None:
     account = pwd.getpwuid(os.getuid())  # windows-footgun: ok — native launchd only
     account_home = Path(account.pw_dir)
     plist = account_home / "Library/LaunchAgents" / f"{label}.plist"
-    from hermes_cli.gateway_runtime_service_identity import verify_launchd_loaded, verify_launchd_plist, read_definition
+    from hermes_cli.gateway_runtime_service_identity import (
+        verify_gateway_argv, verify_launchd_loaded, verify_launchd_plist, read_definition)
     installed = _exists(plist)
-    domains = [f"gui/{os.getuid()}", f"user/{os.getuid()}"]  # windows-footgun: ok — native launchd only
+    domains = _launchd_domains(os.getuid())
     found = []
     loaded = []
+    unaddressable = 0
     for domain in domains:
         result = _run(["launchctl", "print", f"{domain}/{label}"], deadline)
         if result.returncode == 0:
@@ -220,19 +267,45 @@ def _launchd(home: Path, deadline: float) -> ExistingService | None:
             found.append(ExistingService("launchd", ("launchctl", "kickstart", f"{domain}/{label}"),
                                          "state = running" in result.stdout))
             continue
-        # launchctl's native absent-service code; other errors retain uncertainty.
-        if result.returncode != 113:
-            raise RuntimeStartError("service_manager_unavailable")
+        if result.returncode in _LAUNCHD_NOT_LOADED_CODES:
+            unaddressable += result.returncode == 125
+            continue
+        # Any other failure keeps its uncertainty: launchctl could not answer for a reason that
+        # says nothing about the job.
+        raise RuntimeStartError("service_manager_unavailable")
     if len(found) > 1:
         raise RuntimeStartError("service_scope_conflict", "conflict")
     if found:
         _verify_binding(verify_launchd_loaded, loaded[0], home, uid=os.getuid(), username=account.pw_name)  # windows-footgun: ok — native launchd only
         return found[0]
+    # No domain that answered is running the job. Before concluding it is absent, ask the listing
+    # that is NOT domain-explicit: it reaches a job loaded in a domain ``print`` cannot address.
+    listed = _run(["launchctl", "list", label], deadline)
+    job = _launchd_listed_job(listed.stdout or "", label) if listed.returncode == 0 else None
+    if job is not None:
+        pid, argv = job
+        # The same argv binding a print dump gets: a loaded job that is not THIS install's gateway
+        # is refused, never adopted.
+        _verify_binding(verify_gateway_argv, argv, home)
+        if pid is not None and _pid_alive(pid):
+            return ExistingService("launchd", ("launchctl", "kickstart", f"{domains[0]}/{label}"), True)
+        # Loaded but not running, and no answering domain could start it. Saying "the manager is
+        # unavailable" here would report a healthy launchd as dead; bootstrapping a second owner
+        # beside a job we can see but not address would be worse.
+        raise RuntimeStartError("service_manager_unaddressable", detail=(
+            f"{label} is loaded in launchd (pid {pid if pid is not None else 'none'}) but no domain "
+            f"answered `launchctl print` ({', '.join(domains)}), so it cannot be started from here"))
     if installed:
         definition = _verify_binding(plistlib.loads, read_definition(plist))
         _verify_binding(verify_launchd_plist, definition, label, home)
         # Load ONLY the existing file, never bootout/rewrite or kickstart -k.
         return ExistingService("launchd", ("launchctl", "bootstrap", domains[0], str(plist)))
+    if unaddressable == len(domains):
+        # Not one domain could be asked: that is not "no service", and the caller must not read it
+        # as a dead gateway (nor spawn an owner beside one it cannot see).
+        raise RuntimeStartError("service_manager_unaddressable", detail=(
+            f"no launchd domain answered `launchctl print` ({', '.join(domains)}): launchctl cannot "
+            "address the service manager from this context"))
     return None
 
 

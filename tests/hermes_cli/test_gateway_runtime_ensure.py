@@ -386,7 +386,11 @@ def test_detached_restart_reports_a_spent_budget(monkeypatch, capsys, tmp_path):
 def test_native_launchd_ambiguous_domains_cannot_start(tmp_path, monkeypatch):
     from hermes_cli.gateway_runtime_service import discover_existing_gateway_service, RuntimeStartError
     peer = tmp_path / "inert_launchd.py"
-    peer.write_text("print('state = not running')\n", encoding="utf-8")
+    # Loaded in BOTH per-user domains (the conflict this test is about); the system domain holds
+    # no such job, exactly as on a host whose gateway is a per-user LaunchAgent.
+    peer.write_text("import sys\n"
+                    "if sys.argv[2].startswith('system/'):\n    sys.exit(113)\n"
+                    "print('state = not running')\n", encoding="utf-8")
     actual = subprocess.run
     calls = []
     def boundary(argv, **kwargs):
@@ -396,7 +400,8 @@ def test_native_launchd_ambiguous_domains_cannot_start(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", boundary)
     with pytest.raises(RuntimeStartError, match="service_scope_conflict"):
         discover_existing_gateway_service(tmp_path.resolve(), deadline=time.monotonic()+5)
-    assert len(calls) == 2 and all(argv[1] == "print" for argv in calls)
+    assert [argv[2].split("/")[0] for argv in calls] == ["gui", "user", "system"]
+    assert all(argv[1] == "print" for argv in calls)
 
 
 @pytest.mark.platforms("linux")
