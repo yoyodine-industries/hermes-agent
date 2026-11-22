@@ -263,6 +263,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_top_level_only": getattr(res, "skipped_top_level_only", []),
             "tick_yielded": res.tick_yielded,
             "host_budget": host_budget,
+            # Rule 1 of the dispatch-surface contract: the CAP and the DEPTH it was
+            # enforced against, on every tick and in machine-readable form. `demoted`
+            # names the rows moved ready->todo this tick; an empty list with `over` > 0
+            # on a lane would mean the pass did not converge, which is a defect, not a
+            # quiet day.
+            "ready_depth": res.ready_depth,
+            "ready_cap": res.ready_cap,
+            "ready_cap_error": res.ready_cap_error,
         }, ascii=True)
         return 0
     if res.skipped_board_disabled:
@@ -286,6 +294,20 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if items:
             print(f"  {', '.join(items)}")
     print(f"Promoted:     {res.promoted}")
+    # Rule 1 of the dispatch-surface contract: the cap is only a promise if it is READABLE.
+    # This line is the promise's receipt — ready/cap per lane, every tick, on the same
+    # surface an operator already reads. (A disabled cap prints nothing: 0/0 per lane would
+    # read as a throttle that is not there.)
+    from hermes_cli.kanban_ready_cap import format_depth_report as _fmt_depth
+
+    depth_line = _fmt_depth(getattr(res, "ready_depth", None) or {})
+    if depth_line:
+        print(depth_line)
+    demoted_now = (getattr(res, "ready_cap", None) or {}).get("demoted") or []
+    if demoted_now:
+        print(f"Ready cap:    demoted {len(demoted_now)} surplus ready card(s) to todo")
+    if getattr(res, "ready_cap_error", None):
+        print(f"Ready cap:    FAILED ({res.ready_cap_error}) — depth above is unenforced")
     print(f"Spawned:      {len(res.spawned)}")
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:

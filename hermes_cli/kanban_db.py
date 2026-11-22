@@ -1403,7 +1403,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     due_at               INTEGER,
     -- One of VALID_DUE_WINDOW_POLICIES; NULL reads as 'defer'. Recorded with the
     -- fence so the release leg can say which policy the fence was armed under.
-    due_window_policy    TEXT
+    due_window_policy    TEXT,
+    -- Rule 2 of the dispatch-surface contract (hermes_cli/kanban_filing_dedupe.py):
+    -- the (board, assignee, normalised title) digest of a filing's birth, and the
+    -- (board, emitter, body subject) digest. An OPEN row holding either key makes a
+    -- repeat filing an OCCURRENCE on this row, not a new card. NULL = legacy row, or a
+    -- card born before the rules were installed; both are simply not dedupe targets.
+    dedupe_key           TEXT,
+    body_key             TEXT,
+    -- How many filings this row stands for. 1 = one filing (every card born before the
+    -- rules, and every card the rules never matched). N > 1 = the card that absorbed
+    -- N filings (dedupe matches and emitter-quota rollups both count here).
+    occurrences          INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2168,6 +2179,37 @@ def create_task(
     if filing_refusal is not None:
         return filing_refusal
 
+    # THE DEDUPE + EMITTER-QUOTA SEAM (dispatch-surface contract, Rules 2 and 3;
+    # ``hermes_cli.kanban_filing_dedupe``). Same placement and same reason as the budget
+    # door above: this is the ONE moment every filing surface reaches, so a producer
+    # cannot opt out by wiring. Rule 2 answers "is this the same card?" with a REFUSAL
+    # that writes the occurrence onto the open card; Rule 3 answers "is this emitter
+    # flooding the door?" by absorbing the filing into that emitter's single rolling card.
+    # Both run BEFORE the write txn: the only writes they make are onto rows that already
+    # exist (the occurrence counter and its comment), never a half-built new card.
+    from hermes_cli import kanban_filing_dedupe as _dedupe
+    filing_leg = _dedupe.assess(
+        conn, board=dest_board, assignee=assignee, created_by=created_by,
+        title=title, body=body, idempotency_key=idempotency_key,
+    )
+    if filing_leg.get("refusal"):
+        from hermes_cli.kanban_filing_policy import FilingRefusal
+
+        return FilingRefusal(filing_leg["refusal"], filing_leg.get("record") or {})
+    if filing_leg.get("rollup_of"):
+        # The filing LANDED, on the emitter's rolling card: return that id, so a caller
+        # that prints "filed <id>" prints the card that actually holds the work.
+        return filing_leg["rollup_of"]
+    if filing_leg.get("as_rollup"):
+        rollup_max, rollup_hours, _ = _dedupe.quota_for(dest_board)
+        title, body = _dedupe.rollup_card_text(
+            conn, emitter=(created_by or "unknown").strip() or "unknown",
+            title=title, body=body, maximum=rollup_max, hours=rollup_hours,
+        )
+    dedupe_key_value = filing_leg.get("dedupe_key") or None
+    body_key_value = filing_leg.get("body_key") or None
+    dedupe_record = filing_leg.get("record") or {}
+
     # An unresolvable project link is DROPPED either way (never a dangling reference, never a
     # crash), but a silent drop is a silent failure: the caller believes the card is grouped
     # and it is not. Warn on stderr AND carry the finding into the ``created`` event, so the
@@ -2254,6 +2296,26 @@ def create_task(
                 top_level_parked = task_status == "ready" and _top_level_declares(title, body)
                 if top_level_parked:
                     task_status = "scheduled"
+                # RULE 1 of the dispatch-surface contract (hermes_cli/kanban_ready_cap.py):
+                # a card that would be born `ready` on a lane already AT its ready cap is
+                # born `todo` instead. The cap is what makes `ready` mean "startable inside
+                # the window": a ready depth the dispatcher cannot reach is a backlog wearing
+                # a queue's clothes. Nothing is lost — the row is filed in full, its comment
+                # names the cap, and the dispatcher promotes it in (priority desc, created_at
+                # asc) order as slots free.
+                cap_hold_note = ""
+                from hermes_cli import kanban_ready_cap as _ready_cap
+
+                if task_status == "ready":
+                    try:
+                        cap_held, cap_hold_note = _ready_cap.hold_at_cap(
+                            conn, assignee=assignee, board=dest_board,
+                        )
+                    except Exception as exc:  # a cap must never fail a FILING
+                        cap_held, cap_hold_note = False, ""
+                        _log.warning("kanban: ready-cap assessment failed, card born ready: %s", exc)
+                    if cap_held:
+                        task_status = "todo"
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -2287,8 +2349,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        dedupe_key, body_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), card_body, assignee, task_status, priority,
@@ -2298,6 +2361,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        dedupe_key_value, body_key_value,
                     ),
                 )
                 for pid in parents:
@@ -2331,8 +2395,21 @@ def create_task(
                         # producer hit is readable next to the filings that got through. No
                         # policy file = no key (upstream's payload, byte for byte).
                         **({"filing_policy": filing_record} if filing_record else {}),
+                        # Rules 2/3's reading, when they did something: a rollup card says
+                        # which quota opened it; a normal card writes no key at all.
+                        **({"filing_dedupe": dedupe_record} if dedupe_record else {}),
                     },
                 )
+                if cap_hold_note:
+                    # The author must be able to read WHY their card is not dispatchable;
+                    # an unexplained `todo` is a silent throttle. The comment is the record
+                    # a human sees, the event is the record a machine reads.
+                    add_comment(conn, task_id, "kanban", cap_hold_note)
+                    _append_event(
+                        conn, task_id, "ready_cap_held",
+                        {"lane": assignee, "cap": _ready_cap.cap_for(dest_board),
+                         "status": "todo"},
+                    )
                 # The measured reason travels WITH the card (t_b58332a4 -> t_4bec5cfe): the author
                 # sees WHY a declared repo contract became local-only, rather than discovering a
                 # silent downgrade. Only written when the contract actually moved; an unreadable
@@ -4527,6 +4604,28 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def reconcile_ready_depth(conn: sqlite3.Connection, *, board: Optional[str] = None,
+                          now: Optional[int] = None) -> dict:
+    """Rule 1's reconciliation pass — see ``hermes_cli.kanban_ready_cap``.
+
+    Kept as a thin kernel-level name so the dispatcher (and its tests) reach the pass the
+    way they reach every other tick phase (``recompute_ready``, ``demote_above_tranche``),
+    without importing the module's internals or knowing where the numbers come from.
+    """
+    from hermes_cli import kanban_ready_cap as _ready_cap
+
+    return _ready_cap.reconcile_ready_depth(conn, board=board, now=now)
+
+
+def ready_depth_report(conn: sqlite3.Connection, *, board: Optional[str] = None) -> dict:
+    """``{cap, enabled, total_ready, lanes:[{lane, ready, cap, over, at_cap}]}`` — Rule 1's
+    visible half. Read-only; the dispatcher carries it on its own result so the cap can
+    never become a silent throttle."""
+    from hermes_cli import kanban_ready_cap as _ready_cap
+
+    return _ready_cap.depth_report(conn, board=board)
+
+
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
@@ -4542,10 +4641,29 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    # RULE 1 (dispatch-surface contract, hermes_cli/kanban_ready_cap.py): THIS is the one
+    # place a `todo` card becomes `ready`, so it is where the cap has to be honoured — a
+    # blind promotion here would undo the birth hold on the very next tick. Two changes,
+    # both required by the rule: the candidate list is read in DISPATCH RANK order
+    # (priority desc, created_at asc) so a freed slot promotes exactly the highest-ranked
+    # waiting card, and a `todo` row whose lane is at its cap is HELD in `todo` this tick
+    # (no event: it was not promoted, and a per-tick event on 4,000 queued cards would be
+    # noise). A `blocked` row resuming after its circuit breaker is NOT cap-refused: its
+    # hold is a failure clock, not a queue position, and refusing the resume would turn a
+    # recovered card into a silent park.
+    from hermes_cli import kanban_ready_cap as _ready_cap
+
+    try:
+        _cap_board = board_for_connection(conn)
+    except Exception:
+        _cap_board = None
+    _ready_cap_value = _ready_cap.cap_for(_cap_board)
+    _depths = _ready_cap.lane_depths(conn) if _ready_cap_value > 0 else {}
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "SELECT id, status, consecutive_failures, max_retries, assignee "
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "ORDER BY priority DESC, created_at ASC, id ASC"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -4577,10 +4695,19 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                         "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
                     )
                 else:
+                    if resume_status == "ready" and _ready_cap_value > 0:
+                        _lane = row["assignee"] or ""
+                        if _lane and _depths.get(_lane, 0) >= _ready_cap_value:
+                            # Held in `todo`: the lane is at its ready cap. The card is
+                            # first in its lane's rank order, so it promotes the tick a
+                            # slot frees -- exactly the promise `ready` now makes.
+                            continue
                     conn.execute(
                         "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
+                if resume_status == "ready" and (row["assignee"] or ""):
+                    _depths[row["assignee"]] = _depths.get(row["assignee"], 0) + 1
                 _append_event(
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
