@@ -281,6 +281,24 @@ def test_diagnostics_exclude_cards_whose_record_carries_a_cause(kanban_home, mon
 # ---------------------------------------------------------------------------
 
 
+def test_diagnostics_list_the_class_on_a_BOARD_WIDE_call(kanban_home):
+    """The rule's whole point is the board-wide list, and `hermes kanban diagnostics`
+    names EVERY card id: one `IN (?,?…)` past SQLite's variable cap raised "too many SQL
+    variables" and made the surface (and this rule) unusable on a real board. Both bulk
+    id loaders must chunk — exercised here with more ids than SQLite binds."""
+    with kbc.connect_closing() as conn:
+        sealed = _sealed_block(conn)
+        other = kb.create_task(conn, title="unrelated", assignee="worker")
+        ids = [f"t_{i:08x}" for i in range(1200)] + [sealed, other]
+
+        rows = kc._rows_by_task(conn, "task_events", ids)
+        assert rows[sealed] and [r["id"] for r in rows[sealed]] == sorted(
+            r["id"] for r in rows[sealed])
+        graph = kb.task_graph_contexts(conn, ids)
+        assert graph[sealed] == {"parents": [], "children": []}
+        assert "blocked_without_reason" in _diag_kinds(conn, sealed)
+
+
 def test_cli_set_block_reason_records_in_place(kanban_home):
     with kbc.connect_closing() as conn:
         tid = _sealed_block(conn)

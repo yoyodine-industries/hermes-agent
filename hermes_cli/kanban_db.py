@@ -131,6 +131,10 @@ BLOCK_RECURRENCE_LIMIT = 2
 # stale-block clock and read as a re-block to every event-counting sweep. Readers
 # of the block record must prefer the newest of ``blocked`` / ``block_reason_set``.
 BLOCK_REASON_EVENT = "block_reason_set"
+
+# Batches for board-wide id lists (SQLite caps one statement's variables at 999 on
+# historical builds; 400 keeps a wide margin while staying one indexed IN per chunk).
+_GRAPH_QUERY_CHUNK = 400
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # --- The due contract (``due_at``) -----------------------------------------
@@ -3144,16 +3148,20 @@ def task_graph_contexts(conn: sqlite3.Connection, task_ids: Iterable[str]) -> di
     if not ordered_ids:
         return contexts
 
-    placeholders = ",".join("?" for _ in ordered_ids)
-    for bucket, own, other in (("parents", "child_id", "parent_id"), ("children", "parent_id", "child_id")):
-        for row in conn.execute(
-            f"SELECT l.{own} AS owner_id, t.id, t.title, t.status "
-            f"FROM task_links l JOIN tasks t ON t.id = l.{other} "
-            f"WHERE l.{own} IN ({placeholders}) ORDER BY l.{own}, t.id", tuple(ordered_ids),
-        ).fetchall():
-            contexts[row["owner_id"]][bucket].append(
-                {"id": row["id"], "title": row["title"], "status": row["status"]}
-            )
+    # Batched under SQLite's variable cap: a board-wide diagnostics call names EVERY task
+    # id, and one `IN (?,?…)` past the cap dies with "too many SQL variables".
+    for start in range(0, len(ordered_ids), _GRAPH_QUERY_CHUNK):
+        part = ordered_ids[start:start + _GRAPH_QUERY_CHUNK]
+        placeholders = ",".join("?" for _ in part)
+        for bucket, own, other in (("parents", "child_id", "parent_id"), ("children", "parent_id", "child_id")):
+            for row in conn.execute(
+                f"SELECT l.{own} AS owner_id, t.id, t.title, t.status "
+                f"FROM task_links l JOIN tasks t ON t.id = l.{other} "
+                f"WHERE l.{own} IN ({placeholders}) ORDER BY l.{own}, t.id", tuple(part),
+            ).fetchall():
+                contexts[row["owner_id"]][bucket].append(
+                    {"id": row["id"], "title": row["title"], "status": row["status"]}
+                )
     return contexts
 
 

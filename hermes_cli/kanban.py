@@ -914,11 +914,28 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
 
 
 def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
-    """``{task_id: [rows ordered by id]}`` for every id (empty list when none)."""
+    """``{task_id: [rows ordered by id]}`` for every id (empty list when none).
+
+    Batched: a board-wide call names every task id, and SQLite caps the variables in
+    one statement (999 by default), so a single ``IN (?,?,…)`` dies with
+    ``too many SQL variables`` on any board past a few hundred cards — which made
+    ``hermes kanban diagnostics`` unusable exactly where the fleet needs it. Chunk the
+    ids under the cap and concatenate in id order.
+    """
     by = {i: [] for i in ids}
-    placeholders = ",".join(["?"] * len(ids))
-    for row in conn.execute(f"SELECT * FROM {table} WHERE task_id IN ({placeholders}) ORDER BY id", tuple(ids)):
-        by.setdefault(row["task_id"], []).append(row)
+    chunk = 400                      # comfortably under SQLite's historical 999-variable cap
+    for start in range(0, len(ids), chunk):
+        part = ids[start:start + chunk]
+        if not part:
+            continue
+        placeholders = ",".join(["?"] * len(part))
+        for row in conn.execute(
+            f"SELECT * FROM {table} WHERE task_id IN ({placeholders}) ORDER BY id",
+            tuple(part),
+        ):
+            by.setdefault(row["task_id"], []).append(row)
+    for rows in by.values():
+        rows.sort(key=lambda r: r["id"])   # chunks break global id order; callers require it
     return by
 
 
