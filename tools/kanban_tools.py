@@ -1097,11 +1097,34 @@ def _handle_block(args: dict, **kw) -> str:
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
         due_at, window_policy = _due_args(args)
+        caller_run_id = _worker_run_id(tid)
+        # A PARKED card has no run for anyone to own (card t_84f64ea9). The kernel's
+        # classify-in-place branch (``kanban_db.block_task``: status=blocked,
+        # block_kind IS NULL, current_run_id IS NULL, ``expected_run_id is None``) is
+        # the one door that types a park the failure breaker wrote without a kind --
+        # ``kanban_db_dispatch._record_task_failure`` parks ``blocked`` with
+        # consecutive_failures + last_failure_error and no block_kind (measured
+        # 2026-11-22: 1267 of the 1295 untyped platform parks carry a ``gave_up``
+        # event). This handler asserted this worker's run id unconditionally, so the
+        # lane that OWNS such a card could never satisfy the branch: it was refused
+        # verbatim "the live row is status=blocked; no run owns it" (t_9bd1355b,
+        # 2026-11-10), which is what left ``block_kind IS NULL`` a one-way door and
+        # the ladder minting a resolver for an ``unclassifiable`` park instead.
+        # Drop the run assertion exactly where no run can own the row, and only when
+        # the caller supplies the kind the branch requires. No authority is widened:
+        # the kernel re-checks all four conditions inside its write txn, so a live
+        # claim, an already-typed park, or a kind-less call is refused exactly as
+        # before -- this is the same door a CLI/human caller already had.
+        expected_run_id = caller_run_id
+        if (expected_run_id is not None and kind is not None
+                and task is not None and task.status == "blocked"
+                and task.block_kind is None and task.current_run_id is None):
+            expected_run_id = None
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, waits_on=waits_on or (),
                            due_at=due_at, window_policy=window_policy,
-                           expected_run_id=_worker_run_id(tid))
+                           expected_run_id=expected_run_id)
         _check(ok, kb.live_row_refusal(
-            conn, tid, caller_run_id=_worker_run_id(tid), verb="block"))
+            conn, tid, caller_run_id=caller_run_id, verb="block"))
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
         if kind == "dependency" and landed_kind != kind:
