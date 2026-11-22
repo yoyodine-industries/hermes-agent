@@ -1655,7 +1655,7 @@ def _reset_for_tests() -> None:
         _held_copies.clear()
 
 
-def _main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[list[str]] = None) -> int:
     """``python -m tools.async_delegation`` — the delivery ledger's own census and invariant check.
 
     ``--assert`` is meant for a startup path or an ops check: it exits non-zero when a row carries
