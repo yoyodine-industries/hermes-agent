@@ -174,25 +174,161 @@ def test_engine_works_on_sqlite_row_objects(kanban_home):
 # ---------------------------------------------------------------------------
 # stranded_in_ready
 #
-# Surfaces ready tasks that nobody has claimed within the threshold.
-# Identity-agnostic by design: catches typo'd assignees, deleted profiles,
-# down external worker pools, and misconfigured dispatchers in one rule.
+# The trigger is a failed START: a run row with a failed-start outcome inside
+# the evidence window, an assignee with no live profile, or a lane that claimed
+# nothing while the dispatcher is demonstrably running. Queue depth is CONTEXT.
+# On a net-sink board (producers outrun the drain) every ready card is old, so
+# age alone must never raise a warning.
 # ---------------------------------------------------------------------------
 
+_NOW = int(time.time())
 
-def test_stranded_in_ready_fires_when_age_exceeds_threshold():
-    """Default threshold = 30 min. A ready task promoted 45 min ago
-    with no claim should fire as a warning."""
-    now = 100_000
-    task = _task(status="ready", assignee="demo", claim_lock=None)
-    # 45 min = 2700s, threshold = 1800s.
-    events = [_event("created", ts=now - 45 * 60)]
-    diags = kd.compute_task_diagnostics(task, events, [], now=now)
-    stranded = [d for d in diags if d.kind == "stranded_in_ready"]
-    assert len(stranded) == 1
-    assert stranded[0].severity == "warning"
-    assert stranded[0].data["age_seconds"] == 45 * 60
-    assert stranded[0].data["assignee"] == "demo"
+
+def _ready_card(conn, *, title, assignee, age_seconds):
+    """A ready card that has been waiting ``age_seconds`` (no created event, so
+    the rule's ready-clock falls back to ``created_at``)."""
+    tid = kb.create_task(conn, title=title, assignee=assignee)
+    conn.execute("DELETE FROM task_events WHERE task_id = ?", (tid,))
+    conn.execute(
+        "UPDATE tasks SET status = 'ready', created_at = ?, started_at = NULL WHERE id = ?",
+        (_NOW - age_seconds, tid),
+    )
+    conn.commit()
+    return tid
+
+
+def _run_row(conn, task_id, *, profile, outcome, started_offset, error=None):
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, error) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_id, profile, outcome or "running", _NOW - started_offset,
+         None if outcome is None else _NOW - started_offset + 30, outcome, error),
+    )
+    conn.commit()
+
+
+def _stranded_diags(conn, task_id, *, known_profiles=None, window=86400):
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    events = list(conn.execute("SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)))
+    runs = list(conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,)))
+    ctx = kd.build_lane_context(
+        conn, now=_NOW, window_seconds=window, known_profiles=set(known_profiles or ()))
+    diags = kd.compute_task_diagnostics(
+        row, events, runs, now=_NOW, config={"_lane_context": ctx})
+    return [d for d in diags if d.kind == "stranded_in_ready"]
+
+
+def test_deep_ready_queue_with_recent_claims_is_backlog_not_stranded(kanban_home):
+    """Acceptance (a): a lane with a deep ready queue AND recent successful
+    claims produces no stranded_in_ready warning — age is backlog, not failure."""
+    conn = kbc.connect()
+    try:
+        for i in range(30):
+            _ready_card(conn, title=f"q{i}", assignee="alpha", age_seconds=6 * 86400 - i * 60)
+        oldest = _ready_card(conn, title="oldest", assignee="alpha", age_seconds=6 * 86400)
+        for i in range(3):
+            _run_row(conn, oldest, profile="alpha", outcome="completed", started_offset=300 + i * 60)
+        assert _stranded_diags(conn, oldest, known_profiles={"alpha"}) == []
+    finally:
+        conn.close()
+
+
+def test_lane_with_no_claims_while_dispatcher_runs_fires_once(kanban_home):
+    """Acceptance (b): ready work + zero claims in the window + a running
+    dispatcher (another lane keeps claiming) = ONE finding naming the lane."""
+    conn = kbc.connect()
+    try:
+        beta_old = _ready_card(conn, title="beta-old", assignee="beta", age_seconds=3 * 86400)
+        beta_new = _ready_card(conn, title="beta-new", assignee="beta", age_seconds=3600)
+        alpha = _ready_card(conn, title="alpha", assignee="alpha", age_seconds=7200)
+        # The dispatcher is alive: it claimed alpha two minutes ago.
+        _run_row(conn, alpha, profile="alpha", outcome="completed", started_offset=120)
+
+        stranded = _stranded_diags(conn, beta_old, known_profiles={"alpha", "beta"})
+        assert len(stranded) == 1
+        d = stranded[0]
+        assert d.severity == "critical"
+        assert d.data["trigger"] == "no_claim"
+        assert "beta" in d.title and "beta" in d.data["assignee"]
+        assert "no claim" in d.detail
+        # Depth rides along as context and words itself as such.
+        assert "Depth is context" in d.detail
+        assert d.data["lane_ready_depth"] == 2
+
+        # One finding per lane: the rest of that lane's queue stays quiet.
+        assert _stranded_diags(conn, beta_new, known_profiles={"alpha", "beta"}) == []
+    finally:
+        conn.close()
+
+
+def test_assignee_without_live_profile_still_fires(kanban_home):
+    """Acceptance (c): the rule's original purpose — a typo'd / deleted profile
+    can never be claimed, so it fires even though the queue is not the cause.
+    The finding names the dispatcher's own skip reason."""
+    conn = kbc.connect()
+    try:
+        ghost = _ready_card(conn, title="ghost", assignee="ghost", age_seconds=2 * 3600)
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            (ghost, "skipped_nonspawnable", '{"assignee": "ghost"}', _NOW - 1800),
+        )
+        conn.commit()
+        stranded = _stranded_diags(conn, ghost, known_profiles={"alpha"})
+        assert len(stranded) == 1
+        assert stranded[0].severity == "critical"
+        assert stranded[0].data["trigger"] == "profile_missing"
+        assert "ghost" in stranded[0].title
+        assert "skipped_nonspawnable" in stranded[0].detail
+    finally:
+        conn.close()
+
+
+def test_failed_start_on_the_card_fires_with_its_outcome(kanban_home):
+    """A claim that raised (spawn_failed inside the window) is a failed START
+    and fires, even though the lane itself is otherwise healthy."""
+    conn = kbc.connect()
+    try:
+        card = _ready_card(conn, title="crashed", assignee="alpha", age_seconds=3 * 3600)
+        _run_row(conn, card, profile="alpha", outcome="spawn_failed",
+                 started_offset=1800, error="[Errno 24] Too many open files")
+        stranded = _stranded_diags(conn, card, known_profiles={"alpha"})
+        assert len(stranded) == 1
+        d = stranded[0]
+        assert d.severity == "warning"
+        assert d.data["trigger"] == "failed_start"
+        assert d.data["last_start_outcome"] == "spawn_failed"
+        assert "Too many open files" in d.detail
+        assert "not queue depth" in d.detail
+    finally:
+        conn.close()
+
+
+def test_stale_failed_start_outside_the_window_is_backlog(kanban_home):
+    """The platform board's 5,869 cards whose last start failed 8 days ago are
+    backlog once the lane has claimed since — an old failure is not evidence the
+    lane is broken now."""
+    conn = kbc.connect()
+    try:
+        card = _ready_card(conn, title="old-failure", assignee="alpha", age_seconds=9 * 86400)
+        _run_row(conn, card, profile="alpha", outcome="spawn_failed", started_offset=8 * 86400)
+        _run_row(conn, card, profile="alpha", outcome="completed", started_offset=600)
+        # completed run is the latest -> no failed start at all
+        assert _stranded_diags(conn, card, known_profiles={"alpha"}) == []
+        # ...and even with only the old failure on record it is outside the window
+        conn.execute("DELETE FROM task_runs WHERE outcome = 'completed'")
+        conn.commit()
+        assert _stranded_diags(conn, card, known_profiles={"alpha"}) == []
+    finally:
+        conn.close()
+
+
+def test_no_lane_context_does_not_flag_depth(kanban_home):
+    """Standalone callers with no evidence channel get silence, never the old
+    age-only 'no worker' claim."""
+    diags = kd.compute_task_diagnostics(
+        _task(status="ready", assignee="demo"), [_event("created", ts=_NOW - 45 * 60)], [],
+        now=_NOW)
+    assert [d for d in diags if d.kind == "stranded_in_ready"] == []
 
 
 
