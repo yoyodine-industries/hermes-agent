@@ -236,7 +236,7 @@ def _profile_author() -> str:
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
-    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block", "set-block-reason",
     # set-contract is a DECLARATION rewrite (which contract the card must satisfy to close), so a
     # delegated child — inside the parent's own process or a spawned descendant — must not perform
     # it. It was already an ESTATE write (tree_identity.ESTATE_MUTATING_ACTIONS); this closes the
@@ -914,11 +914,28 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
 
 
 def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
-    """``{task_id: [rows ordered by id]}`` for every id (empty list when none)."""
+    """``{task_id: [rows ordered by id]}`` for every id (empty list when none).
+
+    Batched: a board-wide call names every task id, and SQLite caps the variables in
+    one statement (999 by default), so a single ``IN (?,?,…)`` dies with
+    ``too many SQL variables`` on any board past a few hundred cards — which made
+    ``hermes kanban diagnostics`` unusable exactly where the fleet needs it. Chunk the
+    ids under the cap and concatenate in id order.
+    """
     by = {i: [] for i in ids}
-    placeholders = ",".join(["?"] * len(ids))
-    for row in conn.execute(f"SELECT * FROM {table} WHERE task_id IN ({placeholders}) ORDER BY id", tuple(ids)):
-        by.setdefault(row["task_id"], []).append(row)
+    chunk = 400                      # comfortably under SQLite's historical 999-variable cap
+    for start in range(0, len(ids), chunk):
+        part = ids[start:start + chunk]
+        if not part:
+            continue
+        placeholders = ",".join(["?"] * len(part))
+        for row in conn.execute(
+            f"SELECT * FROM {table} WHERE task_id IN ({placeholders}) ORDER BY id",
+            tuple(part),
+        ):
+            by.setdefault(row["task_id"], []).append(row)
+    for rows in by.values():
+        rows.sort(key=lambda r: r["id"])   # chunks break global id order; callers require it
     return by
 
 
@@ -1437,19 +1454,45 @@ def _cmd_block(args: argparse.Namespace) -> int:
             else " — due time cleared (stays blocked until released by hand)"
         )
     failures: dict[str, str] = {}
+    corrected: set[str] = set()
 
     def op(tid: str) -> bool:
         try:
-            return kb.block_task(
+            current = kb.get_task(conn, tid)
+            already_blocked = current is not None and current.status == "blocked"
+            if already_blocked and reason and any(
+                e.kind == "blocked" for e in kb.list_events(conn, tid)
+            ):
+                # The card ALREADY has a block record: this call is a record correction, not
+                # a transition. Correct it in place — the original `blocked` event (and the
+                # card's blocked_at) must survive, and unblock+re-block would trip the loop
+                # breaker into triage carrying a LOOP verdict instead of the real cause.
+                if not kb.set_block_reason(conn, tid, reason=reason, kind=kind):
+                    return False
+                corrected.add(tid)
+                return True
+            if kb.block_task(
                 conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
                 due_at=due_at, window_policy=window_policy,
-            )
-        except ValueError as exc:  # --due with --kind dependency, policy with no fence
+            ):
+                return True
+            # A breaker-parked card has no `blocked` event yet; block_task's in-place
+            # classifier appends one when a kind is supplied, and this is the fallback for a
+            # kind-less call: record the reason without inventing a re-block.
+            if already_blocked and reason and kb.set_block_reason(
+                conn, tid, reason=reason, kind=kind,
+            ):
+                corrected.add(tid)
+                return True
+            return False
+        except ValueError as exc:  # --due with --kind dependency, policy with no fence, bad kind
             failures[tid] = f"{tid}: {exc}"
             return False
 
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
+            if tid in corrected:
+                return f"Recorded block reason on {tid} (still blocked){suffix}"
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
             landed = kb.get_task(conn, tid)
             where = landed.status if landed else "blocked"
@@ -1466,6 +1509,46 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
         op = _commented(conn, reason, author, "BLOCKED", op, verb="block")
         return _bulk_apply(ids, op, ok_msg, lambda tid: failures.get(tid) or f"cannot block {tid}")
+
+
+def _cmd_set_block_reason(args: argparse.Namespace) -> int:
+    """Record or REPLACE an already-blocked card's reason IN PLACE.
+
+    The repair door for a sealed block. It is not a transition: no unblock, no
+    re-block, so the block-loop breaker is never consulted and the card cannot be
+    routed to ``triage`` carrying a loop verdict instead of its real cause.
+    """
+    reason = _joined_words(args.reason) or ""
+    if not reason.strip():
+        return _err('set-block-reason needs the reason text: '
+                    'hermes kanban set-block-reason <id> "<reason>" [--kind ...]')
+    kind = getattr(args, "kind", None)
+    author = _profile_author()
+    ids = _bulk_ids(args)
+    suffix = f": {reason}"
+    failures: dict[str, str] = {}
+
+    def op(tid: str) -> bool:
+        try:
+            return kb.set_block_reason(conn, tid, reason=reason, kind=kind)
+        except ValueError as exc:
+            failures[tid] = f"{tid}: {exc}"
+            return False
+
+    with kbc.connect_closing() as conn:
+        def ok_msg(tid):
+            landed = kb.get_task(conn, tid)
+            where = landed.status if landed else "blocked"
+            recorded_kind = getattr(landed, "block_kind", None) or kind or "needs_input"
+            return f"Recorded block reason on {tid} ({where}, kind {recorded_kind}){suffix}"
+
+        op = _commented(conn, reason, author, "BLOCK REASON SET", op, verb="set-block-reason")
+        return _bulk_apply(
+            ids, op, ok_msg,
+            lambda tid: failures.get(tid) or (
+                f"cannot set a block reason on {tid} (not blocked — a block record exists "
+                f"only on a blocked card)"),
+        )
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -2159,6 +2242,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
+    "set-block-reason": _cmd_set_block_reason,
     "set-contract": _cmd_set_contract, "retarget": _cmd_retarget,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock, "reopen": _cmd_reopen,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
@@ -2194,7 +2278,9 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
-  `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `block <id> [reason]` Mark blocked; on an ALREADY-blocked card it records the missing reason in place
+  `set-block-reason <id> <reason>`  Record/replace a blocked card's reason without unblocking (no loop breaker)
+  `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

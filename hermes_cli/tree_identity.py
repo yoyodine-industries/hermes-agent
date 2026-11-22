@@ -78,7 +78,7 @@ class TreeSkewRefusal(RuntimeError):
 #: here (and in the test) rather than closed from this side.
 ESTATE_MUTATING_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
-    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block", "set-block-reason",
     "set-contract", "set-model", "schedule", "unblock", "promote", "archive",
     "dispatch", "daemon",
     "repair", "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",

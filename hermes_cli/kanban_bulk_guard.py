@@ -167,7 +167,7 @@ BULK_SURFACES: dict[str, dict[str, Callable]] = {
 }
 
 #: The ``--ids`` bulk-mode verbs: bulk exactly when more than one id is named.
-for _verb in ("block", "schedule", "promote"):
+for _verb in ("block", "schedule", "promote", "set-block-reason"):
     BULK_SURFACES[_verb] = {
         "bulk": lambda p: len(p.get("ids") or ()) > 1,
         "scope": lambda p: f"ids={_csv_ids(p.get('ids'))}",
