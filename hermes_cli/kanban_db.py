@@ -124,6 +124,13 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+
+# The event a REASON-ONLY correction writes (:func:`set_block_reason`). Distinct
+# from ``blocked`` on purpose: the card's ``blocked_at`` is the newest ``blocked``
+# event, so a correction recorded as a second ``blocked`` event would restart the
+# stale-block clock and read as a re-block to every event-counting sweep. Readers
+# of the block record must prefer the newest of ``blocked`` / ``block_reason_set``.
+BLOCK_REASON_EVENT = "block_reason_set"
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # --- The due contract (``due_at``) -----------------------------------------
@@ -6800,6 +6807,13 @@ def block_task(
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
 
+    A card that is already blocked and needs its RECORD corrected — a missing or
+    wrong reason/kind — is not this function's job: it is not a transition, and
+    unblocking to re-block would trip the loop breaker into ``triage`` carrying a
+    loop verdict instead of the real cause. Use :func:`set_block_reason`; the
+    ``block`` CLI verb falls back to it so ``hermes kanban block <id> "<reason>"``
+    answers an already-blocked card in place.
+
     ``waits_on`` DECLARES the dependency edge: every card named is validated
     (exists on this board, no cycle) through the live
     :mod:`hermes_cli.kanban_gate_invariants` gate and, after the transition,
@@ -6968,6 +6982,95 @@ def block_task(
                 _append_event(conn, task_id, "dependency_edge_refused",
                               {"parent": parent_id, "error": str(exc)})
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    return True
+
+
+def block_record(conn: sqlite3.Connection, task_id: str) -> tuple[str, str]:
+    """``(reason, kind)`` as the card's block record now reads it.
+
+    The newest ``blocked`` event, or the newest ``block_reason_set`` correction when
+    one is newer. A correction never rewrites history: the original ``blocked``
+    event — and with it the card's ``blocked_at`` — stays exactly where it was, which
+    is why the correction is its own event kind rather than a second ``blocked``.
+    ``kind`` falls back to the event payload when the board has no ``block_kind``
+    column to read.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, BLOCK_REASON_EVENT),
+    ).fetchone()
+    payload = _json_dict(_row_get(row, "payload")) if row is not None else {}
+    reason = str(payload.get("reason") or "")
+    kind = str(payload.get("kind") or payload.get("block_kind") or "").strip().lower()
+    return reason, kind
+
+
+def set_block_reason(
+    conn: sqlite3.Connection, task_id: str, *, reason: str,
+    kind: Optional[str] = None,
+) -> bool:
+    """Record or replace an ALREADY-blocked card's reason IN PLACE.
+
+    A record correction, not a state transition: the status stays ``blocked``, the
+    card's original ``blocked`` event (its ``blocked_at``) is untouched, and the
+    block-loop breaker is never consulted — its subject is a card CYCLING between
+    blocked and unblocked, and a card that never left ``blocked`` cannot be in a
+    loop. The correction is appended as a ``block_reason_set`` event carrying the
+    new reason/kind plus the values it replaced; every reader of the block record
+    must prefer it to the older ``blocked`` event (:func:`block_record` does).
+
+    This is the repair door for a SEALED block — ``blocked`` with no reason, which
+    a reader cannot act on and which ``block``/unblock+block could only make worse
+    (unblock+re-block trips the breaker into ``triage`` carrying a loop verdict
+    instead of the real cause).
+
+    ``kind`` omitted keeps the card's recorded kind. A card the failure breaker
+    parked UNTYPED (``block_kind IS NULL``) and left untyped defaults to
+    ``needs_input`` — the sticky "a human must act" class the parked state already
+    implies — and the event records that it was DEFAULTED rather than asserted.
+
+    Returns True when the card's record now carries *reason* — including when it
+    already did, in which case nothing is written (idempotent, so a retried repair
+    is not a second audit entry). Raises ``ValueError`` for an empty reason or an
+    unknown kind. Returns False for a card that is not ``blocked``: there is no
+    block record to correct, and a reason written nowhere is a false green.
+    """
+    text = (reason or "").strip()
+    if not text:
+        raise ValueError("a block reason must be non-empty text")
+    if kind is not None and kind not in VALID_BLOCK_KINDS:
+        raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)}")
+    columns = _fence_guard(conn, UNSET)
+    has_kind_column = "block_kind" in columns
+    with write_txn(conn):
+        select_cols = _present_columns(columns, ("status", "block_kind"))
+        row = conn.execute(
+            f"SELECT {select_cols} FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or _row_get(row, "status") != "blocked":
+            return False
+        prev_reason, prev_kind = block_record(conn, task_id)
+        recorded_kind = str(_row_get(row, "block_kind") or prev_kind or "").strip().lower()
+        new_kind = (kind or recorded_kind or "needs_input").strip().lower()
+        kind_defaulted = kind is None and not recorded_kind
+        if prev_reason.strip() == text and recorded_kind == new_kind:
+            # The record already says this: a second identical correction appends nothing.
+            return True
+        if has_kind_column:
+            conn.execute(
+                "UPDATE tasks SET block_kind = ? WHERE id = ? AND status = 'blocked'",
+                (new_kind, task_id),
+            )
+        _append_event(conn, task_id, BLOCK_REASON_EVENT, {
+            "reason": text,
+            "kind": new_kind,
+            "previous_reason": prev_reason or None,
+            "previous_kind": recorded_kind or None,
+            "kind_defaulted": kind_defaulted,
+            "in_place": True,
+        })
     return True
 
 

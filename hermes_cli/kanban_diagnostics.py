@@ -113,6 +113,35 @@ def _latest_event_ts(events: Iterable[Any], kinds: set[str]) -> int:
     return max([0, *(_event_ts(ev) for ev in events if _event_kind(ev) in kinds)])
 
 
+def _block_record(events: Iterable[Any]) -> tuple[str, str, int]:
+    """``(reason, kind, blocked_at)`` from the card's own block record.
+
+    The newest ``blocked`` event supplies ``blocked_at`` and the original reason;
+    a ``block_reason_set`` correction appended after it (``kanban_db.
+    set_block_reason``) supplies the record's CURRENT reason/kind without rewriting
+    that history, so ``blocked_at`` never moves on a repair. When no ``blocked``
+    event exists at all, a breaker park's ``gave_up`` event is the record — the
+    dispatcher writes its cause into that payload, so such a card is NOT
+    reason-less. Callers pass events in id (arrival) order, which the DB provides.
+    """
+    reason, kind, blocked_at = "", "", 0
+    for ev in events:
+        k = _event_kind(ev)
+        if k == "blocked":
+            payload = _parse_payload(ev)
+            blocked_at = _event_ts(ev)
+            reason = str(payload.get("reason") or "")
+            kind = str(payload.get("kind") or payload.get("block_kind") or "").strip().lower()
+        elif k == "block_reason_set":
+            payload = _parse_payload(ev)
+            reason = str(payload.get("reason") or "")
+            kind = str(payload.get("kind") or "").strip().lower()
+        elif k == "gave_up" and blocked_at == 0:
+            payload = _parse_payload(ev)
+            reason = str(payload.get("error") or payload.get("reason") or "")
+    return reason, kind, blocked_at
+
+
 def _latest_gave_up_is_terminal_provider(events: Iterable[Any]) -> bool:
     """True when the most recent breaker trip was a terminal provider error (credential
     revoked, model gone) and nothing has resumed the task since."""
@@ -665,6 +694,41 @@ def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagno
     )]
 
 
+def _rule_blocked_without_reason(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """``blocked`` whose block record carries NO reason: a sealed block.
+
+    The state says a human must act and nothing says on what — so every reader that
+    trusts the record (an escalation filer, a rung, the next operator) has nothing to
+    report. Until ``kanban_db.set_block_reason`` existed the only visible "fix" was
+    unblock+re-block, which trips the block-loop breaker into ``triage`` carrying a
+    LOOP verdict instead of the real cause; the notice was therefore actionable only
+    by making the card's state worse. This rule makes the class visible board-wide,
+    and its action is the in-place repair.
+
+    NOT this class: a breaker park (``gave_up``) — the dispatcher writes its cause
+    into that event — and any card whose record already carries a reason, including
+    one recorded by a ``block_reason_set`` correction.
+    """
+    if _task_field(task, "status") != "blocked":
+        return []
+    reason, kind, blocked_at = _block_record(events)
+    if reason.strip():
+        return []
+    task_id = _task_field(task, "id", "")
+    command = f'hermes kanban set-block-reason {task_id} "<reason>" --kind needs_input'
+    return [Diagnostic(
+        kind="blocked_without_reason", severity="warning",
+        title="Blocked with no reason recorded",
+        detail="This card is blocked, so someone is expected to act, but its block record "
+               "carries no reason: the state says 'stop' and nothing says why. Repair the "
+               "record in place — never unblock just to re-block with a reason, which trips "
+               "the block-loop breaker into triage carrying a different cause.",
+        actions=[_cli_hint(f"Record the reason in place: {command}", command, suggested=True)],
+        first_seen_at=blocked_at or now, last_seen_at=now, count=1,
+        data={"block_kind": kind or None, "blocked_at": blocked_at or None},
+    )]
+
+
 def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Blocked for >= cfg["blocked_stale_hours"] (default 24) with no comment
     or unblock since the last ``blocked`` event."""
@@ -997,6 +1061,7 @@ _RULES: list[RuleFn] = [
     _rule_repeated_crashes,
     _rule_review_dependency_deadlock,
     _rule_running_with_open_parents,
+    _rule_blocked_without_reason,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,

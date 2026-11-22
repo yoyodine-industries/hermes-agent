@@ -485,6 +485,28 @@ def _last_event_payload(conn: sqlite3.Connection, task_id: str, kind: str) -> Op
     return data if isinstance(data, dict) else None
 
 
+def _last_block_payload(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """The card's newest block RECORD payload: a ``blocked`` event or the
+    ``block_reason_set`` correction that supersedes it (see
+    ``kanban_db.set_block_reason`` — a reason-only repair never rewrites the
+    original ``blocked`` event, so a reader that stopped at ``blocked`` would
+    keep seeing the missing reason the repair was made to fix)."""
+    try:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            " AND kind IN ('blocked', 'block_reason_set')"
+            " ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["payload"]) if row["payload"] else None
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _block_state(conn: sqlite3.Connection, task_id: str) -> tuple[str, str]:
     """``(reason, kind)`` for a blocked card: its columns, else its newest ``blocked`` event."""
     reason, kind = "", ""
@@ -495,7 +517,7 @@ def _block_state(conn: sqlite3.Connection, task_id: str) -> tuple[str, str]:
             kind = str(row["block_kind"] or "").strip().lower()
     except sqlite3.Error:
         pass
-    payload = _last_event_payload(conn, task_id, "blocked") or {}
+    payload = _last_block_payload(conn, task_id) or {}
     reason = str(payload.get("reason") or "")
     if not kind:
         kind = str(payload.get("kind") or payload.get("block_kind") or "").strip().lower()

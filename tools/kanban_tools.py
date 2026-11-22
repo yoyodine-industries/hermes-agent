@@ -1097,9 +1097,28 @@ def _handle_block(args: dict, **kw) -> str:
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
         due_at, window_policy = _due_args(args)
+        # The card ALREADY has a block record: this call is a RECORD correction, not a
+        # transition. Correct it in place — the original `blocked` event (and the card's
+        # blocked_at) must survive — instead of letting the classifier append a second
+        # `blocked` event or, worse, unblocking to re-block (which trips the loop breaker
+        # into triage carrying a loop verdict instead of the real cause).
+        if (task is not None and task.status == "blocked"
+                and any(e.kind == "blocked" for e in kb.list_events(conn, tid))
+                and kb.set_block_reason(conn, tid, reason=reason, kind=kind)):
+            return _ok_landed(kb, conn, tid, "blocked",
+                              block_kind=kb.get_task(conn, tid).block_kind,
+                              reason_updated_in_place=True)
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, waits_on=waits_on or (),
                            due_at=due_at, window_policy=window_policy,
                            expected_run_id=_worker_run_id(tid))
+        if not ok and task is not None and task.status == "blocked":
+            # A breaker-parked card has no `blocked` event yet: record the reason without
+            # inventing a re-block (block_task's classifier appends the audit event when a
+            # kind is supplied; this is the kind-less fallback).
+            if kb.set_block_reason(conn, tid, reason=reason, kind=kind):
+                return _ok_landed(kb, conn, tid, "blocked",
+                                  block_kind=kb.get_task(conn, tid).block_kind,
+                                  reason_updated_in_place=True)
         _check(ok, kb.live_row_refusal(
             conn, tid, caller_run_id=_worker_run_id(tid), verb="block"))
         landed_kind = kb.get_task(conn, tid).block_kind

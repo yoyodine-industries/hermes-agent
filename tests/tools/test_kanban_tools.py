@@ -478,6 +478,39 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_on_an_already_blocked_card_records_the_missing_reason_in_place(worker_env):
+    """`kanban_block` on a card that is ALREADY blocked is a RECORD correction, not a
+    transition: the reason lands in the card's block record, the card stays blocked, and
+    no unblock/re-block (which trips the loop breaker into triage) is involved."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    first = json.loads(kt._handle_block({"reason": "stale wording"}))
+    assert first["ok"] is True and first["status"] == "blocked"
+    with kbc.connect() as conn:
+        before = [e.kind for e in kb.list_events(conn, worker_env)]
+        blocked_at = max(
+            e.created_at for e in kb.list_events(conn, worker_env) if e.kind == "blocked")
+
+    again = json.loads(kt._handle_block({"reason": "the REAL cause", "kind": "needs_input"}))
+
+    assert again["ok"] is True, again
+    assert again["reason_updated_in_place"] is True
+    assert again["status"] == "blocked"
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert kb.block_record(conn, worker_env) == ("the REAL cause", "needs_input")
+        kinds = [e.kind for e in kb.list_events(conn, worker_env)]
+        assert kinds.count("blocked") == 1          # no re-block audit event
+        assert "unblocked" not in kinds             # never left `blocked`
+        assert max(e.created_at for e in kb.list_events(conn, worker_env)
+                   if e.kind == "blocked") == blocked_at
+        assert before != kinds                      # the repair IS recorded (one new event)
+
+
 def test_schedule_parks_current_worker_with_reason(worker_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc

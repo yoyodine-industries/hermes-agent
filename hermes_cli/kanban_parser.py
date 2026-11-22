@@ -481,6 +481,17 @@ _SPECS = [
              help="Drop the task's due time (the hold stays, with no clock)."),
         _approval_flag("a bulk block"),
     ], help="Mark one or more tasks blocked"),
+    _cmd("set-block-reason", [
+        _TASK_ID,
+        _arg("reason", nargs="*", help="The reason to record (also appended as a comment)"),
+        _bulk_ids("set-block-reason"),
+        _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
+             help="Set/replace the block kind in the same write. Omit to keep the card's "
+                  "recorded kind; a card the failure breaker parked UNTYPED defaults to "
+                  "needs_input and the event records that it was defaulted."),
+        _approval_flag("a bulk set-block-reason"),
+    ], help="Record or replace an ALREADY-blocked card's reason IN PLACE (no unblock, no "
+            "loop breaker) — the repair for a block that carries no reason"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
