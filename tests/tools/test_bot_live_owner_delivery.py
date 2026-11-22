@@ -327,16 +327,18 @@ def _spy_dm_files(bot_mode_dm, monkeypatch):
     return dm_files
 
 
-def test_pre_dial_failure_is_a_definite_no_send_not_ambiguous(tmp_path, monkeypatch):
+def test_pre_dial_failure_is_a_definite_no_send_parked_never_ambiguous(tmp_path, monkeypatch):
     """#139303: a dial that dies before ``bot_relay.deliver`` reached the socket admits
-    nothing — the pinned intent is dropped and the sender hears 'safe to resend',
-    instead of the old 'ambiguous / do not resend' that stranded the DM."""
+    nothing — so the DM is PARKED in the target's durable queue (its sweep retries it) and the
+    receipt says the stage and the target, instead of the old 'ambiguous / do not resend' that
+    stranded the DM or the bare 'safe to resend' that let it vanish (card t_e44932e2)."""
     from tools import bot_live_delivery as live
     from tools import bot_mode_dm
 
     def refused(home, params):
         raise live.PreDialError("dial refused before the RPC went out")
 
+    monkeypatch.setenv("HERMES_DELIVERY_LOG_DIR", str(tmp_path / "sender-state"))
     monkeypatch.setattr(live, "find_canonical_live_owner", lambda home: _owner(tmp_path))
     monkeypatch.setattr(live, "authority_delivery", refused)
     dm_files = _spy_dm_files(bot_mode_dm, monkeypatch)
@@ -345,12 +347,16 @@ def test_pre_dial_failure_is_a_definite_no_send_not_ambiguous(tmp_path, monkeypa
         ["hermes", "-p", "researcher"], "hello", "@researcher",
         stdin_file=False, task_id=None, agent=None, profile_home=tmp_path))
 
-    assert payload["reason"] == "runtime_unavailable"
-    assert "safe to resend" in payload["error"]
-    assert "Do not resend" not in payload["error"]
+    assert payload["status"] == "queued" and payload["queued"] is True, payload
+    assert payload["stage"] == "dial" and payload["target"] == "@researcher", payload
+    assert Path(payload["queue_record"]).is_file(), payload
+    assert "Nothing was admitted" in payload["error"]
     dm_file = Path(dm_files[0])
-    assert not dm_file.exists()  # nothing was admitted: no evidence to retain
+    assert not dm_file.exists()  # ownership moved to the durable queue
     assert not Path(str(dm_file) + ".live.json").exists()  # the pinned intent can never settle
+    rows = (tmp_path / "sender-state" / "bot_delivery_attempts.jsonl").read_text(
+        encoding="utf-8").splitlines()
+    assert json.loads(rows[-1])["stage"] == "dial"
 
 
 def test_pre_dial_failure_on_a_retried_intent_stays_ambiguous(tmp_path, monkeypatch):
@@ -371,3 +377,57 @@ def test_pre_dial_failure_on_a_retried_intent_stays_ambiguous(tmp_path, monkeypa
     with pytest.raises(live.PreDialError):
         bot_mode_dm._admit_live_dm(None, dm_file)
     assert intent.exists() and Path(dm_file).exists()
+
+
+def _discovery(state, reason_code, detail=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(state=state, endpoint=None, reason_code=reason_code, detail=detail)
+
+
+def test_authority_refusal_names_stage_target_reason_and_wait(tmp_path, monkeypatch):
+    """One refusal vocabulary: every 'authority is not ready' names the stage, the TARGET PROFILE,
+    the discovery's own reason_code, its detail, and whether the wait is bounded or unknown. The
+    bare string it replaces named none of them — 69 dial refusals in one day could not say which
+    lane had gone quiet or what to do (card t_e44932e2)."""
+    import asyncio
+
+    from hermes_cli import gateway_runtime
+
+    home = tmp_path / "profiles" / "platform-stl"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(gateway_runtime, "discover_gateway_endpoint",
+                        lambda h, timeout: _discovery("absent", "profile_parked",
+                                                      "the multiplexer parked this profile"))
+
+    with pytest.raises(mailbox.AuthorityNotReady) as info:
+        asyncio.run(mailbox.authority_delivery(home, {"id": "0" * 64, "message": "probe"}))
+
+    assert isinstance(info.value, mailbox.PreDialError)  # still the definite-no-send class
+    assert isinstance(info.value, ValueError)  # and still what ``except ValueError`` callers hold
+    text = str(info.value)
+    for fragment in ("stage=dial", "target=@platform-stl", "state=absent",
+                     "reason=profile_parked", "wait=unknown", "detail=the multiplexer parked"):
+        assert fragment in text, text
+    assert info.value.as_fields()["reason_code"] == "profile_parked"
+
+
+def test_an_owner_that_is_restarting_reports_a_BOUNDED_wait(tmp_path, monkeypatch):
+    """Where the state names a span the owner closes itself, the refusal says bounded (retry);
+    where it does not, it says unknown and the caller is told the wait will not clear it. A
+    made-up ETA is the same defect as the bare string (card t_e44932e2)."""
+    import asyncio
+
+    from hermes_cli import gateway_runtime
+
+    home = tmp_path / "profiles" / "research-stl"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(gateway_runtime, "discover_gateway_endpoint",
+                        lambda h, timeout: _discovery("draining", "restart_wait"))
+
+    with pytest.raises(mailbox.AuthorityNotReady) as info:
+        asyncio.run(mailbox.authority_delivery(home, {"id": "1" * 64, "message": "probe"}))
+
+    assert "wait=bounded" in str(info.value)
+    assert info.value.wait_kind == "bounded"
+    assert "detail=no detail published" in str(info.value)  # never a bare colon
