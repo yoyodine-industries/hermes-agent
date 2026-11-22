@@ -29,7 +29,9 @@ def isolated_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import tools.process_registry as pr_module
 
-    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    # The registry resolves its checkpoint file per call now (the multiplexed gateway's profile
+    # scope decides it), so the test pins the resolver rather than a module-level path.
+    monkeypatch.setattr(pr_module, "_checkpoint_path", lambda: tmp_path / "processes.json")
     registry = pr_module.ProcessRegistry()
     monkeypatch.setattr(pr_module, "process_registry", registry)
     return registry

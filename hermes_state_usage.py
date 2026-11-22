@@ -1,15 +1,11 @@
-"""Token/usage accounting mixin for SessionDB: the coalescing background token writer,
-per-model usage rows, and billing-route columns. Writer thread state lives on the instance."""
+"""Token/usage accounting mixin for SessionDB: per-model usage rows and billing-route columns. Queued deltas
+go through the store holder's accounting queue."""
 
 from __future__ import annotations
 
 import asyncio
-import atexit
-import contextlib
 import logging
-import threading
 import time
-import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
 # caplog tests pin the "hermes_state" logger name.
@@ -49,6 +45,8 @@ def _token_update_sql(delta: bool) -> str:
 
 _TOKEN_UPDATE_ABSOLUTE_SQL = _token_update_sql(delta=False)
 _TOKEN_UPDATE_DELTA_SQL = _token_update_sql(delta=True)
+# Rows a compaction or prune archived: the prompt-cache clock's durable context generation.
+_ARCHIVED_ROWS_SQL = "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 0 AND compacted = 1"
 
 _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
                    session_id, model, billing_provider, billing_base_url, billing_mode,
@@ -81,7 +79,7 @@ _MODEL_USAGE_FIELDS = frozenset((
 
 
 class SessionUsageMixin:
-    """Coalesced token writer, per-model usage rows, billing route."""
+    """Per-model usage rows, billing route."""
 
     def update_session_billing_route(
         self, session_id: str, *, provider: str, base_url: str, billing_mode: Optional[str] = None,
@@ -104,47 +102,6 @@ class SessionUsageMixin:
                    WHERE id = ?""", (provider, base_url, billing_mode, session_id))
         self._execute_write(_do)
 
-    def queue_token_counts(self, session_id: str, **kwargs) -> None:
-        """Enqueue a token/cost delta for the background writer (same kwargs as
-        :meth:`update_token_counts`). After close() stopped the writer, falls back to the
-        synchronous path and may raise."""
-        with self._token_queue_cond:
-            thread = self._token_writer_thread
-            writer_alive = thread is not None and thread.is_alive()
-            writer_stopped = self._token_writer_stop and not writer_alive
-            if not writer_stopped:
-                self._token_queue.append((session_id, kwargs))
-                if not writer_alive:
-                    # Daemon so exit never hangs on accounting; the atexit hook drains
-                    # leftovers. ``not is_alive()`` respawns a writer that died unexpectedly.
-                    thread = threading.Thread(
-                        target=self._token_writer_loop, name="session-db-token-writer", daemon=True)
-                    self._token_writer_thread = thread
-                    thread.start()
-                    if self._token_atexit_hook is None:
-                        self_ref = weakref.ref(self)
-
-                        def _drain_at_exit() -> None:
-                            db = self_ref()
-                            if db is not None:
-                                db._drain_token_queue_at_exit()
-
-                        self._token_atexit_hook = _drain_at_exit
-                        atexit.register(_drain_at_exit)
-                self._token_queue_cond.notify_all()
-        if writer_stopped:
-            # close() ran: enqueueing would drop the delta silently, so apply inline.
-            self.update_token_counts(session_id, **kwargs)
-
-    def _apply_claimed_batch(self, batch) -> None:
-        """Apply a batch whose ``busy`` flag the caller already claimed, then release."""
-        try:
-            self._apply_token_batch(batch)
-        finally:
-            with self._token_queue_cond:
-                self._token_writer_busy = False
-                self._token_queue_cond.notify_all()
-
     def flush_for_read(self) -> bool:
         """Read-side token barrier. On a thread running an asyncio loop it never waits: the writer can sit
         behind another connection's write lock, and a gateway handler reading a session there froze every
@@ -156,146 +113,21 @@ class SessionUsageMixin:
             return self.flush_token_counts()
         return self.flush_token_counts(timeout=0.0)
 
-    def flush_token_counts(self, timeout: float = 5.0) -> bool:
-        """Block until every queued token delta has been applied. False on timeout (callers
-        then read totals stale by the queued deltas). Never raises."""
-        # Lock-free fast path: reads queue-then-busy (see ordering notes below).
-        if not self._token_queue and not self._token_writer_busy:
-            return True
-        batch = None
-        with self._token_queue_cond:
-            deadline = time.monotonic() + timeout
-            while self._token_queue or self._token_writer_busy:
-                # A live writer is authoritative even when stop-flagged: draining here would
-                # race its in-flight batch and reorder deltas (breaking last-non-None-wins /
-                # first-accounted-route / COALESCE-backfill fields). Only a dead writer lets
-                # the caller take leftovers; a claimed busy means "wait".
-                thread = self._token_writer_thread
-                if (thread is None or not thread.is_alive()) and not self._token_writer_busy:
-                    self._token_writer_busy = True
-                    batch = list(self._token_queue)
-                    self._token_queue.clear()
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._token_queue_cond.wait(remaining)
-        if batch:
-            self._apply_claimed_batch(batch)
-        return True
-
-    def _token_writer_loop(self) -> None:
-        while True:
-            with self._token_queue_cond:
-                idle_deadline = time.monotonic() + self._TOKEN_WRITER_IDLE_SECONDS
-                while not self._token_queue and not self._token_writer_stop:
-                    remaining = idle_deadline - time.monotonic()
-                    if remaining <= 0:
-                        # Retire under the lock queue_token_counts() spawns under, so no
-                        # delta strands behind an exiting worker.
-                        self._token_writer_thread = None
-                        return
-                    self._token_queue_cond.wait(remaining)
-                if not self._token_queue:
-                    self._token_writer_thread = None
-                    return  # stop requested and fully drained
-                # busy BEFORE clearing the queue: flush's lock-free fast path must never see
-                # "empty and idle" while a popped batch is unapplied.
-                self._token_writer_busy = True
-                batch = list(self._token_queue)
-                self._token_queue.clear()
-            self._apply_claimed_batch(batch)
-
-    def _apply_token_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
-        """Apply queued deltas in order, coalescing where safe. Never raises."""
-        try:
-            coalesced = self._coalesce_token_deltas(batch)
-        except Exception as exc:
-            # Coalescing must never kill the writer; the merge is only an optimization.
-            logger.warning("async token accounting: coalesce failed, applying raw batch: %s", exc)
-            coalesced = batch
-        for session_id, kwargs in coalesced:
-            try:
-                self.update_token_counts(session_id, **kwargs)
-            except Exception as exc:
-                # Accounting loss is logged, never raised into a turn.
-                logger.warning("async token accounting: apply failed (session=%s): %s", session_id, exc)
-
-    def _coalesce_token_deltas(self, batch: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
-        """Merge adjacent incremental deltas with an identical route, so ordering across
-        sessions and /model switches is preserved exactly. absolute=True never merges."""
-        groups: list[tuple[Optional[tuple], str, dict[str, Any]]] = []
-        for session_id, kwargs in batch:
-            key = None
-            if not kwargs.get("absolute"):
-                key = (session_id, *(kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS))
-            if groups and key is not None and groups[-1][0] == key:
-                merged = groups[-1][2]
-                for f in self._TOKEN_DELTA_SUM_FIELDS:
-                    merged[f] = merged.get(f, 0) + kwargs.get(f, 0)
-                for f in self._TOKEN_DELTA_COST_FIELDS:
-                    value = kwargs.get(f)
-                    if value is not None:
-                        # All-None runs stay None so COALESCE keeps the stored value.
-                        merged[f] = (merged.get(f) or 0.0) + value
-            else:
-                groups.append((key, session_id, dict(kwargs)))
-        return [(sid, kw) for _, sid, kw in groups]
-
-    def _stop_token_writer(self, join_timeout: float = 10.0) -> None:
-        """Stop the writer thread and drain remaining deltas. Never raises."""
-        with self._token_queue_cond:
-            self._token_writer_stop = True
-            self._token_queue_cond.notify_all()
-            thread = self._token_writer_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=join_timeout)
-            if thread.is_alive():
-                # Writer stuck mid-apply: leave deltas unapplied rather than race it.
-                logger.warning(
-                    "async token accounting: writer did not stop within %.0fs; "
-                    "%d queued delta(s) not persisted", join_timeout, len(self._token_queue))
-                return
-        # Writer gone: apply leftovers synchronously under the same busy protocol. Wait out
-        # a flush caller-drain that already claimed busy — close() nulls the connection
-        # right after this returns and must not yank it mid-batch.
-        with self._token_queue_cond:
-            deadline = time.monotonic() + join_timeout
-            while self._token_writer_busy:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    logger.warning(
-                        "async token accounting: concurrent drain did not "
-                        "finish within %.0fs; %d queued delta(s) not persisted",
-                        join_timeout, len(self._token_queue))
-                    return
-                self._token_queue_cond.wait(remaining)
-            # busy BEFORE clearing the queue (same ordering as the writer loop).
-            batch = list(self._token_queue)
-            if batch:
-                self._token_writer_busy = True
-                self._token_queue.clear()
-        if batch:
-            self._apply_claimed_batch(batch)
-
-    def _drain_token_queue_at_exit(self) -> None:
-        with contextlib.suppress(Exception):  # never fatal at interpreter shutdown
-            self._stop_token_writer()
-
     def update_token_counts(
         self, session_id: str, input_tokens: int=0, output_tokens: int=0, model: str | None=None, cache_read_tokens: int=0,
         cache_write_tokens: int=0, reasoning_tokens: int=0, estimated_cost_usd: Optional[float]=None,
         actual_cost_usd: Optional[float]=None, cost_status: Optional[str]=None, cost_source: Optional[str]=None,
         pricing_version: Optional[str]=None, billing_provider: Optional[str]=None, billing_base_url: Optional[str]=None,
         billing_mode: Optional[str]=None, api_call_count: int=0, absolute: bool=False,
-        source: Optional[str]=None, task: str = "",
+        source: Optional[str]=None, task: str = "", prompt_cache_clock: Optional[str]=None,
     ) -> None:
         """Update totals and route attribution, ensuring the legacy missing-row backfill.
         *absolute*=False increments (per-API-call deltas, CLI path); *absolute*=True sets directly
         (gateway path, where the cached agent holds cumulative totals). ``source`` is the session's
         real surface for the row-existence guard; callers that don't know it leave the placeholder.
         ``task`` names a per-turn route (``voice_chat``): its calls count in the session totals and
-        land in ``session_model_usage`` under that task, but never become the session's recorded route."""
+        land in ``session_model_usage`` under that task, but never become the session's recorded route.
+        ``prompt_cache_clock`` (JSON of the latest prompt-cache event) replaces the stored one when given."""
         values = dict(locals())
         values.pop('self')
         values.pop('session_id')
@@ -314,6 +146,7 @@ class SessionUsageMixin:
         actual_cost_usd: Optional[float]=None, cost_status: Optional[str]=None, cost_source: Optional[str]=None,
         pricing_version: Optional[str]=None, billing_provider: Optional[str]=None, billing_base_url: Optional[str]=None,
         billing_mode: Optional[str]=None, api_call_count: int=0, absolute: bool=False, task: str="",
+        prompt_cache_clock: Optional[str]=None,
     ) -> None:
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
         sql = _TOKEN_UPDATE_ABSOLUTE_SQL if absolute else _TOKEN_UPDATE_DELTA_SQL
@@ -356,8 +189,31 @@ class SessionUsageMixin:
                    billing_base_url = ?, billing_mode = ?
                    WHERE id = ?""", (model, billing_provider, billing_base_url, billing_mode, session_id))
         conn.execute(sql, params)
+        if prompt_cache_clock is not None:
+            conn.execute("UPDATE sessions SET prompt_cache_clock = ? WHERE id = ?", (prompt_cache_clock, session_id))
         if record_model_usage:
             self._record_model_usage(conn, session_id, task=task, **usage)
+
+    def get_prompt_cache_clock(self, session_id: str) -> dict[str, Any]:
+        """``{"clock": <stored JSON or None>, "last_assistant_at": <newest assistant row time or None>,
+        "generation": prompt_cache_generation}``. ``last_assistant_at`` is the resume fallback for
+        sessions stored before the clock existed, and only for sessions whose counters show the cache
+        was ever read or written."""
+        self.flush_for_read()
+        row = self._read_one(
+            "SELECT s.prompt_cache_clock, CASE WHEN COALESCE(s.cache_read_tokens, 0) + COALESCE(s.cache_write_tokens, 0) > 0"
+            " THEN (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id AND m.role = 'assistant'"
+            f" AND m.active = 1) END, ({_ARCHIVED_ROWS_SQL}) FROM sessions s WHERE s.id = ?", (session_id, session_id))
+        return {"clock": row[0], "last_assistant_at": row[1], "generation": int(row[2])} if row else {}
+
+    def prompt_cache_generation(self, session_id: str) -> int:
+        """Durable context generation of *session_id* for the prompt-cache clock: how many rows a
+        compaction, micro-compaction or tool-result prune archived (``active = 0, compacted = 1``).
+        Every committed in-place rewrite of what the model sees archives at least one row and none
+        is ever un-archived, so it only grows and survives restarts, unlike a compressor's
+        in-process ``compression_count``. A rotating compaction moves to a new session id instead."""
+        row = self._read_one(_ARCHIVED_ROWS_SQL, (session_id,))
+        return int(row[0]) if row else 0
 
     def _record_model_usage(
         self, conn, session_id: str, *, model: Optional[str]=None, billing_provider: Optional[str]=None,

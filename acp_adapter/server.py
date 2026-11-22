@@ -362,7 +362,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         from hermes_cli.model_switch import switch_model
         from hermes_cli.models import parse_model_input
 
-        current_provider, current_model = getattr(state.agent, "provider", None), str(state.model or "")
+        # Prefer the route's named form (``custom:<name>``): it compares equal against
+        # switch_model's target_provider, which is named too, and an agent whose provider is
+        # empty (a resume that fell back) must never pin the old endpoint under a new
+        # provider's credentials (#139908).
+        current_provider = (getattr(state.agent, "provider_route", None)
+                            or getattr(state.agent, "provider", None))
+        current_model = str(state.model or "")
         explicit_provider, model_input = parse_model_input(raw_model, "")
         cfg = load_config()
         result = switch_model(
@@ -376,7 +382,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             raise ModelRejected(result.error_message or f"Cannot switch to {raw_model}")
         target_provider, new_model = result.target_provider, result.new_model
         endpoint: dict[str, Any] = {}
-        if keep_endpoint and not (current_provider and target_provider != current_provider):
+        # Keep the endpoint only when the provider is KNOWN and equal: an empty current
+        # provider (a resume that fell back) keeping the old base_url while the target
+        # provider's credentials are used is exactly the key/endpoint mismatch of #139908.
+        if keep_endpoint and current_provider and target_provider == current_provider:
             endpoint = {
                 "base_url": getattr(state.agent, "base_url", None), "api_mode": getattr(state.agent, "api_mode", None)
             }
@@ -424,7 +433,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         """Best-effort ``_meta.hermes.sessionProvenance`` for an ACP session."""
         try:
             return session_provenance_meta(
-                self.session_manager._get_db(), acp_session_id, current_hermes_session_id,
+                self.session_manager._get_persistence(), acp_session_id, current_hermes_session_id,
                 previous_hermes_session_id=previous_hermes_session_id,
             )
         except Exception:
@@ -440,13 +449,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         if not self._conn:
             return
         try:
-            row = self.session_manager._get_db().get_session(session_id)
+            row = self.session_manager._get_persistence().sessions.get(session_id)
         except Exception:
             logger.debug("Could not read ACP session info for %s", session_id, exc_info=True)
             return
-        if not row:
+        if row is None:
             return
-        title = row.get("title")
+        title = row.title
         # `sessions` has no `updated_at`; "now" is right since this fires when the title changed.
         update = SessionInfoUpdate(
             session_update="session_info_update",
@@ -1012,12 +1021,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 if (result.get("failure_reason") == "content_policy_blocked"
                         and _adb is not None and _adb is self.session_manager._get_db()
                         and getattr(state.agent, "_session_db_created", False)):
-                    from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE
-                    from hermes_state_rewind import retain_refused_turn_for_display
-                    retain_refused_turn_for_display(
-                        _adb, getattr(state.agent, "session_id", session_id),
-                        notice=CONTENT_REFUSED_NOTICE,
-                        boundary_row_id=result.get("refused_turn_boundary_row_id"))
+                    _refused_sid = getattr(state.agent, "session_id", session_id)
+                    try:  # best-effort: a refusal must never crash turn teardown
+                        _adb.messages.retain_refused_turn_for_display(
+                            _refused_sid, notice=CONTENT_REFUSED_NOTICE,
+                            boundary_row_id=result.get("refused_turn_boundary_row_id"))
+                    except Exception:
+                        logger.warning("content-policy refusal: could not retain the refused turn for %s",
+                                       _refused_sid, exc_info=True)
 
             # Head rotated (compression split): emit provenance so clients can render the boundary.
             post_turn_hermes_id = getattr(state.agent, "session_id", None)

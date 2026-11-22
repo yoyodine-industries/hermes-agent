@@ -173,7 +173,8 @@ def _live_boot_id() -> Optional[str]:
     if sys.platform == "darwin":
         with suppress(Exception):
             out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
-                                 text=True, timeout=3, check=False).stdout
+                                 text=True, encoding="utf-8", errors="replace",
+                                 timeout=3, check=False).stdout
             digits = "".join(ch for ch in (out.partition("sec = ")[2].partition(",")[0]) if ch.isdigit())
             return f"mac:{digits}" if digits else None
     return None

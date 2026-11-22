@@ -1056,7 +1056,8 @@ def _lock_fd_holders(path: Path) -> list[int]:
     """
     try:
         done = subprocess.run(["lsof", "-w", "-t", "--", str(path)],
-                              capture_output=True, text=True, timeout=5, check=False)
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=5, check=False)
         return sorted({int(token) for token in (done.stdout or "").split() if token.isdigit()})
     except Exception:  # health: allow BLE001 -- lsof is absent on Windows and may be denied elsewhere
         return []

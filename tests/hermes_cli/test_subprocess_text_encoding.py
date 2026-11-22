@@ -91,6 +91,11 @@ from pathlib import Path
 
 import pytest
 
+from hermes_agent.compat.paths import current_path
+
+HERMES_CLI = Path(__file__).resolve().parents[2] / current_path("hermes_cli")
+# The scan root of the tree guard below: the checkout root. Every runtime tree is walked from
+# here (RUNTIME_TREES is a directory name, not a compat-mapped package path).
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 RUNTIME_TREES = ("hermes_cli", "agent", "cron", "gateway", "plugins", "pm", "tools", "tui_gateway")

@@ -28,7 +28,8 @@ def isolated_home(tmp_path, monkeypatch):
     from tools import skills_tool
     import tools.skill_manager_tool as smt
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", home / "skills")
-    monkeypatch.setattr(smt, "SKILLS_DIR", home / "skills")
+    # skill_manager_tool has no SKILLS_DIR of its own any more: it resolves the dir through
+    # skills_tool._skills_dir(), which honours the patched module global above.
     # These fixtures seed several near-identical skills from one template to prove ROUTING.
     # That corpus is what the admission gate forbids, and admission has its own module
     # (tests/tools/test_skill_manager_tool_admission.py), so the gate is stubbed off here.

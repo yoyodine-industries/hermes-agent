@@ -279,8 +279,10 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     datetime/locale-sensitive tests are deterministic.
     """
     # 1. Blank every credential-shaped env var that's currently set.
+    # Bridge ownership markers too: an earlier test's real config load leaves them in os.environ, and
+    # a later test's setenv of the same value would then read as the bridge's own leftover.
     for name in list(os.environ.keys()):
-        if _looks_like_credential(name):
+        if _looks_like_credential(name) or name.startswith("HERMES_BRIDGED_"):
             monkeypatch.delenv(name, raising=False)
 
     # 2. Blank behavioral HERMES_* vars that could change test semantics.
@@ -532,7 +534,9 @@ def _close_leaked_session_dbs():
     Instances opened through ``hermes_state_registry.acquire()`` are skipped:
     on those ``close()`` releases a refcount rather than closing, so a sweep
     would silently retire a shared generation that a wider-scoped fixture
-    still holds. The registry owns that lifecycle (``close_all()``).
+    still holds. The registry owns that lifecycle (``close_all()``). A
+    ``SessionDB(path)`` that took its own reference is swept: its ``close()``
+    returns that one reference, once, and never another holder's.
 
     Before the sweep, the auto-title upgrade threads a turn spawned are joined
     (bounded): they hold the turn's SessionDB and write to it (and print to
@@ -555,7 +559,7 @@ def _close_leaked_session_dbs():
     if not registry:
         return
     for db in list(registry):
-        if getattr(db, "_shared_registry_owned", False):
+        if getattr(db, "_shared_registry_owned", False) and getattr(db, "_reference", None) is None:
             continue
         try:
             db.close()
@@ -747,14 +751,22 @@ def scratch_prune_spawns(monkeypatch):
 # without this fixture.
 
 
+# Both modules that open state.db keep their own copy of the guard knobs.
+_STATE_DB_GUARD_MODULES = ("hermes_state", "persistence.sqlite._holder")
+
+
 @pytest.fixture(autouse=True)
 def _state_db_write_guard(request, monkeypatch):
-    _hs = sys.modules.get("hermes_state")
-    if _hs is None or not hasattr(_hs, "_STATE_DB_GUARD_BYPASS"):
+    guarded = [
+        module for module in (sys.modules.get(name) for name in _STATE_DB_GUARD_MODULES)
+        if module is not None and hasattr(module, "_STATE_DB_GUARD_BYPASS")
+    ]
+    if not guarded:
         yield
         return
     if request.node.get_closest_marker("live_system_guard_bypass") is not None:
-        monkeypatch.setattr(_hs, "_STATE_DB_GUARD_BYPASS", True)
+        for module in guarded:
+            monkeypatch.setattr(module, "_STATE_DB_GUARD_BYPASS", True)
         yield
         return
     extra_roots = []
@@ -764,9 +776,8 @@ def _state_db_write_guard(request, monkeypatch):
         extra_roots.append(
             Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve()
         )
-    monkeypatch.setattr(
-        _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
-    )
+    for module in guarded:
+        monkeypatch.setattr(module, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots))
     yield
 
 

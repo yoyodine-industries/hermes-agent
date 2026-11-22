@@ -47,7 +47,7 @@ def _recorded_toolchain(python: str) -> dict[str, str]:
             f"print(json.dumps({{k: sysconfig.get_config_var(k) or '' for k in {_RECORDED!r}}}))")
     try:
         result = subprocess.run([python, "-I", "-c", code], capture_output=True, text=True,
-                                timeout=30, check=False)
+                                encoding="utf-8", errors="replace", timeout=30, check=False)
         return json.loads(result.stdout) if result.returncode == 0 else {}
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return {}

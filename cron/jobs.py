@@ -35,10 +35,14 @@ from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
 from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedule_knobs
-from cron.jobs_model_pin import _main_model_pin
+from cron.jobs_tristate import normalize_catch_up as _normalize_catch_up, normalize_wrap_response
+from cron.jobs_model_pin import _main_model_pin, host_default_model
+from cron.jobs_normalize import (
+    _normalize_base_url, _normalize_context_from, _normalize_failure_deliver, _normalize_job_optional_text,
+)
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
-from cron import extra_fire, store_health
+from cron import extra_fire, jobs_error_text, store_health
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
@@ -1712,65 +1716,6 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
-def _model_name_from_block(model_cfg: Any) -> str:
-    """The model NAME a ``model:`` config block names: ``model: <name>`` shorthand, or a dict's
-    ``default`` / ``model`` / ``name`` key. ``""`` when it names none."""
-    if isinstance(model_cfg, str):
-        return model_cfg.strip()
-    if isinstance(model_cfg, dict):
-        return _normalize_job_optional_text(
-            model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("name")) or ""
-    return ""
-
-
-def _load_home_model_block(home: Path) -> Any:
-    """``model:`` block of *home*'s ``config.yaml`` ({} when absent/empty/unreadable).
-
-    A NAMED profile's home is self-contained: the effective-config loader reads only that home's
-    ``config.yaml``, so a profile with no ``model:`` block has no default model of its own.
-    """
-    from hermes_cli.config_effective import load_user_config_effective
-
-    cfg_path = Path(home) / "config.yaml"
-    if not cfg_path.exists():
-        return {}
-    with contextlib.suppress(Exception):
-        cfg = load_user_config_effective(cfg_path)
-        if isinstance(cfg, dict):
-            return cfg.get("model") or {}
-    return {}
-
-
-def host_default_model(active_home: Optional[Path] = None) -> tuple[str, str, Any]:
-    """``(model, provider, model_cfg)`` a NAMED profile inherits from the HOST root config.
-
-    The active home's own config is the first source (see ``_main_model_pin`` / the scheduler); when
-    it carries no ``model:`` block, a named profile (``<root>/profiles/<name>``) falls back to the
-    HOST root's ``<root>/config.yaml`` default — the same default the root profile runs on — so an
-    unpinned cron job created in that profile's store RUNS instead of dying with "has no model
-    configured" (card t_92b4a684). ``("", "", {})`` when the active home IS the root, or when the
-    host config names no model either.
-    """
-    from hermes_constants import get_default_hermes_root, get_hermes_home
-
-    active = Path(active_home) if active_home is not None else get_hermes_home()
-    try:
-        root = Path(get_default_hermes_root(home=active))
-        same_root = root.resolve() == active.resolve()
-    except OSError:  # pragma: no cover - unreadable path
-        return "", "", {}
-    if same_root:
-        return "", "", {}
-    block = _load_home_model_block(root)
-    model = _model_name_from_block(block)
-    if not model:
-        return "", "", {}
-    provider = ""
-    if isinstance(block, dict):
-        provider = _normalize_job_optional_text(block.get("provider")) or ""
-    return model, provider, block
-
-
 def _profile_store_label(home: Optional[Path] = None) -> str:
     """Human label for a refusal message: the profile name whose store this is, else ``default``."""
     home = Path(home) if home is not None else get_hermes_home()
@@ -1783,51 +1728,6 @@ _NO_MAIN_MODEL_ERROR = (
     "pinned job would be created DEAD. Set a default with `hermes model <name>` (or a `model:` "
     "block in config.yaml) and retry, or create the job unpinned."
 )
-
-
-def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
-    """``(provider, model)`` the main agent runs on right now (``model.default`` + the provider it
-    resolves to), for ``pinned=True`` jobs: the lock is a plain per-job pin, so the scheduler needs
-    no second precedence axis. A NAMED profile with no ``model:`` of its own inherits the HOST root
-    default (``host_default_model``); ``(None, None)`` when nothing resolves anywhere — the caller
-    REFUSES rather than creating a silently-dead job (card t_92b4a684)."""
-    home = get_hermes_home()
-    model_cfg = _load_home_model_block(home)
-    model = _model_name_from_block(model_cfg)
-    requested: Optional[str] = None
-    if not model:
-        _host_model, _host_provider, _host_cfg = host_default_model(home)
-        if _host_model:
-            model = _host_model
-            model_cfg = _host_cfg
-            requested = _host_provider or None
-    if not model:
-        return None, None
-    provider = None
-    with contextlib.suppress(Exception):
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        provider = _normalize_job_optional_text(
-            resolve_runtime_provider(requested=requested).get("provider"))
-    return (provider.lower() if provider else None), model
-
-
-def _normalize_job_optional_text(
-    value: Any, *, strip_trailing_slash: bool = False
-) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    return (value.strip().rstrip("/") if strip_trailing_slash else value.strip()) or None
-
-
-def _normalize_base_url(value: Any) -> Optional[str]:
-    return _normalize_job_optional_text(value, strip_trailing_slash=True)
-
-
-def _normalize_str_list(items: Any) -> Optional[list[str]]:
-    """Non-blank stripped items of *items*, or None when nothing remains."""
-    return [str(j).strip() for j in items if str(j).strip()] or None
-
-
 def _normalize_enabled_toolsets(value: Any) -> Optional[list[str]]:
     """Per-job toolset allowlist. An explicitly-set EMPTY list means 'nothing allowed' and must
     persist as [] — normalizing it to None would read back as 'no restriction' (#82010). Absent
@@ -1837,22 +1737,6 @@ def _normalize_enabled_toolsets(value: Any) -> Optional[list[str]]:
     if not isinstance(value, list):
         raise ValueError("enabled_toolsets must be a list of toolset names (or [] for none).")
     return [str(j).strip() for j in value if str(j).strip()]
-
-
-def _normalize_context_from(value: Any) -> Optional[list[str]]:
-    """Accept a job id or a list of ids; anything else is None."""
-    if isinstance(value, str):
-        value = [value]
-    return _normalize_str_list(value) if isinstance(value, list) else None
-
-
-def _normalize_failure_deliver(value: Any) -> Optional[str]:
-    """failure_deliver shares deliver's value grammar; flatten str/list like the tool layer's
-    _normalize_deliver_param for direct create_job callers. Semantic validation happens at
-    resolution time via the shared deliver path."""
-    if isinstance(value, (list, tuple)):
-        return ",".join(str(p).strip() for p in value if str(p).strip()) or None
-    return _normalize_job_optional_text(value)
 
 
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
@@ -1906,13 +1790,6 @@ def _normalize_job_script_timeout(value: Any) -> Optional[int]:
 
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
-def _normalize_catch_up(value: Any) -> Optional[bool]:
-    """``catch_up``: True runs one catch-up for missed slots, False skips them, None = default."""
-    if value is None or isinstance(value, bool):
-        return value
-    raise ValueError("catch_up must be true, false, or null (use the default).")
-
-
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "model": _normalize_job_optional_text,
     "provider": _normalize_job_optional_text,
@@ -1930,6 +1807,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
     "script_timeout_seconds": _normalize_job_script_timeout,
+    "wrap_response": normalize_wrap_response,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1945,6 +1823,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
     "script_timeout_seconds": _normalize_job_script_timeout,
+    "wrap_response": normalize_wrap_response,
 }
 
 
@@ -2000,6 +1879,7 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    wrap_response: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -2014,7 +1894,7 @@ def create_job(
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
-    (0 = never catch up)."""
+    (0 = never catch up). wrap_response: None inherits cron.wrap_response, a bool overrides it."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -2117,7 +1997,7 @@ def create_job(
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
-        ("catch_up", f["catch_up"]),
+        ("catch_up", f["catch_up"]), ("wrap_response", f["wrap_response"]),
         ("script_timeout_seconds", f["script_timeout_seconds"]),
     ):
         if value is not None:
@@ -2746,7 +2626,7 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     clears it."""
     def apply(jobs, _i, job):
         job["last_fire_error"] = {
-            "at": _hermes_now().isoformat(), "detail": str(detail or "")[:500]}
+            "at": _hermes_now().isoformat(), "detail": jobs_error_text.sanitize_persisted_error(str(detail or ""))[:500]}
         save_jobs(jobs)
         return True
 
@@ -2767,7 +2647,7 @@ def _record_run_outcome(
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
     cancelled = status == "cancelled"  # an operator stop is not a failure
-    job["last_error"] = None if success or cancelled else error
+    job["last_error"] = None if success or cancelled else jobs_error_text.sanitize_persisted_error(error)
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
@@ -2783,8 +2663,8 @@ def _record_run_outcome(
         # a monitor sampling jobs.json then sees a permanently green job. last_failure
         # survives success (latest failure wins); the recency window is the consumer's
         # call. Delivery failures keep their own sticky last_delivery_error.
-        job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
-    job["last_delivery_error"] = delivery_error
+        job["last_failure"] = {"at": now, "detail": jobs_error_text.sanitize_persisted_error(error) or (status or "run failed")}
+    job["last_delivery_error"] = jobs_error_text.sanitize_persisted_error(delivery_error)
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
     job.pop("pending_slot", None)
@@ -2922,6 +2802,9 @@ def mark_job_run(
             quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire)
         else:
             quota_hold.clear_state(job)
+        # A run rewrites all jobs, including legacy failure stamps on idle siblings.
+        for stored_job in jobs:
+            jobs_error_text.scrub_retained_stamps(stored_job)
         save_jobs(jobs)
         return True
 

@@ -51,25 +51,25 @@ def _collect_workspaces(profile: Optional[str], scan: bool) -> dict:
     from tui_gateway import session_workdir as gateway_workdir
 
     # Browsing never bootstraps the owner's session store: a profile whose gateway has not
-    # yet initialized state.db simply contributes no session-derived roots (``db=None``).
+    # yet initialized state.db simply contributes no session-derived roots (``persistence=None``).
     try:
-        db = _open_session_db_for_profile(profile, read_only=True)
+        persistence = _open_session_db_for_profile(profile, read_only=True)
     except HTTPException as exc:
         if exc.status_code != 503:
             raise
-        db = None
+        persistence = None
     try:
         with pdb.connect_closing() as conn:
             policy = gateway_projects._repo_discovery_policy()
             if scan and policy["enabled"]:
                 gateway_projects._scan_discovered_repos_remote(conn, policy)
             projects = [p.to_dict() for p in pdb.list_projects(conn)]
-            repos = gateway_projects._discover_repos_payload(
-                db, conn=conn, backfill=False, include_cached=policy["enabled"])
+            repos = gateway._discover_repos_payload(
+                None, conn=conn, backfill=False, include_cached=policy["enabled"], persistence=persistence)
     finally:
-        if db is not None:
-            db.close()
-    default_cwd = gateway_workdir._completion_cwd({"profile": profile} if profile else {})
+        if persistence is not None:
+            persistence.close()
+    default_cwd = gateway._completion_cwd({"profile": profile} if profile else {})
     return {
         "projects": projects, "repos": repos, "default_cwd": default_cwd,
         "home": str(Path.home()), "scan_enabled": bool(policy["enabled"])}
