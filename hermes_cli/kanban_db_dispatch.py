@@ -1038,6 +1038,20 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    # --- Rule 1 of the dispatch-surface contract (hermes_cli/kanban_ready_cap.py) ------
+    ready_cap: dict = field(default_factory=dict)
+    """The reconciliation pass's own record: ``{"cap", "demoted": [ids], "lanes"}``. A
+    non-empty ``demoted`` means the tick brought over-cap lanes back to their cap; the ids
+    move from ``ready`` to ``todo`` and are promoted back as slots free."""
+    ready_depth: dict = field(default_factory=dict)
+    """``{"cap", "enabled", "total_ready", "lanes": [{"lane","ready","cap","over",...}]}``
+    — the per-lane ready/cap depth THIS tick dispatched from. Carried on the result (not
+    merely logged) so every surface renders the same numbers: a cap that cannot be read is
+    a silent throttle, the same false-green family as a launcher reporting its own exit."""
+    ready_cap_error: Optional[str] = None
+    """Set when the reconciliation pass raised. The tick CONTINUES — a broken cap must not
+    stop dispatch — and the operator sees the failure on the result instead of inferring it
+    from a depth that stopped moving."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -6811,6 +6825,16 @@ def _run_reclaim_phase(
     result.substrate_import.extend(getattr(detect_crashed_workers, "_last_substrate_import", []))
     result.admission_unsettled.extend(getattr(detect_crashed_workers, "_last_admission_unsettled", []))
     result.timed_out = enforce_max_runtime(conn)
+    # RULE 1 (dispatch-surface contract): reconcile every lane back to its ready cap
+    # BEFORE promotion, so the spawn decision below is taken against a queue that honours
+    # the promise `ready` makes. Surplus ready rows move to `todo` (nothing is lost) and
+    # `recompute_ready` lifts them back, cap-aware and in rank order, as slots free.
+    try:
+        result.ready_cap = _kb.reconcile_ready_depth(conn, board=board)
+    except Exception as exc:  # never stop a tick on the cap
+        result.ready_cap = {}
+        result.ready_cap_error = f"{type(exc).__name__}: {exc}"
+        _kb._log.exception("kanban dispatch: ready-cap reconciliation failed")
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
     # Door 3 of the above-tranche guard (t_6ce41549, restored by card t_2e107499): a row ABOVE
     # the reserved tranche is LOWERED into its class ceiling, board-locally, on every tick.
@@ -6842,6 +6866,14 @@ def _run_reclaim_phase(
         f"{row['task_id']} ({row['was']} -> {row['now']}): {row.get('error')}"
         for row in demoted if row.get("error")
     ]
+    # The depth the spawn decision is about to be taken against — measured AFTER the
+    # demotion/promotion passes and BEFORE the spawn loop, so the operator reads the queue
+    # that was actually dispatched from rather than a number taken from a rack outside it.
+    try:
+        result.ready_depth = _kb.ready_depth_report(conn, board=board)
+    except Exception as exc:
+        result.ready_depth = {}
+        result.ready_cap_error = result.ready_cap_error or f"{type(exc).__name__}: {exc}"
 
 
 def _tick_spawn_budget(
