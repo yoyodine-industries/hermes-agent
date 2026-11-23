@@ -22,11 +22,15 @@ def require_not_executing(conn, session_ids):
     against whatever physical target the mutation publishes. Workers have no queued state
     (registered/running/unknown are all live), so any non-terminal worker is executing."""
     for sid in session_ids:
-        admissions = conn.execute("SELECT status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (sid,)).fetchall()
+        admissions = conn.execute("SELECT seq,status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (sid,)).fetchall()
         workers = conn.execute("SELECT status FROM worker_executions WHERE session_id=? AND status IN ('registered','running','unknown')", (sid,)).fetchall()
-        states = {row[0] for row in [*admissions, *workers]}
+        states = {row[1] for row in admissions} | {row[0] for row in workers}
         if 'unknown' in states:
-            raise RuntimeStoreError('unknown_execution')
+            # Name the row it refuses on and the sweep that clears it: without this the caller
+            # cannot tell an owed turn from a stale-epoch latch already abandoned.
+            lost = next((row for row in admissions if row[1] == 'unknown'), None)
+            detail = f'seq={lost[0]} cleared_by=settle_session_input|epoch_sweep' if lost else 'cleared_by=settle_session_input|epoch_sweep'
+            raise RuntimeStoreError('unknown_execution', field='session_admissions.status', detail=detail)
         if states:
             raise RuntimeStoreError('session_busy')
 
@@ -51,11 +55,15 @@ def require_target_advanceable(db, conn, session_ids):
 
 def require_idle(db, conn, session_ids):
     for sid in session_ids:
-        admissions = conn.execute("SELECT status FROM session_admissions WHERE target_session_id=? AND status IN ('queued','started','unknown')", (sid,)).fetchall()
+        admissions = conn.execute("SELECT seq,status FROM session_admissions WHERE target_session_id=? AND status IN ('queued','started','unknown')", (sid,)).fetchall()
         workers = conn.execute("SELECT status FROM worker_executions WHERE session_id=? AND status IN ('registered','running','unknown')", (sid,)).fetchall()
-        states = {row[0] for row in [*admissions, *workers]}
+        states = {row[1] for row in admissions} | {row[0] for row in workers}
         if 'unknown' in states:
-            raise RuntimeStoreError('unknown_execution')
+            # Name the row and the edges that clear it: a caller must be able to tell an owed
+            # turn from a stale-epoch latch that the next epoch sweep abandons.
+            lost = next((row for row in admissions if row[1] == 'unknown'), None)
+            detail = f'seq={lost[0]} cleared_by=settle_session_input|epoch_sweep' if lost else 'cleared_by=settle_session_input|epoch_sweep'
+            raise RuntimeStoreError('unknown_execution', field='session_admissions.status', detail=detail)
         if states:
             raise RuntimeStoreError('session_busy')
         _require_transcript_unleased(db, conn, sid)

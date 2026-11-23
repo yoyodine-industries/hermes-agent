@@ -1488,6 +1488,16 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
     from gateway.session_unattended_unknown import settle_recovered_unattended
     await asyncio.to_thread(settle_recovered_unattended, db, epoch)
+    # The latch is a FINDING THAT ACTS (clause 8): once every release edge has run, a queued row
+    # still sitting behind an `unknown` one is a deterministic card, never a silence. An unclaimable
+    # target that nobody reports is why nine latched doors survived until a census looked.
+    from hermes_state_runtime import admission_strand_alert
+    import logging as _logging
+    try:
+        await asyncio.to_thread(admission_strand_alert, db)
+    except Exception:
+        _logging.getLogger(__name__).warning('Admission strand census/alert failed for %s',
+                                             db.db_path, exc_info=True)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     await asyncio.to_thread(backfill_compression_created_sources, db)
     from gateway.session_local_recovery import release_handed_off_receipts

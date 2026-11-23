@@ -89,14 +89,37 @@ def test_nonterminal_obligations_prevent_any_retirement(tmp_path):
                 if status != 'queued':
                     rt.claim_session_input(db, epoch=epoch, session_id=status)
                 if status == 'unknown':
+                    # A CURRENT-epoch unknown is the owner's to settle: retirement still refuses it,
+                    # and the refusal names the seq it refuses on (it is not a silent busy).
+                    db._execute_write(lambda c: c.execute(
+                        "UPDATE session_admissions SET status='unknown',outcome=NULL WHERE target_session_id=?",
+                        (status,)))
+                    with pytest.raises(rt.RuntimeStoreError, match='unknown_execution') as exc:
+                        db._execute_write(lambda c: delete_in_transaction(db, c, status, {}))
+                    assert 'seq=' in (exc.value.detail or '')
+                    # A STALE-epoch unknown is abandoned by the bump ITSELF, so no obligation is
+                    # left behind: retirement proceeds and the abandonment stays as terminal evidence.
+                    # The bump is the release edge (clause 7); the later sweep has nothing to do.
+                    admission_id = rt.list_session_admissions(db, session_id=status)[0]['admission_id']
                     epoch = rt.begin_runtime_epoch(db, instance_id='next')
-                    rt.recover_session_inputs(db, epoch=epoch)
-            reason = 'unknown_execution' if status == 'unknown' else 'session_busy'
-            with pytest.raises(rt.RuntimeStoreError, match=reason):
+                    abandoned = rt.get_session_admission(db, admission_id=admission_id)
+                    assert abandoned is not None
+                    assert (abandoned['status'], abandoned['outcome']) == ('terminal', 'interrupted'), \
+                        'the bump must abandon the stale-epoch unknown in its own transaction'
+                    assert rt.recover_session_inputs(db, epoch=epoch) == 0, \
+                        'the sweep is a no-op once the bump has released the row'
+                    db._execute_write(lambda c: delete_in_transaction(db, c, status, {}))
+                    assert db.get_session(status) is None
+                    tombstone = rt.get_session_admission(db, admission_id=admission_id)
+                    assert tombstone and tombstone['status'] == 'terminal' and tombstone['outcome'] == 'interrupted'
+                    continue
+            with db._read_ctx() as c:
+                tombstones_before = c.execute("SELECT COUNT(*) FROM state_meta WHERE key LIKE 'gateway.retired_session.v1.%'").fetchone()[0]
+            with pytest.raises(rt.RuntimeStoreError, match='session_busy'):
                 db._execute_write(lambda c: delete_in_transaction(db, c, status, {}))
             assert db.get_session(status) is not None
             with db._read_ctx() as c:
-                assert not c.execute("SELECT 1 FROM state_meta WHERE key LIKE 'gateway.retired_session.v1.%'").fetchall()
+                assert c.execute("SELECT COUNT(*) FROM state_meta WHERE key LIKE 'gateway.retired_session.v1.%'").fetchone()[0] == tombstones_before
 
 
 def test_late_accounting_backfill_cannot_resurrect_a_retired_session(tmp_path):

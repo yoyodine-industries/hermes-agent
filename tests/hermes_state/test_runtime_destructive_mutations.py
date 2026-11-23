@@ -4,7 +4,7 @@ from hermes_state import SessionDB
 import hermes_state_runtime as rt
 
 
-@pytest.mark.parametrize('obligation', ['queued', 'started', 'unknown', 'worker'])
+@pytest.mark.parametrize('obligation', ['queued', 'started', 'worker'])
 def test_delete_refuses_outstanding_descendant_obligations(tmp_path, obligation):
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.create_session('s', source='test')
@@ -125,3 +125,4 @@ def test_idle_delete_takes_every_delegate_and_fork_continuation(tmp_path, shape)
         assert all(db.get_session(sid) is None for sid in chain)
         if shape == 'inherited-branch':
             assert db.get_session('ancestor') is not None
+

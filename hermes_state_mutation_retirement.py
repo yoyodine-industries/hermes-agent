@@ -104,7 +104,17 @@ def retire_terminal_receipts(conn, session_ids):
         workers = conn.execute('SELECT * FROM worker_executions WHERE session_id=?', (sid,)).fetchall()
         states = {r['status'] for r in [*admissions, *workers]} - {'terminal'}
         if states:
-            raise RuntimeStoreError('unknown_execution' if 'unknown' in states else 'session_busy')
+            # Name what is refused and what clears it: a caller must be able to tell an owed turn
+            # from a stale-epoch latch that the next sweep will abandon.
+            if 'unknown' in states:
+                lost = next((r for r in admissions if r['status'] == 'unknown'), None)
+                if lost is not None:
+                    raise RuntimeStoreError('unknown_execution', field='session_admissions.status',
+                                            detail=f"seq={lost['seq']} cleared_by=settle_session_input|epoch_sweep")
+                lost_worker = next(r for r in workers if r['status'] == 'unknown')
+                raise RuntimeStoreError('unknown_execution', field='worker_executions.status',
+                                        detail=f"execution_id={lost_worker['execution_id']} cleared_by=settle_session_input|epoch_sweep")
+            raise RuntimeStoreError('session_busy')
         for raw in admissions:
             row = dict(raw)
             from hermes_state_media import retire_media
