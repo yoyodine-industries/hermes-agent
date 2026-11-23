@@ -22,6 +22,7 @@ from gateway import hosted_room_router as router
 from gateway import hosted_rooms
 from gateway import hosted_rooms_common as common
 from gateway.hosted_room_context import scheduled_post_kind, validate_context
+from gateway.hosted_room_authority_history import TRANSFER_KINDS
 from gateway.hosted_room_task_input import validate_task_input
 from gateway.hosted_rooms_common import compact_json
 
@@ -481,7 +482,8 @@ _EVENT_VALIDATORS = {
     router.ROUTED_EVENT_KIND: router.validate_routed_event, router.CONTINUED_EVENT_KIND: router.validate_continued_event}
 
 
-def _validate_event(raw: Any, *, room: DiscussionRoom, previous_seq: int) -> _ValidatedEvent:
+def _validate_event(raw: Any, *, room: DiscussionRoom, previous_seq: int,
+                    span_epoch: int | None = None) -> _ValidatedEvent:
     if not isinstance(raw, Mapping):
         raise DiscussionValidationError("room event must be an object")
     if raw.get("room_id") != room.room_id:
@@ -495,8 +497,21 @@ def _validate_event(raw: Any, *, room: DiscussionRoom, previous_seq: int) -> _Va
         (payload, Mapping, "event payload must be an object")):
         if not isinstance(value, expected):
             raise DiscussionValidationError(message)
-    if kind in _EPOCH_STAMPED_KINDS and raw.get("authority_epoch") != room.authority_epoch:
-        raise DiscussionValidationError(f"{kind} authority epoch does not match the room")
+    if kind in _EPOCH_STAMPED_KINDS:
+        # An event carries the epoch its author held when it was appended, not the room's
+        # current one: after a committed authority transfer the pre-transfer history is
+        # stamped with superseded epochs on purpose. Compare against the span the log's own
+        # transfer events place this seq in, and only bound the claim while that span is
+        # unknown (a partial event list starts mid-history).
+        epoch = raw.get("authority_epoch")
+        if span_epoch is None:
+            if type(epoch) is not int or not 1 <= epoch <= room.authority_epoch:
+                raise DiscussionValidationError(
+                    f"{kind} at seq {seq} carries authority epoch {epoch!r}, which the room never held")
+        elif epoch != span_epoch:
+            raise DiscussionValidationError(
+                f"{kind} at seq {seq} carries authority epoch {epoch!r}; the committed transfer history "
+                f"puts seq {seq} in epoch {span_epoch}")
     if (validator := _EVENT_VALIDATORS.get(kind)) is not None:
         payload = validator(kind, payload, actor, room)
     return _ValidatedEvent(raw=raw, seq=seq, event_id=event_id, kind=kind, actor=actor, payload=payload)
@@ -505,12 +520,19 @@ def _validate_event(raw: Any, *, room: DiscussionRoom, previous_seq: int) -> _Va
 def _validated_events(events: Sequence[Mapping[str, Any]], *, room: DiscussionRoom) -> tuple[_ValidatedEvent, ...]:
     validated: list[_ValidatedEvent] = []
     event_ids: set[str] = set()
+    span_epoch: int | None = None
     for raw in events:
-        event = _validate_event(raw, room=room, previous_seq=validated[-1].seq if validated else 0)
+        event = _validate_event(raw, room=room, previous_seq=validated[-1].seq if validated else 0,
+                                span_epoch=span_epoch)
         if event.event_id in event_ids:
             raise DiscussionValidationError("room event ids must be unique")
         validated.append(event)
         event_ids.add(event.event_id)
+        # A committed transfer opens its span, so every later event belongs to it.
+        if event.kind in TRANSFER_KINDS:
+            committed = event.payload.get("authority_epoch")
+            if type(committed) is int and committed == raw.get("authority_epoch"):
+                span_epoch = committed
     return tuple(validated)
 
 

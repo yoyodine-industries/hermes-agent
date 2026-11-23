@@ -792,3 +792,43 @@ def test_malformed_log_and_task_reconstruction_fail_closed(
             malformed,
             local_profiles=LOCAL_PROFILES,
         )
+
+
+def _activity(seq: int, *, epoch: int) -> dict:
+    return {
+        "room_id": ROOM_ID, "seq": seq, "event_id": f"activity-{seq}", "kind": "room.activity",
+        "actor": {"kind": "gateway", "id": GATEWAY_ID}, "authority_epoch": epoch,
+        "payload": {"status": "settled", "reason_code": "silent_round", "thread_id": "thread-1",
+                    "discussion_event_id": "user-1"},
+    }
+
+
+def _transfer(seq: int, kind: str, *, previous: str, current: str, epoch: int) -> dict:
+    return {
+        "room_id": ROOM_ID, "seq": seq, "event_id": f"transfer-{seq}", "kind": kind,
+        "actor": {"kind": "system", "id": "authority-control"}, "authority_epoch": epoch,
+        "payload": {"previous_gateway_id": previous, "authority_gateway_id": current, "authority_epoch": epoch},
+    }
+
+
+def test_history_keeps_the_epoch_it_was_authored_under_across_a_handoff():
+    """A handed-off room's pre-transfer events stay valid: they carry the epoch their author held,
+    not the epoch the room adopted (a repair that re-stamped them broke the evidence lineage)."""
+    room = discussion.validate_room(
+        {"room_id": ROOM_ID, "name": "Room", "members": MEMBERS,
+         "authority_gateway_id": GATEWAY_ID, "authority_epoch": 3},
+        local_profiles=LOCAL_PROFILES)
+    handoff = GATEWAY_ID + ":gateway-store"
+    events = [
+        _activity(1, epoch=1),
+        _transfer(2, "authority.lost", previous=GATEWAY_ID, current=handoff, epoch=2),
+        _transfer(3, "authority.claimed", previous=handoff, current=GATEWAY_ID, epoch=3),
+        _activity(4, epoch=3),
+    ]
+
+    assert [event.seq for event in discussion._validated_events(events, room=room)] == [1, 2, 3, 4]
+
+    # Inside a committed span the claim is still checked, and the refusal names the seq.
+    events[-1]["authority_epoch"] = 1
+    with pytest.raises(discussion.DiscussionValidationError, match="seq 4"):
+        discussion._validated_events(events, room=room)

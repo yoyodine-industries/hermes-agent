@@ -3,6 +3,8 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from gateway import hosted_rooms
 from gateway.hosted_rooms_gateway_import import handoff_gateway_id, import_standalone_rooms
 from gateway.owner_identity import host_owner_subject
@@ -123,3 +125,43 @@ def test_gateway_startup_takes_over_the_standalone_rooms(tmp_path, monkeypatch):
         assert [b.room_id for b in authority.hosted_room_service.bindings()] == ["old-room"]
     finally:
         db.close()
+
+
+def test_a_handed_off_room_keeps_the_epochs_its_events_were_authored_under(tmp_path):
+    """The standalone -> ``:gateway-store`` -> gateway round trip preserves each event's authored
+    epoch, and the evidence capture that gates on that lineage still passes afterwards."""
+    from gateway import hosted_room_work_records as work
+    source, target = _stores(tmp_path)
+    _standalone_room(source, "room-round")
+    local = hosted_rooms.local_authority_gateway_id()
+    for n in (2, 3):
+        hosted_rooms.append_event(
+            source, room_id="room-round", event_id=f"user:{n}", kind="message.user",
+            actor={"kind": "user", "id": "desktop"}, payload={"text": "hello"},
+            authority_gateway_id=local, authority_epoch=1)
+
+    assert import_standalone_rooms(target) == 1
+    events = hosted_rooms.read_events(target, room_id="room-round")["events"]
+    assert [(e["seq"], e["kind"], e["authority_epoch"]) for e in events] == [
+        (1, "message.user", 1), (2, "message.user", 1), (3, "message.user", 1),
+        (4, "authority.lost", 2), (5, "authority.claimed", 3)]
+    record = work.capture(target, room_id="room-round", local_gateway_id=local)
+    assert record["version"] == 2 and record["lineage_sha256"]
+
+
+def test_a_re_stamped_history_is_refused_by_room_and_first_bad_seq(tmp_path):
+    """Re-stamping pre-transfer rows with the adopted epoch (what an out-of-band "epoch repair"
+    did) is refused loudly, naming the room, the offending seq and both epochs."""
+    from gateway import hosted_room_work_records as work
+    source, target = _stores(tmp_path)
+    _standalone_room(source, "room-poisoned")
+    import_standalone_rooms(target)
+    with sqlite3.connect(target) as conn:
+        conn.execute("UPDATE hosted_room_events SET authority_epoch=3 WHERE room_id='room-poisoned' AND kind='message.user'")
+
+    with pytest.raises(work.WorkRecordPrefixError) as refused:
+        work.capture(target, room_id="room-poisoned",
+                     local_gateway_id=hosted_rooms.local_authority_gateway_id())
+    message = str(refused.value)
+    assert "not verified" in message and "room-poisoned" in message and "seq 1" in message
+    assert "carries authority epoch 3" in message and "epoch 1" in message
