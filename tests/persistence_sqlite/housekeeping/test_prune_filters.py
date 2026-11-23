@@ -265,3 +265,32 @@ class TestPruneSessionFilters:
             store.maintenance.prune_sessions(
                 older_than_days=None, criteria=PruneCriteria(bogus_filter="x"), media_root=media_root
             )
+
+
+class TestPruneReachesAutoArchived:
+    """The row's rule (card t_0ee10a96 L1) on the persistence criteria: ``archived=False`` with
+    ``include_auto_archived`` reaches the sessions the runtime archived as bookkeeping
+    (``auto_archived=1``) and still spares a human archive (intent), exactly as the old store's
+    ``_ARCHIVED_ELIGIBLE_SQL`` does. Without the flag the old ``s.archived = 0`` meaning stands."""
+
+    @staticmethod
+    def _mk_archived(db, sid, *, auto: bool):
+        create_session(db, session_id=sid, source="cli")
+        end_session(db, sid, end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, archived = 1, auto_archived = ? WHERE id = ?",
+            (time.time() - 100 * 86400, 1 if auto else 0, sid),
+        )
+        db._conn.commit()
+
+    def test_default_keeps_excluding_the_auto_archived_arm(self, db, store):
+        self._mk_archived(db, "auto", auto=True)
+        rows = store.maintenance.list_prune_candidates(criteria=PruneCriteria(archived=False))
+        assert {r.session_id for r in rows} == set()
+
+    def test_flag_reaches_auto_archived_and_still_spares_a_human_archive(self, db, store):
+        self._mk_archived(db, "auto", auto=True)
+        self._mk_archived(db, "human", auto=False)
+        rows = store.maintenance.list_prune_candidates(
+            criteria=PruneCriteria(archived=False, include_auto_archived=True))
+        assert {r.session_id for r in rows} == {"auto"}
