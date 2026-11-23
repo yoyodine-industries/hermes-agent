@@ -9,6 +9,10 @@ was silently dropped for every custom endpoint.
 These tests pin the wire-shape contract:
     - disabled on Ollama  → extra_body.think = False + reasoning_effort=none
     - disabled elsewhere  → reasoning_effort=none, no think (strict APIs 422)
+    - disabled on llama.cpp → NO reasoning_effort at all: that wire has no ``none`` level
+                          (default|minimal|low|medium|high|xhigh|max) and silently discards
+                          an unknown value, applying the chat template's own (expensive)
+                          default instead — fleet-wide, with no warning anywhere
     - enabled + effort    → top-level reasoning_effort (native OpenAI-compat
                           format GLM/ARK expect), passed through verbatim
                           including ``max``/``xhigh``
@@ -18,7 +22,23 @@ These tests pin the wire-shape contract:
 
 from __future__ import annotations
 
+import importlib
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import pytest
+
+# What llama-server's /props answers (abridged, b12588 on 127.0.0.1:7777): build_info is the
+# field hermes_cli.local_runtime.detect fingerprints to tell llama.cpp from every other
+# OpenAI-compatible wire.
+LLAMACPP_PROPS = {
+    "build_info": "b12588-2a3beff7",
+    "model_alias": "yaan-main",
+    "model_ftype": "Q8_0",
+    "default_generation_settings": {"n_ctx": 65536},
+}
+VLLM_PROPS = {"model": "Qwen/Qwen3-8B", "max_model_len": 32768}
 
 
 @pytest.fixture
@@ -235,3 +255,213 @@ class TestCustomResponsesEffortVocabulary:
             },
         )
         assert (effort, enabled) == ("xhigh", True)
+
+
+@pytest.fixture
+def props_server():
+    """Local /props responder; the returned factory yields ``http://127.0.0.1:<port>``.
+
+    Real HTTP, not a mock: the wire predicate is a fingerprint of what a server answers, so a
+    stubbed predicate would prove only that the test can return a boolean.
+    """
+    servers = []
+
+    def _serve(body=None, status: int = 200) -> str:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's name
+                if self.path.split("?")[0] != "/props":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(status)
+                if status == 200:
+                    raw = json.dumps(body).encode()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                else:
+                    self.end_headers()
+
+            def log_message(self, format, *args):  # noqa: A002 - the parent's own signature
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        servers.append(srv)
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    yield _serve
+    for srv in servers:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.fixture
+def wire_module(custom_profile):
+    """The registered profile's own module, with the fingerprint cache emptied around the test."""
+    mod = importlib.import_module(custom_profile.__class__.__module__)
+    reset = getattr(mod, "_reset_llamacpp_wire_cache", None)  # absent before this change
+    if reset is not None:
+        reset()
+    yield mod
+    if reset is not None:
+        reset()
+
+
+class TestLlamaCppWireOmitsReasoningEffort:
+    """llama.cpp's wire has no ``none`` level — emitting it is silently discarded.
+
+    Measured on b12588: ``"none"`` is dropped with no log line, and the chat template's 0.9
+    default applies, so a seat configured with reasoning disabled pays the HIGHEST thinking
+    cost while every log says nothing. The field must be absent, and the server's own
+    ``--reasoning on|off|auto`` decides. ``none`` stays legal on vLLM/SGLang/OpenAI-compat,
+    so this is a wire-shaped omission, never a blanket remap to a lower level.
+    """
+
+    def test_disabled_omits_the_key_on_a_llamacpp_wire(
+        self, custom_profile, wire_module, props_server
+    ):
+        root = props_server(LLAMACPP_PROPS)
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="yaan-main",
+            base_url=f"{root}/v1",
+        )
+        assert "reasoning_effort" not in tl
+        assert tl == {}
+        # think is Ollama-native; llama.cpp is not Ollama and must not receive it.
+        assert eb == {}
+
+    def test_effort_none_omits_the_key_on_a_llamacpp_wire(
+        self, custom_profile, wire_module, props_server
+    ):
+        """``effort: none`` is the other spelling of the disable path — same omission."""
+        root = props_server(LLAMACPP_PROPS)
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "none"},
+            model="yaan-main",
+            base_url=f"{root}/v1",
+        )
+        assert "reasoning_effort" not in tl
+        assert eb == {}
+
+    def test_outgoing_payload_carries_no_reasoning_effort(
+        self, custom_profile, wire_module, props_server
+    ):
+        """THE primary gate: the payload the chat-completions transport actually builds.
+
+        For both disable spellings, on a proven llama.cpp wire, ``reasoning_effort`` is absent
+        from the whole kwargs dict — top level and extra_body alike.
+        """
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        root = props_server(LLAMACPP_PROPS)
+        for reasoning_config in ({"enabled": False}, {"enabled": True, "effort": "none"}):
+            kwargs = ChatCompletionsTransport().build_kwargs(
+                model="yaan-main",
+                messages=[{"role": "user", "content": "ping"}],
+                tools=None,
+                provider_profile=custom_profile,
+                reasoning_config=reasoning_config,
+                base_url=f"{root}/v1",
+                provider_name="custom",
+            )
+            assert "reasoning_effort" not in kwargs, reasoning_config
+            assert "reasoning_effort" not in (kwargs.get("extra_body") or {}), reasoning_config
+
+    @pytest.mark.parametrize(
+        "body, status",
+        [
+            (VLLM_PROPS, 200),  # vLLM answers /props without build_info
+            (None, 404),  # SGLang / LM Studio have no /props at all
+        ],
+    )
+    def test_other_openai_compat_wires_still_carry_none(
+        self, custom_profile, wire_module, props_server, body, status
+    ):
+        """vLLM/SGLang/OpenAI-compat accept ``none`` — the omission must not leak onto them."""
+        root = props_server(body, status)
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="Qwen3-8B",
+            base_url=f"{root}/v1",
+        )
+        assert tl == {"reasoning_effort": "none"}
+        assert eb == {}
+
+    def test_probe_verdict_is_cached_per_root(
+        self, custom_profile, wire_module, props_server, monkeypatch
+    ):
+        """One fingerprint per server per TTL — the request path must not re-probe each call."""
+        root = props_server(LLAMACPP_PROPS)
+        calls = []
+        real = wire_module._props_says_llamacpp
+
+        def _counting(root_url):
+            calls.append(root_url)
+            return real(root_url)
+
+        monkeypatch.setattr(wire_module, "_props_says_llamacpp", _counting)
+        for _ in range(3):
+            _, tl = custom_profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": False}, model="m", base_url=f"{root}/v1"
+            )
+            assert tl == {}
+        assert calls == [root]
+
+    def test_non_loopback_endpoint_is_never_probed(
+        self, custom_profile, wire_module, monkeypatch
+    ):
+        """A remote relay is not assumed to be llama.cpp, and we never probe it."""
+
+        def _boom(root):
+            raise AssertionError(f"probed a non-loopback endpoint: {root}")
+
+        monkeypatch.setattr(wire_module, "_props_says_llamacpp", _boom)
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="glm-5.2",
+            base_url="https://relay.example.com/v1",
+        )
+        assert tl == {"reasoning_effort": "none"}
+
+    def test_unreachable_loopback_endpoint_keeps_previous_behaviour(
+        self, custom_profile, wire_module
+    ):
+        """A closed port yields no fingerprint → ``none`` is still emitted (no regression)."""
+        import socket
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="m",
+            base_url=f"http://127.0.0.1:{port}/v1",
+        )
+        assert tl == {"reasoning_effort": "none"}
+
+    def test_malformed_loopback_port_does_not_raise(self, custom_profile, wire_module):
+        """urlparse's ``port`` raises on ``:99999`` — the predicate must treat it as unknown."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="m",
+            base_url="http://127.0.0.1:99999/v1",
+        )
+        assert tl == {"reasoning_effort": "none"}
+
+    @pytest.mark.parametrize(
+        "effort", ["minimal", "low", "medium", "high", "xhigh", "max"]
+    )
+    def test_graded_effort_is_untouched_on_a_llamacpp_wire(
+        self, custom_profile, wire_module, props_server, effort
+    ):
+        """Only the disable path is wire-shaped; a configured level still goes out verbatim."""
+        root = props_server(LLAMACPP_PROPS)
+        _, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort},
+            model="yaan-main",
+            base_url=f"{root}/v1",
+        )
+        assert tl == {"reasoning_effort": effort}
