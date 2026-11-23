@@ -14,8 +14,10 @@ import logging
 import os
 from pathlib import Path
 import queue
+import random
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
@@ -115,6 +117,15 @@ class _OwnerLink:
         return reply
 
 
+# A worker asks a descriptor the multiplexer rewrites on every owner restart, so 'not ready'
+# is routinely TRANSIENT - and a save that dies on it was never attempted (nothing is lost,
+# it is simply not written, and the death then costs the caller its whole retry budget).
+# Waited out with a bounded, jittered backoff; a genuinely absent owner still surfaces as
+# owner_unavailable naming the attempts instead of hanging.
+DISCOVERY_PATIENCE_SECONDS = 20.0
+DISCOVERY_BACKOFF_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.5, 2.0)
+
+
 class WorkerRPC:
     """Bounded authenticated calls to an existing owner; never starts a daemon.
 
@@ -139,12 +150,7 @@ class WorkerRPC:
         from hermes_cli.gateway_runtime_discovery import query_identify
         from websockets.sync.client import connect
         # A served secondary has no socket; its multiplexer's descriptor names it.
-        from hermes_cli.gateway_runtime import discover_gateway_endpoint
-        discovery = discover_gateway_endpoint(self.home, timeout=5)
-        if discovery.state == 'ready' and discovery.endpoint is not None:
-            self.endpoint = discovery.endpoint
-        elif discovery.state != 'draining' or self.endpoint is None:
-            raise WorkerPersistenceError('owner_unavailable')
+        self._await_owner()
         from hermes_cli.gateway_runtime import control_home_for
         endpoint = self.endpoint
         descriptor = query_identify(control_home_for(self.home, endpoint), timeout=5)
@@ -158,6 +164,43 @@ class WorkerRPC:
         self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=5, close_timeout=1,
                                        max_size=8 * 1024 * 1024, proxy=None, ping_interval=None))
         return self.link
+
+    def _await_owner(self):
+        """Wait out a transient descriptor, bounded, and NAME the owner when it never comes.
+
+        The descriptor is rewritten whenever the owner restarts or the multiplexer
+        re-registers, so 'not ready' is routinely momentary. This used to be asked exactly
+        once: a worker that hit the rewrite died on a save it had not yet attempted, and
+        that death then spent the caller's retry budget on a write SQLite never saw.
+        """
+        from hermes_cli.gateway_runtime import discover_gateway_endpoint
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            discovery = discover_gateway_endpoint(self.home, timeout=5)
+            if discovery.state == 'ready' and discovery.endpoint is not None:
+                self.endpoint = discovery.endpoint
+                if attempt:
+                    logger.info('owner became ready after %d discovery attempt(s) in %.2fs',
+                                attempt + 1, time.monotonic() - started)
+                return discovery
+            if discovery.state == 'draining' and self.endpoint is not None:
+                return discovery
+            backoff = DISCOVERY_BACKOFF_SECONDS[min(attempt, len(DISCOVERY_BACKOFF_SECONDS) - 1)]
+            # A fleet restarting together must not re-ask the descriptor in lockstep.
+            backoff *= 0.75 + 0.5 * random.random()
+            attempt += 1
+            if time.monotonic() + backoff > started + DISCOVERY_PATIENCE_SECONDS:
+                logger.warning(
+                    'owner_unavailable after %d discovery attempt(s) in %.2fs (last state %r, '
+                    'patience %.0fs): the owner never became ready, so this write was NOT '
+                    'attempted - nothing was lost by stopping here',
+                    attempt, time.monotonic() - started, discovery.state,
+                    DISCOVERY_PATIENCE_SECONDS)
+                raise WorkerPersistenceError('owner_unavailable')
+            logger.info('owner not ready (state %r); re-asking discovery in %.2fs (attempt %d)',
+                        discovery.state, backoff, attempt)
+            time.sleep(backoff)
 
     def _drop(self):
         link, self.link = self.link, None
