@@ -781,9 +781,10 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                    ("script_timeout_seconds", "script_timeout_seconds"),
-                    ("interpreter", "interpreter"), ("timezone", "timezone"),
-                    ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"))
+                   ("interpreter", "interpreter"), ("timezone", "timezone"),
+                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"),
+                   ("script_timeout_seconds", "script_timeout_seconds"),
+                   ("wrap_response", "wrap_response"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
