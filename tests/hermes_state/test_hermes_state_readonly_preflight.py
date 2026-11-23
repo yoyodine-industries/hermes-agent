@@ -12,6 +12,14 @@ from deep inside ``_init_schema`` — naming no file and no fix.
 - anything else fails fast with an error naming the exact file and the
   exact ``chmod`` command;
 - WAL sidecars are never deleted, so committed frames survive repair.
+
+Only paths that must exist are judged: the directory and the main DB
+file. ``-wal``/``-shm``/``-journal`` are SQLite's own bookkeeping — a
+connection unlinks them at checkpoint, so *absent is the normal state*.
+The preflight never tests, never reports and never repairs a sidecar:
+reading one as a permission fault invented "state.db is not writable"
+on healthy stores that had simply checkpointed a microsecond earlier,
+and pointed operators at deleting the ``-wal`` that held their commits.
 """
 
 import os
@@ -82,7 +90,8 @@ class TestRepairScope:
 
         assert os.access(db, os.W_OK)
 
-    def test_repairs_readonly_sidecars(self, hermes_home):
+    def test_readonly_sidecars_are_not_policed(self, hermes_home):
+        """A sidecar's mode is SQLite's business: repaired main DB, untouched -wal."""
         db = hermes_home / "state.db"
         _make_wal_db(db)
         wal = db.with_name(db.name + "-wal")
@@ -93,7 +102,8 @@ class TestRepairScope:
         preflight_db_writability(db, db_label="state.db")
 
         assert os.access(db, os.W_OK)
-        assert os.access(wal, os.W_OK)
+        # Never chmod'd by the preflight — and never inspected as a fault.
+        assert not os.access(wal, os.W_OK)
 
 
     def test_repairs_readonly_parent_directory(self, hermes_home):
@@ -126,7 +136,8 @@ class TestRefusalOutsideScope:
         finally:
             os.chmod(db, 0o644)
 
-    def test_wal_error_warns_against_deletion(self, hermes_home, tmp_path):
+    def test_readonly_wal_outside_home_does_not_refuse(self, hermes_home, tmp_path):
+        """A read-only sidecar is not a store-level permission fault."""
         outside = tmp_path / "elsewhere"
         outside.mkdir()
         db = outside / "custom.db"
@@ -134,54 +145,98 @@ class TestRefusalOutsideScope:
         wal = db.with_name(db.name + "-wal")
         os.chmod(wal, 0o444)
         try:
-            with pytest.raises(sqlite3.OperationalError) as exc_info:
-                preflight_db_writability(db, db_label="custom.db")
-            msg = str(exc_info.value)
-            assert str(wal) in msg
+            # The main DB and its directory are writable: nothing to refuse. SQLite
+            # reports what it can actually open; the preflight forms no opinion.
+            preflight_db_writability(db, db_label="custom.db")
         finally:
             os.chmod(wal, 0o644)
 
 
-class TestSkips:
-    @pytest.mark.parametrize("next_opener_recreates", [False, True], ids=["vanished", "recreated"])
-    def test_sidecars_unlinked_by_sibling_close_mid_preflight_are_not_readonly(
-        self, hermes_home, tmp_path, monkeypatch, next_opener_recreates
-    ):
-        """A sibling connection's last close() unlinks -wal/-shm after the preflight
-        listed them (and the next opener may recreate them before the re-check); a
-        vanished sidecar is not read-only (CI flake in
-        test_concurrent_openers_zero_byte_startup_serialization). Outside the home
-        tree, so the chmod repair cannot mask a false verdict."""
+class TestSidecarsAreNotPoliced:
+    """Absence of a -wal/-shm is SQLite checkpointing, never a permission fault."""
+
+    def test_checkpointed_away_sidecars_pass_and_the_store_writes(self, hermes_home):
+        db = hermes_home / "board.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t (x)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.commit()
+        conn.close()  # last close checkpoints and unlinks -wal/-shm
+        wal = db.with_name(db.name + "-wal")
+        shm = db.with_name(db.name + "-shm")
+        assert not wal.exists() and not shm.exists(), (
+            "fixture precondition: a clean close must leave no sidecars"
+        )
+
+        preflight_db_writability(db, db_label="board.db")
+
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("INSERT INTO t VALUES (2)")
+            conn.commit()
+            assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 2
+        finally:
+            conn.close()
+
+    def test_sidecar_unlinked_mid_check_is_absence_not_a_permission_fault(self, hermes_home, monkeypatch):
+        """The production race: the sidecar is gone by the time anyone looks at it."""
+        db = hermes_home / "kanban.db"
+        _make_wal_db(db)
+        sidecars = [db.with_name(db.name + suf) for suf in ("-wal", "-shm")]
+        assert any(p.is_file() for p in sidecars), "fixture precondition: a sidecar must exist"
+
+        real_access = os.access
+        checkpointed = []
+
+        def access_while_sqlite_checkpoints(path, mode, **kwargs):
+            # A concurrent connection checkpoints: the preflight's existence
+            # snapshot is already stale and the sidecars are unlinked.
+            if not checkpointed:
+                checkpointed.append(True)
+                for sidecar in sidecars:
+                    sidecar.unlink(missing_ok=True)
+            return real_access(path, mode, **kwargs)
+
+        monkeypatch.setattr(os, "access", access_while_sqlite_checkpoints)
+        preflight_db_writability(db, db_label="kanban.db")  # must NOT raise
+        monkeypatch.undo()
+
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("INSERT INTO t VALUES (7)")
+            conn.commit()
+            # The store opens and writes: the vanished sidecar was absence, not a fault.
+            assert conn.execute("SELECT count(*) FROM t WHERE x = 7").fetchone()[0] == 1
+        finally:
+            conn.close()
+
+    def test_genuinely_readonly_db_still_refuses(self, hermes_home, tmp_path):
         outside = tmp_path / "elsewhere"
         outside.mkdir()
-        db = outside / "state.db"
-        sibling = sqlite3.connect(str(db))
-        sibling.execute("PRAGMA journal_mode=WAL")
-        sibling.execute("CREATE TABLE t (x)")
-        sibling.commit()
-        wal = db.with_name(db.name + "-wal")
-        assert wal.is_file(), "fixture precondition: the live sibling holds a -wal"
-        real_access = os.access
-        open_sibling, next_opener = [sibling], []
-
-        def access_racing_sibling_close(path, mode, *args, **kwargs):
-            if Path(path) != wal or not open_sibling:
-                return real_access(path, mode, *args, **kwargs)
-            open_sibling.pop().close()  # last connection: SQLite unlinks -wal/-shm
-            verdict = real_access(path, mode, *args, **kwargs)
-            if next_opener_recreates:
-                next_opener.append(conn := sqlite3.connect(str(db)))
-                conn.execute("INSERT INTO t VALUES (1)")
-                conn.commit()  # a fresh -wal generation appears before the re-check
-            return verdict
-
-        monkeypatch.setattr(os, "access", access_racing_sibling_close)
+        db = outside / "custom.db"
+        _make_db(db)
+        os.chmod(db, 0o444)
         try:
-            preflight_db_writability(db, db_label="state.db")
-        finally:
-            for conn in next_opener:
+            with pytest.raises(sqlite3.OperationalError) as exc_info:
+                preflight_db_writability(db, db_label="custom.db")
+            msg = str(exc_info.value)
+            assert str(db) in msg
+            assert "-wal" not in msg and "-shm" not in msg
+            # The refusal is real: the store cannot be written.
+            conn = sqlite3.connect(str(db))
+            try:
+                with pytest.raises(sqlite3.OperationalError):
+                    conn.execute("INSERT INTO t VALUES (2)")
+            finally:
                 conn.close()
-        assert not open_sibling and len(next_opener) == int(next_opener_recreates)
+        finally:
+            os.chmod(db, 0o644)
+
+
+class TestSkips:
+
+
 
     def test_healthy_db_untouched(self, hermes_home):
         db = hermes_home / "state.db"
