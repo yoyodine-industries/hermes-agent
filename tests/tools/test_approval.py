@@ -1450,8 +1450,15 @@ class TestGitGlobalFlagPrefix:
 
     def test_every_git_row_carries_the_shared_prefix(self):
         """A fix that widens `push` but leaves a sibling git row on the bare prefix is worse
-        than no fix: the family reads as closed while a row still admits the bypass."""
-        prefix = r"\bgit\s+" + approval_detection._QUOTED_GLOBAL_FLAGS
+        than no fix: the family reads as closed while a row still admits the bypass.
+
+        Upstream moved the grammar to :mod:`tools.approval_git_options`, so the shared prefix
+        this row pinned as ``_QUOTED_GLOBAL_FLAGS`` is now that module's ``_GIT``. The
+        invariant is unchanged: EVERY git row carries the grammar, quoted spellings included.
+        """
+        from tools.approval_git_options import _GIT
+
+        prefix = _GIT
         rows = [p for p, _d in approval_detection.DANGEROUS_PATTERNS if p.startswith(r"\bgit")]
         assert rows
         assert all(p.startswith(prefix) for p in rows), [p for p in rows if not p.startswith(prefix)]
@@ -1479,9 +1486,15 @@ class TestGitGlobalFlagPrefix:
     def test_fragment_keeps_the_apostrophe_alternative(self):
         """`\\'` inside a single-quoted raw literal IS a literal apostrophe to the regex engine
         (Python keeps the backslash, `re` reads it as an escaped non-special character); `\\\\'`
-        would be a literal BACKSLASH and would silently drop the single-quoted value spelling."""
-        fragment = approval_detection._QUOTED_GLOBAL_FLAGS
-        assert r"\'[^\']*\'" in fragment
+        would be a literal BACKSLASH and would silently drop the single-quoted value spelling.
+
+        The fragment lives in :mod:`tools.approval_git_options` as ``_GIT_WORD``; the clause is
+        unchanged - the single-quoted alternative is there, and it is not a doubled backslash.
+        """
+        from tools.approval_git_options import _GIT_WORD
+
+        fragment = _GIT_WORD
+        assert "'[^']*'" in fragment
         assert "\\\\'" not in fragment
 
 

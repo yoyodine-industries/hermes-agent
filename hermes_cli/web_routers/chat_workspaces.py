@@ -64,12 +64,12 @@ def _collect_workspaces(profile: Optional[str], scan: bool) -> dict:
             if scan and policy["enabled"]:
                 gateway_projects._scan_discovered_repos_remote(conn, policy)
             projects = [p.to_dict() for p in pdb.list_projects(conn)]
-            repos = gateway._discover_repos_payload(
+            repos = gateway_projects._discover_repos_payload(
                 None, conn=conn, backfill=False, include_cached=policy["enabled"], persistence=persistence)
     finally:
         if persistence is not None:
             persistence.close()
-    default_cwd = gateway._completion_cwd({"profile": profile} if profile else {})
+    default_cwd = gateway_workdir._completion_cwd({"profile": profile} if profile else {})
     return {
         "projects": projects, "repos": repos, "default_cwd": default_cwd,
         "home": str(Path.home()), "scan_enabled": bool(policy["enabled"])}

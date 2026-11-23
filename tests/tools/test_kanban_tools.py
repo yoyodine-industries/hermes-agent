@@ -1157,7 +1157,14 @@ def _sub_index(subs):
 def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     """A gateway session (platform + chat_id set) gets auto-subscribed
     to its own kanban_create result, and the response surfaces the
-    ``subscribed`` flag so the orchestrator can react."""
+    ``subscribed`` flag so the orchestrator can react.
+
+    The gateway binds these through ``gateway.session_context``, and a bound (even empty)
+    ContextVar wins over ``os.environ`` - so the test binds the vars the way the runtime does
+    instead of relying on the environ fallback, which a sibling test's binding can shadow.
+    The environ spellings stay set, so the legacy fallback path is still exercised.
+    """
+    from gateway.session_context import reset_session_vars, set_session_vars
     from tools import kanban_tools as kt
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
@@ -1166,10 +1173,16 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "alt-user-9")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
 
-    out = kt._handle_create({
-        "title": "auto-sub gateway",
-        "assignee": "peer",
-    })
+    set_session_vars(
+        platform="telegram", chat_id="chat-42", thread_id="thread-7",
+        user_id="user-9", user_id_alt="alt-user-9", chat_type="forum")
+    try:
+        out = kt._handle_create({
+            "title": "auto-sub gateway",
+            "assignee": "peer",
+        })
+    finally:
+        reset_session_vars()
     d = json.loads(out)
     assert d["ok"] is True
     new_tid = d["task_id"]

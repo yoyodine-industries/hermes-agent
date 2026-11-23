@@ -13,6 +13,7 @@ from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session_contract import SessionRef
 from gateway.session_persistence import authority_persistence
+from hermes_state_runtime import RuntimeStoreError
 from persistence.core.errors import AuthorityRefusal
 from session_rules.automation import automation_descriptor as _descriptor
 

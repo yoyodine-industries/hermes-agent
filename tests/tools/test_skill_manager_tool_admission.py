@@ -110,10 +110,15 @@ pause. Scheduled jobs defer into a reserved band and resume after the window clo
 
 @contextmanager
 def _skills_root(tmp_path):
-    """Point the tool at a temp skills root; the ledger follows HERMES_HOME (conftest-pinned)."""
+    """Point the tool at a temp skills root; the ledger follows HERMES_HOME (conftest-pinned).
+
+    Upstream resolves the root per call through ``tools.skills_tool._skills_dir`` (bound into
+    this module at import) instead of a module-level ``SKILLS_DIR`` constant, so the patch
+    targets the bound name the tool actually reads. The intent is unchanged.
+    """
     root = tmp_path / "skills"
     root.mkdir()
-    with patch("tools.skill_manager_tool.SKILLS_DIR", root), \
+    with patch("tools.skill_manager_tool._skills_dir", return_value=root), \
          patch("agent.skill_utils.get_all_skills_dirs", return_value=[root]):
         yield root
 
