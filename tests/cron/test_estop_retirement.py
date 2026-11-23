@@ -108,7 +108,14 @@ def _bot_armed_operator_hold(**fields) -> dict:
 
 
 def _release_rows() -> list:
-    return [row for row in estop.read_events() if row.get("event") == "release"]
+    """Every row that records a LIFT of a hold.
+
+    The deadman lift carries the ENGINE half's shape on the converged line — an ``expire`` row
+    (ruling t_b70753e9 round 2, shape 1: D5 lists ``expire`` beside ``release{cause}``) — so a
+    reader asking "what lifted this scope, and why" accepts both events. The assertions below
+    are about the CAUSE a lift leaves behind, never about the event's spelling.
+    """
+    return [row for row in estop.read_events() if row.get("event") in ("release", "expire")]
 
 
 # ── 1. `mode: estop` is not a supported operation ───────────────────────────
@@ -348,7 +355,7 @@ def test_every_release_form_records_a_cause(hermes_home):
     time.sleep(1.1)
     estop.is_engaged()  # the gate call is what retires an expired hold
 
-    causes = [row.get("cause") for row in estop.read_events() if row.get("event") == "release"]
+    causes = [row.get("cause") for row in _release_rows()]  # release{cause} rows + the `expire` row
     assert "handle" in causes and "owner" in causes and "deadman" in causes
     assert by_handle
 
@@ -443,7 +450,7 @@ def test_c2_a_hold_armed_by_another_process_survives_a_fresh_interpreter(hermes_
         "print(h, is_engaged())"
     )
     proc = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True,
+        [sys.executable, "-c", code], capture_output=True, text=True, check=False,
         cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(estop.__file__)))),
         env={**os.environ},
     )
