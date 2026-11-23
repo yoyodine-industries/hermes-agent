@@ -9,7 +9,7 @@ import os
 
 from gateway.session_admission import admission_fingerprint
 from hermes_state_runtime import (
-    RuntimeStoreError, _secret_digest, adopt_worker_execution,
+    RuntimeStoreError, _secret_digest, _worker_public, adopt_worker_execution,
     mutate_worker_execution, register_worker_execution,
 )
 
@@ -60,6 +60,7 @@ def _verify(connection, ref, params, claim):
             raise RuntimeStoreError('stale_generation')
         if not hmac.compare_digest(row['adoption_digest'], _secret_digest(claim)):
             raise RuntimeStoreError('permission_denied')
+        return row
 
 
 async def worker_request(connection, ref, params, *, operation):
@@ -71,11 +72,19 @@ async def worker_request(connection, ref, params, *, operation):
     if operation == "persist" and params.get("operation") == "child.reserve":
         from gateway.session_worker_child import worker_child_request
         return await worker_child_request(connection, ref, params)
-    extra = {'register': {'kind'}, 'adopt': set(), 'persist': {'epoch', 'sequence', 'operation', 'payload'}}[operation]
+    extra = {'register': {'kind'}, 'adopt': set(), 'status': set(),
+             'persist': {'epoch', 'sequence', 'operation', 'payload'}}[operation]
     if set(params) != _SCOPE | extra:
         raise RuntimeStoreError('invalid_params')
     claim = _claim(connection, ref, params)
     authority = connection.authority
+    if operation == 'status':
+        # Read-only, and the reason it exists: a lost ACK for a verb that must never be replayed
+        # (worker.adopt/worker.register) is resolved by asking the owner what it HOLDS, not by
+        # resending the claim. Same producer claim, same answer the verb's own receipt carries.
+        if 'worker:adopt' not in connection.actor.capabilities:
+            raise RuntimeStoreError('permission_denied')
+        return _worker_public(_verify(connection, ref, params, claim))
     if operation == 'register':
         authority._require_admission_open()
     scope = {key: params[key] for key in ('execution_id', 'session_id', 'generation')}

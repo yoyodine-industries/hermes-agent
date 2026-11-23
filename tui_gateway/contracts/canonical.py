@@ -525,6 +525,9 @@ canonical_method("worker.register", params=WorkerRegisterParams, result=WorkerEx
                  doc="Register a compute worker execution on an idle session.")
 canonical_method("worker.adopt", params=WorkerScopeParams, result=WorkerExecution,
                  doc="Adopt a registered execution after verifying the live producer claim.")
+canonical_method("worker.status", params=WorkerScopeParams, result=WorkerExecution,
+                 doc="Read the owner's row for this execution: how a lost ACK for a non-replayable "
+                     "worker verb is confirmed, never by resending it.")
 
 
 class WorkerPersistParams(WorkerScopeParams):

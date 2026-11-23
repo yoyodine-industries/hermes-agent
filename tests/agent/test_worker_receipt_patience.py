@@ -52,6 +52,48 @@ def _rpc(monkeypatch, script):
     return rpc, link
 
 
+class _Owner:
+    """A scripted owner that answers PER METHOD, so a fixture can express a late ACK and a fast
+    read without pretending the mutation was re-sent."""
+
+    def __init__(self, receipts):
+        self.receipts = {name: list(steps) for name, steps in receipts.items()}
+        self.sent = []
+        self.ws = types.SimpleNamespace(close=lambda: None)
+
+    def send(self, request_id, message):
+        self.sent.append(json.loads(message))
+
+    def receive(self, timeout):
+        request = self.sent[-1]
+        steps = self.receipts[request['method']]
+        step = steps.pop(0) if len(steps) > 1 else steps[0]
+        if isinstance(step, BaseException):
+            raise step
+        return {**step, 'id': request['id']}
+
+    def methods(self):
+        return [request['method'] for request in self.sent]
+
+
+def _owner(monkeypatch, receipts):
+    rpc = WorkerRPC('/nonexistent-home')
+    owner = _Owner(receipts)
+    monkeypatch.setattr(rpc, '_connection', lambda: owner)
+    monkeypatch.setattr(worker_store, 'RECEIPT_BACKOFF_SECONDS', (0.01,))
+    return rpc, owner
+
+
+ADOPT_SCOPE = {'profile_id': 'p', 'session_id': 's', 'execution_id': 'w', 'generation': 0,
+               'pid': 424242, 'birth': 100.5, 'secret': 'x' * 32}
+ADOPTED_ROW = {'execution_id': 'w', 'session_id': 's', 'kind': 'compute', 'owner_epoch': 7,
+               'generation': 0, 'status': 'running', 'last_sequence': 0}
+
+
+def _reply(result):
+    return {'jsonrpc': '2.0', 'result': result}
+
+
 def test_receipt_timeout_is_re_asked_and_resolves(monkeypatch, caplog):
     reply = {'jsonrpc': '2.0', 'id': 1, 'result': {'ok': True}}
     rpc, link = _rpc(monkeypatch, [TimeoutError('worker_receipt_timeout'), reply])
@@ -75,13 +117,71 @@ def test_busy_owner_past_the_patience_raises_a_classified_timeout(monkeypatch, c
     assert 'did not ACK' in caplog.text
 
 
-def test_a_non_idempotent_method_is_never_re_asked(monkeypatch):
-    rpc, link = _rpc(monkeypatch, [TimeoutError('worker_receipt_timeout')])
-    monkeypatch.setattr(worker_store, 'RECEIPT_PATIENCE_SECONDS', 60.0)
+def test_a_joined_worker_is_kept_when_its_adopt_ack_is_lost(monkeypatch, caplog):
+    """L1: the 75s patience covers only replay-safe methods, so a non-replay-safe miss used to
+    raise on the FIRST 20s budget - discarding a worker the owner had already joined. A late ACK
+    plus an answering read must COMPLETE the turn, with the read named in the log."""
+    rpc, owner = _owner(monkeypatch, {
+        'worker.adopt': [TimeoutError('worker_receipt_timeout')],
+        'worker.status': [_reply(ADOPTED_ROW)],
+    })
+    monkeypatch.setattr(worker_store, 'RECEIPT_PATIENCE_SECONDS', 5.0)
 
-    with pytest.raises(TimeoutError, match='worker_receipt_timeout'):
-        rpc('worker.register', kind='compute')
-    assert len(link.sent) == 1
+    assert rpc('worker.adopt', **ADOPT_SCOPE) == ADOPTED_ROW
+    # The mutation went out ONCE; what followed was the read, carrying the same producer claim.
+    assert owner.methods() == ['worker.adopt', 'worker.status']
+    assert owner.sent[1]['params'] == ADOPT_SCOPE
+    assert 'worker_receipt_confirmed_by_read' in caplog.text
+    assert 'this receipt is lost' not in caplog.text
+
+
+def test_a_lost_register_ack_confirmed_by_read_never_resends_the_claim(monkeypatch, caplog):
+    rpc, owner = _owner(monkeypatch, {
+        'worker.register': [TimeoutError('worker_receipt_timeout')],
+        'worker.status': [_reply({**ADOPTED_ROW, 'status': 'registered'})],
+    })
+    monkeypatch.setattr(worker_store, 'RECEIPT_PATIENCE_SECONDS', 5.0)
+
+    result = rpc('worker.register', kind='compute', **ADOPT_SCOPE)
+    assert result['status'] == 'registered'
+    assert owner.methods() == ['worker.register', 'worker.status']
+    # `kind` is not part of the producer claim the read proves.
+    assert owner.sent[1]['params'] == ADOPT_SCOPE
+
+
+def test_a_read_that_says_not_committed_retries_once_then_fails_classified(monkeypatch, caplog):
+    rpc, owner = _owner(monkeypatch, {
+        'worker.adopt': [TimeoutError('worker_receipt_timeout')],
+        'worker.status': [_reply({**ADOPTED_ROW, 'status': 'registered'})],
+    })
+    monkeypatch.setattr(worker_store, 'RECEIPT_PATIENCE_SECONDS', 5.0)
+    from hermes_state_errors import classify_persistence_error
+
+    with pytest.raises(TimeoutError, match='worker_receipt_timeout') as failure:
+        rpc('worker.adopt', **ADOPT_SCOPE)
+    # Exactly one retry of the mutation - the one case where re-issuing is idempotent.
+    assert owner.methods().count('worker.adopt') == 2
+    assert classify_persistence_error(failure.value) == 'receipt_timeout'
+    assert 'never blindly' in caplog.text
+
+
+def test_an_owner_that_answers_neither_the_call_nor_the_read_is_a_receipt_timeout(monkeypatch, caplog):
+    """The read is the fallback, not a second wall: an owner silent for both must surface a
+    CLASSIFIED receipt_timeout (harness loss), never a bare `unknown` - and still never a resend."""
+    rpc, owner = _owner(monkeypatch, {
+        'worker.register': [TimeoutError('worker_receipt_timeout')],
+        'worker.status': [TimeoutError('worker_receipt_timeout')],
+    })
+    monkeypatch.setattr(worker_store, 'RECEIPT_PATIENCE_SECONDS', 0.35)
+    from hermes_state_errors import classify_persistence_error
+
+    with pytest.raises(TimeoutError, match='worker_receipt_timeout') as failure:
+        rpc('worker.register', kind='compute', **ADOPT_SCOPE)
+    assert classify_persistence_error(failure.value) == 'receipt_timeout'
+    assert owner.methods()[0] == 'worker.register'
+    assert set(owner.methods()[1:]) == {'worker.status'}  # the read may be re-asked; the claim never
+    assert 'worker_receipt_read_unanswered' in caplog.text
+    assert 'this receipt is lost' not in caplog.text
 
 
 def test_flush_drains_a_receipt_the_owner_acknowledges_late(tmp_path):
