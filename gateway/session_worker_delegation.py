@@ -130,17 +130,25 @@ def _read(db, conn, session_id, payload, *, execution_id):
 
 
 def _claim(db, conn, session_id, payload, *, execution_id):
+    from tools.async_delegation import _MAX_DELIVERY_ATTEMPTS, _converge_exhausted_claim
     _shape(payload, {'delegation_id', 'claim_id'})
     row = _owned(conn, session_id, execution_id, payload['delegation_id'])
     _text(payload['claim_id'])
     now = time.time()
     if row['state'] in ('running', 'finalizing'):
         return {'value': False}
+    # Same budget the release path enforces, but in the predicate of the verb that increments the
+    # counter: a claimant that dies holding the claim never releases, so only this test bounds it.
     changed = conn.execute('''UPDATE async_delegations SET delivery_claim=?,delivery_claimed_at=?,
         delivery_attempts=delivery_attempts+1,updated_at=? WHERE delegation_id=? AND delivery_state='pending'
+        AND delivery_attempts<?
         AND (delivery_claim IS NULL OR delivery_claimed_at < ?)''',
-        (payload['claim_id'], now, now, payload['delegation_id'], now - 300)).rowcount
-    return {'value': changed == 1}
+        (payload['claim_id'], now, now, payload['delegation_id'], _MAX_DELIVERY_ATTEMPTS,
+         now - 300)).rowcount
+    if changed == 1:
+        return {'value': True}
+    _converge_exhausted_claim(conn, payload['delegation_id'], now)
+    return {'value': False}
 
 
 _DELIVERY_UPDATES = {
