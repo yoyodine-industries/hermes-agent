@@ -6,6 +6,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import hashlib
 import json
 import logging
 import shutil
@@ -320,6 +321,10 @@ def _jobs_lock():
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
         # See #80703.
         _jobs_lock_state.load_stamp = None
+        # Store GENERATION as of this section's load_jobs(): the CAS token every save presents
+        # (rule 1 of the write guard, t_60afef80). Reset with the stamp for the same reason — a
+        # generation captured by an earlier section must never certify a later write.
+        _jobs_lock_state.load_generation = None
         lock_fd = None
         try:
             try:
@@ -348,6 +353,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.load_generation = None
 
 
 @contextlib.contextmanager
@@ -1397,16 +1403,21 @@ def get_ticker_last_error() -> Optional[str]:
 
 # --- Job CRUD Operations ---
 
-def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
-    """Tolerant jobs.json parse -> ``(data, used_strict_fallback)``: utf-8-sig absorbs a BOM, strict
-    failure retries with ``strict=False``. IO/fallback errors propagate (caller decides repair vs
-    bail)."""
-    with open(jobs_file, "r", encoding="utf-8-sig") as f:
-        raw = f.read()
+def _parse_store_bytes(raw: bytes) -> tuple[Any, bool]:
+    """Tolerant parse of store bytes -> ``(data, used_strict_fallback)``: utf-8-sig absorbs a BOM,
+    strict failure retries with ``strict=False``. Decode/parse errors propagate (caller decides
+    repair vs bail)."""
+    text = raw.decode("utf-8-sig")
     try:
-        return json.loads(raw), False
+        return json.loads(text), False
     except json.JSONDecodeError:
-        return json.loads(raw, strict=False), True
+        return json.loads(text, strict=False), True
+
+
+def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
+    """Tolerant jobs.json parse -> ``(data, used_strict_fallback)``. IO/fallback errors propagate
+    (caller decides repair vs bail)."""
+    return _parse_store_bytes(Path(jobs_file).read_bytes())
 
 
 def load_jobs() -> list[dict[str, Any]]:
@@ -1416,18 +1427,24 @@ def load_jobs() -> list[dict[str, Any]]:
     # Stamp BEFORE reading (fail-safe, see _record_load_stamp): a racing write then forces the
     # merge.
     pre_read_stamp = _jobs_file_stamp(jobs_file)
-    if not jobs_file.exists():
+    raw = _read_store_bytes(jobs_file)
+    if raw is None:
         _record_load_stamp(None)
+        _record_load_generation(_ABSENT_GENERATION)
         return []
 
     try:
-        data, _strict_retry = _parse_jobs_file(jobs_file)
+        data, _strict_retry = _parse_store_bytes(raw)
     except OSError as e:
         logger.error("IOError reading jobs.json: %s", e)
         raise RuntimeError(f"Failed to read cron database: {e}") from e
     except Exception as e:
         logger.error("Failed to auto-repair jobs.json: %s", e)
         raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
+    # The generation this payload was built from: recorded from the SAME bytes parsed above, so a
+    # later write's CAS token describes exactly what the payload saw (rule 1, t_60afef80).
+    read_generation = _generation_from_raw(raw)
+    _record_load_generation(read_generation)
 
     # Accept the canonical dict, or a bare list (auto-repair); any other top-level shape is
     # corruption. Repair details are logged only by the locked pass (an unlocked pass re-runs
@@ -1491,8 +1508,14 @@ def load_jobs() -> list[dict[str, Any]]:
         # Keep the shrink-merge (a degraded-lock sibling's create may have landed since the read)
         # unless disk is STILL a shape the merge would refuse: a sibling may have rewritten it.
         try:
-            save_jobs(jobs, replace=unmergeable and _peek_jobs_unlocked() is None)
+            _repair_save_jobs(jobs, generation=read_generation, reason=f"auto-repair: {repair}",
+                              unmergeable=unmergeable and _peek_jobs_unlocked() is None)
             logger.warning("Auto-repaired jobs.json (%s)", repair)
+            # The repair changed the bytes: certify what THIS payload now matches.
+            read_generation = store_generation(_current_cron_store().jobs_file)
+            _record_load_generation(read_generation)
+        except StoreWriteRefused as exc:  # repaired in memory; a moved store is never clobbered
+            logger.warning("Auto-repair of jobs.json not persisted: %s", exc)
         except OSError as exc:  # repaired in memory; the next load retries the persist
             store_health.note_unwritable(exc, f"jobs.json repair ({repair}) not persisted", "load")
     _record_load_stamp(pre_read_stamp)
@@ -1537,6 +1560,424 @@ def _record_load_stamp(stamp: Optional[tuple[int, int, int]]) -> None:
     """
     if getattr(_jobs_lock_state, "depth", 0):
         _jobs_lock_state.load_stamp = stamp
+
+
+# --- Store generation and the cron-store write guard -------------------------------------
+#
+# A cron-store write used to be "serialize whatever list you are holding". One stale-snapshot
+# whole-file rewrite deleted 33 rows from the live default store and nothing noticed for ~10
+# hours (t_14655d0c, 44 -> 13). The defect was not the bad write: it was that a write could
+# remove a third of the store and the system had no opinion about it. Four rules, all enforced
+# in the ONE write path (_save_jobs_unlocked):
+#
+#   1. COMPARE-AND-SWAP on a store generation (row count, id-set digest, bytes digest). A write
+#      presents the generation it read; the store is re-read immediately before the write and a
+#      changed generation is REFUSED. A snapshot-derived write carries a stale generation and
+#      dies at the door.
+#   2. REMOVALS MUST BE NAMED. An id present before the write and absent from the payload is a
+#      removal; a removal not listed in ``explicit_removals`` is REFUSED. There is no whole-file
+#      replace API and no force flag - restoring a snapshot is expressible only as additions.
+#   3. POST-WRITE PROOF. The serialized payload is parsed back and checked against the intent,
+#      then the store is re-read after the rename: additions present, named removals absent,
+#      set difference exactly the union of the two, updated rows byte-equal in content. On
+#      disagreement the pre-image is restored and a card is filed with the id-level diff.
+#   4. REMOVAL IS AN EVENT. Any write that removes >= 1 row appends an audit row
+#      (``<cron dir>/store-removals.jsonl``) and files a kanban card naming the removed ids to
+#      the lane that owns the store. If the audit row cannot be written the removal is undone:
+#      an unannounced removal does not stand. Threshold is intent, not size - one row alerts.
+
+REMOVAL_AUDIT_NAME = "store-removals.jsonl"
+_IDS_IN_ERROR_MESSAGE = 20  # ids named in an exception message before eliding
+
+
+class StoreWriteRefused(RuntimeError):
+    """A cron-store write was refused before it could touch the store."""
+
+    code = "store-write-refused"
+
+    def __init__(self, message: str, *, detail: Optional[dict[str, Any]] = None):
+        super().__init__(message)
+        self.detail: dict[str, Any] = dict(detail or {})
+
+
+class StoreGenerationMismatch(StoreWriteRefused):
+    """Rule 1: the store changed between the read the payload came from and the write."""
+
+    code = "generation-mismatch"
+
+
+class UnnamedRemovalRefused(StoreWriteRefused):
+    """Rule 2: the payload would drop rows the caller never named for removal."""
+
+    code = "unnamed-removal"
+
+
+class StoreWriteProofFailed(StoreWriteRefused):
+    """Rule 3: the write did not prove itself against the store."""
+
+    code = "post-write-proof-failed"
+
+
+class StoreAlertFailed(StoreWriteRefused):
+    """Rule 4: a removal could not be announced, so it was undone."""
+
+    code = "removal-alert-failed"
+
+
+@dataclass(frozen=True)
+class StoreGeneration:
+    """What the store looked like when it was read: the CAS token for every write.
+
+    ``present`` and ``parsed`` are carried so an absent store and a corrupt store are not
+    mistaken for an empty one; ``ids`` is diagnostic only and never part of the comparison.
+    """
+
+    present: bool
+    parsed: bool
+    row_count: int
+    ids_sha256: str
+    bytes_sha256: str
+    ids: tuple[str, ...] = field(default=(), compare=False, repr=False)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "present": self.present,
+            "parsed": self.parsed,
+            "row_count": self.row_count,
+            "ids_sha256": self.ids_sha256,
+            "bytes_sha256": self.bytes_sha256,
+        }
+
+    def describe(self) -> str:
+        state = "" if self.present else " (absent)"
+        return (
+            f"row_count={self.row_count} ids_sha256={self.ids_sha256[:12]} "
+            f"bytes_sha256={self.bytes_sha256[:12]}{state}"
+        )
+
+
+_ABSENT_GENERATION = StoreGeneration(
+    present=False, parsed=True, row_count=0,
+    ids_sha256=hashlib.sha256(b"").hexdigest(),
+    bytes_sha256=hashlib.sha256(b"").hexdigest(),
+)
+
+
+def _ids_digest(ids: Collection[str]) -> str:
+    """Digest of the SORTED id list - order-independent, so a reorder is not a generation change."""
+    return hashlib.sha256("\n".join(sorted(ids)).encode("utf-8")).hexdigest()
+
+
+def _generation_from_raw(raw: Optional[bytes]) -> StoreGeneration:
+    """Generation of the store bytes *raw* (``None`` = no store file).
+
+    Computed from the EXISTING file format - no new store format is introduced. An unparseable
+    store still gets a definite generation: the byte digest pins it, so a CAS on a corrupt store
+    still catches a change, and ``parsed=False`` tells the write path it cannot prove removals
+    against it.
+    """
+    if raw is None:
+        return _ABSENT_GENERATION
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        text = raw.decode("utf-8-sig")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = json.loads(text, strict=False)
+    except Exception:
+        return StoreGeneration(True, False, 0, _ids_digest(()), digest)
+    if isinstance(data, dict):
+        rows = data.get("jobs", [])
+    else:
+        rows = data
+    if isinstance(rows, dict):  # id-keyed map from external tools (load_jobs flattens this shape)
+        rows = [
+            {**v, "id": v.get("id") or k} for k, v in rows.items() if isinstance(v, dict)
+        ]
+    if not isinstance(rows, list):
+        return StoreGeneration(True, False, 0, _ids_digest(()), digest)
+    ids = sorted(str(j["id"]) for j in rows if isinstance(j, dict) and j.get("id"))
+    return StoreGeneration(True, True, len(rows), _ids_digest(ids), digest, tuple(ids))
+
+
+def _read_store_bytes(jobs_file: Path) -> Optional[bytes]:
+    """Raw store bytes, or ``None`` when the store file does not exist."""
+    try:
+        return jobs_file.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def store_generation(jobs_file: Optional[Path] = None) -> StoreGeneration:
+    """The store's generation ON DISK right now - the token a write presents and is checked against."""
+    path = jobs_file if jobs_file is not None else _current_cron_store().jobs_file
+    return _generation_from_raw(_read_store_bytes(path))
+
+
+def _record_load_generation(generation: Optional[StoreGeneration]) -> None:
+    """Remember the generation ``load_jobs()`` read for the enclosing _jobs_lock() section (no-op
+    outside one). Recorded from the SAME bytes that were parsed, so the token describes exactly
+    what the payload was built from; reset on section exit so an earlier section's token can
+    never certify a later write."""
+    if getattr(_jobs_lock_state, "depth", 0):
+        _jobs_lock_state.load_generation = generation
+
+
+def _payload_ids(jobs: list[dict[str, Any]]) -> set[str]:
+    return {str(j["id"]) for j in jobs if isinstance(j, dict) and j.get("id")}
+
+
+def _sample(ids: Collection[str]) -> list[str]:
+    ordered = sorted(ids)
+    if len(ordered) <= _IDS_IN_ERROR_MESSAGE:
+        return ordered
+    return ordered[:_IDS_IN_ERROR_MESSAGE] + [f"... (+{len(ordered) - _IDS_IN_ERROR_MESSAGE} more)"]
+
+
+def _intent_violations(
+    pre_ids: Collection[str], post_ids: Collection[str],
+    payload_ids: Collection[str], named: Collection[str],
+) -> dict[str, list[str]]:
+    """Id-level differences between what a write INTENDED and what it produced.
+
+    Empty dict = the write removed exactly what it named and nothing else.
+    """
+    pre, post, payload, named = set(pre_ids), set(post_ids), set(payload_ids), set(named)
+    additions = payload - pre
+    removals = pre - payload
+    out: dict[str, list[str]] = {}
+    if removals - named:
+        out["unnamed_removals"] = _sample(removals - named)
+    if additions - post:
+        out["missing_additions"] = _sample(additions - post)
+    if removals & post:
+        out["removals_still_present"] = _sample(removals & post)
+    if post - payload:
+        out["unintended_additions"] = _sample(post - payload)
+    return out
+
+
+def _refuse_unnamed_removals(
+    pre: StoreGeneration, payload_ids: Collection[str], named: Collection[str],
+    jobs_file: Path, *, allow_unknown: bool = False,
+) -> None:
+    """Rule 2: a payload may only drop an id it explicitly named."""
+    if not pre.parsed:
+        if allow_unknown:
+            return  # corrupt-store repair: the pre-image id set is unknowable; the repair alerts
+        raise StoreWriteRefused(
+            f"cron store at {jobs_file} is unparseable, so a write cannot prove which rows it "
+            f"would remove; refusing ({pre.describe()})",
+            detail={"store": str(jobs_file), "generation": pre.as_dict()},
+        )
+    dropped = set(pre.ids) - set(payload_ids) - set(named)
+    if dropped:
+        raise UnnamedRemovalRefused(
+            f"refusing cron store write to {jobs_file}: the payload drops "
+            f"{len(dropped)} row(s) it did not name for removal: {_sample(dropped)}. "
+            f"Pass them in explicit_removals if the removal is intended.",
+            detail={
+                "store": str(jobs_file),
+                "generation": pre.as_dict(),
+                "unnamed_removals": sorted(dropped),
+            },
+        )
+
+
+def _restore_preimage(jobs_file: Path, pre_raw: Optional[bytes]) -> None:
+    """Put the store back exactly as it was before a write that could not be announced."""
+    if pre_raw is None:
+        raise StoreWriteRefused(
+            f"cannot restore {jobs_file}: no pre-image bytes were captured",
+            detail={"store": str(jobs_file)},
+        )
+    fd, tmp_path = mkstemp_beside(jobs_file, suffix=".tmp", prefix=".jobs_restore_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(pre_raw)
+            f.flush()
+            os.fsync(f.fileno())
+        replaced = Path(atomic_replace(tmp_path, jobs_file))
+        tmp_path = None
+        fsync_directory(replaced.parent)
+    finally:
+        _unlink_quiet(tmp_path)
+
+
+def _caller_label() -> str:
+    """``module:function`` of the first frame outside this module - who is writing."""
+    try:
+        frame = sys._getframe(1)
+    except Exception:  # pragma: no cover - exotic interpreters
+        return "unknown"
+    while frame is not None and frame.f_globals.get("__name__") == __name__:
+        frame = frame.f_back
+    if frame is None:  # pragma: no cover - defensive
+        return "unknown"
+    return f"{Path(frame.f_code.co_filename).name}:{frame.f_code.co_name}"
+
+
+def _store_owner_lane(jobs_file: Path) -> str:
+    """Profile that owns *jobs_file*: ``<home>/profiles/<lane>/cron`` -> that lane, else default."""
+    try:
+        parts = jobs_file.resolve().parent.parent.parts
+    except OSError:  # pragma: no cover - defensive
+        return "default"
+    if "profiles" in parts:
+        idx = parts.index("profiles")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return "default"
+
+
+def _append_removal_audit(cron_dir: Path, row: dict[str, Any]) -> Path:
+    """Append one fsynced JSONL audit row; append-only so concurrent removals never clobber."""
+    path = cron_dir / REMOVAL_AUDIT_NAME
+    line = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return path
+
+
+def _file_removal_card(
+    *, jobs_file: Path, removed: list[str], pre: StoreGeneration, post: StoreGeneration,
+    caller: str, reason: str, audit_path: Path, event: str = "removal",
+) -> str:
+    """File the alert card for a removal; returns its id. Raises if the board cannot be reached."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as _kbc
+
+    owner = _store_owner_lane(jobs_file)
+    board = os.environ.get("HERMES_KANBAN_BOARD") or None
+    body = "\n".join([
+        "## Cron store removal event" if event == "removal" else "## Cron store rewrite event",
+        "",
+        f"A guarded write to `{jobs_file}` removed **{len(removed)}** row(s).",
+        "This card is filed by the store write guard (rule 4, t_60afef80): every removal is",
+        "an event, never a side effect.",
+        "",
+        f"- store: `{jobs_file}`",
+        f"- rows before -> after: {pre.row_count} -> {post.row_count}",
+        f"- generation before: `{pre.describe()}`",
+        f"- generation after: `{post.describe()}`",
+        f"- caller: `{caller}`",
+        f"- reason given: {reason or '_none given_'}",
+        f"- audit row: `{audit_path}`",
+        "",
+        "### Removed ids",
+        "",
+        *[f"- `{i}`" for i in removed],
+        "",
+        "If this removal was not intended, restore the rows as ADDITIONS (never a whole-file",
+        "replace) and check the store generation you are writing against.",
+    ])
+    title = (
+        f"cron store removal: {len(removed)} row(s) removed from {jobs_file.name} ({owner})"
+        if event == "removal"
+        else f"cron store rewrite: auto-repair of {jobs_file.name} ({owner})"
+    )
+    removed_digest = hashlib.sha256("\n".join(sorted(removed)).encode("utf-8")).hexdigest()[:16]
+    with _kb.pin_first_board_resolution():
+        conn = _kbc.connect(board=board)
+        try:
+            return _kb.create_task(
+                conn,
+                title=title,
+                body=body,
+                assignee=owner,
+                created_by="cron-store-guard",
+                board=board,
+                initial_status="blocked",  # an operator/orchestrator must judge the removal
+                idempotency_key=(
+                    f"cron-store-removal:{jobs_file}:{removed_digest}"
+                ),
+            )
+        finally:
+            conn.close()
+
+
+def _announce_removal(
+    jobs_file: Path, removed: list[str], pre: StoreGeneration, post: StoreGeneration,
+    caller: str, reason: str, pre_raw: Optional[bytes], *, event: str = "removal",
+) -> Optional[str]:
+    """Rule 4: record the audit row, then file the alert card. An unannounced removal is undone."""
+    cron_dir = jobs_file.parent
+    audit = {
+        "event": event,
+        "at": _hermes_now().isoformat(),
+        "store": str(jobs_file),
+        "owner_lane": _store_owner_lane(jobs_file),
+        "row_count_before": pre.row_count,
+        "row_count_after": post.row_count,
+        "ids_removed": removed,
+        "generation_before": pre.as_dict(),
+        "generation_after": post.as_dict(),
+        "caller": caller,
+        "reason": reason or "unspecified",
+        "pid": os.getpid(),
+    }
+    try:
+        audit_path = _append_removal_audit(cron_dir, audit)
+    except OSError as exc:
+        _restore_preimage(jobs_file, pre_raw)
+        raise StoreAlertFailed(
+            f"cron store removed {len(removed)} row(s) from {jobs_file} but the audit row could "
+            f"not be written ({exc}); the pre-image was restored so no silent removal stands",
+            detail={"store": str(jobs_file), "ids_removed": removed},
+        ) from exc
+
+    try:
+        card_id = _file_removal_card(
+            jobs_file=jobs_file, removed=removed, pre=pre, post=post,
+            caller=caller, reason=reason, audit_path=audit_path, event=event,
+        )
+    except Exception as exc:
+        # The audit row already names the ids durably; the card is the second sink. A board that
+        # cannot be reached must not wedge the store, and it must not be quiet either.
+        logger.critical(
+            "cron store removal from %s (%d row(s): %s) could not file its alert card: %s",
+            jobs_file, len(removed), _sample(removed), exc)
+        with contextlib.suppress(OSError):
+            _append_removal_audit(cron_dir, {
+                "event": "removal-alert-failed", "at": _hermes_now().isoformat(),
+                "store": str(jobs_file), "ids_removed": removed, "error": f"{type(exc).__name__}: {exc}",
+            })
+        return None
+
+    with contextlib.suppress(OSError):
+        _append_removal_audit(cron_dir, {
+            "event": "removal-alert", "at": _hermes_now().isoformat(),
+            "store": str(jobs_file), "ids_removed": removed, "card_id": card_id,
+            "caller": caller, "reason": reason or "unspecified",
+        })
+    logger.warning(
+        "Cron store removal: %d row(s) removed from %s by %s (%s); alert card %s",
+        len(removed), jobs_file, caller, reason or "no reason given", card_id)
+    return card_id
+
+
+def _repair_save_jobs(
+    jobs: list[dict[str, Any]], *, generation: Optional[StoreGeneration], reason: str,
+    unmergeable: bool = False,
+) -> None:
+    """Persist a LOAD-TIME auto-repair of a broken store shape (bare list, id-keyed map, junk
+    entries). Not a second write door: it rides the ONE write path with the auto-repair flag, so
+    it still presents the generation ``load_jobs()`` read, still refuses an unnamed drop (unless
+    the pre-image is unparseable, where the id set is unknowable), still proves itself against
+    the store, and AUDITS AND ALERTS the rewrite."""
+    with _jobs_lock():
+        _save_jobs_unlocked(
+            jobs,
+            expected_generation=generation,
+            reason=f"{reason}{' (unmergeable shape)' if unmergeable else ''}",
+            _repair_rewrite=True,
+        )
+
 
 
 def _unmerged_disk_jobs(
@@ -1607,61 +2048,238 @@ def _stage_jobs_payload(jobs_file: Path, jobs: list[dict[str, Any]]) -> str:
 _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 
+def _write_staged_payload(
+    jobs_file: Path, pre: StoreGeneration, jobs: list[dict[str, Any]],
+    payload_ids: Collection[str], named: Collection[str], *, allow_unknown: bool = False,
+) -> tuple[StoreGeneration, StoreGeneration, Optional[str]]:
+    """Serialize, prove, and atomically land *jobs*.
+
+    Returns ``(pre, post, written_bytes_sha256)`` where *pre* is the baseline actually used - a
+    sibling landing during serialization re-baselines it, and the caller must judge removals
+    against THAT baseline, not the one it passed in.
+    """
+    tmp_path = None
+    written_sha: Optional[str] = None
+    try:
+        for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
+            if attempt:
+                pre = store_generation(jobs_file)
+                _refuse_unnamed_removals(pre, payload_ids, named, jobs_file,
+                                         allow_unknown=allow_unknown)
+            tmp_path = _stage_jobs_payload(jobs_file, jobs)
+            staged_raw = Path(tmp_path).read_bytes()
+            staged_sha = hashlib.sha256(staged_raw).hexdigest()
+            staged = _generation_from_raw(staged_raw)
+            violations = _intent_violations(pre.ids, staged.ids, payload_ids, named)
+            if not staged.parsed or staged.row_count != len(jobs) or violations:
+                _unlink_quiet(tmp_path)
+                tmp_path = None
+                _fail_proof(jobs_file, pre, staged, violations, where="staged payload")
+            if attempt < _SAVE_JOBS_MERGE_ATTEMPTS and store_generation(jobs_file) != pre:
+                _unlink_quiet(tmp_path)  # a sibling landed while we serialized: re-baseline
+                tmp_path = None
+                continue
+            assert tmp_path is not None
+            replaced = Path(atomic_replace(tmp_path, jobs_file))
+            tmp_path = None
+            fsync_directory(replaced.parent)
+            _secure_file(jobs_file)
+            written_sha = staged_sha
+            return pre, store_generation(jobs_file), written_sha
+    finally:
+        _unlink_quiet(tmp_path)
+    raise StoreWriteRefused(  # pragma: no cover - the final attempt always writes
+        f"cron store write to {jobs_file} exhausted {_SAVE_JOBS_MERGE_ATTEMPTS} merge attempts",
+        detail={"store": str(jobs_file)},
+    )
+
+
+def _fail_proof(
+    jobs_file: Path, pre: StoreGeneration, post: StoreGeneration,
+    violations: dict[str, list[str]], *, where: str,
+) -> None:
+    """Rule 3 failure: file a card naming the id-level diff, then raise."""
+    caller = _caller_label()
+    try:
+        _file_proof_card(jobs_file=jobs_file, pre=pre, post=post,
+                         violations=violations, where=where, caller=caller)
+    except Exception as exc:  # the refusal below is the loud part; the card is best-effort
+        logger.critical(
+            "cron store write to %s failed its %s proof and could not file the diff card: %s",
+            jobs_file, where, exc)
+    raise StoreWriteProofFailed(
+        f"cron store write to {jobs_file} failed its post-write proof ({where}): {violations}",
+        detail={"store": str(jobs_file), "where": where, "violations": violations,
+                "pre": pre.as_dict(), "post": post.as_dict()},
+    )
+
+
+def _file_proof_card(
+    *, jobs_file: Path, pre: StoreGeneration, post: StoreGeneration,
+    violations: dict[str, list[str]], where: str, caller: str,
+) -> str:
+    """File the post-write-proof-failure card; returns its id. Raises if unreachable."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as _kbc
+
+    board = os.environ.get("HERMES_KANBAN_BOARD") or None
+    body = "\n".join([
+        "## Post-write proof failed",
+        "",
+        f"A guarded write to `{jobs_file}` ({where}) did not prove itself.",
+        "The store was left untouched (pre-image restored where needed).",
+        "",
+        f"- pre: `{pre.describe()}`",
+        f"- post: `{post.describe()}`",
+        f"- caller: `{caller}`",
+        "",
+        "### Id-level diff",
+        *[f"- {k}: {v}" for k, v in violations.items()],
+    ])
+    with _kb.pin_first_board_resolution():
+        conn = _kbc.connect(board=board)
+        try:
+            return _kb.create_task(
+                conn,
+                title=f"cron store write failed its post-write proof ({jobs_file.name})",
+                body=body,
+                assignee=_store_owner_lane(jobs_file),
+                created_by="cron-store-guard",
+                board=board,
+                initial_status="blocked",
+            )
+        finally:
+            conn.close()
+
+
 def _save_jobs_unlocked(
     jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
-):
-    """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
-    ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
-    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes)."""
+    explicit_removals: Optional[Collection[str]] = None,
+    expected_generation: Optional[StoreGeneration] = None,
+    reason: Optional[str] = None, caller: Optional[str] = None,
+    replace: bool = False, _repair_rewrite: bool = False,
+) -> Optional[list[str]]:
+    """Write *jobs* as the store. Caller must hold _jobs_lock().
+
+    The one write path, under the four guard rules (see the module block above):
+
+    1. CAS - the write presents the generation it read (``expected_generation``, else the one
+       this lock section's ``load_jobs()`` recorded) and is refused if the store moved.
+    2. Named removals only - an id dropped from the payload must be in
+       ``explicit_removals``/``removed_ids``; anything else is refused. ``replace=True`` is a
+       retired tombstone that refuses too: a whole-file replace is not expressible.
+    3. Post-write proof from the store, with the pre-image restored on failure.
+    4. Every removal appends an audit row and files an alert card; if the audit row cannot be
+       written the removal is undone.
+
+    Returns the ids removed by this write (empty list when none) - the caller can log them.
+    """
+    if replace:
+        raise StoreWriteRefused(
+            "whole-file replace is retired (cron store write guard, t_60afef80): present the "
+            "generation you read and name every removed id in explicit_removals",
+            detail={"refused": "replace"},
+        )
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
-    # Owner snapshot BEFORE replace so a root writer can hand the file back to the gateway user.
+    named = {str(i) for i in (*(removed_ids or ()), *(explicit_removals or ())) if i}
+    payload_ids = _payload_ids(jobs)
+    caller = caller or _caller_label()
+    reason = (reason or "").strip()
+
+    # Owner snapshot BEFORE writing so a root writer can hand the file back to the gateway user.
     _stat_before = None
     for probe in (jobs_file, jobs_file.parent):
         with contextlib.suppress(OSError):
             _stat_before = os.stat(probe)
             break
 
-    # Shrink-merge loop: merge, stage, re-peek, repeat; the last attempt writes without a re-peek.
-    tmp_path = None
-    try:
-        for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
-            if not replace:
-                jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
-            tmp_path = _stage_jobs_payload(jobs_file, jobs)
-            # Verify-after-stage: a sibling landing during serialization forces another merge round.
-            if (
-                not replace
-                and attempt < _SAVE_JOBS_MERGE_ATTEMPTS
-                and _unmerged_disk_jobs(jobs, removed_ids)
-            ):
-                _unlink_quiet(tmp_path)
-                tmp_path = None
-                continue
-            # fsync the directory the rename actually landed in (atomic_replace resolves symlinks).
-            replaced = Path(atomic_replace(tmp_path, jobs_file))
-            tmp_path = None
-            fsync_directory(replaced.parent)
-            _secure_file(jobs_file)
-            _preserve_file_ownership(jobs_file, _stat_before)
-            # Invalidate (never refresh) the stamp: a refresh would let a nested save certify disk
-            # against an OUTER caller's stale payload. Later saves take the full merge (fail-safe).
-            _record_load_stamp(None)
-            store_health.note_writable(jobs_file.parent)
-            return
-    except BaseException:
-        _unlink_quiet(tmp_path)
-        raise
+    pre_raw = _read_store_bytes(jobs_file)
+    pre = _generation_from_raw(pre_raw)
+    if _repair_rewrite:
+        # The repair owns the whole pre-image it parsed; when that pre-image is unparseable its
+        # id set is unknowable and rule 2 can only be satisfied by allowing it (it alerts below).
+        named = named | set(pre.ids)
+
+    # --- Rule 1: compare-and-swap on the generation the payload was built from.
+    presented = expected_generation
+    if presented is None:
+        presented = getattr(_jobs_lock_state, "load_generation", None)
+    if presented is not None and presented != pre:
+        raise StoreGenerationMismatch(
+            f"cron store changed since it was read: refusing to write {jobs_file}. "
+            f"read [{presented.describe()}], live [{pre.describe()}]",
+            detail={
+                "store": str(jobs_file),
+                "presented": presented.as_dict(),
+                "live": pre.as_dict(),
+                "ids_added_since_read": sorted(set(pre.ids) - set(presented.ids)),
+                "ids_gone_since_read": sorted(set(presented.ids) - set(pre.ids)),
+            },
+        )
+    if presented is None:
+        logger.debug(
+            "cron store write to %s presents no generation (payload not loaded in this lock "
+            "section; caller=%s). Rule 1 cannot certify it; rules 2-4 still apply.",
+            jobs_file, caller)
+
+    # --- Rule 2: no unnamed removal.
+    _refuse_unnamed_removals(pre, payload_ids, named, jobs_file, allow_unknown=_repair_rewrite)
+    if not _repair_rewrite:
+        # A named removal that the payload still carries is a contradiction, not an edit.
+        contradictory = named & payload_ids
+        if contradictory:
+            raise StoreWriteRefused(
+                f"refusing cron store write to {jobs_file}: {len(contradictory)} id(s) are named "
+                f"for removal but still present in the payload: {_sample(contradictory)}",
+                detail={"store": str(jobs_file), "named_but_present": sorted(contradictory)},
+            )
+
+    pre, post, written_sha = _write_staged_payload(
+        jobs_file, pre, jobs, payload_ids, named, allow_unknown=_repair_rewrite)
+    _preserve_file_ownership(jobs_file, _stat_before)
+    # Invalidate (never refresh) the stamp and generation: a refresh would let a nested save
+    # certify disk against an OUTER caller's stale payload.
+    _record_load_stamp(None)
+    _record_load_generation(None)
+    store_health.note_writable(jobs_file.parent)
+
+    # --- Rule 3: prove the write from the store.
+    violations = _intent_violations(pre.ids, post.ids, payload_ids, named)
+    if not post.parsed or post.row_count != len(jobs) or violations:
+        if post.bytes_sha256 == written_sha:
+            # What we wrote is on disk but it is not what we intended: nobody landed after us,
+            # so the pre-image can be restored without clobbering anyone.
+            _restore_preimage(jobs_file, pre_raw)
+        _fail_proof(jobs_file, pre, post, violations, where="store re-read")
+
+    removed = sorted(set(pre.ids) - set(post.ids))
+    if removed or (_repair_rewrite and not pre.parsed):
+        # --- Rule 4: a removal is an event (and so is a rewrite of an unreadable store).
+        _announce_removal(
+            jobs_file, removed, pre, post, caller, reason, pre_raw,
+            event="repair-rewrite" if _repair_rewrite else "removal",
+        )
+    return removed
 
 
 def save_jobs(
     jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
-):
-    """Save all jobs under the lock; see ``_save_jobs_unlocked`` for ``removed_ids``/``replace``."""
+    explicit_removals: Optional[Collection[str]] = None,
+    expected_generation: Optional[StoreGeneration] = None,
+    reason: Optional[str] = None, replace: bool = False,
+) -> Optional[list[str]]:
+    """Persist *jobs* as the store under the write guard; see ``_save_jobs_unlocked``.
+
+    ``explicit_removals`` (alias ``removed_ids``) names every id this write is allowed to drop.
+    ``expected_generation`` presents an out-of-lock snapshot's CAS token; omitted, the one
+    ``load_jobs()`` recorded in this lock section is used. ``replace=True`` is retired and refuses.
+    """
     with _jobs_lock():
-        _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
+        return _save_jobs_unlocked(
+            jobs, removed_ids=removed_ids, explicit_removals=explicit_removals,
+            expected_generation=expected_generation, reason=reason, replace=replace,
+        )
 
 
 _MISSING = object()
@@ -2681,7 +3299,7 @@ def remove_job(job_id: str) -> bool:
             return False
         # Resolve BEFORE saving so a legacy unsafe ID fails closed without a half-applied removal.
         job_output_dir = _job_output_dir(canonical_id)
-        save_jobs(jobs, removed_ids={canonical_id})
+        save_jobs(jobs, removed_ids={canonical_id}, reason=f"remove_job({canonical_id})")
         marker = _self_removal_delivery.get()
         if marker is not None and marker.job_id == canonical_id:
             marker.removed = True
@@ -2971,7 +3589,8 @@ def claim_dispatch(job_id: str) -> bool:
             # it stops appearing due, leaving an operator-visible diagnostic.
             jobs.pop(i)
             # See #73973.
-            save_jobs(jobs, removed_ids={job_id})
+            save_jobs(jobs, removed_ids={job_id},
+                      reason=f"one-shot dispatch limit reached ({completed}/{times})")
             from cron.jobs_oneshot_diagnostics import write_wedged
             write_wedged(job)
             logger.info(
@@ -3678,7 +4297,8 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
 
     if scan.needs_save:
         try:
-            save_jobs(raw_jobs, removed_ids=scan.removed or None)
+            save_jobs(raw_jobs, removed_ids=scan.removed or None,
+                      reason="due-scan repair: wedged/duplicate rows retired")
         except OSError as exc:  # repairs live in memory; the next tick retries the persist
             store_health.note_unwritable(exc, "due-scan repairs not persisted", "scan")
             return due

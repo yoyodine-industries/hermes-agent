@@ -1840,20 +1840,22 @@ class TestJobsJsonIdKeyedMap:
             JOBS_FILE.write_text(json.dumps(payload), encoding="utf-8")
 
         add_junk()
-        real_parse = jobs_mod._parse_jobs_file
+        real_parse = jobs_mod._parse_store_bytes
         raced = []
 
-        def parse_then_race(path):
-            parsed = real_parse(path)
+        def parse_then_race(raw):
+            parsed = real_parse(raw)
             if not raced:
                 raced.append(True)
                 update_job(job["id"], {"name": "raced"})
             return parsed
 
-        monkeypatch.setattr(jobs_mod, "_parse_jobs_file", parse_then_race)
+        monkeypatch.setattr(jobs_mod, "_parse_store_bytes", parse_then_race)
         assert [j["id"] for j in list_jobs(include_disabled=True)] == [job["id"]]
-        monkeypatch.setattr(jobs_mod, "_parse_jobs_file", real_parse)
+        monkeypatch.setattr(jobs_mod, "_parse_store_bytes", real_parse)
         on_disk = json.loads(JOBS_FILE.read_text(encoding="utf-8"))["jobs"]
+        # The repair rides the locked re-read, so it uses the post-race bytes: the racer's update
+        # stands and the junk is dropped in the same write (never a stale snapshot over it).
         assert [(j["id"], j["name"]) for j in on_disk] == [(job["id"], "raced")]
 
         add_junk()

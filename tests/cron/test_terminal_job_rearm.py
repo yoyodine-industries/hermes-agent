@@ -125,9 +125,10 @@ def test_rearm_refuses_recurring_and_live_claim(tmp_cron_dir):
         rearm_oneshot(recurring["id"], future)
 
     oneshot = create_job("claimed", "in 30m")
-    record = get_job(oneshot["id"])
+    jobs = load_jobs()
+    record = next(j for j in jobs if j["id"] == oneshot["id"])
     record["run_claim"] = {"at": datetime.now(UTC).isoformat(), "by": "live"}
-    save_jobs([record])
+    save_jobs(jobs)
     with pytest.raises(ValueError, match="claim"):
         rearm_oneshot(oneshot["id"], future)
 
