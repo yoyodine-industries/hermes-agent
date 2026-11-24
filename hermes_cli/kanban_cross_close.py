@@ -57,6 +57,8 @@ import json
 import sqlite3
 from typing import Any, Optional
 
+from hermes_cli.kanban_promotion import PromotionRefused
+
 __all__ = [
     "ACTOR",
     "PLACEHOLDER",
@@ -156,15 +158,21 @@ def _move_children(
             row["action"] = "promoted" if ok else "refused"
             row["reason"] = "" if ok else (detail or "promote refused")
         else:  # blocked
-            ok = kb.unblock_task(
-                conn, child_id,
-                extra_event={"actor": ACTOR, "reason": reason,
-                             "parent_closed": parent_id,
-                             **( {"caller_task_id": caller} if caller else {} ),
-                             **( {"board": board} if board else {} )},
-            )
+            try:
+                ok = kb.unblock_task(
+                    conn, child_id,
+                    extra_event={"actor": ACTOR, "reason": reason,
+                                 "parent_closed": parent_id,
+                                 **( {"caller_task_id": caller} if caller else {} ),
+                                 **( {"board": board} if board else {} )},
+                )
+                refusal = ""
+            except PromotionRefused as exc:
+                # A held card (needs_input / sticky / unreadable PR) is not released by a
+                # close: the receipt says why, and the row reports it rather than crashing.
+                ok, refusal = False, str(exc)
             row["action"] = "unblocked" if ok else "refused"
-            row["reason"] = "" if ok else "unblock refused (not blocked any more)"
+            row["reason"] = "" if ok else (refusal or "unblock refused (not blocked any more)")
         row["to"] = _status(kb.get_task(conn, child_id))
         moved.append(row)
     return moved
