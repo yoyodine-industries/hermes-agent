@@ -19,6 +19,11 @@ _TASK_DICT_FIELDS = (
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
+    # The BLOCK STATE columns, so a `list --json` reader can tell a human-ask park from a
+    # dependency wait without a second query into the store (card t_67ed1645). The reason
+    # TEXT is not a column - it rides the block event, so `show --json` adds a `block`
+    # object for that (see kb.block_state).
+    "block_kind", "block_recurrences",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
@@ -33,6 +38,40 @@ _ATTACHMENT_FIELDS = ("id", "filename", "content_type", "size", "uploaded_by", "
 
 def _fmt_ts(ts: Optional[int]) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
+
+
+def _fmt_age(seconds: Optional[int]) -> str:
+    """Compact "how long ago" for a hold: ``<1m`` / ``42m`` / ``7h`` / ``8d``."""
+    if seconds is None:
+        return ""
+    secs = max(0, int(seconds))
+    if secs < 60:
+        return "<1m"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+#: One line per block kind: what the READER must do about it. The distinction is the
+#: point - a "waiting on a human" and a "waiting on the scheduler" park read identically
+#: as bare ``blocked`` and get escalated the same way (card t_67ed1645).
+_BLOCK_KIND_LABELS = {
+    "needs_input": "a human must answer",
+    "dependency": "waits on a parent card, then resumes on its own",
+    "capability": "a hard wall - no access, no credential, or an act no agent can do",
+    "transient": "a flaky failure that may clear on its own",
+}
+
+
+def _block_headline(block: dict) -> str:
+    """``<kind> — <what the reader must do>`` for the ``show`` block line."""
+    kind = block.get("kind")
+    if not kind:
+        return "untyped - the failure breaker parked this card with no kind recorded"
+    label = _BLOCK_KIND_LABELS.get(kind)
+    return f"{kind} - {label}" if label else str(kind)
 
 
 def _print_json(obj: Any, *, ascii: bool = False) -> None:
