@@ -214,7 +214,13 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
     """``reclaimed`` events should carry claim_expires, last_heartbeat_at,
     and worker_pid so operators can diagnose why a claim went stale
     (#23025: previous payload only had ``stale_lock`` which gives no
-    timing context)."""
+    timing context).
+
+    The heartbeat here must be genuinely *stale*, not merely old: since card t_28747981 a
+    recorded heartbeat inside ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` holds the claim
+    (30 minutes is liveliness, not evidence of a wedge), so this test drives the reclaim by
+    parking the heartbeat past that bound.
+    """
     import json
     import hermes_cli.kanban_db as _kb
 
@@ -224,7 +230,7 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         kbd._set_worker_pid(conn, t, 12345)
         old_expires = int(time.time()) - 3600
-        hb_at = int(time.time()) - 1800
+        hb_at = int(time.time()) - (_kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS + 600)
         conn.execute(
             "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
             "WHERE id = ?",
