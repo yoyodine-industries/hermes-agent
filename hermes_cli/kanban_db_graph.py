@@ -153,6 +153,16 @@ def decompose_triage_task(
 
     # ONE txn so the fan-out is atomic; helpers that open their own write_txn
     # (create_task, link_tasks, add_comment) must not be called in here.
+    # THE ALIGNMENT-VEHICLE GATE (card t_f79daa7f), per CHILD and before the txn: a
+    # decomposition files N instructions, and each one is a card a worker will execute.
+    # Checking only the root would let the orchestrator fan out the exact class this rule
+    # refuses on the ordinary door. All-or-nothing, like the budget door above.
+    from hermes_cli import kanban_alignment_vehicle_gate as _vehicle
+    for child in children:
+        vehicle_refusal, _ = _vehicle.apply(title=child.get("title"),
+                                            body=child.get("body"))
+        if vehicle_refusal is not None:
+            return vehicle_refusal
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
