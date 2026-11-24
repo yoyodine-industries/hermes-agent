@@ -790,3 +790,75 @@ def test_prune_owner_lookup_survives_symlinked_scratch_and_drops_orphaned_mcp_he
             helper.kill()
             helper.wait(timeout=10)
 
+
+
+def test_a_card_worker_is_given_a_tree_named_for_its_card(tmp_path):
+    """The WRITER half of the card-keyed scratch contract (card t_a47cec75).
+
+    A process working for a card gets ``<home>/cache/scratch/t_<cardid>`` and a ``KANBAN_CARD``
+    marker naming the card and the creating pid. The point is not the folder: it is that the
+    fleet's reaper can then decide the tree by the CARD's row instead of by age, which is the
+    only predicate that ever converged on a store where everything is touched daily.
+    """
+    home = tmp_path / "home"
+    env = {"HERMES_HOME": str(home), "HERMES_KANBAN_TASK": "t_a47cec75"}
+    assert apply_scratch_tmp_env(env) is True
+    tree = home / "cache" / "scratch" / "t_a47cec75"
+    assert env["TMPDIR"] == env["TMP"] == env["TEMP"] == env["HERMES_SCRATCH_DIR"] == str(tree)
+    marker = tree / "KANBAN_CARD"
+    assert marker.exists(), "a card-keyed tree must say whose it is"
+    text = marker.read_text(encoding="utf-8")
+    assert "card: t_a47cec75" in text and f"pid: {os.getpid()}" in text
+
+
+def test_a_session_with_no_card_keeps_the_shared_scratch_root(tmp_path):
+    """Negative control: an ordinary interactive session is not given a card tree."""
+    home = tmp_path / "home"
+    env = {"HERMES_HOME": str(home)}
+    assert apply_scratch_tmp_env(env) is True
+    assert env["TMPDIR"] == str(home / "cache" / "scratch")
+    assert not (home / "cache" / "scratch" / "KANBAN_CARD").exists()
+
+
+def test_an_adhoc_or_malformed_card_id_is_never_adopted(tmp_path):
+    """A guessed owner is worse than no owner: only the exact ``t_<8 hex>`` shape counts.
+
+    These are the real names out of the fleet's stores — ``t64r3b``, ``rv68919``,
+    ``card375`` — and the reaper must never read a card out of one of them.
+    """
+    home = tmp_path / "home"
+    for value in ("t64r3b", "rv68919", "card375", "t_2cb1d7f6x", "t_a47cec7", ""):
+        env = {"HERMES_HOME": str(home), "HERMES_KANBAN_TASK": value}
+        assert apply_scratch_tmp_env(env) is True, value
+        assert env["TMPDIR"] == str(home / "cache" / "scratch"), value
+
+
+def test_the_pruner_leaves_a_card_keyed_tree_to_the_board_reaper(tmp_path):
+    """Age is the WRONG predicate for a card-keyed tree: an open card's tree is a working set
+    however old its files look, and a done card's tree goes on its card's row, not 24 h later.
+    This pruner therefore never decides one — the fleet's board-aware reaper does."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    card_tree = scratch / "t_aaaa1111"
+    plain = scratch / "old-dump"
+    for path in (card_tree, plain):
+        path.mkdir()
+        (path / "f").write_text("x", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for path in (card_tree, card_tree / "f", plain, plain / "f"):
+        os.utime(path, (ancient, ancient))
+    assert prune_scratch_dir(scratch) == 1
+    assert card_tree.exists(), "a card-keyed tree was decided by age"
+    assert not plain.exists()
+
+
+def test_a_run_scoped_temp_root_outranks_the_card_tree(tmp_path):
+    """The dispatcher's per-RUN root sticks (``kanban-run-<card>-<run>``): the boot helper
+    re-derives only a temp var Hermes itself exported, so an already-set run root is never
+    overridden by the card tree. The two writer schemes coexist; the narrower one wins."""
+    home = tmp_path / "home"
+    run_root = home / "cache" / "scratch" / "kanban-run-t_a47cec75-7"
+    env = {"HERMES_HOME": str(home), "HERMES_KANBAN_TASK": "t_a47cec75",
+           "TMPDIR": str(run_root), "TMP": str(run_root), "TEMP": str(run_root)}
+    assert apply_scratch_tmp_env(env) is False
+    assert env["TMPDIR"] == str(run_root)
+    assert not (home / "cache" / "scratch" / "t_a47cec75").exists()
