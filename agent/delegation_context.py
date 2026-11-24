@@ -264,7 +264,7 @@ def child_kanban_write_purpose() -> str:
 #: invocation); a long-lived process (the gateway) can only ever ADD this refusal for a caller
 #: descended from a worker of ITS OWN board, which it never is, so a stale entry is inert there.
 LIVE_CLAIM_PROBE_TTL_SECONDS = 15.0
-_live_claim_cache: dict[str, tuple[float, tuple[tuple[int, object], ...]]] = {}
+_live_claim_cache: dict[str, tuple[float, tuple[tuple[str, int, object], ...]]] = {}
 #: Ancestry is stable for the life of a process; computed once, capped so a pathological tree
 #: cannot spin.
 _MAX_ANCESTOR_HOPS = 64
@@ -337,8 +337,10 @@ def _resolve_claim_store(path: os.PathLike[str] | str | None) -> str | None:
         return None
 
 
-def live_claim_workers(path: os.PathLike[str] | str | None = None) -> tuple[tuple[int, object], ...]:
-    """``(worker_pid, worker_started_at)`` for every LIVE claim on *path*'s board.
+def live_claim_tasks(
+    path: os.PathLike[str] | str | None = None,
+) -> tuple[tuple[str, int, object], ...]:
+    """``(task_id, worker_pid, worker_started_at)`` for every LIVE claim on *path*'s board.
 
     LIVE is the dispatcher's own reading: ``status = 'running'`` with an unexpired
     ``claim_expires`` and a recorded ``worker_pid``. Read-only and bounded; any failure answers
@@ -353,19 +355,19 @@ def live_claim_workers(path: os.PathLike[str] | str | None = None) -> tuple[tupl
     cached = _live_claim_cache.get(store)
     if cached is not None and (now - cached[0]) <= LIVE_CLAIM_PROBE_TTL_SECONDS:
         return cached[1]
-    rows: tuple[tuple[int, object], ...] = ()
+    rows: tuple[tuple[str, int, object], ...] = ()
     try:
         conn = sqlite3.connect(f"file:{store}?mode=ro", uri=True, timeout=1.0)
         try:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(
-                "SELECT worker_pid, worker_started_at FROM tasks "
+                "SELECT id, worker_pid, worker_started_at FROM tasks "
                 "WHERE status = 'running' AND worker_pid IS NOT NULL "
                 "  AND claim_expires IS NOT NULL AND claim_expires > ?",
                 (int(time.time()),),
             )
             rows = tuple(
-                (int(r["worker_pid"]), r["worker_started_at"])
+                (str(r["id"]), int(r["worker_pid"]), r["worker_started_at"])
                 for r in cur.fetchall() if r["worker_pid"]
             )
         finally:
@@ -374,6 +376,40 @@ def live_claim_workers(path: os.PathLike[str] | str | None = None) -> tuple[tupl
         rows = ()
     _live_claim_cache[store] = (now, rows)
     return rows
+
+
+def live_claim_workers(path: os.PathLike[str] | str | None = None) -> tuple[tuple[int, object], ...]:
+    """``(worker_pid, worker_started_at)`` for every LIVE claim on *path*'s board.
+
+    The provenance arm's own view; :func:`live_claim_tasks` is the same read with the task id
+    kept, which the operator-ask exemption records on the card it files.
+    """
+    return tuple((pid, started_at) for _task_id, pid, started_at in live_claim_tasks(path))
+
+
+def fencing_claim_task_id(path: os.PathLike[str] | str | None = None) -> str | None:
+    """The task id of the LIVE claim that would fence THIS process's call on *path*'s board.
+
+    The same predicate :func:`ancestor_owns_live_kanban_claim` refuses on (an ANCESTOR pid is the
+    claimed worker's pid, guarded by the ``worker_started_at`` fingerprint), answered as the task
+    id instead of a bool — so a sanctioned exemption can RECORD which claim it overrode instead
+    of reconstructing shell lineage later.
+    """
+    ancestors = process_ancestors()
+    if not ancestors:
+        return None
+    claims = live_claim_tasks(path)
+    if not claims:
+        return None
+    ancestor_set = set(ancestors)
+    try:
+        from hermes_cli.kanban_db_dispatch import _worker_not_dead
+    except Exception:  # health: allow BLE001 -- fail-open (t_fcf7a321): without the dispatcher's own liveness check the claim is unprovable, so this arm stays silent
+        return None
+    for task_id, pid, started_at in claims:
+        if pid in ancestor_set and _worker_not_dead(pid, started_at):
+            return task_id
+    return None
 
 
 def ancestor_owns_live_kanban_claim(path: os.PathLike[str] | str | None = None) -> bool:

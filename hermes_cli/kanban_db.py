@@ -275,6 +275,15 @@ def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None
     )
 
     target = kanban_home() if path is None else path
+    # THE ONE EXEMPTION (card t_af03b766): a validated operator-ask raise, scoped to this single
+    # handler call and this single board store. The operator ask is a RAISE addressed to the
+    # operator, not a self-dealing board mutation — born at the board's floor, designated through
+    # the kernel's designation door, lifted by the kernel's own re-rank — which is why it is the
+    # sole exemption. Every other write keeps both arms below exactly as they are.
+    from hermes_cli import kanban_operator_ask as _koa
+
+    if _koa.admits_store(target):
+        return
     if kanban_path_is_fenced(target):
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
     if ancestor_owns_live_kanban_claim(target):
