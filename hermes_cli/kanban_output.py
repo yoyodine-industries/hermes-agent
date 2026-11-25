@@ -97,3 +97,35 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     d = _obj_dict(t, _TASK_DICT_FIELDS)
     d["skills"] = list(t.skills) if t.skills else []
     return d
+
+
+#: The loss classes (``task_runs.metadata.loss_class``) that mean the HARNESS lost the process
+#: and the card's work was never judged. Both the human renderers below print them on their own
+#: line so a run cannot be read as "the work failed" -- or as "review requested changes" -- when
+#: nobody ever judged it. ONE vocabulary, shared with ``kanban_db_dispatch.LOSS_CLASSES``.
+HARNESS_LOSS_CLASSES = frozenset({
+    "receipt_timeout", "storage_unclassified", "storage_locked",
+    "owner_admission_unavailable", "worker_vanished", "killed", "spawn_failed",
+})
+
+
+def loss_class_of(run: Any) -> Optional[str]:
+    """The run's own harness-loss class, when it reported one; ``None`` otherwise."""
+    meta = getattr(run, "metadata", None)
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(meta, dict):
+        return None
+    value = meta.get("loss_class")
+    return value if isinstance(value, str) and value in HARNESS_LOSS_CLASSES else None
+
+
+def fmt_loss_line(run: Any, prefix: str = "     ") -> Optional[str]:
+    """One line distinguishing a harness loss (work not judged) from a work failure."""
+    loss_class = loss_class_of(run)
+    if loss_class is None:
+        return None
+    return f"{prefix}⛔ harness loss ({loss_class}) — the WORK WAS NOT JUDGED"

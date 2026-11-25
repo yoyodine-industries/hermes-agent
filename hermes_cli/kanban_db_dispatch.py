@@ -32,7 +32,10 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli import kanban_crash_sweep_guard as _crash_guard
-from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.quiet_single_query import (
+    KANBAN_WORKER_EXIT_TRAILER,
+    KANBAN_WORKER_LOSS_CLASS_TRAILER,
+)
 from hermes_cli._startup_fast import project_root_str
 
 if TYPE_CHECKING:
@@ -102,6 +105,14 @@ DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS = 120
 # Half-width of the deterministic per-task jitter (never a random source: every reader of the
 # same card must compute the same deadline, or the guard would oscillate tick to tick).
 STORAGE_LOCKED_COOLDOWN_JITTER_SECONDS = 30
+
+# How many HARNESS losses (busy store / lost receipt / unreachable owner / unsettled admission /
+# substrate import) a card may survive before the dispatcher parks it ``blocked`` with the loss
+# class named. This is a SURVIVAL budget, not the work budget: ``failure_limit`` (default 2)
+# decides "this card has failed too often" and this one decides "this host keeps losing
+# processes", and the two must never share a counter -- a card must not be given up because it
+# was unlucky. Overridable via ``HERMES_KANBAN_SURVIVAL_ATTEMPT_LIMIT``.
+SURVIVAL_ATTEMPT_LIMIT = 6
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -1736,6 +1747,45 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     return int(matches[-1]) if matches else None
 
 
+# The ONE loss-class vocabulary a run row carries (``task_runs.metadata.loss_class``). It names
+# WHAT the harness lost, never the card's work: ``receipt_timeout`` / ``storage_unclassified`` /
+# ``storage_locked`` / ``owner_admission_unavailable`` / ``worker_vanished`` / ``killed`` /
+# ``spawn_failed``. ``storage_unclassified`` is the bucket the card t_5800fe41 measured (197
+# crashes/24h carrying the "couldn't save this conversation" explainer with no cause named).
+LOSS_CLASSES = (
+    "receipt_timeout", "storage_unclassified", "storage_locked",
+    "owner_admission_unavailable", "worker_vanished", "killed", "spawn_failed",
+)
+_LOSS_CLASS_TRAILER_RE = re.compile(
+    r"^" + re.escape(KANBAN_WORKER_LOSS_CLASS_TRAILER) + r"([a-z_]+)\s*$", re.MULTILINE,
+)
+# The explainer the turn finalizer prints when persistence failed for a cause the old build could
+# not name. Used ONLY as a fallback for a worker build with no loss-class trailer; the trailer is
+# the worker's own words and always wins.
+_UNCLASSIFIED_STORAGE_MARKERS = (
+    "couldn't save this conversation", "could not save this conversation",
+)
+
+
+def _worker_log_loss_class(task_id: str, board: Optional[str] = None) -> Optional[str]:
+    """The loss class the worker itself reported in its log; None when it reported none."""
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+    except Exception:
+        return None
+    matches = _LOSS_CLASS_TRAILER_RE.findall(raw or "")
+    if not matches:
+        return None
+    loss_class = matches[-1]
+    return loss_class if loss_class in LOSS_CLASSES else None
+
+
+def _unclassified_storage_loss_in_output(worker_output: str) -> bool:
+    """A death with no named cause whose own words are the persistence explainer."""
+    text = (worker_output or "").lower()
+    return any(marker in text for marker in _UNCLASSIFIED_STORAGE_MARKERS)
+
+
 def reap_worker_zombies() -> list[int]:
     """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
     every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
@@ -2920,6 +2970,15 @@ def _classify_dead_worker(
                     dead.event_payload["infrastructure"] = True
                     dead.event_payload["substrate_import"] = True
                     dead.event_payload["substrate_signature"] = signature
+                    dead.event_payload["loss_class"] = "spawn_failed"
+            elif (_is_unexplained_death(dead)
+                  and "loss_class" not in dead.event_payload
+                  and _unclassified_storage_loss_in_output(worker_output)):
+                # No cause was named by the worker, but its own last words are the persistence
+                # explainer: the card's ``unclassified save text`` bucket, recorded as such
+                # instead of a bare crash. It stays a crash (the budget is spent) -- this only
+                # makes the row say WHAT the harness lost.
+                dead.event_payload["loss_class"] = "storage_unclassified"
             dead.error_text = (
                 f"{naming} {dead.error_text}" if naming else dead.error_text
             ) + f"{WORKER_OUTPUT_SEP}{worker_output!r}"
@@ -2982,12 +3041,20 @@ def _classify_dead_worker_exit(
         # ``_classify_dead_worker``) and it deliberately avoids every
         # ``_RESPAWN_BLOCKER_RE`` word, so ``check_respawn_guard`` reads the RUN
         # OUTCOME instead of trapping the card on the stamped line.
+        #
+        # rc=76 covers more than a busy store: a lost persistence receipt and an unreachable
+        # owner land here too. The worker names which in its own loss-class trailer; the run
+        # row carries that name and only falls back to ``storage_locked`` when the worker said
+        # nothing (an older build). Never synthesised from the exit code alone.
+        reported = _worker_log_loss_class(task_id, board=board) if task_id else None
+        payload = {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code}
+        payload["loss_class"] = reported or "storage_locked"
         return _DeadWorker(
             kind, code,
             f"pid {pid} exited with code {code}: the turn stopped on a transient state-store lock; "
             "the card was re-queued without counting a failure",
             "storage_locked",
-            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
+            payload,
             storage_locked=True,
         )
     if kind == "terminal_provider":
@@ -3012,6 +3079,17 @@ def _classify_dead_worker_exit(
     if code is not None and kind != "unknown":
         event_payload["exit_kind"] = kind
         event_payload["exit_code"] = code
+    # loss_class is the worker's own report when it left one; otherwise only a class the
+    # dispatcher DIRECTLY observed (a signal, a vanished pid). A bare nonzero exit gets none
+    # here -- ``_classify_dead_worker`` adds ``storage_unclassified`` only if the worker's own
+    # output is the persistence explainer, which is evidence, not a guess from ``rc``.
+    reported = _worker_log_loss_class(task_id, board=board) if task_id else None
+    if reported:
+        event_payload["loss_class"] = reported
+    elif kind == "signaled":
+        event_payload["loss_class"] = "killed"
+    elif kind == "unknown":
+        event_payload["loss_class"] = "worker_vanished"
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
 
@@ -3037,6 +3115,10 @@ class _CrashSweep:
     # death is the OWNER's. Held apart from ``crash_details`` for the same reason as
     # ``storage_locked``.
     admission_unsettled: list[str] = field(default_factory=list)
+    # ``(task_id, loss_class, error_text)``: harness losses that spend the SURVIVAL budget and
+    # never the work budget. Accounted after the txn by ``_account_survival_attempts`` (needs its
+    # own write_txn), which parks the card ``blocked`` once the survival bound is reached.
+    survival_details: list[tuple[str, str, str]] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -3340,6 +3422,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 # reach ``_account_crashes`` (the breaker) and must not count toward
                 # the mass-crash abort either.
                 sweep.storage_locked.append(row["id"])
+                sweep.survival_details.append((
+                    row["id"],
+                    str(dead.event_payload.get("loss_class") or "storage_locked"),
+                    error_text,
+                ))
             elif dead.substrate_import:
                 # NEVER crash_details, for the SAME reason as a lock-stop: nothing of the
                 # card ran, so the death is the tree's and must not spend the card's
@@ -3348,6 +3435,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 # rows as ``running`` with dead pids instead of releasing them spaced.
                 # Counted for the LANE actor (filenames the artifact) after the txn.
                 sweep.substrate_deferred.append(row["id"])
+                sweep.survival_details.append((row["id"], "spawn_failed", error_text))
                 if dead.substrate_signature:
                     sweep.substrate_signatures.append(dead.substrate_signature)
             elif dead.admission_unsettled:
@@ -3355,6 +3443,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 # admission must not spend the card's retry budget. The run's own error names the
                 # owner and the budget it outlasted.
                 sweep.admission_unsettled.append(row["id"])
+                sweep.survival_details.append((
+                    row["id"], "owner_admission_unavailable", error_text,
+                ))
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -3441,6 +3532,71 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
+def _survival_attempt_limit() -> int:
+    """``HERMES_KANBAN_SURVIVAL_ATTEMPT_LIMIT`` (>=1) else ``SURVIVAL_ATTEMPT_LIMIT``."""
+    return int(_kb._env_int("HERMES_KANBAN_SURVIVAL_ATTEMPT_LIMIT", SURVIVAL_ATTEMPT_LIMIT, minimum=1))
+
+
+def _account_survival_attempts(
+    conn: sqlite3.Connection, survival_details: list, board: Optional[str] = None,
+) -> list[str]:
+    """Spend the SURVIVAL budget once per harness loss; returns the ids it parked ``blocked``.
+
+    A run the harness lost (busy store, lost receipt, unreachable owner, admission never
+    settled, substrate import) never judged the card's work, so it must not spend the counter
+    that decides "this card has failed too often" -- ``consecutive_failures`` belongs to the
+    WORK. It still must not retry forever: after ``SURVIVAL_ATTEMPT_LIMIT`` such losses the card
+    is parked ``blocked`` with the loss class named in ``last_failure_error`` and a
+    ``survival_exhausted`` event -- never ``gave_up``, which would accuse the work of a death it
+    never caused. Reset by ``_clear_failure_counter`` when a run completes.
+    """
+    limit = _survival_attempt_limit()
+    parked: list[str] = []
+    for task_id, loss_class, error_text in survival_details:
+        with _kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT survival_failures FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            n = int(row["survival_failures"] or 0) + 1
+            conn.execute(
+                "UPDATE tasks SET survival_failures = ? WHERE id = ?", (n, task_id),
+            )
+            if n < limit:
+                continue
+            # The run's own stamped error stays FIRST: it names the concrete event and keeps
+            # ``_RESPAWN_BLOCKER_RE`` blind (the guard reads the run OUTCOME anyway).
+            prior = conn.execute(
+                "SELECT last_failure_error FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            prior_text = (prior["last_failure_error"] or "").strip() if prior else ""
+            notice = (
+                f"harness loss x{n} ({loss_class}) -- the WORK WAS NOT JUDGED; parked blocked "
+                f"after {n} harness losses (limit {limit}) with the card's work budget untouched "
+                "(this is NOT a work failure; release it when the host is quiet)"
+            )
+            framed = f"{prior_text}{'; ' if prior_text else ''}{notice}"
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'blocked', last_failure_error = ? WHERE id = ? "
+                "AND status IN ('ready', 'running', 'review')",
+                (framed[:500], task_id),
+            )
+            if cur.rowcount != 1:
+                continue
+            _kb._append_event(
+                conn, task_id, "survival_exhausted",
+                {
+                    "survival_failures": n,
+                    "limit": limit,
+                    "loss_class": loss_class,
+                    "error": error_text[:300],
+                },
+            )
+            parked.append(task_id)
+    return parked
+
+
 def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -3475,6 +3631,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
         # empty and the crash accounting below must not run. When that subset was NON-empty those
         # runs really were closed, so they fall through to the ordinary accounting and hooks.
         detect_crashed_workers._last_auto_blocked = []  # type: ignore[attr-defined]
+        detect_crashed_workers._last_survival_blocked = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_rate_limited = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_storage_locked = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_substrate_import = []  # type: ignore[attr-defined]
@@ -3482,10 +3639,18 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
         return []
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    # The SURVIVAL budget, spent by harness losses only. Never the work budget: a run the
+    # harness lost did not judge the card. At the bound the card is PARKED BLOCKED with the
+    # loss class named, never ``gave_up``.
+    survival_boarded = (
+        _account_survival_attempts(conn, sweep.survival_details, board=board)
+        if sweep.survival_details else []
+    )
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # and storage-locked requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+    detect_crashed_workers._last_survival_blocked = survival_boarded  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
     detect_crashed_workers._last_storage_locked = sweep.storage_locked  # type: ignore[attr-defined]
     detect_crashed_workers._last_substrate_import = sweep.substrate_deferred  # type: ignore[attr-defined]
@@ -3719,10 +3884,14 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     Called from ``complete_task`` on success. NOT called on spawn success: a
     spawn proves the worker could start, not that the run will succeed, so
     timeouts and crashes must accumulate across spawn boundaries.
+
+    Also clears ``survival_failures``: a completed run proves the card's work, so the harness
+    losses it survived (busy store, lost receipt, unreachable owner) start clean -- the two
+    counters are spent by different events and must reset on the same proof.
     """
     with _kb.write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET consecutive_failures = 0, "
+            "UPDATE tasks SET consecutive_failures = 0, survival_failures = 0, "
             "last_failure_error = NULL WHERE id = ?",
             (task_id,),
         )
