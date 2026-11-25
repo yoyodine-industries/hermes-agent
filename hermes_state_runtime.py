@@ -48,6 +48,18 @@ class RuntimeStoreError(ValueError):
 ADMITTED_REQUEST_CONFLICT = {'field': 'request_id', 'detail': 'this request id was already admitted with another payload'}
 
 
+#: The per-admission settlement receipt: `state_meta[key]` holds the resolution id, the edge that
+#: cleared it and the epoch. The census prints it, so "settled once" is a read, not a memory.
+_RESOLUTION_KEY = 'session_input.resolution.v1.%s'
+
+
+def _resolution_id(admission_id: str, epoch: int, generation: int) -> str:
+    """A deterministic settlement id: the same admission settles to the same id, never twice."""
+    import hashlib
+    return 'res-' + hashlib.sha256(('%s:%s:%s' % (admission_id, epoch, generation))
+                                   .encode('utf-8')).hexdigest()[:16]
+
+
 def _one_line(value, limit):
     """A refusal's ``field``/``detail`` as the log line and the client frame carry it: either may hold
     client text, so whitespace collapses to single spaces, other non-printables drop (no forged log
@@ -383,13 +395,19 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         if _guard is not None:
             _guard(conn)
         session = _session(conn, session_id)
-        blocked = conn.execute("SELECT status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (session_id,)).fetchall()
-        if any(row[0] == 'unknown' for row in blocked):
-            raise RuntimeStoreError('unknown_execution')
+        blocked = conn.execute("SELECT seq,status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown') ORDER BY seq", (session_id,)).fetchall()
+        stuck = next((row for row in blocked if row['status'] == 'unknown'), None)
+        if stuck is not None:
+            # NAME THE ROW. The drain settles an unattended unknown and retries; a refusal that
+            # only says `unknown_execution` forces the reader to go and find which seq it meant,
+            # and `cleared_by=none` says this one is still nobody's clearing - a person owns it.
+            raise RuntimeStoreError('unknown_execution', field='admission',
+                                    detail='seq=%s cleared_by=none' % stuck['seq'])
         from hermes_state_runtime_workers import worker_states
         workers = worker_states(conn, session_id)
         if 'unknown' in workers:
-            raise RuntimeStoreError('unknown_execution')
+            raise RuntimeStoreError('unknown_execution', field='worker',
+                                    detail='seq=- cleared_by=none')
         if blocked or workers:
             return None
         row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' "
@@ -863,7 +881,7 @@ def import_legacy_session_admissions(db, *, epoch: int, source_path, principal_i
 
 
 def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generation: int,
-                                  _terminal_write=None, _captured=None) -> dict:
+                                  _terminal_write=None, _captured=None, _edge: str = 'resolve') -> dict:
     """Explicit operator acknowledgement; resolves uncertainty, never requeues it.
 
     ``_terminal_write(conn, row)`` is the owner's same-transaction effect (the discarded turn's
@@ -898,6 +916,16 @@ def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generati
         conn.execute("UPDATE session_admissions SET status='terminal',outcome=? WHERE admission_id=?",
                      (outcome, admission_id))
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
+        # THE SETTLE'S OWN RECEIPT, committed with it: which edge cleared which row, at which
+        # epoch. The id is DERIVED from (admission, epoch, generation), so a double-run rewrites
+        # the same id instead of minting a second settlement - the census reads it to prove a
+        # row was cleared once, by one edge, and a re-reading cannot be mistaken for a second
+        # decision.
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
+                     'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                     (_RESOLUTION_KEY % admission_id,
+                      _json({'resolution_id': _resolution_id(admission_id, epoch, row['generation']),
+                             'edge': _edge, 'epoch': epoch, 'seq': row['seq'], 'outcome': outcome})))
         return _row(_admission(conn, admission_id))
     return db._execute_write(write)
 
