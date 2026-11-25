@@ -8300,18 +8300,19 @@ def run_daemon(
     while not stop_event.is_set():
         try:
             # Re-resolved every tick (config load is mtime-cached) so operator
-            # edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
-            # A caller that passed no --max is still bound: an absent cap resolves
-            # to the HOST ceiling, never to None = unlimited (card t_001338fa).
-            tick_max_spawn = (
-                max_spawn if max_spawn is not None else resolve_dispatch_caps({})["max_spawn"]
-            )
+            # edits apply without a restart. EVERY cap comes from the same
+            # host-baseline resolver as the CLI and the gateway: this daemon used
+            # to resolve max_in_progress on its own caller-dependent path, which
+            # fell through to None (= unlimited) when the seat carried no
+            # ``kanban:`` block and memory could not be sampled (card t_001338fa).
+            caps = resolve_dispatch_caps()
+            tick_max_spawn = max_spawn if max_spawn is not None else caps["max_spawn"]
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=tick_max_spawn,
-                    max_in_progress=max_in_progress,
+                    max_in_progress=caps["max_in_progress"],
+                    max_in_progress_per_profile=caps["max_in_progress_per_profile"],
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:

@@ -282,3 +282,58 @@ def test_gateway_dispatcher_settings_are_host_bounded(kanban_home_with_profiles,
     empty = kwd._resolve_dispatcher_settings({}, kb)
     assert empty.max_spawn == 8
     assert empty.max_in_progress == 8
+
+
+# ---------------------------------------------------------------------------
+# the standalone daemon is not the one uncapped entry point
+# ---------------------------------------------------------------------------
+
+def test_run_daemon_tick_is_host_bounded_from_a_lane_seat(kanban_home_with_profiles, monkeypatch):
+    """``hermes kanban dispatch --daemon`` from a lane seat: EVERY cap host-bounded.
+
+    The daemon resolved ``max_in_progress`` on its own path
+    (``configured_max_in_progress`` -> ``resolve_max_in_progress``), so a lane
+    seat whose profile carries no ``kanban:`` block fell back to a memory sample
+    and, where memory cannot be read, to ``None`` -- unlimited. It must use the
+    same resolver as the CLI and the gateway, for every cap, not just
+    ``max_spawn``.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    _write_root_config(
+        kanban_home_with_profiles,
+        "kanban:\n  max_spawn: 8\n  max_in_progress: 8\n  max_in_progress_per_profile: 4\n",
+    )
+    # Memory unreadable: the pre-fix path resolves max_in_progress to None here.
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {})
+
+    captured = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+
+    class _DummyConn:
+        def close(self):
+            pass
+
+    class _StubConnect:
+        def connect(self):
+            return _DummyConn()
+
+    monkeypatch.setattr(kbd, "_kbc", _StubConnect())
+
+    import threading
+    stop = threading.Event()
+
+    def on_tick(_res):
+        stop.set()
+
+    kbd.run_daemon(interval=0.01, max_spawn=None, stop_event=stop, on_tick=on_tick)
+
+    assert captured.get("max_spawn") == 8, captured
+    assert captured.get("max_in_progress") == 8, captured
+    assert captured.get("max_in_progress_per_profile") == 4, captured
