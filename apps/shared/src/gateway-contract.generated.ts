@@ -7231,6 +7231,8 @@ export interface CanonicalRpcMethods {
   'worker.persist': { params: WorkerPersistParams; result: WorkerPersistResult }
   /** Register a compute worker execution on an idle session. */
   'worker.register': { params: WorkerRegisterParams; result: WorkerExecution }
+  /** Read the owner's row for this execution: how a lost ACK for a non-replayable worker verb is confirmed, never by resending it. */
+  'worker.status': { params: WorkerScopeParams; result: WorkerExecution }
 }
 export type CanonicalRpcMethod = keyof CanonicalRpcMethods
 export const CANONICAL_RPC_METHODS = [
@@ -7287,7 +7289,8 @@ export const CANONICAL_RPC_METHODS = [
   'shell.exec',
   'worker.adopt',
   'worker.persist',
-  'worker.register'
+  'worker.register',
+  'worker.status'
 ] as const satisfies readonly CanonicalRpcMethod[]
 
 // ── Canonical method namespaces: member names exist only at runtime (gate on `capability`) ──

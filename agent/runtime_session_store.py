@@ -41,6 +41,17 @@ RECEIPT_BUDGET_SECONDS = 20.0
 RECEIPT_BACKOFF_SECONDS = (1.0, 3.0, 8.0, 15.0)
 # Only a method whose replay the owner dedupes may be re-asked after a missed ACK.
 _REPLAY_SAFE_METHODS = frozenset({'worker.persist'})
+
+# Repeating a mutation and confirming its outcome are different questions. These verbs are a
+# producer claim, so a blind resend is not idempotent - but the owner already HOLDS the row they
+# write, so a lost ACK is resolvable by ASKING rather than giving up. Value = the status strings
+# that prove the write landed; the read is ``worker.status`` (read-only, same claim, same owner).
+_CONFIRM_BY_READ = {
+    'worker.adopt': ('running',),
+    'worker.register': ('registered', 'running'),
+}
+_CONFIRM_READ_METHOD = 'worker.status'
+_CONFIRM_READ_SCOPE = ('profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret')
 # Failures that mean "the owner is busy", never "this store is broken": a flush reports these
 # as False and keeps the journal (the outbox a later reopen replays), exactly like the
 # in-process SessionDB contract ("False on timeout ... Never raises").
@@ -269,6 +280,8 @@ class WorkerRPC:
             message = json.dumps({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
             # Only a receipt the owner dedupes by (execution, sequence, digest) may be re-asked.
             replay_safe = method in _REPLAY_SAFE_METHODS and isinstance(params.get('sequence'), int)
+            confirmable = method in _CONFIRM_BY_READ
+            retried = False
             try:
                 link = self._send(self._connection(), request_id, message)
                 started = time.monotonic()
@@ -282,6 +295,35 @@ class WorkerRPC:
                     except TimeoutError:
                         waited = time.monotonic() - sent
                         self._drop()
+                        if confirmable:
+                            # A mutation may not be repeated blind, but its OUTCOME is not
+                            # unknowable: the owner holds the row this verb writes. Ask it, and
+                            # never discard a joined, working worker because its ACK was slow.
+                            committed, row = self._confirm_by_read(method, params, deadline)
+                            if committed:
+                                row = row or {}
+                                logger.warning(
+                                    'worker_receipt_confirmed_by_read after %.1fs: the owner did not ACK '
+                                    '%s but holds this execution as %s (owner_epoch %s); proceeding on '
+                                    'that row, the write is not lost', waited, method,
+                                    row.get('status'), row.get('owner_epoch'))
+                                return self._settle(method, params, row)
+                            if retried:
+                                raise TimeoutError('worker_receipt_timeout') from None
+                            # The owner answered and the write genuinely did not land: the one case
+                            # where re-issuing the call is idempotent, and it happens exactly once.
+                            retried = True
+                            attempt += 1
+                            logger.warning(
+                                'worker_receipt_timeout after %.1fs: the owner holds no committed %s for '
+                                'this execution (read says not applied); retrying the call once, '
+                                'never blindly', waited, method)
+                            self.request_id += 1
+                            request_id = self.request_id
+                            message = json.dumps({'jsonrpc': '2.0', 'id': request_id,
+                                                  'method': method, 'params': params})
+                            link = self._send(self._connection(), request_id, message)
+                            continue
                         backoff = RECEIPT_BACKOFF_SECONDS[min(attempt, len(RECEIPT_BACKOFF_SECONDS) - 1)]
                         attempt += 1
                         if not replay_safe or time.monotonic() + backoff > deadline:
@@ -304,10 +346,61 @@ class WorkerRPC:
                 raise
             if 'error' in response:
                 raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
-            if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
-                global _worker_process
-                _worker_process = True
-            return response['result']
+            return self._settle(method, params, response['result'])
+
+    def _settle(self, method, params, result):
+        """One exit for an ACKed call and for one confirmed by read, so both bind the process the
+        same way (``_worker_process`` gates the owner-side launch path)."""
+        if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
+            global _worker_process
+            _worker_process = True
+        return result
+
+    def _confirm_by_read(self, method, params, deadline):
+        """Resolve a lost ACK for a mutation by ASKING the owner, never by resending it.
+
+        Returns ``(True, row)`` when the owner already holds the row this verb writes, and
+        ``(False, None)`` when it answered and the write did not land. Raises when the read
+        itself cannot be answered inside the receipt patience: an owner that answers neither the
+        call nor the read is a ``receipt_timeout`` (a cause of harness loss), never a guess about
+        what it committed.
+        """
+        committed = _CONFIRM_BY_READ[method]
+        read_params = {key: params[key] for key in _CONFIRM_READ_SCOPE if key in params}
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    'worker_receipt_read_unanswered: the owner answered neither %s nor %s inside the '
+                    'receipt patience; the outcome is not knowable from here (receipt_timeout)',
+                    method, _CONFIRM_READ_METHOD)
+                raise TimeoutError('worker_receipt_timeout') from None
+            self.request_id += 1
+            request_id = self.request_id
+            message = json.dumps({'jsonrpc': '2.0', 'id': request_id,
+                                  'method': _CONFIRM_READ_METHOD, 'params': read_params})
+            link = self._send(self._connection(), request_id, message)
+            try:
+                response = link.receive(min(RECEIPT_BUDGET_SECONDS, remaining))
+            except TimeoutError:
+                # A read is idempotent, so it is re-asked inside the same patience.
+                self._drop()
+                time.sleep(min(RECEIPT_BACKOFF_SECONDS[0], max(remaining, 0.0)))
+                continue
+            if 'error' in response:
+                reason = response['error'].get('message', 'persistence_failed')
+                if reason in ('not_found', 'stale_generation'):
+                    # The owner answered: it holds no row this claim may have written.
+                    logger.warning('worker_receipt_read_not_applied: the owner holds no %s row for this '
+                                   'execution (%s); the write did not land', method, reason)
+                    return False, None
+                raise WorkerPersistenceError(reason)
+            row = response['result'] or {}
+            if row.get('status') in committed:
+                return True, row
+            logger.warning('worker_receipt_read_not_applied: the owner reports this execution as %r, '
+                           'not %r; the write did not land', row.get('status'), committed)
+            return False, None
 
     def _send(self, link, request_id, message):
         """Send once; a link the owner closed before the frame was written is redialed once."""

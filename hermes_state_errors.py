@@ -98,7 +98,8 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "session_row_missing", "unknown",
+    "replaced", "deleted_wal", "disk", "session_row_missing", "receipt_timeout",
+    "owner_unavailable", "unknown",
 )
 
 
@@ -278,6 +279,10 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
 )
 _PERSISTENCE_CAUSE_BY_PHRASE = (
     (("turn lease",), "turn_lease"),
+    # Harness loss, not store damage: the owner never ACKed a receipt (or was unreachable), so
+    # nothing about the store is known and `unknown` would mis-file the crash as a data fault.
+    (("worker_receipt_timeout",), "receipt_timeout"),
+    (("owner_unavailable",), "owner_unavailable"),
     (("closed by compression",), "compression_closed"),
     (("being compressed", "compression lease"), "compression"),
     # RPC-wrapped errors lose their exception type; retain the same sidecar/main-file split.
