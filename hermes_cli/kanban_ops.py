@@ -58,45 +58,6 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
-def _max_spawn_by_board(_kanban_cfg: dict) -> dict:
-    """``kanban.max_spawn_by_board`` as ``{slug: ceiling}``, junk dropped silently.
-
-    Read here for the MEASUREMENT only: the CLI never passes these ceilings to
-    ``dispatch_once`` (that is the gateway dispatcher's job, and it resolves and
-    warns about the same map). A NAMED board's ceiling can never be a
-    non-positive int, so it is left out rather than coerced into one.
-
-    The reserved ``default`` key is the one exception, and it is a different
-    rule on purpose: it is the arm for every board the map does not name, where
-    ``0`` means "an unmapped board draws no slots". Dropping it here would make
-    the dry-run report a budget the gateway does not apply — the exact false
-    green this reader exists to prevent — so the measurement applies the SAME
-    rule the enforcement parser (``gateway.kanban_watchers_dispatcher``) applies:
-    ``default`` accepts any non-negative int, named boards stay positive.
-    """
-    raw = _kanban_cfg.get("max_spawn_by_board") if isinstance(_kanban_cfg, dict) else None
-    if not isinstance(raw, dict):
-        return {}
-    ceilings: dict = {}
-    for slug, value in raw.items():
-        key = str(slug).strip()
-        if not key or isinstance(value, bool):
-            continue
-        try:
-            ival = int(value)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if ival != value:
-            continue
-        if key == kbd.DEFAULT_CEILING_KEY:
-            if ival < 0:
-                continue
-        elif ival < 1:
-            continue
-        ceilings[key] = ival
-    return ceilings
-
-
 def _held_lines(res: object, host_budget: dict) -> list[str]:
     """Every card a gate held this tick, named on one line, or ``[]``.
 
@@ -173,31 +134,47 @@ def _held_lines(res: object, host_budget: dict) -> list[str]:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    # Honour kanban.default_assignee, kanban.max_in_progress,
-    # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
-    # semantics as the gateway dispatch path.
-    max_spawn_by_board: dict = {}
+    # The caps are a HOST property (card t_001338fa), not the invoking seat's:
+    # resolve the ROOT config as the baseline and let THIS profile's kanban block
+    # narrow it per key. A lane seat with no ``kanban:`` block therefore inherits
+    # the host ceiling instead of planning an unbounded fan-out — the defect was
+    # that an ABSENT block resolved to None, and None means unlimited here.
+    #
+    # The per-BOARD ceilings (``max_spawn_by_board``) come from the SAME resolved
+    # map the gateway enforces: the host names a board's ceiling and this profile
+    # may narrow it, never raise it (review 2026-11-25). Measuring from the
+    # profile's raw block here reported a budget the dispatcher never applied.
+    caps = kbd.resolve_dispatch_caps({})
+    max_spawn_by_board: dict = caps["max_spawn_by_board"]
+    default_assignee = None
     try:
         from hermes_cli.config import load_config
         _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        if not isinstance(_kanban_cfg, dict):
+            _kanban_cfg = {}
+        caps = kbd.resolve_dispatch_caps(_kanban_cfg)
+        max_spawn_by_board = caps["max_spawn_by_board"]
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-        max_in_progress_per_profile = kbd._positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile"), None
-        )
-        # Memory-derived default when unset — same fallback the gateway applies.
-        max_in_progress = kbd.resolve_max_in_progress(
-            kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
-        )
-        # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
-        cli_max = getattr(args, "max", None)
-        max_spawn = (
-            cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
-        )
-        max_spawn_by_board = _max_spawn_by_board(_kanban_cfg)
     except Exception:
-        default_assignee = max_in_progress_per_profile = max_in_progress = None
-        max_spawn = getattr(args, "max", None)
+        # An unreadable config is not a licence to spawn: ``caps`` still holds the
+        # host baseline + floor resolved above.
+        pass
+    # CLI --max is the more explicit signal, so it wins over kanban.max_spawn —
+    # it is the operator typing the bound on THIS command line, not a seat
+    # inheriting one.
+    cli_max = getattr(args, "max", None)
+    max_spawn = cli_max if cli_max is not None else caps["max_spawn"]
+    max_in_progress = caps["max_in_progress"]
+    max_in_progress_per_profile = caps["max_in_progress_per_profile"]
+    if caps["clamped_to_host"]:
+        # Never silent: the profile asked above the host ceiling and was held to it.
+        print(
+            "Caps (host floor): "
+            f"{', '.join(caps['clamped_to_host'])} requested above the host ceiling "
+            f"(max_spawn={caps['host_baseline']['max_spawn']}); the host value binds "
+            "(kanban.allow_profile_cap_raise is not set)."
+        )
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
@@ -273,6 +250,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_top_level_only": getattr(res, "skipped_top_level_only", []),
             "tick_yielded": res.tick_yielded,
             "host_budget": host_budget,
+            # WHO invoked this command must not change the plan: the resolved
+            # caps, the host baseline they came from, and any profile value the
+            # host ceiling refused (card t_001338fa).
+            "dispatch_caps": {
+                "max_spawn": max_spawn,
+                "max_in_progress": max_in_progress,
+                "max_in_progress_per_profile": max_in_progress_per_profile,
+                "max_spawn_by_board": max_spawn_by_board,
+                "host_baseline": caps["host_baseline"],
+                "clamped_to_host": caps["clamped_to_host"],
+            },
         }, ascii=True)
         return 0
     if res.skipped_board_disabled:

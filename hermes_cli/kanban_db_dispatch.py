@@ -4331,6 +4331,199 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+# ---------------------------------------------------------------------------
+# The fleet's dispatch ceiling is a HOST property (card t_001338fa)
+# ---------------------------------------------------------------------------
+# MEASURED 2026-11-25 13:3xZ, the same command on the same board, three seats:
+#   hermes                       -> Spawned: 0   (Held: board ceiling max_spawn=8 met)
+#   hermes -p financially-stl    -> Spawned: 5183  (no hold, no cap)
+#   hermes -p research-stl       -> Spawned: 5183  (no hold, no cap)
+# The caps were read from the INVOKING profile's config.yaml only, and the lane
+# profiles carry no ``kanban:`` block — so every cap was ABSENT, and an absent cap
+# resolved to ``None``, which on this path means UNLIMITED. A seat could raise the
+# fleet's spawn ceiling as a SIDE EFFECT of not having a config section.
+#
+# The resolution below is the ruling's shape (platform-stl, same card):
+#   1. the HOST (root) config.yaml is the BASELINE, whoever invoked the command;
+#   2. the invoking profile's ``kanban:`` block overrides it PER KEY — but only
+#      DOWNWARD. Raising the fleet ceiling is the host's decision, stated in the
+#      HOST file as ``kanban.allow_profile_cap_raise: true``; we do not set it, so
+#      a lane seat can narrow its own share and never widen the host's.
+#   3. anything still unset resolves to ``DEFAULT_HOST_MAX_SPAWN`` — never None.
+# Fail CLOSED, the way ``board_dispatch_enabled`` already fails closed for an
+# unknown board: absent configuration is a bound, not a licence.
+DEFAULT_HOST_MAX_SPAWN = 8
+
+# Cap keys whose baseline is the host and whose profile value may only narrow it.
+_DISPATCH_CAP_KEYS = ("max_spawn", "max_in_progress", "max_in_progress_per_profile")
+
+
+def _cap_int(value: Any) -> Optional[int]:
+    """A cap as a positive int, or ``None`` when absent/invalid. A bool is not a cap."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
+def _board_ceilings(raw: Any) -> dict:
+    """``kanban.max_spawn_by_board`` as ``{slug: int}``, unusable entries dropped.
+
+    The SAME value rules the gateway's enforcing parser applies: a NAMED board's
+    ceiling must be a positive integer (a non-integral float is a typo and is
+    never truncated, a non-finite float must never reach ``int()``, and a bool is
+    an int subclass but not a ceiling); the reserved ``default`` arm accepts a
+    non-negative integer, because ``default: 0`` is how the host says "a board
+    this map does not name draws no slots".
+
+    No board-inventory check happens here: the resolver does not know which
+    boards exist, and the gateway still validates against its inventory. Junk is
+    dropped rather than coerced — a typo must never become a dispatch-governing
+    number.
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    ceilings: dict[str, int] = {}
+    for slug, value in raw.items():
+        key = str(slug).strip()
+        if not key or isinstance(value, bool):
+            continue
+        if isinstance(value, float) and not value.is_integer():
+            continue
+        try:
+            ceiling = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if key == DEFAULT_CEILING_KEY:
+            if ceiling < 0:
+                continue
+        elif ceiling < 1:
+            continue
+        ceilings[key] = ceiling
+    return ceilings
+
+
+def host_kanban_config() -> dict:
+    """The ROOT config.yaml's ``kanban:`` block — the fleet baseline, whoever invoked us.
+
+    ``load_config()`` reads the ACTIVE profile's home, which is precisely the
+    caller-dependence this resolver exists to end. The root home is resolved
+    independently (``get_default_hermes_root`` maps a profile home back to the
+    root that holds it) and read through the same effective-config pipeline used
+    for any user config (env expansion + managed overlay), so no second notion of
+    "what the host said" is introduced. ``{}`` when the file is missing or
+    unreadable: the floor below then applies.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        from hermes_cli.config_effective import load_user_config_effective
+        root_cfg = load_user_config_effective(Path(get_default_hermes_root()) / "config.yaml")
+    except Exception:
+        return {}
+    section = root_cfg.get("kanban") if isinstance(root_cfg, Mapping) else None
+    return dict(section) if isinstance(section, Mapping) else {}
+
+
+def _active_kanban_config() -> dict:
+    """The ACTIVE profile's ``kanban:`` block (``{}`` when it has none/unreadable)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        section = (load_config_readonly() or {}).get("kanban")
+    except Exception:
+        return {}
+    return dict(section) if isinstance(section, Mapping) else {}
+
+
+def resolve_dispatch_caps(
+    profile_kanban_cfg: Optional[Mapping[str, Any]] = None,
+    host_kanban_cfg: Optional[Mapping[str, Any]] = None,
+) -> dict:
+    """The caps a dispatch tick is bound by: host baseline, profile narrowing, hard floor.
+
+    ``profile_kanban_cfg`` is the invoking profile's ``kanban:`` block (``{}`` when
+    it has none — an EMPTY block is the normal state of a lane seat, and it must
+    resolve to the host's ceilings, never to ``None``); ``None`` reads the ACTIVE
+    profile's block itself. ``host_kanban_cfg`` overrides the host file read, for
+    callers that already hold it and for tests.
+
+    Returns ``{max_spawn, max_in_progress, max_in_progress_per_profile,
+    host_baseline, clamped_to_host}``. Every returned cap is a positive int except
+    ``max_in_progress_per_profile``, which stays ``None`` when nobody set it: a
+    per-profile cap is a SHARE of the host budget, so "no share cap" is bounded by
+    the two host caps above it and can never be unlimited.
+
+    ``Allow the profile to RAISE a cap`` is a HOST statement
+    (``kanban.allow_profile_cap_raise: true`` in the ROOT file), and it is not set
+    on this estate: a named profile therefore cannot lift the fleet ceiling, only
+    narrow it. ``clamped_to_host`` names the keys where it tried — so the refusal
+    is visible in a dispatch output instead of silently applied.
+
+    The per-board map (``kanban.max_spawn_by_board``) is resolved the same way,
+    per BOARD key: the HOST block names a board's ceiling and the invoking
+    profile may only narrow it. A board the host does not name has the host's
+    ``max_spawn`` for a ceiling (the gateway's fallback arm), so a profile value
+    for such a board is measured against that number. A refused entry is named in
+    ``clamped_to_host`` as ``max_spawn_by_board.<slug>``. The result carries the
+    resolved map as ``max_spawn_by_board`` — both enforcement (gateway) and
+    measurement (CLI) read that one map, so a dry run cannot report a budget the
+    dispatcher never applies.
+    """
+    host = dict(host_kanban_cfg) if isinstance(host_kanban_cfg, Mapping) else host_kanban_config()
+    if isinstance(profile_kanban_cfg, Mapping):
+        profile = dict(profile_kanban_cfg)
+    else:
+        profile = _active_kanban_config()
+    allow_raise = host.get("allow_profile_cap_raise") is True
+
+    host_max_spawn = _cap_int(host.get("max_spawn")) or DEFAULT_HOST_MAX_SPAWN
+    # The memory-derived default is the host's own baseline when the root file is
+    # silent (it is bounded by DERIVED_MAX_IN_PROGRESS_CEILING); the hard floor
+    # covers a host whose memory cannot be read at all.
+    host_max_in_progress = (
+        _cap_int(host.get("max_in_progress"))
+        or derive_default_max_in_progress()
+        or DEFAULT_HOST_MAX_SPAWN
+    )
+    host_boards = _board_ceilings(host.get("max_spawn_by_board"))
+    baseline = {
+        "max_spawn": host_max_spawn,
+        "max_in_progress": host_max_in_progress,
+        "max_in_progress_per_profile": _cap_int(host.get("max_in_progress_per_profile")),
+        "max_spawn_by_board": dict(host_boards),
+    }
+
+    resolved = dict(baseline)
+    clamped: list[str] = []
+    for key in _DISPATCH_CAP_KEYS:
+        wanted = _cap_int(profile.get(key))
+        if wanted is None:
+            continue
+        ceiling = baseline[key]
+        if ceiling is None or allow_raise or wanted <= ceiling:
+            resolved[key] = wanted
+        else:
+            clamped.append(key)
+    # Per-board ceilings, narrow-only per board key. The host's map is the
+    # baseline; the profile may lower a board (never raise it), and a board the
+    # host does not name is measured against the host ``max_spawn`` it inherits.
+    boards = dict(host_boards)
+    profile_boards = _board_ceilings(profile.get("max_spawn_by_board"))
+    for slug in sorted(profile_boards):
+        wanted = profile_boards[slug]
+        ceiling = host_boards.get(slug, host_max_spawn)
+        if allow_raise or wanted <= ceiling:
+            boards[slug] = wanted
+        else:
+            clamped.append(f"max_spawn_by_board.{slug}")
+    resolved["max_spawn_by_board"] = boards
+    resolved["host_baseline"] = baseline
+    resolved["clamped_to_host"] = clamped
+    return resolved
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -8169,13 +8362,19 @@ def run_daemon(
     while not stop_event.is_set():
         try:
             # Re-resolved every tick (config load is mtime-cached) so operator
-            # edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            # edits apply without a restart. EVERY cap comes from the same
+            # host-baseline resolver as the CLI and the gateway: this daemon used
+            # to resolve max_in_progress on its own caller-dependent path, which
+            # fell through to None (= unlimited) when the seat carried no
+            # ``kanban:`` block and memory could not be sampled (card t_001338fa).
+            caps = resolve_dispatch_caps()
+            tick_max_spawn = max_spawn if max_spawn is not None else caps["max_spawn"]
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
+                    max_spawn=tick_max_spawn,
+                    max_in_progress=caps["max_in_progress"],
+                    max_in_progress_per_profile=caps["max_in_progress_per_profile"],
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
