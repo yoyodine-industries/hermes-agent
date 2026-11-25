@@ -2274,6 +2274,10 @@ DEFAULT_CONFIG = {
         "auto_prune": False,
         # Inactive days of ended-session history to keep (= `hermes sessions prune`).
         "retention_days": 90,
+        # Per-session ceiling on stored message rows, oldest-first, enforced by the
+        # maintenance pass (prune time, never in a turn). 0 disables. Summaries,
+        # tool-effect audit rows and failed-turn records are never deleted.
+        "message_cap": 5000,
         # Auto-archive (soft-hide, never delete) sessions with no activity for auto_archive_days,
         # once per min_interval_hours. Pinned sessions are exempt.
         "auto_archive": False,
