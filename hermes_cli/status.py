@@ -115,7 +115,11 @@ def _estop_status_line():
         return f"⏸️  HOLD {handle} — LEGACY fleet-wide halt{reason}; lift it by handle: {lift}"
     lanes = ", ".join(sorted(state.allow_profiles)) or "(no lane named — every lane is held)"
     until = f" until {hold['expires_at']}" if hold.get("expires_at") else ""
-    return f"⏸️  HOLD {handle} lanes=[{lanes}]{until}{reason}; lift it with {lift}"
+    # t_7b226853: the banner says WHAT the hold exists for, not just whom it holds — the
+    # reader must be able to see why it will not lift yet.
+    cards = [str(c) for c in ((hold.get("purpose") or {}).get("cards") or [])]
+    for_ = f" for {', '.join(cards)}" if cards else ""
+    return f"⏸️  HOLD {handle} lanes=[{lanes}]{for_}{until}{reason}; lift it with {lift}"
 
 
 # --- Data tables driving the per-section renderers -------------------------
