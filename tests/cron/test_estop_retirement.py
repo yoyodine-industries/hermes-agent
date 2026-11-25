@@ -250,10 +250,12 @@ def test_the_history_printer_renders_every_row(hermes_home, capsys):
     out = capsys.readouterr().out
     assert "handle=" in out and "lanes=[platform-coder]" in out
 
-    estop.release(owner="bot:runner", actor="bot:ops-seat")
+    # t_7b226853: the release row an ops seat reads is the HOLDER's own — a third party can no
+    # longer lift by handle, so the row it must render carries via=holder.
+    estop.release(owner="bot:runner", actor="bot:runner")
     assert _print_history(10, False) == 0
     out = capsys.readouterr().out
-    assert "release" in out and "cause=owner" in out and "via=ops-venue" in out
+    assert "release" in out and "cause=owner" in out and "via=holder" in out
 
 
 def test_a_bot_armed_hold_wearing_operator_is_liftable_by_an_ops_venue(
@@ -277,15 +279,24 @@ def test_a_bot_armed_hold_wearing_operator_is_liftable_by_an_ops_venue(
 
 
 def test_a_hold_the_operator_really_armed_still_refuses_a_bot(hermes_home):
-    """D7 is untouched: R2 is about a bot's CLAIM, not about the operator's own hold."""
+    """D7 is untouched: R2 is about a bot's CLAIM, not about the operator's own hold.
+
+    t_7b226853 tightens the second half: the ops seat can no longer lift the operator's REAL
+    hold by handle either. The operator lifts it, or the lease runs out — that is the price
+    of "a hold is not voidable by the next caller that decides the work is done".
+    """
     _bot_armed_operator_hold(actor="operator")
 
     result = estop.release(owner="operator", actor="bot:ops-seat")
 
     assert result.forbidden is True and result.released is False
     assert estop.is_engaged() is True
-    # ...and it is still liftable BY HANDLE, which is the ops seat's path for it.
-    assert estop.release(handle=estop.holds()[0]["handle"], actor="bot:ops-seat").released is True
+    by_handle = estop.release(handle=estop.holds()[0]["handle"], actor="bot:ops-seat")
+    assert by_handle.forbidden is True and by_handle.released is False
+    assert estop.is_engaged() is True
+    # The operator's own release is the exit, and it needs no grant.
+    assert estop.release(handle=estop.holds()[0]["handle"],
+                         actor=estop.ACTOR_OPERATOR).released is True
 
 
 def test_resume_all_is_retired_as_a_recovery_path(hermes_home, capsys, monkeypatch):
@@ -333,15 +344,23 @@ def test_resume_all_lifts_only_a_pre_ruling_total_hold_and_logs_it(
 
 
 def test_every_release_form_records_a_cause(hermes_home):
-    """R3: `handle`, `owner` and `deadman` releases all leave a readable cause."""
+    """R3: `handle`, `owner` and `deadman` releases all leave a readable cause.
+
+    t_7b226853 changes WHO may take each form (the holder, not any venue), never the
+    vocabulary the ops seat reads back.
+    """
     by_handle = estop.arm(owner="ops-head", mode=estop.MODE_LOCKDOWN, ttl="45m", actor="bot:a",
                           allow={"profiles": ["platform-coder"]}).handle
-    assert estop.release(handle=by_handle, actor="bot:ops-seat").released is True
+    assert estop.release(handle=by_handle, actor="bot:a").released is True
+
+    # A stranger is refused, and the refusal is in the ledger too.
+    stranger = estop.arm(owner="wind-down", mode=estop.MODE_LOCKDOWN, ttl="45m", actor="bot:b",
+                         allow={"profiles": ["platform-coder"]}).handle
+    assert estop.release(handle=stranger, actor="bot:ops-seat").forbidden is True
+    assert [r for r in estop.read_events() if r.get("event") == "release_refused"]
 
     # D4: the OWNER is the actor that armed it — a claim like "wind-down" is recorded, not worn.
-    estop.arm(owner="wind-down", mode=estop.MODE_LOCKDOWN, ttl="45m", actor="bot:b",
-              allow={"profiles": ["platform-coder"]})
-    assert estop.release(owner="bot:b", actor="bot:ops-seat").released is True
+    assert estop.release(owner="bot:b", actor="bot:b").released is True
 
     estop.arm(owner="window-job", mode=estop.MODE_LOCKDOWN, ttl="1s", actor="bot:c",
               allow={"profiles": ["platform-coder"]})

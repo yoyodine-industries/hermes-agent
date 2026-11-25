@@ -161,6 +161,11 @@ def _print_history(limit: int, json_out: bool) -> int:
             parts.append(f"cause={row['cause']}")
         if row.get("via"):
             parts.append(f"via={row['via']}")
+        # t_7b226853: WHY the hold may not lift yet, and who else the arm let lift it.
+        if row.get("purpose_cards"):
+            parts.append(f"for={','.join(str(c) for c in row['purpose_cards'])}")
+        if row.get("release_grant"):
+            parts.append(f"may_lift={','.join(str(a) for a in row['release_grant'])}")
         print("  " + "  ".join(parts))
     return 0
 
@@ -251,9 +256,9 @@ def _stale_recommended_lanes(live: tuple[str, ...]) -> list[str]:
 def cmd_pause(args: argparse.Namespace) -> int:
     """Engage the global emergency stop (total, or lane-scoped with ``--lockdown``)."""
     from agent.estop import (
-        MODE_LOCKDOWN, EstopOrderRequired, EstopRefusal, EstopTotalHaltRetired, ORDER_ENV,
-        actor_handle, arm, get_state, is_engaged, ledger_path, parse_duration, record_event,
-        scoped_controls_help,
+        ANY_VENUE, MODE_LOCKDOWN, EstopOrderRequired, EstopRefusal, EstopTotalHaltRetired,
+        ORDER_ENV, actor_handle, arm, get_state, is_engaged, ledger_path, parse_duration,
+        record_event, scoped_controls_help,
     )
 
     if getattr(args, "history", False):
@@ -331,10 +336,19 @@ def cmd_pause(args: argparse.Namespace) -> int:
     json_out = bool(getattr(args, "json", False))
     actor = actor_handle()
     order = (getattr(args, "order", None) or os.environ.get(ORDER_ENV) or "").strip() or None
+    # Card t_7b226853: WHO ELSE may lift this hold, and WHAT it is for, are both decided HERE,
+    # at the arm, and signed onto the hold. A release cannot invent either afterwards.
+    release_grant = [str(item).strip() for item in (getattr(args, "release_by", None) or [])
+                     if str(item).strip()]
+    if getattr(args, "release_by_any_venue", False):
+        release_grant.append(ANY_VENUE)
+    purpose_cards = [str(item).strip() for item in (getattr(args, "purpose_card", None) or [])
+                     if str(item).strip()]
     already = is_engaged()
     try:
         outcome = arm(
             reason=reason, allow=allow, ttl=ttl, mode=mode, actor=actor, order=order,
+            purpose=purpose_cards or None, release_grant=release_grant or None,
             # A repeated `hermes pause` is idempotent for its OWN holder: it replaces the entry
             # recorded under this actor, never stacking a second hold for the same venue.
             replace_owner=True,
@@ -420,6 +434,8 @@ def cmd_pause(args: argparse.Namespace) -> int:
                 "order": outcome.order,
                 "verified": outcome.verified,
                 "ttl_s": outcome.ttl_s,
+                "purpose": list(outcome.purpose),
+                "release_grant": list(outcome.release_grant),
             },
             indent=2, sort_keys=True,
         ))
@@ -434,6 +450,11 @@ def cmd_pause(args: argparse.Namespace) -> int:
           f"`hermes resume --handle {outcome.handle}`)")
     deadline = f" until {state['expires_at']}" if state.get("expires_at") else " until released"
     print(f"    scope: hold {outcome.handle} lanes=[{', '.join(lanes)}]{deadline}")
+    if outcome.purpose:
+        print(f"    for: {', '.join(outcome.purpose)} — this hold will NOT lift while any of")
+        print("    them is non-terminal (the holder may still end it early with --purpose-met).")
+    if outcome.release_grant:
+        print(f"    may also be lifted by: {', '.join(outcome.release_grant)}")
     print("    those lanes keep working; every other lane's cards and cron jobs are HELD per")
     print("    item and recorded, never silently skipped. A board is NOT a key: an admitted lane")
     print("    spawns on any board, a held lane on none.")
@@ -508,7 +529,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        result = release(handle=handle, owner=owner, actor=actor, all_holds=lift_all)
+        result = release(handle=handle, owner=owner, actor=actor, all_holds=lift_all,
+                         purpose_met=bool(getattr(args, "purpose_met", False)))
     except EstopRefusal as exc:
         # The HOLD refused this venue (agent/estop.py::arm_admission) — same shape as the
         # pre-check above. The live hold stays in force: nothing was lifted.
@@ -522,6 +544,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
         if result.remaining:
             print(f"   Still held: {', '.join(sorted(result.remaining_owners))}")
         return 6
+    if result.purpose_unfinished:
+        # Card t_7b226853: the caller may well be the holder — the WORK the hold exists for is
+        # not finished. Exit 7 is distinct from forbidden (6): the remedy is "finish the card"
+        # or the holder's explicit --purpose-met, not "get a different venue".
+        print(f"⛔ {result.message}")
+        if result.remaining:
+            print(f"   Still held: {', '.join(sorted(result.remaining_owners))}")
+        return 7
     if result.stale:
         print(f"⛔ Release refused: {result.message}")
         print("   Nothing was released — a blind release would lift someone else's scope.")
@@ -544,6 +574,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 "actor": result.actor,
                 "unverified_cleared": result.unverified_cleared,
                 "remaining": sorted(result.remaining_owners),
+                "authority": result.authority,
+                "purpose_cards": list(result.purpose_cards),
             },
             indent=2, sort_keys=True,
         ))
@@ -592,6 +624,20 @@ def build_pause_parser(subparsers) -> None:
              "HERMES_ESTOP_ORDER). Without one such an arm is refused (rc=5): it would "
              "resurrect a stop the operator lifted, silently.")
     pause_parser.add_argument(
+        "--release-by", action="append", default=None, metavar="ACTOR",
+        help="Also allow ACTOR to lift THIS hold (repeatable — e.g. an ops-seat handle). "
+             "Recorded AND SIGNED at arm time: a release cannot grant itself the right to "
+             "lift a hold it did not arm.")
+    pause_parser.add_argument(
+        "--release-by-any-venue", action="store_true",
+        help="Record the pre-card behaviour on THIS hold: any admitted venue may lift it "
+             "(the ops-seat un-strand path). Off by default — a fleet hold is its holder's.")
+    pause_parser.add_argument(
+        "--purpose-card", action="append", default=None, metavar="CARD",
+        help="The card this hold EXISTS FOR (repeatable). A release refuses while it is "
+             "non-terminal (rc=7), so a window cannot be voided mid-landing. Card ids named "
+             "in --reason are picked up automatically.")
+    pause_parser.add_argument(
         "--history", action="store_true",
         help="Print the ESTOP hold history (the append-only ledger beside the sentinel) and "
              "exit. READ-ONLY — it neither arms nor lifts; it shows what was held, by whom, "
@@ -617,9 +663,15 @@ def build_pause_parser(subparsers) -> None:
             "executable by any admitted venue).")
     resume_parser.add_argument(
         "--handle", default=None, metavar="H",
-        help="Release exactly this hold (the value in `hermes pause --history`). Works from "
-             "any admitted venue, whatever name the hold wears. A stale handle is refused, "
-             "never silently ignored.")
+        help="Release exactly this hold (the value in `hermes pause --history`). Only its "
+             "HOLDER, the operator, or an actor the arm named in --release-by may lift it "
+             "(rc=6 otherwise); a card-scoped hold ALSO refuses while its card is "
+             "non-terminal (rc=7). A stale handle is refused, never silently ignored.")
+    resume_parser.add_argument(
+        "--purpose-met", action="store_true",
+        help="The HOLDER's assertion that the card(s) this hold exists for are finished "
+             "early. Required to lift a card-scoped hold while a card is still non-terminal; "
+             "refused for a caller that is not the hold's holder (or the operator).")
     resume_parser.add_argument(
         "--owner", default=None, metavar="OWNER",
         help="Release the holds owned by OWNER. Releasing a hold THE OPERATOR armed is "
