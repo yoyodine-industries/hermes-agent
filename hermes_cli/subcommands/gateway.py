@@ -229,6 +229,9 @@ def build_gateway_parser(
 
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
 
+    from hermes_cli.gateway_admission import add_admission_parser
+    add_admission_parser(gateway_subparsers)
+
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
     gateway_migrate_legacy = gateway_subparsers.add_parser(
