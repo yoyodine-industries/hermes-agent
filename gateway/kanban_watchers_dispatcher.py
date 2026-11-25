@@ -373,9 +373,17 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         interval = 60.0
     interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-    max_spawn = kanban_cfg.get("max_spawn")
-    if max_spawn is not None:
-        logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
+    # THE CEILING IS A HOST PROPERTY (card t_001338fa): the caps resolve from the
+    # ROOT config as the baseline, narrowed per key by the profile this gateway
+    # runs under, and never fall back to None (= unlimited) when that profile
+    # carries no ``kanban:`` block. A dispatcher booted as a lane seat therefore
+    # enforces the same ceiling as one booted as the root profile.
+    caps = _kbd().resolve_dispatch_caps(kanban_cfg)
+    max_spawn = caps["max_spawn"]
+    logger.info(
+        "kanban dispatcher: max_spawn=%s (host baseline max_spawn=%s, clamped_from_profile=%s)",
+        max_spawn, caps["host_baseline"]["max_spawn"], caps["clamped_to_host"] or "none",
+    )
 
     # Per-board overrides of the ceiling above (operator ask: skew bandwidth to
     # one board without a second host-wide dial). Parsed once at boot alongside
@@ -385,13 +393,14 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
     # out. Explicit config wins; otherwise a memory-derived default (unbounded
-    # fan-out swap-thrashes small hosts), or None where total memory can't be read.
-    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
-    effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
-    if max_in_progress is None and effective_max_in_progress is not None:
+    # fan-out swap-thrashes small hosts), or the fail-closed host floor where
+    # total memory can't be read — never None (card t_001338fa).
+    configured_max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
+    effective_max_in_progress = caps["max_in_progress"]
+    if configured_max_in_progress is None:
         logger.info(
-            "kanban dispatcher: kanban.max_in_progress unset; using "
-            "memory-derived default max_in_progress=%d "
+            "kanban dispatcher: kanban.max_in_progress unset for this caller; using "
+            "host-resolved max_in_progress=%d "
             "(set kanban.max_in_progress in config.yaml to override)",
             effective_max_in_progress,
         )
@@ -438,8 +447,9 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         reconcile_orphans=bool(kanban_cfg.get("reconcile_orphans", True)),
         default_assignee=default_assignee,
         # Per-profile concurrency cap: no single profile's local model / API
-        # quota / browser pool gets overwhelmed by a fan-out.
-        max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        # quota / browser pool gets overwhelmed by a fan-out. Host baseline,
+        # narrowed by this caller (card t_001338fa).
+        max_in_progress_per_profile=caps["max_in_progress_per_profile"],
         # Per-board overrides of max_spawn (slug -> ceiling); unnamed boards keep
         # max_spawn. Resolved per tick by max_spawn_for_board().
         max_spawn_by_board=max_spawn_by_board,
