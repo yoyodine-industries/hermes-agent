@@ -2901,6 +2901,24 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 PRIORITY_AGE_BONUS_STEP_SECONDS = 3600
 PRIORITY_AGE_BONUS_CAP = 6
 
+#: THE TIE-BREAK that resolves equal effective priority — ONE object, read by the query
+#: builder AND by the prints that DECLARE the order (ruling platform-stl 2026-11-08, item 2,
+#: recorded on t_ceb583fb; card t_a1890b04). ``sql`` is what goes into the ``ORDER BY``, so a
+#: printed declaration that reads this object cannot disagree with the order the dispatcher
+#: actually executes. A policy tie-break chosen later is entered HERE — ``sql`` + ``label`` +
+#: ``declared: True`` — and both the query and every print move together. Until then the
+#: tie-break is ``created_at ASC``: inherited from the query, never chosen by anyone.
+#:
+#: DO NOT edit this to change the order of live cards: re-ordering the reserved tranche is a
+#: ruling of its own. This object exists so the order in force is DECLARED, not so it is
+#: replaced (card t_a1890b04, "Do not change the ORDER BY in this card").
+PRIORITY_TIE_BREAK: dict[str, Any] = {
+    "sql": "created_at ASC",
+    "label": "OLDEST FIRST",
+    "declared": False,
+    "why": "undeclared by policy, inherited from the query",
+}
+
 
 def priority_age_bonus(created_at: Optional[float], *, now: Optional[float] = None) -> int:
     """Waiting-time credit for one card: ``floor(wait / STEP)`` clamped to ``[0, CAP]``."""
@@ -2921,6 +2939,30 @@ def effective_priority(
     return int(priority or 0) + priority_age_bonus(created_at, now=now)
 
 
+def _priority_effective_expr() -> str:
+    """The SQL head of the ordering key — ONE producer for the query and the label.
+
+    ``effective_priority_order_sql`` builds its ``ORDER BY`` from this, and
+    :func:`priority_order_declaration` builds the sentence it prints from the same
+    constants, so the two cannot describe different rules.
+    """
+    return (
+        f"(priority + MIN({int(PRIORITY_AGE_BONUS_CAP)}, "
+        f"MAX(0, CAST((? - created_at) / {int(PRIORITY_AGE_BONUS_STEP_SECONDS)} AS INTEGER))))"
+    )
+
+
+def _priority_effective_label() -> str:
+    """The human head of the ordering key, derived from the same constants as the SQL.
+
+    Prints as ``(priority + age bonus: +1/h, max 6)``; the step and the cap are READ, so a
+    change to either constant re-labels the line without anyone editing a sentence.
+    """
+    hours = int(PRIORITY_AGE_BONUS_STEP_SECONDS) // 3600
+    step = f"+1/{hours}h" if hours else f"+1/{int(PRIORITY_AGE_BONUS_STEP_SECONDS)}s"
+    return f"(priority + age bonus: {step}, max {int(PRIORITY_AGE_BONUS_CAP)})"
+
+
 def effective_priority_order_sql(now: Optional[float] = None) -> tuple[str, list[Any]]:
     """``(order_by_body, params)`` shared by EVERY ready/review order site.
 
@@ -2928,13 +2970,175 @@ def effective_priority_order_sql(now: Optional[float] = None) -> tuple[str, list
     :func:`list_tasks` both call this one helper so the two can never drift.
     ``now`` defaults to ``time.time()``; pass it explicitly for deterministic
     tests.
+
+    The tail of the clause is :data:`PRIORITY_TIE_BREAK`'s own ``sql``, never a literal:
+    :func:`priority_order_declaration` prints the same object, so the declaration and the
+    query cannot drift apart (card t_a1890b04).
     """
     at = time.time() if now is None else float(now)
-    expr = (
-        f"(priority + MIN({int(PRIORITY_AGE_BONUS_CAP)}, "
-        f"MAX(0, CAST((? - created_at) / {int(PRIORITY_AGE_BONUS_STEP_SECONDS)} AS INTEGER))))"
+    return f"{_priority_effective_expr()} DESC, {PRIORITY_TIE_BREAK['sql']}", [at]
+
+
+def priority_order_declaration() -> dict[str, Any]:
+    """THE ORDER IN FORCE, as data plus the sentence that declares it.
+
+    ``order_sql`` is exactly what :func:`effective_priority_order_sql` appends to a query;
+    ``line`` is what the dispatch output and every tranche listing print. Both are produced
+    here from ONE expression builder and ONE tie-break object, so a print can never claim an
+    order the query does not run — the defect the ruling names ("a clause no operator asked
+    for and no dry-run prints").
+    """
+    tie = PRIORITY_TIE_BREAK
+    qualifier = "" if tie.get("declared") else f" — {tie.get('why') or 'undeclared'}"
+    return {
+        "order_sql": f"{_priority_effective_expr()} DESC, {tie['sql']}",
+        "label": f"{_priority_effective_label()} DESC, {tie['sql']}",
+        "tie_sql": tie["sql"],
+        "tie_label": tie["label"],
+        "tie_declared": bool(tie.get("declared")),
+        "line": (
+            f"order={_priority_effective_label()} DESC, {tie['sql']} "
+            f"(tie-break: {tie['label']}{qualifier})"
+        ),
+    }
+
+
+def _dispatch_lane_priority_counts(conn: sqlite3.Connection) -> dict[int, int]:
+    """Cards in the DISPATCHER's own spawnable lane, counted per priority value.
+
+    The parenthetical in the tie-depth line used to count ``status = 'ready'`` only, while the
+    dispatcher's lane is ready **plus review when review dispatch is enabled**, unclaimed, and
+    assigned to a profile this host can spawn (``kanban_db_dispatch._spawnable_lane_rows``).
+    A review card the next tick WILL spawn was therefore printed as "0 ready" — the same
+    print-vs-query drift the declaration exists to prevent (platform-stl review round 1, item 1).
+
+    The dispatcher's own predicate is READ, never mirrored: a copy would be free to drift again.
+    Pure read; imported lazily because ``kanban_db_dispatch`` imports this module.
+    """
+    from hermes_cli import kanban_db_dispatch as dispatch
+
+    counts: dict[int, int] = {}
+    for row in dispatch.spawnable_rows(conn):
+        value = int(row["priority"] or 0)
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def tranche_tie_depth(conn: sqlite3.Connection) -> list[dict[str, int]]:
+    """Tie depth per reserved-tranche priority: how many cards share each value.
+
+    A tie of 2 and a tie of 173 are different operational facts and an order alone cannot
+    tell them apart (card t_a1890b04 requirement 2). Two populations are measured for every
+    value because they answer different questions:
+
+    * ``non_terminal`` — every card holding the rung that a worker could still run. This is
+      the depth a "why is my designated card not running" reader cares about;
+    * ``lane`` — the cards actually IN the dispatcher's spawnable lane, measured through
+      :func:`_dispatch_lane_priority_counts` (the dispatcher's own predicate: ready + review
+      when review dispatch is on, unclaimed, spawnable assignee). A value whose lane count is
+      0 is not losing a tie at all: nothing of it is waiting to be spawned, and the reason it
+      is not running is upstream of order (state, assignee, a hold, a disabled board).
+
+    A difference between the two is the finding, so both are printed rather than the sum.
+    """
+    from hermes_cli import kanban_priority_policy as policy
+
+    lo, hi = int(policy.TRANCHE_FLOOR), int(policy.TRANCHE_TOP)
+    rows = conn.execute(
+        "SELECT priority, "
+        "SUM(CASE WHEN status NOT IN ('done', 'archived') THEN 1 ELSE 0 END) AS non_terminal, "
+        "COUNT(*) AS total "
+        "FROM tasks WHERE priority BETWEEN ? AND ? GROUP BY priority ORDER BY priority DESC",
+        (lo, hi),
+    ).fetchall()
+    lane = _dispatch_lane_priority_counts(conn)
+    return [
+        {
+            "priority": int(r["priority"]),
+            "non_terminal": int(r["non_terminal"] or 0),
+            "lane": int(lane.get(int(r["priority"]), 0)),
+            "total": int(r["total"] or 0),
+        }
+        for r in rows
+        if int(r["non_terminal"] or 0) or lane.get(int(r["priority"]), 0)
+    ]
+
+
+def priority_in_tranche(value: Any) -> bool:
+    """True when ``value`` sits at or above the board's reserved-tranche floor.
+
+    The predicate a listing uses to decide whether it is showing ANY of the rung the order
+    declaration is about — an ordinary listing stays quiet, a tranche listing declares the
+    order in force (card t_a1890b04).
+    """
+    from hermes_cli import kanban_priority_policy as policy
+
+    try:
+        return int(value or 0) >= int(policy.TRANCHE_FLOOR)
+    except (TypeError, ValueError):
+        return False
+
+
+def listing_order_line(sort: Optional[str]) -> Optional[str]:
+    """The order a TRANCHE LISTING is actually sorted in when ``--sort`` overrides the default.
+
+    ``None`` when no override is in force: the listing then runs the dispatcher's own age-aware
+    order, already declared on line 1. With ``--sort`` it does NOT run that order, so printing
+    the dispatcher declaration alone would describe a query the list never executed — the
+    print-vs-query drift this card exists to end (platform-stl review round 1, item 2).
+
+    The SQL fragment is read from :data:`VALID_SORT_ORDERS`, the same mapping
+    :func:`list_tasks` appends to its query, so this line cannot name a different sort than the
+    one in force.
+    """
+    if sort is None:
+        return None
+    key = str(sort).strip().lower()
+    sql = VALID_SORT_ORDERS.get(key)
+    if sql is None:
+        return None
+    return (
+        f"Tranche listing order: --sort {key} = {sql} "
+        f"(this LISTING is not in the dispatcher's order declared above)"
     )
-    return f"{expr} DESC, created_at ASC", [at]
+
+
+def tranche_order_lines(
+    conn: sqlite3.Connection, *, listing_sort: Optional[str] = None
+) -> list[str]:
+    """The DECLARATION lines every tranche listing / dispatch summary prints.
+
+    Line 1 is the order in force and its tie-break, read from
+    :func:`priority_order_declaration` (never a literal). When the caller's listing overrides
+    that order with ``--sort``, :func:`listing_order_line` declares the sort actually in force
+    before the depth line. The last line is the tie depth per tranche value, with the
+    dispatcher's own spawnable share in parentheses.
+
+    Pure read, no writes, no model: the same rows produce the same lines wherever they are
+    printed, which is what lets a seat read either output and answer "why is my designated
+    card not running".
+    """
+    from hermes_cli import kanban_priority_policy as policy
+
+    lines = [f"Tranche order: {priority_order_declaration()['line']}"]
+    listing = listing_order_line(listing_sort)
+    if listing:
+        lines.append(listing)
+    depth = tranche_tie_depth(conn)
+    if not depth:
+        lines.append(
+            f"Tranche tie depth: no card sits in {int(policy.TRANCHE_FLOOR)}-"
+            f"{int(policy.TRANCHE_TOP)}"
+        )
+        return lines
+    parts = [
+        f"{row['priority']}: {row['non_terminal']} tied ({row['lane']} spawnable)"
+        for row in depth
+    ]
+    lines.append(
+        "Tranche tie depth (non-terminal; dispatcher-spawnable in parens): " + " · ".join(parts)
+    )
+    return lines
 
 
 VALID_SORT_ORDERS: dict[str, str] = {

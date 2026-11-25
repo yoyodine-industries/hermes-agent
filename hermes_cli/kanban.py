@@ -699,6 +699,21 @@ def _cmd_list(args: argparse.Namespace) -> int:
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
         )
+        # A listing that SHOWS the reserved tranche must DECLARE the order it is showing it in
+        # (ruling platform-stl 2026-11-08 item 2, card t_a1890b04). An ordinary listing stays
+        # quiet: the declaration is about a rung, not about every listing. `--sort` overrides
+        # the dispatcher's order, so the declaration carries the sort ACTUALLY in force too —
+        # otherwise it would describe a query the list did not run (review round 1, item 2).
+        if any(kb.priority_in_tranche(getattr(t, "priority", None)) for t in tasks):
+            order_lines = kb.tranche_order_lines(
+                conn, listing_sort=getattr(args, "sort", None)
+            )
+        else:
+            order_lines = []
+    # Machine readers: this array SHAPE is the `ls --json` contract, so the declaration rides
+    # `dispatch --json` (`tranche_order`) rather than a top-level key here — wrapping the array
+    # would break every existing consumer. Machine LISTINGS are out of scope by decision
+    # (platform-stl review round 1, item 3, card t_a1890b04).
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
@@ -713,6 +728,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
+    if order_lines:
+        for line in order_lines:
+            print(line)
+        print()
     for t in tasks:
         print(_fmt_task_line(t))
     return 0
