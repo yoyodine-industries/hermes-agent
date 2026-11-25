@@ -4647,6 +4647,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _release_live_run_handle(self, run_id: str) -> None:
         return _api_runs._release_live_run_handle(self, run_id)
 
+    def _retire_live_run(self, run_id: str) -> None:
+        """The adapter-surface alias of the run-control retire (used by the stalled-run reap)."""
+        return _api_runs._retire_live_run(self, run_id)
+
     def _run_has_live_handle(self, run_id: str) -> bool:
         """The fence predicate: does this process still hold executable work for the run?"""
         return _api_runs._run_has_live_handle(self, run_id)

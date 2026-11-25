@@ -27,6 +27,7 @@ except ImportError:
     RequestKey = None  # type: ignore[assignment,misc]
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response, room_run_claims
+from gateway.platforms.api_server_run_reap import reap_stalled_runs
 from gateway.turn_executor import _UnboundedThreadExecutor
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
@@ -1708,3 +1709,8 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     for run_id, status in list(self._run_statuses.items()):
         if status.get("status") not in TERMINAL_STATUSES:
             _fence_unheld_run_status(self, run_id, status)
+    # A slot held by a task that never returns is held BY DEFINITION: the fence above skips it
+    # because a handle exists, and nothing bounded how long that handle may sit (t_2fd3bc0b28:
+    # 16/16 held ~12h each while five runs were genuinely open, so every peer message 429'd).
+    # The bound is declared in ``api_server_run_reap`` and the reap is logged before/after.
+    reap_stalled_runs(self, now=now)
