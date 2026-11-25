@@ -699,6 +699,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
         )
+        # A listing that SHOWS the reserved tranche must DECLARE the order it is showing it in
+        # (ruling platform-stl 2026-11-08 item 2, card t_a1890b04). An ordinary listing stays
+        # quiet: the declaration is about a rung, not about every listing.
+        if any(kb.priority_in_tranche(getattr(t, "priority", None)) for t in tasks):
+            order_lines = kb.tranche_order_lines(conn)
+        else:
+            order_lines = []
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
@@ -713,6 +720,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
+    if order_lines:
+        for line in order_lines:
+            print(line)
+        print()
     for t in tasks:
         print(_fmt_task_line(t))
     return 0
