@@ -895,10 +895,21 @@ class AuthorityConnection:
         return asdict(await self.authority.receipt(self.actor, ref, admission_id))
 
     async def resolve_unknown(self, ref, params):
-        if set(params) != {'session_id', 'admission_id', 'execution_generation'}:
+        required = {'session_id', 'admission_id', 'execution_generation'}
+        if not required <= set(params) or set(params) - required - {'reason'}:
             raise RuntimeStoreError('invalid_params')
-        return asdict(await self.authority.resolve_unknown(
-            self.actor, ref, params['admission_id'], params['execution_generation']))
+        reason = params.get('reason')
+        if reason is not None and (not isinstance(reason, str) or not reason.strip() or len(reason) > 200):
+            raise RuntimeStoreError('invalid_params', field='reason',
+                                    detail='a retirement reason is required, at most 200 characters')
+        receipt = await self.authority.resolve_unknown(
+            self.actor, ref, params['admission_id'], params['execution_generation'])
+        if reason:
+            # The operator's own words, which the board and the owner log can both read back:
+            # a retirement is evidence, not a silent deletion.
+            logger.warning('Operator retired admission %s on session %s: %s',
+                           receipt.admission_id, ref.session_id, reason.strip())
+        return asdict(receipt)
 
     async def interrupt(self, ref, params):
         from gateway.session_managed_worker import interrupt_managed

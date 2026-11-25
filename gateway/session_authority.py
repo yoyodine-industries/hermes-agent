@@ -1518,6 +1518,10 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
     from gateway.session_unattended_unknown import settle_recovered_unattended
     await asyncio.to_thread(settle_recovered_unattended, db, epoch)
+    # What is left non-terminal belongs to a dead generation (a person's lost turn, or a claim
+    # whose turn died): it would pause its session's FIFO forever, so boot retires it interrupted.
+    from gateway.session_stale_admissions import retire_stale_admissions_at_boot
+    await asyncio.to_thread(retire_stale_admissions_at_boot, db, epoch)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     await asyncio.to_thread(backfill_compression_created_sources, db)
     from gateway.session_local_recovery import release_handed_off_receipts

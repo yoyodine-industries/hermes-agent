@@ -5656,10 +5656,19 @@ def _cmd_migrate(args):
     cmd_migrate(args)
 
 
+def _cmd_admission(args):
+    from hermes_cli.gateway_admission import cmd_admission
+    code = cmd_admission(args)
+    if code:
+        # ``_gateway_command_inner`` drops a handler's return value; a refusal must be the exit code.
+        raise SystemExit(code)
+
+
 _GATEWAY_SUBCOMMANDS = {
     None: _cmd_run, "run": _cmd_run, "setup": _cmd_setup, "install": _cmd_install,
     "uninstall": _cmd_uninstall, "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart,
     "status": _cmd_status, "list": _cmd_list, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
+    "admission": _cmd_admission,
 }
 
 

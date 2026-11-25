@@ -66,9 +66,13 @@ canonical_method("prompt.cancel", params=PromptCancelParams, result=AdmissionSta
 
 
 class PromptResolveUnknownParams(Params):
+    """``reason`` is the operator's own words for a retirement (``hermes gateway admission
+    retire``): it is recorded in the owner log beside the row it cleared, never on the wire back."""
+
     session_id: str
     admission_id: str
     execution_generation: int
+    reason: str | None = None
 
 
 canonical_method("prompt.resolve_unknown", params=PromptResolveUnknownParams, result=AdmissionStatus,

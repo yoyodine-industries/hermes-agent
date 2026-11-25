@@ -4,6 +4,8 @@ No execution, transport, or authority objects live here. Every mutation uses the
 SessionDB transaction owner, including its inode guard and SQLite retry policy.
 """
 import json
+import logging
+import time
 import uuid
 from typing import NamedTuple, Optional
 
@@ -12,6 +14,8 @@ from agent.message_metadata import (
     CANONICAL_ROW, DATA_USE, DB_ROW_SNAPSHOT, MESSAGE_UID, PERSISTENCE_ONLY_MESSAGE_FIELDS, TOOL_CALL_UID, TOOL_CALL_UIDS,
 )
 from hermes_state_keys import admission_fingerprint
+
+logger = logging.getLogger(__name__)
 
 
 class SessionGoneEvent(NamedTuple):
@@ -46,6 +50,31 @@ def _one_line(value, limit):
         return None
     text = ''.join(ch for ch in ' '.join(str(value).split()) if ch.isprintable())
     return text[:limit] or None
+
+
+def _named_ids(ids, limit=160):
+    """A refusal's ``field``/``detail`` naming the rows that block a session.
+
+    The blocking admission is an id an operator has to type into
+    ``hermes gateway admission retire --id`` — the bare reason code left them guessing which
+    row, and a stale one can be days old. Bounded to the ``detail`` budget: whole ids, then a
+    count of the rest, never a truncated id.
+    """
+    ids = [text for text in ids if isinstance(text, str) and text]
+    if not ids:
+        return None
+    shown, used = [], 0
+    for admission_id in ids:
+        cost = len(admission_id) + (1 if shown else 0)
+        reserve = len(f' (+{len(ids) - len(shown)} more)')
+        if shown and used + cost + reserve > limit:
+            break
+        shown.append(admission_id)
+        used += cost
+    text = ','.join(shown)
+    if len(shown) < len(ids):
+        text += f' (+{len(ids) - len(shown)} more)'
+    return text
 
 
 def _text(value):
@@ -111,6 +140,81 @@ def _row(row):
     result.pop('lineage_json')
     result.pop('retired_at', None)  # tombstone retention stamp, not admission state
     return result
+
+
+def _live_turn_lease(db, conn, session_id):
+    """The live turn lease on this session's conversation, as a refusal ``detail``; None when none.
+
+    ``session_turn_leases`` is the only proof a turn is still being driven across processes: the
+    holder names the pid, and ``expires_at`` moves as the turn renews. A ``started`` admission with
+    a live lease behind it is a turn in flight and must not be retired; one without is a fossil.
+    """
+    key_fn = getattr(db, '_session_turn_lease_key_on_conn', None)
+    if key_fn is None:
+        return None
+    key = key_fn(conn, session_id)
+    row = conn.execute('SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id=?',
+                       (key,)).fetchone()
+    if row is None:
+        return None
+    remaining = float(row['expires_at']) - time.time()
+    if remaining <= 0:
+        return None
+    holder = row['holder'] or ''
+    pid = None
+    for part in holder.split(':'):
+        if part.startswith('pid='):
+            pid = part[4:]
+            break
+    who = f'pid {pid}' if pid else (holder[:60] or 'an unnamed process')
+    return f'live turn lease held by {who}, {int(remaining)}s left'
+
+
+def retire_stale_admissions(db, *, epoch: int, reason: str = 'boot', _terminal_write=None):
+    """Boot recovery: retire NON-TERMINAL admissions stamped by a DEAD runtime generation.
+
+    The epoch advances once per owner start, so a row whose ``owner_epoch`` is another epoch is
+    owned by a process that no longer exists: its turn can never settle. Such a row — ``started``
+    or ``unknown`` — makes ``claim_session_input`` refuse its session forever, and neither
+    ``settle_session_input`` nor ``cancel_session_input`` can reach it (the one requires the old
+    generation and epoch, the other refuses ``started`` outright). Retiring it ``interrupted`` —
+    the shape a settled interrupted turn has — restores the FIFO; the input is never replayed.
+
+    ``_terminal_write(conn, row)`` is the owner's same-transaction transcript boundary, exactly as
+    ``resolve_unknown_session_input`` takes it. The whole sweep is ONE transaction, so a failure
+    never leaves a session half-repaired, and every retirement is logged with its session,
+    admission id, owner epoch and generation: the recovery is evidence, not a silent deletion.
+    Terminal rows are never touched — history is not rewritten.
+    """
+    def write(conn):
+        _epoch(conn, epoch)
+        rows = conn.execute(
+            "SELECT * FROM session_admissions WHERE status IN ('started','unknown') "
+            "AND (owner_epoch IS NULL OR owner_epoch != ?) ORDER BY seq", (epoch,)).fetchall()
+        retired = []
+        for row in rows:
+            if _terminal_write is not None:
+                _terminal_write(conn, row)
+            changed = conn.execute(
+                "UPDATE session_admissions SET status='terminal',outcome='interrupted' "
+                "WHERE admission_id=? AND status IN ('started','unknown')",
+                (row['admission_id'],)).rowcount
+            if not changed:  # settled by the live owner between the read and the write: leave it
+                continue
+            _retire_admission_workers(conn, row, row['owner_epoch'])
+            conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?',
+                         (row['target_session_id'],))
+            retired.append({'admission_id': row['admission_id'], 'session_id': row['target_session_id'],
+                            'owner_epoch': row['owner_epoch'], 'generation': row['generation'],
+                            'status': row['status']})
+        return retired
+    retired = db._execute_write(write)
+    for entry in retired:  # after the commit: a rolled-back sweep logs nothing
+        logger.info('Retired stale admission %s session=%s owner_epoch=%s generation=%s reason=%s '
+                    'outcome=interrupted (owner generation gone; input not replayed)',
+                    entry['admission_id'], entry['session_id'], entry['owner_epoch'],
+                    entry['generation'], reason)
+    return retired
 
 
 def begin_runtime_epoch(db, *, instance_id: str) -> int:
@@ -214,13 +318,21 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         if _guard is not None:
             _guard(conn)
         session = _session(conn, session_id)
-        blocked = conn.execute("SELECT status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (session_id,)).fetchall()
-        if any(row[0] == 'unknown' for row in blocked):
-            raise RuntimeStoreError('unknown_execution')
-        from hermes_state_runtime_workers import worker_states
+        blocked = conn.execute("SELECT admission_id, status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown') ORDER BY seq", (session_id,)).fetchall()
+        unknown_ids = [row[0] for row in blocked if row[1] == 'unknown']
+        if unknown_ids:
+            # Name the rows: the session is paused by an admission id an operator clears with
+            # ``hermes gateway admission retire --id``. A bare ``unknown_execution`` made the
+            # blocked session indistinguishable from a bug.
+            raise RuntimeStoreError('unknown_execution', field='admission_id', detail=_named_ids(unknown_ids))
+        from hermes_state_runtime_workers import runtime_lineage, worker_states
         workers = worker_states(conn, session_id)
         if 'unknown' in workers:
-            raise RuntimeStoreError('unknown_execution')
+            worker_ids = [row[0] for row in conn.execute(
+                "SELECT DISTINCT execution_id FROM worker_executions WHERE session_id IN "
+                "(SELECT value FROM json_each(?)) AND status='unknown' ORDER BY execution_id",
+                (json.dumps(sorted(runtime_lineage(conn, session_id))),)).fetchall()]
+            raise RuntimeStoreError('unknown_execution', field='execution_id', detail=_named_ids(worker_ids))
         if blocked or workers:
             return None
         row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' ORDER BY seq LIMIT 1", (session_id,)).fetchone()
@@ -672,7 +784,18 @@ def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generati
                 and (row['outcome'] == 'interrupted' or conn.execute(
                     'SELECT 1 FROM state_meta WHERE key=?', (RESULT_PREFIX + admission_id,)).fetchone())):
             return _row(row)
-        if type(generation) is not int or row['status'] != 'unknown' or row['generation'] != generation:
+        if row['status'] == 'started' and row['owner_epoch'] == epoch:
+            # A ``started`` row stamped by THIS epoch may still be a turn in flight. The turn lease
+            # is the proof: while one is live the row is not retirable, and the refusal names it.
+            # With no live lease the turn died inside this generation, and the row is a fossil.
+            lease = _live_turn_lease(db, conn, row['target_session_id'])
+            if lease is not None:
+                raise RuntimeStoreError('admission_running', field='lease', detail=lease)
+        elif row['status'] not in ('unknown', 'started'):
+            raise RuntimeStoreError('stale_generation')
+        # A ``started`` row from ANOTHER epoch is owned by a process generation that no longer
+        # exists: it can never settle, so an operator acknowledgement retires it like an ``unknown``.
+        if type(generation) is not int or row['generation'] != generation:
             raise RuntimeStoreError('stale_generation')
         outcome = 'interrupted'
         if _captured is not None and row['owner_epoch'] == epoch:

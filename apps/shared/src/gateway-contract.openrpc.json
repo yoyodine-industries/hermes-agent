@@ -32270,6 +32270,7 @@
       },
       "PromptResolveUnknownParams": {
         "additionalProperties": false,
+        "description": "``reason`` is the operator's own words for a retirement (``hermes gateway admission\nretire``): it is recorded in the owner log beside the row it cleared, never on the wire back.",
         "properties": {
           "session_id": {
             "title": "Session Id",
@@ -32282,6 +32283,18 @@
           "execution_generation": {
             "title": "Execution Generation",
             "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
           }
         },
         "required": [
