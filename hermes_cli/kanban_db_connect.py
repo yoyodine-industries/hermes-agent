@@ -907,6 +907,12 @@ _LATER_TASK_COLUMNS = (
     ("due_window_policy", "due_window_policy TEXT"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Dispatch-surface contract, Rules 2 + 3 (hermes_cli/kanban_filing_dedupe.py). The two
+    # identities a repeat filing is matched on, and the count of filings this row stands
+    # for. NULL keys on a legacy row mean "not a dedupe target", never "match everything".
+    ("dedupe_key", "dedupe_key TEXT"),
+    ("body_key", "body_key TEXT"),
+    ("occurrences", "occurrences INTEGER NOT NULL DEFAULT 1"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -975,6 +981,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # Partial: only fenced cards are ever selected by due time, so the human holds
     # (due_at IS NULL, the majority) cost a row in no index.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_at) WHERE due_at IS NOT NULL")
+    # Rule 2's lookup is by key against OPEN rows; a partial index keeps the birth path
+    # from scanning a 10k-row board on every filing.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_dedupe ON tasks(dedupe_key) "
+        "WHERE dedupe_key IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_body_key ON tasks(body_key) "
+        "WHERE body_key IS NOT NULL"
+    )
 
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).
