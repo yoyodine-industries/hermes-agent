@@ -899,6 +899,12 @@ _LATER_TASK_COLUMNS = (
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
+    # Harness-loss attempts: runs the HARNESS lost (busy store, lost receipt, unreachable
+    # owner, admission never settled, substrate import) -- never the card's work. Bounded on
+    # its own counter (SURVIVAL_ATTEMPT_LIMIT) so the card is parked ``blocked`` with the loss
+    # class named, never ``gave_up`` for being unlucky. Reset with consecutive_failures on a
+    # completed run: a card that proves its work starts clean.
+    ("survival_failures", "survival_failures INTEGER NOT NULL DEFAULT 0"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Clock fence for a parked card (absolute epoch seconds). NULL = parked with
     # no clock -- the human hold -- which is never auto-released.

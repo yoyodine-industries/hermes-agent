@@ -28,7 +28,7 @@ from hermes_cli.kanban_filing_policy import is_refusal as kb_is_filing_refusal
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, BOARD_PIN_REMEDY, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
-    _task_to_dict,
+    _task_to_dict, fmt_loss_line,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
@@ -856,6 +856,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+            loss_line = fmt_loss_line(r, prefix="        ")
+            if loss_line:
+                print(loss_line)
     return 0
 
 
@@ -1846,6 +1849,11 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             print(f"     → {r.summary.splitlines()[0][:100]}")
         if r.error:
             print(f"     ✖ {r.error[:100]}")
+        loss_line = fmt_loss_line(r, prefix="     ")
+        if loss_line:
+            # The harness lost the process: say so plainly, so this row is never read as the
+            # card's work being judged (or as "review requested changes").
+            print(loss_line)
     return 0
 
 

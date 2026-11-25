@@ -29,6 +29,23 @@ _MAX_QUIET_NOTIFY_ROUNDS = 8
 # (and a 75 as the same rate-limit requeue) whichever process notices the death.
 KANBAN_WORKER_EXIT_TRAILER = "[kanban-worker-exit] rc="
 
+# WHY the harness ended the turn, in the worker's OWN words, next to the exit trailer. The
+# board must be able to say "the harness lost the process -- the work was not judged" instead
+# of inferring a cause from an exit code: ``rc=76`` covers a busy store, a lost receipt and an
+# unreachable owner, and each is a different operator action. Vocabulary (one, shared with the
+# other harness-loss readers): ``receipt_timeout`` / ``storage_unclassified`` / ``storage_locked``
+# / ``owner_admission_unavailable`` / ``worker_vanished`` / ``killed`` / ``spawn_failed``.
+KANBAN_WORKER_LOSS_CLASS_TRAILER = "[kanban-worker-loss-class] "
+
+
+def record_worker_loss_class(loss_class: str) -> None:
+    """Stamp the worker's own cause line into its log; a no-op outside a Kanban worker."""
+    if not os.environ.get("HERMES_KANBAN_TASK") or not loss_class:
+        return
+    with contextlib.suppress(Exception):
+        # stderr: stdout may be the ``--stream-json`` record stream, as for the exit trailer.
+        print(f"\n{KANBAN_WORKER_LOSS_CLASS_TRAILER}{loss_class}", file=sys.stderr, flush=True)
+
 
 def exit_single_query(code: int) -> None:
     """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log."""

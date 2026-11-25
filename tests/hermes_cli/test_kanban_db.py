@@ -496,9 +496,11 @@ def test_storage_locked_exit_requeues_without_counting_failure(
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="sl", assignee="a")
 
-        # FAR more lock-stops than DEFAULT_FAILURE_LIMIT (2): if any counted, the
-        # card would be blocked/given up well before the loop ends.
-        for i in range(6):
+        # More lock-stops than DEFAULT_FAILURE_LIMIT (2): if any counted, the card would be
+        # given up well before the loop ends. Five is one under SURVIVAL_ATTEMPT_LIMIT (6):
+        # the survival bound is exercised by its own test below, because at six the card is
+        # PARKED BLOCKED (with the loss class named) -- never given up on the work.
+        for i in range(5):
             pid = 72000 + i
             kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
             conn.execute(
@@ -524,6 +526,9 @@ def test_storage_locked_exit_requeues_without_counting_failure(
                 f"hit {i}: a lock-stop must not count a failure, "
                 f"got {task.consecutive_failures}"
             )
+            assert conn.execute(
+                "SELECT survival_failures FROM tasks WHERE id=?", (tid,)
+            ).fetchone()[0] == i + 1, f"hit {i}: the SURVIVAL budget must count it"
 
         # The stamped notice is what the respawn guard reads, and it must be free of
         # every blocker_auth word: the guard has to see the OUTCOME, not the prose.
