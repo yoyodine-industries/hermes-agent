@@ -157,6 +157,13 @@ _TRANSIENT_STORAGE_REASONS = frozenset({
     "session_persistence_failed:compression",         # compaction held the store/lease
     "session_persistence_failed:compression_closed",  # lease rotated; a fresh turn re-acquires
     "session_persistence_failed:turn_lease",          # a peer took the session; a fresh turn wins it
+    # Owner-side receipt loss (2026-11-25): the write's receipt never came back from the
+    # runtime that owns the session store (``worker_receipt_timeout``), or that owner was
+    # unreachable altogether (``owner_unavailable`` -- gateway discovery not ``ready``).
+    # Nothing of the card was judged; the content is retained in the worker outbox and a
+    # fresh turn re-attaches to a healthy owner. Named individually, per the rule above.
+    "session_persistence_failed:receipt_timeout",
+    "session_persistence_failed:owner_unavailable",
 })
 
 

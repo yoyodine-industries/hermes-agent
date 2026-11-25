@@ -91,21 +91,16 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
 # Cooldown after a storage-locked (state-store contention) requeue before
-# re-spawning. Default 0 is DELIBERATE and is the contract's "immediately": the
-# reclaim pass already re-queued the card on this tick and the dispatcher's own
-# 60 s cadence is the spacing, so nothing is consumed and there is no hot loop.
-# The env override (``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS``) exists for
-# tests and for an operator who wants wider spacing around a known maintenance
-# window.
-#
-# Landed on the reconciled line (card t_3286715e) because committed
-# ``hermes_cli/kanban_db.py`` imports this name (config default for
-# ``_resolve_storage_locked_cooldown_seconds``) while the constant itself lived
-# only in the live install's UNCOMMITTED dispatch file: a fresh clone of either
-# line could not import ``hermes_cli.kanban_db`` at all. The consumer half of
-# the feature (the storage-locked plumbing in the dispatcher) is still owed by
-# its own card, t_ccfb92a1 -- this constant alone changes no behaviour.
-DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS = 0
+# re-spawning. The run booked against the card did not judge the card's work, so the retry
+# must not land inside the same contention: 120 s (with a deterministic per-task +-30 s
+# jitter, ``_resolve_storage_locked_cooldown_seconds``) is wide enough to outlast a
+# compaction/checkpoint burst, while staying inside one dispatcher cadence band.
+# Overridable via ``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS`` (0 = next tick, for
+# tests), which applies verbatim with NO jitter so a caller that names a number gets it.
+DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS = 120
+# Half-width of the deterministic per-task jitter (never a random source: every reader of the
+# same card must compute the same deadline, or the guard would oscillate tick to tick).
+STORAGE_LOCKED_COOLDOWN_JITTER_SECONDS = 30
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -3819,11 +3814,11 @@ def check_respawn_guard(
     #     stamped text is infrastructure prose, so ``blocker_auth`` must not see it:
     #     the card is spaced by this cooldown and never consumes its give-up budget.
     if latest_run is not None and latest_run["outcome"] == "storage_locked":
-        sl_cooldown = _kb._resolve_storage_locked_cooldown_seconds()
+        sl_cooldown = _kb._resolve_storage_locked_cooldown_seconds(task_id)
         if sl_cooldown <= 0:
-            # Default 0: respawn immediately (the reclaim pass already spaced it by
-            # a tick and the dispatcher's own cadence is the interval), skipping
-            # blocker_auth so the stamped storage-lock line cannot re-trap the card.
+            # Operator/test override of 0: respawn immediately (the reclaim pass already
+            # spaced it by a tick), skipping blocker_auth so the stamped storage-lock line
+            # cannot re-trap the card.
             return None
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < sl_cooldown:
