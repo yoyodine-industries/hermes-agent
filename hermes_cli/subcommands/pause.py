@@ -248,6 +248,50 @@ def _stale_recommended_lanes(live: tuple[str, ...]) -> list[str]:
     return [name for name in RECOMMENDED_LANES if name not in live]
 
 
+def _renew(handle: str, ttl, budget, json_out: bool) -> int:
+    """``hermes pause --renew <handle>`` — push a LIVE hold's lease forward (D2).
+
+    The one verb that keeps an armed section alive: a run-owned hold is a lease, and a live
+    section renews while a dead one cannot, so *expiry means owner-dead within one lease
+    period*. It never arms and never lifts: rc=3 when the hold layer refuses the venue or the
+    handle names no live hold, rc=4 when the renewal could not be written.
+    """
+    from agent.estop import EstopRefusal, renew
+
+    try:
+        outcome = renew(handle, ttl=ttl, budget=budget)
+    except EstopRefusal as exc:
+        print(f"⛔ {exc}")
+        return 3
+    except OSError as exc:
+        print(f"⛔ The renewal could NOT be recorded: {exc}")
+        return 4
+    if json_out:
+        print(json.dumps(
+            {
+                "handle": outcome.handle,
+                "renewed": outcome.renewed,
+                "stale": outcome.stale,
+                "expires_at": outcome.expires_at,
+                "ttl_s": outcome.ttl_s,
+                "owner_run": outcome.owner_run,
+                "actor": outcome.actor,
+                "ledger": outcome.ledger,
+            },
+            indent=2, sort_keys=True,
+        ))
+        return 0
+    if outcome.stale:
+        print(f"⛔ {outcome.message}")
+        return 3
+    print(f"⏱️  {outcome.message}")
+    if outcome.owner_run:
+        print(f"    owner run: {outcome.owner_run}")
+    if not outcome.ledger:
+        print("    ⚠ the ledger could not be written — this renewal is NOT recorded")
+    return 0
+
+
 def cmd_pause(args: argparse.Namespace) -> int:
     """Engage the global emergency stop (total, or lane-scoped with ``--lockdown``)."""
     from agent.estop import (
@@ -261,6 +305,13 @@ def cmd_pause(args: argparse.Namespace) -> int:
         # may read the record of the hold that is in force.
         return _print_history(int(getattr(args, "history_limit", 20) or 0),
                               bool(getattr(args, "json", False)))
+
+    if getattr(args, "renew", None):
+        # D2 — RENEWAL is the liveness proof of a run-owned hold: it pushes the lease forward
+        # and records it, and it armed or lifted nothing. Handled before the arm fence so the
+        # HOLD layer answers (with rc=3 either way), exactly as it does for arm/lift.
+        return _renew(args.renew, getattr(args, "ttl", None),
+                      getattr(args, "budget", None), bool(getattr(args, "json", False)))
 
     lanes = list(getattr(args, "allow_profile", None) or [])
     lockdown = bool(getattr(args, "lockdown", False))
@@ -326,6 +377,7 @@ def cmd_pause(args: argparse.Namespace) -> int:
     allow = {
         "user_ids": list(getattr(args, "allow_user", None) or []),
         "profiles": lanes,
+        "jobs": list(getattr(args, "allow_job", None) or []),
     }
     mode = MODE_LOCKDOWN
     json_out = bool(getattr(args, "json", False))
@@ -335,6 +387,7 @@ def cmd_pause(args: argparse.Namespace) -> int:
     try:
         outcome = arm(
             reason=reason, allow=allow, ttl=ttl, mode=mode, actor=actor, order=order,
+            budget=getattr(args, "budget", None),
             # A repeated `hermes pause` is idempotent for its OWN holder: it replaces the entry
             # recorded under this actor, never stacking a second hold for the same venue.
             replace_owner=True,
@@ -445,7 +498,9 @@ def cmd_pause(args: argparse.Namespace) -> int:
     if allowed.get("user_ids"):
         print(f"    allowlist (turns): {', '.join(allowed['user_ids'])} — served through the pause")
     if state.get("expires_at"):
-        print(f"    deadman: auto-resumes at {state['expires_at']} (--ttl {ttl})")
+        bound = f"--ttl {ttl}" if ttl else (
+            f"--budget {getattr(args, 'budget', None) or '30m'} (default lease)")
+        print(f"    deadman: auto-resumes at {state['expires_at']} ({bound})")
     print("    In-flight work keeps running. `hermes resume` releases YOUR hold only.")
     return 0
 
@@ -580,12 +635,29 @@ def build_pause_parser(subparsers) -> None:
         help="Lane admitted through --lockdown (repeatable; validated against the live "
              "profile roster) — the lanes that keep working while every other lane is held")
     pause_parser.add_argument(
+        "--allow-job", action="append", default=None, metavar="JOB",
+        help="Cron job (id or name) admitted through --lockdown (repeatable) — the JOB-level "
+             "exemption, so a window never holds its own release leg. The engine ALSO reserves "
+             "the release carriers (deploy-train, hermes-update) structurally, so this is "
+             "belt-and-braces rather than the only guard.")
+    pause_parser.add_argument(
         "--allow-user", action="append", default=None, metavar="ID",
         help="Authenticated user id served through the pause (repeatable) — normally the operator's")
     pause_parser.add_argument(
         "--ttl", default=None, metavar="DUR",
         help="Deadman: auto-lift THIS hold after this long (e.g. 45m, 90m, 2h, or seconds). "
-            "Bounds a window job that dies between arm and release.")
+            "Bounds a window job that dies between arm and release. With no --ttl the "
+            "section's --budget applies, so a hold always carries a deadline.")
+    pause_parser.add_argument(
+        "--budget", default=None, metavar="DUR",
+        help="The SECTION's declared budget: the lease applied when --ttl is not given "
+             "(default 30m). A run-owned hold is a lease — never unbounded.")
+    pause_parser.add_argument(
+        "--renew", default=None, metavar="HANDLE",
+        help="Push the lease of this LIVE hold forward and record the renewal. Renewal is "
+             "the liveness proof of a run-owned hold: a live section renews, a dead one "
+             "cannot, so expiry means owner-dead within one lease period. Arms/lifts nothing; "
+             "a handle naming no live hold is refused (rc=3).")
     pause_parser.add_argument(
         "--order", default=None, metavar="TEXT",
         help="The authority for a re-arm that lands AFTER the operator's resume (also "
