@@ -289,17 +289,16 @@ def test_cli_text_output_names_the_board_whose_ceiling_exceeds_the_cap(
 ):
     from hermes_cli import config as hermes_config
 
-    monkeypatch.setattr(
-        hermes_config,
-        "load_config",
-        lambda *a, **kw: {
-            "kanban": {
-                "max_spawn": 8,
-                "max_in_progress": 8,
-                "max_spawn_by_board": {kb.DEFAULT_BOARD: 12},
-            }
-        },
-    )
+    # A ROOT invocation: the profile block IS the host block, and the per-board
+    # ceiling above ``max_in_progress`` is the host's own decision (a lane seat
+    # could not raise it — see test_kanban_host_cap_resolution.py).
+    host_block = {
+        "max_spawn": 8,
+        "max_in_progress": 8,
+        "max_spawn_by_board": {kb.DEFAULT_BOARD: 12},
+    }
+    monkeypatch.setattr(hermes_config, "load_config", lambda *a, **kw: {"kanban": dict(host_block)})
+    monkeypatch.setattr(kbd, "host_kanban_config", lambda: dict(host_block))
 
     kanban_ops._cmd_dispatch(_dispatch_args(json=False))
     out = capsys.readouterr().out

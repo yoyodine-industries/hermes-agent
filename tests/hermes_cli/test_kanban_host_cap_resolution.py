@@ -142,6 +142,55 @@ def test_host_can_explicitly_delegate_the_raise(kanban_home_with_profiles):
 
 
 # ---------------------------------------------------------------------------
+# (d) per-board ceilings are the SAME host property, narrow-only per board key
+# ---------------------------------------------------------------------------
+
+def test_profile_cannot_raise_a_boards_host_ceiling(kanban_home_with_profiles):
+    """Host ``{platform: 8}`` + lane ``{platform: 5000}`` -> 8, and the clamp is named.
+
+    The remaining caller-owned arm: the gateway parsed ``max_spawn_by_board``
+    from the ACTIVE profile and applied it verbatim, so a lane seat could lift a
+    single board above the host's ceiling. A board ceiling is now resolved from
+    the HOST block with the same narrow-only rule as ``max_spawn``.
+    """
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    caps = kbd.resolve_dispatch_caps(
+        {"max_spawn_by_board": {"platform": 5000}},
+        host_kanban_cfg={"max_spawn": 8, "max_spawn_by_board": {"platform": 8}},
+    )
+    assert caps["max_spawn_by_board"]["platform"] == 8
+    assert "max_spawn_by_board.platform" in caps["clamped_to_host"]
+    assert caps["host_baseline"]["max_spawn_by_board"] == {"platform": 8}
+
+
+def test_profile_can_narrow_a_boards_host_ceiling(kanban_home_with_profiles):
+    """The same resolver lets the lane take LESS of one board's ceiling."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    caps = kbd.resolve_dispatch_caps(
+        {"max_spawn_by_board": {"platform": 2}},
+        host_kanban_cfg={"max_spawn": 8, "max_spawn_by_board": {"platform": 8}},
+    )
+    assert caps["max_spawn_by_board"] == {"platform": 2}
+    assert caps["clamped_to_host"] == []
+
+
+def test_unnamed_board_cannot_be_raised_by_a_profile(kanban_home_with_profiles):
+    """A board the host does not name inherits the host ``max_spawn``; a profile
+    entry above that number is a raise and is refused by name."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    caps = kbd.resolve_dispatch_caps(
+        {"max_spawn_by_board": {"platform": 5000}},
+        host_kanban_cfg={"max_spawn": 8},
+    )
+    # Absent from the map == the gateway's fallback arm == the host max_spawn.
+    assert "platform" not in caps["max_spawn_by_board"]
+    assert "max_spawn_by_board.platform" in caps["clamped_to_host"]
+
+
+# ---------------------------------------------------------------------------
 # the ONLY difference is WHICH PROFILE INVOKED IT -> the plan is the same bound
 # ---------------------------------------------------------------------------
 
@@ -282,6 +331,76 @@ def test_gateway_dispatcher_settings_are_host_bounded(kanban_home_with_profiles,
     empty = kwd._resolve_dispatcher_settings({}, kb)
     assert empty.max_spawn == 8
     assert empty.max_in_progress == 8
+
+
+def test_gateway_per_board_ceiling_is_host_bounded_for_a_lane_seat(
+    kanban_home_with_profiles, monkeypatch,
+):
+    """A lane seat cannot lift ONE board above the host's ceiling either.
+
+    The gateway used to parse ``kanban.max_spawn_by_board`` from the ACTIVE
+    profile's block and apply it verbatim, so ``{"platform": 5000}`` in a lane's
+    config replaced the host-resolved ceiling for that board. The per-board map
+    now resolves from the HOST block with the same narrow-only rule.
+    """
+    from gateway import kanban_watchers_dispatcher as kwd
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    kb.init_db()
+    kb.create_board("platform")  # the gateway validates slugs against its inventory
+    monkeypatch.setattr(
+        kbd, "host_kanban_config",
+        lambda: {"max_spawn": 8, "max_in_progress": 8,
+                 "max_spawn_by_board": {"platform": 8}},
+    )
+
+    greedy = kwd._resolve_dispatcher_settings(
+        {"max_spawn_by_board": {"platform": 5000}}, kb
+    )
+    assert greedy.max_spawn == 8
+    assert greedy.max_spawn_for_board("platform") == 8
+
+    narrow = kwd._resolve_dispatcher_settings(
+        {"max_spawn_by_board": {"platform": 2}}, kb
+    )
+    assert narrow.max_spawn_for_board("platform") == 2
+
+
+def test_cli_measurement_uses_the_host_resolved_board_map(
+    kanban_home_with_profiles, monkeypatch, capsys,
+):
+    """The dry-run's budget is measured from the map the gateway will enforce."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban as kb_cli
+
+    kb.init_db()
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"max_spawn_by_board": {"platform": 5000}}},
+    )
+    monkeypatch.setattr(
+        kbd, "host_kanban_config",
+        lambda: {"max_spawn": 8, "max_in_progress": 8,
+                 "max_spawn_by_board": {"platform": 8}},
+    )
+
+    captured: dict = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        return kb.DispatchResult()
+
+    def fake_measure(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "measure_host_budget", fake_measure)
+    kb_cli._cmd_dispatch(argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False))
+
+    assert captured.get("ceilings") == {"platform": 8}
+    assert "max_spawn_by_board.platform" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

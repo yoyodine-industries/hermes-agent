@@ -363,8 +363,16 @@ def _parse_max_spawn_by_board(kanban_cfg: dict, kb: Any) -> dict:
     return parsed
 
 
-def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
-    """Parse and log the dispatcher settings in their established order."""
+def _resolve_dispatcher_settings(
+    kanban_cfg: dict, kb: Any, host_kanban_cfg: Optional[dict] = None
+) -> _DispatcherSettings:
+    """Parse and log the dispatcher settings in their established order.
+
+    ``kanban_cfg`` is the ``kanban:`` block of the profile this gateway runs
+    under. ``host_kanban_cfg`` overrides the ROOT (host) block read — for tests,
+    and for a caller that already holds it; production leaves it ``None`` so the
+    host block is read from the root config, whoever the gateway runs as.
+    """
     try:
         interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
     except (ValueError, TypeError):
@@ -378,7 +386,20 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     # runs under, and never fall back to None (= unlimited) when that profile
     # carries no ``kanban:`` block. A dispatcher booted as a lane seat therefore
     # enforces the same ceiling as one booted as the root profile.
-    caps = _kbd().resolve_dispatch_caps(kanban_cfg)
+    #
+    # The per-BOARD ceilings (``kanban.max_spawn_by_board``) are the same class
+    # of property and were the remaining caller-owned arm: they were parsed from
+    # the ACTIVE PROFILE's block and applied verbatim, so a lane seat could raise
+    # one board above the host's ceiling. Both raw maps are parsed here for the
+    # gateway's own warnings and board-inventory check; the narrow-only merge
+    # (profile may lower a board, never raise it) belongs to the resolver, and
+    # both enforcement and measurement read its one resolved map.
+    kbd = _kbd()
+    host_cfg = dict(host_kanban_cfg) if isinstance(host_kanban_cfg, dict) else kbd.host_kanban_config()
+    host_cfg["max_spawn_by_board"] = _parse_max_spawn_by_board(host_cfg, kb)
+    profile_cfg = dict(kanban_cfg) if isinstance(kanban_cfg, dict) else {}
+    profile_cfg["max_spawn_by_board"] = _parse_max_spawn_by_board(profile_cfg, kb)
+    caps = kbd.resolve_dispatch_caps(profile_cfg, host_cfg)
     max_spawn = caps["max_spawn"]
     logger.info(
         "kanban dispatcher: max_spawn=%s (host baseline max_spawn=%s, clamped_from_profile=%s)",
@@ -386,10 +407,10 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     )
 
     # Per-board overrides of the ceiling above (operator ask: skew bandwidth to
-    # one board without a second host-wide dial). Parsed once at boot alongside
-    # the rest; every other board keeps ``max_spawn``. The key is logged by the
-    # parser itself, so a live boot names the board-cap line it resolved.
-    max_spawn_by_board = _parse_max_spawn_by_board(kanban_cfg, kb)
+    # one board without a second host-wide dial), already resolved host-baseline +
+    # profile-narrowed. Every other board keeps ``max_spawn``. The parser above
+    # already named any board-cap line it dropped, so a live boot is not silent.
+    max_spawn_by_board = caps["max_spawn_by_board"]
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
     # out. Explicit config wins; otherwise a memory-derived default (unbounded

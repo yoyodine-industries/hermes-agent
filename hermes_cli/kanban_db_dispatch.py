@@ -4369,6 +4369,43 @@ def _cap_int(value: Any) -> Optional[int]:
     return parsed if parsed >= 1 else None
 
 
+def _board_ceilings(raw: Any) -> dict:
+    """``kanban.max_spawn_by_board`` as ``{slug: int}``, unusable entries dropped.
+
+    The SAME value rules the gateway's enforcing parser applies: a NAMED board's
+    ceiling must be a positive integer (a non-integral float is a typo and is
+    never truncated, a non-finite float must never reach ``int()``, and a bool is
+    an int subclass but not a ceiling); the reserved ``default`` arm accepts a
+    non-negative integer, because ``default: 0`` is how the host says "a board
+    this map does not name draws no slots".
+
+    No board-inventory check happens here: the resolver does not know which
+    boards exist, and the gateway still validates against its inventory. Junk is
+    dropped rather than coerced — a typo must never become a dispatch-governing
+    number.
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    ceilings: dict[str, int] = {}
+    for slug, value in raw.items():
+        key = str(slug).strip()
+        if not key or isinstance(value, bool):
+            continue
+        if isinstance(value, float) and not value.is_integer():
+            continue
+        try:
+            ceiling = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if key == DEFAULT_CEILING_KEY:
+            if ceiling < 0:
+                continue
+        elif ceiling < 1:
+            continue
+        ceilings[key] = ceiling
+    return ceilings
+
+
 def host_kanban_config() -> dict:
     """The ROOT config.yaml's ``kanban:`` block — the fleet baseline, whoever invoked us.
 
@@ -4423,6 +4460,16 @@ def resolve_dispatch_caps(
     on this estate: a named profile therefore cannot lift the fleet ceiling, only
     narrow it. ``clamped_to_host`` names the keys where it tried — so the refusal
     is visible in a dispatch output instead of silently applied.
+
+    The per-board map (``kanban.max_spawn_by_board``) is resolved the same way,
+    per BOARD key: the HOST block names a board's ceiling and the invoking
+    profile may only narrow it. A board the host does not name has the host's
+    ``max_spawn`` for a ceiling (the gateway's fallback arm), so a profile value
+    for such a board is measured against that number. A refused entry is named in
+    ``clamped_to_host`` as ``max_spawn_by_board.<slug>``. The result carries the
+    resolved map as ``max_spawn_by_board`` — both enforcement (gateway) and
+    measurement (CLI) read that one map, so a dry run cannot report a budget the
+    dispatcher never applies.
     """
     host = dict(host_kanban_cfg) if isinstance(host_kanban_cfg, Mapping) else host_kanban_config()
     if isinstance(profile_kanban_cfg, Mapping):
@@ -4440,10 +4487,12 @@ def resolve_dispatch_caps(
         or derive_default_max_in_progress()
         or DEFAULT_HOST_MAX_SPAWN
     )
+    host_boards = _board_ceilings(host.get("max_spawn_by_board"))
     baseline = {
         "max_spawn": host_max_spawn,
         "max_in_progress": host_max_in_progress,
         "max_in_progress_per_profile": _cap_int(host.get("max_in_progress_per_profile")),
+        "max_spawn_by_board": dict(host_boards),
     }
 
     resolved = dict(baseline)
@@ -4457,6 +4506,19 @@ def resolve_dispatch_caps(
             resolved[key] = wanted
         else:
             clamped.append(key)
+    # Per-board ceilings, narrow-only per board key. The host's map is the
+    # baseline; the profile may lower a board (never raise it), and a board the
+    # host does not name is measured against the host ``max_spawn`` it inherits.
+    boards = dict(host_boards)
+    profile_boards = _board_ceilings(profile.get("max_spawn_by_board"))
+    for slug in sorted(profile_boards):
+        wanted = profile_boards[slug]
+        ceiling = host_boards.get(slug, host_max_spawn)
+        if allow_raise or wanted <= ceiling:
+            boards[slug] = wanted
+        else:
+            clamped.append(f"max_spawn_by_board.{slug}")
+    resolved["max_spawn_by_board"] = boards
     resolved["host_baseline"] = baseline
     resolved["clamped_to_host"] = clamped
     return resolved
