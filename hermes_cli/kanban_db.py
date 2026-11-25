@@ -18,6 +18,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -468,11 +469,28 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 
-def _resolve_storage_locked_cooldown_seconds() -> int:
-    """``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default."""
-    return _env_int(
-        "HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS,
-    )
+def _resolve_storage_locked_cooldown_seconds(task_id: str | None = None) -> int:
+    """``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS`` (verbatim, 0 = next tick, for tests)
+    else the default with a deterministic per-task +-``STORAGE_LOCKED_COOLDOWN_JITTER_SECONDS``.
+
+    The jitter is derived from the task id, never a random source: the guard is read by more
+    than one process (dispatcher ticks, the dashboard), and a fresh random draw each read would
+    oscillate the same card between "spaced" and "spawn now" twice a minute. Same card, same
+    window, every reader.
+    """
+    raw = os.environ.get("HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    base = DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS
+    jitter = STORAGE_LOCKED_COOLDOWN_JITTER_SECONDS
+    if base <= 0 or jitter <= 0 or not task_id:
+        return base
+    span = 2 * jitter + 1
+    offset = hashlib.sha256(str(task_id).encode("utf-8")).digest()[0] % span - jitter
+    return max(1, base + offset)
 # --- Paths ---
 
 DEFAULT_BOARD = "default"
@@ -8948,6 +8966,7 @@ from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS,
+    STORAGE_LOCKED_COOLDOWN_JITTER_SECONDS,
     DispatchResult,
     WORKER_ALIVE,
     WORKER_DEAD,

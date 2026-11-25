@@ -97,7 +97,14 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
-    "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
+    "locked", "compression", "compression_closed", "turn_lease",
+    # The OWNER side of persistence: the receipt for a write never came back
+    # (``agent/runtime_session_store.py`` raises ``WorkerPersistenceError`` with these two
+    # causes). Neither is a store fault and neither says anything about the turn's work --
+    # a fresh turn wins both -- but before they were named here they collapsed to
+    # ``unknown``, which the Kanban exit mapping could not route to a requeue.
+    "receipt_timeout", "owner_unavailable",
+    "corrupt", "fts_index",
     "replaced", "deleted_wal", "disk", "session_row_missing", "unknown",
 )
 
@@ -284,6 +291,15 @@ _PERSISTENCE_CAUSE_BY_PHRASE = (
     (("deleted state.db-wal", "deleted state.db-shm"), "deleted_wal"),
     (("was replaced underneath",), "replaced"),
     (_DB_CORRUPTION_MARKERS, "corrupt"),
+    # Owner-side receipt loss, matched by phrase because the exception type
+    # (``agent.runtime_session_store.WorkerPersistenceError``) does not live in this module and
+    # RPC-wrapped strings lose it anyway. ``worker_receipt_timeout`` / ``pending_receipt`` /
+    # ``did not ack`` are what a lost write receipt actually prints; ``owner_unavailable`` is
+    # raised when the owning runtime cannot be reached at all (gateway discovery not ``ready``).
+    # BEFORE the lock bucket: a receipt wait can also mention the lock it was waiting behind.
+    (("worker_receipt_timeout", "receipt_timeout", "pending_receipt", "did not ack"),
+     "receipt_timeout"),
+    (("owner_unavailable",), "owner_unavailable"),
     (("locked", "busy"), "locked"),
     # A flush rejected by the session-row FK: the row was removed under a live agent (#123583).
     (("foreign key constraint failed",), "session_row_missing"),
