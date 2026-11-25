@@ -208,6 +208,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+        # THE ORDER THIS TICK DISPATCHED IN, DECLARED (ruling platform-stl 2026-11-08 item 2,
+        # card t_a1890b04). Printed on a real tick AND on a dry run, because "designated" must
+        # never be a synonym for "arbitrary": the pool is ordered by effective priority and the
+        # tie inside it is resolved by a clause nobody chose. Read from the SAME helper the
+        # dispatcher's ORDER BY comes from, so the sentence cannot describe a different order
+        # than the tick ran. Read here, under the open connection, and printed below.
+        order_lines = kb.tranche_order_lines(conn)
     # The CONFIG's own arithmetic, measured so the numbers ride every dispatch
     # output instead of living in a reader's head (card t_843cb0a9 requirement 2).
     # max_spawn is per BOARD and a CEILING, not a reservation; max_in_progress is
@@ -246,6 +253,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_locked": res.skipped_locked,
             "skipped_board_disabled": res.skipped_board_disabled,
             "memory_pressure": res.memory_pressure,
+            # The order in force and the tie depth of the reserved tranche (card t_a1890b04):
+            # a machine reader gets the same declaration the human output prints.
+            "tranche_order": order_lines,
             # The budget gates. These were recorded on the result and never
             # published, so a saturated board reported every bucket empty: the
             # tick that spawns nothing for want of capacity now names the gate,
@@ -273,6 +283,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
               "no card on it can be spawned; `hermes kanban boards set-dispatch "
               "<slug> on` admits it again.")
         return 0
+    # The declaration leads: a reader who sees a spawn list first will believe the list's
+    # order was chosen. It was not — it is read from the same helper the ORDER BY is built
+    # from (card t_a1890b04).
+    for line in order_lines:
+        print(line)
     print(f"Reclaimed:    {res.reclaimed}")
     if res.reaped_terminal_workers:
         print(f"Reaped workers of finished tasks: {', '.join(res.reaped_terminal_workers)}")
