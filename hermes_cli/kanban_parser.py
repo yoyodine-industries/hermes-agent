@@ -539,6 +539,9 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
         _bulk_ids("promote"),
+        _arg("--priority", type=int, default=None,
+             help="Re-rank the card on the way through (worked on a READY card too: the "
+                  "ordering lever a starving card needs). Same doors as `edit --priority`."),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
         _approval_flag("a bulk promote"),

@@ -1637,13 +1637,15 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
     dry_run = bool(args.dry_run)
+    priority = getattr(args, "priority", None)
 
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
+            ok, err = kb.promote_task(
+                conn, tid, actor=author, reason=reason, priority=priority, dry_run=dry_run)
             results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
-                            "reason": reason, "error": err})
+                            "reason": reason, "priority": priority, "error": err})
 
     failed = [r for r in results if not r["promoted"]]
     if getattr(args, "json", False):
@@ -1656,7 +1658,8 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     suffix = f": {reason}" if reason else ""
     for r in results:
         if r["promoted"]:
-            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
+            rank = f" (priority -> {r['priority']})" if r["priority"] is not None else ""
+            print(f"{label} {r['task_id']} -> ready{rank}{tag}{suffix}")
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1

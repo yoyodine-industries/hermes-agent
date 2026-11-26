@@ -4811,7 +4811,7 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
 ) -> int:
-    """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed.
+    """Reclaim ``running`` tasks whose claim carries NO liveness evidence; returns the count.
 
     Every reclaim that actually releases a claim is a non-success attempt and
     is booked through ``_record_task_failure`` (#111306): a claim that expired
@@ -4836,16 +4836,41 @@ def release_stale_claims(
     so any genuinely active worker keeps its heartbeat fresh as a side effect of normal API traffic.
     ``enforce_max_runtime`` and ``detect_crashed_workers`` remain the upper bounds for genuinely wedged or
     dead workers.
+
+    THE SELECT USED TO REQUIRE A LEASE (card t_d7105215). ``WHERE claim_expires IS NOT NULL AND
+    claim_expires < now`` made the backstop above UNREACHABLE for the two shapes that starve a
+    board: a claim that carries NO lease at all (a crash mid-claim left the bookkeeping partial),
+    and a lease that was still in the future when the worker stopped heartbeating. Both held a
+    dispatch slot indefinitely, because every other reaper needs a pid that is PROVEN dead and a
+    recorded pid can stay occupied by a recycled number or a wedged process. MEASURED
+    2026-11-25 on board ``platform``: three of six ``running`` slots held claims over a day and
+    a half old, 2,187 ready cards could not be claimed, and only a manual ``reclaim`` freed one.
+
+    So the query now takes every CLAIMED running row whose lease is missing, expired, or whose
+    heartbeat is past the ceiling; the loop decides on evidence:
+
+      * conclusive silence — the heartbeat is past the ceiling, or absent and the claim's own run
+        row is older than it — is the one signal a recycled or unprovable pid cannot fake. Such a
+        claim is reclaimed even if the process is still there (the existing #29747 ruling), and
+        the ``reclaimed`` event records ``reason``, ``claim_age_seconds`` and
+        ``heartbeat_age_seconds`` so the reaping is auditable;
+      * a live, heartbeating worker keeps its claim, and a claim that lost its LEASE under it is
+        given one back (``claim_lease_restored``) instead of stalling or being killed;
+      * a lease-less claim with no conclusive silence and a worker that cannot be proven alive
+        still defers, exactly as before: missing evidence is never proof.
     """
     now = int(time.time())
     reclaimed = 0
     host_prefix = _host_prefix()
+    ceiling = DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?", (now,),
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.worker_started_at, t.claim_expires, "
+        "       t.last_heartbeat_at, t.assignee, r.started_at AS run_started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_lock IS NOT NULL "
+        "  AND (t.claim_expires IS NULL OR t.claim_expires < ? "
+        "       OR (t.last_heartbeat_at IS NOT NULL AND t.last_heartbeat_at < ?))",
+        (now, now - ceiling),
     ).fetchall()
     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
     for row in stale:
@@ -4855,26 +4880,62 @@ def release_stale_claims(
         hb = _to_epoch(row["last_heartbeat_at"])
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        heartbeat_age = None if hb is None else max(0, now - hb)
+        heartbeat_stale = heartbeat_age is not None and heartbeat_age > ceiling
+        lease_missing = _to_epoch(row["claim_expires"]) is None
+        run_started = _to_epoch(_row_get(row, "run_started_at"))
+        claim_age = None if run_started is None else max(0, now - run_started)
+        # Conclusive silence: no heartbeat for the ceiling. A claim that never beat is silent once
+        # its OWN run (not the card's sticky ``started_at``) is older than the ceiling.
+        silent = bool(heartbeat_stale or
+                      (hb is None and claim_age is not None and claim_age > ceiling))
+        if silent and lease_missing:
+            reap_reason = ("claim_without_lease_and_heartbeat" if hb is None
+                           else "claim_without_lease")
+        elif silent:
+            reap_reason = "heartbeat_silent"
+        else:
+            reap_reason = "lease_expired"
         started_at = _row_get(row, "worker_started_at")
-        # ``not_dead``, not ``alive``: an unprovable worker must HOLD its claim too. Releasing it
-        # beside a process that may still be running is how a duplicate is spawned next to it
-        # (#123811); the worker's own fence still lets it close the card.
-        if (host_local and row["worker_pid"] and _worker_not_dead(row["worker_pid"], started_at)
-                and not heartbeat_stale):
-            _extend_live_stale_claim(conn, row, now)
+        worker_dead = bool(host_local and row["worker_pid"]
+                           and not _worker_not_dead(row["worker_pid"], started_at))
+        # Live EVIDENCE: a pid that is not provably dead, or a heartbeat. A claim with neither —
+        # the never-spawned shape (#111306) — is not evidence of anything and expires normally.
+        has_live_evidence = bool(
+            (host_local and row["worker_pid"]
+             and _worker_not_dead(row["worker_pid"], started_at))
+            or hb is not None
+        )
+        # ``not_dead``, not ``alive``: an unprovable worker must HOLD its claim too — unless the
+        # heartbeat says nothing is executing. Releasing beside a process that may still be running
+        # is how a duplicate is spawned next to it (#123811); conclusive silence is the exception
+        # the #29747 backstop already names, and the worker's own fence still lets it close the card.
+        #
+        # HOLD WHAT IS NOT PROVABLY OVER: conclusive silence or a worker PROVEN dead is the licence
+        # to reclaim. A claim with live evidence (or one missing its lease entirely, which cannot be
+        # aged any other way) keeps its slot, and a host-local claim that lost its LEASE under such
+        # a worker is given one back.
+        if not silent and not worker_dead and (lease_missing or has_live_evidence):
+            if host_local:
+                if lease_missing:
+                    _restore_missing_claim_lease(conn, row, now)
+                else:
+                    _extend_live_stale_claim(conn, row, now)
             continue
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
         )
-        # A live worker of ours must keep its claim (else a duplicate spawns beside it).
+        # A live worker of ours must keep its claim (else a duplicate spawns beside it) — unless
+        # the heartbeat is conclusively silent, where holding the claim IS the outage.
         if _worker_survived_termination(termination):
-            _defer_reclaim_for_live_worker(
-                conn, row["id"], row["claim_lock"], now, termination,
-                reason="ttl_expired_worker_alive",
-            )
-            continue
+            if not silent:
+                _defer_reclaim_for_live_worker(
+                    conn, row["id"], row["claim_lock"], now, termination,
+                    reason="ttl_expired_worker_alive",
+                )
+                continue
+            termination["released_despite_live_pid"] = True
         with write_txn(conn):
             # Again under the write lock: an interpreter that bound since the check above
             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
@@ -4885,10 +4946,11 @@ def release_stale_claims(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ? "
-                # A worker that registered its own pid since the SELECT keeps its claim.
-                "AND worker_pid IS ?",
-                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"]),
+                # A worker that registered its own pid, extended its lease or beat since the
+                # SELECT keeps its claim: the evidence the reclaim was judged on is CAS-pinned.
+                "AND worker_pid IS ? AND claim_expires IS ? AND last_heartbeat_at IS ?",
+                (retry_status, row["id"], row["claim_lock"], row["worker_pid"],
+                 row["claim_expires"], row["last_heartbeat_at"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -4896,6 +4958,7 @@ def release_stale_claims(
                 conn, row["id"], termination,
                 error=error,
                 payload={
+                    "reason": reap_reason,
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
                     "claim_expires": _to_epoch(row["claim_expires"]),
@@ -4903,6 +4966,8 @@ def release_stale_claims(
                     "now": now,
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
+                    "heartbeat_age_seconds": heartbeat_age,
+                    "claim_age_seconds": claim_age,
                     "retry_status": retry_status,
                 },
             )
@@ -4959,9 +5024,44 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
             conn, row["id"], "claim_extended",
             {
                 "reason": "pid_alive",
-                "worker_pid": int(row["worker_pid"]),
+                "worker_pid": _opt_int(row["worker_pid"]),
                 "claim_lock": row["claim_lock"],
                 "claim_expires_was": _to_epoch(row["claim_expires"]),
+                "claim_expires_now": new_expires,
+                "last_heartbeat_at": _to_epoch(row["last_heartbeat_at"]),
+            },
+            run_id=run_id,
+        )
+
+
+def _restore_missing_claim_lease(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> None:
+    """Give a LEASE back to a ``running`` claim that lost it but still has a live worker.
+
+    The mirror of :func:`_extend_live_stale_claim` for the claim whose ``claim_expires`` is NULL
+    (a crash mid-claim, manual SQL, a restore). Without a lease the claim cannot be extended,
+    ``release_stale_claims`` used to skip it, and nothing else could age it: the card held its
+    dispatch slot until an operator noticed (card t_d7105215). CAS on ``claim_expires IS NULL``
+    so a concurrent writer wins cleanly, and record the repair on the run.
+    """
+    new_expires = now + _resolve_claim_ttl_seconds()
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET claim_expires = ? "
+            "WHERE id = ? AND status = 'running' "
+            "  AND claim_lock IS ? "
+            "  AND claim_expires IS NULL "
+            "  AND worker_pid IS ?",
+            (new_expires, row["id"], row["claim_lock"], row["worker_pid"]),
+        )
+        if cur.rowcount != 1:
+            return
+        run_id = _extend_run_claim(conn, row["id"], new_expires)
+        _append_event(
+            conn, row["id"], "claim_lease_restored",
+            {
+                "reason": "claim carried a live worker with no lease",
+                "worker_pid": _opt_int(row["worker_pid"]),
+                "claim_lock": row["claim_lock"],
                 "claim_expires_now": new_expires,
                 "last_heartbeat_at": _to_epoch(row["last_heartbeat_at"]),
             },
@@ -7273,20 +7373,45 @@ def request_changes(
 
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
+    priority: Optional[int] = None, dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    """Operator promotion ``todo``/``blocked``/``ready`` with an audit event.
+
+    A ``ready`` card has nowhere to be promoted TO, but the verb is the fleet's ordering
+    lever and ``ready`` is exactly the state a starving card is in: card t_d7105215 measured
+    2,187 ready cards behind a stale claim, and ``promote`` refused the one that needed to
+    move because 'promote only applies to todo or blocked'. So a ready card is accepted:
+
+      * with ``priority`` ... re-ranked through :func:`edit_task`, which means EVERY priority
+        door (the kernel domain, the above-tranche ceiling, the board floor and the gate
+        floor) applies exactly as it does for ``hermes kanban edit --priority``;
+      * without one ......... an idempotent success: the card is already dispatchable.
+
+    A ``todo``/``blocked`` promotion still moves the card to ``ready`` first and then applies
+    the same re-rank. Refused while a parent is unfinished; ``dry_run`` only validates.
+    Returns ``(ok, reason)``.
+    """
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "blocked", "ready"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked' or 'ready'"
         )
+
+    if cur_status == "ready":
+        if priority is None:
+            return True, None
+        if dry_run:
+            return True, None
+        if not edit_task(conn, task_id, priority=priority):
+            return False, f"task {task_id} could not be re-ranked"
+        _append_event(conn, task_id, "promoted_manual", {
+            "actor": actor, "reason": reason, "already_ready": True, "priority": priority,
+        })
+        return True, None
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
@@ -7316,6 +7441,10 @@ def promote_task(
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
         _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+
+    if priority is not None:
+        if not edit_task(conn, task_id, priority=priority):
+            return False, f"task {task_id} was promoted but could not be re-ranked"
 
     return True, None
 
