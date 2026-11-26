@@ -428,6 +428,9 @@ def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S):
         row = json.loads(raw)
         conn.execute('DELETE FROM state_meta WHERE key IN (?,?,?)', (key, RESULT_PREFIX + row['admission_id'],
                      identity_key(row['principal_id'], row['target_session_id'], row['request_id'])))
+        # The result cache's own ledger row goes with it, or the cache keeps counting bytes
+        # for a row that no longer exists.
+        conn.execute('DELETE FROM admission_result_cache WHERE key=?', (RESULT_PREFIX + row['admission_id'],))
     conn.execute(f'DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED}', (WORKER_PREFIX + '*', cutoff))
     for prefix in (RETIRED_PREFIX, ROUTE_FENCE_PREFIX):
         _reclaim_expired(conn, prefix, cutoff)

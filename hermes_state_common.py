@@ -642,6 +642,20 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+-- Insertion/recency index for the gateway admission-result cache rows in state_meta. state_meta
+-- carries no timestamp, so expiry and the size cap cannot be derived from it; this table is the
+-- cache's own ledger. ``rank`` orders eviction (epoch-seconds for rows written since this ledger
+-- existed, admission ``seq`` for rows backfilled from an older store, so the legacy flood is the
+-- oldest and evicts first); ``stored_at`` stays 0 for a backfilled row whose real age is unknown,
+-- and such a row is never TTL-dropped, only cap-evicted.
+CREATE TABLE IF NOT EXISTS admission_result_cache (
+    key TEXT PRIMARY KEY,
+    stored_at REAL NOT NULL DEFAULT 0,
+    rank REAL NOT NULL DEFAULT 0,
+    bytes INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_admission_result_cache_rank ON admission_result_cache(rank);
+
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
     session_key TEXT NOT NULL,
