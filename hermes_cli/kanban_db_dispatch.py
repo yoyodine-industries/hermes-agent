@@ -1108,6 +1108,13 @@ class DispatchResult:
     worker is structurally fenced from it. The card is PARKED ``scheduled``
     (due_at NULL) -- never a silent skip -- and the tick's suppression line names
     the hold, because a silent hold is how a starved board reads as an idle one."""
+    gate_edge_held: list[str] = field(default_factory=list)
+    """Task ids HELD at the run door because the card DECLARES it waits on another
+    card and the board carries no edge for it (hermes_cli/kanban_gate_edge.py;
+    ruling t_26d2f957). The card is PARKED ``needs_input`` with the missing edge
+    named -- never a silent skip -- because an ungated carrier looks exactly like
+    a gated one until a tick claims it. START-scope claims hold; LANDING-scope
+    claims do not (building is wanted; the edge belongs on the landing card)."""
     substrate_held: list[str] = field(default_factory=list)
     """Task ids HELD by per-unit substrate admission (door 3; card ``t_0ae49984``, design
     ``t_72e9bf03``): the card's own workspace root answered a DENIAL to a real operation, so it
@@ -1570,6 +1577,12 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             # never silently skipped, so the tick's own line must name the hold --
             # a silent hold is how a starved board reads as an idle one.
             counts["skipped_top_level_only"] = counts.get("skipped_top_level_only", 0) + len(res.skipped_top_level_only)
+        if res.gate_edge_held:
+            # The declared-gate EDGE door held these (hermes_cli/kanban_gate_edge.py;
+            # ruling t_26d2f957): the card says it waits on another card and the board
+            # does not represent the wait, so the spawn was refused and the card parked.
+            # A silent hold is how a starved board reads as an idle one.
+            counts["gate_edge_held"] = counts.get("gate_edge_held", 0) + len(res.gate_edge_held)
         if res.substrate_held:
             # DOOR 3 (card t_0ae49984, design t_72e9bf03): these cards were not claimed because
             # their own workspace root was denied. They are still ready, so without this counter
@@ -6690,6 +6703,20 @@ def _dispatch_lane_task(
         result.skipped_top_level_only.append(task_id)
         return False
 
+    # DECLARED-GATE EDGE door (RUN door, ruling t_26d2f957): a card whose LIVE text
+    # says it waits on another card -- "gated on t_x", "blocked until t_x", "the
+    # consent card t_x is still blocked" -- is NEVER spawned while the board carries
+    # no edge for it. Prose holds nobody back: the measured instance's three pruning
+    # carriers named their consent card and sat ``ready`` parented only on the ruling
+    # card, so a tick would have started trimming a 5.97 GB store nobody had approved.
+    # START-scope claims are held here; LANDING-scope claims are NOT (a card that says
+    # "build now, do not merge before X" must still build -- its edge belongs on the
+    # card that lands it). Re-checked LIVE so an amendment after filing is honoured.
+    # Respects ``dry_run``: reports the hold, writes nothing.
+    if _hold_declared_gate(conn, task_id, dry_run=dry_run, board=board):
+        result.gate_edge_held.append(task_id)
+        return False
+
     # SUBSTRATE ADMISSION -- door 3 (card t_0ae49984, design t_72e9bf03): a card whose own
     # workspace root is on a denied substrate is HELD -- NOT claimed, NOT failed, NOT blocked --
     # and this tick carries on with its siblings (invariant I2). Deliberately BEFORE the claim:
@@ -6870,6 +6897,83 @@ def _hold_substrate_denied(
     except Exception:
         _kb._log.debug(
             "kanban dispatch: substrate hold could not be recorded for %s", task_id, exc_info=True,
+        )
+    return True
+
+
+def _hold_declared_gate(
+    conn: sqlite3.Connection, task_id: str, *, dry_run: bool = False,
+    board: Optional[str] = None,
+) -> bool:
+    """The RUN door of the declared-gate edge gate (hermes_cli/kanban_gate_edge.py).
+
+    Returns True when the card DECLARES a START-scope gate -- it says in its own
+    live text that it waits on another card -- and the board carries no edge for
+    that card, so it must not be spawned. False when there is no claim, when every
+    claimed card is already an ancestor, when the named card is finished, or when
+    the only claims are LANDING-scope.
+
+    LANDING scope is deliberately NOT held here. The measured over-correction
+    (ruling ``t_26d2f957``): a card reading "BUILD AND PR NOW. DO NOT MERGE OR
+    DEPLOY ... landing is gated on the answer" was parented on the consent card by
+    hand, which freezes the build the ruling itself ordered -- the false-NEGATIVE
+    mirror of the defect this gate exists to close. Its edge belongs on the card
+    that lands it.
+
+    The hold is never silent: ONE deduped ``gate_edge_refused`` event and ONE
+    comment naming the missing edge, then the card is PARKED ``needs_input``.
+    Deduped on the payload because the guard runs every tick. A write fault must
+    never take the tick down -- the next tick retries, and the card is not spawned
+    either way. ``dry_run`` reports the hold and writes nothing.
+    """
+    from hermes_cli import kanban_gate_edge as _ge
+
+    row = conn.execute(
+        "SELECT title, body, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in ("ready", "review"):
+        return False
+    verdict = _ge.evaluate(
+        conn, task_id, title=row["title"], body=row["body"], status=row["status"],
+    )
+    if not verdict.refused:
+        return False
+    if dry_run:
+        return True
+    payload = {
+        "cause": verdict.cause,
+        "missing": [c.card_id for c in verdict.unbacked_start],
+        "scope": "start",
+        "board": board,
+    }
+    try:
+        with _kb.write_txn(conn):
+            last = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'gate_edge_refused' "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if last is None or last["payload"] != _kb._json_or_null(payload):
+                _kb._append_event(conn, task_id, "gate_edge_refused", payload)
+                _kb.add_comment(
+                    conn, task_id, "dispatcher",
+                    "GATE EDGE MISSING before the run (not spawned).\n\n"
+                    + _ge.refusal_message(task_id, verdict),
+                )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: gate-edge refusal could not be recorded for %s",
+            task_id, exc_info=True,
+        )
+    try:
+        _kb.block_task(
+            conn, task_id,
+            reason="gate-edge: " + ", ".join(c.card_id for c in verdict.unbacked_start),
+            kind="needs_input",
+        )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: gate-edge park failed for %s", task_id, exc_info=True,
         )
     return True
 
