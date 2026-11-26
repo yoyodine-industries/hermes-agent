@@ -4325,10 +4325,15 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
     from hermes_cli.config import load_config as _load_full_config
     from hermes_state_registry import acquire, release_or_close
     _sess_cfg = (_load_full_config().get("sessions") or {})
-    if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
-        return
     _adb = acquire()
     try:
+        # Hygiene bounds first, and independently of auto_archive/auto_prune: a state-owned
+        # session nothing will ever end, and a replay cache with no expiry. Both are throttled
+        # and never raise, so a store configured without retention still gets them.
+        _adb.trim_admission_result_cache()
+        _adb.maybe_reap_abandoned_sessions()
+        if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
+            return
         if _sess_cfg.get("auto_archive", False):
             _adb.maybe_auto_archive(
                 idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
