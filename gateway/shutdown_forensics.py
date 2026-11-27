@@ -73,10 +73,16 @@ def _read_marker(path: Path) -> Optional[str]:
         return None
 
 
-def snapshot_shutdown_context(received_signal: Any = None) -> dict[str, Any]:
+def snapshot_shutdown_context(received_signal: Any = None, *,
+                              planned_stop_request: Optional[dict] = None) -> dict[str, Any]:
     """Fast (<10ms) snapshot of who/what is asking us to shut down: signal name/number, own + parent
     /proc summaries, systemd parentage, takeover/planned-stop markers, TracerPid, 1-min load,
-    timestamps. Pure stdlib, never raises, never blocks."""
+    timestamps. Pure stdlib, never raises, never blocks.
+
+    A stop delivered by the planned-stop MARKER carries no signal at all, so when the marker (or
+    the record already consumed from it, ``planned_stop_request``) names us, the context reports
+    ``signal=marker`` and carries the requester + ``stop_id`` that the marker was written with —
+    otherwise the line an operator reads is ``signal=UNKNOWN`` with no attribution."""
     pid, ppid = os.getpid(), os.getppid()
     ctx: dict[str, Any] = {
         "ts": time.time(), "ts_monotonic": time.monotonic(),
@@ -84,12 +90,16 @@ def snapshot_shutdown_context(received_signal: Any = None) -> dict[str, Any]:
         "signal_num": int(received_signal) if received_signal is not None else None,
         "pid": pid, "ppid": ppid, "parent": _proc_summary(ppid), "self": _proc_summary(pid),
     }
-    # INVOCATION_ID is set by systemd units; ppid==1 also suggests systemd forwarded the SIGTERM.
+    # INVOCATION_ID is set by systemd units; on LINUX ppid==1 also suggests systemd forwarded the
+    # SIGTERM. On darwin a launchd LaunchDaemon is ALWAYS re-parented to 1, so ppid==1 there says
+    # nothing about systemd (measured false on this host: under_systemd=yes for a plain launchd
+    # daemon) — deriving it from parentage is a lie the reader cannot detect.
     for ctx_key, env_key in (("systemd_invocation_id", "INVOCATION_ID"),
                              ("systemd_journal_stream", "JOURNAL_STREAM")):
         if os.environ.get(env_key):
             ctx[ctx_key] = os.environ[env_key]
-    ctx["under_systemd"] = bool(os.environ.get("INVOCATION_ID")) or ppid == 1
+    ctx["under_systemd"] = bool(os.environ.get("INVOCATION_ID")) or (
+        ppid == 1 and sys.platform.startswith("linux"))
     # High load points at "something crushing the box" rather than an external killer.
     with contextlib.suppress(OSError, AttributeError):
         ctx["loadavg_1m"] = os.getloadavg()[0]
@@ -101,6 +111,7 @@ def snapshot_shutdown_context(received_signal: Any = None) -> dict[str, Any]:
     # Race hint: a takeover marker on disk that does NOT name us is a smoking gun for "another
     # --replace instance is killing us". Filenames mirror gateway.status; literals keep the signal-
     # handler path import-light.
+    marker_record: Optional[dict] = None
     with contextlib.suppress(Exception):
         hermes_home_str = os.path.expanduser(os.environ.get("HERMES_HOME", ""))
         if hermes_home_str:
@@ -112,6 +123,21 @@ def snapshot_shutdown_context(received_signal: Any = None) -> dict[str, Any]:
             raw = _read_marker(Path(hermes_home_str) / ".gateway-planned-stop.json")
             if raw is not None:
                 ctx["planned_stop_marker"] = raw[:300]
+                with contextlib.suppress(ValueError):
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict) and parsed.get("target_pid") == pid:
+                        marker_record = parsed
+                        ctx["planned_stop_marker_for_self"] = True
+    attributed = planned_stop_request if isinstance(planned_stop_request, dict) else marker_record
+    if attributed:
+        ctx["planned_stop_attributed"] = True
+        if attributed.get("stop_id"):
+            ctx["stop_id"] = attributed.get("stop_id")
+        if isinstance(attributed.get("requester"), dict):
+            ctx["requester"] = attributed.get("requester")
+        if received_signal is None:
+            ctx["signal"] = "marker"
+            ctx["signal_num"] = None
     return ctx
 
 
@@ -171,7 +197,12 @@ def spawn_async_diagnostic(log_path: Path, signal_name: str, *,
 
 
 def format_context_for_log(ctx: dict[str, Any]) -> str:
-    """Render a shutdown context dict as one scannable log line (parent identity, never argv)."""
+    """Render a shutdown context dict as one scannable log line (parent identity, never argv).
+
+    When the stop is attributable it names the ``stop_id``, the requester's ``kind``/``lane`` and
+    its ``reason_code`` — the four facts an operator otherwise has to reconstruct from three
+    different records.
+    """
     parent = ctx.get("parent") or {}
     load_str = f"{load:.2f}" if isinstance(load := ctx.get("loadavg_1m"), (int, float)) else "?"
     extras: list[str] = []
@@ -180,6 +211,18 @@ def format_context_for_log(ctx: dict[str, Any]) -> str:
         extras.append(f"takeover_marker_present={who}")
     if ctx.get("planned_stop_marker") is not None:
         extras.append("planned_stop_marker_present=yes")
+    if ctx.get("planned_stop_attributed"):
+        extras.append("planned_stop_attributed=yes")
+    if ctx.get("stop_id"):
+        extras.append(f"stop_id={ctx['stop_id']}")
+    requester_raw = ctx.get("requester")
+    requester = requester_raw if isinstance(requester_raw, dict) else {}
+    if requester.get("kind"):
+        extras.append(f"requester_kind={requester['kind']}")
+    if requester.get("lane"):
+        extras.append(f"requester_lane={requester['lane']}")
+    if requester.get("reason_code"):
+        extras.append(f"reason_code={requester['reason_code']}")
     if ctx.get("tracer_pid"):
         extras.append(f"tracer_pid={ctx['tracer_pid']}")
     extras_str = (" " + " ".join(extras)) if extras else ""

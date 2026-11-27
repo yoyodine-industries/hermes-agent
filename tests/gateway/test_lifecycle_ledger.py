@@ -88,7 +88,9 @@ def test_first_boot_reports_nothing_and_claims_sentinel(tmp_path: Path) -> None:
     assert "start_time" in sentinel
 
 
-def test_clean_exit_then_boot_reports_nothing(tmp_path: Path) -> None:
+def test_clean_exit_then_boot_reports_the_previous_life(tmp_path: Path) -> None:
+    """A CLEAN prior life is reported too (``gateway.previous_exit``): "who stopped the gateway
+    and why" does not depend on the exit code, and a clean/forced life used to leave nothing."""
     record_startup(home=tmp_path)
     mark_exited(0, reason="graceful_shutdown", home=tmp_path)
 
@@ -98,7 +100,13 @@ def test_clean_exit_then_boot_reports_nothing(tmp_path: Path) -> None:
     assert sentinel["exit_reason"] == "graceful_shutdown"
 
     assert record_startup(home=tmp_path) is None
-    assert _exit_diag_records(tmp_path) == []
+    records = _exit_diag_records(tmp_path)
+    assert len(records) == 1
+    assert records[0]["tag"] == "gateway.previous_exit"
+    assert records[0]["exit_code"] == 0
+    assert records[0]["exit_reason"] == "graceful_shutdown"
+    assert records[0]["prior_phase"] == "exited"
+    assert records[0]["pid"] == os.getpid()
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +140,14 @@ def test_record_startup_persists_unclean_report_and_reclaims(tmp_path: Path) -> 
     assert evidence is not None
 
     records = _exit_diag_records(tmp_path)
-    assert len(records) == 1
-    assert records[0]["tag"] == "gateway.previous_unclean_exit"
-    assert records[0]["prior_pid"] == _DEAD_PID
-    assert records[0]["pid"] == os.getpid()
+    # The general row for the prior life, then the unclean-specific one (both before the claim).
+    assert [r["tag"] for r in records] == [
+        "gateway.previous_exit", "gateway.previous_unclean_exit"]
+    assert records[1]["prior_pid"] == _DEAD_PID
+    assert records[1]["pid"] == os.getpid()
+    assert records[0]["pid"] == _DEAD_PID
+    assert records[0]["prior_phase"] == "running"
+    assert records[0]["exit_reason"] == "unclean (no exit path ran)"
 
     # Sentinel reclaimed for the new life.
     sentinel = _read_sentinel(tmp_path)

@@ -1822,7 +1822,7 @@ def _reap_unsupervised_gateway_orphans(
         if _windows_scheduled_task_supervises(_task_name):
             return False
 
-    from gateway.status import _pid_exists, get_process_start_time, write_planned_stop_marker
+    from gateway.status import _pid_exists, get_process_start_time
     own = _reaper_exclusion_pids(extra_exclude)
     try:
         # On Windows also drop Task Scheduler-owned candidates (the pidfile-less gap).
@@ -1859,7 +1859,11 @@ def _reap_unsupervised_gateway_orphans(
     reaped = False
     for pid in orphans:
         with contextlib.suppress(Exception):
-            write_planned_stop_marker(pid)
+            from gateway.stop_attribution import write_stop_request
+            write_stop_request(
+                pid, kind="maintenance", reason_code="orphan_reap", delivery="marker",
+                reason_text="orphaned gateway reaped before this start",
+                lull_gate="not_consulted")
         # ``os.kill(..., SIGTERM)`` maps to TerminateProcess on Windows, so it
         # would kill the gateway before its marker watcher can drain and close
         # state cleanly. Let the bounded survivor wait below escalate instead.

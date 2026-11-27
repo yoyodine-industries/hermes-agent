@@ -336,7 +336,8 @@ def real_s6(monkeypatch: pytest.MonkeyPatch):
 def marker_calls(monkeypatch: pytest.MonkeyPatch):
     marked: list[int] = []
     monkeypatch.setattr(
-        "gateway.status.write_planned_stop_marker", lambda pid: marked.append(pid) or True
+        "gateway.stop_attribution.write_stop_request",
+        lambda pid, **kw: marked.append(pid) or "stopid",
     )
     return marked
 
@@ -377,11 +378,11 @@ def test_s6_stop_marker_write_failure_still_stops(
     (s6_scandir / "gateway-coder").mkdir()
     attempted: list[int] = []
 
-    def _boom(pid):
+    def _boom(pid, **_kwargs):
         attempted.append(pid)
         raise OSError("disk gone")
 
-    monkeypatch.setattr("gateway.status.write_planned_stop_marker", _boom)
+    monkeypatch.setattr("gateway.stop_attribution.write_stop_request", _boom)
 
     S6ServiceManager(scandir=s6_scandir).stop("gateway-coder")
 

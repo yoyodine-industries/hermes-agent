@@ -1979,10 +1979,16 @@ def _pid_marker_names_self(target_pid: int, target_start_time: Any) -> bool:
     return None in (target_start_time, our_start_time) or target_start_time == our_start_time
 
 
-def _consume_pid_marker_for_self(path: Path, *, ttl_s: int, on_consume=None, keep: bool = False) -> bool:
+def _consume_pid_marker_for_self(path: Path, *, ttl_s: int, on_consume=None,
+                                 keep: bool = False) -> Optional[dict[str, Any]]:
+    """Consume a marker naming us; the consumed RECORD on a match, else None.
+
+    Returning the record (not just a bool) is what lets the stop path quote the marker's
+    ``stop_id`` + ``requester`` into ``gateway.stop_seen`` (see gateway.stop_attribution).
+    """
     parsed = _read_live_pid_marker(path, ttl_s)
     if parsed is None:
-        return False
+        return None
     record, target_pid, target_start_time = parsed
     # Cross-profile guard: new markers name the verified TARGET home, which permits a deliberate
     # cross-HERMES_HOME --replace while ignoring a marker accidentally written into another
@@ -1992,17 +1998,17 @@ def _consume_pid_marker_for_self(path: Path, *, ttl_s: int, on_consume=None, kee
     target_home = record.get("target_hermes_home")
     if target_home is not None:
         if not isinstance(target_home, str) or not _same_hermes_home(target_home, our_home):
-            return False
+            return None
     else:
         replacer_home = record.get("replacer_hermes_home")
         if replacer_home is not None and not _same_hermes_home(replacer_home, our_home):
-            return False
+            return None
     matches = _pid_marker_names_self(target_pid, target_start_time)
     if matches and on_consume is not None:
         on_consume(path, record)
     if not keep:
         _unlink_quietly(path)
-    return matches
+    return record if matches else None
 
 
 def write_takeover_marker(
@@ -2037,7 +2043,8 @@ def _write_marker(path: Path, record: dict[str, Any]) -> bool:
 
 def consume_takeover_marker_for_self() -> bool:
     """Consume the takeover marker; True => planned takeover (exit 0); unlinked on match/stale."""
-    return _consume_pid_marker_for_self(_get_takeover_marker_path(), ttl_s=_TAKEOVER_MARKER_TTL_S)
+    return _consume_pid_marker_for_self(
+        _get_takeover_marker_path(), ttl_s=_TAKEOVER_MARKER_TTL_S) is not None
 
 
 def clear_takeover_marker(target_home: Optional[Path] = None) -> None:
@@ -2227,14 +2234,52 @@ def _terminate_verified_owner(
     return None
 
 
-def write_planned_stop_marker(target_pid: int) -> bool:
+def _planned_stop_payload(target_pid: int, requester: Any, stop_id: Any,
+                          target_start_time: Any = _UNSET) -> Optional[dict[str, Any]]:
+    """The marker record, or None when it would be unattributable (and therefore refused)."""
+    requester = requester if isinstance(requester, dict) else {}
+    if not requester.get("kind") or not str(stop_id or "").strip():
+        logger.warning(
+            "Refusing to write an unattributed planned-stop marker for pid %s (requester/stop_id "
+            "required)", target_pid)
+        return None
+    if target_start_time is _UNSET:
+        target_start_time = _get_process_start_time(target_pid)
+    return {
+        "target_pid": target_pid, "target_start_time": target_start_time,
+        "stopper_pid": os.getpid(), "written_at": _utc_now_iso(),
+        "stop_id": str(stop_id), "requester": dict(requester),
+    }
+
+
+def write_planned_stop_marker(target_pid: int, *, requester: dict[str, Any], stop_id: str) -> bool:
     """Record that ``target_pid`` is being stopped intentionally: unexpected SIGTERM exits non-zero
     so service managers revive the gateway; the CLI writes this first so a deliberate stop exits
-    cleanly."""
-    return _write_marker(_get_planned_stop_marker_path(), {
-        "target_pid": target_pid, "target_start_time": _get_process_start_time(target_pid),
-        "stopper_pid": os.getpid(), "written_at": _utc_now_iso(),
-    })
+    cleanly.
+
+    ``requester`` and ``stop_id`` are REQUIRED: a marker is the gateway's only in-band evidence
+    that its stop was asked for, so a marker without attribution is refused rather than written
+    (see ``gateway.stop_attribution.write_stop_request``, the single door that writes both the
+    request row and this marker)."""
+    payload = _planned_stop_payload(target_pid, requester, stop_id)
+    return payload is not None and _write_marker(_get_planned_stop_marker_path(), payload)
+
+
+def write_planned_stop_marker_in(target_home: Path, target_pid: int, *, requester: dict[str, Any],
+                                 stop_id: str, target_start_time: Any = _UNSET) -> bool:
+    """Cross-home variant: the marker must land in the TARGET home (a caller stopping another
+    profile's gateway, or an owner whose home differs from this process's).
+
+    Same attribution requirement as :func:`write_planned_stop_marker` — one payload builder, so a
+    cross-home stop cannot be less attributable than a local one."""
+    try:
+        payload = _planned_stop_payload(target_pid, requester, stop_id, target_start_time)
+        if payload is None:
+            return False
+        marker_home = _canonical_hermes_home(target_home)
+        return _write_marker(marker_home / _PLANNED_STOP_MARKER_FILENAME, payload)
+    except OSError:
+        return False
 
 
 _PLANNED_STOP_MUTEX_WAIT_S = 2.0
@@ -2266,8 +2311,12 @@ def _checkpoint_planned_stop(path: Path, record: dict[str, Any]) -> None:
             update_pause_record.mark_stop_consumed(path, record)
 
 
-def consume_planned_stop_marker_for_self() -> bool:
-    """Return True when the current process is being intentionally stopped."""
+def consume_planned_stop_request_for_self() -> Optional[dict[str, Any]]:
+    """Consume the planned-stop marker for the current process; the marker RECORD on a match.
+
+    The record carries ``stop_id`` + ``requester`` (see ``gateway.stop_attribution``), which the
+    shutdown handler quotes into its ``gateway.stop_seen`` row and its shutdown-context log line.
+    """
     from hermes_cli import update_pause_record
     path = _get_planned_stop_marker_path()
     try:
@@ -2286,6 +2335,11 @@ def consume_planned_stop_marker_for_self() -> bool:
         logger.warning("Planned-stop checkpoint skipped (%s); the stop request stays on disk", exc)
         return _consume_pid_marker_for_self(_get_planned_stop_marker_path(), ttl_s=_PLANNED_STOP_MARKER_TTL_S,
                                             keep=True, on_consume=update_pause_record.mark_stop_accepted)
+
+
+def consume_planned_stop_marker_for_self() -> bool:
+    """Return True when the current process is being intentionally stopped."""
+    return consume_planned_stop_request_for_self() is not None
 
 
 def planned_stop_marker_targets_self() -> bool:

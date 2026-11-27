@@ -102,16 +102,18 @@ def _stop(ph: ParityHome, proc: subprocess.Popen) -> bool:
         if proc.poll() is None:
             marker = subprocess.run(
                 [sys.executable, "-c",
-                 "import sys; from gateway.status import write_planned_stop_marker as w, "
-                 "_get_planned_stop_marker_path as p; ok = w(int(sys.argv[1])); print(p()); "
-                 "sys.exit(0 if ok else 1)",
+                 "import sys; from gateway.stop_attribution import write_stop_request as w; "
+                 "from gateway.status import _get_planned_stop_marker_path as p; "
+                 "sid = w(int(sys.argv[1]), kind='cli_stop', reason_code='parity_stop', "
+                 "reason_text='parity driver: hermes gateway stop', lull_gate='not_consulted'); "
+                 "print('%s %s' % (sid, p())); sys.exit(0 if sid else 1)",
                  str(proc.pid)],
                 cwd=ph.project, env=ph.env(), capture_output=True, text=True, timeout=60,
                 stdin=subprocess.DEVNULL,
                 check=False,
             )
             assert marker.returncode == 0, f"planned-stop marker write failed: {marker.stderr[-1000:]}"
-            marker_path = Path(marker.stdout.strip().splitlines()[-1])
+            marker_path = Path(marker.stdout.strip().splitlines()[-1].split(" ", 1)[1])
             deadline = time.monotonic() + STOP_TIMEOUT
             while marker_path.exists() and proc.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.05)

@@ -1428,11 +1428,19 @@ class TestScopedLockTakeover:
 class TestPlannedStopMarker:
     """Tests for intentional service/manual gateway stop markers."""
 
+    @staticmethod
+    def _mark(pid: int) -> bool:
+        """Write a marker through the attributed door (requester + stop_id are mandatory)."""
+        from gateway.stop_attribution import capture_requester, new_stop_id
+
+        return status.write_planned_stop_marker(
+            target_pid=pid, requester=capture_requester(kind="cli_stop"), stop_id=new_stop_id())
+
     def test_write_marker_records_target_identity(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 42)
 
-        ok = status.write_planned_stop_marker(target_pid=12345)
+        ok = self._mark(12345)
 
         assert ok is True
         marker = tmp_path / ".gateway-planned-stop.json"
@@ -1442,6 +1450,20 @@ class TestPlannedStopMarker:
         assert payload["target_start_time"] == 42
         assert payload["stopper_pid"] == os.getpid()
         assert "written_at" in payload
+        # Attribution rides in the marker (schema: t_4f9976aa): no caller may write it bare.
+        assert payload["stop_id"]
+        assert payload["requester"]["kind"] == "cli_stop"
+        assert payload["requester"]["pid"] == os.getpid()
+
+    def test_write_marker_refuses_without_a_requester(self, tmp_path, monkeypatch):
+        """The marker is the gateway's only in-band evidence a stop was ASKED for: an unattributed
+        marker is refused rather than written, so a stop can never be silently unattributable."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        assert status.write_planned_stop_marker(12345, requester={}, stop_id="abc") is False
+        assert status.write_planned_stop_marker(
+            12345, requester={"kind": "cli_stop"}, stop_id="") is False
+        assert not (tmp_path / ".gateway-planned-stop.json").exists()
 
 
     def test_consume_returns_true_on_windows_when_start_time_unavailable(
@@ -1463,7 +1485,7 @@ class TestPlannedStopMarker:
         # Simulate Windows: no start_time available for any PID.
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
 
-        ok = status.write_planned_stop_marker(target_pid=os.getpid())
+        ok = self._mark(os.getpid())
         assert ok is True
         # Marker carries a null start_time, exactly as written on Windows.
         payload = json.loads((tmp_path / ".gateway-planned-stop.json").read_text())
@@ -1486,7 +1508,7 @@ class TestPlannedStopMarker:
         """
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 100)
-        status.write_planned_stop_marker(target_pid=os.getpid())
+        self._mark(os.getpid())
 
         # Simulate PID reuse: same PID, different start_time.
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 9999)

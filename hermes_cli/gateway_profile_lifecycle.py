@@ -21,16 +21,27 @@ def ack_failure(answer):
     return "host control socket did not answer"
 
 
-def mark_planned_stop(pid: int | None = None) -> None:
-    """Best-effort planned-stop marker for ``pid`` (default: the recorded gateway PID)."""
+def mark_planned_stop(pid: int | None = None, *, kind: str = "cli_stop",
+                      reason_code: str | None = "gateway_stop") -> str | None:
+    """Best-effort planned-stop request for ``pid`` (default: the recorded gateway PID).
+
+    Writes the ``gateway.stop_requested`` row and the marker through the single door
+    (``gateway.stop_attribution.write_stop_request``), so the stop is attributable from the log
+    alone; returns the ``stop_id`` (None when there was no pid to stop).
+    """
     try:
-        from gateway.status import get_running_pid, write_planned_stop_marker
+        from gateway.status import get_running_pid
         if pid is None:
             pid = get_running_pid(cleanup_stale=False)
-        if pid is not None:
-            write_planned_stop_marker(pid)
+        if pid is None:
+            return None
+        from gateway.stop_attribution import write_stop_request
+
+        return write_stop_request(
+            pid, kind=kind, reason_code=reason_code, delivery="marker",
+            reason_text="hermes gateway stop / restart", lull_gate="not_consulted")
     except Exception:
-        pass
+        return None
 
 
 def host_scope_for_all_verb(owner):

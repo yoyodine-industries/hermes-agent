@@ -177,31 +177,51 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
     planned_stop_seen = [False]
 
     def shutdown_signal_handler(received_signal=None):
+        from gateway.stop_attribution import announce_stop_seen
+
         # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
         def _takeover() -> bool:
             from gateway.status import consume_takeover_marker_for_self
             return consume_takeover_marker_for_self()
 
         # Planned stop: CLI marks first, else its SIGTERM looks like an external kill. SIGINT = Ctrl+C.
-        def _planned_stop() -> bool:
-            from gateway.status import consume_planned_stop_marker_for_self
-            return consume_planned_stop_marker_for_self()
+        # Returns the marker RECORD (requester + stop_id) so the stop is attributable below.
+        def _planned_stop():
+            from gateway.status import consume_planned_stop_request_for_self
+            return consume_planned_stop_request_for_self()
 
         # Fast (<10ms) sync snapshot: stdlib + /proc, no subprocesses (`ps aux` here once blocked ~3s).
         def _snapshot():
             from gateway.shutdown_forensics import snapshot_shutdown_context
             return snapshot_shutdown_context(received_signal)
 
+        # Snapshot BEFORE the markers are consumed: the marker on disk is exactly the evidence the
+        # context needs (`signal=marker` + requester). Taking it after the consume made every
+        # marker-driven stop read `signal=UNKNOWN planned_stop_marker_present=` (measured
+        # 2026-11-27: pid 381 stopped by the bounce door's marker, log blamed nobody).
+        _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
+
         planned_takeover = bool(_best_effort(_takeover, "Takeover marker check failed: %s"))
-        planned_stop = received_signal == signal.SIGINT or (
-            not planned_takeover and bool(_best_effort(_planned_stop, "Planned stop marker check failed: %s")))
+        planned_stop_request = None if planned_takeover else _best_effort(
+            _planned_stop, "Planned stop marker check failed: %s")
+        planned_stop = received_signal == signal.SIGINT or bool(planned_stop_request)
         # `hermes gateway stop` writes the marker, THEN signals: the planned-stop watcher can consume
         # the marker in between, and the CLI's own SIGTERM must not then read as an external kill.
         if planned_stop:
             planned_stop_seen[0] = True
         elif planned_stop_seen[0] and not planned_takeover:
             planned_stop = True
-        _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
+        # ONE stop_id for this stop, whatever delivered it: the gateway-side half of the record.
+        # Best-effort — a forensic write never decides whether the stop happens.
+        attribution = _best_effort(
+            lambda: announce_stop_seen(planned_stop_request, received_signal=received_signal),
+            "stop attribution record failed: %s")
+        if isinstance(attribution, dict) and _shutdown_ctx is not None:
+            _shutdown_ctx["stop_id"] = attribution.get("stop_id") or _shutdown_ctx.get("stop_id")
+            if not isinstance(_shutdown_ctx.get("requester"), dict):
+                _shutdown_ctx["requester"] = attribution.get("requester")
+            if _shutdown_ctx.get("signal") in (None, "UNKNOWN"):
+                _shutdown_ctx["signal"] = attribution.get("signal") or "marker"
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
 
         if planned_takeover:

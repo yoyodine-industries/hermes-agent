@@ -36,7 +36,10 @@ def _accepted_then_orphaned(tmp_path: Path, monkeypatch, *, home_writable: bool)
     token = pause_record.record_pause({"resume_needed": True, "profiles": {"p": pid},
                                        "identities": {str(pid): pause_record.identity(pid)["ct"]}}, None, [])
     pause_record.mark_stop_requested(token, [pid], markers={pid: marker})
-    assert status.write_planned_stop_marker(pid)
+    from gateway.stop_attribution import capture_requester, new_stop_id
+
+    assert status.write_planned_stop_marker(
+        pid, requester=capture_requester(kind="update"), stop_id=new_stop_id())
     root.chmod(0o555)
     if not home_writable:
         home.chmod(0o555)

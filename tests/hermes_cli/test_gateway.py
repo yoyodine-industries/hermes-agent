@@ -637,7 +637,7 @@ class TestStopProfileGateway:
         )
         monkeypatch.setattr(gateway_windows, "_windows_stop_drain_timeout", lambda: 7.0)
         monkeypatch.setattr(status, "get_running_pid", lambda: pid if alive["value"] else None)
-        monkeypatch.setattr(status, "write_planned_stop_marker", lambda target: None)
+        monkeypatch.setattr("gateway.stop_attribution.write_stop_request", lambda target, **kw: None)
         monkeypatch.setattr(status, "_pid_exists", lambda target: alive["value"])
         # The original gateway (start time 100) exits during the drain and its PID is recycled (999).
         monkeypatch.setattr(
@@ -749,7 +749,7 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
         killed_pids = []
         monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
-        monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
+        monkeypatch.setattr("gateway.stop_attribution.write_stop_request", lambda pid, **kw: None)
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr("time.monotonic", lambda: 1.0)
 
@@ -817,7 +817,7 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         marked_pids = []
         monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
-        monkeypatch.setattr("gateway.status.write_planned_stop_marker", marked_pids.append)
+        monkeypatch.setattr("gateway.stop_attribution.write_stop_request", lambda pid, **kw: marked_pids.append(pid))
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr("time.monotonic", lambda: 1.0)
 
@@ -917,7 +917,7 @@ class TestReaperStartupGrace:
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("time.sleep", lambda _: None)
         marked = []
-        monkeypatch.setattr("gateway.status.write_planned_stop_marker", marked.append)
+        monkeypatch.setattr("gateway.stop_attribution.write_stop_request", lambda pid, **kw: marked.append(pid))
 
         assert gateway._reap_unsupervised_gateway_orphans(min_age_s=180.0) is True
         assert marked == [stale]

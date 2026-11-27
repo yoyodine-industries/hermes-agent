@@ -90,6 +90,11 @@ def _exit_diag_records(home: Path) -> list:
     return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
 
 
+def _by_tag(home: Path, tag: str) -> dict:
+    """The record for ``tag`` (every boot also writes ``gateway.previous_exit`` first)."""
+    return next(r for r in _exit_diag_records(home) if r["tag"] == tag)
+
+
 # ── the checker itself ──────────────────────────────────────────────────────
 
 
@@ -120,7 +125,7 @@ def test_unclean_exit_records_the_corruption_verdict(tmp_path: Path) -> None:
 
     assert evidence is not None
     assert evidence["state_db_integrity"] != "ok"
-    record = _exit_diag_records(tmp_path)[0]
+    record = _by_tag(tmp_path, "gateway.previous_unclean_exit")
     assert record["state_db_integrity"] != "ok"
 
 
@@ -178,9 +183,8 @@ def test_deferred_startup_never_runs_the_check_inline(tmp_path: Path, monkeypatc
     assert evidence["state_db_integrity"] == "deferred"
     assert not started.is_set(), "the inline integrity scan ran on the deferred boot path"
     assert elapsed < 5.0
-    record = _exit_diag_records(tmp_path)[0]
+    record = _by_tag(tmp_path, "gateway.previous_unclean_exit")
     assert record["state_db_integrity"] == "deferred"
-    assert record["tag"] == "gateway.previous_unclean_exit"
 
 
 def test_deferred_scan_appends_a_second_record_and_returns_the_verdict(tmp_path: Path) -> None:
@@ -194,8 +198,8 @@ def test_deferred_scan_appends_a_second_record_and_returns_the_verdict(tmp_path:
 
     records = _exit_diag_records(tmp_path)
     assert [r["tag"] for r in records] == [
-        "gateway.previous_unclean_exit", "gateway.state_db_integrity"]
-    deferred = records[1]
+        "gateway.previous_exit", "gateway.previous_unclean_exit", "gateway.state_db_integrity"]
+    deferred = records[-1]
     assert deferred["deferred"] is True
     assert deferred["state_db_integrity"] == verdict
     assert deferred["prior_pid"] == _DEAD_PID
