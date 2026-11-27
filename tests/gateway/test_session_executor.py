@@ -277,3 +277,17 @@ def test_configure_reads_the_gateway_config_key_once(monkeypatch):
     assert session_executor.configure(_Config()) == 'default'
     # Sticky for the process: a later caller cannot flip a running executor underneath it.
     assert session_executor.configure(None) == 'default'
+
+
+def test_close_on_a_full_queue_is_bounded_not_a_hang():
+    """Shutdown must not wait forever for a queue slot: the join is bounded, the drain is best-effort."""
+    started, release, blocked, _ = _gate()
+    executor = SessionStoreExecutor(workers=1, queue_depth=1, deadline_s=5.0)
+    executor.submit(blocked, 'first', task='first')
+    assert started.wait(5)
+    executor.submit(blocked, 'queued', task='queued')
+    began = time.monotonic()
+    executor.close()                      # the queue is full AND the only worker is wedged
+    elapsed = time.monotonic() - began
+    release.set()
+    assert elapsed < 7.0, f'close() took {elapsed:.1f}s on a full queue'

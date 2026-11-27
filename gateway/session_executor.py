@@ -325,13 +325,19 @@ class SessionStoreExecutor:
             logger.debug(line, task, run_ms, wait_ms, self._name)
 
     def close(self, *, wait: bool = True) -> None:
-        """Stop accepting work and stop the threads (tests and clean shutdown)."""
+        """Stop accepting work and stop the threads (tests and clean shutdown).
+
+        A FULL queue must not turn shutdown into a hang: the sentinel is best-effort (a worker
+        drains the remaining tickets and then sees ``_closed``), and the join is bounded. Nothing
+        is lost — an unacknowledged session-store write is the caller's to re-ask, and the worker's
+        own outbox retains it.
+        """
         self._closed = True
         for _ in self._threads:
             try:
                 self._queue.put_nowait(None)
-            except queue.Full:  # a full queue is drained by the workers; nudge once more
-                self._queue.put(None)
+            except queue.Full:
+                break
         if wait:
             for thread in self._threads:
                 thread.join(5.0)
