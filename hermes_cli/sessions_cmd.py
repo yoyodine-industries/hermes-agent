@@ -1390,8 +1390,118 @@ def _cmd_adopt(args):
     return cmd_adopt(args)
 
 
+def _fmt_bytes(value) -> str:
+    from hermes_cli.sizefmt import format_bytes
+    return format_bytes(value)
+
+
+def _maintenance_geometry_line(label: str, geo) -> str:
+    geo = geo or {}
+    mode = geo.get("auto_vacuum")
+    mode_text = {0: "NONE", 1: "FULL", 2: "INCREMENTAL"}.get(mode, "?") if mode is not None else "?"
+    return (f"  {label}: file {_fmt_bytes(geo.get('file_bytes'))}, live {_fmt_bytes(geo.get('live_bytes'))}, "
+            f"slack {_fmt_bytes(geo.get('slack_bytes'))}, prunable {_fmt_bytes(geo.get('prunable_bytes'))}, "
+            f"auto_vacuum {mode_text}")
+
+
+def _print_maintenance_receipt(receipt: dict, *, source: str, dry_run: bool) -> int:
+    """Print one maintenance receipt. A refused reclaim is printed as data — never a silent green."""
+    if receipt.get("error"):
+        print(f"Maintenance failed: {receipt['error']}")
+        return 1
+    print(f"state.db maintenance — {source}")
+    print(_maintenance_geometry_line("before", receipt.get("before")))
+    if dry_run:
+        if not receipt.get("dry_run"):
+            print("  (the owner answered without a dry-run receipt)")
+            return 0
+        print(f"  dry run — nothing written. retention {receipt.get('retention_days')} day(s); "
+              f"{receipt.get('prune_candidates')} ended session(s) match the window; "
+              f"reclaim would {receipt.get('reclaim_mode') or 'not run'}")
+        ratio = receipt.get("freelist_ratio")
+        if isinstance(ratio, float):
+            print(f"  freelist ratio {ratio * 100:.1f}%")
+        return 0
+    print(f"  retention {receipt.get('retention_days')} day(s): pruned {receipt.get('pruned')} session(s), "
+          f"{receipt.get('pruned_archived_messages')} archived message row(s); "
+          f"closed {receipt.get('closed')} stale open session(s); "
+          f"reaped {receipt.get('reaped_orphan_messages')} orphan message row(s); "
+          f"merged {receipt.get('fts_indexes_optimized')} FTS index(es)")
+    if receipt.get("skipped"):
+        print("  the pass was SKIPPED (an earlier pass is inside its own interval, or the maintenance lock is "
+              "held) — nothing was pruned and no reclaim was attempted")
+    elif receipt.get("vacuum_skipped_holders"):
+        holders = receipt.get("vacuum_skipped_holder_pids") or []
+        print(f"  reclaim REFUSED: {receipt['vacuum_skipped_holders']} other holder(s) of the store — nothing "
+              "was rewritten. Move them, then re-run:")
+        for holder in holders:
+            print(f"    {holder}")
+    elif receipt.get("vacuumed"):
+        print(f"  reclaim: {receipt.get('reclaim_mode')} — {_fmt_bytes(receipt.get('reclaimed_bytes'))} returned "
+              f"in {receipt.get('max_lock_hold_ms')} ms of longest write-lock hold")
+    elif receipt.get("reclaim_stopped"):
+        print(f"  reclaim not attempted: {receipt['reclaim_stopped']} (freed rows below the freelist-ratio "
+              "gate, or nothing was freed)")
+    else:
+        print("  reclaim not attempted: no row-deleting leg freed anything")
+    print(_maintenance_geometry_line("after", receipt.get("after")))
+    return 0
+
+
+def _cmd_maintain(args) -> int:
+    """``hermes sessions maintain``: ONE state.db maintenance pass, applied by the OWNER.
+
+    The always-on gateway owns ``state.db``, so with a ready owner the owner runs the pass
+    in-process (it is exempt from its own holder scan) and this process only prints the receipt.
+    With no owner the pass runs here, behind the same holder scan ``optimize-storage`` uses — never
+    ``--force``, and it never stops or restarts a service. A skipped reclaim is reported as data
+    (the holder list), not as a failed exit code: the pass is idempotent and the refusal names what
+    to move.
+    """
+    from hermes_cli.sessions_owner import live_owner, owner_maintain, report_maintenance_failure
+    dry_run = bool(getattr(args, "dry_run", False))
+    as_json = bool(getattr(args, "json", False))
+    endpoint = live_owner()
+    if endpoint is not None:
+        try:
+            receipt = owner_maintain(endpoint, **({"dry_run": True} if dry_run else {}))
+        except Exception as exc:
+            return report_maintenance_failure(exc)
+        if as_json:
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0
+        return _print_maintenance_receipt(receipt, source="owner", dry_run=dry_run)
+    path = get_hermes_home() / "state.db"
+    if not path.exists():
+        print(f"{path} not created yet — nothing to maintain.")
+        return 0
+    if not dry_run:
+        from hermes_state_holders import held_store_refusal
+        # force_hint=None: this verb offers no override. A holder means the owner is absent and
+        # another writer is live — the pass waits, it never rewrites the store underneath one.
+        refusal = held_store_refusal(path, command="maintain", force_hint=None)
+        if refusal:
+            print(refusal)
+            return 1
+    from hermes_cli.config import load_config
+    from hermes_state import SessionDB
+    from hermes_state_maintenance import run_state_db_maintenance
+    sessions_cfg = dict(load_config().get("sessions") or {})
+    db = SessionDB(db_path=path, read_only=dry_run)
+    try:
+        receipt = run_state_db_maintenance(
+            db, sessions_cfg=sessions_cfg, sessions_dir=_sessions_dir(), dry_run=dry_run)
+    finally:
+        db.close()
+    if as_json:
+        print(json.dumps(receipt, indent=2, sort_keys=True))
+        return 0
+    return _print_maintenance_receipt(receipt, source=str(path), dry_run=dry_run)
+
+
 _PRE_DB_HANDLERS = {
     "repair": _cmd_repair, "recover": _cmd_recover, "import": _cmd_import,
+    "maintain": _cmd_maintain,  # the owner applies the pass; this process never opens it as a writer
     "repair-profiles": _cmd_repair_profiles,  # opens every profile's store itself
     "set-journal-mode": _cmd_set_journal_mode,  # offline: must not open the store it converts
     "discard": _cmd_discard,  # a gateway control (prompt.resolve_unknown), never a direct store write

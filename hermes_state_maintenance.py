@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -386,7 +387,7 @@ class SessionMaintenanceMixin:
         }
 
     @staticmethod
-    def _window_age_arms(filters: Dict[str, Any]) -> list[Tuple[str, list]]:
+    def _window_age_arms(filters: dict[str, Any]) -> list[tuple[str, list]]:
         """The age clause(s) that define "past the window" for the census, independent of
         eligibility: activity, else start time, else nothing can be past an unbounded window."""
         if filters.get("last_active_before") is not None:
@@ -679,6 +680,42 @@ class SessionMaintenanceMixin:
         a stat() delta understates the win and can go negative."""
         values = self._page_pragmas(("page_count", "page_size"), "Could not read logical DB size: %s")
         return None if values is None else values[0] * values[1]
+
+    def store_geometry(self) -> dict[str, Any]:
+        """The store's shape, over the live connection — the numbers a maintenance receipt reports.
+
+        * ``live_bytes`` — pages actually in use: ``(page_count - freelist_count) * page_size``;
+        * ``prunable_bytes`` — ``freelist_count * page_size``: what a reclaim gives back NOW;
+        * ``file_bytes`` — ``os.path.getsize`` of the main file, WAL sidecar EXCLUDED (a rewrite
+          lands in ``-wal`` until a checkpoint, so a stat() delta is not the reclaim's size);
+        * ``slack_bytes`` — ``file_bytes - live_bytes - prunable_bytes``: file bytes neither live
+          nor on the freelist. May be negative while the WAL holds pages this connection has not
+          checkpointed; that is a measurement, not an error.
+
+        Never raises: an unreadable PRAGMA or unreadable file leaves those fields ``None``.
+        """
+        values = self._page_pragmas(
+            ("page_count", "page_size", "freelist_count", "auto_vacuum"),
+            "Could not read the store geometry: %s")
+        out: dict[str, Any] = {
+            "page_count": None, "page_size": None, "freelist_count": None, "auto_vacuum": None,
+            "live_bytes": None, "file_bytes": None, "slack_bytes": None, "prunable_bytes": None,
+        }
+        db_path = getattr(self, "db_path", None)
+        if db_path is not None:
+            try:
+                out["file_bytes"] = os.path.getsize(db_path)
+            except OSError:
+                pass
+        if values is not None:
+            pages, page_size, freelist, auto_vacuum = values
+            out.update(page_count=pages, page_size=page_size, freelist_count=freelist,
+                       auto_vacuum=auto_vacuum)
+            out["prunable_bytes"] = freelist * page_size
+            out["live_bytes"] = (pages - freelist) * page_size
+            if out["file_bytes"] is not None:
+                out["slack_bytes"] = out["file_bytes"] - out["live_bytes"] - out["prunable_bytes"]
+        return out
 
     def _freelist_ratio(self) -> Optional[float]:
         """Reclaimable fraction (``freelist_count / page_count``) gating VACUUM in
@@ -1061,3 +1098,77 @@ class SessionMaintenanceMixin:
         finally:
             _release_auto_maintenance_lock(maintenance_lock)
         return result
+
+
+# ── the owner-applied maintenance pass (card t_bf94858f) ─────────────────────────────────────
+#
+# ONE resolver and ONE runner for every producer of a maintenance pass: the gateway housekeeping
+# tick (``gateway/run.py::_housekeeping_state_db_maintenance``), the ``session.maintenance`` owner
+# RPC (``gateway/session_maintenance.py``) and the no-owner CLI fallback (``hermes sessions
+# maintain``). A pass an operator triggers is then, by construction, the pass the tick would run:
+# same config resolution, same store call, same receipt. Nothing here hard-codes 90 days.
+
+def resolve_maintenance_kwargs(sessions_cfg: Optional[dict] = None, *, retention_days=None,
+                               vacuum=None) -> dict[str, Any]:
+    """``SessionDB.maybe_auto_prune_and_vacuum`` kwargs for ONE profile.
+
+    *sessions_cfg* is that profile's OWN ``sessions`` config section (``load_config()`` inside the
+    profile's home scope — never the launch home's block, which a secondary does not inherit).
+    Explicit *retention_days* / *vacuum* override the profile's values; ``None`` means "the
+    profile's own config". The caller supplies ``sessions_dir`` (its transcript dir).
+    """
+    cfg = sessions_cfg if isinstance(sessions_cfg, dict) else {}
+    if retention_days is None:
+        retention_days = cfg.get("retention_days", 90)
+    if vacuum is None:
+        vacuum = cfg.get("vacuum_after_prune", True)
+    return {
+        "retention_days": int(retention_days),
+        "min_interval_hours": int(cfg.get("min_interval_hours", 24)),
+        "min_vacuum_interval_days": int(cfg.get("min_vacuum_interval_days", 1)),
+        "vacuum": bool(vacuum),
+        "vacuum_chunk_pages": int(cfg.get("vacuum_chunk_pages", RECLAIM_CHUNK_PAGES)),
+        "vacuum_max_pages_per_pass": int(cfg.get("vacuum_max_pages_per_pass", RECLAIM_MAX_PAGES_PER_PASS)),
+        "vacuum_max_seconds_per_pass": float(cfg.get("vacuum_max_seconds_per_pass", RECLAIM_MAX_SECONDS_PER_PASS)),
+    }
+
+
+def run_state_db_maintenance(db, *, sessions_cfg: Optional[dict] = None, retention_days=None,
+                             vacuum=None, sessions_dir: Optional[Path] = None,
+                             dry_run: bool = False) -> dict[str, Any]:
+    """One maintenance pass on an ALREADY-OPEN SessionDB — the owner's own instance.
+
+    The store must be the owner's live handle: a second connection under a live gateway is the
+    second-writer class the held-store refusal exists to stop, so callers never re-open the store
+    to maintain it. ``dry_run`` writes NOTHING; it reports what the pass would select.
+
+    The receipt is the store's own (``maybe_auto_prune_and_vacuum``, which also records
+    ``state_meta['last_state_db_maintenance']``), plus ``before`` / ``after`` geometry
+    (:meth:`SessionMaintenanceMixin.store_geometry`) so a reader can tell a pass that reclaimed
+    nothing from one that never attempted a reclaim.
+    """
+    kwargs = resolve_maintenance_kwargs(sessions_cfg, retention_days=retention_days, vacuum=vacuum)
+    before = db.store_geometry()
+    if dry_run:
+        ratio = db._freelist_ratio()
+        mode = before.get("auto_vacuum")
+        return {
+            "dry_run": True,
+            "retention_days": kwargs["retention_days"],
+            "vacuum": kwargs["vacuum"],
+            "prune_candidates": db.count_prune_matches(older_than_days=kwargs["retention_days"]),
+            "freelist_ratio": ratio,
+            # Which reclaim branch the pass would take; None when the caller disabled reclaim.
+            "reclaim_mode": (("incremental" if mode == 2 else "migrate") if kwargs["vacuum"] else None),
+            "before": before,
+            "after": before,
+        }
+    receipt = db.maybe_auto_prune_and_vacuum(sessions_dir=sessions_dir, **kwargs)
+    receipt["retention_days"] = kwargs["retention_days"]  # kept on a skipped pass, which omits it
+    if receipt.get("vacuumed"):
+        # A migration VACUUM writes the new image THROUGH the WAL, so the main file still carries
+        # its old size until a checkpoint copies it back. PASSIVE (never TRUNCATE: it retires the
+        # generation a sibling writer holds) makes ``after.file_bytes`` the bytes a reader sees,
+        # instead of a pre-checkpoint snapshot that understates the reclaim.
+        db._try_checkpoint("PASSIVE", "WAL checkpoint after the maintenance reclaim failed: %s")
+    return {**receipt, "before": before, "after": db.store_geometry()}

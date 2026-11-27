@@ -4846,6 +4846,48 @@ export interface SessionPruneResult {
   routing_deleted?: number | null
   skipped?: number | null
 }
+/** No filters: one retention window, one reclaim switch, and a dry run that writes nothing. ``retention_days`` / ``vacuum`` default to the profile's OWN ``sessions`` config at call time (never a hard-coded 90); ``dry_run`` reports what the pass would select. */
+export interface SessionMaintenanceParams {
+  retention_days?: number | null
+  vacuum?: boolean | null
+  dry_run?: boolean | null
+}
+/** The store's own maintenance receipt (``maybe_auto_prune_and_vacuum`` + the ``state_meta['last_state_db_maintenance']`` row it writes) plus ``before`` / ``after`` geometry. ``vacuum_skipped_holders`` > 0 means the reclaim was REFUSED by a live holder and ``vacuum_skipped_holder_pids`` names them — distinguishable from a pass that reclaimed 0 bytes because it stopped at the freelist-ratio gate (``reclaim_stopped``). */
+export interface SessionMaintenanceResult {
+  dry_run?: boolean | null
+  skipped?: boolean | null
+  retention_days?: number | null
+  vacuum?: boolean | null
+  pruned?: number | null
+  pruned_archived_messages?: number | null
+  closed?: number | null
+  reaped_orphan_messages?: number | null
+  fts_indexes_optimized?: number | null
+  vacuumed?: boolean | null
+  reclaim_mode?: string | null
+  reclaim_stopped?: string | null
+  reclaimed_bytes?: number | null
+  reclaimed_pages?: number | null
+  max_lock_hold_ms?: number | null
+  freelist_ratio?: number | null
+  vacuum_skipped_holders?: number | null
+  vacuum_skipped_holder_pids?: string[] | null
+  prune_candidates?: number | null
+  error?: string | null
+  before?: StoreGeometry | null
+  after?: StoreGeometry | null
+}
+/** ``SessionDB.store_geometry()``: the store's shape over the owner's live connection. The four byte quantities are kept SEPARATE on purpose — ``prunable_bytes`` is what a reclaim gives back now, ``slack_bytes`` is neither live nor on the freelist (and may be negative while the WAL holds un-checkpointed pages). */
+export interface StoreGeometry {
+  page_count?: number | null
+  page_size?: number | null
+  freelist_count?: number | null
+  auto_vacuum?: number | null
+  live_bytes?: number | null
+  file_bytes?: number | null
+  slack_bytes?: number | null
+  prunable_bytes?: number | null
+}
 export interface CommandObserveParams {
   session_id: string
   name: string
@@ -7214,6 +7256,8 @@ export interface CanonicalRpcMethods {
   'session.info': { params: CanonicalSessionInfoParams; result: CanonicalSessionInfo }
   'session.interrupt': { params: CanonicalControlParams; result: CanonicalSessionHandle }
   'session.list': { params: CanonicalListParams; result: CanonicalListResult }
+  /** Local operator only: the owner runs ONE state.db maintenance pass (prune + archived-row retention + stale-open close + orphan reap + FTS merge + bounded reclaim) on its own live store; a reclaim refused by a live holder comes back as data, never as a silent green pass. */
+  'session.maintenance': { params: SessionMaintenanceParams; result: SessionMaintenanceResult }
   /** Revision-fenced, retry-idempotent session edit (rename, archive, sidebar, branch, delete, rewind, reset, model, reasoning, workspace, edit_policy, compress, import). */
   'session.mutate': { params: SessionMutateParams; result: SessionMutateResult }
   /** Local operator only: the owner deletes the ended sessions `hermes sessions prune` selected, skipping busy sessions and retained reset owners. */
@@ -7279,6 +7323,7 @@ export const CANONICAL_RPC_METHODS = [
   'session.info',
   'session.interrupt',
   'session.list',
+  'session.maintenance',
   'session.mutate',
   'session.prune',
   'session.redirect',

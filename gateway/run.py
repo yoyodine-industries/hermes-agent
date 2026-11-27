@@ -4334,15 +4334,11 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
                 idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
                 min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)))
         if _sess_cfg.get("auto_prune", False):
+            # ONE resolver (hermes_state_maintenance.resolve_maintenance_kwargs) is shared with the
+            # `session.maintenance` owner RPC, so an operator-triggered pass runs exactly this pass.
+            from hermes_state_maintenance import resolve_maintenance_kwargs
             _adb.maybe_auto_prune_and_vacuum(
-                retention_days=int(_sess_cfg.get("retention_days", 90)),
-                min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                min_vacuum_interval_days=int(_sess_cfg.get("min_vacuum_interval_days", 1)),
-                vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
-                vacuum_chunk_pages=int(_sess_cfg.get("vacuum_chunk_pages", 512)),
-                vacuum_max_pages_per_pass=int(_sess_cfg.get("vacuum_max_pages_per_pass", 4096)),
-                vacuum_max_seconds_per_pass=float(_sess_cfg.get("vacuum_max_seconds_per_pass", 5.0)),
-                sessions_dir=_profile_sessions_dir(launch))
+                sessions_dir=_profile_sessions_dir(launch), **resolve_maintenance_kwargs(_sess_cfg))
     finally:
         release_or_close(_adb)
 

@@ -2,10 +2,10 @@
  "counts": {
   "http": {
    "keep-host-wide": 1,
-   "undecided": 349
+   "undecided": 350
   },
   "rpc": {
-   "authority": 112,
+   "authority": 113,
    "keep-host-wide": 1,
    "undecided": 179
   },
@@ -181,6 +181,7 @@
   {"current_path": "hermes_cli.web_routers.skills:list_skill_hub_updates", "decision": "undecided", "handler": "GET /api/skills/hub/updates", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.status:get_ssh_ownership", "decision": "undecided", "handler": "GET /api/ssh/ownership", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.status:get_status", "decision": "undecided", "handler": "GET /api/status", "kind": "http", "ref": ""},
+  {"current_path": "hermes_cli.web_routers.status:get_substrate", "decision": "undecided", "handler": "GET /api/substrate", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.status:get_system_stats", "decision": "undecided", "handler": "GET /api/system/stats", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.tools:get_computer_use_status", "decision": "undecided", "handler": "GET /api/tools/computer-use/status", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.tools:get_terminal_backends", "decision": "undecided", "handler": "GET /api/tools/terminal/backends", "kind": "http", "ref": ""},
@@ -602,6 +603,7 @@
   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "session.info", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "session.interrupt", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "session.list", "kind": "rpc", "ref": ""},
+  {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "session.maintenance", "kind": "rpc", "ref": ""},
   {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "session.most_recent", "kind": "rpc", "ref": "D3"},
   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "session.mutate", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "session.prune", "kind": "rpc", "ref": ""},
