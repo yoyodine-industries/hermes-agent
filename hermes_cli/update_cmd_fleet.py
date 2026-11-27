@@ -1603,6 +1603,16 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
             if _restart_left_pending(pid, proc.profile, out.self_restart_pending_pids, born,
                                      supervised=restart_mode == "external-supervisor"):
                 continue
+            # Attribute the stop BEFORE the signal (the drain fell back to SIGTERM): no marker
+            # here — a planned-stop marker would turn a restart into a stop.
+            with suppress(Exception):
+                from gateway.stop_attribution import write_stop_request
+                from hermes_cli.update_cmd_windows import _update_run_id
+                write_stop_request(
+                    pid, kind="update", reason_code="update_restart_sigterm",
+                    reason_text=f"hermes update {_update_run_id() or 'unknown-run'} restarted the "
+                                f"gateway at the post-update fleet restart stage",
+                    delivery="sigterm", write_marker=False, lull_gate="not_consulted")
             with suppress(ProcessLookupError, PermissionError):
                 os.kill(pid, _signal.SIGTERM)
         # Wait ≤5s for exit: Telegram keeps the old getUpdates session ~30s; a new gateway
@@ -1618,6 +1628,14 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     for pid in manual_pids:
         if pid in profile_processes and pid not in unrestartable_pids:
             continue
+        with suppress(Exception):
+            from gateway.stop_attribution import write_stop_request
+            from hermes_cli.update_cmd_windows import _update_run_id
+            write_stop_request(
+                pid, kind="update", reason_code="update_stop_unmapped",
+                reason_text=f"hermes update {_update_run_id() or 'unknown-run'} stopped an unmapped "
+                            f"gateway at the post-update fleet stage",
+                delivery="sigterm", write_marker=False, lull_gate="not_consulted")
         with suppress(ProcessLookupError, PermissionError):
             os.kill(pid, _signal.SIGTERM)
             out.killed_pids.add(pid)

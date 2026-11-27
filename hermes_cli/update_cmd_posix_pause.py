@@ -395,7 +395,8 @@ def _stop_job(job: dict, *, drained: bool = False) -> None:
     from hermes_cli.gateway import _locate_launchd_gateway_service
     from hermes_cli.update_cmd_windows import _write_update_planned_stop_marker
     if not drained and job.get("home"):
-        _write_update_planned_stop_marker(Path(job["home"]), job["pid"])
+        _write_update_planned_stop_marker(Path(job["home"]), job["pid"],
+                                          stage="launchd_bootout", delivery="launchd")
     result = subprocess.run(["launchctl", "bootout", f"{job['domain']}/{job['label']}"],
                             capture_output=True, text=True, encoding="utf-8", errors="replace",
                    stdin=subprocess.DEVNULL, timeout=90, check=False)
@@ -466,7 +467,8 @@ def _stop_at_once(entry: dict) -> None:
     elif entry.get("kind") == "launchd":
         _stop_job(entry)
     else:
-        _write_update_planned_stop_marker(Path(entry["home"]), entry["pid"])
+        _write_update_planned_stop_marker(Path(entry["home"]), entry["pid"],
+                                          stage="sigterm_stop", delivery="sigterm")
         with suppress(ProcessLookupError, PermissionError):
             os.kill(entry["pid"], signal.SIGTERM)
 

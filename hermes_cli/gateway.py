@@ -1661,6 +1661,14 @@ def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None,
                     continue
                 from gateway.status import get_process_start_time
                 expected_start_time = get_process_start_time(pid)
+            # Attribute the stop BEFORE the signal: this sweep is a bare SIGTERM with no marker,
+            # so without this row the next restart reads as an unexplained death.
+            with contextlib.suppress(Exception):
+                from gateway.stop_attribution import write_stop_request
+                write_stop_request(pid, kind="operator", reason_code="gateway_kill",
+                                   reason_text="gateway process killed by the CLI sweep",
+                                   delivery="sigterm", write_marker=False,
+                                   lull_gate="not_consulted")
             terminate_pid(pid, force=force, expected_start_time=expected_start_time)
             killed += 1
         except ProcessLookupError:
@@ -3625,7 +3633,8 @@ def systemd_stop(system: bool = False):
     system = _systemd_scope_preamble("stop", system)
     gateway_service_owner.refuse_foreign_systemd_unit("stop", system)
     _sync_hermes_home_from_systemd_unit(system=system)
-    _mark_planned_stop()
+    # The stop is delivered by systemd, not by our own marker+SIGTERM: say so in the record.
+    _mark_planned_stop(kind="supervisor", reason_code="systemd_stop", delivery="systemd")
     try:
         _run_systemctl(["stop", get_service_name()], system=system, check=True, timeout=90)
     except subprocess.TimeoutExpired:
@@ -5284,6 +5293,10 @@ def _stop_host_multiplexer(owner) -> int:
     if stopped:
         return stopped
     try:
+        from gateway.stop_attribution import write_stop_request
+        write_stop_request(owner.pid, kind="operator", reason_code="host_stop",
+                           reason_text="host gateway stopped for `hermes gateway stop --all`",
+                           delivery="sigterm", write_marker=False, lull_gate="not_consulted")
         terminate_pid(owner.pid, force=False)
         return 1
     except (ProcessLookupError, PermissionError, OSError):

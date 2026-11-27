@@ -1952,6 +1952,13 @@ def _stop_gateway_process(profile_dir: Path) -> None:
         expected_start_time = data.get("start_time")
         if expected_start_time is None:
             expected_start_time = get_process_start_time(pid)
+        # Attribute the stop BEFORE the signal: a profile delete/park stops the gateway with a
+        # bare SIGTERM, which would otherwise read as an unexplained death next boot.
+        with contextlib.suppress(Exception):
+            from gateway.stop_attribution import write_stop_request
+            write_stop_request(pid, kind="operator", reason_code="profile_stop",
+                               reason_text=f"gateway stopped with profile {profile_dir.name!r}",
+                               delivery="sigterm", write_marker=False, lull_gate="not_consulted")
         terminate_pid(pid)  # graceful first
         if _wait_then_force_kill([pid], {pid: expected_start_time}):
             print(f"✓ Gateway stopped (PID {pid})")

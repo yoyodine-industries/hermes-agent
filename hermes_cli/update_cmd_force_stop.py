@@ -141,7 +141,14 @@ def _signal_stop(entry: dict) -> None:
     """Planned-stop marker + SIGTERM: the gateway's immediate ``stop()``, read as a planned stop."""
     from hermes_cli.update_cmd_windows import _write_update_planned_stop_marker
     if entry.get("home"):
-        _write_update_planned_stop_marker(Path(entry["home"]), entry["pid"])
+        _write_update_planned_stop_marker(Path(entry["home"]), entry["pid"],
+                                          stage="force_stop", delivery="sigterm")
+    else:
+        # No home to place the marker in: still record the request before the signal, in ours.
+        from gateway.stop_attribution import write_stop_request
+        write_stop_request(entry["pid"], kind="update", reason_code="update_stop",
+                           reason_text="hermes update --force stopped a gateway with no known home",
+                           delivery="sigterm", write_marker=False, lull_gate="not_consulted")
     with suppress(ProcessLookupError, PermissionError):
         os.kill(entry["pid"], signal.SIGTERM)
 

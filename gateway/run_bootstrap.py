@@ -74,6 +74,21 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
         return False
     existing_start_time = get_process_start_time(existing_pid)
     logger.info("Replacing existing gateway instance (PID %d) with --replace.", existing_pid)
+    # Attribute the takeover BEFORE the request is delivered. THIS process is the requester (the
+    # incoming gateway); the victim is the target. The takeover marker below is the delivery, so
+    # no planned-stop marker is written here (that would change the victim's exit classification).
+    try:
+        from gateway.stop_attribution import capture_requester, write_stop_request
+        write_stop_request(
+            existing_pid, kind="replace_takeover", reason_code="replace_requested",
+            reason_text="incoming gateway started with --replace and is taking over this home",
+            lull_gate="not_consulted", delivery="marker", write_marker=False,
+            requester=capture_requester(
+                kind="replace_takeover", reason_code="replace_requested",
+                reason_text="incoming gateway started with --replace and is taking over this home",
+                lull_gate="not_consulted"))
+    except Exception:
+        pass
     # Takeover marker: target exits 0 on our SIGTERM (exit 1 → systemd Restart=on-failure flap loop).
     try:
         from gateway.status import write_takeover_marker

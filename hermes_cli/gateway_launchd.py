@@ -850,7 +850,8 @@ def _launchd_ok(message: str) -> None:
 def launchd_stop():
     gateway_service_owner.refuse_foreign_launchd_plist("stop")
     target = f"{_launchd_domain()}/{get_launchd_label()}"
-    _gw()._mark_planned_stop()
+    # launchd delivers the stop (bootout): record that, not a marker+SIGTERM.
+    _gw()._mark_planned_stop(kind="supervisor", reason_code="launchd_stop", delivery="launchd")
     # bootout unloads the definition so KeepAlive doesn't respawn; `hermes gateway start` re-bootstraps.
     try:
         # Captured: an already-unloaded job (3/113/125) is handled below, so launchctl's own
