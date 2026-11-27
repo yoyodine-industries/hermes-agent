@@ -74,6 +74,23 @@ class _FakeGateway:
     def _active_cron_job_count(self):
         return 0
 
+    # The drain censuses production workflow flights beside cron/api work (``run_shutdown_workflow``)
+    # and names any run the kill sweep reaped. The census/attribution methods themselves are
+    # production code and run here unchanged over an EMPTY registry: this double serves no flights,
+    # so only the two ledger readers are stubbed. A new drain-time read therefore needs no new
+    # hand-written stub here — only a reader that would touch the real ledger does.
+    _workflow_census_at_start = gw_mod.GatewayRunner._workflow_census_at_start
+    _workflow_census_now = gw_mod.GatewayRunner._workflow_census_now
+    _workflow_census_fragment = gw_mod.GatewayRunner._workflow_census_fragment
+    _stamp_reaped_workflow_runs = gw_mod.GatewayRunner._stamp_reaped_workflow_runs
+    _shutdown_interrupt_reason = gw_mod.GatewayRunner._shutdown_interrupt_reason
+
+    def _workflow_runs_in_flight(self):
+        return []
+
+    def _workflow_runs_now(self):
+        return []
+
     # Real hook + counter: 0 while ``adapters`` is empty, the API-server count once a fake adapter is in.
     _api_server_hook = gw_mod.GatewayShutdownMixin._api_server_hook
     _mark_api_runs_shutdown_requested = gw_mod.GatewayShutdownMixin._mark_api_runs_shutdown_requested
