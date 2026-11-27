@@ -105,6 +105,18 @@ def _exists(path: Path) -> bool:
         return False
 
 
+#: launchctl's own answers for one ``print``: loaded here, not loaded in this domain, and this
+#: domain cannot own the label at all. The last is what a LaunchDaemon probed as a per-user agent
+#: returns on every call, so it is never terminal.
+_LAUNCHD_LOADED = 0
+_LAUNCHD_NOT_LOADED = 113
+_LAUNCHD_DOMAIN_CANNOT_OWN = 125
+
+#: Where LaunchDaemon definitions live. Module-level so a test can point it at a fixture: the
+#: domain a label can be loaded in follows from the definition's own directory.
+_LAUNCHD_DAEMON_DIR = Path("/Library/LaunchDaemons")
+
+
 def _systemd(home: Path, deadline: float) -> ExistingService | None:
     from hermes_cli import gateway as gw
     from hermes_cli.service_manager import _s6_running
@@ -201,38 +213,65 @@ def _s6(home: Path, deadline: float) -> ExistingService | None:
     return ExistingService("s6", (service_name,), manager.is_running(service_name))
 
 
+def _launchd_domains(label: str, agent_plist: Path) -> list[tuple[str, Path | None]]:
+    """The domains that can own *label*, in the order its own definitions say to ask.
+
+    A LaunchDaemon definition (``/Library/LaunchDaemons/<label>.plist``) can only be loaded in
+    ``system/``; a LaunchAgent definition lives in ``gui/<uid>`` then ``user/<uid>``. Asking a
+    domain the label cannot live in is not an error — ``launchctl print`` answers 125 there — but
+    it used to be terminal, so on a LaunchDaemon host every client's probe failed on the first
+    ``gui/`` call. With no definition on disk all three are still asked (a job can be loaded from
+    a file since removed): an unprobed domain could hold the loaded owner a start would duplicate.
+    """
+    daemon_plist = _LAUNCHD_DAEMON_DIR / f"{label}.plist"
+    domains: list[tuple[str, Path | None]] = []
+    if _exists(daemon_plist):
+        domains.append(("system", daemon_plist))
+    if _exists(agent_plist):
+        domains.append((f"gui/{os.getuid()}", agent_plist))  # windows-footgun: ok — native launchd only
+        domains.append((f"user/{os.getuid()}", agent_plist))  # windows-footgun: ok — native launchd only
+    if domains:
+        return domains
+    return [(f"gui/{os.getuid()}", None), (f"user/{os.getuid()}", None),  # windows-footgun: ok — native launchd only
+            ("system", None)]
+
+
 def _launchd(home: Path, deadline: float) -> ExistingService | None:
     import pwd
     suffix = service_suffix(home)
     label = f"ai.hermes.gateway{'-' + suffix if suffix else ''}"
     account = pwd.getpwuid(os.getuid())  # windows-footgun: ok — native launchd only
     account_home = Path(account.pw_dir)
-    plist = account_home / "Library/LaunchAgents" / f"{label}.plist"
+    agent_plist = account_home / "Library/LaunchAgents" / f"{label}.plist"
     from hermes_cli.gateway_runtime_service_identity import verify_launchd_loaded, verify_launchd_plist, read_definition
-    installed = _exists(plist)
-    domains = [f"gui/{os.getuid()}", f"user/{os.getuid()}"]  # windows-footgun: ok — native launchd only
-    found = []
-    loaded = []
-    for domain in domains:
+    domains = _launchd_domains(label, agent_plist)
+    loaded: list[tuple[str, str]] = []  # (domain, launchctl output)
+    for domain, _definition in domains:
         result = _run(["launchctl", "print", f"{domain}/{label}"], deadline)
-        if result.returncode == 0:
-            loaded.append(result.stdout)
-            found.append(ExistingService("launchd", ("launchctl", "kickstart", f"{domain}/{label}"),
-                                         "state = running" in result.stdout))
+        if result.returncode == _LAUNCHD_LOADED:
+            loaded.append((domain, result.stdout))
+            if len(loaded) > 1:
+                # Two domains own the label: never choose one.
+                raise RuntimeStartError("service_scope_conflict", "conflict")
             continue
-        # launchctl's native absent-service code; other errors retain uncertainty.
-        if result.returncode != 113:
-            raise RuntimeStartError("service_manager_unavailable")
-    if len(found) > 1:
-        raise RuntimeStartError("service_scope_conflict", "conflict")
-    if found:
-        _verify_binding(verify_launchd_loaded, loaded[0], home, uid=os.getuid(), username=account.pw_name)  # windows-footgun: ok — native launchd only
-        return found[0]
-    if installed:
-        definition = _verify_binding(plistlib.loads, read_definition(plist))
+        if result.returncode in {_LAUNCHD_NOT_LOADED, _LAUNCHD_DOMAIN_CANNOT_OWN}:
+            # Not loaded here, or this domain cannot own the label: ask the next domain.
+            continue
+        # Any other code is the control interface not answering; the caller retries it.
+        raise RuntimeStartError("service_manager_unavailable")
+    if loaded:
+        domain, output = loaded[0]
+        _verify_binding(verify_launchd_loaded, output, home, uid=os.getuid(), username=account.pw_name)  # windows-footgun: ok — native launchd only
+        return ExistingService("launchd", ("launchctl", "kickstart", f"{domain}/{label}"),
+                               "state = running" in output)
+    definition_path = next((path for _domain, path in domains if path is not None), None)
+    if definition_path is not None:
+        domain = next(d for d, path in domains if path == definition_path)
+        definition = _verify_binding(plistlib.loads, read_definition(definition_path))
         _verify_binding(verify_launchd_plist, definition, label, home)
-        # Load ONLY the existing file, never bootout/rewrite or kickstart -k.
-        return ExistingService("launchd", ("launchctl", "bootstrap", domains[0], str(plist)))
+        # Load ONLY the existing file, never bootout/rewrite or kickstart -k, and load it into
+        # the domain its own definition names.
+        return ExistingService("launchd", ("launchctl", "bootstrap", domain, str(definition_path)))
     return None
 
 
@@ -297,6 +336,12 @@ def _no_supervisor(home: Path, deadline: float) -> None:
     systemd probe, which finds no unit and lands on the same unmanaged start."""
 
 
+#: Backoff between attempts at one supervisor probe whose control interface did not answer.
+#: Three retries (four probes) inside the caller's deadline: a launchctl/systemd/schtasks
+#: hiccup must not read as "the owner is absent" and must not read as terminal either.
+_SUPERVISOR_RETRY_BACKOFF_S = (1.0, 2.0, 4.0)
+
+
 def discover_existing_gateway_service(home: Path, *, deadline: float) -> ExistingService | None:
     from hermes_cli.service_manager import _s6_running
 
@@ -304,12 +349,29 @@ def discover_existing_gateway_service(home: Path, *, deadline: float) -> Existin
                                          "android": _no_supervisor}.get(sys.platform)
     if backend is None:
         raise RuntimeStartError("unsupported_supervisor_platform")
-    try:
-        return backend(home, deadline)
-    except subprocess.TimeoutExpired:
-        raise TimeoutError from None
-    except (OSError, ValueError) as exc:
-        raise RuntimeStartError("service_manager_unavailable") from exc
+    attempt = 0
+    while True:
+        try:
+            return backend(home, deadline)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError from None
+        except (OSError, ValueError) as exc:
+            # The control interface could not be spoken to at all.
+            refusal = RuntimeStartError("service_manager_unavailable")
+            refusal.__cause__ = exc
+        except RuntimeStartError as exc:
+            if exc.reason != "service_manager_unavailable":
+                raise
+            refusal = exc
+        if attempt >= len(_SUPERVISOR_RETRY_BACKOFF_S):
+            raise refusal
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            # The caller's deadline is spent. Answer with the refusal already in hand rather
+            # than turning a supervisor that did not answer into a timeout it never raised.
+            raise refusal
+        time.sleep(min(_SUPERVISOR_RETRY_BACKOFF_S[attempt], budget))
+        attempt += 1
 
 
 def start_existing_gateway_service(service: ExistingService, *, deadline: float) -> None:

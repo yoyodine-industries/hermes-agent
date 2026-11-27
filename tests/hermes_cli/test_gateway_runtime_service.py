@@ -398,6 +398,133 @@ def test_native_launchd_checks_loaded_job_before_disk(case, reason, tmp_path, mo
     assert plist.read_bytes() == original
 
 
+@pytest.mark.platforms("macos")
+def test_native_launchd_treats_a_refused_domain_as_unable_to_own_the_label(tmp_path, monkeypatch):
+    """The measured host (2026-11-27): ``launchctl print gui/<uid>/<label>`` answers 125 with
+    "Domain does not support specified action" because the job is a LaunchDaemon. That code is
+    not terminal — it says this domain cannot own the label — so the probe must continue to
+    ``system/``, where the running daemon answers 0. Treating it as terminal is what made every
+    client on this host report ``service_manager_unavailable`` beside a healthy owner."""
+    import pwd
+    from types import SimpleNamespace
+    from hermes_cli import gateway_runtime_service as service
+
+    home = tmp_path / 'profile'
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(pwd, 'getpwuid', lambda uid: SimpleNamespace(pw_dir=str(tmp_path), pw_name="owner"))
+    monkeypatch.setattr(service, '_LAUNCHD_DAEMON_DIR', tmp_path / 'Library/LaunchDaemons')
+    label = 'ai.hermes.gateway-' + service.service_suffix(home)
+    argv = [sys.executable, '-m', 'hermes_cli.main', 'gateway', 'run']
+    output = ('system/' + label + ' = {\n\tstate = running\n\tusername = owner\n\tprogram = ' + argv[0]
+              + '\n\targuments = {\n' + '\n'.join('\t\t' + arg for arg in argv) + '\n\t}\n\tenvironment = {\n'
+              + '\t\tHERMES_HOME => ' + str(home) + '\n\t\tHERMES_SUPERVISED_CHILD => 1\n\t}\n}')
+    peer = tmp_path / 'launchctl.py'
+    peer.write_text('import sys\n' + f'output = {output!r}\n' +
+                    'args = sys.argv[1:]\n' +
+                    'assert args[0] == "print", args\n' +
+                    'target = args[1]\n' +
+                    'if target.startswith("gui/"):\n sys.exit(125)\n' +
+                    'if target.startswith("user/"):\n sys.exit(113)\n' +
+                    'if target.startswith("system/"):\n print(output)\n sys.exit(0)\n' +
+                    'sys.exit(91)\n', encoding='utf-8')
+    actual = subprocess.run
+    calls = []
+
+    def boundary(argv, **kw):
+        assert argv[0] == 'launchctl'
+        calls.append(argv)
+        return actual([sys.executable, str(peer), *argv[1:]], **kw)
+    monkeypatch.setattr(subprocess, 'run', boundary)
+    found = service.discover_existing_gateway_service(home, deadline=time.monotonic() + 10)
+    assert found is not None
+    assert found.start_argv == ('launchctl', 'kickstart', 'system/' + label)
+    assert found.running is True
+    assert [call[2] for call in calls] == [f'gui/{os.getuid()}/{label}',
+                                           f'user/{os.getuid()}/{label}',
+                                           f'system/{label}']
+
+
+@pytest.mark.platforms("macos")
+def test_native_launchd_asks_the_domain_the_labels_definition_names(tmp_path, monkeypatch):
+    """A LaunchDaemon definition can only be loaded in ``system/``: ask it first, and only it."""
+    import plistlib
+    import pwd
+    from types import SimpleNamespace
+    from hermes_cli import gateway_runtime_service as service
+
+    home = tmp_path / 'profile'
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(pwd, 'getpwuid', lambda uid: SimpleNamespace(pw_dir=str(tmp_path), pw_name="owner"))
+    daemon_dir = tmp_path / 'Library/LaunchDaemons'
+    daemon_dir.mkdir(parents=True)
+    monkeypatch.setattr(service, '_LAUNCHD_DAEMON_DIR', daemon_dir)
+    label = 'ai.hermes.gateway-' + service.service_suffix(home)
+    argv = [sys.executable, '-m', 'hermes_cli.main', 'gateway', 'run']
+    (daemon_dir / (label + '.plist')).write_bytes(plistlib.dumps(dict(
+        Label=label, UserName="owner", ProgramArguments=argv,
+        EnvironmentVariables=dict(HERMES_HOME=str(home), HERMES_SUPERVISED_CHILD="1"))))
+    output = ('system/' + label + ' = {\n\tstate = running\n\tusername = owner\n\tprogram = ' + argv[0]
+              + '\n\targuments = {\n' + '\n'.join('\t\t' + arg for arg in argv) + '\n\t}\n\tenvironment = {\n'
+              + '\t\tHERMES_HOME => ' + str(home) + '\n\t\tHERMES_SUPERVISED_CHILD => 1\n\t}\n}')
+    peer = tmp_path / 'launchctl.py'
+    peer.write_text('import sys\n' + f'output = {output!r}\n' +
+                    'args = sys.argv[1:]\n' +
+                    'if args[1].startswith("system/"):\n print(output)\n sys.exit(0)\n' +
+                    'sys.exit(125)\n', encoding='utf-8')
+    actual = subprocess.run
+    calls = []
+
+    def boundary(argv, **kw):
+        assert argv[0] == 'launchctl'
+        calls.append(argv)
+        return actual([sys.executable, str(peer), *argv[1:]], **kw)
+    monkeypatch.setattr(subprocess, 'run', boundary)
+    found = service.discover_existing_gateway_service(home, deadline=time.monotonic() + 10)
+    assert found is not None and found.start_argv == ('launchctl', 'kickstart', 'system/' + label)
+    assert [call[2] for call in calls] == [f'system/{label}']
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_a_supervisor_that_does_not_answer_is_retried_inside_the_deadline(tmp_path, monkeypatch):
+    from hermes_cli import gateway_runtime_service as service
+
+    monkeypatch.setattr(service, '_SUPERVISOR_RETRY_BACKOFF_S', (0.0, 0.0, 0.0))
+    attempts = []
+    found = service.ExistingService('launchd', ('launchctl', 'kickstart', 'system/x'), running=True)
+
+    def backend(home, deadline):
+        attempts.append(home)
+        if len(attempts) < 3:
+            raise service.RuntimeStartError('service_manager_unavailable')
+        return found
+    monkeypatch.setattr('hermes_cli.service_manager._s6_running', lambda: False)
+    monkeypatch.setattr(service, '_launchd', backend)
+    monkeypatch.setattr(service, '_systemd', backend)
+    assert service.discover_existing_gateway_service(tmp_path, deadline=time.monotonic() + 5) is found
+    assert len(attempts) == 3
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_a_supervisor_that_never_answers_reports_the_refusal_not_a_timeout(tmp_path, monkeypatch):
+    """Three retries, then the refusal itself: the caller decides from the filesystem."""
+    from hermes_cli import gateway_runtime_service as service
+
+    monkeypatch.setattr(service, '_SUPERVISOR_RETRY_BACKOFF_S', (5.0, 5.0, 5.0))
+    attempts = []
+
+    def backend(home, deadline):
+        attempts.append(home)
+        raise service.RuntimeStartError('service_manager_unavailable')
+    monkeypatch.setattr('hermes_cli.service_manager._s6_running', lambda: False)
+    monkeypatch.setattr(service, '_launchd', backend)
+    monkeypatch.setattr(service, '_systemd', backend)
+    with pytest.raises(service.RuntimeStartError, match='service_manager_unavailable'):
+        service.discover_existing_gateway_service(tmp_path, deadline=time.monotonic() + 0.2)
+    assert len(attempts) == 2  # the budget ran out during the first backoff
+
+
 @pytest.mark.platforms("windows")
 @pytest.mark.parametrize("wrong", [False, True])
 def test_native_task_query_uses_installed_xml_and_vendor_launcher(wrong, tmp_path, monkeypatch):

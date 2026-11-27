@@ -135,7 +135,7 @@ def test_installed_service_start_is_nonmutating_and_failed_manager_never_spawns(
     assert not (home / "logs").exists()
     (tmp_path / "fail").touch()
     result = runtime.ensure_gateway_runtime(home, timeout=3.0)
-    assert result.state == "inaccessible" and result.reason_code == "service_manager_unavailable"
+    assert result.state == "inaccessible" and result.reason_code == "supervisor_unreachable"
     assert "private-supervisor-token" not in repr(result)
     assert sum("start" in json.loads(line) for line in calls.read_text().splitlines()) == 1
     assert not (home / "logs").exists()
