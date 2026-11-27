@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 import queue
+import random
 import sys
 import threading
 import time
@@ -43,7 +44,17 @@ _REPLAY_SAFE_METHODS = frozenset({'worker.persist'})
 # Failures that mean "the owner is busy", never "this store is broken": a flush reports these
 # as False and keeps the journal (the outbox a later reopen replays), exactly like the
 # in-process SessionDB contract ("False on timeout ... Never raises").
-_TRANSIENT_RECEIPT_FAILURES = frozenset({'worker_receipt_timeout', 'pending_receipt', 'owner_unavailable'})
+#
+# ``session_store_saturated`` / ``session_store_deadline`` are the owner's NAMED refusals from
+# its bounded session-store executor (gateway/session_executor.py). They are the same class of
+# news as ``worker_receipt_timeout`` - the owner could not get to the write in time - but they
+# arrive EARLIER and say why (queue depth, wait, task). Treating them as anything but transient
+# would turn the fix into a worse failure than the bug: a refused-but-retryable save would
+# become a hard persistence error and kill a turn that could simply re-ask.
+_TRANSIENT_RECEIPT_FAILURES = frozenset({
+    'worker_receipt_timeout', 'pending_receipt', 'owner_unavailable',
+    'session_store_saturated', 'session_store_deadline',
+})
 
 
 def _env_seconds(name, default):
@@ -57,6 +68,15 @@ def _env_seconds(name, default):
 
 
 RECEIPT_PATIENCE_SECONDS = _env_seconds('HERMES_WORKER_RECEIPT_PATIENCE', 75.0)
+
+# A worker asks a descriptor the multiplexer rewrites on every owner restart, so 'not ready'
+# is routinely TRANSIENT - and a save that dies on it was never attempted (nothing is lost,
+# it is simply not written, and the death then costs the caller its whole retry budget).
+# Waited out with a bounded, jittered backoff: the caller's write budget pays for the
+# patience, so it stays short, and a genuinely absent owner still surfaces as
+# owner_unavailable naming the attempts instead of hanging.
+DISCOVERY_PATIENCE_SECONDS = _env_seconds('HERMES_WORKER_DISCOVERY_PATIENCE', 20.0)
+DISCOVERY_BACKOFF_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.5, 2.0)
 
 
 def _receipt_is_transient(failure):
@@ -87,7 +107,8 @@ def apply_row_annotations(messages, annotations):
                 message[key] = value
 
 class WorkerPersistenceError(RuntimeError):
-    pass
+    #: A refusal's wire ``data`` (queue depth, wait, task) when the owner named one, else None.
+    refusal: dict | None = None
 
 
 def _caller_summary(limit=8):
@@ -182,12 +203,7 @@ class WorkerRPC:
         from hermes_cli.gateway_runtime_discovery import query_identify
         from websockets.sync.client import connect
         # A served secondary has no socket; its multiplexer's descriptor names it.
-        from hermes_cli.gateway_runtime import discover_gateway_endpoint
-        discovery = discover_gateway_endpoint(self.home, timeout=5)
-        if discovery.state == 'ready' and discovery.endpoint is not None:
-            self.endpoint = discovery.endpoint
-        elif discovery.state != 'draining' or self.endpoint is None:
-            raise WorkerPersistenceError('owner_unavailable')
+        self._await_owner()
         from hermes_cli.gateway_runtime import control_home_for
         endpoint = self.endpoint
         descriptor = query_identify(control_home_for(self.home, endpoint), timeout=5)
@@ -201,6 +217,43 @@ class WorkerRPC:
         self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=5, close_timeout=1,
                                        max_size=8 * 1024 * 1024, proxy=None, ping_interval=None))
         return self.link
+
+    def _await_owner(self):
+        """Wait out a transient descriptor, bounded, and NAME the owner when it never comes.
+
+        The descriptor is rewritten whenever the owner restarts or the multiplexer
+        re-registers, so 'not ready' is routinely momentary. This used to be asked exactly
+        once: a worker that hit the rewrite died on a save it had not yet attempted, and
+        that death then spent the caller's retry budget on a write SQLite never saw.
+        """
+        from hermes_cli.gateway_runtime import discover_gateway_endpoint
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            discovery = discover_gateway_endpoint(self.home, timeout=5)
+            if discovery.state == 'ready' and discovery.endpoint is not None:
+                self.endpoint = discovery.endpoint
+                if attempt:
+                    logger.info('owner became ready after %d discovery attempt(s) in %.2fs',
+                                attempt + 1, time.monotonic() - started)
+                return discovery
+            if discovery.state == 'draining' and self.endpoint is not None:
+                return discovery
+            backoff = DISCOVERY_BACKOFF_SECONDS[min(attempt, len(DISCOVERY_BACKOFF_SECONDS) - 1)]
+            # A fleet restarting together must not re-ask the descriptor in lockstep.
+            backoff *= 0.75 + 0.5 * random.random()
+            attempt += 1
+            if time.monotonic() + backoff > started + DISCOVERY_PATIENCE_SECONDS:
+                logger.warning(
+                    'owner_unavailable after %d discovery attempt(s) in %.2fs (last state %r, '
+                    'patience %.0fs): the owner never became ready, so this write was NOT '
+                    'attempted - nothing was lost by stopping here',
+                    attempt, time.monotonic() - started, discovery.state,
+                    DISCOVERY_PATIENCE_SECONDS)
+                raise WorkerPersistenceError('owner_unavailable')
+            logger.info('owner not ready (state %r); re-asking discovery in %.2fs (attempt %d)',
+                        discovery.state, backoff, attempt)
+            time.sleep(backoff)
 
     def _drop(self):
         link, self.link = self.link, None
@@ -261,7 +314,14 @@ class WorkerRPC:
                 self._drop()
                 raise
             if 'error' in response:
-                raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
+                error = response['error']
+                exc = WorkerPersistenceError(error.get('message', 'persistence_failed'))
+                # The owner names a bounded refusal and packs the numbers behind it (queue depth,
+                # the wait, which write) into ``data``. Attach them to the exception so the
+                # worker's log carries the cause without a second query; ``str(exc)`` stays the
+                # bare wire code that ``_receipt_is_transient`` classifies.
+                exc.refusal = error.get('data') or {}
+                raise exc
             if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
                 global _worker_process
                 _worker_process = True

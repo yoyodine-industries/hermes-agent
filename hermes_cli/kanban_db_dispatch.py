@@ -32,7 +32,11 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli import kanban_crash_sweep_guard as _crash_guard
-from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.quiet_single_query import (
+    KANBAN_WORKER_EXIT_TRAILER,
+    KANBAN_WORKER_LOSS_CLASS_TRAILER,
+)
+from hermes_cli._startup_fast import project_root_str
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -91,21 +95,24 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
 # Cooldown after a storage-locked (state-store contention) requeue before
-# re-spawning. Default 0 is DELIBERATE and is the contract's "immediately": the
-# reclaim pass already re-queued the card on this tick and the dispatcher's own
-# 60 s cadence is the spacing, so nothing is consumed and there is no hot loop.
-# The env override (``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS``) exists for
-# tests and for an operator who wants wider spacing around a known maintenance
-# window.
-#
-# Landed on the reconciled line (card t_3286715e) because committed
-# ``hermes_cli/kanban_db.py`` imports this name (config default for
-# ``_resolve_storage_locked_cooldown_seconds``) while the constant itself lived
-# only in the live install's UNCOMMITTED dispatch file: a fresh clone of either
-# line could not import ``hermes_cli.kanban_db`` at all. The consumer half of
-# the feature (the storage-locked plumbing in the dispatcher) is still owed by
-# its own card, t_ccfb92a1 -- this constant alone changes no behaviour.
-DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS = 0
+# re-spawning. The run booked against the card did not judge the card's work, so the retry
+# must not land inside the same contention: 120 s (with a deterministic per-task +-30 s
+# jitter, ``_resolve_storage_locked_cooldown_seconds``) is wide enough to outlast a
+# compaction/checkpoint burst, while staying inside one dispatcher cadence band.
+# Overridable via ``HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS`` (0 = next tick, for
+# tests), which applies verbatim with NO jitter so a caller that names a number gets it.
+DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS = 120
+# Half-width of the deterministic per-task jitter (never a random source: every reader of the
+# same card must compute the same deadline, or the guard would oscillate tick to tick).
+STORAGE_LOCKED_COOLDOWN_JITTER_SECONDS = 30
+
+# How many HARNESS losses (busy store / lost receipt / unreachable owner / unsettled admission /
+# substrate import) a card may survive before the dispatcher parks it ``blocked`` with the loss
+# class named. This is a SURVIVAL budget, not the work budget: ``failure_limit`` (default 2)
+# decides "this card has failed too often" and this one decides "this host keeps losing
+# processes", and the two must never share a counter -- a card must not be given up because it
+# was unlucky. Overridable via ``HERMES_KANBAN_SURVIVAL_ATTEMPT_LIMIT``.
+SURVIVAL_ATTEMPT_LIMIT = 6
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -1101,6 +1108,13 @@ class DispatchResult:
     worker is structurally fenced from it. The card is PARKED ``scheduled``
     (due_at NULL) -- never a silent skip -- and the tick's suppression line names
     the hold, because a silent hold is how a starved board reads as an idle one."""
+    gate_edge_held: list[str] = field(default_factory=list)
+    """Task ids HELD at the run door because the card DECLARES it waits on another
+    card and the board carries no edge for it (hermes_cli/kanban_gate_edge.py;
+    ruling t_26d2f957). The card is PARKED ``needs_input`` with the missing edge
+    named -- never a silent skip -- because an ungated carrier looks exactly like
+    a gated one until a tick claims it. START-scope claims hold; LANDING-scope
+    claims do not (building is wanted; the edge belongs on the landing card)."""
     substrate_held: list[str] = field(default_factory=list)
     """Task ids HELD by per-unit substrate admission (door 3; card ``t_0ae49984``, design
     ``t_72e9bf03``): the card's own workspace root answered a DENIAL to a real operation, so it
@@ -1563,6 +1577,12 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             # never silently skipped, so the tick's own line must name the hold --
             # a silent hold is how a starved board reads as an idle one.
             counts["skipped_top_level_only"] = counts.get("skipped_top_level_only", 0) + len(res.skipped_top_level_only)
+        if res.gate_edge_held:
+            # The declared-gate EDGE door held these (hermes_cli/kanban_gate_edge.py;
+            # ruling t_26d2f957): the card says it waits on another card and the board
+            # does not represent the wait, so the spawn was refused and the card parked.
+            # A silent hold is how a starved board reads as an idle one.
+            counts["gate_edge_held"] = counts.get("gate_edge_held", 0) + len(res.gate_edge_held)
         if res.substrate_held:
             # DOOR 3 (card t_0ae49984, design t_72e9bf03): these cards were not claimed because
             # their own workspace root was denied. They are still ready, so without this counter
@@ -1738,6 +1758,45 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
         return None
     matches = _EXIT_TRAILER_RE.findall(raw or "")
     return int(matches[-1]) if matches else None
+
+
+# The ONE loss-class vocabulary a run row carries (``task_runs.metadata.loss_class``). It names
+# WHAT the harness lost, never the card's work: ``receipt_timeout`` / ``storage_unclassified`` /
+# ``storage_locked`` / ``owner_admission_unavailable`` / ``worker_vanished`` / ``killed`` /
+# ``spawn_failed``. ``storage_unclassified`` is the bucket the card t_5800fe41 measured (197
+# crashes/24h carrying the "couldn't save this conversation" explainer with no cause named).
+LOSS_CLASSES = (
+    "receipt_timeout", "storage_unclassified", "storage_locked",
+    "owner_admission_unavailable", "worker_vanished", "killed", "spawn_failed",
+)
+_LOSS_CLASS_TRAILER_RE = re.compile(
+    r"^" + re.escape(KANBAN_WORKER_LOSS_CLASS_TRAILER) + r"([a-z_]+)\s*$", re.MULTILINE,
+)
+# The explainer the turn finalizer prints when persistence failed for a cause the old build could
+# not name. Used ONLY as a fallback for a worker build with no loss-class trailer; the trailer is
+# the worker's own words and always wins.
+_UNCLASSIFIED_STORAGE_MARKERS = (
+    "couldn't save this conversation", "could not save this conversation",
+)
+
+
+def _worker_log_loss_class(task_id: str, board: Optional[str] = None) -> Optional[str]:
+    """The loss class the worker itself reported in its log; None when it reported none."""
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+    except Exception:
+        return None
+    matches = _LOSS_CLASS_TRAILER_RE.findall(raw or "")
+    if not matches:
+        return None
+    loss_class = matches[-1]
+    return loss_class if loss_class in LOSS_CLASSES else None
+
+
+def _unclassified_storage_loss_in_output(worker_output: str) -> bool:
+    """A death with no named cause whose own words are the persistence explainer."""
+    text = (worker_output or "").lower()
+    return any(marker in text for marker in _UNCLASSIFIED_STORAGE_MARKERS)
 
 
 def reap_worker_zombies() -> list[int]:
@@ -2924,6 +2983,15 @@ def _classify_dead_worker(
                     dead.event_payload["infrastructure"] = True
                     dead.event_payload["substrate_import"] = True
                     dead.event_payload["substrate_signature"] = signature
+                    dead.event_payload["loss_class"] = "spawn_failed"
+            elif (_is_unexplained_death(dead)
+                  and "loss_class" not in dead.event_payload
+                  and _unclassified_storage_loss_in_output(worker_output)):
+                # No cause was named by the worker, but its own last words are the persistence
+                # explainer: the card's ``unclassified save text`` bucket, recorded as such
+                # instead of a bare crash. It stays a crash (the budget is spent) -- this only
+                # makes the row say WHAT the harness lost.
+                dead.event_payload["loss_class"] = "storage_unclassified"
             dead.error_text = (
                 f"{naming} {dead.error_text}" if naming else dead.error_text
             ) + f"{WORKER_OUTPUT_SEP}{worker_output!r}"
@@ -2986,12 +3054,20 @@ def _classify_dead_worker_exit(
         # ``_classify_dead_worker``) and it deliberately avoids every
         # ``_RESPAWN_BLOCKER_RE`` word, so ``check_respawn_guard`` reads the RUN
         # OUTCOME instead of trapping the card on the stamped line.
+        #
+        # rc=76 covers more than a busy store: a lost persistence receipt and an unreachable
+        # owner land here too. The worker names which in its own loss-class trailer; the run
+        # row carries that name and only falls back to ``storage_locked`` when the worker said
+        # nothing (an older build). Never synthesised from the exit code alone.
+        reported = _worker_log_loss_class(task_id, board=board) if task_id else None
+        payload = {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code}
+        payload["loss_class"] = reported or "storage_locked"
         return _DeadWorker(
             kind, code,
             f"pid {pid} exited with code {code}: the turn stopped on a transient state-store lock; "
             "the card was re-queued without counting a failure",
             "storage_locked",
-            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
+            payload,
             storage_locked=True,
         )
     if kind == "terminal_provider":
@@ -3016,6 +3092,17 @@ def _classify_dead_worker_exit(
     if code is not None and kind != "unknown":
         event_payload["exit_kind"] = kind
         event_payload["exit_code"] = code
+    # loss_class is the worker's own report when it left one; otherwise only a class the
+    # dispatcher DIRECTLY observed (a signal, a vanished pid). A bare nonzero exit gets none
+    # here -- ``_classify_dead_worker`` adds ``storage_unclassified`` only if the worker's own
+    # output is the persistence explainer, which is evidence, not a guess from ``rc``.
+    reported = _worker_log_loss_class(task_id, board=board) if task_id else None
+    if reported:
+        event_payload["loss_class"] = reported
+    elif kind == "signaled":
+        event_payload["loss_class"] = "killed"
+    elif kind == "unknown":
+        event_payload["loss_class"] = "worker_vanished"
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
 
@@ -3041,6 +3128,10 @@ class _CrashSweep:
     # death is the OWNER's. Held apart from ``crash_details`` for the same reason as
     # ``storage_locked``.
     admission_unsettled: list[str] = field(default_factory=list)
+    # ``(task_id, loss_class, error_text)``: harness losses that spend the SURVIVAL budget and
+    # never the work budget. Accounted after the txn by ``_account_survival_attempts`` (needs its
+    # own write_txn), which parks the card ``blocked`` once the survival bound is reached.
+    survival_details: list[tuple[str, str, str]] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -3344,6 +3435,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 # reach ``_account_crashes`` (the breaker) and must not count toward
                 # the mass-crash abort either.
                 sweep.storage_locked.append(row["id"])
+                sweep.survival_details.append((
+                    row["id"],
+                    str(dead.event_payload.get("loss_class") or "storage_locked"),
+                    error_text,
+                ))
             elif dead.substrate_import:
                 # NEVER crash_details, for the SAME reason as a lock-stop: nothing of the
                 # card ran, so the death is the tree's and must not spend the card's
@@ -3352,6 +3448,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 # rows as ``running`` with dead pids instead of releasing them spaced.
                 # Counted for the LANE actor (filenames the artifact) after the txn.
                 sweep.substrate_deferred.append(row["id"])
+                sweep.survival_details.append((row["id"], "spawn_failed", error_text))
                 if dead.substrate_signature:
                     sweep.substrate_signatures.append(dead.substrate_signature)
             elif dead.admission_unsettled:
@@ -3359,6 +3456,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 # admission must not spend the card's retry budget. The run's own error names the
                 # owner and the budget it outlasted.
                 sweep.admission_unsettled.append(row["id"])
+                sweep.survival_details.append((
+                    row["id"], "owner_admission_unavailable", error_text,
+                ))
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -3445,6 +3545,71 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
+def _survival_attempt_limit() -> int:
+    """``HERMES_KANBAN_SURVIVAL_ATTEMPT_LIMIT`` (>=1) else ``SURVIVAL_ATTEMPT_LIMIT``."""
+    return int(_kb._env_int("HERMES_KANBAN_SURVIVAL_ATTEMPT_LIMIT", SURVIVAL_ATTEMPT_LIMIT, minimum=1))
+
+
+def _account_survival_attempts(
+    conn: sqlite3.Connection, survival_details: list, board: Optional[str] = None,
+) -> list[str]:
+    """Spend the SURVIVAL budget once per harness loss; returns the ids it parked ``blocked``.
+
+    A run the harness lost (busy store, lost receipt, unreachable owner, admission never
+    settled, substrate import) never judged the card's work, so it must not spend the counter
+    that decides "this card has failed too often" -- ``consecutive_failures`` belongs to the
+    WORK. It still must not retry forever: after ``SURVIVAL_ATTEMPT_LIMIT`` such losses the card
+    is parked ``blocked`` with the loss class named in ``last_failure_error`` and a
+    ``survival_exhausted`` event -- never ``gave_up``, which would accuse the work of a death it
+    never caused. Reset by ``_clear_failure_counter`` when a run completes.
+    """
+    limit = _survival_attempt_limit()
+    parked: list[str] = []
+    for task_id, loss_class, error_text in survival_details:
+        with _kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT survival_failures FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            n = int(row["survival_failures"] or 0) + 1
+            conn.execute(
+                "UPDATE tasks SET survival_failures = ? WHERE id = ?", (n, task_id),
+            )
+            if n < limit:
+                continue
+            # The run's own stamped error stays FIRST: it names the concrete event and keeps
+            # ``_RESPAWN_BLOCKER_RE`` blind (the guard reads the run OUTCOME anyway).
+            prior = conn.execute(
+                "SELECT last_failure_error FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            prior_text = (prior["last_failure_error"] or "").strip() if prior else ""
+            notice = (
+                f"harness loss x{n} ({loss_class}) -- the WORK WAS NOT JUDGED; parked blocked "
+                f"after {n} harness losses (limit {limit}) with the card's work budget untouched "
+                "(this is NOT a work failure; release it when the host is quiet)"
+            )
+            framed = f"{prior_text}{'; ' if prior_text else ''}{notice}"
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'blocked', last_failure_error = ? WHERE id = ? "
+                "AND status IN ('ready', 'running', 'review')",
+                (framed[:500], task_id),
+            )
+            if cur.rowcount != 1:
+                continue
+            _kb._append_event(
+                conn, task_id, "survival_exhausted",
+                {
+                    "survival_failures": n,
+                    "limit": limit,
+                    "loss_class": loss_class,
+                    "error": error_text[:300],
+                },
+            )
+            parked.append(task_id)
+    return parked
+
+
 def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -3479,6 +3644,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
         # empty and the crash accounting below must not run. When that subset was NON-empty those
         # runs really were closed, so they fall through to the ordinary accounting and hooks.
         detect_crashed_workers._last_auto_blocked = []  # type: ignore[attr-defined]
+        detect_crashed_workers._last_survival_blocked = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_rate_limited = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_storage_locked = []  # type: ignore[attr-defined]
         detect_crashed_workers._last_substrate_import = []  # type: ignore[attr-defined]
@@ -3486,10 +3652,18 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
         return []
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    # The SURVIVAL budget, spent by harness losses only. Never the work budget: a run the
+    # harness lost did not judge the card. At the bound the card is PARKED BLOCKED with the
+    # loss class named, never ``gave_up``.
+    survival_boarded = (
+        _account_survival_attempts(conn, sweep.survival_details, board=board)
+        if sweep.survival_details else []
+    )
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # and storage-locked requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+    detect_crashed_workers._last_survival_blocked = survival_boarded  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
     detect_crashed_workers._last_storage_locked = sweep.storage_locked  # type: ignore[attr-defined]
     detect_crashed_workers._last_substrate_import = sweep.substrate_deferred  # type: ignore[attr-defined]
@@ -3723,10 +3897,14 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     Called from ``complete_task`` on success. NOT called on spawn success: a
     spawn proves the worker could start, not that the run will succeed, so
     timeouts and crashes must accumulate across spawn boundaries.
+
+    Also clears ``survival_failures``: a completed run proves the card's work, so the harness
+    losses it survived (busy store, lost receipt, unreachable owner) start clean -- the two
+    counters are spent by different events and must reset on the same proof.
     """
     with _kb.write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET consecutive_failures = 0, "
+            "UPDATE tasks SET consecutive_failures = 0, survival_failures = 0, "
             "last_failure_error = NULL WHERE id = ?",
             (task_id,),
         )
@@ -3819,11 +3997,11 @@ def check_respawn_guard(
     #     stamped text is infrastructure prose, so ``blocker_auth`` must not see it:
     #     the card is spaced by this cooldown and never consumes its give-up budget.
     if latest_run is not None and latest_run["outcome"] == "storage_locked":
-        sl_cooldown = _kb._resolve_storage_locked_cooldown_seconds()
+        sl_cooldown = _kb._resolve_storage_locked_cooldown_seconds(task_id)
         if sl_cooldown <= 0:
-            # Default 0: respawn immediately (the reclaim pass already spaced it by
-            # a tick and the dispatcher's own cadence is the interval), skipping
-            # blocker_auth so the stamped storage-lock line cannot re-trap the card.
+            # Operator/test override of 0: respawn immediately (the reclaim pass already
+            # spaced it by a tick), skipping blocker_auth so the stamped storage-lock line
+            # cannot re-trap the card.
             return None
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < sl_cooldown:
@@ -3912,19 +4090,19 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
-    """``hermes_cli.profiles.profile_exists``, or ``None`` when it cannot be
-    imported (local import avoids a cycle; callers fall back to trusting the
-    assignee).
+    """``profile_exists`` from ``hermes_cli.profiles``; ``None`` when it cannot be
+    imported and no allowlist is set (callers then trust the assignee).
 
-    When ``kanban.dispatch_profiles`` is set (#110995) the returned predicate
-    additionally requires the assignee to be listed, fail-closed — so a card
-    assigned to ``default`` is only claimable by homes that opted into it.
-    Foreign assignees land in the existing ``skipped_nonspawnable`` bucket.
-    """
+    With ``kanban.dispatch_profiles`` set (#110995) the predicate also requires the
+    assignee to be listed, fail-closed: a ``default`` card is only claimable by homes that
+    opted in, and a set allowlist whose gate cannot be built claims nothing (#147531)."""
     try:
         from hermes_cli.profiles import normalize_profile_name, profile_exists
     except Exception:
-        return None
+        if _dispatch_profile_allowlist(str) is None:
+            return None
+        _kb._log.warning("kanban: hermes_cli.profiles unimportable — claiming no cards", exc_info=True)
+        return lambda _name: False
     allowlist = _dispatch_profile_allowlist(normalize_profile_name)
     if allowlist is None:
         return profile_exists
@@ -3952,24 +4130,24 @@ def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
           dispatch_profiles: ["sage", "researcher"]   # or "sage,researcher"
 
     Returns ``None`` only when the key is absent from the user config (upstream
-    behavior: any existing profile is claimable). A present value is
-    fail-closed: an empty list, ``null`` or a bare ``dispatch_profiles:`` claims
-    nothing. The user layer is read without the ``DEFAULT_CONFIG`` merge (whose
-    ``None`` placeholder would make the key look present in every home), and a
-    config read that raises also claims nothing — a corrupt config on a shared
-    board must never widen this home's claim scope silently (#113620).
+    behavior: any existing profile is claimable). A present value is fail-closed:
+    an empty list, ``null`` or a bare ``dispatch_profiles:`` claims nothing, and
+    so does a non-mapping ``kanban`` section (a bare ``kanban:`` is absent) or an
+    unreadable config (#113620, #147532) — the user layer is read without the
+    ``DEFAULT_CONFIG`` merge, whose ``None`` placeholder fakes the key's presence.
     """
     try:
         from hermes_cli.config_effective import load_user_config_effective
-        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban")
+        if kanban is not None and not isinstance(kanban, Mapping):
+            raise TypeError(f"the `kanban` section is {type(kanban).__name__}, not a mapping")
     except Exception as exc:
         _kb._log.warning(
-            "kanban: could not read kanban.dispatch_profiles (%s: %s) — "
-            "this home claims no cards until the config is readable",
+            "kanban: kanban.dispatch_profiles cannot be resolved (%s: %s) — this home claims no cards",
             type(exc).__name__, exc,
         )
         return frozenset()
-    if not isinstance(kanban, Mapping) or "dispatch_profiles" not in kanban:
+    if "dispatch_profiles" not in (kanban or {}):
         return None
     raw = kanban["dispatch_profiles"]
     if raw is None or (isinstance(raw, str) and not raw.strip()):
@@ -3989,15 +4167,14 @@ def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
 
 
 def dispatch_profile_allowlist_summary() -> str:
-    """Human-readable resolution of ``kanban.dispatch_profiles`` for this home.
-
-    Surfaced by ``hermes kanban diagnostics`` so an operator on a shared board
-    can see what a home believes it may claim (#113620): ``any`` (key absent),
-    the sorted allowed names, or ``none (fail-closed: ...)``.
-    """
+    """What this home may claim, for ``hermes kanban diagnostics`` (#113620): ``any``
+    (key absent; also when profiles cannot import, as the gate then stays open too),
+    the sorted allowed names, or ``none (fail-closed: ...)``, as `_profile_exists_fn`."""
     try:
         from hermes_cli.profiles import normalize_profile_name
     except Exception as exc:
+        if _dispatch_profile_allowlist(str) is None:
+            return "any"
         return f"none (fail-closed: profiles unavailable: {exc})"
     allowlist = _dispatch_profile_allowlist(normalize_profile_name)
     if allowlist is None:
@@ -4071,7 +4248,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
 
     Lets health telemetry tell "stuck" (``0 spawned`` with spawnable work) from
     "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
-    back to "any assigned" when ``profile_exists`` is unimportable.
+    back to "any assigned" when profiles cannot import and no allowlist is set.
     """
     return _has_spawnable(conn, "ready")
 
@@ -4165,6 +4342,199 @@ def configured_max_in_progress() -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return ival if ival >= 1 else None
+
+
+# ---------------------------------------------------------------------------
+# The fleet's dispatch ceiling is a HOST property (card t_001338fa)
+# ---------------------------------------------------------------------------
+# MEASURED 2026-11-25 13:3xZ, the same command on the same board, three seats:
+#   hermes                       -> Spawned: 0   (Held: board ceiling max_spawn=8 met)
+#   hermes -p financially-stl    -> Spawned: 5183  (no hold, no cap)
+#   hermes -p research-stl       -> Spawned: 5183  (no hold, no cap)
+# The caps were read from the INVOKING profile's config.yaml only, and the lane
+# profiles carry no ``kanban:`` block — so every cap was ABSENT, and an absent cap
+# resolved to ``None``, which on this path means UNLIMITED. A seat could raise the
+# fleet's spawn ceiling as a SIDE EFFECT of not having a config section.
+#
+# The resolution below is the ruling's shape (platform-stl, same card):
+#   1. the HOST (root) config.yaml is the BASELINE, whoever invoked the command;
+#   2. the invoking profile's ``kanban:`` block overrides it PER KEY — but only
+#      DOWNWARD. Raising the fleet ceiling is the host's decision, stated in the
+#      HOST file as ``kanban.allow_profile_cap_raise: true``; we do not set it, so
+#      a lane seat can narrow its own share and never widen the host's.
+#   3. anything still unset resolves to ``DEFAULT_HOST_MAX_SPAWN`` — never None.
+# Fail CLOSED, the way ``board_dispatch_enabled`` already fails closed for an
+# unknown board: absent configuration is a bound, not a licence.
+DEFAULT_HOST_MAX_SPAWN = 8
+
+# Cap keys whose baseline is the host and whose profile value may only narrow it.
+_DISPATCH_CAP_KEYS = ("max_spawn", "max_in_progress", "max_in_progress_per_profile")
+
+
+def _cap_int(value: Any) -> Optional[int]:
+    """A cap as a positive int, or ``None`` when absent/invalid. A bool is not a cap."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
+def _board_ceilings(raw: Any) -> dict:
+    """``kanban.max_spawn_by_board`` as ``{slug: int}``, unusable entries dropped.
+
+    The SAME value rules the gateway's enforcing parser applies: a NAMED board's
+    ceiling must be a positive integer (a non-integral float is a typo and is
+    never truncated, a non-finite float must never reach ``int()``, and a bool is
+    an int subclass but not a ceiling); the reserved ``default`` arm accepts a
+    non-negative integer, because ``default: 0`` is how the host says "a board
+    this map does not name draws no slots".
+
+    No board-inventory check happens here: the resolver does not know which
+    boards exist, and the gateway still validates against its inventory. Junk is
+    dropped rather than coerced — a typo must never become a dispatch-governing
+    number.
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    ceilings: dict[str, int] = {}
+    for slug, value in raw.items():
+        key = str(slug).strip()
+        if not key or isinstance(value, bool):
+            continue
+        if isinstance(value, float) and not value.is_integer():
+            continue
+        try:
+            ceiling = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if key == DEFAULT_CEILING_KEY:
+            if ceiling < 0:
+                continue
+        elif ceiling < 1:
+            continue
+        ceilings[key] = ceiling
+    return ceilings
+
+
+def host_kanban_config() -> dict:
+    """The ROOT config.yaml's ``kanban:`` block — the fleet baseline, whoever invoked us.
+
+    ``load_config()`` reads the ACTIVE profile's home, which is precisely the
+    caller-dependence this resolver exists to end. The root home is resolved
+    independently (``get_default_hermes_root`` maps a profile home back to the
+    root that holds it) and read through the same effective-config pipeline used
+    for any user config (env expansion + managed overlay), so no second notion of
+    "what the host said" is introduced. ``{}`` when the file is missing or
+    unreadable: the floor below then applies.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        from hermes_cli.config_effective import load_user_config_effective
+        root_cfg = load_user_config_effective(Path(get_default_hermes_root()) / "config.yaml")
+    except Exception:
+        return {}
+    section = root_cfg.get("kanban") if isinstance(root_cfg, Mapping) else None
+    return dict(section) if isinstance(section, Mapping) else {}
+
+
+def _active_kanban_config() -> dict:
+    """The ACTIVE profile's ``kanban:`` block (``{}`` when it has none/unreadable)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        section = (load_config_readonly() or {}).get("kanban")
+    except Exception:
+        return {}
+    return dict(section) if isinstance(section, Mapping) else {}
+
+
+def resolve_dispatch_caps(
+    profile_kanban_cfg: Optional[Mapping[str, Any]] = None,
+    host_kanban_cfg: Optional[Mapping[str, Any]] = None,
+) -> dict:
+    """The caps a dispatch tick is bound by: host baseline, profile narrowing, hard floor.
+
+    ``profile_kanban_cfg`` is the invoking profile's ``kanban:`` block (``{}`` when
+    it has none — an EMPTY block is the normal state of a lane seat, and it must
+    resolve to the host's ceilings, never to ``None``); ``None`` reads the ACTIVE
+    profile's block itself. ``host_kanban_cfg`` overrides the host file read, for
+    callers that already hold it and for tests.
+
+    Returns ``{max_spawn, max_in_progress, max_in_progress_per_profile,
+    host_baseline, clamped_to_host}``. Every returned cap is a positive int except
+    ``max_in_progress_per_profile``, which stays ``None`` when nobody set it: a
+    per-profile cap is a SHARE of the host budget, so "no share cap" is bounded by
+    the two host caps above it and can never be unlimited.
+
+    ``Allow the profile to RAISE a cap`` is a HOST statement
+    (``kanban.allow_profile_cap_raise: true`` in the ROOT file), and it is not set
+    on this estate: a named profile therefore cannot lift the fleet ceiling, only
+    narrow it. ``clamped_to_host`` names the keys where it tried — so the refusal
+    is visible in a dispatch output instead of silently applied.
+
+    The per-board map (``kanban.max_spawn_by_board``) is resolved the same way,
+    per BOARD key: the HOST block names a board's ceiling and the invoking
+    profile may only narrow it. A board the host does not name has the host's
+    ``max_spawn`` for a ceiling (the gateway's fallback arm), so a profile value
+    for such a board is measured against that number. A refused entry is named in
+    ``clamped_to_host`` as ``max_spawn_by_board.<slug>``. The result carries the
+    resolved map as ``max_spawn_by_board`` — both enforcement (gateway) and
+    measurement (CLI) read that one map, so a dry run cannot report a budget the
+    dispatcher never applies.
+    """
+    host = dict(host_kanban_cfg) if isinstance(host_kanban_cfg, Mapping) else host_kanban_config()
+    if isinstance(profile_kanban_cfg, Mapping):
+        profile = dict(profile_kanban_cfg)
+    else:
+        profile = _active_kanban_config()
+    allow_raise = host.get("allow_profile_cap_raise") is True
+
+    host_max_spawn = _cap_int(host.get("max_spawn")) or DEFAULT_HOST_MAX_SPAWN
+    # The memory-derived default is the host's own baseline when the root file is
+    # silent (it is bounded by DERIVED_MAX_IN_PROGRESS_CEILING); the hard floor
+    # covers a host whose memory cannot be read at all.
+    host_max_in_progress = (
+        _cap_int(host.get("max_in_progress"))
+        or derive_default_max_in_progress()
+        or DEFAULT_HOST_MAX_SPAWN
+    )
+    host_boards = _board_ceilings(host.get("max_spawn_by_board"))
+    baseline = {
+        "max_spawn": host_max_spawn,
+        "max_in_progress": host_max_in_progress,
+        "max_in_progress_per_profile": _cap_int(host.get("max_in_progress_per_profile")),
+        "max_spawn_by_board": dict(host_boards),
+    }
+
+    resolved = dict(baseline)
+    clamped: list[str] = []
+    for key in _DISPATCH_CAP_KEYS:
+        wanted = _cap_int(profile.get(key))
+        if wanted is None:
+            continue
+        ceiling = baseline[key]
+        if ceiling is None or allow_raise or wanted <= ceiling:
+            resolved[key] = wanted
+        else:
+            clamped.append(key)
+    # Per-board ceilings, narrow-only per board key. The host's map is the
+    # baseline; the profile may lower a board (never raise it), and a board the
+    # host does not name is measured against the host ``max_spawn`` it inherits.
+    boards = dict(host_boards)
+    profile_boards = _board_ceilings(profile.get("max_spawn_by_board"))
+    for slug in sorted(profile_boards):
+        wanted = profile_boards[slug]
+        ceiling = host_boards.get(slug, host_max_spawn)
+        if allow_raise or wanted <= ceiling:
+            boards[slug] = wanted
+        else:
+            clamped.append(f"max_spawn_by_board.{slug}")
+    resolved["max_spawn_by_board"] = boards
+    resolved["host_baseline"] = baseline
+    resolved["clamped_to_host"] = clamped
+    return resolved
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
@@ -6333,6 +6703,20 @@ def _dispatch_lane_task(
         result.skipped_top_level_only.append(task_id)
         return False
 
+    # DECLARED-GATE EDGE door (RUN door, ruling t_26d2f957): a card whose LIVE text
+    # says it waits on another card -- "gated on t_x", "blocked until t_x", "the
+    # consent card t_x is still blocked" -- is NEVER spawned while the board carries
+    # no edge for it. Prose holds nobody back: the measured instance's three pruning
+    # carriers named their consent card and sat ``ready`` parented only on the ruling
+    # card, so a tick would have started trimming a 5.97 GB store nobody had approved.
+    # START-scope claims are held here; LANDING-scope claims are NOT (a card that says
+    # "build now, do not merge before X" must still build -- its edge belongs on the
+    # card that lands it). Re-checked LIVE so an amendment after filing is honoured.
+    # Respects ``dry_run``: reports the hold, writes nothing.
+    if _hold_declared_gate(conn, task_id, dry_run=dry_run, board=board):
+        result.gate_edge_held.append(task_id)
+        return False
+
     # SUBSTRATE ADMISSION -- door 3 (card t_0ae49984, design t_72e9bf03): a card whose own
     # workspace root is on a denied substrate is HELD -- NOT claimed, NOT failed, NOT blocked --
     # and this tick carries on with its siblings (invariant I2). Deliberately BEFORE the claim:
@@ -6353,8 +6737,8 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task  # reassigned since the gates: CAS loses (#147534)
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee)
     if claimed is None:
         return False
     # SLOT RECYCLING (ruling t_b2865b89 §4). A card that carried no ``max_runtime_seconds`` is
@@ -6513,6 +6897,83 @@ def _hold_substrate_denied(
     except Exception:
         _kb._log.debug(
             "kanban dispatch: substrate hold could not be recorded for %s", task_id, exc_info=True,
+        )
+    return True
+
+
+def _hold_declared_gate(
+    conn: sqlite3.Connection, task_id: str, *, dry_run: bool = False,
+    board: Optional[str] = None,
+) -> bool:
+    """The RUN door of the declared-gate edge gate (hermes_cli/kanban_gate_edge.py).
+
+    Returns True when the card DECLARES a START-scope gate -- it says in its own
+    live text that it waits on another card -- and the board carries no edge for
+    that card, so it must not be spawned. False when there is no claim, when every
+    claimed card is already an ancestor, when the named card is finished, or when
+    the only claims are LANDING-scope.
+
+    LANDING scope is deliberately NOT held here. The measured over-correction
+    (ruling ``t_26d2f957``): a card reading "BUILD AND PR NOW. DO NOT MERGE OR
+    DEPLOY ... landing is gated on the answer" was parented on the consent card by
+    hand, which freezes the build the ruling itself ordered -- the false-NEGATIVE
+    mirror of the defect this gate exists to close. Its edge belongs on the card
+    that lands it.
+
+    The hold is never silent: ONE deduped ``gate_edge_refused`` event and ONE
+    comment naming the missing edge, then the card is PARKED ``needs_input``.
+    Deduped on the payload because the guard runs every tick. A write fault must
+    never take the tick down -- the next tick retries, and the card is not spawned
+    either way. ``dry_run`` reports the hold and writes nothing.
+    """
+    from hermes_cli import kanban_gate_edge as _ge
+
+    row = conn.execute(
+        "SELECT title, body, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in ("ready", "review"):
+        return False
+    verdict = _ge.evaluate(
+        conn, task_id, title=row["title"], body=row["body"], status=row["status"],
+    )
+    if not verdict.refused:
+        return False
+    if dry_run:
+        return True
+    payload = {
+        "cause": verdict.cause,
+        "missing": [c.card_id for c in verdict.unbacked_start],
+        "scope": "start",
+        "board": board,
+    }
+    try:
+        with _kb.write_txn(conn):
+            last = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'gate_edge_refused' "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if last is None or last["payload"] != _kb._json_or_null(payload):
+                _kb._append_event(conn, task_id, "gate_edge_refused", payload)
+                _kb.add_comment(
+                    conn, task_id, "dispatcher",
+                    "GATE EDGE MISSING before the run (not spawned).\n\n"
+                    + _ge.refusal_message(task_id, verdict),
+                )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: gate-edge refusal could not be recorded for %s",
+            task_id, exc_info=True,
+        )
+    try:
+        _kb.block_task(
+            conn, task_id,
+            reason="gate-edge: " + ", ".join(c.card_id for c in verdict.unbacked_start),
+            kind="needs_input",
+        )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: gate-edge park failed for %s", task_id, exc_info=True,
         )
     return True
 
@@ -6693,20 +7154,16 @@ def _record_reserved_tranche_hold(
         )
 
 
-def _apply_default_assignee(
-    conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool,
+def _default_assignee_may_take(
+    conn: sqlite3.Connection, task_id: str, assignee: str,
 ) -> bool:
-    """Persist ``kanban.default_assignee`` on an unassigned ready row.
+    """May ``kanban.default_assignee`` adopt this row at all?
 
-    Mutating the row keeps board state honest: the task is legitimately owned
-    by the default, not "unassigned but secretly routed". ``dry_run`` reports
-    without writing. Returns False when the write failed.
-
-    A row whose stored skills no worker for the default can load is refused
-    here as well: the assign would hand the dispatcher a card that crash-loops
-    on ``Unknown skill(s)`` and auto-blocks with the reason visible only in a
-    worker log. ``kanban.default_assignee`` is a config value, so this attach is
-    the one with no operator in the loop to read a refusal — it is logged.
+    The WRITE is ``hermes_cli.kanban_db_default_assignee.fill_default_assignee``'s (the tick
+    calls it after this gate). This is the one attach with no operator in the loop to read a
+    refusal, so a row whose stored skills no worker for the default can load is refused HERE
+    and logged -- the assign would otherwise hand the dispatcher a card that crash-loops on
+    ``Unknown skill(s)`` and auto-blocks with the reason visible only in a worker log.
     """
     row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
     try:
@@ -6715,25 +7172,6 @@ def _apply_default_assignee(
         _kb._log.warning(
             "kanban dispatch: not applying default_assignee=%r to task %s: %s",
             assignee, task_id, exc,
-        )
-        return False
-    if dry_run:
-        return True
-    try:
-        with _kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                "AND (assignee IS NULL OR assignee = '')",
-                (assignee, task_id),
-            )
-            _kb._append_event(
-                conn, task_id, "assigned",
-                {"assignee": assignee, "source": "kanban.default_assignee"},
-            )
-    except Exception:
-        _kb._log.debug(
-            "kanban dispatch: failed to apply default_assignee=%r to task %s",
-            assignee, task_id, exc_info=True,
         )
         return False
     return True
@@ -7091,7 +7529,7 @@ def _any_spawnable_review(
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
-    Unavailable profile metadata retains the historic fail-open behavior. A
+    Unimportable profiles fail open only when no allowlist is set. A
     review row that :func:`_dispatch_lane_task` would refuse this tick — its
     assignee already at the per-profile cap, respawn-guarded, or parked by
     the author-exclusion guard — cannot
@@ -7121,9 +7559,9 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     """``kanban.default_assignee`` when it names a real profile this home may
     claim (``kanban.dispatch_profiles`` gated, same predicate as the spawn
     gate). Otherwise ``None`` so an unassigned shared-board card is never
-    written to. When the profiles module isn't importable trust the
-    operator's config: the downstream check still buckets a missing profile
-    as nonspawnable."""
+    written to. Profiles unimportable: trust the config if no allowlist is set
+    (the downstream check still buckets a missing profile as nonspawnable),
+    else ``None`` — the fail-closed gate claims nothing (#147531)."""
     name = (default_assignee or "").strip() or None
     if name:
         profile_exists = _profile_exists_fn()
@@ -7250,13 +7688,15 @@ def _dispatch_once_locked(
                 result.skipped_operator_rung.append(row["id"])
                 _record_reserved_tranche_hold(conn, row["id"], tranche_reason, dry_run=dry_run)
                 continue
-            if not default_assignee or not _apply_default_assignee(
-                conn, row["id"], default_assignee, dry_run=dry_run,
-            ):
+            # Skills gate first: it is a refusal about the ROW, and it must not reach the write.
+            if default_assignee and not _default_assignee_may_take(conn, row["id"], default_assignee):
                 result.skipped_unassigned.append(row["id"])
                 continue
-            row_assignee = default_assignee
-            result.auto_assigned_default.append(row["id"])
+            row_assignee = _kbda.fill_default_assignee(
+                conn, row["id"], default_assignee, result, dry_run=dry_run,
+            )
+            if not row_assignee:
+                continue
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
 
@@ -7785,9 +8225,8 @@ def _open_worker_log(task: Task, board: Optional[str]):
     log_dir = _kb.worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
-    from hermes_cli.kanban_worker_log import rotate_worker_log, worker_log_rotation_config
-    rotate_worker_log(log_path, *worker_log_rotation_config())
-    return open(log_path, "ab")
+    from hermes_cli.kanban_worker_log import open_worker_log
+    return open_worker_log(log_path)
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
@@ -7938,13 +8377,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # The worker is `-m hermes_cli.kanban_worker_client`: Hermes itself, with no console-script
-    # bootstrap. The routed-profile scrub above strips Hermes-owned PYTHONPATH entries (user
-    # children must not see our tree), so a PYTHONPATH-launched dispatcher spawned a child that
-    # died on `No module named 'hermes_cli'` before it ever reached the owner. Same pin as cron's
-    # external worker (#112729): applied to the sanitized env, after every other decision stands.
+    # The worker is `-m hermes_cli.kanban_worker_client` with no console-script bootstrap, and the scrub
+    # above strips our PYTHONPATH entries, so a PYTHONPATH-launched dispatcher's child died on
+    # `No module named 'hermes_cli'` (#112729). Pinned last, after every other env decision.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
-    env = pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parent.parent)
+    env = pin_hermes_tree_on_pythonpath(env, Path(project_root_str()))
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
@@ -8029,13 +8466,19 @@ def run_daemon(
     while not stop_event.is_set():
         try:
             # Re-resolved every tick (config load is mtime-cached) so operator
-            # edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            # edits apply without a restart. EVERY cap comes from the same
+            # host-baseline resolver as the CLI and the gateway: this daemon used
+            # to resolve max_in_progress on its own caller-dependent path, which
+            # fell through to None (= unlimited) when the seat carried no
+            # ``kanban:`` block and memory could not be sampled (card t_001338fa).
+            caps = resolve_dispatch_caps()
+            tick_max_spawn = max_spawn if max_spawn is not None else caps["max_spawn"]
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
+                    max_spawn=tick_max_spawn,
+                    max_in_progress=caps["max_in_progress"],
+                    max_in_progress_per_profile=caps["max_in_progress_per_profile"],
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
@@ -8052,6 +8495,7 @@ def run_daemon(
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
+from hermes_cli import kanban_db_default_assignee as _kbda
 from hermes_cli import kanban_db_workspace as _kbw
 from hermes_cli import substrate_access as _sa
 

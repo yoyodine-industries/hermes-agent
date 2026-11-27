@@ -50,7 +50,12 @@ _EXIT_REASON_PREFIX_EXPLANATIONS = tuple(
 )
 
 # ``session_persistence_failed`` refined by the classified cause (lock contention ≠ disk full).
-_PERSISTENCE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease", "session_row_missing", "locked", "replaced", "deleted_wal", "corrupt", "fts_index", "disk"})
+# Every cause ``classify_persistence_error`` can return besides ``unknown`` belongs here: a cause
+# that is classified but has no key still falls through to the default copy, which names no cause
+# the operator can act on. ``receipt_timeout`` is the owner-side receipt loss
+# (``worker_receipt_timeout`` / ``pending_receipt``): the gateway's loop was restarting or stalled,
+# the write never happened, and nothing was lost.
+_PERSISTENCE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease", "session_row_missing", "locked", "replaced", "deleted_wal", "corrupt", "fts_index", "disk", "owner_unavailable", "receipt_timeout"})
 
 
 def _persistence_explanation_key(cause: Optional[str]) -> str:

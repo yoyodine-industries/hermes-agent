@@ -215,15 +215,19 @@ def test_the_shutdown_handler_names_the_requester_on_its_context_line(home, monk
     assert lifecycle_ledger.read_sentinel_stop_id(home=home) == stop_id
 
 
-def test_under_systemd_is_not_derived_from_ppid_one_on_darwin(monkeypatch) -> None:
-    """A launchd LaunchDaemon is always re-parented to 1, so ``ppid == 1`` on darwin is NOT
-    evidence of systemd (measured false on this host)."""
+def test_under_systemd_comes_from_the_supervisor_stamp_not_from_parentage(monkeypatch) -> None:
+    """A launchd LaunchDaemon (and any macOS orphan) is always re-parented to 1, so ``ppid == 1``
+    is NOT evidence of systemd on any platform; supervision is read from what the supervisor
+    stamps (systemd: ``INVOCATION_ID``). Measured false on this host, where pid 381 read
+    ``under_systemd=yes parent_pid=1`` while running under launchd."""
     monkeypatch.setattr(shutdown_forensics.os, "getppid", lambda: 1)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
-    monkeypatch.setattr(shutdown_forensics.sys, "platform", "darwin")
-    assert shutdown_forensics.snapshot_shutdown_context(None)["under_systemd"] is False
-
-    monkeypatch.setattr(shutdown_forensics.sys, "platform", "linux")
+    for platform in ("darwin", "linux"):
+        monkeypatch.setattr(shutdown_forensics.sys, "platform", platform)
+        ctx = shutdown_forensics.snapshot_shutdown_context(None)
+        assert ctx["under_systemd"] is False
+        assert ctx["supervisor"] in ("launchd", "none")  # never "systemd" without a real stamp
+    monkeypatch.setenv("INVOCATION_ID", "abc123")
     assert shutdown_forensics.snapshot_shutdown_context(None)["under_systemd"] is True
 
 

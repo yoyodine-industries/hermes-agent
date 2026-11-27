@@ -202,6 +202,10 @@ def acquire(db_path: Optional[Path] = None) -> SessionDB:
     from hermes_state import _default_db_path
 
     raw_path = Path(db_path) if db_path is not None else Path(_default_db_path())
+    if os.name != "nt":
+        from hermes_state_dbfile import refuse_planted_state_db_link
+
+        refuse_planted_state_db_link(raw_path)
     try:
         path = raw_path.resolve()
     except OSError:
@@ -391,7 +395,7 @@ def close_all_under(directory: str | Path) -> int:
     return closed
 
 
-def _release_header_probes_under(root: Path) -> None:
+def _release_header_probes_under(root: Path) -> int:
     """Without this, a probe fd stays open until exit: one per profile a multiplexed gateway ever
     served. Invariant: a probe is never closed while another descriptor in this process holds its
     inode, because closing any descriptor cancels every POSIX lock the process holds on the file.
@@ -400,27 +404,71 @@ def _release_header_probes_under(root: Path) -> None:
     the inode is rescanned inside ``offline_file_access``, which blocks tracked opens through any
     spelling (a hard link too) until the close. An untracked ``sqlite3.connect`` that opens between
     the scan and the close is not covered."""
-    from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
-    from hermes_state_dbfile import (
-        close_header_probe_if_unchanged, header_probes_under, inodes_with_other_descriptors,
+    from hermes_state_dbfile import close_header_probe_if_unchanged, header_probes_under
+
+    candidates = _probe_candidates(header_probes_under(root), root=root)
+    return _release_header_probes(candidates, close_header_probe_if_unchanged)
+
+
+def release_idle_header_probes(
+    max_idle_seconds: float, *, root: Optional[Path] = None
+) -> int:
+    """Close this process's cached header probes that nothing has read for *max_idle_seconds*.
+
+    The bounded half of the probe cache: a multiplexed READER (``hermes dashboard``) opens each
+    profile's ``state.db`` read-only per request and closes it, but the lock-safe header probe
+    keeps one O_RDONLY fd per store for the life of the process -- so a store the dashboard once
+    listed stays a foreign holder forever and its owner-applied ``auto_vacuum`` rewrite is
+    skipped (``hermes_state_holders``). Releasing the idle entries is what makes the dashboard a
+    holder of only the stores it is actually serving.
+
+    Same lock discipline as :func:`_release_header_probes_under`: a probe closes only while no
+    other descriptor in this process holds its inode, and re-checked under the path's lifecycle
+    lock + ``offline_file_access``, so a store with a live connection (the gateway, an open chat)
+    keeps its probe. Returns the number of probes closed.
+    """
+    from hermes_state_dbfile import close_header_probe_if_idle, idle_header_probes
+
+    candidates = _probe_candidates(idle_header_probes(max_idle_seconds), root=root)
+    return _release_header_probes(
+        candidates,
+        lambda key, entry: close_header_probe_if_idle(key, entry, max_idle_seconds),
     )
 
-    candidates: dict[str, tuple[Path, tuple[int, int, int]]] = {}
-    for key, entry in header_probes_under(root).items():
+
+def _probe_candidates(
+    probes: Dict[str, Tuple[int, int, int]], *, root: Optional[Path] = None
+) -> Dict[str, Tuple[Path, Tuple[int, int, int]]]:
+    candidates: Dict[str, Tuple[Path, Tuple[int, int, int]]] = {}
+    for key, entry in probes.items():
         try:
-            candidates[key] = (Path(key).resolve(), entry)
+            path = Path(key).resolve()
         except OSError:
-            candidates[key] = (Path(key), entry)
+            path = Path(key)
+        if root is not None and not _path_is_under(path, root):
+            continue
+        candidates[key] = (path, entry)
+    return candidates
+
+
+def _release_header_probes(candidates, close_one) -> int:
+    """Close each candidate probe exactly as the two callers above need: *close_one(key, entry)*
+    is ``close_header_probe_if_unchanged`` or the idle variant, both of which re-check the entry
+    under the probe lock."""
+    from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+    from hermes_state_dbfile import inodes_with_other_descriptors
+
     if not candidates:
-        return
+        return 0
     with _lock:
         locks = {path: _path_lifecycle_lock_locked(path) for path, _entry in candidates.values()}
+    closed = 0
     with contextlib.ExitStack() as stack:
         for path in sorted(locks, key=str):  # one fixed order: two sweeps never deadlock
             stack.enter_context(locks[path])
         held_elsewhere = inodes_with_other_descriptors({entry[1:] for _path, entry in candidates.values()})
         if held_elsewhere is None:
-            return  # descriptor table unreadable: unknown is unsafe
+            return 0  # descriptor table unreadable: unknown is unsafe
         for key, (path, entry) in candidates.items():
             if entry[1:] in held_elsewhere:
                 continue
@@ -429,9 +477,11 @@ def _release_header_probes_under(root: Path) -> None:
                     held = inodes_with_other_descriptors({entry[1:]})
                     if held is None or entry[1:] in held:
                         continue  # opened after the first scan, maybe through another pathname
-                    close_header_probe_if_unchanged(key, entry)
+                    if close_one(key, entry):
+                        closed += 1
             except LiveConnectionError:
                 continue  # a tracked connection opened after the scan
+    return closed
 
 
 def other_generations_for_path(

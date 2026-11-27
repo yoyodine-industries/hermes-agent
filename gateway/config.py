@@ -444,6 +444,9 @@ class PlatformConfig:
     # Runtime-only, never serialized: set when the GATEWAY_RELAY_URL relay-exclusive rule
     # (config_env._relay) switched an enabled platform off, so surfaces can say why (#141175).
     disabled_by_relay: bool = False
+    # Runtime-only: the config.yaml version this copy was loaded from (taken before the read), so the
+    # live-allowlist baseline names the file that produced the adapter's gates, not a later edit.
+    loaded_version: Optional[tuple] = field(default=None, compare=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -625,6 +628,12 @@ class GatewayConfig:
     # compatibility with external tooling and downgrade safety; set gateway.write_sessions_json: false in
     # config.yaml to stop producing the file.
     write_sessions_json: bool = True
+    # Which executor session-store persistence runs on — "dedicated" (default) or "default".
+    # "dedicated": gateway.session_executor's own bounded, named pool with explicit backpressure, a
+    # per-write deadline and a post-commit receipt. "default": the pre-change behaviour
+    # (asyncio.to_thread on the event loop's shared default pool) — the ROLLBACK lever for a fleet-wide
+    # change; one config flip at the next restart, no code change.
+    session_store_executor: str = "dedicated"
     always_log_local: bool = True  # Always save cron outputs to local files
     # Drop outbound "silence narration" (*(silent)*, 🔇, a bare ".") that ping-pongs in bot-to-bot
     # channels; a substrate guard that survives prompt drift.
@@ -676,7 +685,8 @@ class GatewayConfig:
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
-        "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
+        "write_sessions_json", "session_store_executor",
+        "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
         "max_concurrent_sessions", "multiplex_profiles",
         "on_all_adapters_down",
@@ -808,6 +818,9 @@ class GatewayConfig:
             quick_commands=_coerce_dict(data.get("quick_commands", {})),
             sessions_dir=Path(data["sessions_dir"]) if "sessions_dir" in data else get_hermes_home() / "sessions",
             **{name: _coerce_bool(data.get(name), default) for name, default in _TOPLEVEL_BOOL_DEFAULTS.items()},
+            session_store_executor=_normalize_choice(
+                pick("session_store_executor"), {"dedicated", "default"}, "dedicated"
+            ),
             stt_enabled=_coerce_bool(stt_setting("stt_enabled", "enabled"), True),
             stt_echo_transcripts=_coerce_bool(stt_setting("stt_echo_transcripts", "echo_transcripts"), True),
             multiplex_profiles=None if multiplex_profiles is None else _coerce_bool(multiplex_profiles, True),
@@ -847,15 +860,35 @@ class GatewayConfig:
         return "public" if choice is None else choice
 
 
-def load_gateway_config() -> GatewayConfig:
-    """Load gateway configuration. Priority: env > ~/.hermes/config.yaml > legacy gateway.json > defaults."""
+def load_gateway_config(*, strict: bool = False) -> GatewayConfig:
+    """Load gateway configuration. Priority: env > ~/.hermes/config.yaml > legacy gateway.json > defaults.
+
+    ``strict=True`` raises a config.yaml failure instead of falling back to env + gateway.json: a live
+    allowlist refresh keeps its last good lists rather than apply an env-only config."""
     from gateway import config_loader
+    from gateway.platforms._shared import gate_config_version, yaml_env_transaction
 
     _home = get_hermes_home()
+    version = gate_config_version()
     gw_data = config_loader.load_legacy_gateway_json(_home)
+    # One transaction through typed construction, overrides and validation: the runner's authorization
+    # reads the bridged env, so a load that fails after the YAML overlay must not leave its writes.
+    with yaml_env_transaction():
+        config = _load_gateway_config_layers(_home, gw_data, strict)
+    for platform_config in config.platforms.values():
+        platform_config.loaded_version = version
+    return config
+
+
+def _load_gateway_config_layers(_home: Path, gw_data: dict, strict: bool) -> GatewayConfig:
+    from gateway import config_loader
+    from gateway.platforms._shared import abort_yaml_env_refresh
     try:
         config_loader.load_yaml_layer(_home, gw_data)
     except Exception as e:
+        if strict:
+            raise
+        abort_yaml_env_refresh()
         logger.warning(
             # DingTalk settings → env vars: migrated to the dingtalk plugin's apply_yaml_config_fn hook
             # (plugins/platforms/dingtalk/adapter.py). #41112 / #3823.

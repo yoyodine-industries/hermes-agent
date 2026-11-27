@@ -247,12 +247,16 @@ def test_cli_json_reports_the_host_ceiling(kanban_home, all_assignees_spawnable,
 
     assert payload["host_budget"]["max_spawn"] == 2
     assert payload["host_budget"]["ceiling_sum"] == 4      # 2 boards x max_spawn 2
-    # No host cap is derived in this isolated home, so the unreachable count is
-    # UNMEASURED (None), never invented as 0 — and never the old ceiling_sum - cap.
-    assert payload["host_budget"]["max_in_progress"] is None
-    assert payload["host_budget"]["unreachable_slots"] is None
+    # Card t_001338fa: an UNSET host cap no longer measures as None (= unlimited on
+    # the spawn path). It resolves to the fail-closed host floor, so the count is
+    # always measured and an isolated home reports the floor, never "unmeasured".
+    assert payload["host_budget"]["max_in_progress"] == kbd.DEFAULT_HOST_MAX_SPAWN == 8
+    assert payload["host_budget"]["unreachable_slots"] == 0
     assert payload["host_budget"]["per_board_unreachable"] == {}
     assert payload["host_budget"]["oversubscribed"] is False
+    # The resolution basis rides the payload: who invoked the command is visible.
+    assert payload["dispatch_caps"]["host_baseline"]["max_spawn"] == kbd.DEFAULT_HOST_MAX_SPAWN
+    assert payload["dispatch_caps"]["clamped_to_host"] == []
 
 
 def test_cli_text_output_prints_no_capacity_advice_for_an_elastic_host(
@@ -285,17 +289,16 @@ def test_cli_text_output_names_the_board_whose_ceiling_exceeds_the_cap(
 ):
     from hermes_cli import config as hermes_config
 
-    monkeypatch.setattr(
-        hermes_config,
-        "load_config",
-        lambda *a, **kw: {
-            "kanban": {
-                "max_spawn": 8,
-                "max_in_progress": 8,
-                "max_spawn_by_board": {kb.DEFAULT_BOARD: 12},
-            }
-        },
-    )
+    # A ROOT invocation: the profile block IS the host block, and the per-board
+    # ceiling above ``max_in_progress`` is the host's own decision (a lane seat
+    # could not raise it — see test_kanban_host_cap_resolution.py).
+    host_block = {
+        "max_spawn": 8,
+        "max_in_progress": 8,
+        "max_spawn_by_board": {kb.DEFAULT_BOARD: 12},
+    }
+    monkeypatch.setattr(hermes_config, "load_config", lambda *a, **kw: {"kanban": dict(host_block)})
+    monkeypatch.setattr(kbd, "host_kanban_config", lambda: dict(host_block))
 
     kanban_ops._cmd_dispatch(_dispatch_args(json=False))
     out = capsys.readouterr().out

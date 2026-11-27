@@ -31,6 +31,7 @@ async def standalone_lifespan(app: "FastAPI"):
         _eager_reconcile_own_session_db, _warm_gateway_module,
         _start_desktop_cron_ticker, _dashboard_selftest_loop,
         _auto_archive_ticker_loop, _terminate_desktop_managed_gateway,
+        _header_probe_reaper_loop,
     )
     from hermes_cli.web_server_chat import PTY_REGISTRY
 
@@ -136,6 +137,10 @@ async def standalone_lifespan(app: "FastAPI"):
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
     # Periodic authenticated self-test feeding the ``dashboard`` component on /api/status.
     selftest_task = asyncio.create_task(_dashboard_selftest_loop())
+    # Bounded header-probe cache: release the per-store probe fds nothing has read for the idle
+    # window, so this backend is a foreign holder of only the stores it is serving (an idle one
+    # blocks that store's owner-applied auto_vacuum rewrite forever -- see the module docstring).
+    probe_reaper_task = asyncio.create_task(_header_probe_reaper_loop())
     # Live auto-archive timer, independent of list requests.
     auto_archive_task = asyncio.create_task(_auto_archive_ticker_loop())
 
@@ -175,6 +180,7 @@ async def standalone_lifespan(app: "FastAPI"):
             cron_stop.set()
         pty_reaper_task.cancel()
         selftest_task.cancel()
+        probe_reaper_task.cancel()
         auto_archive_task.cancel()
         eager_reconcile_thread.join()
         await PTY_REGISTRY.close_all()

@@ -9,9 +9,9 @@ OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_
 import asyncio
 import errno
 import hashlib
-import hmac
 import itertools
 import json
+from collections import Counter
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar, copy_context
 from functools import wraps
@@ -138,6 +138,7 @@ from gateway.readiness import collect_runtime_readiness
 
 from gateway.parked_route_refusal import ParkedRouteRefused
 from gateway.platforms._shared import coerce_port as _coerce_port, get_scoped_secret as _get_scoped_secret
+from gateway.platforms._shared import secrets_match
 from gateway.platforms.tcp_site import start_tcp_site
 from hermes_state_errors import SessionActiveWriteGuardError
 
@@ -834,8 +835,36 @@ def _gate_route_label(route: Any) -> str:
     return str(route or "")[:80]
 
 
+def _host_load_gauge() -> dict[str, Any]:
+    """Host pressure published BESIDE the agent-work gate, never read by it.
+
+    A gauge for operators only (t_4ee24aa2): admission is count-only by decision, so nothing
+    here can refuse a request. The load read is guarded because status publication must never
+    fail on a diagnostic -- an unsupported platform (or a load average the kernel will not
+    answer) yields ``null``s, not an exception.
+    """
+    cpu_count = os.cpu_count() or 0
+    gauge: dict[str, Any] = {
+        "cpu_count": cpu_count, "load1": None, "load5": None, "load15": None,
+        "load1_per_core": None,
+    }
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except (OSError, AttributeError, NotImplementedError):
+        return gauge
+    gauge.update(load1=load1, load5=load5, load15=load15)
+    if cpu_count > 0:
+        gauge["load1_per_core"] = round(load1 / cpu_count, 2)
+    return gauge
+
+
 def _gate_holders_summary(snapshot: dict[str, Any], limit: int = 4) -> list[str]:
-    """The oldest few gate holders, in a shape that fits on one log line."""
+    """The oldest few gate holders and who they belong to, in a shape that fits on one log line.
+
+    The last fragment is the CONCENTRATION (t_4ee24aa2): the shape that caused a refusal
+    (16/16 slots held by one session) is invisible in a per-holder list without counting
+    ``session_id=`` repetitions by eye, so the top three sessions are named by count.
+    """
     holders = snapshot.get("holders") or []
     summary: list[str] = []
     for holder in holders[:limit]:
@@ -847,6 +876,10 @@ def _gate_holders_summary(snapshot: dict[str, Any], limit: int = 4) -> list[str]
         summary.append(" ".join(bits))
     if len(holders) > limit:
         summary.append(f"+{len(holders) - limit} more")
+    counts = Counter(str(holder.get("session_id") or "") for holder in holders)
+    counts.pop("", None)  # an unattributed holder belongs to no session
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+    summary.append("top_sessions=[" + ", ".join(f"{sid[:12]}={n}" for sid, n in ranked) + "]")
     return summary
 
 
@@ -1562,7 +1595,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._reset_metrics_if_needed()
         heartbeat = self._metrics_last_heartbeat_at if heartbeat_at is None else heartbeat_at
         return {
-            "host": self._host,
+            # ``host`` is host PRESSURE, published beside the gate as a GAUGE (t_4ee24aa2):
+            # admission is count-only by decision and never reads it. The bind address it used
+            # to hold is ``bind_host`` so a reader cannot mistake one for the other.
+            "host": _host_load_gauge(),
+            "bind_host": self._host,
             "port": self._port,
             "active_runs": self._live_api_run_count(),
             # The non-terminal ROW census, named as rows (R2): a leaked row can only move this
@@ -1736,9 +1773,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            # Compare as bytes: compare_digest raises TypeError on non-ASCII str, and the
-            # token is raw client input — a stray byte must 401, not 500.
-            if hmac.compare_digest(token.encode(), expected_key.encode()):
+            if secrets_match(token, expected_key):
                 return None
         logger.warning("API server rejected invalid API key: %s", self._request_audit_log_suffix(request))
         return self._auth_failed_response()
@@ -2507,18 +2542,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
             _resolve_gateway_model, _load_gateway_config, GatewayRunner)
         from hermes_cli.tools_config import _get_platform_tools
-        # RuntimeError is caught ONLY here (sole provider-auth raiser); the typed subclass keeps
-        # run_conversation() errors distinct.
+        # RuntimeError is caught ONLY here (sole provider-auth raiser); the typed subclass keeps run_conversation() errors distinct.
         try:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
-        # A fallback-provider runtime carries its own ``model``: pop it (overrides config, and
-        # must not collide with the ``**runtime_kwargs`` spread).
+        # A fallback runtime's own ``model`` overrides config and must not collide with the spread.
         model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
         runtime_kwargs.pop("_fallback_notice", None)  # raw API surface: the switch is already logged
-        request_reasoning_config = _request_reasoning_config(model_options)
-        request_service_tier = _request_service_tier(model_options)
+        from agent.primary_auth_fallback import RUNTIME_KEY, attach_primary_auth_failure, failure_for_route, route_snapshot
+        _primary_auth_failure, resolved_route = runtime_kwargs.pop(RUNTIME_KEY, None), route_snapshot(runtime_kwargs)
+        request_reasoning_config, request_service_tier = _request_reasoning_config(model_options), _request_service_tier(model_options)
         model, session_override, request_model, request_provider = self._select_agent_runtime(
             runtime_kwargs, model,
             requested_model=requested_model, requested_provider=requested_provider, route=route,
@@ -2564,6 +2598,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
         agent = AIAgent(**agent_kwargs)
+        attach_primary_auth_failure(agent, failure_for_route(_primary_auth_failure, resolved_route, runtime_kwargs))
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override
@@ -4068,7 +4103,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     _JOB_ID_RE = re.compile(r"[a-f0-9]{12}")
     # Update whitelist — prevents clients injecting arbitrary keys.
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "timezone"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -4108,17 +4143,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return web.json_response({"error": scan_error}, status=400)
         return None
 
-    def _job_response(self, fn, job_id: str, *, notify: bool) -> web.Response:
-        """Run ``fn(job_id)``: 404 when falsy, else ``{"job": ...}``; exceptions -> 500."""
-        try:
-            job = fn(job_id)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
-            if notify:
-                _notify_cron_provider_jobs_changed()
-            return web.json_response({"job": job})
-        except Exception as e:
-            return self._cron_error_response(e)
+    def _job_response(self, fn, job_id: str, *, notify: bool, invalid_input=()) -> web.Response:
+        from gateway.platforms.api_server_cron_jobs import job_response
+        return job_response(self, fn, job_id, notify=notify, invalid_input=invalid_input)
 
     async def _job_lookup_or_mutate(self, request: web.Request, fn, *, notify: bool) -> web.Response:
         job_id, err = self._cron_request_guard(request, need_job_id=True)
@@ -4162,7 +4189,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "prompt": prompt, "schedule": schedule, "name": name,
                 "deliver": body.get("deliver", "local"),
                 "origin": self._cron_origin_from_request(request)}
-            for key in ("paused", "paused_reason"):
+            for key in ("paused", "paused_reason", "timezone"):
                 if key in body:
                     kwargs[key] = body[key]
             if skills:
@@ -4183,24 +4210,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _handle_update_job(self, request: web.Request) -> web.Response:
         """PATCH /api/jobs/{job_id} — update a cron job."""
-        job_id, err = self._cron_request_guard(request, need_job_id=True)
-        if err:
-            return err
-        try:
-            body = await request.json()
-            # Whitelist allowed fields to prevent arbitrary key injection
-            sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
-            if not sanitized:
-                return web.json_response({"error": "No valid fields to update"}, status=400)
-            if "name" in sanitized and len(sanitized["name"]) > self._MAX_NAME_LENGTH:
-                return web.json_response({"error": f"Name must be ≤ {self._MAX_NAME_LENGTH} characters"}, status=400)
-            if "prompt" in sanitized:
-                prompt_err = self._validate_cron_prompt(sanitized["prompt"])
-                if prompt_err:
-                    return prompt_err
-        except Exception as e:
-            return self._cron_error_response(e)
-        return self._job_response(lambda jid: _cron_update(jid, sanitized), job_id, notify=True)
+        from gateway.platforms.api_server_cron_jobs import handle_update_job
+        return await handle_update_job(self, request)
 
     async def _handle_delete_job(self, request: web.Request) -> web.Response:
         """DELETE /api/jobs/{job_id} — delete a cron job."""
@@ -4672,6 +4683,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _release_live_run_handle(self, run_id: str) -> None:
         return _api_runs._release_live_run_handle(self, run_id)
+
+    def _retire_live_run(self, run_id: str) -> None:
+        """The adapter-surface alias of the run-control retire (used by the stalled-run reap)."""
+        return _api_runs._retire_live_run(self, run_id)
 
     def _run_has_live_handle(self, run_id: str) -> bool:
         """The fence predicate: does this process still hold executable work for the run?"""

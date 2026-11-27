@@ -28,7 +28,7 @@ from hermes_cli.kanban_filing_policy import is_refusal as kb_is_filing_refusal
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, BOARD_PIN_REMEDY, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
-    _task_to_dict,
+    _task_to_dict, fmt_loss_line,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
@@ -699,6 +699,21 @@ def _cmd_list(args: argparse.Namespace) -> int:
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
         )
+        # A listing that SHOWS the reserved tranche must DECLARE the order it is showing it in
+        # (ruling platform-stl 2026-11-08 item 2, card t_a1890b04). An ordinary listing stays
+        # quiet: the declaration is about a rung, not about every listing. `--sort` overrides
+        # the dispatcher's order, so the declaration carries the sort ACTUALLY in force too —
+        # otherwise it would describe a query the list did not run (review round 1, item 2).
+        if any(kb.priority_in_tranche(getattr(t, "priority", None)) for t in tasks):
+            order_lines = kb.tranche_order_lines(
+                conn, listing_sort=getattr(args, "sort", None)
+            )
+        else:
+            order_lines = []
+    # Machine readers: this array SHAPE is the `ls --json` contract, so the declaration rides
+    # `dispatch --json` (`tranche_order`) rather than a top-level key here — wrapping the array
+    # would break every existing consumer. Machine LISTINGS are out of scope by decision
+    # (platform-stl review round 1, item 3, card t_a1890b04).
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
@@ -713,6 +728,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
+    if order_lines:
+        for line in order_lines:
+            print(line)
+        print()
     for t in tasks:
         print(_fmt_task_line(t))
     return 0
@@ -856,6 +875,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+            loss_line = fmt_loss_line(r, prefix="        ")
+            if loss_line:
+                print(loss_line)
     return 0
 
 
@@ -1766,21 +1788,22 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         )
         if value
     }
-    user_id, user_id_alt = _caller_identity_for_target(
-        args.platform, args.chat_id, args.thread_id, args.user_id, getattr(args, "user_id_alt", None))
+    from hermes_cli.kanban_notify_thread import resolve_subscribe_thread
     with kbc.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             return _err(f"no such task: {args.task_id}")
+        thread_id = resolve_subscribe_thread(conn, args)
+        user_id, user_id_alt = _caller_identity_for_target(
+            args.platform, args.chat_id, thread_id, args.user_id, getattr(args, "user_id_alt", None))
         kbn.add_notify_sub(
             conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
-            chat_type=args.chat_type, thread_id=args.thread_id, user_id=user_id,
+            chat_type=args.chat_type, thread_id=thread_id, user_id=user_id,
             user_id_alt=user_id_alt,
             notifier_profile=args.notifier_profile or _profile_author(),
             delivery_mode=getattr(args, "delivery_mode", None),
             delivery_metadata=delivery_metadata or None,
         )
-    print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
-          + f" to {args.task_id}")
+    print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{thread_id}" if thread_id else "") + f" to {args.task_id}")
     return 0
 
 
@@ -1806,9 +1829,10 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_notify_thread import resolve_unsubscribe_thread
     with kbc.connect_closing() as conn:
         ok = kbn.remove_notify_sub(conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
-                                  thread_id=args.thread_id)
+                                  thread_id=resolve_unsubscribe_thread(conn, args))
     return _ok_or_err(ok, "(no such subscription)", f"Unsubscribed from {args.task_id}")
 
 
@@ -1846,6 +1870,11 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             print(f"     → {r.summary.splitlines()[0][:100]}")
         if r.error:
             print(f"     ✖ {r.error[:100]}")
+        loss_line = fmt_loss_line(r, prefix="     ")
+        if loss_line:
+            # The harness lost the process: say so plainly, so this row is never read as the
+            # card's work being judged (or as "review requested changes").
+            print(loss_line)
     return 0
 
 

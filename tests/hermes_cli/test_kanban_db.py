@@ -496,9 +496,11 @@ def test_storage_locked_exit_requeues_without_counting_failure(
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="sl", assignee="a")
 
-        # FAR more lock-stops than DEFAULT_FAILURE_LIMIT (2): if any counted, the
-        # card would be blocked/given up well before the loop ends.
-        for i in range(6):
+        # More lock-stops than DEFAULT_FAILURE_LIMIT (2): if any counted, the card would be
+        # given up well before the loop ends. Five is one under SURVIVAL_ATTEMPT_LIMIT (6):
+        # the survival bound is exercised by its own test below, because at six the card is
+        # PARKED BLOCKED (with the loss class named) -- never given up on the work.
+        for i in range(5):
             pid = 72000 + i
             kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
             conn.execute(
@@ -524,6 +526,9 @@ def test_storage_locked_exit_requeues_without_counting_failure(
                 f"hit {i}: a lock-stop must not count a failure, "
                 f"got {task.consecutive_failures}"
             )
+            assert conn.execute(
+                "SELECT survival_failures FROM tasks WHERE id=?", (tid,)
+            ).fetchone()[0] == i + 1, f"hit {i}: the SURVIVAL budget must count it"
 
         # The stamped notice is what the respawn guard reads, and it must be free of
         # every blocker_auth word: the guard has to see the OUTCOME, not the prose.
@@ -593,17 +598,27 @@ def test_respawn_guard_defers_storage_locked_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
-def test_storage_locked_cooldown_defaults_to_the_next_tick(kanban_home, monkeypatch):
-    """Default 0 is the contract's "immediately" and is what makes the fix cheap: the
-    reclaim pass has already re-queued the card on this tick and the dispatcher's own
-    cadence is the spacing, so nothing is consumed and there is no hot loop."""
+def test_storage_locked_cooldown_defaults_to_a_jittered_deferral(kanban_home, monkeypatch):
+    """The default is a real deferral, not "immediately": a worker the store lost must not
+    re-enter the same contention on the next tick. The per-task jitter is deterministic, so
+    every reader computes the same deadline for the same card; an explicit env value is
+    honoured verbatim (0 = next tick, for tests)."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.delenv("HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", raising=False)
-    assert kbd.DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS == 0
-    assert _kb._resolve_storage_locked_cooldown_seconds() == 0
+    assert kbd.DEFAULT_STORAGE_LOCKED_COOLDOWN_SECONDS == 120
+    assert kbd.STORAGE_LOCKED_COOLDOWN_JITTER_SECONDS == 30
+    # No task id → the bare base (legacy callers keep a predictable number).
+    assert _kb._resolve_storage_locked_cooldown_seconds() == 120
+    for tid in ("t_one", "t_two", "t_5800fe41"):
+        first = _kb._resolve_storage_locked_cooldown_seconds(tid)
+        assert 120 - 30 <= first <= 120 + 30, (tid, first)
+        # Deterministic across calls and processes: same card, same window.
+        assert _kb._resolve_storage_locked_cooldown_seconds(tid) == first
     monkeypatch.setenv("HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", "600")
-    assert _kb._resolve_storage_locked_cooldown_seconds() == 600
+    assert _kb._resolve_storage_locked_cooldown_seconds("t_one") == 600
+    monkeypatch.setenv("HERMES_KANBAN_STORAGE_LOCKED_COOLDOWN_SECONDS", "0")
+    assert _kb._resolve_storage_locked_cooldown_seconds("t_one") == 0
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import stat
 import struct
 import sys
 import threading
@@ -69,8 +70,11 @@ def _prepare_connection_retirement():
 # cached for the life of the process (opening never cancels locks).  When the path is re-pointed
 # at a new inode (the very replacement this probe detects) the stale fd is RETIRED, never closed
 # — closing it would cancel the live connection's locks.  Replacements are rare and halt writes.
-# close_all_under (hermes_state_registry) closes a home's probes, but only once no other
-# descriptor in the process is open on the inode: the only lock-safe time to close.
+# close_all_under / release_idle_header_probes (hermes_state_registry) close a home's or the
+# process's probes, but only once no other descriptor in the process is open on the inode: the
+# only lock-safe time to close.  The idle release is what bounds a multiplexed READER (the
+# dashboard) that lists many profile stores while holding none of them: the probe a listing
+# request leaves behind is closed again once that store goes unread for the idle window.
 _HEADER_PROBE_LOCK = threading.Lock()
 # close_header_probe_if_unchanged runs while _live_lock is held (offline_file_access), and a
 # collection can finalize an unclosed SessionDB inside _pread_db_range (which holds this lock),
@@ -79,8 +83,77 @@ _HEADER_PROBE_LOCK = threading.Lock()
 # cycle in the rare contend-with-GC case; this path is unserve / delete / restore, never a hot path.
 _HEADER_PROBE_LOCK_TIMEOUT = 0.1
 _HEADER_PROBE_FDS: dict[str, tuple[int, int, int]] = {}  # key -> (fd, dev, ino)
+# Last read per cached probe (monotonic seconds), so a cache entry's age is measurable: the LRU
+# clock for hermes_state_registry.release_idle_header_probes.  A probe without an entry here is
+# treated as fully idle (it was cached before this bookkeeping existed).
+_HEADER_PROBE_LAST_USED: dict[str, float] = {}
+# Default idle window before release_idle_header_probes() may close an unused probe.  Bounded on
+# purpose: a reader that listed a store once must not stay a foreign holder of it forever, while
+# a store it is actively serving keeps its connection (and therefore its probe) anyway.
+HEADER_PROBE_IDLE_SECONDS = 60.0
 _RETIRED_HEADER_PROBE_FDS: list[int] = []  # intentionally never closed
 _FTS_TABLE_NAMES = ("messages_fts", "messages_fts_trigram")
+
+
+def _is_operator_store_link(link: Path, link_st: os.stat_result) -> bool:
+    """A ``state.db`` symlink this user owns, to an existing file this user owns.
+
+    A dangling link is refused: SQLite would create the store wherever it points, such as an
+    unmounted volume's mount point (symlinked home directories follow the same rule). A link or
+    target owned by anyone else is refused as planted (#109857).
+    """
+    try:
+        target_st = os.stat(link)
+    except OSError:
+        return False
+    uid = os.geteuid()
+    return link_st.st_uid == uid and target_st.st_uid == uid
+
+
+def refuse_planted_state_db_link(path: Path) -> None:
+    """Raise ``ELOOP`` when ``path`` is a symlink other than the operator's own store link.
+
+    For openers that canonicalize the path before ``SessionDB`` sees it (the registry), so the
+    link is judged before ``resolve()`` hides it.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if stat.S_ISLNK(st.st_mode) and not _is_operator_store_link(path, st):
+        raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(path))
+
+
+def _chmod_pinned_inode(path: Path, mode: int) -> None:
+    """Tighten ``path`` without following a link swapped in after the lstat().
+
+    A bare chmod(2) on the path re-resolves the name, so a replacement symlink
+    racing between validation and chmod could change the mode of an unrelated
+    target (#109857). On Linux the validated inode is pinned with an O_PATH
+    descriptor and reached through ``/proc/self/fd/<fd>``; an O_PATH descriptor
+    holds no POSIX locks, so closing it stays lock-neutral for live SQLite
+    connections. Platforms without O_PATH (macOS/BSD) use the no-follow chmod,
+    which applies to the link itself, never to a swapped-in target.
+    """
+    if hasattr(os, "O_PATH"):
+        # O_PATH|O_NOFOLLOW pins a swapped-in symlink itself instead of failing.
+        fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            st_mode = os.fstat(fd).st_mode
+            if stat.S_ISLNK(st_mode):
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(path))
+            if not stat.S_ISREG(st_mode):
+                return
+            try:
+                os.chmod(f"/proc/self/fd/{fd}", mode)
+            except FileNotFoundError:
+                # No /proc (minimal chroot/sandbox): leave the mode as is rather
+                # than fall back to a pathname chmod that could follow a swap.
+                logger.debug("state db: /proc unavailable; not tightening %s", path)
+        finally:
+            os.close(fd)
+    else:
+        os.chmod(path, mode, follow_symlinks=False)
 
 
 def _pread_db_range(db_path: Path, offset: int, length: int) -> Optional[bytes]:
@@ -103,6 +176,7 @@ def _pread_db_range(db_path: Path, offset: int, length: int) -> Optional[bytes]:
         if cached is not None and (cached[1], cached[2]) != (st.st_dev, st.st_ino):
             # Path re-pointed at a new file. Retire (never close) the old fd.
             _RETIRED_HEADER_PROBE_FDS.append(_HEADER_PROBE_FDS.pop(key)[0])
+            _HEADER_PROBE_LAST_USED.pop(key, None)
             cached = None
         if cached is None:
             try:
@@ -115,6 +189,7 @@ def _pread_db_range(db_path: Path, offset: int, length: int) -> Optional[bytes]:
                 _RETIRED_HEADER_PROBE_FDS.append(fd)
                 return None
             cached = _HEADER_PROBE_FDS[key] = (fd, fst.st_dev, fst.st_ino)
+        _HEADER_PROBE_LAST_USED[key] = time.monotonic()
         with contextlib.suppress(OSError):
             return os.pread(cached[0], length, offset)
     return None
@@ -168,6 +243,60 @@ def close_header_probe_if_unchanged(key: str, expected: tuple[int, int, int]) ->
         if _HEADER_PROBE_FDS.get(key) != expected:
             return False
         del _HEADER_PROBE_FDS[key]
+        _HEADER_PROBE_LAST_USED.pop(key, None)
+        with contextlib.suppress(OSError):
+            os.close(expected[0])
+    finally:
+        _HEADER_PROBE_LOCK.release()
+    return True
+
+
+def header_probe_last_used(key: str) -> Optional[float]:
+    """Monotonic time of the last read through *key*'s cached probe; None when it has no probe."""
+    with _HEADER_PROBE_LOCK:
+        if key not in _HEADER_PROBE_FDS:
+            return None
+        return _HEADER_PROBE_LAST_USED.get(key)
+
+
+def idle_header_probes(
+    max_idle_seconds: float, *, now: Optional[float] = None
+) -> dict[str, tuple[int, int, int]]:
+    """The cached probes nothing has read for at least *max_idle_seconds*, least recently used
+    first (the LRU order the reaper releases in).  A snapshot: the caller re-checks each entry
+    under the probe lock with :func:`close_header_probe_if_idle` before closing it."""
+    current = time.monotonic() if now is None else now
+    with _HEADER_PROBE_LOCK:
+        ages = {
+            key: current - _HEADER_PROBE_LAST_USED.get(key, 0.0)
+            for key in _HEADER_PROBE_FDS
+        }
+        entries = dict(_HEADER_PROBE_FDS)
+    aged = [(key, entry) for key, entry in entries.items() if ages[key] >= max_idle_seconds]
+    aged.sort(key=lambda item: ages[item[0]], reverse=True)
+    return dict(aged)
+
+
+def close_header_probe_if_idle(
+    key: str, expected: tuple[int, int, int], max_idle_seconds: float, *,
+    now: Optional[float] = None,
+) -> bool:
+    """:func:`close_header_probe_if_unchanged`'s lock discipline, but only once the probe has
+    gone *max_idle_seconds* without a read.  False (and the fd stays) when the entry changed, the
+    probe was read again after the snapshot, or the probe lock is busy."""
+    if not _HEADER_PROBE_LOCK.acquire(timeout=_HEADER_PROBE_LOCK_TIMEOUT):
+        logger.debug(
+            "idle header probe of %s kept: probe lock busy for %.2fs, the next sweep retries",
+            key, _HEADER_PROBE_LOCK_TIMEOUT)
+        return False
+    try:
+        if _HEADER_PROBE_FDS.get(key) != expected:
+            return False
+        current = time.monotonic() if now is None else now
+        if current - _HEADER_PROBE_LAST_USED.get(key, 0.0) < max_idle_seconds:
+            return False
+        del _HEADER_PROBE_FDS[key]
+        _HEADER_PROBE_LAST_USED.pop(key, None)
         with contextlib.suppress(OSError):
             os.close(expected[0])
     finally:

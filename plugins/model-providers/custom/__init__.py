@@ -1,6 +1,10 @@
 """Custom / Ollama (local) provider profile: any endpoint registered as
 provider="custom" (Ollama, vLLM, llama.cpp, GLM-5.2 on ARK, …)."""
 
+import json
+import threading
+import time
+import urllib.request
 from typing import Any
 from urllib.parse import urlparse
 
@@ -8,6 +12,100 @@ from agent.reasoning_effort import OPENAI_COMPAT_WIRE_EFFORTS, clamp_effort
 from providers import register_provider
 from providers.base import ProviderProfile
 from utils import base_url_host_matches
+
+# llama.cpp has no ``none`` level on its OpenAI-compatible wire: the accepted ladder is
+# default|minimal|low|medium|high|xhigh|max, and a value outside it is DISCARDED SILENTLY
+# (no log line, unlike a numeric effort) so the chat template's own default — usually the
+# most expensive — applies to a seat that believes reasoning is off. On that wire the client
+# must send no ``reasoning_effort`` at all and let ``--reasoning on|off|auto`` decide.
+_LLAMACPP_PROP_TIMEOUT_S = 0.5
+_LLAMACPP_PROP_TTL_S = 600.0  # a confirmed llama-server keeps this shape for its build's life
+_LLAMACPP_MISS_TTL_S = 30.0  # re-check a non-answer: the server may still be booting
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+_llamacpp_cache: dict[str, tuple[bool, float]] = {}
+_llamacpp_probing: set[str] = set()
+_llamacpp_lock = threading.Lock()
+
+
+def _loopback_root(base_url: str | None) -> str | None:
+    """``scheme://host:port`` root of a LOOPBACK base_url, else None.
+
+    Only a local endpoint is fingerprinted: the probe is an extra request to the user's own
+    server, and a remote OpenAI-compatible relay is never assumed to be llama.cpp.
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw if "://" in raw else f"//{raw}")
+    scheme = (parsed.scheme or "http").lower()
+    if scheme not in ("http", "https"):
+        return None
+    host = (parsed.hostname or "").lower()
+    if host not in _LOOPBACK_HOSTS:
+        return None
+    try:  # urlparse defers the ValueError-happy port read to the caller
+        port = parsed.port
+    except ValueError:
+        return None
+    return f"{scheme}://{f'[{host}]' if ':' in host else host}:{port or 8080}"
+
+
+def _props_says_llamacpp(root: str) -> bool:
+    """Fingerprint the wire by ``GET /props``: llama-server always reports a non-empty build_info.
+
+    Same signal ``hermes_cli.local_runtime.detect.probe_port`` uses to tell llama-server apart
+    from Ollama, LM Studio, vLLM and SGLang, which answer /v1/models but carry no build_info.
+    Any failure — refused, timeout, non-JSON, a 404 from a vLLM/SGLang wire — is a NEGATIVE,
+    never an error: an unproven wire keeps the previous behaviour.
+    """
+    try:
+        with urllib.request.urlopen(f"{root}/props", timeout=_LLAMACPP_PROP_TIMEOUT_S) as resp:
+            props = json.loads(resp.read() or b"null")
+    except Exception:  # noqa: BLE001 - any failure means "not proven llama.cpp"
+        return False
+    return isinstance(props, dict) and bool(str(props.get("build_info") or "").strip())
+
+
+def _is_llamacpp_wire(base_url: str | None) -> bool:
+    """True when base_url provably speaks the llama.cpp wire (cached, never raises).
+
+    Called from the request path, so: at most one probe per root per TTL, and a caller that
+    finds a probe already in flight gets the previous answer (emit ``none``) instead of
+    blocking on another thread's socket.
+    """
+    root = _loopback_root(base_url)
+    if root is None:
+        return False
+    now = time.monotonic()
+    cached = _llamacpp_cache.get(root)
+    if cached and cached[1] > now:
+        return cached[0]
+    with _llamacpp_lock:
+        cached = _llamacpp_cache.get(root)
+        if cached and cached[1] > now:
+            return cached[0]
+        if root in _llamacpp_probing:
+            return False
+        _llamacpp_probing.add(root)
+    try:
+        verdict = _props_says_llamacpp(root)
+    except Exception:  # noqa: BLE001 - the predicate must never break the kwargs build
+        verdict = False
+    with _llamacpp_lock:
+        _llamacpp_probing.discard(root)
+        _llamacpp_cache[root] = (
+            verdict,
+            time.monotonic() + (_LLAMACPP_PROP_TTL_S if verdict else _LLAMACPP_MISS_TTL_S),
+        )
+    return verdict
+
+
+def _reset_llamacpp_wire_cache() -> None:
+    """Drop the cached fingerprints (tests, and when an endpoint changes under one port)."""
+    with _llamacpp_lock:
+        _llamacpp_cache.clear()
+        _llamacpp_probing.clear()
 
 
 def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
@@ -71,8 +169,13 @@ class CustomProfile(ProviderProfile):
         if reasoning_config and isinstance(reasoning_config, dict):
             effort = (reasoning_config.get("effort") or "").strip().lower()
             if effort == "none" or reasoning_config.get("enabled", True) is False:
-                # See #14820.
-                top_level["reasoning_effort"] = "none"
+                # See #14820. llama.cpp is the exception: its wire has no "none" level
+                # (default|minimal|low|medium|high|xhigh|max) and silently DISCARDS a value
+                # it does not know, leaving the chat template's own default — the most
+                # expensive one — on a seat that asked for no reasoning. Omit the field
+                # there and let the server's --reasoning on|off|auto decide.
+                if not _is_llamacpp_wire(ctx.get("base_url")):
+                    top_level["reasoning_effort"] = "none"
                 if _looks_like_ollama_endpoint(ctx.get("base_url")):
                     extra_body["think"] = False
             elif effort and base_url_host_matches(str(ctx.get("base_url") or ""), "api.groq.com"):

@@ -633,6 +633,9 @@ async def _dashboard_selftest_loop() -> None:
 from hermes_cli import web_server_gateway as _gateway_mod
 from hermes_cli.web_server_gateway import _ACTION_LOG_FILES, _terminate_desktop_managed_gateway
 from hermes_cli.web_server_sessions import _auto_archive_ticker_loop
+from hermes_cli.web_server_probe_reaper import (
+    _header_probe_reaper_loop, header_probe_idle_seconds, reap_idle_header_probes,
+)
 from hermes_cli.web_server_chat import PTY_REGISTRY
 from hermes_cli.web_server_dashboard import (
     _discover_dashboard_plugins, _mount_plugin_api_routes, mount_spa,
@@ -798,6 +801,7 @@ from hermes_cli.web_routers import (
     cron as _cron_routes,
     mcp as _mcp_routes,
     ops as _ops_routes,
+    transfer as _transfer_routes,
     skills as _skills_routes,
     tools as _tools_routes,
     analytics as _analytics_routes,
@@ -846,6 +850,7 @@ app.include_router(_status_routes.logs_router)
 app.include_router(_cron_routes.router)
 app.include_router(_mcp_routes.router)
 app.include_router(_ops_routes.router)
+app.include_router(_transfer_routes.router)
 app.include_router(_skills_routes.hub_router)
 app.include_router(_profiles_routes.router)
 app.include_router(_skills_routes.router)
@@ -1476,6 +1481,9 @@ def _start_server_runtime(
     # The SPA bootstrap reads this so profile-less deep links (/chat?resume=<id>) inherit the
     # launcher's preselected profile instead of silently running in the launch scope (#73085).
     app.state.initial_profile = str(initial_profile or "")
+    # Before multi-profile activation can mirror a turn's profile into HERMES_HOME.
+    from hermes_cli.isolated_scope import record_launch_scope
+    record_launch_scope(isolated=isolated, desktop_owned=is_desktop_owned_backend())
 
     config, server = _build_uvicorn_server(host, port, ssh_isolated=bool(ssh_session_token))
 

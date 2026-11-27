@@ -228,6 +228,16 @@ class LocalSessionPolicy:
                     agent[key] = live_agent[key]
                 else:
                     agent.pop(key, None)
+        if model is None:
+            # R3-I (ruling t_094f82f5): a turn that names no model runs and STAMPS the owning profile's
+            # ``model.default`` — read from the same config the route resolves from below (the frozen policy
+            # config IS that profile's config; a following turn's fold above already replaced its ``model``
+            # block with the profile's own). A custom provider entry's declared ``default_model`` is never a
+            # substitute for a model the profile declares: leaving ``None`` here is what let the route
+            # resolver take it, stamping yaan-main on five lanes whose own default is deepseek-flash.
+            from gateway.run import _resolve_gateway_model
+            model = _resolve_gateway_model(config) or None
+            admit_route_pair(config, model, json.loads(self.request_json))
         source = (config.get('model') or {}).get('api_key_from') if isinstance(config.get('model'), dict) else None
         if source:
             # ``/model <alias>`` with a literal key: the receipt points at the alias entry's secret.
@@ -365,6 +375,42 @@ def profile_target(config):
         provider = str(model.get('provider') or '').strip()
         return str(model.get('default') or '').strip(), '' if provider.lower() == 'auto' else provider
     return (model.strip() if isinstance(model, str) else ''), ''
+
+
+#: What a creation request may name to select a ROUTE without naming a model.
+ROUTE_PICKS = ('provider', 'base_url')
+
+
+def named_route_pick(request):
+    """The provider/base_url a creation request names *without* a model, or ``{}``.
+
+    ``provider: auto`` is the thin client's "no pick" sentinel, so it is not a route pick. A launch that
+    names a model is not this rule's subject (``effective`` only asks when the policy names none).
+    """
+    pick = {key: request[key] for key in ROUTE_PICKS
+            if isinstance(request.get(key), str) and request[key].strip()}
+    if str(pick.get('provider') or '').strip().lower() == 'auto':
+        pick.pop('provider')
+    return pick
+
+
+def admit_route_pair(config, model, request):
+    """R3-I: route and model are ONE pair — refuse a model-less route pick whose entry cannot serve *model*.
+
+    The model a model-less turn runs is the owning profile's (resolved by ``effective``); this is the check
+    that the provider/base_url the same launch picked actually serves it, instead of running one backend
+    under another's name. Only a configured custom entry that DECLARES its models can prove a conflict
+    (``runtime_provider_custom.route_model_conflict``): a pick that names no route, or one whose entry
+    declares nothing, is never refused here.
+    """
+    if not model or not named_route_pick(request):
+        return
+    from hermes_cli.runtime_provider_custom import route_model_conflict
+    conflict = route_model_conflict(config, model)
+    if conflict is not None:
+        identity, declared = conflict
+        _refuse('model', f'{model} is not served by {identity}, which declares {", ".join(declared)}; '
+                         'name the model that endpoint serves')
 
 
 def model_route(block):
@@ -700,8 +746,16 @@ def _resolve_toolsets(params, config, source, safe_mode, coding_posture=False, b
         posture = focus_toolsets(config)
     enabled = set(posture) if posture is not None else _get_platform_tools(config, 'acp' if source == 'acp' else 'cli')
     if explicit is not None:
-        from toolsets import resolve_toolset
+        from toolsets import TOOLSETS, resolve_toolset
         requested = {t for name in explicit for t in resolve_toolset(name)}
+        dropped = _unnamed_extension_toolsets(explicit, requested, config) & enabled
+        enabled -= dropped
+        # ``hermes-api-server`` expands into built-in names; keep one an MCP server or plugin shares (``web``) when
+        # the pick needs its built-in tools and asked for all of them, instead of refusing the pick. A wider name
+        # (a plugin key called ``coding``) would grant tools the pick never asked for.
+        missing = requested - {t for name in enabled for t in resolve_toolset(name)}
+        static = {n: set(resolve_toolset(n, include_registry=False)) for n in dropped & set(TOOLSETS)}
+        enabled |= {n for n, tools in static.items() if tools & missing and tools <= requested}
         effective = {t for name in enabled for t in resolve_toolset(name)}
         if not requested <= effective:
             _refuse('toolsets', f"not available on this surface: {', '.join(sorted(requested - effective))}")
@@ -720,6 +774,23 @@ def _resolve_toolsets(params, config, source, safe_mode, coding_posture=False, b
         from hermes_cli.tools_config import _get_plugin_toolset_keys
         enabled -= _get_plugin_toolset_keys()
     return enabled
+
+
+def _unnamed_extension_toolsets(explicit, requested, config):
+    """Plugin toolsets and MCP servers an explicit pick did not name. ``_get_platform_tools`` adds every plugin
+    toolset not in ``known_plugin_toolsets`` and every enabled MCP server, so without this ``-t session_search``
+    also got a plugin's terminal/file tools (#147832). ``all``/``*`` names everything."""
+    if {'all', '*'} & set(explicit):
+        return set()
+    from hermes_cli.tools_config import _get_plugin_toolset_keys, enabled_mcp_server_names
+    from toolsets import TOOLSETS, resolve_toolset
+    configured = config.get('mcp_servers') if isinstance(config.get('mcp_servers'), dict) else {}
+    named = set(explicit) | {n[4:] for n in explicit if n.startswith('mcp-') and n not in configured}
+    plugin_keys = _get_plugin_toolset_keys()
+    # A plugin key may share a built-in name (``coding``); a composite pick like ``hermes-cli`` covers it only
+    # when every tool it resolves to is already in the pick, otherwise the name alone would smuggle tools in.
+    covered = {k for k in plugin_keys & set(TOOLSETS) if set(resolve_toolset(k)) <= requested}
+    return (plugin_keys | enabled_mcp_server_names(config)) - named - covered
 
 
 def _in_coding_workspace(config, source, cwd):

@@ -35,10 +35,14 @@ from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
 from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedule_knobs
+from cron.jobs_tristate import normalize_catch_up as _normalize_catch_up, normalize_wrap_response
 from cron.jobs_model_pin import _main_model_pin
+from cron.jobs_normalize import (
+    _normalize_base_url, _normalize_context_from, _normalize_failure_deliver, _normalize_job_optional_text,
+)
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
-from cron import extra_fire, store_health
+from cron import extra_fire, jobs_error_text, store_health
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
@@ -1811,23 +1815,6 @@ def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
     return (provider.lower() if provider else None), model
 
 
-def _normalize_job_optional_text(
-    value: Any, *, strip_trailing_slash: bool = False
-) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    return (value.strip().rstrip("/") if strip_trailing_slash else value.strip()) or None
-
-
-def _normalize_base_url(value: Any) -> Optional[str]:
-    return _normalize_job_optional_text(value, strip_trailing_slash=True)
-
-
-def _normalize_str_list(items: Any) -> Optional[list[str]]:
-    """Non-blank stripped items of *items*, or None when nothing remains."""
-    return [str(j).strip() for j in items if str(j).strip()] or None
-
-
 def _normalize_enabled_toolsets(value: Any) -> Optional[list[str]]:
     """Per-job toolset allowlist. An explicitly-set EMPTY list means 'nothing allowed' and must
     persist as [] — normalizing it to None would read back as 'no restriction' (#82010). Absent
@@ -1837,22 +1824,6 @@ def _normalize_enabled_toolsets(value: Any) -> Optional[list[str]]:
     if not isinstance(value, list):
         raise ValueError("enabled_toolsets must be a list of toolset names (or [] for none).")
     return [str(j).strip() for j in value if str(j).strip()]
-
-
-def _normalize_context_from(value: Any) -> Optional[list[str]]:
-    """Accept a job id or a list of ids; anything else is None."""
-    if isinstance(value, str):
-        value = [value]
-    return _normalize_str_list(value) if isinstance(value, list) else None
-
-
-def _normalize_failure_deliver(value: Any) -> Optional[str]:
-    """failure_deliver shares deliver's value grammar; flatten str/list like the tool layer's
-    _normalize_deliver_param for direct create_job callers. Semantic validation happens at
-    resolution time via the shared deliver path."""
-    if isinstance(value, (list, tuple)):
-        return ",".join(str(p).strip() for p in value if str(p).strip()) or None
-    return _normalize_job_optional_text(value)
 
 
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
@@ -1906,13 +1877,6 @@ def _normalize_job_script_timeout(value: Any) -> Optional[int]:
 
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
-def _normalize_catch_up(value: Any) -> Optional[bool]:
-    """``catch_up``: True runs one catch-up for missed slots, False skips them, None = default."""
-    if value is None or isinstance(value, bool):
-        return value
-    raise ValueError("catch_up must be true, false, or null (use the default).")
-
-
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "model": _normalize_job_optional_text,
     "provider": _normalize_job_optional_text,
@@ -1929,6 +1893,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "wrap_response": normalize_wrap_response,
     "script_timeout_seconds": _normalize_job_script_timeout,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
@@ -1944,6 +1909,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "wrap_response": normalize_wrap_response,
     "script_timeout_seconds": _normalize_job_script_timeout,
 }
 
@@ -2000,6 +1966,7 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    wrap_response: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -2014,7 +1981,7 @@ def create_job(
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
-    (0 = never catch up)."""
+    (0 = never catch up). wrap_response: None inherits cron.wrap_response, a bool overrides it."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -2117,7 +2084,7 @@ def create_job(
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
-        ("catch_up", f["catch_up"]),
+        ("catch_up", f["catch_up"]), ("wrap_response", f["wrap_response"]),
         ("script_timeout_seconds", f["script_timeout_seconds"]),
     ):
         if value is not None:
@@ -2746,7 +2713,7 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     clears it."""
     def apply(jobs, _i, job):
         job["last_fire_error"] = {
-            "at": _hermes_now().isoformat(), "detail": str(detail or "")[:500]}
+            "at": _hermes_now().isoformat(), "detail": jobs_error_text.sanitize_persisted_error(str(detail or ""))[:500]}
         save_jobs(jobs)
         return True
 
@@ -2767,7 +2734,7 @@ def _record_run_outcome(
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
     cancelled = status == "cancelled"  # an operator stop is not a failure
-    job["last_error"] = None if success or cancelled else error
+    job["last_error"] = None if success or cancelled else jobs_error_text.sanitize_persisted_error(error)
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
@@ -2783,8 +2750,8 @@ def _record_run_outcome(
         # a monitor sampling jobs.json then sees a permanently green job. last_failure
         # survives success (latest failure wins); the recency window is the consumer's
         # call. Delivery failures keep their own sticky last_delivery_error.
-        job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
-    job["last_delivery_error"] = delivery_error
+        job["last_failure"] = {"at": now, "detail": jobs_error_text.sanitize_persisted_error(error) or (status or "run failed")}
+    job["last_delivery_error"] = jobs_error_text.sanitize_persisted_error(delivery_error)
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
     job.pop("pending_slot", None)
@@ -2922,6 +2889,9 @@ def mark_job_run(
             quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire)
         else:
             quota_hold.clear_state(job)
+        # A run rewrites all jobs, including legacy failure stamps on idle siblings.
+        for stored_job in jobs:
+            jobs_error_text.scrub_retained_stamps(stored_job)
         save_jobs(jobs)
         return True
 
@@ -3545,7 +3515,96 @@ def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str
     return slot
 
 
-def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float) -> bool:
+# --------------------------------------------------------------------------- #
+# THE CRON SEAM OF THE FLEET HOLD (card t_2f60a701)
+#
+# ``agent.estop.work_admitted`` is the ONE predicate for "may new work start in this lane", and
+# the kanban dispatch seam already gates on it. CRON DID NOT, and that gap is why a maintenance
+# window could not produce a lull: every job in every home kept firing straight through the
+# window's own hold, so a gate that parked the fleet and then measured for quiet only ever
+# measured its own cadence. (Measured 2026-11-03: fourteen consecutive departures died at
+# ``drain_gate`` classified ``cadence``.)
+#
+# The rule is deliberately stronger than "do not dispatch": a slot that elapses under a hold is
+# COLLAPSED to the next live slot -- never fired late, never replayed on release. A hold lifted
+# after nine jobs missed an occurrence must not fire those nine at one instant.
+# --------------------------------------------------------------------------- #
+
+_HOLD_LOG_INTERVAL_S = 600.0
+_hold_logged: Dict[Tuple[str, str], float] = {}
+
+
+def cron_store_lane(store: "_CronStorePaths | None" = None) -> str:
+    """The lane a cron store belongs to: ``default`` at a hermes home, else ``profiles/<lane>``.
+
+    Read from the STORE'S OWN PATH -- the same rule the fleet's hold scoping uses -- so a job is
+    attributed to the home it lives in and never to whichever profile happens to be scheduling.
+    """
+    try:
+        home = Path((store or _current_cron_store()).cron_dir).parent
+    except Exception:
+        return ""
+    if home.parent.name == "profiles":
+        return home.name
+    return "default"
+
+
+def hold_admission():
+    """``(work_admitted, state, lane)`` while a hold is live for this home, else ``None``.
+
+    Read ONCE per scan so a single tick can never see two different modes. FAIL-OPEN on purpose:
+    a scheduler that stops because the estop helper could not be read is a fleet-wide silent stop
+    with no owner, which is worse than one late job. An unreadable hold therefore changes nothing.
+    """
+    try:
+        from agent import estop
+
+        state = estop.read_state()
+    except Exception:  # noqa: BLE001 - see fail-open above
+        logger.debug("cron: estop state unreadable; no hold applied", exc_info=True)
+        return None
+    if not getattr(state, "engaged", False):
+        return None
+    lane = cron_store_lane()
+    if not lane:
+        return None
+    return (estop.work_admitted, state, lane)
+
+
+def _defer_under_hold(d: "_DueJob", recurring: bool, admission) -> bool:
+    """True when this job's slot must be COLLAPSED instead of dispatched: its lane is held."""
+    if admission is None:
+        return False
+    admitted, state, lane = admission
+    try:
+        if admitted(lane, state=state):
+            return False
+    except Exception:  # noqa: BLE001 - fail open, exactly as hold_admission() does
+        return False
+    key = (lane, str(d.job.get("id") or ""))
+    now_mono = time.monotonic()
+    last = _hold_logged.get(key)
+    if last is None or now_mono - last >= _HOLD_LOG_INTERVAL_S:
+        if len(_hold_logged) > 512:
+            _hold_logged.clear()
+        _hold_logged[key] = now_mono
+        logger.info(
+            "cron: job '%s' is due but lane '%s' is HELD by an estop hold - slot %s is "
+            "collapsed to the next live slot, never fired late",
+            d.label, lane, d.next_run)
+    if recurring:
+        new_next = d.recompute_next()
+        if new_next:
+            d.scan.persist(d.job["id"], next_run_at=new_next)
+    else:
+        # A one-shot is an INTENT, not a cadence: it keeps its place, slid forward to now so the
+        # ordinary grace gate cannot retire it while the hold is up, and fires once on release.
+        d.scan.persist(d.job["id"], next_run_at=d.scan.now.isoformat())
+    return True
+
+
+def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float,
+                      admission=None) -> bool:
     """Decide whether one enabled, non-terminal job fires this tick, persisting any repairs.
     Ordering matters: recover missing next_run_at, repair timezone shifts, re-arm stale-error
     recurring jobs; then once due: re-anchor stale cron instants, fast-forward missed recurring
@@ -3594,6 +3653,12 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         return False
     d.next_run_dt = _rearm_stale_error_recurring(d)
     if _instant_after(d.next_run_dt, now):
+        return False
+
+    # THE HOLD GATE (card t_2f60a701). A due job whose lane is held never dispatches, and its slot
+    # collapses: the maintenance window parks the fleet BEFORE it measures, so the lull it waits
+    # for is one it can actually reach. A manual trigger is a direct operator act and is not held.
+    if not manual_run and _defer_under_hold(d, recurring, admission):
         return False
 
     # Only the dispatch snapshot carries this field; never infer it from a later stamp.
@@ -3650,6 +3715,9 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
     jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
     # One-shot run-claim TTL, resolved once per scan (see _oneshot_run_claim_ttl_seconds).
     run_claim_ttl = _oneshot_run_claim_ttl_seconds()
+    # THE FLEET HOLD, read ONCE for the whole tick (card t_2f60a701): every job in this store is
+    # judged against the same state, so one tick can never see two different modes.
+    admission = hold_admission()
 
     # Retention sweep: completed one-shots are kept for inspection but must not accumulate forever.
     if _sweep_completed_oneshots(raw_jobs, scan.now, removed_ids=scan.removed):
@@ -3669,7 +3737,7 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
             if _has_pause_marker(job):
                 _self_disable_half_paused(job, scan)
                 continue
-            if _evaluate_due_job(job, scan, run_claim_ttl):
+            if _evaluate_due_job(job, scan, run_claim_ttl, admission):
                 due.append(job)
         except Exception:
             logger.exception(

@@ -157,7 +157,28 @@ _TRANSIENT_STORAGE_REASONS = frozenset({
     "session_persistence_failed:compression",         # compaction held the store/lease
     "session_persistence_failed:compression_closed",  # lease rotated; a fresh turn re-acquires
     "session_persistence_failed:turn_lease",          # a peer took the session; a fresh turn wins it
+    # Owner-side receipt loss (2026-11-25): the write's receipt never came back from the
+    # runtime that owns the session store (``worker_receipt_timeout``), or that owner was
+    # unreachable altogether (``owner_unavailable`` -- gateway discovery not ``ready``).
+    # Nothing of the card was judged; the content is retained in the worker outbox and a
+    # fresh turn re-attaches to a healthy owner. Named individually, per the rule above.
+    "session_persistence_failed:receipt_timeout",
+    "session_persistence_failed:owner_unavailable",
 })
+
+
+# The loss-class vocabulary the board reads off the run row. A storage cause is not the same
+# event as a busy store: a lost receipt and an unreachable owner are distinct operator actions,
+# so they keep their own names on the run instead of collapsing into ``storage_locked``. One
+# vocabulary, shared with ``hermes_cli.quiet_single_query.KANBAN_WORKER_LOSS_CLASS_TRAILER``.
+_LOSS_CLASS_BY_STORAGE_CAUSE = {
+    "receipt_timeout": "receipt_timeout",
+    "owner_unavailable": "owner_admission_unavailable",
+    "locked": "storage_locked",
+    "compression": "storage_locked",
+    "compression_closed": "storage_locked",
+    "turn_lease": "storage_locked",
+}
 
 
 # A turn the LEASE REFRESHER killed is a storage condition too, but it arrives as an INTERRUPT
@@ -237,6 +258,14 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
             store_reason = reason if reason in _TRANSIENT_STORAGE_REASONS else ""
         if store_reason:
             from hermes_cli.kanban_db import KANBAN_STORAGE_LOCKED_EXIT_CODE
+            from hermes_cli.quiet_single_query import record_worker_loss_class
+
+            # The worker's OWN statement of why the harness ended the turn, written beside the
+            # exit trailer: rc=76 covers a busy store, a lost receipt and an unreachable owner.
+            cause = store_reason.split(":", 1)[1] if ":" in store_reason else ""
+            record_worker_loss_class(
+                _LOSS_CLASS_BY_STORAGE_CAUSE.get(cause, "storage_locked")
+            )
             return KANBAN_STORAGE_LOCKED_EXIT_CODE
 
     return turn_exit_code(

@@ -63,6 +63,26 @@ and a `hermes resume` released a maintenance hold in the same stroke. So:
 * an expired hold stops counting for the state and is retired, so a holder that dies
   without releasing cannot pause the fleet forever.
 
+RELEASE AUTHORITY, and WHAT A HOLD IS FOR (card t_7b226853). The registry above stops one
+holder's release from taking another's entry with it; it does NOT decide whether the caller
+may lift the entry it names. Two further rules, both enforced HERE so every surface inherits
+them:
+
+* a hold may be lifted only by its ``owner``, by the interactive ``operator``, by an actor the
+  ARM named in ``release_grant``, or — for a pre-ruling legacy total, the R2 un-strand path —
+  from any admitted venue. Anything else is refused LOUDLY with the holder named and the hold
+  left in force. A hold armed with the ``any-admitted-venue`` grant keeps the OLD behaviour,
+  but only because the arm asked for it and the grant is SIGNED with the hold: a fleet hold is
+  no longer voidable by whichever agent next decides the work is done;
+* a hold that names a CARD (``purpose``, taken from ``--purpose-card`` or read out of the
+  signed ``reason``) refuses to lift while that card is non-terminal. The release answers
+  "is the work this window exists for finished?" before it answers "may I?". The holder may
+  assert an early end with ``--purpose-met`` (recorded); the operator may release outright;
+  a grantee may not assert the holder's purpose for it.
+
+``purpose`` and ``release_grant`` are signed by a v4 canonical text — the v3 text plus ONE
+line — so every hold already on disk keeps verifying exactly as it did.
+
 Ported from gastownhall/gastown estop.go (MIT).
 """
 
@@ -75,6 +95,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -149,6 +170,18 @@ SCOPED_CONTROLS: tuple = (
 # Owner key of the operator's own pause. The LIBRARY default for ``engage()``/``acquire()``
 # (back-compat); the CLI resolves its owner from the actor instead (D4/D7).
 DEFAULT_OWNER = "operator"
+
+# Release authority (card t_7b226853). A hold is lifted by its holder or the operator; an arm
+# may name who ELSE may lift it, and that grant is signed with the hold. ``ANY_VENUE`` is the
+# recorded form of the pre-card behaviour ("any admitted venue may lift this"), available only
+# when the arm asked for it.
+ANY_VENUE = "any-admitted-venue"
+
+# A card-scoped purpose: a card id is ``t_`` plus eight hex (the board's own id shape). A hold
+# whose reason (or --purpose-card) names one exists FOR it and may not be lifted while the card
+# is non-terminal. ``done``/``archived`` are the board's terminal statuses.
+_CARD_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+TERMINAL_CARD_STATUSES = frozenset({"done", "archived"})
 
 # Defect lines (fail-closed rows): each is loud on purpose — a scoped stop we cannot read is
 # never silently a total one, and an empty allowlist is never silently "everyone admitted".
@@ -397,6 +430,12 @@ class ReleaseResult:
     actor: str = ""
     unverified_cleared: int = 0
     ledger: bool = True
+    # Card t_7b226853: the hold is the CALLER'S to lift, but the work it exists for is not
+    # finished. Distinct from ``forbidden`` because the remedy differs: nothing about the venue
+    # is wrong; the window's purpose is still open.
+    purpose_unfinished: bool = False
+    purpose_cards: tuple = ()
+    authority: str = ""
 
     @property
     def remaining_owners(self) -> list:
@@ -425,6 +464,10 @@ class ArmResult:
     verified: bool = True
     ttl_s: Optional[int] = None
     ledger: bool = True
+    # Card t_7b226853: the cards this hold exists for, and who else may lift it. Both are on
+    # the SIGNED record, so a CLI can report exactly what it armed.
+    purpose: tuple = ()
+    release_grant: tuple = ()
 
 
 class EstopWriteError(OSError):
@@ -697,6 +740,89 @@ def _canonical(handle: Any, owner: Any, actor: Any, mode: Any, reason: Any,
     ])
 
 
+def card_ids_in(text: Any) -> list:
+    """The card ids a string names, in order, deduped — ``t_`` plus eight hex."""
+    seen, out = set(), []
+    for match in _CARD_RE.finditer(str(text or "")):
+        card = match.group(0)
+        if card not in seen:
+            seen.add(card)
+            out.append(card)
+    return out
+
+
+def _normalize_purpose(purpose: Any, reason: Any = None) -> dict:
+    """``{"cards": [...]}`` — the cards this hold EXISTS FOR, or ``{}``.
+
+    An explicit purpose wins; otherwise the ids are READ OUT of the signed ``reason``, so
+    ``--reason "fleet-window t_5800fe41"`` is a purpose without a second flag. Only
+    well-formed ids are kept: a malformed id would become a card nobody can ever finish, and
+    a purpose that names nothing is not a purpose.
+    """
+    if isinstance(purpose, dict):
+        raw = purpose.get("cards") or purpose.get("card") or []
+    elif purpose:
+        raw = purpose
+    else:
+        raw = card_ids_in(reason)
+    if isinstance(raw, str):
+        raw = [raw]
+    cards: list = []
+    for item in raw or []:
+        card = str(item or "").strip()
+        if card and _CARD_RE.fullmatch(card) and card not in cards:
+            cards.append(card)
+    return {"cards": cards} if cards else {}
+
+
+def _normalize_grant(grant: Any) -> dict:
+    """``{"actors": [...]}`` — who, beside the holder, may lift this hold.
+
+    ``ANY_VENUE`` is the recorded form of the pre-card behaviour (any admitted venue may lift
+    it). It is available ONLY because the ARM asked for it, and it is signed with the hold, so
+    no later caller can grant itself the right to lift a hold it did not arm.
+    """
+    if isinstance(grant, dict):
+        raw = list(grant.get("actors") or [])
+        if grant.get("any_venue"):
+            raw.append(ANY_VENUE)
+    elif isinstance(grant, (list, tuple, set)):
+        raw = list(grant)
+    elif grant:
+        raw = [grant]
+    else:
+        raw = []
+    actors: list = []
+    for item in raw:
+        actor = str(item or "").strip()
+        if actor and actor not in actors:
+            actors.append(actor)
+    return {"actors": actors} if actors else {}
+
+
+def _canonical_signed(source: dict) -> str:
+    """The text a hold is signed over: the v3 text exactly, plus ONE v4 line when the entry
+    carries a purpose or a release grant.
+
+    The versioning is load-bearing: every hold already on disk was signed over the v3 text,
+    and re-cutting that text would demote all of them to unverified TOTAL halts on the next
+    read. A hold carrying either v4 field verifies over the v4 text ONLY, so neither can be
+    added or edited afterwards — a tampered purpose invalidates the entry, which demotes it to
+    an unattributed total halt (D5), never to a hold with a smaller purpose.
+    """
+    base = _canonical(**_canonical_fields(source))
+    if _normalize_purpose(source.get("purpose")) or _normalize_grant(source.get("release_grant")):
+        extra = json.dumps(
+            {
+                "purpose": _normalize_purpose(source.get("purpose")),
+                "release_grant": _normalize_grant(source.get("release_grant")),
+            },
+            sort_keys=True, separators=(",", ":"),
+        )
+        return base + "\n" + extra
+    return base
+
+
 def _canonical_fields(source: dict) -> dict:
     """The signed subset of an entry, normalised identically on the write and the read path,
     so an entry this module wrote re-verifies byte-for-byte."""
@@ -726,7 +852,7 @@ def _load_key_verified(source: dict, sentinel: Path) -> bool:
     if not key:
         return False
     expected = hmac.new(
-        key, _canonical(**_canonical_fields(source)).encode("utf-8"), hashlib.sha256
+        key, _canonical_signed(source).encode("utf-8"), hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(sig[len(SIG_PREFIX):], expected)
 
@@ -737,7 +863,7 @@ def _sign_fields(fields: dict, sentinel: Path) -> Optional[str]:
     key = _load_key(sentinel, create=True)
     if not key:
         return None
-    digest = hmac.new(key, _canonical(**fields).encode("utf-8"), hashlib.sha256).hexdigest()
+    digest = hmac.new(key, _canonical_signed(fields).encode("utf-8"), hashlib.sha256).hexdigest()
     return SIG_PREFIX + digest
 
 
@@ -958,6 +1084,10 @@ def _hold_from_entry(entry: Any, *, path: Path) -> dict:
     engaged_at = payload.get("engaged_at") or None
     expires_at = payload.get("expires_at") or None
     sig = payload.get("sig")
+    # A purpose/grant on an UNVERIFIED entry is not evidence: it may not narrow or widen
+    # anything. The entry is a total halt already, and the operator is the one who lifts it.
+    purpose = _normalize_purpose(payload.get("purpose")) if verified else {}
+    release_grant = _normalize_grant(payload.get("release_grant")) if verified else {}
     return {
         "handle": handle,
         "owner": owner,
@@ -970,6 +1100,8 @@ def _hold_from_entry(entry: Any, *, path: Path) -> dict:
         "engaged_at": engaged_at,
         "expires_at": expires_at,
         "allow": allow,
+        "purpose": purpose,
+        "release_grant": release_grant,
         "expired": _is_past(expires_at),
         "path": str(path),
         "venue": payload.get("venue") or None,
@@ -1206,6 +1338,11 @@ def _write_registry(path: Path, holds_list: list) -> bool:
                     ("expires_at", hold.get("expires_at")),
                     ("allow", hold.get("allow") or None),
                     ("venue", hold.get("venue")),
+                    # v4 (card t_7b226853): what the hold exists FOR, and who the arm said
+                    # may lift it. Both are signed by `_canonical_signed`, so a rewrite around
+                    # a KEPT holder must carry them verbatim or that holder reads unverified.
+                    ("purpose", hold.get("purpose") or None),
+                    ("release_grant", hold.get("release_grant") or None),
                     # D2: the provenance signature, written VERBATIM when the hold brought one
                     # (a keeper we did not author keeps its own), else dropped.
                     ("sig", hold.get("sig")),
@@ -1267,7 +1404,8 @@ def _remove_holds(targets: list) -> bool:
             {
                 key: hold.get(key)
                 for key in ("handle", "owner", "actor", "claimed_owner", "mode", "reason",
-                            "engaged_at", "expires_at", "allow", "venue", "sig")
+                            "engaged_at", "expires_at", "allow", "venue", "sig",
+                            "purpose", "release_grant")
             }
             for hold in existing
             if hold["handle"] not in handles
@@ -1314,6 +1452,8 @@ def arm(
     replace_owner: bool = False,
     actor: Optional[str] = None,
     order: Optional[str] = None,
+    purpose: Any = None,
+    release_grant: Any = None,
 ) -> ArmResult:
     """Add ONE hold to this home's sentinel and report what actually landed.
 
@@ -1395,6 +1535,11 @@ def arm(
     handle = _handle_for(owner_id, now)
     existing, _defect = _read_holds(target)
     kept = [hold for hold in existing if not (replace_owner and hold["owner"] == owner_id)]
+    # v4 (card t_7b226853): WHAT this hold is for (the cards) and WHO ELSE may lift it. Both
+    # are captured HERE, at the arm — never at the release, where the caller asking to lift is
+    # the party whose interest the fence exists to check.
+    purpose_body = _normalize_purpose(purpose, reason)
+    grant_body = _normalize_grant(release_grant)
     entry = {
         "handle": handle,
         "owner": owner_id,
@@ -1406,10 +1551,12 @@ def arm(
         "expires_at": expiry.isoformat() if expiry is not None else None,
         "allow": _normalize_allow(allow),
         "venue": venue,
+        "purpose": purpose_body or None,
+        "release_grant": grant_body or None,
     }
     # D2 — sign the entry EXACTLY as it will be written, so a later read recomputes the same
     # canonical text. None means "no key beside this sentinel": unsigned, still a hold.
-    entry["sig"] = _sign_fields(_canonical_fields(entry), target)
+    entry["sig"] = _sign_fields(entry, target)
     kept.append(entry)
     if not _write_registry(target, kept):
         logger.error("ESTOP hold %s could not be written to %s", handle, target)
@@ -1429,7 +1576,7 @@ def arm(
                                     for key, value in entry.items()
                                     if key in ("handle", "owner", "actor", "claimed_owner",
                                                "mode", "venue", "engaged_at", "sig", "reason",
-                                               "expires_at", "allow")
+                                               "expires_at", "allow", "purpose", "release_grant")
                                     and value not in (None, "", {}, [])
                                 }
                             ],
@@ -1455,18 +1602,22 @@ def arm(
     # flat ``allow_profiles`` list, so a lockdown armed with N lanes is legible in the ledger.
     ledger_allow = entry["allow"] or None
     ledger_profiles = list((entry["allow"] or {}).get("profiles") or [])
+    ledger_purpose = list(purpose_body.get("cards") or [])
+    ledger_grant = list(grant_body.get("actors") or [])
     # D6 — the ledger. Best-effort, but the caller is TOLD when it failed.
     ledger_ok = record_event(
         "arm", sentinel=target, path=str(target), handle=handle, owner=owner_id, actor=actor_id,
         claimed_owner=claimed_owner, mode=resolved_mode, reason=reason or None,
         order=recorded_order, ttl_s=seconds, verified=entry["sig"] is not None,
         allow=ledger_allow, allow_profiles=ledger_profiles,
+        purpose_cards=ledger_purpose or None, release_grant=ledger_grant or None,
     )
     if renamed:
         ledger_ok = record_event(
             "arm_renamed", sentinel=target, path=str(target), handle=handle, owner=owner_id,
             actor=actor_id, claimed_owner=claimed_owner, mode=resolved_mode, reason=reason or None,
             allow=ledger_allow, allow_profiles=ledger_profiles,
+            purpose_cards=ledger_purpose or None, release_grant=ledger_grant or None,
         ) and ledger_ok
     if gate_kind == "ordered":
         ledger_ok = record_event(
@@ -1474,6 +1625,7 @@ def arm(
             actor=actor_id, claimed_owner=claimed_owner, mode=resolved_mode, reason=reason or None,
             order=recorded_order, after_resume=resume_at,
             allow=ledger_allow, allow_profiles=ledger_profiles,
+            purpose_cards=ledger_purpose or None, release_grant=ledger_grant or None,
         ) and ledger_ok
     return ArmResult(
         handle=handle,
@@ -1488,6 +1640,8 @@ def arm(
         verified=entry["sig"] is not None,
         ttl_s=seconds,
         ledger=ledger_ok,
+        purpose=tuple(ledger_purpose),
+        release_grant=tuple(ledger_grant),
     )
 
 
@@ -1501,6 +1655,8 @@ def acquire(
     replace_owner: bool = False,
     actor: Optional[str] = None,
     order: Optional[str] = None,
+    purpose: Any = None,
+    release_grant: Any = None,
 ) -> str:
     """Add ONE hold to this home's sentinel and return its handle.
 
@@ -1518,7 +1674,163 @@ def acquire(
         replace_owner=replace_owner,
         actor=actor,
         order=order,
+        purpose=purpose,
+        release_grant=release_grant,
     ).handle
+
+
+# ---------------------------------------------------------------------------------
+# Release authority and purpose (card t_7b226853).
+# ---------------------------------------------------------------------------------
+
+def _card_status(card: str) -> tuple:
+    """``(status, board)`` for a card id read from every live board; ``(None, "")`` when no
+    board knows it, or when the board layer cannot be consulted at all.
+
+    READ-ONLY by construction: each board's DB is opened with sqlite ``mode=ro`` and only when
+    the file already exists and carries bytes, so asking a question about a card can never
+    create, migrate or repair a board (a zero-byte board is skipped, not initialized). An
+    unreadable board leaves the status UNKNOWN, which the caller treats as UNFINISHED: a
+    protection window must not be voidable by a read failure.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_db_boards as _boards
+    except Exception as exc:  # the board layer is not importable from this process
+        logger.warning("ESTOP: the board layer is unavailable (%s) — card status UNKNOWN", exc)
+        return None, ""
+    try:
+        boards = _boards.list_boards(include_archived=False)
+    except Exception as exc:
+        logger.warning("ESTOP: the board list is unreadable (%s) — card status UNKNOWN", exc)
+        return None, ""
+    for meta in boards or []:
+        slug = str((meta or {}).get("slug") or _kb.DEFAULT_BOARD)
+        try:
+            path = _kb.kanban_db_path(board=slug)
+        except Exception:
+            continue
+        try:
+            if not path.exists() or path.stat().st_size == 0:
+                continue
+            conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+        except (OSError, sqlite3.Error, ValueError):
+            continue
+        try:
+            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (card,)).fetchone()
+        except sqlite3.Error:
+            row = None
+        finally:
+            with suppress(Exception):
+                conn.close()
+        if row is not None:
+            return str(row[0] or ""), slug
+    return None, ""
+
+
+def purpose_rows(hold: dict, statuses: Optional[dict] = None) -> list:
+    """One row per card the hold names: ``{"card", "status", "board", "terminal"}``.
+
+    ``statuses`` is an optional ``{card: (status, board)}`` memo so one release resolves a card
+    once even when several holds name it.
+    """
+    memo = statuses if statuses is not None else {}
+    cards = list((_normalize_purpose(hold.get("purpose")) or {}).get("cards") or [])
+    rows = []
+    for card in cards:
+        if card not in memo:
+            memo[card] = _card_status(card)
+        status, board = memo[card]
+        rows.append({
+            "card": card,
+            "status": status or "",
+            "board": board,
+            "terminal": bool(status) and status in TERMINAL_CARD_STATUSES,
+        })
+    return rows
+
+
+def is_unstable_owner(name: Any) -> bool:
+    """True when ``name`` is an UNRESOLVED-PID identity (``bot:unresolved:<pid>@<boot>``).
+
+    Such a string is not an identity a later process can adopt: the pid and boot id are the
+    fingerprint of the one process that armed the hold. Scoping a release to it would make the
+    entry un-releasable except by the operator or the TTL — the stranding this card is about,
+    mirrored — so for D1 it is OWNERLESS: an admitted venue may lift it, and the PURPOSE gate
+    (D2) is what protects the work it covers. A runner that wants its hold protected names a
+    stable holder instead (``HERMES_ESTOP_ACTOR=window:<id>``).
+    """
+    return str(name or "").strip().startswith("bot:unresolved:")
+
+
+def release_authority(hold: dict, actor: str) -> str:
+    """WHO this caller is to this hold: ``holder`` · ``operator`` · ``grant`` · ``any-venue``
+    · ``claimed`` · ``unstable-owner`` · ``legacy`` · ``refused``.
+
+    The default is ``refused`` — that is the whole card. ``legacy`` is the R2 un-strand path
+    (a PRE-RULING total halt under a name no admitted venue owns) and nothing else: a
+    bot-armed lockdown hold is never legacy, whatever it wears. ``claimed`` is R2's other
+    half: a bot that armed UNDER the operator's name owns nothing, so the entry stays
+    liftable by an admitted venue — the false claim must not be able to strand the fleet.
+    ``unstable-owner`` is the same reading of an UNRESOLVED-PID owner (see
+    :func:`is_unstable_owner`): a hold whose owner cannot be re-established is ownerless for
+    the purpose of WHO may lift it, and D2's purpose gate is what protects its work.
+    """
+    actor = str(actor or "").strip()
+    if actor == ACTOR_OPERATOR:
+        return "operator"
+    owner = str(hold.get("owner") or "").strip()
+    if owner and owner == actor:
+        return "holder"
+    actors = set((_normalize_grant(hold.get("release_grant")) or {}).get("actors") or [])
+    if actor and actor in actors:
+        return "grant"
+    if ANY_VENUE in actors:
+        return "any-venue"
+    # R2 survives, and only here: a hold that WEARS the operator's name but was ARMED by a bot
+    # is not the operator's. The claim is not credible, so the entry is ownerless in exactly
+    # the way a pre-ruling total halt is, and any admitted venue may lift it (that path is the
+    # whole of R2). A REAL operator hold never reaches this: `operator` is earned by the
+    # CALLER's identity above, never by the owner field.
+    hold_actor = str(hold.get("actor") or "").strip()
+    if owner == ACTOR_OPERATOR and hold_actor and hold_actor != ACTOR_OPERATOR:
+        return "claimed"
+    if is_unstable_owner(owner):
+        return "unstable-owner"
+    if is_legacy_total(hold):
+        return "legacy"
+    return "refused"
+
+
+def _via_for(authority: str) -> str:
+    """The ledger's ``via`` vocabulary, which predates this card and stays readable."""
+    return {"holder": "holder", "operator": "operator", "grant": "grant"}.get(authority, "ops-venue")
+
+
+def release_refusal(hold: dict, actor: str, *, refusal: str, rows: list) -> str:
+    """The refusal text: what was refused, why, and every way forward."""
+    handle = hold.get("handle") or "?"
+    owner = hold.get("owner") or "unknown"
+    if refusal == "purpose-unfinished":
+        detail = ", ".join(
+            f"{row['card']} is {row['status'] or 'UNREADABLE'}"
+            + (f" (board {row['board']})" if row.get("board") else "")
+            for row in rows
+        )
+        return (
+            f"release of hold {handle} refused: the window's purpose is UNFINISHED — {detail}.\n"
+            f"   The hold was armed FOR those cards; it lifts when they are done/archived.\n"
+            f"   The holder may assert an early end: `hermes resume --handle {handle} --purpose-met`.\n"
+            f"   The operator may release it outright. Its TTL still expires it."
+        )
+    return (
+        f"release of hold {handle} refused: it is not {actor}'s to lift — it is held by {owner}.\n"
+        f"   A fleet hold is released by its HOLDER, by the operator, or by an actor the ARM named\n"
+        f"   (--release-by, recorded and signed with the hold). A hold with no such grant cannot be\n"
+        f"   voided by the next caller that decides the work is done.\n"
+        f"   Ways forward: let {owner} release it; the operator may release it outright; or let its\n"
+        f"   TTL ({hold.get('expires_at') or 'none — bounded only by a release'}) expire it."
+    )
 
 
 def release(
@@ -1526,8 +1838,9 @@ def release(
     owner: Optional[str] = None,
     actor: Optional[str] = None,
     all_holds: bool = False,
+    purpose_met: bool = False,
 ) -> ReleaseResult:
-    """Lift a hold — by exact ``handle``, by ``owner``, or every hold with ``all_holds``.
+    """Lift a hold — by exact ``handle``, by ``owner``, or every legacy hold with ``all_holds``.
 
     A release acts on exactly the holds it names and never touches another holder's entry.
     ``actor`` is WHO is lifting (defaults to :func:`actor_handle`); D7 gives that teeth:
@@ -1541,7 +1854,14 @@ def release(
       ``mode: estop`` holds — legacy state, the alarm the boundary statement names — and any
       ADMITTED venue may run it (the ops seat), never the operator only. With none on disk it
       refuses and names the by-handle release plus the scoped controls;
-    * ``handle=`` is unchanged, and now also names an ``unverified#...`` hold.
+    * ``handle=`` is unchanged as a LOOKUP, and now also names an ``unverified#...`` hold — but
+      naming a hold is not the right to lift it (card t_7b226853): the caller must BE the
+      holder, the operator, or an actor the arm granted (``release_grant``, including the
+      recorded ``any-admitted-venue`` form). Anything else is refused with ``forbidden``;
+    * a hold that names CARDS refuses while any of them is non-terminal
+      (``purpose_unfinished``) and the caller is not the operator and has not asserted
+      ``purpose_met`` as the HOLDER. "Is the work this window exists for finished?" is answered
+      before "may I?", because a release that ignores it is a window that ends mid-landing.
 
     A handle that names no LIVE hold (unknown, already released, or expired) is reported as
     ``stale`` so the caller can fail loudly: a workflow that released into the void believes
@@ -1549,12 +1869,13 @@ def release(
 
     Each released hold is recorded in the ledger (D6) AFTER its file write succeeds, because
     D8's re-arm gate reads those rows; ``ReleaseResult.ledger`` is False when a row could not
-    be written.
+    be written. A REFUSED release is recorded too, with its cause and the card statuses it
+    saw, so an attempted lift of a window that was still doing its job is legible afterwards.
 
     FENCED: an unadmitted venue (a delegated child, a dispatched kanban worker) cannot lift
     a hold here — see :func:`arm_admission`. The internal deadman expiry path does NOT come
     through this function (``_retire_hold`` -> ``_remove_holds``), so an expiry is never
-    fenced by the caller's venue.
+    fenced by the caller's venue, and an unreleasable hold is always bounded by its TTL.
     """
     admitted, _venue, refusal = arm_admission("lift")
     if not admitted:
@@ -1636,6 +1957,59 @@ def release(
                 actor=actor_id,
             )
         cause = "owner"
+    # ---- WHO may lift, and WHAT the hold exists for (card t_7b226853) -----------------
+    # Both are answered BEFORE anything is written: a refusal must leave the hold exactly as
+    # it was, and be RECORDED, so "who tried to lift it, and why it refused" survives the
+    # attempt. Naming a hold (by handle) has never been the right to lift it.
+    authorities: dict = {}
+    refusals: list = []
+    statuses: dict = {}
+    for target in targets:
+        authority = release_authority(target, actor_id)
+        authorities[target["handle"]] = authority
+        if authority == "refused":
+            refusals.append((target, "not-the-holder", []))
+            continue
+        rows = purpose_rows(target, statuses)
+        unfinished = [row for row in rows if not row["terminal"]]
+        if unfinished:
+            # The operator's own resume IS the decision. The HOLDER may also end its own
+            # window early, but only as an explicit claim -- a grantee may not make that
+            # claim for the holder, which is the "next agent decides it is done" defect.
+            overridden = actor_id == ACTOR_OPERATOR or (
+                purpose_met and authority in ("holder", "operator"))
+            if not overridden:
+                refusals.append((target, "purpose-unfinished", rows))
+    if refusals:
+        ledger_ok = True
+        messages = []
+        for target, refusal_kind, rows in refusals:
+            messages.append(release_refusal(target, actor_id, refusal=refusal_kind, rows=rows))
+            target_allow = target.get("allow") or None
+            ledger_ok = record_event(
+                "release_refused",
+                sentinel=Path(target.get("path") or sentinel_path()),
+                path=target.get("path"), handle=target["handle"], owner=target.get("owner"),
+                actor=actor_id, mode=target.get("mode"), cause=cause,
+                reason=refusal_kind, authority=authorities.get(target["handle"]),
+                cards=[row["card"] for row in rows] or None,
+                statuses={row["card"]: (row["status"] or "unreadable") for row in rows} or None,
+                allow=target_allow,
+                allow_profiles=list((target_allow or {}).get("profiles") or []),
+            ) and ledger_ok
+        forbidden_any = any(kind == "not-the-holder" for _target, kind, _rows in refusals)
+        unfinished_any = any(kind == "purpose-unfinished" for _target, kind, _rows in refusals)
+        return ReleaseResult(
+            False,
+            forbidden=forbidden_any,
+            purpose_unfinished=unfinished_any and not forbidden_any,
+            message="\n\n".join(messages),
+            remaining=state.holds,
+            actor=actor_id,
+            authority=",".join(sorted(set(authorities.values()))),
+            purpose_cards=tuple(sorted(statuses)),
+            ledger=ledger_ok,
+        )
     if not _remove_holds(targets):
         return ReleaseResult(
             False,
@@ -1656,11 +2030,16 @@ def release(
         hold_cause = cause
         if target_owner == ACTOR_UNVERIFIED and not all_holds:
             hold_cause = "operator-resume"
+        authority = authorities.get(target["handle"], "holder")
         ledger_ok = record_event(
             "release", sentinel=Path(target.get("path") or sentinel_path()),
             path=target.get("path"), handle=target["handle"], owner=target.get("owner"),
             actor=actor_id, mode=target.get("mode"), verified=bool(target.get("verified")),
-            cause=hold_cause, via="holder" if target_owner == actor_id else "ops-venue",
+            cause=hold_cause, via=_via_for(authority),
+            authority=authority,
+            purpose_cards=(list((_normalize_purpose(target.get("purpose")) or {}).get("cards") or [])
+                           or None),
+            purpose_met=True if purpose_met else None,
             allow=target_allow, allow_profiles=list((target_allow or {}).get("profiles") or []),
         ) and ledger_ok
     after = read_state()
@@ -1681,6 +2060,8 @@ def release(
         actor=actor_id,
         unverified_cleared=unverified_cleared,
         ledger=ledger_ok,
+        authority=",".join(sorted(set(authorities.values()))),
+        purpose_cards=tuple(sorted(statuses)),
     )
 
 
@@ -1694,6 +2075,8 @@ def engage(
     replace_owner: bool = True,
     actor: Optional[str] = None,
     order: Optional[str] = None,
+    purpose: Any = None,
+    release_grant: Any = None,
 ) -> Path:
     """Arm a hold on the ESTOP sentinel and return the sentinel path.
 
@@ -1725,6 +2108,8 @@ def engage(
         replace_owner=replace_owner,
         actor=actor,
         order=order,
+        purpose=purpose,
+        release_grant=release_grant,
     )
     return sentinel_path()
 

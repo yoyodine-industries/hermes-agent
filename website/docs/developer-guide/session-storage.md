@@ -146,6 +146,13 @@ rows in the same transaction and refuses while work is live or `unknown`. An inp
 was `started` when its owner died becomes `unknown` at the next owner start and is never
 replayed; its later inputs wait until it is resolved (`prompt.resolve_unknown`).
 
+The `runtime_epoch` row is the store's owner fence: the gateway captures it once at boot
+and every write is checked against it, so bumping it is a takeover. Only the profile's lock
+holder may take it over — `begin_runtime_epoch()` refuses a bump while another process
+holds the profile's `gateway.lock` flock, because a stray bump leaves the running gateway
+permanently behind the fence: every write on that store then fails with `stale_epoch` until
+it restarts, and `/reset` does not recover it (#142330).
+
 `hermes sessions recover` copies the row-bearing tables above into the
 recovered database (FTS indexes and `schema_version` are regenerated), including
 the lazily-created `delivery_obligations` ledger when the source has one — its
@@ -207,6 +214,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT,
     api_call_count INTEGER DEFAULT 0,
     -- ... additional gateway/workspace/handoff/compression columns ...
+    prompt_cache_clock TEXT,  -- JSON of the latest prompt-cache event (agent/prompt_cache_clock.py)
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -216,6 +224,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique
     ON sessions(title) WHERE title IS NOT NULL;
 ```
+
+`prompt_cache_clock` is nullable JSON: the route (provider, normalized base URL, model), requested
+and granted cache tiers, one coverage deadline per tier, the guaranteed and estimated ends,
+confidence, send time, and the session's context generation when the last request read or wrote
+the provider's prompt cache. It rides the same queued token-count batch as the usage counters (no
+extra write on the turn loop). The context generation is the number of rows a compaction or prune
+archived (`active = 0, compacted = 1`): it only grows, so a saved clock recorded before an in-place
+compaction no longer validates after a restart; for a managed worker the owner stamps that count
+onto the clock inside the usage receipt that carries it. A resumed agent restores the clock before its first
+response is recorded, and the agentless `session.context_breakdown` reads it too, checked against
+the row's persisted model and `model_config` provider/base URL so a `/model` switch reports
+`unknown`. Every clock read is advisory: a failed store read reports `unknown` and never fails the
+turn. Sessions stored
+before the column fall back to the newest assistant row's timestamp (`assumed`, never guaranteed).
 
 `user_id` is the principal on the other end of the session: messaging adapters
 store the platform sender id, and `desktop` / dashboard sessions opened through
@@ -601,3 +623,28 @@ wherever `HERMES_HOME` points (see [Hermes home and profile isolation](#hermes-h
 
 The database file, WAL file (`state.db-wal`), and shared-memory file
 (`state.db-shm`) are all created in the same directory.
+
+## The session-store executor (gateway)
+
+When a gateway process serves more than one profile, a secondary's save is an RPC to that
+process, so its `state.db` write runs on the **owner's** machine. `gateway/session_executor.py`
+runs every session-store write there on one process-wide, bounded, NAMED thread pool instead of
+the event loop's default executor — the default pool is shared with unrelated blocking work, and
+a save queued behind it is a receipt the owner cannot answer inside the worker's receipt budget
+(`worker_receipt_timeout` -> `persistence_degraded` -> "Hermes couldn't save this conversation").
+
+The contract, in one place:
+
+- **A receipt is answered only after the write commits.** The write functions commit their SQLite
+  transaction before returning, and a ticket's future resolves on that return — never before.
+- **Backpressure is named.** A full queue raises `SessionStoreRefused` with `code`, `queue_depth`
+  and the oldest queued write's age. There is no unbounded queue and no silent drop.
+- **Every wait has a deadline** (under the worker's 20 s receipt budget). A deadline is not a
+  cancellation: the write may still commit, the refusal says `settled=None`, and the caller
+  re-asks idempotently (receipts dedupe on execution/sequence/digest).
+- **The mirror is derived.** With `gateway.write_sessions_json: false` the save writes `state.db`
+  only and skips the legacy `sessions.json` rewrite (measured 277 ms per session creation out of
+  the shared pool). `state.db` is the only primary.
+
+Rollback is one config flip, no code change: `gateway.session_store_executor: "default"` in the root
+config, or `HERMES_SESSION_STORE_EXECUTOR=default` in the environment.
