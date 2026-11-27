@@ -1625,6 +1625,22 @@ class TestGatewayRoutingTable:
         assert store.get_prompt_pin(entry.session_key) is None
         store._db.close()
 
+    def test_sessions_json_mirror_write_logs_bytes_and_ms(self, tmp_path, caplog):
+        """Every mirror rewrite must be measurable (bytes + ms) where the cost is paid."""
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store.get_or_create_session(self._source())
+        with caplog.at_level(logging.INFO, logger="gateway.session"):
+            store._save_entries()
+        msgs = [r.getMessage() for r in caplog.records
+                if "sessions.json mirror: wrote" in r.getMessage()]
+        assert msgs, [r.getMessage() for r in caplog.records][-5:]
+        mirror = tmp_path / "sessions.json"
+        assert mirror.exists()
+        assert ("wrote %d bytes" % mirror.stat().st_size) in msgs[-1]
+        assert msgs[-1].endswith(" ms")
+        store._db.close()
+
     def test_write_sessions_json_false_stops_producing_file(self, tmp_path):
         config = GatewayConfig(write_sessions_json=False)
         store = SessionStore(sessions_dir=tmp_path, config=config)

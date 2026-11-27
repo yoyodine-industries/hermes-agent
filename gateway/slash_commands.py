@@ -24,6 +24,7 @@ from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_c
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore
+from gateway.session_executor import run_session_write
 from gateway.session_transcript import TranscriptReadError
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
 from gateway.slash_commands_model import GatewayModelCommandsMixin
@@ -974,8 +975,12 @@ class GatewaySlashCommandsMixin(
             # A first-message /yolo has no routing entry yet; materialize it so the flag has a home.
             persisted = (await self.async_session_store.get_or_create_session(event.source)).yolo is True
             persist = lambda on: store.set_session_yolo(session_key, on)
-        # Off the loop: the persist is a routing-store write (thread-safe, like AsyncSessionStore's calls).
-        enable = await asyncio.to_thread(toggle_session_yolo, session_key, persisted=persisted, persist=persist)
+        # Off the loop, on the session-store's own executor: this is a routing-store write, and it
+        # must not queue behind the default pool (gateway/session_executor.py).
+        enable = await run_session_write(
+            toggle_session_yolo, session_key, persisted=persisted, persist=persist,
+            task="session-store.set_session_yolo",
+        )
         return EphemeralReply(t("gateway.yolo.enabled" if enable else "gateway.yolo.disabled"))
 
     async def _handle_verbose_command(self, event: MessageEvent) -> str:

@@ -2,18 +2,49 @@
 
 Only explicit local compute registrations are enabled here. A delegated child is reserved by
 the owner on its parent's receipt stream (gateway/session_worker_child.py), never registered.
+
+Every durable step below runs on the session-store's OWN bounded executor
+(``gateway.session_executor``), which is the same path the owner's own store writes take — one
+implementation for owner and secondaries. The JSON-RPC reply is built from this coroutine's return
+value and from nothing else, so the receipt a worker waits for is answered only after the write's
+transaction commits; a full queue or a passed deadline comes back as a NAMED refusal carrying the
+queue depth and the wait.
 """
-import asyncio
 import hmac
 import os
 
 from gateway.session_admission import admission_fingerprint
+from gateway.session_executor import SessionStoreRefused, run_session_write
 from hermes_state_runtime import (
     RuntimeStoreError, _secret_digest, adopt_worker_execution,
     mutate_worker_execution, register_worker_execution,
 )
 
 _SCOPE = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret'}
+
+
+async def _durable_write(fn, *args, task, **kwargs):
+    """Run one durable worker write on the session-store executor, naming a refusal for the wire.
+
+    ``RuntimeStoreError`` is the wire vocabulary (``reason``/``field``/``detail``/``retry_after``),
+    so the executor's own refusal is translated HERE rather than leaking a gateway-internal type
+    into the RPC layer — the worker then sees ``session_store_saturated`` or
+    ``session_store_deadline`` with the queue depth and wait, not a bare "owner busy".
+    """
+    try:
+        return await run_session_write(fn, *args, task=task, **kwargs)
+    except SessionStoreRefused as exc:
+        # A queue refusal reserved nothing (retryable at once); a deadline may still commit, so it
+        # is reported as not-retryable-in-place: the worker re-asks it idempotently, and the
+        # receipt transaction dedupes that replay on (execution, sequence, digest).
+        raise RuntimeStoreError(
+            exc.code,
+            field='session_store_executor',
+            detail=(f'queue_depth={exc.queue_depth} wait_ms={exc.wait_ms:.0f} '
+                    f'workers={exc.workers} task={exc.task}'),
+            retry_after=0.05 if exc.retryable else None,
+        ) from None
+
 
 
 def _claim(connection, ref, params):
@@ -85,16 +116,18 @@ async def worker_request(connection, ref, params, *, operation):
         authority.authorize(connection.actor, ref, 'worker:adopt')
         if params['kind'] != 'compute':
             raise RuntimeStoreError('unsupported_producer')
-        return await asyncio.to_thread(register_worker_execution, authority.db, epoch=authority.epoch,
-            **scope, kind='compute', adoption_secret=claim, require_idle=True)
+        return await _durable_write(register_worker_execution, authority.db, task='worker.register',
+            epoch=authority.epoch, **scope, kind='compute', adoption_secret=claim, require_idle=True)
     if 'worker:adopt' not in connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
     _verify(connection, ref, params, claim)
     if operation == 'adopt':
-        return await asyncio.to_thread(adopt_worker_execution, authority.db, epoch=authority.epoch,
-                                       **scope, adoption_secret=claim)
-    result = await asyncio.to_thread(mutate_worker_execution, authority.db, epoch=params['epoch'],
-        **scope, sequence=params['sequence'], operation=params['operation'], payload=params['payload'])
+        return await _durable_write(adopt_worker_execution, authority.db, task='worker.adopt',
+                                   epoch=authority.epoch, **scope, adoption_secret=claim)
+    result = await _durable_write(mutate_worker_execution, authority.db,
+                                 task=f"worker.persist.{params['operation']}",
+                                 epoch=params['epoch'], **scope, sequence=params['sequence'],
+                                 operation=params['operation'], payload=params['payload'])
     if params['operation'] == 'execution.finish':
         # Queued input parked behind this worker; nothing else would restart its FIFO.
         authority.wake_after_worker(params['session_id'])

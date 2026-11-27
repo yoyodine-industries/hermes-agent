@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Any
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
 from gateway.session_detached import detached_route_of
+from gateway.session_executor import run_session_write
 from gateway.session_identity import transport_profile_of
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
@@ -807,10 +808,21 @@ class _RouteDecision:
 
 
 class AsyncSessionStore:
-    """Async boundary for the synchronous, thread-safe SessionStore."""
+    """Async boundary for the synchronous, thread-safe SessionStore.
+
+    Every call runs on the session-store's OWN bounded executor
+    (``gateway.session_executor``), never on the event loop's default executor: the default pool is
+    shared with unrelated blocking work, and a save that queues behind it is a receipt the owner
+    cannot answer inside the worker's budget. See that module for the measured chain, the
+    backpressure contract and the rollback switch.
+    """
 
     def __init__(self, store: "SessionStore") -> None:
         self._store = store
+        # Resolve the executor's mode/sizing once per process from the gateway config; a rollback to
+        # the default executor is `gateway.session_store_executor: "default"`, no code change.
+        from gateway.session_executor import configure
+        configure(getattr(store, "config", None))
 
     def __getattr__(self, name: str):
         attr = getattr(self._store, name)
@@ -818,7 +830,9 @@ class AsyncSessionStore:
             return attr
 
         async def _offloaded(*args, **kwargs) -> Any:
-            return await asyncio.to_thread(attr, *args, **kwargs)
+            return await run_session_write(
+                attr, *args, task=f"session-store.{name}", **kwargs,
+            )
 
         return _offloaded
 

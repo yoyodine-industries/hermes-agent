@@ -8,6 +8,7 @@ import contextlib
 import logging
 import json
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 from utils import atomic_json_write
@@ -624,8 +625,27 @@ class SessionPersistenceMixin:
                     del fast_persisted[key]
 
     def _save_sessions_json(self, data: dict[str, Any]) -> None:
-        """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
-        atomic_json_write(self.sessions_dir / "sessions.json", {"_README": _SESSIONS_JSON_README, **data}, mode=0o600)
+        """Write the legacy sessions.json mirror of the routing index (atomic + fsync).
+
+        Measured on every write. This is one full O(entries) rewrite of a single fleet-shared
+        file, and every whole-index save runs it under ``_save_lock`` inside a worker of the
+        shared default executor (``AsyncSessionStore`` offloads through ``asyncio.to_thread``) —
+        the same pool that serves ``worker.persist``. Without a per-write bytes/ms record,
+        contention on this path only surfaces later as another lane's receipt timeout, so the
+        cost is logged where it is paid.
+        """
+        path = self.sessions_dir / "sessions.json"
+        started = time.monotonic()
+        atomic_json_write(path, {"_README": _SESSIONS_JSON_README, **data}, mode=0o600)
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = -1
+        logger.info(
+            "sessions.json mirror: wrote %d bytes (%d entries) in %.1f ms",
+            size, len(data), elapsed_ms,
+        )
 
     def _save_entries(self) -> None:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""

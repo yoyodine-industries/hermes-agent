@@ -44,7 +44,17 @@ _REPLAY_SAFE_METHODS = frozenset({'worker.persist'})
 # Failures that mean "the owner is busy", never "this store is broken": a flush reports these
 # as False and keeps the journal (the outbox a later reopen replays), exactly like the
 # in-process SessionDB contract ("False on timeout ... Never raises").
-_TRANSIENT_RECEIPT_FAILURES = frozenset({'worker_receipt_timeout', 'pending_receipt', 'owner_unavailable'})
+#
+# ``session_store_saturated`` / ``session_store_deadline`` are the owner's NAMED refusals from
+# its bounded session-store executor (gateway/session_executor.py). They are the same class of
+# news as ``worker_receipt_timeout`` - the owner could not get to the write in time - but they
+# arrive EARLIER and say why (queue depth, wait, task). Treating them as anything but transient
+# would turn the fix into a worse failure than the bug: a refused-but-retryable save would
+# become a hard persistence error and kill a turn that could simply re-ask.
+_TRANSIENT_RECEIPT_FAILURES = frozenset({
+    'worker_receipt_timeout', 'pending_receipt', 'owner_unavailable',
+    'session_store_saturated', 'session_store_deadline',
+})
 
 
 def _env_seconds(name, default):
@@ -97,7 +107,8 @@ def apply_row_annotations(messages, annotations):
                 message[key] = value
 
 class WorkerPersistenceError(RuntimeError):
-    pass
+    #: A refusal's wire ``data`` (queue depth, wait, task) when the owner named one, else None.
+    refusal: dict | None = None
 
 
 def _caller_summary(limit=8):
@@ -303,7 +314,14 @@ class WorkerRPC:
                 self._drop()
                 raise
             if 'error' in response:
-                raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
+                error = response['error']
+                exc = WorkerPersistenceError(error.get('message', 'persistence_failed'))
+                # The owner names a bounded refusal and packs the numbers behind it (queue depth,
+                # the wait, which write) into ``data``. Attach them to the exception so the
+                # worker's log carries the cause without a second query; ``str(exc)`` stays the
+                # bare wire code that ``_receipt_is_transient`` classifies.
+                exc.refusal = error.get('data') or {}
+                raise exc
             if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
                 global _worker_process
                 _worker_process = True

@@ -628,6 +628,12 @@ class GatewayConfig:
     # compatibility with external tooling and downgrade safety; set gateway.write_sessions_json: false in
     # config.yaml to stop producing the file.
     write_sessions_json: bool = True
+    # Which executor session-store persistence runs on — "dedicated" (default) or "default".
+    # "dedicated": gateway.session_executor's own bounded, named pool with explicit backpressure, a
+    # per-write deadline and a post-commit receipt. "default": the pre-change behaviour
+    # (asyncio.to_thread on the event loop's shared default pool) — the ROLLBACK lever for a fleet-wide
+    # change; one config flip at the next restart, no code change.
+    session_store_executor: str = "dedicated"
     always_log_local: bool = True  # Always save cron outputs to local files
     # Drop outbound "silence narration" (*(silent)*, 🔇, a bare ".") that ping-pongs in bot-to-bot
     # channels; a substrate guard that survives prompt drift.
@@ -679,7 +685,8 @@ class GatewayConfig:
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
-        "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
+        "write_sessions_json", "session_store_executor",
+        "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
         "max_concurrent_sessions", "multiplex_profiles",
         "on_all_adapters_down",
@@ -811,6 +818,9 @@ class GatewayConfig:
             quick_commands=_coerce_dict(data.get("quick_commands", {})),
             sessions_dir=Path(data["sessions_dir"]) if "sessions_dir" in data else get_hermes_home() / "sessions",
             **{name: _coerce_bool(data.get(name), default) for name, default in _TOPLEVEL_BOOL_DEFAULTS.items()},
+            session_store_executor=_normalize_choice(
+                pick("session_store_executor"), {"dedicated", "default"}, "dedicated"
+            ),
             stt_enabled=_coerce_bool(stt_setting("stt_enabled", "enabled"), True),
             stt_echo_transcripts=_coerce_bool(stt_setting("stt_echo_transcripts", "echo_transcripts"), True),
             multiplex_profiles=None if multiplex_profiles is None else _coerce_bool(multiplex_profiles, True),

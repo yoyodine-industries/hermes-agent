@@ -623,3 +623,28 @@ wherever `HERMES_HOME` points (see [Hermes home and profile isolation](#hermes-h
 
 The database file, WAL file (`state.db-wal`), and shared-memory file
 (`state.db-shm`) are all created in the same directory.
+
+## The session-store executor (gateway)
+
+When a gateway process serves more than one profile, a secondary's save is an RPC to that
+process, so its `state.db` write runs on the **owner's** machine. `gateway/session_executor.py`
+runs every session-store write there on one process-wide, bounded, NAMED thread pool instead of
+the event loop's default executor — the default pool is shared with unrelated blocking work, and
+a save queued behind it is a receipt the owner cannot answer inside the worker's receipt budget
+(`worker_receipt_timeout` -> `persistence_degraded` -> "Hermes couldn't save this conversation").
+
+The contract, in one place:
+
+- **A receipt is answered only after the write commits.** The write functions commit their SQLite
+  transaction before returning, and a ticket's future resolves on that return — never before.
+- **Backpressure is named.** A full queue raises `SessionStoreRefused` with `code`, `queue_depth`
+  and the oldest queued write's age. There is no unbounded queue and no silent drop.
+- **Every wait has a deadline** (under the worker's 20 s receipt budget). A deadline is not a
+  cancellation: the write may still commit, the refusal says `settled=None`, and the caller
+  re-asks idempotently (receipts dedupe on execution/sequence/digest).
+- **The mirror is derived.** With `gateway.write_sessions_json: false` the save writes `state.db`
+  only and skips the legacy `sessions.json` rewrite (measured 277 ms per session creation out of
+  the shared pool). `state.db` is the only primary.
+
+Rollback is one config flip, no code change: `gateway.session_store_executor: "default"` in the root
+config, or `HERMES_SESSION_STORE_EXECUTOR=default` in the environment.
