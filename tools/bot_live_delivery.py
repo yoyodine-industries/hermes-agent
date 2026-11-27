@@ -27,7 +27,6 @@ DELIVERY_DIR_NAME = "bot_live_delivery"
 _OWNER_KEYS = ("profile_home", "session_id", "lease_id", "live_session_id")
 _TERMINAL = frozenset({"settled", "failed", "cancelled", "ambiguous"})
 
-
 def _bot_chat_tip(home: Path) -> str | None:
     """Current Bot Chat tip id, or None when the profile has no store or no Bot Chat yet."""
     from hermes_state import SessionDB
@@ -48,17 +47,13 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     ``session_id`` is the current Bot Chat tip, or ``''`` when the profile has none yet: the
     authority's deliver door creates it on first delivery (main's ``--create-if-missing``),
     so a missing chat is not a refusal. None only when the profile has no store at all."""
-    from hermes_cli.gateway_runtime import discover_gateway_endpoint
-
     home = Path(profile_home).resolve()
-    discovery = discover_gateway_endpoint(home, timeout=5)
-    if discovery.state != 'ready' or discovery.endpoint is None:
-        raise ValueError('profile authority is not ready')
+    endpoint = discover_serving_endpoint(home, timeout=5)
     if not (home / 'state.db').is_file():
         return None
     tip = _bot_chat_tip(home)
     return dict(profile_home=str(home), session_id=tip or '', canonical=True,
-                lease_id=discovery.endpoint.instance_id, live_session_id=tip or '')
+                lease_id=endpoint.instance_id, live_session_id=tip or '')
 
 
 class PreDialError(ValueError):
@@ -66,6 +61,74 @@ class PreDialError(ValueError):
     this is a definite no-send the sender may safely retry — never the ambiguous
     post-admission state that orders 'do not resend' (#139303). A ``ValueError`` like the
     "authority is not ready" refusals it wraps, so existing ``except ValueError`` callers hold."""
+
+
+# The three decisions a sender can reach. They are named because the single refusal string this
+# module used to raise collapsed all of them into one: an owner that is BOOTING and will answer in
+# seconds, and an owner that is GONE, both read as "not ready", so a sender either gave up on a
+# restart it should have waited out or retried a target that will never come back.
+DELIVERED = "DELIVERED"
+RETRY_LATER_GATEWAY_BOOTING = "RETRY_LATER_GATEWAY_BOOTING"
+FAILED_TARGET_ABSENT = "FAILED_TARGET_ABSENT"
+# `starting` is the one state that means "exists, serving shortly": a re-probe can answer it, and
+# every other non-ready state is already a verdict about a target that is not there.
+BOOTING_STATES = frozenset({"starting"})
+
+
+def decision_for_state(state: str) -> str:
+    """The sender's act for a discovery state it never got to dial."""
+    return RETRY_LATER_GATEWAY_BOOTING if state in BOOTING_STATES else FAILED_TARGET_ABSENT
+
+
+class AuthorityNotReady(PreDialError):
+    """The authority is not serving this client, and it says WHICH state the discovery saw.
+
+    Carries the state value, not merely a sentence about it: a caller decides whether to resend by
+    reading ``decision`` (or ``state``), never by matching this message's text, so a copy edit
+    cannot silently turn a retry into a discard. Still a ``PreDialError``/``ValueError``, so every
+    existing ``except ValueError`` caller keeps working.
+    """
+
+    def __init__(self, state: str, reason_code: str | None = None, detail: str | None = None):
+        self.state = state
+        self.reason_code = reason_code
+        self.detail = detail
+        self.decision = decision_for_state(state)
+        seen = f"state={state}"
+        if reason_code:
+            seen += f" reason_code={reason_code}"
+        if detail:
+            seen += f" detail={detail}"
+        super().__init__(f"profile authority is not ready ({seen})")
+
+
+def discover_serving_endpoint(profile_home: Path | str, *, attempts: int = 4,
+                               interval: float = 2.0, timeout: float = 5.0):
+    """This profile's authority discovery, with a BOOTING owner treated as not-yet-an-answer.
+
+    A delivery that races a gateway restart is ordinary, and waiting it out is what the sender
+    wants; a gateway that never comes up is not. So a ``starting`` discovery is re-probed a
+    BOUNDED number of times - bounded because the caller is a live tool call, not a supervisor -
+    and the refusal that follows names the state it finally saw (``AuthorityNotReady``) instead of
+    the one string every non-ready state used to produce.
+
+    Returns the ENDPOINT: a ``ready`` discovery with no endpoint is not attachable, so the two are
+    one answer and callers never have to re-check the pair.
+    """
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+
+    home = Path(profile_home).resolve()
+    attempt = 0
+    while True:
+        discovery = discover_gateway_endpoint(home, timeout=timeout)
+        if discovery.state == "ready" and discovery.endpoint is not None:
+            return discovery.endpoint
+        attempt += 1
+        state = discovery.state or "unknown"
+        if state not in BOOTING_STATES or attempt >= max(1, attempts):
+            raise AuthorityNotReady(state, getattr(discovery, "reason_code", None),
+                                    getattr(discovery, "detail", None))
+        time.sleep(max(0.0, interval))
 
 
 def authority_delivery(home, params):
@@ -81,7 +144,6 @@ def authority_settle(home, params):
 
 def _authority_rpc(home, method, params):
     import asyncio
-    from hermes_cli.gateway_runtime import discover_gateway_endpoint
     from hermes_cli.gateway_client import GATEWAY_WS_PROTOCOL, GatewayClient, _session_ticket, gateway_ws_target
     from websockets.asyncio.client import connect
 
@@ -90,10 +152,7 @@ def _authority_rpc(home, method, params):
 
     async def request():
         nonlocal rpc_started
-        discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=5)
-        if discovery.state != 'ready' or discovery.endpoint is None:
-            raise ValueError('profile authority is not ready')
-        endpoint = discovery.endpoint
+        endpoint = await asyncio.to_thread(discover_serving_endpoint, home, timeout=5)
         ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
         # Loopback authority dial: never through HTTP(S)_PROXY (websockets>=14 honours it by default).
@@ -115,6 +174,10 @@ def _authority_rpc(home, method, params):
         return _run_async(request())
     except Exception as exc:
         if not rpc_started:
+            # A not-ready refusal already carries the state it saw and the decision that follows
+            # from it; re-wrapping it as a plain PreDialError would throw both away.
+            if isinstance(exc, AuthorityNotReady):
+                raise
             raise PreDialError(str(exc)) from exc
         raise
 
