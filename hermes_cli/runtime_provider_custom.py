@@ -406,6 +406,90 @@ def _entry_serves_model(entry: dict[str, Any], target: str) -> bool:
     return False
 
 
+def config_entry_at_path(config: Optional[dict[str, Any]], path: Optional[tuple]) -> Any:
+    """The RAW config entry *path* addresses: dict steps by key, legacy list steps by index.
+
+    ``named_custom_provider_config_path`` returns ``("providers", <key>)`` for the keyed table but
+    ``("custom_providers", <int index>)`` for a legacy ``custom_providers:`` LIST entry — the shape
+    this estate's lane configs carry, and the root fallback's too. Walking that path with ``dict.get``
+    only turned the index into ``None``, which read as "the entry declares nothing" and silently
+    disabled the pair rule on every lane.
+    """
+    entry: Any = config
+    for part in path or ():
+        if isinstance(entry, dict):
+            entry = entry.get(part)
+        elif isinstance(entry, (list, tuple)) and isinstance(part, int) and 0 <= part < len(entry):
+            entry = entry[part]
+        else:
+            return None
+    return entry
+
+
+def declared_models(entry: dict[str, Any]) -> list[str]:
+    """The model ids a configured ``providers:`` / ``custom_providers:`` entry DECLARES it serves.
+
+    A keyed ``providers:`` entry declares ``default_model`` (optionally with a ``models`` table); a
+    legacy ``custom_providers:`` entry declares its endpoint's model as ``default_model`` or ``model``.
+    Both are read: a model-less launch's route is judged against what the entry itself says it sells,
+    never against a name it merely defaults to.
+    """
+    if not isinstance(entry, dict):
+        return []
+    ids: list[str] = []
+    for key in ("default_model", "model"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            ids.append(value.strip())
+    models = entry.get("models")
+    if isinstance(models, dict):
+        ids.extend(str(name).strip() for name in models)
+    elif isinstance(models, list):
+        for item in models:
+            value = (item.get("id") or item.get("name")) if isinstance(item, dict) else item
+            if isinstance(value, str) and value.strip():
+                ids.append(value.strip())
+    return list(dict.fromkeys(name for name in ids if name))
+
+
+def route_model_conflict(config: Optional[dict[str, Any]], model: Optional[str]) -> Optional[tuple[str, list[str]]]:
+    """``(custom:<name>, the models it declares)`` when the route *config* selects is a configured
+    custom entry that does NOT serve *model*; else ``None``.
+
+    R3-I's pair rule (ruling t_094f82f5): route and model are one pair. A launch that names only a
+    provider/base_url leaves the model to the owning profile, so the entry the route actually lands on
+    must serve it — never run one backend under another's name.
+
+    An explicit ``base_url`` IS the route that runs (it beats the provider name at resolution), so the
+    entry owning that URL decides; without one, a ``custom:<name>`` provider picks its own entry. Only an
+    entry that DECLARES models can prove a conflict: an entry declaring none is a generic endpoint, and a
+    route that is not a configured custom entry (a built-in provider, an unconfigured URL) is not judged.
+    The entry is read from the RAW config at the path resolution named — legacy ``custom_providers:``
+    entries live at a list index, so the path is indexed, never only dict-walked.
+    """
+    target = str(model or "").strip().lower()
+    if not isinstance(config, dict) or not target:
+        return None
+    block = config.get("model")
+    if not isinstance(block, dict):
+        return None
+    url = str(block.get("base_url") or "").strip()
+    identity: Optional[str] = (_find_custom_identity(
+        lambda entry: _route_key(_entry_url(entry)) == _route_key(url), config) if url else None)
+    if not identity:
+        provider = str(block.get("provider") or "").strip()
+        identity = provider.lower() if provider.lower().startswith("custom:") else None
+    if not identity:
+        return None
+    path = named_custom_provider_config_path(identity, config)
+    if not path:
+        return None
+    declared = declared_models(config_entry_at_path(config, path))
+    if not declared or any(name.lower() == target for name in declared):
+        return None
+    return identity, declared
+
+
 def routed_custom_identity(base_url: Optional[str], model: Optional[str],
                            config: Optional[dict[str, Any]] = None, held: Optional[str] = None) -> Optional[str]:
     """The configured ``custom:<name>`` entry a bare ``custom`` pick (the billing class every named

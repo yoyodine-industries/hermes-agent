@@ -228,6 +228,16 @@ class LocalSessionPolicy:
                     agent[key] = live_agent[key]
                 else:
                     agent.pop(key, None)
+        if model is None:
+            # R3-I (ruling t_094f82f5): a turn that names no model runs and STAMPS the owning profile's
+            # ``model.default`` — read from the same config the route resolves from below (the frozen policy
+            # config IS that profile's config; a following turn's fold above already replaced its ``model``
+            # block with the profile's own). A custom provider entry's declared ``default_model`` is never a
+            # substitute for a model the profile declares: leaving ``None`` here is what let the route
+            # resolver take it, stamping yaan-main on five lanes whose own default is deepseek-flash.
+            from gateway.run import _resolve_gateway_model
+            model = _resolve_gateway_model(config) or None
+            admit_route_pair(config, model, json.loads(self.request_json))
         source = (config.get('model') or {}).get('api_key_from') if isinstance(config.get('model'), dict) else None
         if source:
             # ``/model <alias>`` with a literal key: the receipt points at the alias entry's secret.
@@ -365,6 +375,42 @@ def profile_target(config):
         provider = str(model.get('provider') or '').strip()
         return str(model.get('default') or '').strip(), '' if provider.lower() == 'auto' else provider
     return (model.strip() if isinstance(model, str) else ''), ''
+
+
+#: What a creation request may name to select a ROUTE without naming a model.
+ROUTE_PICKS = ('provider', 'base_url')
+
+
+def named_route_pick(request):
+    """The provider/base_url a creation request names *without* a model, or ``{}``.
+
+    ``provider: auto`` is the thin client's "no pick" sentinel, so it is not a route pick. A launch that
+    names a model is not this rule's subject (``effective`` only asks when the policy names none).
+    """
+    pick = {key: request[key] for key in ROUTE_PICKS
+            if isinstance(request.get(key), str) and request[key].strip()}
+    if str(pick.get('provider') or '').strip().lower() == 'auto':
+        pick.pop('provider')
+    return pick
+
+
+def admit_route_pair(config, model, request):
+    """R3-I: route and model are ONE pair — refuse a model-less route pick whose entry cannot serve *model*.
+
+    The model a model-less turn runs is the owning profile's (resolved by ``effective``); this is the check
+    that the provider/base_url the same launch picked actually serves it, instead of running one backend
+    under another's name. Only a configured custom entry that DECLARES its models can prove a conflict
+    (``runtime_provider_custom.route_model_conflict``): a pick that names no route, or one whose entry
+    declares nothing, is never refused here.
+    """
+    if not model or not named_route_pick(request):
+        return
+    from hermes_cli.runtime_provider_custom import route_model_conflict
+    conflict = route_model_conflict(config, model)
+    if conflict is not None:
+        identity, declared = conflict
+        _refuse('model', f'{model} is not served by {identity}, which declares {", ".join(declared)}; '
+                         'name the model that endpoint serves')
 
 
 def model_route(block):
