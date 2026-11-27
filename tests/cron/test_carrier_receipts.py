@@ -393,3 +393,71 @@ def test_a_crash_between_ledger_and_job_row_resumes_cleanly(store, monkeypatch):
     assert executions.get_execution(execution_id)["status"] == "failed"
     assert not carrier_receipts.receipt_path(execution_id).exists()
 
+
+# ── R5: a scheduler budget kill SAYS SO (t_568873e3) ───────────────────────────────────────
+
+
+def _budget_receipt(job_id, **overrides):
+    fields = dict(exit_code=-9, timeout_s=3600, signal="SIGKILL", run_id=RUN_ID)
+    fields.update(overrides)
+    return carrier_receipts.new_receipt(
+        job_id=job_id, execution_id="exec-budget",
+        status=carrier_receipts.STATUS_EXITED, **fields)
+
+
+def test_a_budget_kill_is_named_in_the_verdict(store):
+    job = _job()
+    record = _budget_receipt(job["id"])
+    assert carrier_receipts._verdict(record) == (
+        False,
+        "carrier killed by the scheduler's script budget after 3600s (signal SIGKILL); "
+        f"exit code -9 (run {RUN_ID})")
+
+
+def test_the_failure_notice_says_the_budget_killed_the_run(store):
+    job = _job()
+    record = _budget_receipt(job["id"])
+    success, error = carrier_receipts._verdict(record)
+    assert success is False
+    text = carrier_receipts.failure_notice_text(job, record, error)
+    assert "- termination: killed by the scheduler's script budget after 3600s (signal SIGKILL)" in text
+    assert "- attempt status: `exited`, exit code -9" in text
+
+
+def test_a_signal_death_with_no_recorded_timeout_is_not_called_a_budget_kill(store):
+    """The control: -9 with no timeout_s is an unattributed death, never a budget claim."""
+    job = _job()
+    record = _budget_receipt(job["id"], timeout_s=None, signal=None, run_id=None)
+    assert record.get("timeout_s") is None
+    success, error = carrier_receipts._verdict(record)
+    assert success is False
+    assert error == "carrier exited with code -9 (run exec-budget)"
+    text = carrier_receipts.failure_notice_text(job, record, error)
+    assert "script budget" not in text
+
+
+def test_a_budget_kill_with_no_recorded_signal_omits_the_clause(store):
+    job = _job()
+    record = _budget_receipt(job["id"], timeout_s=600, signal=None)
+    assert carrier_receipts._verdict(record) == (
+        False,
+        "carrier killed by the scheduler's script budget after 600s; "
+        f"exit code -9 (run {RUN_ID})")
+
+
+def test_reconcile_delivers_a_notice_and_settles_a_cause_that_say_budget(store, monkeypatch):
+    """End to end: the consumer-visible text and the ledger row both carry the fact."""
+    job = _job()
+    execution_id = _attempt(job["id"])
+    _receipt(store, execution_id, job_id=job["id"], exit_code=-9,
+             timeout_s=3600, signal="SIGKILL", run_id=RUN_ID)
+    deliveries = Deliveries()
+    monkeypatch.setattr(carrier_receipts, "_deliver_notice", deliveries)
+
+    assert carrier_receipts.reconcile_receipts() == 1
+
+    row = executions.get_execution(execution_id)
+    assert row["status"] == "failed"
+    assert "scheduler's script budget after 3600s (signal SIGKILL)" in (row.get("error") or "")
+    assert deliveries.calls and deliveries.calls[0]["for_failure"] is True
+    assert "scheduler's script budget after 3600s (signal SIGKILL)" in deliveries.texts[0]

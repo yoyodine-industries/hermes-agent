@@ -141,6 +141,7 @@ _DEFAULTS: dict[str, Any] = {
     "finished_at": None,
     "exit_code": None,
     "timeout_s": None,
+    "signal": None,
     "stdout_path": None,
     "stderr_path": None,
     "run_id": None,
@@ -373,6 +374,24 @@ def _carrier_is_live(record: dict[str, Any]) -> bool:
 # ── Verdict (never inferred from prose) ────────────────────────────────────────────────────
 
 
+def _budget_kill(record: dict[str, Any]) -> Optional[str]:
+    """The scheduler-budget kill phrase, or ``None`` when the receipt records no timeout.
+
+    READ FROM THE RECEIPT ONLY.  ``timeout_s`` is written by the supervisor BEFORE its own
+    SIGKILL (U2), so the field's presence is the scheduler's own admission that this exit was a
+    budget kill and not the carrier's own failure.  An exit code of ``-SIGKILL`` with NO
+    ``timeout_s`` is therefore never described as a budget kill: that death is an external kill
+    or the carrier's own, the receipt does not attribute it, and claiming otherwise is the
+    fabrication this module refuses everywhere else.
+    """
+    timeout_s = _as_int(record.get("timeout_s"))
+    if timeout_s is None:
+        return None
+    signal_name = str(record.get("signal") or "").strip()
+    phrase = f"killed by the scheduler's script budget after {timeout_s}s"
+    return f"{phrase} (signal {signal_name})" if signal_name else phrase
+
+
 def _verdict(record: dict[str, Any]) -> Optional[tuple[bool, Optional[str]]]:
     """``(success, error)`` for a settleable receipt, or ``None`` while it must be left alone.
 
@@ -398,6 +417,9 @@ def _verdict(record: dict[str, Any]) -> Optional[tuple[bool, Optional[str]]]:
             return None
         if code == 0:
             return True, None
+        budget = _budget_kill(record)
+        if budget:
+            return False, f"carrier {budget}; exit code {code} (run {_run_label(record)})"
         return False, f"carrier exited with code {code} (run {_run_label(record)})"
     logger.warning("carrier receipt %s has unknown status %r; left in place",
                    record.get("execution_id"), status)
@@ -576,6 +598,9 @@ def failure_notice_text(job: dict[str, Any], record: dict[str, Any],
         f"- attempt status: `{record.get('status')}`"
         + (f", exit code {record.get('exit_code')}" if record.get("status") == STATUS_EXITED else ""),
     ]
+    budget = _budget_kill(record)
+    if budget:
+        lines.append(f"- termination: {budget}")
     published = str(record.get("published_path") or "").strip()
     if published:
         lines.append(f"- artifact: `{published}`")
