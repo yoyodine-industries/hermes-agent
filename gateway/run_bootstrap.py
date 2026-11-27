@@ -268,6 +268,17 @@ def _start_gateway_claim_pid_file(force: bool = False) -> bool:
     from hermes_cli.gateway_multiplex_mode import publish_pending_multiplex_decision
     publish_pending_multiplex_decision()
     _claim_host_gateway_role(force=force)
+    # Publish the cold-start lease the moment this process is the authoritative gateway. Everything
+    # below — nine state.db stores, ~10 GiB, opened inside GatewayRunner.__init__ — runs before
+    # anything else is published, and until this write the file still carried the PREVIOUS life's
+    # record (a dead pid reported as ``running``). It also cycles the lifecycle sentinel to
+    # ``starting`` for this pid. Best-effort: progress must never abort a start.
+    try:
+        from gateway.startup_progress import begin_startup
+
+        begin_startup()
+    except Exception:
+        logger.debug("Could not publish the startup lease", exc_info=True)
     return True
 
 
@@ -681,6 +692,10 @@ async def _start_gateway_run_runner(runner, _signal_initiated_shutdown: list) ->
     before running mode (start failed, clean exit, aborted startup); None to continue into cron."""
     from gateway.run import (_discover_gateway_mcp_tools, _resolve_gateway_exit_verdict,
                              _shutdown_gateway_health_export, _shutdown_mcp_servers_nonblocking)
+    # MCP discovery (up to 120 s) plus every adapter connect: publish the phase before either can
+    # block, so a client waiting on a slow boot sees where the time is going.
+    from gateway.startup_progress import PHASE_ADAPTERS, advance_startup_phase
+    advance_startup_phase(PHASE_ADAPTERS)
     # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
     try:
         # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
@@ -834,12 +849,17 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
             resolved_config = _reload_config_keeping_multiplex_verdict(resolved_config)
 
         from gateway.run_runtime import initialize_gateway_runtime, pin_launch_store, unpin_launch_store
+        # The expensive phase: GatewayRunner.__init__ opens every served profile's state.db.
+        from gateway.startup_progress import PHASE_SERVICES_WIRING, PHASE_STORE_OPEN, advance_startup_phase
+
+        advance_startup_phase(PHASE_STORE_OPEN)
         _launch_store_pin = await asyncio.to_thread(pin_launch_store)
         try:
             runner = GatewayRunner(resolved_config)
         finally:
             unpin_launch_store(_launch_store_pin)
         await initialize_gateway_runtime(runner)
+        advance_startup_phase(PHASE_SERVICES_WIRING)
         # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
         # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.
         # See #82936.
@@ -930,6 +950,10 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
             await await_session_socket_preload(ws_preload)
             # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
             publish_gateway_runtime_ready(runner)
+            # The cold start is over: stamp phase="ready"/ready_at and stand the startup heartbeat
+            # down. From here the gateway's normal status writer owns the record.
+            from gateway.startup_progress import mark_startup_ready
+            mark_startup_ready()
             runner._start_systemd_watchdog()
             if idle_exit:
                 from gateway.run_idle_exit import arm_unmanaged_idle_exit
@@ -966,5 +990,13 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
                 _planned_stop_watcher_stop.set()
             if _control_server is not None:
                 await _control_server.stop()
+            # A start that never reached ready must not leave the startup heartbeat rewriting
+            # gateway_state.json: the heartbeat exists for the startup window and stops at ready.
+            try:
+                from gateway.startup_progress import stop_startup_progress
+
+                stop_startup_progress()
+            except Exception:
+                logger.debug("Could not stop the startup heartbeat", exc_info=True)
             remove_pid_file()
             release_gateway_runtime_lock()

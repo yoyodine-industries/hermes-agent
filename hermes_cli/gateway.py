@@ -3868,7 +3868,7 @@ from hermes_cli.gateway_launchd import (
     wait_for_launchd_gateway_supervision,
     launchd_status,
 )
-from datetime import UTC
+from datetime import UTC, datetime
 
 
 # Cached launchd domain — probe once per process invocation.
@@ -4594,6 +4594,41 @@ _WATCHDOG_EXIT_REASONS = {
 }
 
 
+def _epoch_seconds(value) -> float | None:
+    """``value`` as epoch seconds, or None when it is not a number (never raises)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _startup_phase_line(startup) -> str | None:
+    """One line naming the published cold-start phase (``gateway_state.json`` ``startup``).
+
+    Written by ``gateway/startup_progress.py`` at the PID claim, so during a cold start the
+    operator sees WHERE the minutes are going instead of only "not running yet".
+    """
+    if not isinstance(startup, dict):
+        return None
+    phase = startup.get("phase")
+    if not phase or phase == "ready":
+        return None  # ready is the ordinary running state; nothing to warn about
+    ready_by = _epoch_seconds(startup.get("ready_by"))
+    dead_by = (datetime.fromtimestamp(ready_by, UTC).strftime("%H:%M:%SZ")
+               if ready_by is not None else "an unstated time")
+    phase_started = _epoch_seconds(startup.get("phase_started_at"))
+    elapsed_text = ""
+    if phase_started is not None:
+        elapsed = max(0, int(datetime.now(UTC).timestamp() - phase_started))
+        elapsed_text = f", {elapsed} s in this phase"
+    renewals = startup.get("renewals") or 0
+    renewed_text = f", renewed {renewals}x" if renewals else ""
+    return (
+        f"⏳ Gateway starting: phase {phase} (pid {startup.get('pid')}{elapsed_text}; "
+        f"ready by {dead_by}{renewed_text})"
+    )
+
+
 def _runtime_health_lines() -> list[str]:
     """Summarize the latest persisted gateway runtime health state."""
     try:
@@ -4631,6 +4666,11 @@ def _runtime_health_lines() -> list[str]:
                 f"⚠ Gateway heartbeat stale: housekeeping has not refreshed gateway_state.json for {age} s "
                 f"(event loop or housekeeping wedged; pid {state.get('pid')} alive) — restart the gateway"
             )
+
+    if gateway_state == "starting":
+        startup_line = _startup_phase_line(state.get("startup"))
+        if startup_line:
+            lines.append(startup_line)
 
     if gateway_state == "startup_failed" and exit_reason:
         lines.append(f"⚠ Last startup issue: {exit_reason}")
