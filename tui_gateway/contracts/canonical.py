@@ -136,6 +136,70 @@ canonical_method("session.prune", params=SessionPruneParams, result=SessionPrune
                      "selected, skipping busy sessions and retained reset owners.")
 
 
+class StoreGeometry(Result):
+    """``SessionDB.store_geometry()``: the store's shape over the owner's live connection. The four
+    byte quantities are kept SEPARATE on purpose — ``prunable_bytes`` is what a reclaim gives back
+    now, ``slack_bytes`` is neither live nor on the freelist (and may be negative while the WAL
+    holds un-checkpointed pages)."""
+
+    page_count: int | None = None
+    page_size: int | None = None
+    freelist_count: int | None = None
+    auto_vacuum: int | None = None
+    live_bytes: int | None = None
+    file_bytes: int | None = None
+    slack_bytes: int | None = None
+    prunable_bytes: int | None = None
+
+
+class SessionMaintenanceParams(Params):
+    """No filters: one retention window, one reclaim switch, and a dry run that writes nothing.
+    ``retention_days`` / ``vacuum`` default to the profile's OWN ``sessions`` config at call time
+    (never a hard-coded 90); ``dry_run`` reports what the pass would select."""
+
+    retention_days: int | None = None
+    vacuum: bool | None = None
+    dry_run: bool | None = None
+
+
+class SessionMaintenanceResult(Result):
+    """The store's own maintenance receipt (``maybe_auto_prune_and_vacuum`` + the
+    ``state_meta['last_state_db_maintenance']`` row it writes) plus ``before`` / ``after``
+    geometry. ``vacuum_skipped_holders`` > 0 means the reclaim was REFUSED by a live holder and
+    ``vacuum_skipped_holder_pids`` names them — distinguishable from a pass that reclaimed 0
+    bytes because it stopped at the freelist-ratio gate (``reclaim_stopped``)."""
+
+    dry_run: bool | None = None
+    skipped: bool | None = None
+    retention_days: int | None = None
+    vacuum: bool | None = None
+    pruned: int | None = None
+    pruned_archived_messages: int | None = None
+    closed: int | None = None
+    reaped_orphan_messages: int | None = None
+    fts_indexes_optimized: int | None = None
+    vacuumed: bool | None = None
+    reclaim_mode: str | None = None
+    reclaim_stopped: str | None = None
+    reclaimed_bytes: int | None = None
+    reclaimed_pages: int | None = None
+    max_lock_hold_ms: float | None = None
+    freelist_ratio: float | None = None
+    vacuum_skipped_holders: int | None = None
+    vacuum_skipped_holder_pids: list[str] | None = None
+    prune_candidates: int | None = None
+    error: str | None = None
+    before: StoreGeometry | None = None
+    after: StoreGeometry | None = None
+
+
+canonical_method("session.maintenance", params=SessionMaintenanceParams, result=SessionMaintenanceResult,
+                 doc="Local operator only: the owner runs ONE state.db maintenance pass (prune + archived-row "
+                     "retention + stale-open close + orphan reap + FTS merge + bounded reclaim) on its own "
+                     "live store; a reclaim refused by a live holder comes back as data, never as a silent "
+                     "green pass.")
+
+
 class CommandObserveParams(Params):
     session_id: str
     name: str

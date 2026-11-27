@@ -12,6 +12,10 @@ from __future__ import annotations
 #: write, so a short client budget would only misreport a prune that still commits.
 PRUNE_RPC_TIMEOUT = 600
 
+#: The maintenance pass may migrate a store (ONE whole-file rewrite, minutes on a multi-GB file);
+#: the owner shields it in a worker thread, so the client waits well past a default socket budget.
+MAINTENANCE_RPC_TIMEOUT = 1800
+
 
 def live_owner():
     """The ready gateway endpoint serving this home, else None. Discovery only: never starts one."""
@@ -32,7 +36,30 @@ def owner_prune(endpoint, **params) -> dict:
     return asyncio.run(_run())
 
 
+def owner_maintain(endpoint, **params) -> dict:
+    """Run one ``session.maintenance`` on *endpoint*; raises ``GatewayClientError`` on refusal/loss.
+
+    A first pass on a store still at ``auto_vacuum = NONE`` is ONE whole-file rewrite of a
+    multi-GB file: minutes of pure I/O the owner shields, so a short client budget would only
+    misreport a pass that is still running.
+    """
+    import asyncio
+    from hermes_cli.gateway_client import connect_gateway
+
+    async def _run():
+        async with connect_gateway(endpoint) as client:
+            return await client.rpc("session.maintenance", _timeout=MAINTENANCE_RPC_TIMEOUT, **params)
+    return asyncio.run(_run())
+
+
 def report_owner_failure(exc) -> int:
     print(f"Error: the gateway did not complete the prune ({exc}). Run `hermes sessions prune --dry-run` "
           "with the same filters to see what is left.")
+    return 1
+
+
+def report_maintenance_failure(exc) -> int:
+    print(f"Error: the gateway did not complete the maintenance pass ({exc}). Run "
+          "`hermes sessions maintain --dry-run` to see what it would do; the pass is idempotent, so "
+          "re-running it is safe.")
     return 1
