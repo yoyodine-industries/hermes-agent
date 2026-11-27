@@ -257,9 +257,10 @@ def capture_transition_locked(conn, room_id):
         capture_locked(conn, room_id=room_id, local_gateway_id=owner[0])
     except InvalidStoredWorkRecord:
         logging.getLogger(__name__).warning("Hosted work evidence invalid for room %s", room_id)
-    except (WorkRecordError, sqlite3.Error):
+    except (WorkRecordError, sqlite3.Error) as exc:
         conn.execute("ROLLBACK TO work_transition_capture")
-        logging.getLogger(__name__).warning("Hosted work evidence unavailable for room %s", room_id, exc_info=True)
+        logging.getLogger(__name__).warning(
+            "Hosted work evidence unavailable for room %s: %s", room_id, exc, exc_info=True)
     finally:
         conn.execute("RELEASE work_transition_capture")
 
