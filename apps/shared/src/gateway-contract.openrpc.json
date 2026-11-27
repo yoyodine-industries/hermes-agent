@@ -39845,6 +39845,323 @@
         "title": "SessionLiveInfo",
         "type": "object"
       },
+      "SessionMaintenanceParams": {
+        "additionalProperties": false,
+        "description": "No filters: one retention window, one reclaim switch, and a dry run that writes nothing.\n``retention_days`` / ``vacuum`` default to the profile's OWN ``sessions`` config at call time\n(never a hard-coded 90); ``dry_run`` reports what the pass would select.",
+        "properties": {
+          "retention_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Retention Days"
+          },
+          "vacuum": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vacuum"
+          },
+          "dry_run": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Dry Run"
+          }
+        },
+        "title": "SessionMaintenanceParams",
+        "type": "object"
+      },
+      "SessionMaintenanceResult": {
+        "additionalProperties": false,
+        "description": "The store's own maintenance receipt (``maybe_auto_prune_and_vacuum`` + the\n``state_meta['last_state_db_maintenance']`` row it writes) plus ``before`` / ``after``\ngeometry. ``vacuum_skipped_holders`` > 0 means the reclaim was REFUSED by a live holder and\n``vacuum_skipped_holder_pids`` names them \u2014 distinguishable from a pass that reclaimed 0\nbytes because it stopped at the freelist-ratio gate (``reclaim_stopped``).",
+        "properties": {
+          "dry_run": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Dry Run"
+          },
+          "skipped": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Skipped"
+          },
+          "retention_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Retention Days"
+          },
+          "vacuum": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vacuum"
+          },
+          "pruned": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Pruned"
+          },
+          "pruned_archived_messages": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Pruned Archived Messages"
+          },
+          "closed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Closed"
+          },
+          "reaped_orphan_messages": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reaped Orphan Messages"
+          },
+          "fts_indexes_optimized": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Fts Indexes Optimized"
+          },
+          "vacuumed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vacuumed"
+          },
+          "reclaim_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reclaim Mode"
+          },
+          "reclaim_stopped": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reclaim Stopped"
+          },
+          "reclaimed_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reclaimed Bytes"
+          },
+          "reclaimed_pages": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reclaimed Pages"
+          },
+          "max_lock_hold_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Lock Hold Ms"
+          },
+          "freelist_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Freelist Ratio"
+          },
+          "vacuum_skipped_holders": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vacuum Skipped Holders"
+          },
+          "vacuum_skipped_holder_pids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vacuum Skipped Holder Pids"
+          },
+          "prune_candidates": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Prune Candidates"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "before": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StoreGeometry"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "after": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StoreGeometry"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "title": "SessionMaintenanceResult",
+        "type": "object"
+      },
       "SessionMostRecentParams": {
         "additionalProperties": false,
         "properties": {
@@ -44123,6 +44440,110 @@
         ],
         "title": "SteerStatus",
         "type": "string"
+      },
+      "StoreGeometry": {
+        "additionalProperties": false,
+        "description": "``SessionDB.store_geometry()``: the store's shape over the owner's live connection. The four\nbyte quantities are kept SEPARATE on purpose \u2014 ``prunable_bytes`` is what a reclaim gives back\nnow, ``slack_bytes`` is neither live nor on the freelist (and may be negative while the WAL\nholds un-checkpointed pages).",
+        "properties": {
+          "page_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Count"
+          },
+          "page_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Size"
+          },
+          "freelist_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Freelist Count"
+          },
+          "auto_vacuum": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Auto Vacuum"
+          },
+          "live_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Live Bytes"
+          },
+          "file_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File Bytes"
+          },
+          "slack_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Slack Bytes"
+          },
+          "prunable_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Prunable Bytes"
+          }
+        },
+        "title": "StoreGeometry",
+        "type": "object"
       },
       "StoredTranscriptParams": {
         "additionalProperties": false,
@@ -51031,6 +51452,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CanonicalListResult"
+        }
+      }
+    },
+    {
+      "name": "session.maintenance",
+      "summary": "Local operator only: the owner runs ONE state.db maintenance pass (prune + archived-row retention + stale-open close + orphan reap + FTS merge + bounded reclaim) on its own live store; a reclaim refused by a live holder comes back as data, never as a silent green pass.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionMaintenanceParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionMaintenanceResult"
         }
       }
     },

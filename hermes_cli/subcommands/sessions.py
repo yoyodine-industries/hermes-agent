@@ -201,6 +201,24 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     _flag(sessions_optimize_storage, "--force",
         help="Run even while another Hermes process (gateway, Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped; the rebuild then paces itself so that process stays responsive (much slower)")
 
+    sessions_maintain = sessions_subparsers.add_parser(
+        "maintain",
+        help="Run one state.db maintenance pass (prune, retention, FTS merge, bounded reclaim)",
+        description="Run ONE state.db maintenance pass: the retention prune, archived-message "
+            "retention, stale-open close, orphan-message reap, the FTS index merge and the bounded "
+            "space reclaim — the same pass the gateway's housekeeping tick runs, with the same "
+            "settings from this profile's own `sessions` config. While a gateway serves this home "
+            "the OWNER applies it in-process (`session.maintenance`), so nothing is restarted and "
+            "no second writer ever touches the store; with no gateway the pass runs here, refusing "
+            "while another process holds the store (there is no --force). Idempotent: a pass that "
+            "is throttled or has nothing to free says so, and a reclaim refused by a live holder "
+            "names the holder instead of rewriting the file. Use -p/--profile to target another "
+            "profile.")
+    _flag(sessions_maintain, "--dry-run", default=False,
+        help="Report what the pass would select and reclaim, and write nothing")
+    _flag(sessions_maintain, "--json", default=False,
+        help="Print the maintenance receipt as JSON (the store's own counters plus before/after geometry)")
+
     sessions_repair = sessions_subparsers.add_parser(
         "repair", help="Repair a malformed state.db schema so hidden sessions reappear",
         description="Recover a state.db whose schema is malformed (e.g. 'table "

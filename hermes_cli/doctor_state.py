@@ -717,3 +717,100 @@ def _check_profiles(should_fix: bool, f: Finding) -> None:
     for line in duplicate_credential_findings():
         check_warn("Duplicate platform credential across profiles", f"({line})")
         f.manual_issues.append(line)
+
+
+#: A store whose last recorded maintenance pass is older than this is reported by doctor: past a
+#: week with no pass, nothing at all is bounding the store's growth (card t_bf94858f).
+STATE_DB_MAINTENANCE_OVERDUE_DAYS = 7.0
+
+
+def _profile_maintenance_record(home: Path) -> tuple[bool, dict | None]:
+    """``(readable, record)`` for one profile's ``state_meta['last_state_db_maintenance']``.
+
+    Read through a ``mode=ro`` tracked connection: doctor is a reader, and a writable open of a
+    gateway-held WAL store is the second-writer class (#103339). ``readable=False`` means the
+    question was not answered — never conflate it with "no record".
+    """
+    db_path = home / "state.db"
+    if not db_path.exists():
+        return False, None
+    try:
+        import json as _json
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        conn = connect_tracked(read_only_db_uri(db_path), uri=True, tracking_path=db_path)
+        try:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key='last_state_db_maintenance'").fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return False, None
+    if not row or not row[0]:
+        return True, None
+    try:
+        record = _json.loads(row[0])
+    except ValueError:
+        record = {}
+    return True, (record if isinstance(record, dict) else {})
+
+
+def _profile_sessions_gates(home: Path) -> tuple[bool, bool]:
+    """``(auto_prune, auto_archive)`` from THIS profile's OWN config.yaml (absent = False)."""
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        sessions = load_user_config_effective(home / "config.yaml").get("sessions")
+        sessions = sessions if isinstance(sessions, dict) else {}
+        return bool(sessions.get("auto_prune", False)), bool(sessions.get("auto_archive", False))
+    except Exception:
+        return False, False
+
+
+@doctor_check("")  # best-effort: profile enumeration must never break doctor
+def _check_state_db_maintenance(should_fix: bool, f: Finding) -> None:
+    """Every served profile: is the maintenance RECORD recent, and can its OWN config run a pass?
+
+    Two ways a store silently stops being maintained, and they look identical from the file: no
+    pass has ever been recorded (or the last one is past a week), and the profile's own ``sessions``
+    config has both ``auto_prune`` and ``auto_archive`` false — the launch home's block is NOT
+    inherited, so a secondary with neither key never runs the tick at all. Each row names the
+    config key to set and the owner verb that applies a pass now.
+    """
+    import time as _time
+    from hermes_cli.profiles import list_profiles
+
+    rows: list[tuple[str, Path, str]] = []
+    for profile in list_profiles():
+        home = Path(profile.path)
+        if not (home / "state.db").exists():
+            continue
+        name = profile.name
+        readable, record = _profile_maintenance_record(home)
+        auto_prune, auto_archive = _profile_sessions_gates(home)
+        reasons: list[str] = []
+        if not readable:
+            reasons.append("its maintenance record could not be read")
+        elif record is None:
+            reasons.append("no maintenance pass has ever been recorded")
+        else:
+            try:
+                age_days = (_time.time() - float(record.get("at") or 0)) / 86400.0
+            except (TypeError, ValueError):
+                age_days = None
+            if age_days is None:
+                reasons.append("its maintenance record has no usable timestamp")
+            elif age_days > STATE_DB_MAINTENANCE_OVERDUE_DAYS:
+                when = record.get("at_iso") or f"{age_days:.1f} days ago"
+                reasons.append(f"last pass was {when} ({age_days:.1f} days ago)")
+        if not (auto_prune or auto_archive):
+            reasons.append("sessions.auto_prune and sessions.auto_archive are both false in its own config")
+        if reasons:
+            rows.append((name, home, "; ".join(reasons)))
+    if not rows:
+        check_ok("state.db maintenance: every served profile has a recent pass and its tick enabled")
+        return
+    _section("state.db Maintenance")
+    for name, home, reason in rows:
+        hint = (f"set `sessions.auto_prune: true` (with `sessions.retention_days`) in "
+                f"{home / 'config.yaml'}, or run `hermes sessions maintain -p {name}`")
+        check_warn(f"{name}: {reason}", f"({hint})")
+        f.manual_issues.append(f"state.db maintenance is not running for profile '{name}' ({reason}) — {hint}")
