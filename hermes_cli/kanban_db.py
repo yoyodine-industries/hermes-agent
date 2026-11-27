@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli import kanban_close_proof as _close_proof
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
 
@@ -5435,6 +5436,16 @@ COMPLETION_REFUSAL_CAUSES = (
     # ``todo``/``scheduled`` are the seat-scoped door's remit, and the terminal pair belongs to
     # ``hermes kanban reopen``. Distinct from ``not_running``, which is a run that moved.
     "status_not_completable",      # the card never held a completable status
+    # RETIREMENT IS NOT A COMPLETION (ruling ESC-36b70d83894494d2, card t_1da139e3). A handoff
+    # in the retire vocabulary that names another card is a retirement claim: it belongs on
+    # ``archive --reason ...``, which the board excludes from done counts. Completing it instead
+    # counts work nobody did (t_fd2c802f: 0s, "SUPERSEDED by t_b3efee10", zero rows written).
+    "retire_is_not_a_completion",  # summary/result says superseded/duplicate + names a card
+    "supersede_ack_refused",       # --supersede-ack named a destination the archive door refused
+    # THE DECLARED CLOSE PROOF (ruling §5): a card that carries a ``proof:`` line is judged by
+    # EXECUTING it, and a card that declares ``proof_required`` cannot close without one.
+    "proof_failed",                # the declared proof ran and its answer is negative
+    "proof_missing",               # proof_required is declared and no proof line exists
 )
 
 
@@ -5908,13 +5919,169 @@ def _not_completable_refusal(conn: sqlite3.Connection, task_id: str) -> Completi
     )
 
 
+@dataclass
+class Retirement:
+    """A close that is NOT a completion: the card was archived, and nothing was counted as work.
+
+    ``complete_task`` returns this instead of ``True`` so the RECEIPT stops saying
+    "Completed" one layer below the status. Ruling ESC-36b70d83894494d2: "a row that
+    renders as superseded but emits a DONE event leaves the same false green one layer
+    down". Truthy, so every ``if not complete_task(...)`` caller keeps its meaning.
+    """
+
+    task_id: str
+    reason: str
+    destination: Any = None
+
+    def __bool__(self) -> bool:                       # noqa: D105 - truthiness is the contract
+        return True
+
+    def receipt(self) -> str:
+        where = f"; the work is carried by {self.destination}" if self.destination else ""
+        return (f"Retired {self.task_id} — archived as '{self.reason}'{where}; "
+                f"NOT counted as done")
+
+
+def _retire_not_complete(
+    conn: sqlite3.Connection, task_id: str, claim: dict[str, str], *,
+    supersede_ack: Any = None, actor: str = "",
+) -> bool | CompletionRefusal | Retirement:
+    """Answer a RETIREMENT claim with the retirement door, never with ``done``.
+
+    Two outcomes, both explicit:
+
+    * no ``supersede_ack`` — refuse with ``retire_is_not_a_completion`` and name the exact
+      command (and the one-call form), so the refusal can never be a dead end;
+    * ``supersede_ack=<board>/<card>`` — perform the archive in THIS call, with the destination
+      the claim points at. The archive door then enforces that the destination is live
+      (``destination_closed``/``destination_archived``) and writes the rehome key BEFORE the
+      source flips, which is the record the completion door never wrote.
+    """
+    board = _archive_source_board(conn)
+    reason = "duplicate" if claim["phrase"] == "duplicate of" else "superseded"
+    remedy = (
+        f"hermes kanban archive {task_id} --reason {reason} "
+        f"--destination {board}/<card> --actor <seat>"
+        f"   (or re-run this close with --supersede-ack {board}/<card>)"
+    )
+    if supersede_ack:
+        try:
+            # ``archive_task`` normalises the destination itself (string or mapping) and enforces
+            # that it is open; passing the raw form here keeps ONE reader of the spelling.
+            # A worker retiring its OWN card must not be signalled: ``archive_task`` kills the
+            # recorded worker pid after commit, and here that pid is the caller's.
+            row = conn.execute(
+                "SELECT status, worker_pid FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            self_owned = bool(
+                row and row["status"] == "running"
+                and int(row["worker_pid"] or 0) == os.getpid()
+            )
+            archived = archive_task(
+                conn, task_id, reason=reason, actor=actor, destination=supersede_ack,
+                terminate_worker=not self_owned,
+            )
+        except ArchiveRefused as exc:
+            return CompletionRefusal(
+                "supersede_ack_refused",
+                f"{exc}. Nothing changed; the claim names {claim['card']}, so point the "
+                f"archive at a card that can still carry the work.",
+            )
+        if not archived:
+            return CompletionRefusal(
+                "not_running",
+                f"{task_id} is unknown or already archived; this retirement changed nothing",
+            )
+        return Retirement(task_id, reason, supersede_ack)
+    with write_txn(conn):
+        _append_event(conn, task_id, "completion_blocked_retire", {
+            "phrase": claim["phrase"],
+            "cited_card": claim["card"],
+            "reason": reason,
+            "remedy": remedy,
+        })
+    return CompletionRefusal(
+        "retire_is_not_a_completion",
+        f"{task_id}'s handoff says {claim['phrase']!r} and names {claim['card']}: that is a "
+        f"RETIREMENT, not a completion, and a completion would count work nobody did. "
+        f"Nothing changed. Retire it with: {remedy}",
+    )
+
+
+def _gate_close_proof(
+    conn: sqlite3.Connection, task_id: str, metadata: Optional[dict], *, force: bool,
+) -> tuple[Optional[CompletionRefusal], Optional[dict]]:
+    """Execute the card's declared proof; returns ``(refusal, record)``.
+
+    *record* is what the close stores on the run row: ``{"verified": bool, ...}``. A close with
+    NO declaration and no requirement writes nothing (``(None, None)``): ``unproven`` is the
+    absence of a proof record, so the counts can tell "nobody checked" from "checks passed"
+    without putting a marker on every run row — silence in a FIELD is readable, the silence
+    this defect was about was a missing CHECK.
+
+    ``force`` is the operator path and waives a MISSING declaration (``proof_missing``), never
+    a FAILED one: a declaration that ran and answered negatively is a fact about the artifact,
+    and an operator override does not change the artifact.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None, None
+    spec = _close_proof.parse_proof(task.body)
+    required = _close_proof.proof_required(task.body, metadata)
+    if spec is None:
+        if required and not force:
+            detail = (
+                f"{task_id} declares proof_required but carries no `proof:` line, so a close "
+                f"would assert an artifact nobody checked. Add ONE line to the body "
+                f"(`proof: cmd=<command>` or `proof: path=<file-or-glob>`) with "
+                f"`hermes kanban edit --body`, then retry."
+            )
+            with write_txn(conn):
+                _append_event(conn, task_id, "completion_blocked_proof", {
+                    "cause": "proof_missing", "required": True, "declared": None,
+                })
+            return CompletionRefusal("proof_missing", detail), None
+        record: dict[str, Any] = {
+            "kind": None, "verified": False, "reason": "no proof declared",
+        }
+        if required and force:
+            # The operator may overrule a DECLARATION GAP; say so on the run row instead of
+            # letting it read as an ordinary unproven close.
+            record["waived"] = "proof_required waived by operator force"
+            return None, record
+        # An ordinary close writes NO proof key: ``unproven`` is derived from the absence, and a
+        # run row that no clause touched keeps its shape (the review-approval synthesis and every
+        # downstream reader depend on ``metadata`` meaning "what the closer handed over").
+        return None, None
+    record = _close_proof.run_proof(spec, base_dir=getattr(task, "workspace_path", None))
+    if not record.get("verified"):
+        detail = (
+            f"{task_id}'s declared proof did not hold: {record.get('declared')} -> "
+            f"{record.get('reason')}. Nothing changed; make the artifact true (or correct the "
+            f"`proof:` line with `hermes kanban edit --body`) and retry."
+        )
+        with write_txn(conn):
+            _append_event(conn, task_id, "completion_blocked_proof", {
+                "cause": "proof_failed",
+                "declared": record.get("declared"),
+                "rc": record.get("rc"),
+                "expect": record.get("expect"),
+                "match_count": record.get("match_count"),
+                "output_tail": record.get("output_tail"),
+                "reason": record.get("reason"),
+            })
+        return CompletionRefusal("proof_failed", detail), None
+    return None, record
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
     deferred_children: Optional[Mapping[str, Any]] = None,
-) -> bool | CompletionRefusal:
+    supersede_ack: Any = None, actor: str = "",
+) -> bool | CompletionRefusal | Retirement:
     """``running|ready|blocked|review -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
@@ -5941,6 +6108,18 @@ def complete_task(
     # ``if not complete_task(...)`` caller keeps its meaning.
     if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
         return CompletionRefusal("unknown_id", f"no task {task_id} on this board")
+    # RETIREMENT IS NOT A COMPLETION (ruling ESC-36b70d83894494d2 §3, card t_1da139e3). The
+    # board's terminal NON-done state already exists (``archived``, reached through
+    # ``archive_task``); what was missing is that ``complete`` silently accepted the same words.
+    # ``t_fd2c802f`` closed in 0s with "SUPERSEDED by t_b3efee10", wrote nothing, and the done
+    # count took it. So the handoff vocabulary is judged HERE, before any gate that costs a forge
+    # read or a proof run: a claim to be superseded is answered by the retirement door, and the
+    # refusal is not a dead end (``supersede_ack`` performs the archive in this same call).
+    retire_claim = _close_proof.find_retire_claim(result, summary)
+    if retire_claim is not None:
+        return _retire_not_complete(
+            conn, task_id, retire_claim, supersede_ack=supersede_ack, actor=actor,
+        )
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return CompletionRefusal(
@@ -5972,6 +6151,28 @@ def complete_task(
     # acceptance WITHOUT this call is a silent free pass — strictly worse than today's
     # unclosable card — so the two halves ship as one unit.
     _gate_deploy_proof(conn, task_id, metadata)
+    # THE DECLARED CLOSE PROOF (ruling ESC-36b70d83894494d2 §5). The card may carry ONE line —
+    # ``proof: cmd=...`` or ``proof: path=...`` — which is EXECUTED here, outside the write txn,
+    # and judged on rc/existence alone. Placed after the ``landed`` deploy-proof gate (that
+    # contract owns its own ``metadata.proof`` block, so the two never judge one claim twice) and
+    # before every gate that spends a forge read or writes a receipt. A card that declares
+    # nothing closes normally and is COUNTED unproven (the split derives it from the absent
+    # record); the count can then say proven vs unproven instead of assuming, which is the
+    # assumption that hid this whole defect.
+    proof_refusal, proof_record = _gate_close_proof(conn, task_id, metadata, force=force)
+    if isinstance(proof_refusal, CompletionRefusal):
+        return proof_refusal
+    if proof_record is not None:
+        # ``close_proof`` and NOT ``proof``: ``metadata.proof`` is the ``landed`` contract's own
+        # vocabulary (the deploy-proof gate refuses it on any other card), so the close proof is
+        # a separate, additive record that cannot be confused with a landed claim.
+        metadata = {**(metadata if isinstance(metadata, dict) else {}),
+                    "close_proof": proof_record}
+        if proof_record.get("kind"):
+            # Echo the DECLARED proof only: an unproven close is marked on the run row, not
+            # dressed up in the result as though something had been checked.
+            echo = _close_proof.echo_line(proof_record)
+            result = f"{result}\n\n{echo}" if result else echo
     # INVARIANT A at the transition (design record platform-stl t_43be623a, ruling ESC-01650 /
     # platform/t_88cbc437 -> t_52183ba9): a completion must DECLARE the evidence behind it. The
     # seam sat here in the home of record and was dropped when this file became a tracked member
@@ -6144,9 +6345,18 @@ def complete_task(
         # Never-claimed task: synthesize a run so the handoff fields survive.
         if run_id is None and (summary or metadata or result or prior_status == "review"):
             synth_summary, synth_metadata = handoff_summary, metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
+            # A close proof record is EVIDENCE, not a handoff: an approval that carries only
+            # ``close_proof`` is still "approved without additional evidence", and the note must
+            # survive beside the record (the proof clause runs before this synth branch).
+            _only_proof = (isinstance(synth_metadata, dict) and bool(synth_metadata)
+                           and set(synth_metadata) <= {"close_proof"})
+            if prior_status == "review" and not synth_summary and (
+                    not synth_metadata or _only_proof):
                 synth_summary = _REVIEW_APPROVED_NOTE
-                synth_metadata = {"source_status": "review", "approval": "manual"}
+                synth_metadata = {
+                    **(synth_metadata or {}),
+                    "source_status": "review", "approval": "manual",
+                }
             # No run was open when this completion landed. Either the card was never claimed, or an
             # infrastructure reclaim closed the run and NULLed ``current_run_id`` — the un-owned
             # branch admits. In the second case the run this lands on must SAY it is the recovery:
@@ -8240,6 +8450,17 @@ def _write_rehome_link(conn: sqlite3.Connection, dest: tuple[str, str], key: str
                     f"destination {dest_board}/{dest_card} is itself archived; "
                     f"a link to it inherits nothing — pick a live destination",
                     card=source_card)
+            if row["status"] == "done":
+                # A destination that has already CLOSED inherits nothing: the work this card
+                # points at is over, so the retirement would land on a card nobody can still
+                # act on. This is the "closed by citing another card's existence" defect in
+                # its second form (ruling ESC-36b70d83894494d2 §4, card t_1da139e3): a duplicate
+                # retired onto a done card reads as a handoff while leaving the work nowhere.
+                raise ArchiveRefused(
+                    "destination_closed",
+                    f"destination {dest_board}/{dest_card} is already done; a retirement must "
+                    f"point at a card that can still carry the work — pick the OPEN successor",
+                    card=source_card)
             held = (row["idempotency_key"] or "").strip()
             if held and held != key:
                 raise ArchiveRefused(
@@ -8310,6 +8531,7 @@ def _archive_flip(conn: sqlite3.Connection, task_id: str, receipt: dict) -> Opti
 def archive_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     actor: str = "", destination: Any = None, signal_fn=None,
+    terminate_worker: bool = True,
 ) -> bool:
     """Archive a task, RECORDING why, and writing a rehome link BEFORE the flip.
 
@@ -8342,6 +8564,12 @@ def archive_task(
       core cannot read the item store, but it can read the card, and this
       fail-closed proxy covers 133 of the 163 cohort cards. ``reason="operator"``
       is the single override.
+
+    ``terminate_worker=False`` keeps the post-commit kill off. The one caller that
+    passes it is a worker retiring its OWN card through ``complete --supersede-ack``:
+    the recorded pid is then the caller's own, and the run is already closed as
+    ``reclaimed`` by :func:`_archive_flip`, so signalling would kill the process
+    that is executing the retirement.
 
     Returns ``True`` when THIS call archived the card, ``False`` when the card is
     unknown or was already archived; every refusal raises :class:`ArchiveRefused`
@@ -8384,7 +8612,7 @@ def archive_task(
     flipped = _archive_flip(conn, task_id, receipt)
     if flipped is None:
         return False
-    if flipped["was_running"]:
+    if flipped["was_running"] and terminate_worker:
         termination = _terminate_reclaimed_worker(
             flipped["prev_pid"], flipped["prev_lock"], signal_fn=signal_fn,
             started_at=flipped["prev_started"])
@@ -8638,6 +8866,39 @@ def zero_run_ready(
     }
 
 
+def _proof_split(conn: sqlite3.Connection) -> dict[str, int]:
+    """``done`` / ``proven`` / ``unproven`` / ``retired`` — the four numbers that must travel together.
+
+    Ruling ESC-36b70d83894494d2 §6 (card t_1da139e3): a completion metric that
+    reports ``done`` alone is the metric that hid a board counting a 0s
+    "SUPERSEDED by …" close as work performed. ``proven`` reads the ``proof``
+    record :func:`complete_task` writes on the closing run; a done card that
+    carries no such record is UNPROVEN — never presumed proven, and never
+    silently folded into a percentage.
+    """
+    row = conn.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM tasks WHERE status = 'done') AS done,
+          (SELECT COUNT(*) FROM tasks WHERE status = 'archived') AS retired,
+          (SELECT COUNT(*) FROM tasks t
+             JOIN task_runs r ON r.id = (
+                   SELECT MAX(id) FROM task_runs WHERE task_id = t.id)
+            WHERE t.status = 'done'
+              AND r.metadata LIKE '%"close_proof"%'
+              AND r.metadata LIKE '%"verified": true%') AS proven
+        """
+    ).fetchone()
+    done = int(row["done"] or 0)
+    proven = int(row["proven"] or 0)
+    return {
+        "done": done,
+        "proven": proven,
+        "unproven": max(0, done - proven),
+        "retired": int(row["retired"] or 0),
+    }
+
+
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, the oldest ``ready`` age, and the
     stuck-ready probe (see :func:`zero_run_ready`) — the board-health surface
@@ -8665,6 +8926,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
         "zero_run_ready": zero_run_ready(conn, now=now),
+        "proof_split": _proof_split(conn),
         "now": now,
     }
 
