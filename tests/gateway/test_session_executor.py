@@ -249,8 +249,31 @@ def test_async_session_store_offloads_to_the_dedicated_named_threads():
     assert threads and threads[0].startswith('hermes-session-store'), threads
 
 
+def test_mirror_off_routing_save_through_the_pool_writes_no_mirror(tmp_path, caplog):
+    """Ruling item (b): with `gateway.write_sessions_json: false` the save still commits to state.db
+    and never pays the mirror rewrite (measured 277 ms/session creation: 274.8 ms dumps + 1.9 ms
+    fsync). The mirror is derived data; state.db is the only primary.
+    """
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import AsyncSessionStore, SessionSource, SessionStore
+
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig(write_sessions_json=False))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='chat-1', chat_name='Alice',
+                           chat_type='dm', user_id='user-1')
+    try:
+        with caplog.at_level('INFO', logger='gateway.session'):
+            async def scenario():
+                return await AsyncSessionStore(store).get_or_create_session(source)
+
+            entry = asyncio.run(scenario())
+        assert entry is not None and entry.session_id
+        assert not (tmp_path / 'sessions.json').exists()
+        assert not [r for r in caplog.records if 'sessions.json mirror: wrote' in r.getMessage()]
+    finally:
+        store._db.close()
+
+
 def test_mode_default_restores_the_pre_change_executor(monkeypatch):
-    """The rollback is one config/env flip at the single call site, not a code change."""
     monkeypatch.setenv('HERMES_SESSION_STORE_EXECUTOR', 'default')
     reset_for_tests()
     seen = []
