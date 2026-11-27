@@ -597,6 +597,11 @@ def _live_intent_file(dm_file: str | os.PathLike) -> str:
     return f"{os.fspath(dm_file)}.live.json"
 
 
+def _target_label(home: Path | str | None) -> str:
+    """``@lane`` for a resolved target home, or "" when the caller never resolved one."""
+    return f"@{Path(home).name}" if home else ""
+
+
 def _dm_delivery_id(dm_file: str | os.PathLike) -> str:
     """One delivery id per DM file: the dispatch ack, the live-owner intent and every retry
     of the runner derive it the same way, so the sender can correlate all of them."""
@@ -607,10 +612,17 @@ class LiveTargetUnavailableError(RuntimeError):
     """The canonical Bot Chat owner could not be reached with anything admitted — before the
     intent was pinned, or on a dial that died before the deliver RPC went out: nothing was
     sent, so this is a definite no-send the sender may retry, not the ambiguous
-    post-admission state."""
+    post-admission state.
+
+    ``stage``/``target``/``fields`` are filled by :func:`_unavailable_from` so every receipt that
+    quotes this refusal can say WHICH stage died for WHICH lane (card t_e44932e2).
+    """
 
     reason = "runtime_unavailable"
     resend = "once the target is up"
+    stage: str = ""
+    target: str = ""
+    fields: dict[str, Any] | None = None
 
 
 class LiveTargetHeldError(LiveTargetUnavailableError):
@@ -660,9 +672,27 @@ def _describe(exc: object) -> str:
     return text or f"{type(exc).__name__} with no message"
 
 
-def _unavailable_payload(dm_file: str, exc: LiveTargetUnavailableError) -> str:
+def _unavailable_from(stage: str, cause: BaseException, headline: str) -> LiveTargetUnavailableError:
+    """A definite no-send tagged with the stage it died at, so every receipt can name it."""
+    fields = _refusal_fields(cause, target="")
+    named = str(fields.get("stage") or stage) if fields.get("reason_code") else stage
+    error = LiveTargetUnavailableError(
+        f"{headline} (stage={named} target={fields.get('target') or 'unknown'}: "
+        f"{_describe(cause)})")
+    error.stage = named
+    error.target = str(fields.get("target") or "")
+    error.fields = fields
+    return error
+
+
+def _unavailable_payload(dm_file: str, exc: LiveTargetUnavailableError, *,
+                         author: Optional[dict] = None, target: str = "") -> str:
+    fields = _refusal_fields(exc, target=target)
+    _record_admission_attempt(dm_file, exc, reason=exc.reason, author=author, target=target)
     payload: dict[str, Any] = {"reason": exc.reason, "delivery_id": _dm_delivery_id(dm_file),
-                               "error": f"{_describe(exc)} - the message was NOT sent; it is safe to resend {exc.resend}."}
+                               **fields,
+                               "error": f"{_describe(exc)} - the message was NOT sent; it is safe "
+                                        f"to resend {exc.resend}."}
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
         # Nothing was reserved, so this refusal is retryable and says when.
@@ -761,8 +791,33 @@ def _tail_rows(path, window):
     return rows
 
 
+def _refusal_fields(exc: BaseException, *, target: str = "") -> dict[str, Any]:
+    """WHICH STAGE and WHICH TARGET refused, read from the cause chain's own verdict.
+
+    A refusal that names neither is unactionable: 69 dial refusals in one day read "profile
+    authority is not ready" and 83 admission refusals read "could not be confirmed: " with no
+    cause attached at all (card t_e44932e2). The structured cause (:class:`AuthorityNotReady`) is
+    the source of truth; every hop of the chain is consulted so a wrapper cannot hide it.
+    """
+    seen: set[int] = set()
+    hop: BaseException | None = exc
+    while hop is not None and id(hop) not in seen:
+        seen.add(id(hop))
+        verdict = getattr(hop, "as_fields", None)
+        if callable(verdict):
+            raw = verdict()
+            if isinstance(raw, dict):
+                data: dict[str, Any] = dict(raw)
+                if target:
+                    data["target"] = target
+                return data
+        hop = hop.__cause__ or hop.__context__
+    return {"stage": getattr(exc, "stage", "") or "admission", "target": target or "unknown",
+            "detail": _describe(exc), "wait": "unknown"}
+
+
 def _record_admission_attempt(dm_file: str, exc: BaseException, *, reason: str,
-                              author: Optional[dict]) -> int:
+                              author: Optional[dict], target: str = "") -> int:
     """Append this refusal to the durable log and return its attempt number for this delivery."""
     delivery_id = _dm_delivery_id(dm_file)
     path = _delivery_attempt_log()
@@ -773,47 +828,141 @@ def _record_admission_attempt(dm_file: str, exc: BaseException, *, reason: str,
             for row in _tail_rows(path, _ATTEMPT_SCAN_WINDOW):
                 if row.get("delivery_id") == delivery_id:
                     attempt += 1
+        fields = _refusal_fields(exc, target=target)
         row = dict(at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                    delivery_id=delivery_id, reason=reason or None,
                    retryable=bool(reason), attempt=attempt,
-                   error=str(exc), author=author)
+                   error=_describe(exc), stage=fields.get("stage"),
+                   target=fields.get("target"), reason_code=fields.get("reason_code"),
+                   wait=fields.get("wait"), detail=fields.get("detail"),
+                   author=author)
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, sort_keys=True) + "\n")
     except OSError as log_exc:  # the ack must still be produced when the log is unwritable
-        _log("delivery_attempt_log_failed", error=str(log_exc), delivery_id=delivery_id)
+        logger.warning("delivery_attempt_log_failed delivery_id=%s: %s", delivery_id, log_exc)
     return attempt
 
 
 def _refused_admission_payload(dm_file: str, exc: BaseException, *,
-                               author: Optional[dict] = None) -> str:
+                               author: Optional[dict] = None, target: str = "") -> str:
     """The ack for an admission whose outcome is unknown.
 
     An admission failure is genuinely ambiguous - the send may or may not have been admitted - so
     the instruction matters more than the status word. "Do not resend" is only true when the reason
     is FINAL; when it is in RETRYABLE_REASONS the honest instruction is to resend under the SAME
     idempotency key, with the attempt counted, and the attempt is written to a durable log.
+
+    The refusal NAMES its stage and target and never prints an empty cause: the string this
+    replaces read "Live delivery admission could not be confirmed: . Do not resend." - 83 of those
+    in one day, unactionable by construction (card t_e44932e2).
     """
     reason = _retryable_reason(exc)
-    attempt = _record_admission_attempt(dm_file, exc, reason=reason, author=author)
+    attempt = _record_admission_attempt(dm_file, exc, reason=reason, author=author, target=target)
+    fields = _refusal_fields(exc, target=target)
+    where = f"stage={fields['stage']} target={fields['target']}"
     payload: dict[str, Any] = dict(status="ambiguous", delivery_id=_dm_delivery_id(dm_file),
-                                   evidence_file=dm_file)
+                                   evidence_file=dm_file, **fields)
     if reason:
         retry_at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                  time.gmtime(time.time() + _RETRYABLE_RETRY_AFTER_SECONDS))
         payload.update(reason=reason, retryable=True, attempt=attempt, retry_at=retry_at)
-        payload["error"] = (f"Live delivery admission could not be confirmed: {exc}. "
-                            f"{reason} is retryable - resend with the SAME idempotency key, "
-                            f"attempt {attempt}, not before {retry_at}.")
+        payload["error"] = (f"Live delivery admission could not be confirmed ({where}): "
+                            f"{_describe(exc)}. {reason} is retryable - resend with the SAME "
+                            f"idempotency key, attempt {attempt}, not before {retry_at}.")
     else:
         payload.update(retryable=False, attempt=attempt)
-        payload["error"] = (f"Live delivery admission could not be confirmed: {exc}. Do not resend.")
+        payload["error"] = (f"Live delivery admission could not be confirmed ({where}): "
+                            f"{_describe(exc)}. Do not resend.")
     return json.dumps(payload)
 
 
-def _settled_no_send(dm_file: str, exc: LiveTargetUnavailableError) -> str:
-    """The answer to a definite no-send, for both the tool and its runner: first the payload and
-    any pinned intent go, so nothing local can rebuild or replay the delivery. A file that is still
-    there is not settlement: the answer is then the unknown outcome, never "safe to resend"."""
+def _park_refused_delivery(dm_file: str, exc: BaseException, *, target_home: Path | str | None,
+                           author: Optional[dict] = None, label: str = "") -> str | None:
+    """Park a DEFINITE no-send in the target's durable queue instead of dropping it.
+
+    Only a DIAL-stage refusal qualifies: the authority was never reached, so nothing can have been
+    admitted and a later delivery cannot duplicate. The record lives in the target's own spool and
+    the gateway's sweep offers it again every ``sweep_seconds`` -- the "retried on a schedule"
+    half of the card that the live path used to skip, leaving the sender holding a message the
+    fleet had already decided not to carry (card t_e44932e2).
+
+    Returns the ack, or None when the refusal is not parkable (already past admission, or the
+    queue refuses the record) so the caller answers with the definite no-send it always did.
+    """
+    fields = _refusal_fields(exc, target="")
+    if fields.get("stage") != "dial" or target_home is None:
+        return None
+    from tools import bot_delivery_queue as delivery_queue
+
+    home = Path(target_home).resolve()
+    target = label or f"@{home.name}"
+    delivery_id = _dm_delivery_id(dm_file)
+    try:
+        message = Path(dm_file).read_text(encoding="utf-8-sig")
+        record = delivery_queue.admit(
+            home,
+            sender_profile=str(getattr(exc, "sender_profile", "") or _sender_profile(author)),
+            target_profile=home.name,
+            target_session_id=None,
+            idempotency_key=f"botdm:{delivery_id}",
+            fingerprint=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            delivery_id=delivery_id,
+            message=message,
+            status_detail="target_authority_not_ready",
+        )
+    except Exception as exc_queue:  # queue_full or an unusable spool: answer as the no-send it is
+        logger.warning("refused_delivery_park_failed delivery_id=%s: %s", delivery_id,
+                       _describe(exc_queue))
+        return None
+    _record_admission_attempt(dm_file, exc, reason=getattr(exc, "reason", "") or "", author=author,
+                              target=target)
+    for path in (_live_intent_file(dm_file), dm_file):
+        _unlink_dm_file(path)
+    payload: dict[str, Any] = dict(fields)
+    payload.update(status="queued", queued=True, delivery_id=delivery_id, target=target,
+                   queue_record=str(delivery_queue.delivery_root(home) / "queue" / f"{delivery_id}.json"),
+                   queue_position=record.get("queue_position"),
+                   retry=("the target's gateway sweep offers queued deliveries every "
+                          f"{delivery_queue.sweep_seconds():.0f}s"),
+                   error=(f"Live Bot Chat admission refused ({'stage=' + str(fields.get('stage'))} "
+                          f"target={target}): {_describe(exc)}. Nothing was admitted; the message "
+                          f"is parked in {target}'s durable delivery queue and will be offered "
+                          f"when that authority is ready. Do not resend."))
+    _log_parked(delivery_id, target, fields.get("reason_code"), record.get("queue_position"))
+    return json.dumps(payload)
+
+
+def _log_parked(delivery_id: str, target: str, reason: object, position: object) -> None:
+    """One durable line per parked refusal, beside the attempt row it also wrote."""
+    logger.warning("refused_delivery_parked delivery_id=%s target=%s reason=%s queue_position=%s",
+                   delivery_id, target, reason, position)
+
+
+def _sender_profile(author: Optional[dict]) -> str:
+    """The sending seat's profile id: the author envelope's own field, else this process's lane."""
+    for key in ("profile", "profile_id", "sender_profile"):
+        value = (author or {}).get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    try:
+        return Path(_default_home()).name
+    except Exception:  # pragma: no cover - a home that cannot be resolved still names a sender
+        return "unknown"
+
+
+def _settled_no_send(dm_file: str, exc: LiveTargetUnavailableError, *,
+                     target_home: Path | str | None = None, author: Optional[dict] = None,
+                     target: str = "") -> str:
+    """The answer to a definite no-send, for both the tool and its runner.
+
+    A dial-stage refusal is first PARKED in the target's durable queue (it is retried by the
+    target's own sweep, so a lane that comes up later still gets the message); only when that is
+    not possible is the payload dropped and the sender told it may resend.
+    """
+    parked = _park_refused_delivery(dm_file, exc, target_home=target_home, author=author,
+                                    label=target)
+    if parked is not None:
+        return parked
     left = []
     for path in (_live_intent_file(dm_file), dm_file):
         _unlink_dm_file(path)
@@ -821,7 +970,7 @@ def _settled_no_send(dm_file: str, exc: LiveTargetUnavailableError) -> str:
             left.append(path)
     if left:
         return _live_outcome_unknown(dm_file, f"could not remove {left[0]}")
-    return _unavailable_payload(dm_file, exc)
+    return _unavailable_payload(dm_file, exc, author=author, target=target)
 
 
 def _held_disposition(record: dict | None) -> bool:
@@ -848,9 +997,12 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
             owner = find_canonical_live_owner(profile_home)
         except Exception as exc:
             # Discovery runs before the intent exists and never admits: definite, not ambiguous.
-            raise LiveTargetUnavailableError(f"canonical Bot Chat target is unavailable ({exc})") from exc
+            raise _unavailable_from("dial", exc, "canonical Bot Chat target is unavailable") from exc
         if owner is None:
-            raise LiveTargetUnavailableError("canonical Bot Chat target is unavailable")
+            raise _unavailable_from(
+                "dial",
+                ValueError(f"@{Path(profile_home).name} has no state.db (nothing to deliver to)"),
+                "canonical Bot Chat target is unavailable")
         intent = dict(owner=owner, message=Path(dm_file).read_text(encoding="utf-8-sig"),
                       delivery_id=_dm_delivery_id(dm_file),
                       **({"author": author} if author else {}))
@@ -895,7 +1047,7 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
             # This call pinned the intent and its first dial died before the RPC went out: nothing
             # was admitted anywhere, so it is a definite no-send the sender may retry (#139303).
             _unlink_dm_file(_live_intent_file(dm_file))
-            raise LiveTargetUnavailableError(f"live authority dial failed before admission ({exc})") from exc
+            raise _unavailable_from("dial", exc, "live authority dial failed before admission") from exc
     if _held_disposition(record):
         # The callers remove the intent and payload (``_settled_no_send``).
         raise LiveTargetHeldError("Bot Chat is held by another session writer")
@@ -1048,10 +1200,12 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
             try:
                 record = _admit_live_dm(home, dm_file, author)
             except LiveTargetHeldError as exc:
-                print(_settled_no_send(dm_file, exc))  # the owner settled the id: drop the payload too
+                print(_settled_no_send(dm_file, exc, target_home=home, author=author,
+                                       target=_target_label(home)))
                 return 1
             except LiveTargetUnavailableError as exc:
-                print(_unavailable_payload(dm_file, exc))
+                print(_settled_no_send(dm_file, exc, target_home=home, author=author,
+                                       target=_target_label(home)))
                 return 1
             except Exception as exc:
                 print(_live_outcome_unknown(dm_file, exc))
@@ -1103,11 +1257,12 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
         try:
             record = _admit_live_dm(profile_home, dm_file, author)
         except LiveTargetUnavailableError as exc:
-            return _settled_no_send(dm_file, exc)
+            return _settled_no_send(dm_file, exc, target_home=profile_home, author=author,
+                                    target=label)
         except Exception as exc:
             # A bare handler told senders not to resend a RETRYABLE refusal (queue_full), which is
             # how 20 peer briefs were lost with attempts=1. Classify, count, and record durably.
-            return _refused_admission_payload(dm_file, exc, author=author)
+            return _refused_admission_payload(dm_file, exc, author=author, target=label)
         if record is not None:
             if wake == "none":
                 # The admission is durable at the owner and nothing waits for its reply: the intent and

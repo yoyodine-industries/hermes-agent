@@ -768,11 +768,13 @@ def test_named_profile_sender_prefix(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("lookup", ["not_ready", "no_owner"])
 def test_unavailable_authority_is_reported_never_worked_around(tmp_path, monkeypatch, lookup):
-    """No canonical target, found BEFORE any intent is pinned: nothing was admitted, so the sender
-    gets a definite, resendable ``runtime_unavailable`` refusal (never the ambiguous "do not
-    resend" state) and nothing else (no CLI, no background runner) is started."""
+    """No canonical target, found BEFORE any intent is pinned: nothing was admitted, so the DM is
+    PARKED in the target's durable queue (its own sweep retries it) and the receipt names the stage
+    and the target — never the ambiguous "do not resend" state and never a silent drop (card
+    t_e44932e2)."""
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")
+    monkeypatch.setenv("HERMES_DELIVERY_LOG_DIR", str(tmp_path / "sender-state"))
     from tools import bot_live_delivery as live
 
     def unavailable(home):  # "no_owner": discovery is ready but the profile has no store (None)
@@ -789,9 +791,41 @@ def test_unavailable_authority_is_reported_never_worked_around(tmp_path, monkeyp
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
     )
-    assert result["reason"] == "runtime_unavailable" and "status" not in result
-    assert "NOT sent" in result["error"] and "Do not resend" not in result["error"]
+    # Parked, not dropped: the durable record is the retry, and the receipt says where it lives.
+    assert result["status"] == "queued" and result["queued"] is True, result
+    assert result["stage"] == "dial" and result["target"] == "@researcher", result
+    assert Path(result["queue_record"]).is_file(), result
+    assert "Do not resend" in result["error"] and "Nothing was admitted" in result["error"]
     assert list(tmp_path.glob("*.live.json")) == []  # no intent: nothing can replay this DM
+    row = json.loads((tmp_path / "sender-state" / "bot_delivery_attempts.jsonl")
+                     .read_text(encoding="utf-8").splitlines()[-1])
+    assert row["stage"] == "dial" and row["target"] == "@researcher" and row["error"]
+
+
+def test_unavailable_authority_when_the_queue_refuses_names_stage_and_target(tmp_path, monkeypatch):
+    """With nowhere durable to park it, the refusal is still a definite no-send that NAMES the
+    stage and the target — never "profile authority is not ready" on its own (card t_e44932e2)."""
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Bot Chat")
+    monkeypatch.setenv("HERMES_DELIVERY_LOG_DIR", str(tmp_path / "sender-state"))
+    from tools import bot_live_delivery as live
+    from tools import bot_delivery_queue as delivery_queue
+
+    monkeypatch.setattr(live, "find_canonical_live_owner",
+                        lambda home: (_ for _ in ()).throw(ValueError("profile authority is not ready")))
+    monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
+    monkeypatch.setattr(delivery_queue, "admit", lambda *a, **k: (_ for _ in ()).throw(
+        delivery_queue.QueueFullError("queue_full")))
+    import tools.terminal_tool as terminal_tool_module
+
+    monkeypatch.setattr(terminal_tool_module, "terminal_tool",
+                        lambda *a, **k: pytest.fail("no runner may start without admission"))
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
+    )
+    assert result["reason"] == "runtime_unavailable" and "status" not in result, result
+    assert result["stage"] == "dial" and result["target"] == "@researcher", result
+    assert "NOT sent" in result["error"] and "Do not resend" not in result["error"]
 
 
 def test_notification_spawn_failure_is_reported_after_admission(tmp_path, monkeypatch):

@@ -53,7 +53,7 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     home = Path(profile_home).resolve()
     discovery = discover_gateway_endpoint(home, timeout=5)
     if discovery.state != 'ready' or discovery.endpoint is None:
-        raise ValueError('profile authority is not ready')
+        raise AuthorityNotReady(home, discovery)
     if not (home / 'state.db').is_file():
         return None
     tip = _bot_chat_tip(home)
@@ -66,6 +66,73 @@ class PreDialError(ValueError):
     this is a definite no-send the sender may safely retry — never the ambiguous
     post-admission state that orders 'do not resend' (#139303). A ``ValueError`` like the
     "authority is not ready" refusals it wraps, so existing ``except ValueError`` callers hold."""
+
+
+#: Discovery reason codes whose span is BOUNDED: the owner is restarting or paused on purpose and
+#: will be reachable again without anyone acting. Everything else is ``unknown`` — most of all
+#: ``absent`` with no controller start, which never clears by waiting (card t_e44932e2).
+BOUNDED_WAIT_REASONS = frozenset({"restart_wait", "update_paused", "draining"})
+
+
+class AuthorityNotReady(PreDialError):
+    """The target profile's authority was not discoverable, so nothing was dialed and nothing was
+    admitted — a definite no-send.
+
+    It carries the discovery verdict whole (``state``, ``reason_code``, ``detail``) plus the target
+    profile and the stage, because the bare string it replaces named none of them: 69 refusals in
+    one day read "profile authority is not ready" with no target, no cause and no wait, and a
+    caller could neither act on one nor tell which lane had gone quiet (card t_e44932e2).
+
+    ``wait`` is a (kind, basis) pair, never an invented ETA: ``bounded`` only where the state names
+    a span the owner closes itself, ``unknown`` otherwise.
+    """
+
+    def __init__(self, profile_home, discovery, *, stage: str = "dial"):
+        home = Path(profile_home).resolve()
+        self.stage = stage
+        self.profile = home.name
+        self.profile_home = str(home)
+        self.state = str(getattr(discovery, "state", "") or "absent")
+        self.reason_code = str(getattr(discovery, "reason_code", "") or "unknown")
+        self.detail = (getattr(discovery, "detail", "") or "").strip() or "no detail published"
+        self.wait_kind = "bounded" if self.reason_code in BOUNDED_WAIT_REASONS else "unknown"
+        super().__init__(self.render())
+
+    @property
+    def wait(self) -> str:
+        """How long, in words a caller can act on: bounded means retry, unknown forbids the wait."""
+        if self.wait_kind == "bounded":
+            return f"bounded (reason={self.reason_code}: the owner closes this itself, retry after it)"
+        return f"unknown (reason={self.reason_code}: waiting will not clear it)"
+
+    def render(self, note: str = "") -> str:
+        head = f"profile authority is not ready{note}"
+        return (f"{head}: stage={self.stage} target=@{self.profile} state={self.state} "
+                f"reason={self.reason_code} wait={self.wait} home={self.profile_home} "
+                f"detail={self.detail}")
+
+    @classmethod
+    def from_verdict(cls, profile_home, *, state: str, reason_code: str, detail: str | None = None,
+                     stage: str = "dial") -> "AuthorityNotReady":
+        """Build one from a verdict discovery did not package (a protocol mismatch on the wire)."""
+        shim = _DiscoveryVerdict(state=state, reason_code=reason_code, detail=detail)
+        return cls(profile_home, shim, stage=stage)
+
+    def as_fields(self) -> dict[str, Any]:
+        """The same verdict flat, for a receipt or a durable journal row."""
+        return dict(stage=self.stage, target=f"@{self.profile}", profile_home=self.profile_home,
+                    state=self.state, reason_code=self.reason_code, wait=self.wait_kind,
+                    detail=self.detail)
+
+
+class _DiscoveryVerdict:
+    """The three fields :class:`AuthorityNotReady` reads, for a refusal that is not a discovery."""
+
+    __slots__ = ("state", "reason_code", "detail")
+
+    def __init__(self, *, state: str, reason_code: str, detail: str | None):
+        self.state, self.reason_code, self.detail = state, reason_code, detail
+
 
 
 def authority_delivery(home, params):
@@ -92,14 +159,16 @@ def _authority_rpc(home, method, params):
         nonlocal rpc_started
         discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=5)
         if discovery.state != 'ready' or discovery.endpoint is None:
-            raise ValueError('profile authority is not ready')
+            raise AuthorityNotReady(home, discovery)
         endpoint = discovery.endpoint
         ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
         # Loopback authority dial: never through HTTP(S)_PROXY (websockets>=14 honours it by default).
         async with connect(url, subprotocols=protocols, open_timeout=10, proxy=None) as ws:
             if ws.subprotocol != GATEWAY_WS_PROTOCOL:
-                raise ValueError('authority protocol mismatch')
+                raise AuthorityNotReady.from_verdict(home, state='incompatible',
+                                                     reason_code='runtime_protocol',
+                                                     detail=f'negotiated {ws.subprotocol or "no subprotocol"}')
             async with GatewayClient(ws) as client:
                 rpc_started = True  # the RPC is going out: past here a failure may have been admitted
                 return await client.rpc(method, **params)
@@ -114,6 +183,8 @@ def _authority_rpc(home, method, params):
         from model_tools import _run_async
         return _run_async(request())
     except Exception as exc:
+        if isinstance(exc, AuthorityNotReady):
+            raise  # already carries the discovery verdict: re-wrapping would strip it
         if not rpc_started:
             raise PreDialError(str(exc)) from exc
         raise
