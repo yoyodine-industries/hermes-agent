@@ -387,7 +387,9 @@ def announce_stop_seen(
         "stop_id": stop_id,
         "requester": requester,
         "phase": phase,
-        "signal": _signal_name(received_signal) if received_signal is not None else "marker",
+        # ``marker`` only when a marker really was consumed: a bare handler call is not evidence of one.
+        "signal": (_signal_name(received_signal) if received_signal is not None
+                   else ("marker" if marker is not None else "unknown")),
     }
     with contextlib.suppress(Exception):
         append_record({
