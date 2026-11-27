@@ -27,6 +27,48 @@ DELIVERY_DIR_NAME = "bot_live_delivery"
 _OWNER_KEYS = ("profile_home", "session_id", "lease_id", "live_session_id")
 _TERMINAL = frozenset({"settled", "failed", "cancelled", "ambiguous"})
 
+#: Budget one pre-dial discovery gives the gateway's control socket. Quoted in the refusal,
+#: because "did not answer within 5 s" and "nothing is listening" name different components.
+DISCOVERY_TIMEOUT_SECONDS = 5.0
+
+
+def discovery_refusal(discovery: Any, *, timeout: float = DISCOVERY_TIMEOUT_SECONDS) -> str:
+    """Why a pre-dial delivery was refused, named by what DISCOVERY saw.
+
+    A refusal here proves exactly one thing: this client could not obtain the endpoint. It
+    proves nothing about the target profile, which stays ``ready`` while the gateway's event
+    loop is stalled — measured across the 04:52-05:17Z authority-epoch gap, where every profile
+    answered ``state=ready`` in 1 ms minutes after ``ws write slow (loop stalled >10.0s)``.
+    The sentence this replaces ("profile authority is not ready") accused that innocent party,
+    so a reader checked, restarted and re-verified a profile that could not be the cause.
+    Report the discovery outcome instead: a timeout, a refused connection, an unknown endpoint.
+    """
+    state = getattr(discovery, "state", None)
+    reason = getattr(discovery, "reason_code", None)
+    detail = getattr(discovery, "detail", None)
+    if reason == "control_timeout":
+        cause = (f"discovery timeout after {timeout:g}s - the gateway endpoint did not answer its "
+                 f"control socket (a stalled event loop, on this caller or on the gateway)")
+    elif state == "starting":
+        cause = "endpoint unknown - the gateway is still starting and has published no endpoint"
+    elif state == "absent":
+        cause = ("connection refused - no gateway control socket answers for this profile "
+                 "(endpoint unknown)")
+    elif reason == "foreign_stale_lock":
+        cause = ("endpoint unknown - this profile's gateway lock belongs to another user or "
+                 "cannot be read")
+    elif state:
+        named = f" ({reason})" if reason else ""
+        cause = (f"endpoint unknown - discovery reported state={state}{named}, "
+                 f"which is not a serving endpoint")
+    else:
+        named = f" ({reason})" if reason else ""
+        cause = (f"endpoint unknown - discovery returned neither a state nor an endpoint{named}")
+    if detail:
+        cause += f": {detail}"
+    return (f"gateway endpoint discovery failed: {cause}. Nothing was admitted, so this is a "
+            f"definite no-send the sender may retry.")
+
 
 def _bot_chat_tip(home: Path) -> str | None:
     """Current Bot Chat tip id, or None when the profile has no store or no Bot Chat yet."""
@@ -51,9 +93,9 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     from hermes_cli.gateway_runtime import discover_gateway_endpoint
 
     home = Path(profile_home).resolve()
-    discovery = discover_gateway_endpoint(home, timeout=5)
+    discovery = discover_gateway_endpoint(home, timeout=DISCOVERY_TIMEOUT_SECONDS)
     if discovery.state != 'ready' or discovery.endpoint is None:
-        raise ValueError('profile authority is not ready')
+        raise ValueError(discovery_refusal(discovery))
     if not (home / 'state.db').is_file():
         return None
     tip = _bot_chat_tip(home)
@@ -65,7 +107,7 @@ class PreDialError(ValueError):
     """The authority call died before its RPC reached the socket: nothing was admitted, so
     this is a definite no-send the sender may safely retry — never the ambiguous
     post-admission state that orders 'do not resend' (#139303). A ``ValueError`` like the
-    "authority is not ready" refusals it wraps, so existing ``except ValueError`` callers hold."""
+    pre-dial discovery refusals it wraps, so existing ``except ValueError`` callers hold."""
 
 
 def authority_delivery(home, params):
@@ -90,9 +132,9 @@ def _authority_rpc(home, method, params):
 
     async def request():
         nonlocal rpc_started
-        discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=5)
+        discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=DISCOVERY_TIMEOUT_SECONDS)
         if discovery.state != 'ready' or discovery.endpoint is None:
-            raise ValueError('profile authority is not ready')
+            raise ValueError(discovery_refusal(discovery))
         endpoint = discovery.endpoint
         ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)

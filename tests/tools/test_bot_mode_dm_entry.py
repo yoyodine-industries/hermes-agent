@@ -95,8 +95,12 @@ def test_delivery_runner_admits_through_dependencies_it_activates(tmp_path, comm
     assert "No module named" not in result.stdout + result.stderr, result
     assert result.returncode == 1, result
     payload = json.loads(result.stdout)
-    assert payload["delivery_id"] == _dm_delivery_id(str(dm_file)), payload
-    assert "profile authority is not ready" in payload["error"], payload
+    # A definite no-send carries no delivery key: nothing was admitted, so there is no receipt
+    # to correlate (t_ffa66b16 leg 2). It names DISCOVERY, never the target's authority (leg 1).
+    assert "delivery_id" not in payload, payload
+    assert "discovery" in payload["error"], payload
+    assert "authority" not in payload["error"].lower(), payload
+    assert "NOT sent" in payload["error"], payload
     assert "hello teammate" not in result.stdout  # the transport never ran
     assert dm_file.read_text(encoding="utf-8") == "hello teammate"
 
