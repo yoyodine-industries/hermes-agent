@@ -10,7 +10,7 @@ The last test is the invariant, not one string: every cause the classifier can r
 an explainer key AND a rendered copy, so a future named cause cannot silently fall back to the
 default sentence again.
 """
-from agent.i18n import t
+from agent.i18n import SUPPORTED_LANGUAGES, t
 from agent.runtime_session_store import WorkerPersistenceError
 from agent.turn_explainers import (
     TurnExplainersMixin,
@@ -69,3 +69,23 @@ def test_every_classified_cause_has_an_explainer_key_and_a_rendered_copy():
     assert [c for c in named if c not in _PERSISTENCE_CAUSES] == []
     assert [c for c in named
             if t(f'explainer.persistence.{c}') == f'explainer.persistence.{c}'] == []
+
+
+def test_every_bundled_catalog_serves_the_owner_and_receipt_copy():
+    """The two owner-side keys are SERVED in all 17 catalogs, not merely present in one.
+
+    ``t()`` falls back to the English catalog, so a key missing from a translation renders
+    English text and NOT the bare key: without this test the claim that a non-English operator
+    reads their own language is unmeasured. The non-English arm is what distinguishes "translated"
+    from "silently served English"; ``owner_unavailable`` was en-only until this change and would
+    have failed it.
+    """
+    for key in ('explainer.persistence.receipt_timeout',
+                'explainer.persistence.owner_unavailable'):
+        english = t(key, lang='en')
+        assert english != key, key
+        for lang in SUPPORTED_LANGUAGES:
+            copy = t(key, lang=lang)
+            assert copy != key, (lang, key, 'key served bare')
+            if lang != 'en':
+                assert copy != english, (lang, key, 'catalog serves the English text')
