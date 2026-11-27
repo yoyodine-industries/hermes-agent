@@ -96,16 +96,17 @@ def _write_sentinel(payload: dict[str, Any], home: Optional[Path]) -> None:
 
 
 def _append_exit_diag(record: dict[str, Any], home: Optional[Path]) -> None:
-    """Append a JSON line to gateway-exit-diag.log (same format as the CLI's ``_exit_diag``)."""
-    try:
-        path = _home_path(home, "logs", "gateway-exit-diag.log")
-        from hermes_constants import mkdir_under_hermes_home
+    """Append a JSON line to gateway-exit-diag.log (same format as the CLI's ``_exit_diag``).
 
-        mkdir_under_hermes_home(path.parent)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
-    except OSError:
-        logger.debug("Failed to append unclean-exit record", exc_info=True)
+    The write itself lives in ``gateway.stop_attribution`` — the ONE writer of this artifact —
+    so every stop row (request/seen/forced/previous) shares one format and one failure mode.
+    """
+    try:
+        from gateway.stop_attribution import append_record
+
+        append_record(record, home=home)
+    except Exception:
+        logger.debug("Failed to append exit-diag record", exc_info=True)
 
 
 def _pid_is_sentinel_owner(pid: Any, start_time: Any, create_time: Any) -> bool:
@@ -151,6 +152,41 @@ def _suspected_oom(mem: dict[str, Any]) -> bool:
     return avail < _CRITICAL_AVAILABLE_KIB or (
         isinstance(total, int) and total > 0 and avail / total < _CRITICAL_AVAILABLE_FRACTION
     )
+
+
+def read_sentinel_stop_id(home: Optional[Path] = None) -> Optional[str]:
+    """``stop_id`` of the stop this life accepted (None when no request was ever seen)."""
+    try:
+        value = (_read_json(get_lifecycle_sentinel_path(home)) or {}).get("stop_id")
+        return value if isinstance(value, str) and value else None
+    except Exception:
+        return None
+
+
+def record_stop_seen(stop_id: str, *, requester: Optional[dict[str, Any]] = None,
+                     home: Optional[Path] = None) -> None:
+    """Thread the accepted stop's ``stop_id`` onto the lifecycle sentinel. Never raises.
+
+    The sentinel is the only state the forced-exit writer and the NEXT boot can both read, so it
+    is where the ``stop_id`` survives a shutdown watchdog's ``os._exit``. Only the process that
+    owns the sentinel may write it: during ``--replace`` the replacement claims it first.
+    """
+    try:
+        if not stop_id:
+            return
+        sentinel = _read_json(get_lifecycle_sentinel_path(home))
+        if sentinel is None:
+            sentinel = {"phase": "running", "pid": os.getpid(), "started_at": _now_iso()}
+        elif sentinel.get("pid") != os.getpid():
+            return
+        updated = dict(sentinel)
+        updated["stop_id"] = str(stop_id)
+        updated["stop_seen_at"] = _now_iso()
+        if requester:
+            updated["stop_requester"] = requester
+        _write_sentinel(updated, home)
+    except Exception:
+        logger.debug("Failed to thread the stop id onto the sentinel", exc_info=True)
 
 
 def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
@@ -330,6 +366,26 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
     """
     evidence: Optional[dict[str, Any]] = None
     try:
+        # EVERY prior life is reported, not only an unclean one: a clean or watchdog-forced exit
+        # used to leave nothing behind, so the next boot could not say who stopped the gateway or
+        # why. Written BEFORE the claim overwrites the sentinel (the only copy of that life).
+        prior = _read_json(get_lifecycle_sentinel_path(home))
+        if prior:
+            prior_stop_id = prior.get("stop_id") if isinstance(prior.get("stop_id"), str) else None
+            if not prior_stop_id and isinstance(prior.get("pid"), int):
+                # SIGKILL ran no exit path, so the sentinel never learned the stop id: correlate
+                # with the requester's row (a request issued after that life began).
+                from gateway.stop_attribution import _parse_iso, find_stop_request
+
+                request = find_stop_request(prior["pid"], home=home,
+                                            since_ts=_parse_iso(prior.get("started_at")))
+                prior_stop_id = (request or {}).get("stop_id")
+            from gateway.stop_attribution import record_previous_exit
+
+            record_previous_exit(prior, home=home, prior_stop_id=prior_stop_id)
+    except Exception:
+        logger.debug("Previous-exit record failed", exc_info=True)
+    try:
         evidence = detect_unclean_exit(home)
         if evidence is not None:
             _report_unclean_exit(evidence, home, defer_integrity_check=defer_integrity_check)
@@ -441,7 +497,7 @@ def record_shutdown_drain_capped(
     than silently reconciled as ``interrupted``. Never raises.
     """
     try:
-        record: Dict[str, Any] = {
+        record: dict[str, Any] = {
             "ts": _now_iso(),
             "tag": "gateway.shutdown_drain_capped",
             "pid": os.getpid(),
@@ -474,7 +530,9 @@ def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdow
                                   "exited_at": _now_iso()}
         # Carry the incarnation identity: the Windows start attestation matches a clean exit by
         # PID *and* start time so a reused PID's exit cannot vouch for a different life (#110020).
-        for key in ("start_time", "create_time"):
+        # ``stop_id`` rides along for the same reason: the next boot's ``gateway.previous_exit``
+        # must name the stop this life accepted (see gateway.stop_attribution).
+        for key in ("start_time", "create_time", "stop_id", "started_at"):
             if sentinel is not None and sentinel.get(key) is not None:
                 exited[key] = sentinel[key]
         _write_sentinel(exited, home)

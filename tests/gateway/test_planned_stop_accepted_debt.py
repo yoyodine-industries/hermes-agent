@@ -26,6 +26,14 @@ pytestmark = [
 ]
 
 
+def _mark(pid: int) -> bool:
+    """Write the marker through the attributed door (requester + stop_id are mandatory)."""
+    from gateway.stop_attribution import capture_requester, new_stop_id
+
+    return status.write_planned_stop_marker(
+        pid, requester=capture_requester(kind="update"), stop_id=new_stop_id())
+
+
 def _home(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     root, home = tmp_path / "root", tmp_path / "root" / "profiles" / "p"
     home.mkdir(parents=True)
@@ -43,7 +51,7 @@ def _accepted_unrecorded(tmp_path: Path, monkeypatch, *, home_writable: bool) ->
     token = pause_record.record_pause({"resume_needed": True, "profiles": {"p": pid},
                                        "identities": {str(pid): pause_record.identity(pid)["ct"]}}, None, [])
     pause_record.mark_stop_requested(token, [pid], markers={pid: marker})
-    assert status.write_planned_stop_marker(pid)
+    assert _mark(pid)
     root.chmod(0o555)
     if not home_writable:
         home.chmod(0o555)
@@ -117,7 +125,7 @@ def test_with_no_pause_on_disk_the_consumer_never_waits_on_the_pause_lock(tmp_pa
     try:
         assert held.wait(5), "premise: another thread holds the pause lock"
         marker = status._get_planned_stop_marker_path()
-        assert status.write_planned_stop_marker(os.getpid())
+        assert _mark(os.getpid())
         started = time.monotonic()
         assert status.consume_planned_stop_marker_for_self() is True
         elapsed = time.monotonic() - started

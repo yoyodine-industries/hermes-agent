@@ -722,7 +722,10 @@ def test_an_accepted_stop_the_record_could_not_checkpoint_outlives_the_request_t
     token = pause_record.record_pause({"resume_needed": True, "profiles": {"p": pid},
                                        "identities": {str(pid): pause_record.identity(pid)["ct"]}}, None, [])
     pause_record.mark_stop_requested(token, [pid], markers={pid: marker})
-    assert status.write_planned_stop_marker(pid)
+    from gateway.stop_attribution import capture_requester, new_stop_id
+
+    assert status.write_planned_stop_marker(
+        pid, requester=capture_requester(kind="update"), stop_id=new_stop_id())
     root.chmod(0o555)
     try:
         pause_record.mark_stop_sent(token, pid)  # refused: best effort

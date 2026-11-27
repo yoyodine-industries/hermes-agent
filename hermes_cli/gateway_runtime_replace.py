@@ -87,14 +87,29 @@ def _verified_owner(control: Path, payload: dict) -> tuple[int, Any] | str:
     return pid, current
 
 
-def _write_planned_stop(control: Path, pid: int, start_time: Any) -> None:
+def _write_planned_stop(control: Path, pid: int, start_time: Any) -> str | None:
     """The marker ``hermes gateway stop`` writes, in the OWNER's home (it reads its own), so the old
-    gateway exits as a planned stop: clean exit, ``stopped`` persisted, no supervisor revival."""
-    from gateway.status import _PLANNED_STOP_MARKER_FILENAME, _utc_now_iso, _write_marker
-    _write_marker(control / _PLANNED_STOP_MARKER_FILENAME, {
-        "target_pid": pid, "target_start_time": start_time,
-        "stopper_pid": os.getpid(), "written_at": _utc_now_iso(),
-    })
+    gateway exits as a planned stop: clean exit, ``stopped`` persisted, no supervisor revival.
+
+    Written through the attributed door and with the request row landing in the OWNER's diag log,
+    so that gateway's ``gateway.stop_seen`` / ``previous_exit`` rows quote this requester and the
+    same ``stop_id``."""
+    from gateway.status import _UNSET, write_planned_stop_marker_in
+    from gateway.stop_attribution import capture_requester, new_stop_id, STOP_REQUESTED, append_record, _now_iso
+
+    requester = capture_requester(
+        kind="replace_takeover", reason_code="replace_incompatible",
+        reason_text="an owner running an older Hermes runtime answered for this home",
+        lull_gate="not_consulted")
+    stop_id = new_stop_id()
+    append_record({
+        "ts": _now_iso(), "tag": STOP_REQUESTED, "stop_id": stop_id,
+        "target": {"pid": pid, "start_time": start_time, "home": str(control)},
+        "delivery": {"method": "marker", "raw": None}, "requester": requester,
+    }, control)
+    write_planned_stop_marker_in(control, pid, requester=requester, stop_id=stop_id,
+                                 target_start_time=(_UNSET if start_time is None else start_time))
+    return stop_id
 
 
 def _wait_gone(pid: int, seconds: float) -> bool:

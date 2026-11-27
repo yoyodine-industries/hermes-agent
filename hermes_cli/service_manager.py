@@ -647,8 +647,12 @@ class S6ServiceManager:
         pid = self._supervised_pid(name)
         if pid is not None:
             try:
-                from gateway.status import write_planned_stop_marker
-                write_planned_stop_marker(pid)
+                from gateway.stop_attribution import write_stop_request
+                # The ruling's ``kind`` vocabulary has no separate supervisor value: an operator
+                # (or a supervisor acting for one) asked, and ``delivery`` names s6.
+                write_stop_request(pid, kind="operator", reason_code="service_stop",
+                                   delivery="s6", reason_text=f"s6-svc -d {name}",
+                                   lull_gate="not_consulted")
             except Exception:
                 pass
         self._run_svc("-d", "stop", name)

@@ -39,14 +39,19 @@ def _resolve_target_pid(argv: list[str] | tuple[str, ...]) -> int | None:
 
 
 def main(argv: list[str] | tuple[str, ...] | None = None) -> int:
-    """Write the planned-stop marker for the supervised PID. Always 0."""
+    """Write the attributed planned-stop request for the supervised PID. Always 0."""
     try:
         pid = _resolve_target_pid(list(argv) if argv is not None else sys.argv)
         if pid is None:
             return 0
-        from gateway.status import write_planned_stop_marker
+        from gateway.stop_attribution import write_stop_request
 
-        write_planned_stop_marker(pid)
+        # Called from the unit's ExecStop=, so the requester IS this helper process; its argv names
+        # systemd as the origin and ``delivery`` says so, because the SIGTERM that follows belongs
+        # to systemd, not to the helper.
+        write_stop_request(pid, kind="operator", reason_code="systemd_stop", delivery="systemd",
+                           reason_text="systemd ExecStop= for the gateway unit",
+                           lull_gate="not_consulted")
     except Exception:
         pass
     return 0

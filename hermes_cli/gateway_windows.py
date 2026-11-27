@@ -1829,12 +1829,15 @@ def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
     if pid <= 0:
         return False
     try:
-        from gateway.status import write_planned_stop_marker, _pid_exists
+        from gateway.status import _pid_exists
+        from gateway.stop_attribution import write_stop_request
     except ImportError:
         return False
 
     try:
-        write_planned_stop_marker(pid)
+        write_stop_request(pid, kind="cli_stop", reason_code="windows_stop", delivery="marker",
+                           reason_text="windows gateway stop: marker-only drain",
+                           lull_gate="not_consulted")
     except Exception:
         pass   # best-effort; caller escalates to a hard kill
 

@@ -163,12 +163,26 @@ def _hard_exit(exit_code: int) -> None:
     os._exit(exit_code)
 
 
-def _mark_exited_quietly(exit_code: int, reason: str) -> None:
+def _snapshot_count(snapshot: Any, key: str) -> Optional[int]:
+    """A non-negative int from a watchdog snapshot, else None (never a fabricated 0)."""
+    if not isinstance(snapshot, dict):
+        return None
+    value = snapshot.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _mark_exited_quietly(exit_code: int, reason: str, *, active_agents: Optional[int] = None,
+                         active_cron_jobs: Optional[int] = None) -> None:
     """Best-effort terminal stamp on BOTH lifecycle records before ``os._exit`` skips teardown:
     the lifecycle ledger (so the next boot names the watchdog, not SIGKILL/OOM) and
     ``gateway_state.json`` (so ``hermes gateway status`` and every other reader of that file stop
     seeing ``running`` for a process the watchdog killed — #113372). The runtime-status write goes
     LAST: it is the record housekeeping refreshes, so nothing may overwrite it after we stamp it.
+
+    Also appends ``gateway.forced_exit`` to ``logs/gateway-exit-diag.log`` (best-effort, with the
+    stop id this life accepted) — an ``os._exit`` runs no exit path, so without this row a forced
+    stop left NO trace in the artifact the fleet greps, and the next boot could only report it as
+    an unexplained unclean death.
 
     The UPDATE receipt is stamped FIRST (R2 item 1, t_3cd65f01): ``os._exit`` gives the update's own
     writer no chance to finalize, so a run killed by this watchdog would keep ``outcome: running``
@@ -182,6 +196,10 @@ def _mark_exited_quietly(exit_code: int, reason: str) -> None:
     with contextlib.suppress(Exception):
         from gateway.lifecycle_ledger import mark_exited
         mark_exited(exit_code, reason=reason)
+    with contextlib.suppress(Exception):
+        from gateway.stop_attribution import record_forced_exit
+        record_forced_exit(exit_code, reason, active_agents=active_agents,
+                           active_cron_jobs=active_cron_jobs)
     with contextlib.suppress(Exception):  # os._exit skips atexit: stamp the exit-metrics marker now
         from hermes_cli.observability.shared_metrics_process import stamp_exit
         stamp_exit("watchdog")
@@ -356,7 +374,11 @@ def arm_shutdown_watchdog(
         with contextlib.suppress(Exception):
             from hermes_logging import drain_log_queue
             drain_log_queue(timeout=1.0)
-        _mark_exited_quietly(exit_code, "shutdown_watchdog")
+        _mark_exited_quietly(
+            exit_code, "shutdown_watchdog",
+            active_agents=_snapshot_count(snapshot, "active_agents"),
+            active_cron_jobs=_snapshot_count(snapshot, "active_cron_jobs"),
+        )
         _hard_exit(exit_code)
     try:
         threading.Thread(target=_watchdog, daemon=True, name=name).start()

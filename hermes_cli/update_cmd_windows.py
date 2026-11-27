@@ -56,17 +56,25 @@ def _planned_stop_markers(running_pids, profile_processes, service_gateway_pids)
 
 
 def _write_update_planned_stop_marker(profile_path: Path, pid: int) -> bool:
-    """Write a planned-stop marker into a specific profile home."""
+    """Write an attributed planned-stop marker into a specific profile home.
+
+    The request row lands in THAT profile's diag log (the log its gateway writes), so the update's
+    stop is attributable from the log alone; the marker refuses without a requester, exactly like
+    the local door."""
     try:
-        from gateway.status import _get_process_start_time
-        from utils import atomic_json_write
-        atomic_json_write(
-            _planned_stop_marker_path(profile_path),
-            {"target_pid": pid, "target_start_time": _get_process_start_time(pid), "stopper_pid": os.getpid(),
-             "written_at": datetime.now(UTC).isoformat()},
-            indent=None, separators=(",", ":"),
-        )
-        return True
+        from gateway.status import write_planned_stop_marker_in
+        from gateway.stop_attribution import capture_requester, write_stop_request
+
+        home = Path(profile_path)
+        requester = capture_requester(kind="update", reason_code="update_stop",
+                                      reason_text="windows update stopping the gateway to replace "
+                                                  "its code",
+                                      lull_gate="not_consulted")
+        # Row first (a gateway killed a microsecond later is still attributable), marker second —
+        # and the marker's own success is what this returns.
+        stop_id = write_stop_request(pid, requester=requester, delivery="marker", home=home,
+                                     write_marker=False)
+        return write_planned_stop_marker_in(home, pid, requester=requester, stop_id=stop_id)
     except (OSError, PermissionError):
         return False
 
