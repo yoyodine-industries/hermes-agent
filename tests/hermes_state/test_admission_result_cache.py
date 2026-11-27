@@ -271,3 +271,104 @@ def test_the_cache_does_not_grow_across_one_thousand_admissions(tmp_path, monkey
         assert newest - oldest < 3600 * 24
     finally:
         db.close()
+
+
+def test_a_turn_user_row_attachment_is_bounded_before_the_verdict(tmp_path):
+    """The user-row copy is CONTEXT: bound IT, and never pay for it with the answer.
+
+    ``compact_result`` stores the current turn's user row — the row a chained Responses turn
+    replays — in ``result._turn_user_row``.  Its ``api_content`` carries attachment, plugin and
+    memory-prefetch text (p95 65 KB, max 424 KB on a live store), so on its own it overflows the
+    64 KB row budget.  The old fallback emptied ``final_response`` to pay for it while leaving the
+    big field whole; this test drives the overflow from the user row, not from ``messages``, and
+    pins the invariant the other tests could not see.
+    """
+    from gateway.platforms.api_server import APIServerAdapter
+
+    db = SessionDB(tmp_path / 'state.db')
+    try:
+        db.create_session('s', 'api_server')
+        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        rt.admit_session_input(db, epoch=epoch, principal_id='api', session_id='s',
+                               request_id='attach', payload={'text': 'see attached'})
+        row = rt.claim_session_input(db, epoch=epoch, session_id='s')
+        messages = [{
+            'role': 'user', 'content': 'see attached',
+            # The user row as the model saw it: one 200 KB attachment/plugin/memory block.
+            'api_content': 'see attached\n\n' + 'A' * 200_000,
+        }]
+        for i in range(6):
+            messages.append({'role': 'assistant', 'content': None, 'tool_calls': [{
+                'id': f'c{i}', 'type': 'function',
+                'function': {'name': 'read_file', 'arguments': json.dumps({'path': f'f{i}'})}}]})
+            messages.append({'role': 'tool', 'tool_call_id': f'c{i}', 'content': 't' * 200})
+        messages.append({'role': 'assistant', 'content': 'the reply'})
+        result = {'result': {'final_response': 'the reply', 'messages': messages,
+                             'current_turn_user_idx': 0, 'completed': True},
+                  'usage': {'input_tokens': 7}}
+        rt.settle_session_input(db, epoch=epoch, admission_id=row['admission_id'],
+                                generation=row['generation'], outcome='completed', result=result)
+
+        with db._read_ctx() as conn:
+            text = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                                (RESULT_PREFIX + row['admission_id'],)).fetchone()[0]
+        assert len(text.encode('utf-8')) <= 64 * 1024
+        from hermes_state_terminal import RESULT_ROW_MAX_BYTES
+        assert len(text.encode('utf-8')) <= RESULT_ROW_MAX_BYTES
+        stored = json.loads(text)
+        # The answer survives whole; the context field is the one that was cut.
+        assert stored['result']['final_response'] == 'the reply'
+        assert stored['result']['completed'] is True
+        assert stored['_body']['turn_user_row_capped'] == ['api_content']
+        user_row = stored['result']['_turn_user_row']
+        assert user_row['role'] == 'user'
+        assert len(user_row['api_content']) < 40_000
+        # Read back exactly as ``_settled_api_result`` does: reply and current-turn output intact.
+        saved = admission_result(db, row['admission_id'])
+        assert saved['result']['final_response'] == 'the reply'
+        assert saved['result']['_turn_user_row']['content'] == 'see attached'
+        items = APIServerAdapter._extract_output_items(saved['result'])
+        kinds = [item['type'] for item in items]
+        assert kinds.count('function_call') == 6
+        assert kinds.count('function_call_output') == 6
+        assert items[-1] == {'type': 'message', 'role': 'assistant',
+                             'content': [{'type': 'output_text', 'text': 'the reply'}]}
+    finally:
+        db.close()
+
+
+def test_a_bounded_turn_never_keeps_a_tool_result_without_its_call(tmp_path):
+    """A split ``function_call``/``function_call_output`` pair is malformed Responses output.
+
+    ``_extract_output_items`` renders one ``function_call`` per assistant ``tool_calls`` row and
+    one ``function_call_output`` per tool row, so dropping the oldest prefix under the row bound
+    must drop a tool result together with the call it answers.  On the live over-budget population
+    the unpaired rule left 283 of 400 sampled rows with an output item no call answered.
+    """
+    from gateway.platforms.api_server import APIServerAdapter
+
+    db = SessionDB(tmp_path / 'state.db')
+    try:
+        db.create_session('s', 'api_server')
+        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        body = []
+        for i in range(200):
+            body.append({'role': 'assistant', 'content': None, 'tool_calls': [{
+                'id': f'call-{i}', 'type': 'function',
+                'function': {'name': 'run', 'arguments': '{}'}}]})
+            body.append({'role': 'tool', 'tool_call_id': f'call-{i}', 'content': 'z' * 4096})
+        body.append({'role': 'assistant', 'content': 'the reply'})
+        row = _settle(db, epoch, 's', 'split', 'ask split',
+                      {'result': {'final_response': 'the reply', 'messages': body}})
+        saved = admission_result(db, row['admission_id'])
+        kept = saved['result']['messages']
+        assert saved['result']['final_response'] == 'the reply'
+        assert any(m.get('tool_call_id') for m in kept)  # tool traffic survived the bound
+        calls = {c['id'] for m in kept if m.get('role') == 'assistant'
+                 for c in (m.get('tool_calls') or [])}
+        assert all(m['tool_call_id'] in calls for m in kept if m.get('role') == 'tool')
+        items = APIServerAdapter._extract_output_items(saved['result'])
+        assert {i['call_id'] for i in items if i['type'] == 'function_call_output'} \
+            <= {i['call_id'] for i in items if i['type'] == 'function_call'}
+    finally:
+        db.close()
