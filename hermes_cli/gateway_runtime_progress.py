@@ -71,6 +71,12 @@ class StartRunway:
         self._window: tuple[int, float, float] | None = None  # (owner pid, when, cpu) at window start
         self._sampled = 0.0
 
+    @property
+    def adaptive(self) -> bool:
+        """Whether this runway may extend at all. An explicit ``timeout`` is a hard deadline:
+        nothing — progress on the host or a lease the owner published — may move it."""
+        return self._adaptive
+
     def extend(self, homes, child) -> float:
         """The deadline after one pending iteration; never earlier than before, never past the cap.
         Nothing to wait on yet (no ``homes``, no ``child``) is not a sample: it must not spend the

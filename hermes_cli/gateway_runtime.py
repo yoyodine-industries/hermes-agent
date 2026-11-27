@@ -436,6 +436,10 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
         RuntimeStartError, discover_existing_gateway_service, remaining,
         start_existing_gateway_service,
     )
+    from hermes_cli.gateway_runtime_lease import (
+        LIVE, POLL_MAX_S, POLL_MIN_S, PROBE_TIMEOUT_S, STALLED, horizon_s,
+        observe as observe_startup_lease,
+    )
     from hermes_constants import get_default_hermes_root, get_process_hermes_home
 
     from hermes_cli.gateway_launchd_runtime import GatewayJob
@@ -447,6 +451,33 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
     child = None
     child_home, child_offset = home, 0
     waiting: dict[Path, None] = {}  # the homes whose pending start this call awaits: their owners are sampled
+    # A live startup lease (gateway_state.json ``startup``) moves this call's deadline to the
+    # owner's own ``ready_by``. Kept apart from the CPU-progress runway, whose cap is its own.
+    lease_deadline = 0.0  # monotonic
+    lease_renewals: int | None = None
+    lease_waiting = False
+
+    def follow_lease(home: Path) -> GatewayDiscovery | None:
+        """Read the owner's published cold-start lease and follow it.
+
+        Returns the terminal verdict when the writer stopped (``owner_start_stalled``, naming the
+        phase), else None while the start is still worth waiting for — moving this call's deadline
+        to the lease's own ``ready_by`` (never past the watchdog ceiling) when it is live.
+        """
+        nonlocal lease_deadline, lease_renewals, lease_waiting, delay
+        from gateway.runtime_ownership import live_runtime_owner
+        now = time.time()
+        wait = observe_startup_lease(home, owner_pid=live_runtime_owner(home),
+                                     renewals_seen=lease_renewals, now=now)
+        if wait.kind == STALLED:
+            return GatewayDiscovery("inaccessible", reason_code="owner_start_stalled",
+                                    detail=wait.detail)
+        if wait.kind == LIVE and wait.lease is not None:
+            lease_renewals = wait.renewals
+            lease_waiting = True
+            lease_deadline = max(lease_deadline, time.monotonic() + horizon_s(wait.lease, now))
+            delay = max(delay, POLL_MIN_S)
+        return None
     # A gateway ending through its own idle exit is not a refusal: wait for it to go (its lock is
     # still held for a moment after its control socket closes, which reads as "starting"), then
     # start the replacement this call owes the client.
@@ -465,13 +496,23 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
             # timeout is a deadline, as before. A progressing owner moves this loop's deadline, and a
             # macOS launchd job's, whose poll() would otherwise stop reporting an exit at the old one.
             deadline = runway.extend(tuple(waiting), child)
+            deadline = max(deadline, lease_deadline)
             if isinstance(child, GatewayJob):
                 child.extend_deadline(deadline)
             # Poll BEFORE discovering: an exit observed first, then "absent", cannot be a child that
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
-            observed = _observe_replacing_stale(home, deadline, replaced)
+            probe_deadline = deadline
+            if lease_waiting:
+                # While a lease is being waited on, sample it at the poll cadence too: one wedged
+                # control socket must not consume the whole horizon unobserved.
+                probe_deadline = min(deadline, time.monotonic() + PROBE_TIMEOUT_S)
+            observed = _observe_replacing_stale(home, probe_deadline, replaced)
             if observed.reason_code == "control_timeout":
+                # The socket exists but did not answer. A live lease still says the owner is
+                # starting, so sample it rather than looping on the probe alone.
+                if runway.adaptive and (verdict := follow_lease(home)) is not None:
+                    return verdict
                 continue  # the probe used its whole budget; the next one raises unless extended
             if observed.state == "draining" and observed.reason_code in _RETIRING:
                 retiring, requested, child = True, False, None
@@ -492,6 +533,12 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
             if observed.state == "starting" and not retiring:
                 requested = True
                 waiting[home] = None
+                if runway.adaptive:
+                    # The owner publishes a cold-start lease in gateway_state.json. While it is
+                    # alive its own ``ready_by`` — not this call's base budget — is the deadline;
+                    # when it goes stale the verdict names the phase, not a supervisor.
+                    if (verdict := follow_lease(home)) is not None:
+                        return verdict
             if observed.state == "absent":
                 retiring = False
             reserved = _starting_multiplexer_root(home) if observed.state == "absent" and not requested else None
@@ -509,13 +556,28 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
                 # (or await) the MULTIPLEXER. A per-profile spawn here would become a second owner
                 # that blocks the multiplexer's next all-or-nothing reserve.
                 from hermes_cli.gateway_runtime_multiplex import implied_host_root, multiplexer_serves_home
+                from hermes_cli.gateway_runtime_discovery import missing_owner_state
                 target = multiplexer_serves_home(home) or home
-                service = discover_existing_gateway_service(target, deadline=deadline)
-                if service is None and target == home and (host := implied_host_root(home)) is not None:
-                    # Main's guard refuses a named profile a gateway of its own unless it is standalone
-                    # or already installed; with no multiplexer evidence yet, the host is still its owner.
-                    target = host
+                service = None
+                try:
                     service = discover_existing_gateway_service(target, deadline=deadline)
+                    if service is None and target == home and (host := implied_host_root(home)) is not None:
+                        # Main's guard refuses a named profile a gateway of its own unless it is standalone
+                        # or already installed; with no multiplexer evidence yet, the host is still its owner.
+                        target = host
+                        service = discover_existing_gateway_service(target, deadline=deadline)
+                except RuntimeStartError as exc:
+                    if exc.reason != "service_manager_unavailable":
+                        raise
+                    # "The supervisor's control interface did not answer" is not evidence of an
+                    # absent owner. The filesystem is: a live lock holder means a start is in
+                    # flight, and this call waits on its published lease instead of aborting.
+                    if missing_owner_state(home) == "starting" or (
+                            target != home and missing_owner_state(target) == "starting"):
+                        requested = True
+                        waiting[home] = None
+                        continue
+                    raise RuntimeStartError("supervisor_unreachable") from None
                 # Runtime locks settle races remaining after this second probe.
                 observed = discover_gateway_endpoint(home, timeout=remaining(deadline))
                 if observed.state != "absent":
@@ -532,8 +594,10 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
             # Never raises: an exhausted budget gets one more sample (top of loop) before its verdict.
             time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             # Capped low: each probe is a lock-file read or one local identify, and READY is noticed
-            # within ~50 ms instead of up to 250 ms later on every cold start.
-            delay = min(delay * 1.5, 0.05)
+            # within ~50 ms instead of up to 250 ms later on every cold start. While a published
+            # lease is being waited on, the cadence eases to one read per 1-5 s: a ten-minute cold
+            # start must not become tens of thousands of status-file reads.
+            delay = min(delay * 1.5, POLL_MAX_S if lease_waiting else 0.05)
     except TimeoutError:
         return GatewayDiscovery("starting", reason_code="deadline")
     except RuntimeStartError as exc:
