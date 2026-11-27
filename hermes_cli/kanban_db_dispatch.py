@@ -1137,6 +1137,12 @@ class DispatchResult:
     """Task ids the reclaim HELD because their recorded identity fingerprint is not comparable with
     the shape this dispatcher would write (R2 ``UNKNOWN -> HOLD`` at row granularity, R6). They were
     neither reclaimed nor counted; their claims are untouched."""
+    settled_claims_released: list[str] = field(default_factory=list)
+    """Task ids whose EXPIRED claim was released on a row whose status is not ``running``
+    (``kanban_db.release_settled_claims``): residue that no other reader can clear, because every
+    one of them is scoped ``status='running'``. Released per row, before the crash sweep counts
+    anything -- so these rows are never censused as deaths. A non-empty value here is board hygiene,
+    not a failure: the card keeps the status the state machine gave it."""
     identity_generation_alerts: list[str] = field(default_factory=list)
     """R6 divergence reasons for this tick (``identity-shape-changed:…``, ``psutil-lost``,
     ``witness-bytes-lost:…``); empty when the deployed identity generation is unchanged. Non-empty
@@ -3141,6 +3147,10 @@ class _CrashSweep:
     # The guard's whole decision for this sweep (the R4 count verdict and the R6 held rows), or
     # ``None`` when the sweep was never assessed.
     assessment: Optional[_crash_guard.SweepAssessment] = None
+    # Claims released on rows whose status is NOT ``running`` -- expired residue the tick can clear
+    # one row at a time (``kanban_db.release_settled_claims``). Booked BEFORE the count, so these
+    # rows are gone from it and can never be reported as mass deaths. Empty on a healthy board.
+    settled_released: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -3253,6 +3263,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     contract_ok = _liveness_contract_ok()
     veto_seconds = resolve_heartbeat_veto_seconds()
     write_shape = _crash_guard.identity_shape(_process_fingerprint(os.getpid()))
+    # THE RECLAIM LEG RUNS BEFORE THE COUNT. Expired claims on rows whose status is NOT ``running``
+    # -- settled-row residue, which no other verb can ever clear -- are released one row at a time
+    # here, on their own expiry, and are never counted: they are not deaths, and nothing about them
+    # is witness-derived. So reclaimable rows are gone from ``counted`` before the guard is asked,
+    # and a tick that drained them reports ``released=N`` beside ``count`` instead of feeding the
+    # board's own occupancy back as the population it refuses to change.
+    sweep.settled_released = _kb.release_settled_claims(conn, now=now)
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
@@ -3341,6 +3358,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 for row, pid, dead, _ in pending
             ],
             write_shape=write_shape,
+            released=len(sweep.settled_released),
         )
         sweep.assessment = assessment
         # THE ONLY ROWS THAT MAY BOOK. A refusal writes nothing else -- not the witness-leg rows,
@@ -3638,6 +3656,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     detect_crashed_workers._last_crash_sweep_held = (  # type: ignore[attr-defined]
         list(sweep.assessment.held) if sweep.assessment is not None else []
     )
+    detect_crashed_workers._last_settled_released = list(sweep.settled_released)  # type: ignore[attr-defined]
     if (sweep.assessment is not None and sweep.assessment.refusal_needed
             and not sweep.crash_details):
         # The refusal closed NOTHING (the kernel-proven subset was empty): the returned list is
@@ -7230,10 +7249,16 @@ def _run_reclaim_phase(
     result.identity_generation_alerts = _check_identity_generation(conn, board=board)
     result.crashed = detect_crashed_workers(conn, board=board)
     _refused = getattr(detect_crashed_workers, "_last_crash_sweep_abort", None)
+    result.settled_claims_released = list(
+        getattr(detect_crashed_workers, "_last_settled_released", []) or []
+    )
     if _refused is not None:
         result.crash_sweep_refused = {
             "signature": _refused.signature,
             "count": _refused.count,
+            # Beside the count, for the same reason the event payload carries it: a refusal whose
+            # count is the board's stock cannot distinguish a drained tick from a static one.
+            "released": _refused.released,
             "threshold": _refused.threshold,
             "ended_at": _refused.ended_at,
             "task_ids": list(_refused.task_ids),
