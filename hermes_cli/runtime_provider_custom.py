@@ -406,12 +406,33 @@ def _entry_serves_model(entry: dict[str, Any], target: str) -> bool:
     return False
 
 
+def config_entry_at_path(config: Optional[dict[str, Any]], path: Optional[tuple]) -> Any:
+    """The RAW config entry *path* addresses: dict steps by key, legacy list steps by index.
+
+    ``named_custom_provider_config_path`` returns ``("providers", <key>)`` for the keyed table but
+    ``("custom_providers", <int index>)`` for a legacy ``custom_providers:`` LIST entry — the shape
+    this estate's lane configs carry, and the root fallback's too. Walking that path with ``dict.get``
+    only turned the index into ``None``, which read as "the entry declares nothing" and silently
+    disabled the pair rule on every lane.
+    """
+    entry: Any = config
+    for part in path or ():
+        if isinstance(entry, dict):
+            entry = entry.get(part)
+        elif isinstance(entry, (list, tuple)) and isinstance(part, int) and 0 <= part < len(entry):
+            entry = entry[part]
+        else:
+            return None
+    return entry
+
+
 def declared_models(entry: dict[str, Any]) -> list[str]:
     """The model ids a configured ``providers:`` / ``custom_providers:`` entry DECLARES it serves.
 
     A keyed ``providers:`` entry declares ``default_model`` (optionally with a ``models`` table); a
-    legacy ``custom_providers:`` entry declares ``model``. Both are read: a model-less launch's route
-    is judged against what the entry itself says it sells, never against a name it merely defaults to.
+    legacy ``custom_providers:`` entry declares its endpoint's model as ``default_model`` or ``model``.
+    Both are read: a model-less launch's route is judged against what the entry itself says it sells,
+    never against a name it merely defaults to.
     """
     if not isinstance(entry, dict):
         return []
@@ -443,6 +464,8 @@ def route_model_conflict(config: Optional[dict[str, Any]], model: Optional[str])
     entry owning that URL decides; without one, a ``custom:<name>`` provider picks its own entry. Only an
     entry that DECLARES models can prove a conflict: an entry declaring none is a generic endpoint, and a
     route that is not a configured custom entry (a built-in provider, an unconfigured URL) is not judged.
+    The entry is read from the RAW config at the path resolution named — legacy ``custom_providers:``
+    entries live at a list index, so the path is indexed, never only dict-walked.
     """
     target = str(model or "").strip().lower()
     if not isinstance(config, dict) or not target:
@@ -461,10 +484,7 @@ def route_model_conflict(config: Optional[dict[str, Any]], model: Optional[str])
     path = named_custom_provider_config_path(identity, config)
     if not path:
         return None
-    entry: Any = config
-    for part in path:
-        entry = entry.get(part) if isinstance(entry, dict) else None
-    declared = declared_models(entry)
+    declared = declared_models(config_entry_at_path(config, path))
     if not declared or any(name.lower() == target for name in declared):
         return None
     return identity, declared

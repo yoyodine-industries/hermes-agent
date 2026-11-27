@@ -113,3 +113,57 @@ def test_a_launch_that_names_a_model_is_never_re_judged(tmp_path):
     policy = _policy(tmp_path, config, provider='custom:yoyodine', model='yaan-main')
     model, runtime = _route(policy)
     assert (model, runtime['model'], runtime['base_url'].rstrip('/')) == ('yaan-main', 'yaan-main', LOCAL_7777)
+
+
+# ── the ESTATE shape: a keyed ``providers:`` table PLUS the yoyodine entry inside a legacy LIST ──
+# Every lane on this host, and the root fallback, carries this mix. The pair rule must see the legacy
+# entry: ``named_custom_provider_config_path`` names it by LIST INDEX, not by a dict key, so a
+# dict-only walk of that path reads ``None`` and the rule silently never fires.
+
+LEGACY_ESTATE = {
+    'model': {'provider': 'custom:deepseek', 'default': 'deepseek-flash', 'base_url': DEEPSEEK},
+    'providers': {'deepseek': {'api': DEEPSEEK, 'default_model': 'deepseek-flash'}},
+    'custom_providers': [{'name': 'yoyodine', 'api': LOCAL_7777, 'default_model': 'yaan-main'}],
+}
+
+
+def test_the_legacy_list_entry_is_located_by_its_indexed_config_path():
+    """Lookup regression: a legacy entry's path is an INDEX, and the raw entry still declares its model."""
+    from hermes_cli.runtime_provider_custom import (
+        config_entry_at_path, declared_models, named_custom_provider_config_path)
+    path = named_custom_provider_config_path('custom:yoyodine', LEGACY_ESTATE)
+    assert path == ('custom_providers', 0)
+    assert declared_models(config_entry_at_path(LEGACY_ESTATE, path)) == ['yaan-main']
+
+
+def test_a_model_less_provider_pick_of_a_legacy_list_entry_is_refused(tmp_path):
+    """Estate shape, provider door: a legacy ``custom:yoyodine`` declares only ``yaan-main``."""
+    from hermes_state_runtime import RuntimeStoreError
+    policy = _policy(tmp_path, LEGACY_ESTATE, provider='custom:yoyodine')
+    with pytest.raises(RuntimeStoreError) as refused:
+        policy.effective()
+    assert (refused.value.reason, refused.value.field) == ('invalid_params', 'model')
+    assert 'deepseek-flash' in refused.value.detail and 'custom:yoyodine' in refused.value.detail
+
+
+def test_a_model_less_base_url_pick_of_a_legacy_list_entry_is_refused(tmp_path):
+    """Estate shape, false-clean door: ``--base-url`` 7777 with no model used to land ``deepseek-flash``
+    there under ``yaan-main``'s weights — it must refuse now."""
+    from hermes_state_runtime import RuntimeStoreError
+    policy = _policy(tmp_path, LEGACY_ESTATE, base_url=LOCAL_7777)
+    with pytest.raises(RuntimeStoreError) as refused:
+        policy.effective()
+    assert (refused.value.reason, refused.value.field) == ('invalid_params', 'model')
+    assert 'deepseek-flash' in refused.value.detail and 'custom:yoyodine' in refused.value.detail
+
+
+def test_a_legacy_list_entry_serving_the_profile_model_still_runs(tmp_path):
+    """The rule refuses only a PROVEN conflict: a legacy entry that does declare the model runs."""
+    config = {'model': {'provider': 'custom:deepseek', 'default': 'deepseek-flash', 'base_url': DEEPSEEK},
+              'providers': {'deepseek': {'api': DEEPSEEK, 'default_model': 'deepseek-flash'}},
+              'custom_providers': [{'name': 'local', 'api': LOCAL_7777,
+                                    'default_model': 'deepseek-flash'}]}
+    policy = _policy(tmp_path, config, base_url=LOCAL_7777)
+    model, runtime = _route(policy)
+    assert (model, runtime['model'], runtime['base_url'].rstrip('/')) == (
+        'deepseek-flash', 'deepseek-flash', LOCAL_7777)
