@@ -132,6 +132,23 @@ def _not_pinned_sql(alias: str = "s") -> str:
 # own transaction with a duty-cycle yield between them, so a live turn commits between chunks.
 _ARCHIVED_MESSAGE_CHUNK_ROWS = 2000
 
+# The rows NEITHER bound may delete (ruling t_cd34976b §Q1, shared by
+# :meth:`SessionMaintenanceMixin.prune_archived_messages` and :meth:`SessionMaintenanceMixin.
+# cap_session_messages` so one policy keeps one meaning). Each row is bounded by an EVENT, not by
+# messages, and each is evidence:
+#   * ``_compressed_summary`` — a compaction SUMMARY is display history and the only semantic
+#     record of what compaction folded away;
+#   * ``effect_disposition`` — a tool call whose effect is UNKNOWN (it timed out) or was blocked;
+#   * ``display_kind = 'failed_turn'`` — the record that a turn DIED.
+_PRESERVED_MESSAGE_SQL = (
+    "COALESCE(m._compressed_summary, 0) = 0 "
+    "AND COALESCE(m.effect_disposition, '') = '' "
+    "AND COALESCE(m.display_kind, '') <> 'failed_turn'"
+)
+
+# Retention additionally requires the row to be INVISIBLE to every reader before it deletes it.
+_ARCHIVED_PRESERVED_SQL = f"m.active = 0 AND m.compacted = 1 AND {_PRESERVED_MESSAGE_SQL}"
+
 
 class SessionMaintenanceMixin:
     """Retention pruning, stale-session archiving and VACUUM policy for SessionDB."""
@@ -568,8 +585,17 @@ class SessionMaintenanceMixin:
         * ``compacted = 1`` — the compaction archive, not Undo/Rewind rows (widening to those is
           measured at +15% and deliberately deferred);
         * ``COALESCE(_compressed_summary, 0) = 0`` — a compaction SUMMARY is display history, kept;
+        * ``COALESCE(effect_disposition, '') = ''`` — an audit row: a tool call whose effect is
+          UNKNOWN (it timed out) or was blocked. Deleting it would erase the evidence;
+        * ``COALESCE(display_kind, '') <> 'failed_turn'`` — the record that a turn DIED, and the
+          evidence of exactly the failures this fleet chases;
         * ``timestamp < now - older_than_days * 86400`` — the same window, one policy, one meaning
           (``sessions.retention_days``; no second knob).
+
+        The preservation clauses are shared with :meth:`cap_session_messages` so one policy keeps
+        one meaning: neither bound may delete a summary, a tool-effect audit row or a failed-turn
+        record. Measured cost of the two evidence clauses on this host: 170 + 288 rows of 191,596
+        reachable at 14 days (0.24%), and both sets are bounded by EVENTS, not by messages.
 
         Deletes in bounded chunks, each its own ``_execute_write`` transaction (write lock released
         between chunks) with the FTS backfill's duty cycle between them, renewing the startup
@@ -588,8 +614,8 @@ class SessionMaintenanceMixin:
             return 0
         cutoff = time.time() - float(older_than_days) * 86400.0
         where = ("m.session_id IN (SELECT s.id FROM sessions s WHERE s.source IN "
-                 f"({_placeholders(source_list)})) AND m.active = 0 AND m.compacted = 1 "
-                 "AND COALESCE(m._compressed_summary, 0) = 0 AND m.timestamp < ?")
+                 f"({_placeholders(source_list)})) AND {_ARCHIVED_PRESERVED_SQL} "
+                 "AND m.timestamp < ?")
         params = (*source_list, cutoff)
 
         def _chunk(conn) -> list:
@@ -627,6 +653,180 @@ class SessionMaintenanceMixin:
                 total, older_than_days, ",".join(source_list), chunks, max_hold_ms)
         return total
 
+    def archived_unreachable_rows_by_source(
+        self, older_than_days: float, sources: Optional[tuple[str, ...]] = None,
+    ) -> dict[str, int]:
+        """The pruner's OWN predicate, counted over sessions whose ``source`` is NOT in scope —
+        i.e. what :meth:`prune_archived_messages` would delete today if that source were listed.
+
+        Purpose (ruling t_cd34976b): a scope constant that reaches nothing is INVISIBLE — the ruled
+        window ran for weeks, deleted 0 rows and reported ``pruned_archived_messages: 0`` because
+        ``MESSAGE_RETENTION_SOURCES`` named one source the store barely used. A source that appears
+        later must show up the day its archive crosses the window, not three weeks later at 6 GB,
+        so the maintenance record carries this census (and the per-run jsonl line with it).
+
+        One aggregate query per run. Returns ``{source: rows}`` with non-zero counts only; ``{}``
+        when every archived row past the window is already reachable.
+        """
+        if older_than_days is None or older_than_days < 0:
+            return {}
+        source_list = tuple(self.MESSAGE_RETENTION_SOURCES if sources is None else sources)
+        cutoff = time.time() - float(older_than_days) * 86400.0
+        # Fail-closed scope: an EMPTY tuple means the rule reaches nothing, so every source is
+        # unreachable and the census names them all (no NOT IN () — a syntax error).
+        unreachable = (f" AND s.source NOT IN ({_placeholders(source_list)})" if source_list else "")
+        sql = ("SELECT s.source AS source, COUNT(*) AS rows FROM messages m "
+               "JOIN sessions s ON s.id = m.session_id "
+               f"WHERE {_ARCHIVED_PRESERVED_SQL}{unreachable} AND m.timestamp < ? "
+               "GROUP BY s.source ORDER BY rows DESC")
+        try:
+            rows = self._read_all(sql, (*source_list, cutoff))
+        except Exception as exc:
+            logger.debug("Could not census unreachable archived rows: %s", exc)
+            return {}
+        return {str(row[0]): int(row[1]) for row in rows if row and row[0] and row[1]}
+
+    def _cap_session_chunk(self, conn, sid: str, cap: int, chunk_rows: int,
+                           *, active_only: bool = False) -> Optional[tuple[list, int]]:
+        """One chunk of :meth:`cap_session_messages`, inside the caller's write transaction.
+
+        ``None`` = a live turn lease / compression lock protects ``sid`` (skip it this pass; a later
+        pass trims it — "the live turn is unharmed" is an invariant, not a hope). Otherwise
+        ``(ids, active_deleted)``: the ids this chunk deleted and how many of them were ``active = 1``
+        (``[]``/``0`` = the session is at or under the ceiling, or every remaining candidate is
+        preserved).
+
+        ``active_only=False`` trims the archive below the newest ``cap`` rows — the running turn's
+        context is never a candidate. ``active_only=True`` is the explicit arm for a session whose
+        ACTIVE rows alone exceed ``cap``: the excess oldest active rows go. Either arm recomputes
+        the stored counters when it deletes an active row, so ``message_count`` is never silently
+        stale.
+        """
+        if self._write_guards_reject(conn, sid):
+            return None
+        total = int(conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (sid,)).fetchone()[0])
+        if total <= cap:
+            return [], 0
+        if active_only:
+            held = int(conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1",
+                (sid,)).fetchone()[0])
+            excess = held - cap
+            scope, scope_params = "m.session_id = ? AND m.active = 1", (sid,)
+        else:
+            excess = total - cap
+            boundary_row = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (sid, cap - 1)).fetchone()
+            if boundary_row is None:
+                return [], 0
+            scope, scope_params = "m.session_id = ? AND m.id < ?", (sid, boundary_row[0])
+        if excess <= 0:
+            return [], 0
+        # The SAME preservation predicate prune_archived_messages applies: summaries, tool-effect
+        # audit rows and failed-turn records are never deleted by either bound.
+        rows = conn.execute(
+            f"SELECT m.id, m.active FROM messages m WHERE {scope} AND {_PRESERVED_MESSAGE_SQL} "
+            "ORDER BY m.id ASC LIMIT ?",
+            (*scope_params, min(int(chunk_rows), int(excess)))).fetchall()
+        if not rows:
+            # Effective floor is cap + the preserved rows; report nothing rather than spin.
+            return [], 0
+        ids = [row[0] for row in rows]
+        active_deleted = sum(1 for row in rows if row[1])
+        conn.execute(f"DELETE FROM messages WHERE id IN ({_placeholders(ids)})", ids)
+        if active_deleted:
+            # Local import: hermes_state_messages carries the transcript mixin and importing it at
+            # module scope would close an import cycle through hermes_state.
+            from hermes_state_messages import _SET_COUNTERS_SQL
+            message_count, tool_call_count = self._active_transcript_counts(conn, sid)
+            conn.execute(f"{_SET_COUNTERS_SQL} WHERE id = ?",
+                         (message_count, tool_call_count, sid))
+        return ids, active_deleted
+
+    def cap_session_messages(
+        self, cap: int = 5000, chunk_rows: int = _ARCHIVED_MESSAGE_CHUNK_ROWS,
+    ) -> dict[str, Any]:
+        """Apply the per-session ceiling ``sessions.message_cap`` to stored message ROWS (ruling
+        t_cd34976b §Q2: 5,000 rows, ``0`` disables).
+
+        PRUNE TIME ONLY, never write-time rotation: this runs inside
+        :meth:`maybe_auto_prune_and_vacuum`, off the turn path, behind the maintenance lock. It
+        mutates no session identity, and it puts no DELETE in a turn's write path.
+
+        * Candidates: ``COUNT(*) > cap`` per session (one aggregate scan).
+        * Any session under a live turn lease / compression lock is SKIPPED this pass
+          (:meth:`_write_guards_reject`) and trimmed on a later one.
+        * Oldest-first, and the newest ``cap`` rows are never candidates — a running turn's context
+          is structurally untouched. Summaries, ``effect_disposition`` audit rows and
+          ``display_kind='failed_turn'`` records are never deleted, so the effective floor is
+          ``cap`` + the preserved rows.
+        * If a session's ACTIVE rows alone exceed ``cap``, the excess oldest active rows go and
+          ``message_count`` / ``tool_call_count`` are recomputed — recorded as
+          ``capped_active_rows``, never silent.
+        * Deletes in 2,000-row chunks, each its own ``_execute_write`` transaction, with the FTS
+          backfill's duty cycle between them and the startup watchdog's lease renewed per chunk —
+          the same mechanics, reused, as :meth:`prune_archived_messages`.
+
+        Returns ``{"capped_messages", "capped_active_rows", "sessions_capped", "skipped_guarded",
+        "max_lock_hold_ms"}``.
+        """
+        result: dict[str, Any] = {
+            "capped_messages": 0, "capped_active_rows": 0, "sessions_capped": 0,
+            "skipped_guarded": 0, "max_lock_hold_ms": 0.0,
+        }
+        if cap is None or int(cap) <= 0:
+            return result
+        cap = int(cap)
+        try:
+            candidates = [str(row[0]) for row in self._read_all(
+                "SELECT session_id FROM messages GROUP BY session_id HAVING COUNT(*) > ? "
+                "ORDER BY COUNT(*) DESC", (cap,))]
+        except Exception as exc:
+            logger.debug("state.db message cap: candidate scan failed: %s", exc)
+            return result
+        max_hold_ms = 0.0
+        for sid in candidates:
+            deleted_rows, deleted_active, skipped = 0, 0, False
+            for active_only in (False, True):
+                while True:
+                    # Same watchdog reasoning as the retention pass: the delete is I/O-bound with
+                    # ~zero CPU, which the CPU fallback misreads as a parked deadlock.
+                    report_startup_progress(900.0, phase="state_db_auto_cap")
+                    started = time.monotonic()
+                    chunk = self._execute_write(
+                        lambda conn, _sid=sid, _active=active_only: self._cap_session_chunk(
+                            conn, _sid, cap, chunk_rows, active_only=_active))
+                    hold_ms = (time.monotonic() - started) * 1000.0
+                    if chunk is None:  # live turn lease / compression lock
+                        skipped = True
+                        break
+                    ids, active_deleted = chunk
+                    if not ids:
+                        break
+                    max_hold_ms = max(max_hold_ms, hold_ms)
+                    deleted_rows += len(ids)
+                    deleted_active += active_deleted
+                    # Yield the write lock between chunks (the FTS backfill's duty cycle, reused):
+                    # back-to-back BEGIN IMMEDIATE chunks starve a live gateway out of its retries.
+                    time.sleep(max(self._FTS_REBUILD_MIN_PAUSE,
+                                   (hold_ms / 1000.0) * self._FTS_REBUILD_DUTY_FACTOR))
+                if skipped:
+                    break
+            if skipped:
+                result["skipped_guarded"] += 1
+                continue
+            if deleted_rows:
+                result["sessions_capped"] += 1
+                result["capped_messages"] += deleted_rows
+                result["capped_active_rows"] += deleted_active
+                logger.info(
+                    "state.db message cap: session %s trimmed %d row(s) (%d active) to the "
+                    "%d-row ceiling", sid, deleted_rows, deleted_active, cap)
+        result["max_lock_hold_ms"] = round(max_hold_ms, 3)
+        return result
+
     def _record_state_db_maintenance(self, result: dict[str, Any], now: float) -> None:
         """Persist one row per maintenance run for audit: the counters the run produced plus
         the store geometry AFTER it. Written to ``state_meta['last_state_db_maintenance']``
@@ -645,8 +845,17 @@ class SessionMaintenanceMixin:
                 "page_size": pages[1] if pages else None,
                 "freelist_count": pages[2] if pages else None,
                 "retention_days": result.get("retention_days"),
+                "message_cap": result.get("message_cap"),
                 "pruned": result.get("pruned"),
                 "pruned_archived_messages": result.get("pruned_archived_messages"),
+                # Non-empty entries only: the sources the retention SCOPE does not name, with the
+                # rows the pruner's predicate would have deleted there (visibility, not action).
+                "archived_unreachable_rows_by_source":
+                    result.get("archived_unreachable_rows_by_source") or {},
+                "capped_messages": result.get("capped_messages"),
+                "capped_active_rows": result.get("capped_active_rows"),
+                "sessions_capped": result.get("sessions_capped"),
+                "skipped_guarded": result.get("skipped_guarded"),
                 "closed": result.get("closed"),
                 "reaped_orphan_messages": result.get("reaped_orphan_messages"),
                 "fts_indexes_optimized": result.get("fts_indexes_optimized"),
@@ -893,6 +1102,7 @@ class SessionMaintenanceMixin:
         vacuum_chunk_pages: int = RECLAIM_CHUNK_PAGES,
         vacuum_max_pages_per_pass: int = RECLAIM_MAX_PAGES_PER_PASS,
         vacuum_max_seconds_per_pass: float = RECLAIM_MAX_SECONDS_PER_PASS,
+        message_cap: int = 5000,
     ) -> dict[str, Any]:
         """Idempotent startup auto-maintenance (never raises): prune inactive sessions, reap stale open
         state-owned rows, optional space reclaim.  Runs at most once per ``min_interval_hours``; the
@@ -904,10 +1114,14 @@ class SessionMaintenanceMixin:
         (``startup_orphan_reap``); they stay resumable and age from their close.  After pruning it
         applies the SAME declared window to archived message ROWS of the declared stateless sources
         (:meth:`prune_archived_messages` — rows no reader can see, which session retention cannot
-        reach for a session that never goes idle), reaps orphan ``messages`` rows
+        reach for a session that never goes idle), censuses what the retention scope COULD NOT
+        reach (:meth:`archived_unreachable_rows_by_source`), applies the per-session ceiling
+        ``sessions.message_cap`` to message rows (:meth:`cap_session_messages` — retention first,
+        cap second), reaps orphan ``messages`` rows
         (:meth:`reap_orphan_messages`) and merges BOTH FTS5 indexes (:meth:`optimize_fts`), then
         optionally reclaims; a per-run record is written by :meth:`_record_state_db_maintenance`.
-        Returns ``{"skipped", "pruned", "pruned_archived_messages", "closed",
+        Returns ``{"skipped", "pruned", "pruned_archived_messages", "archived_unreachable_rows_by_source",
+        "capped_messages", "capped_active_rows", "sessions_capped", "skipped_guarded", "closed",
         "reaped_orphan_messages", "fts_indexes_optimized", "vacuumed"}`` plus
         ``"reclaimed_bytes"`` / ``"max_lock_hold_ms"`` / ``"reclaim_mode"`` / ``"freelist_ratio"``
         when a reclaim was attempted, and ``"error"`` on failure.
@@ -923,11 +1137,14 @@ class SessionMaintenanceMixin:
         scheduler). See #54189.
         When *sessions_dir* is provided, on-disk transcript files (``.json`` / ``.jsonl`` /
         ``request_dump_*``) for pruned sessions are removed as part of the same sweep (issue #3015).
-        Messaging and UI sources are never touched here. See #54189.
+        Session pruning still never touches messaging and UI sources' SESSIONS; only their
+        archived message ROWS past the window are in reach of the message-level rule
+        (:attr:`SessionDB.MESSAGE_RETENTION_SOURCES`). See #54189.
         """
         from hermes_state_repair import _release_auto_maintenance_lock, _try_acquire_auto_maintenance_lock
         result: dict[str, Any] = {"skipped": False, "pruned": 0, "closed": 0, "vacuumed": False}
         result["retention_days"] = retention_days
+        result["message_cap"] = message_cap
         if retention_days is None or retention_days < 0:
             # A negative retention would build a future cutoff and match every ended
             # session; auto_prune=false is the disable switch, not a negative bound.
@@ -963,6 +1180,20 @@ class SessionMaintenanceMixin:
             # store's growth (~120 MB/day measured). Counts as freed rows for the admission below.
             result["pruned_archived_messages"] = archived = self.prune_archived_messages(
                 older_than_days=retention_days)
+            # Visibility, not deletion: the pruner's own predicate counted over the sources the
+            # scope does NOT name. A source that appears later shows up here — and in the per-run
+            # jsonl line — the day its archive crosses the window, instead of silently
+            # re-creating the defect where the ruled window reached nothing (ruling t_cd34976b).
+            result["archived_unreachable_rows_by_source"] = (
+                self.archived_unreachable_rows_by_source(retention_days))
+            # Per-session ceiling (ruling t_cd34976b §Q2): retention first, cap second — the cap
+            # then only has to bound what the window legitimately keeps. Its own longest lock hold
+            # is reported separately so the reclaim's max_lock_hold_ms stays honest about the
+            # VACUUM, not about a delete chunk.
+            _cap = self.cap_session_messages(cap=message_cap)
+            result["cap_max_lock_hold_ms"] = _cap.pop("max_lock_hold_ms", 0.0)
+            result.update(_cap)
+            capped = result["capped_messages"] + result["capped_active_rows"]
             report_startup_progress(900.0, phase="state_db_auto_sweep")
             closed = self.sweep_orphaned_sessions(
                 max_idle_seconds=float(retention_days) * 86400.0,
@@ -996,7 +1227,7 @@ class SessionMaintenanceMixin:
             #    gate. It is the LAST whole-file rewrite this path issues for the store.
             since_vacuum = _seconds_since(now, self.get_meta("last_vacuum"))
             vacuum_due = since_vacuum is None or since_vacuum >= min_vacuum_interval_days * 86400
-            if vacuum and (pruned > 0 or reaped > 0 or archived > 0) and vacuum_due:
+            if vacuum and (pruned > 0 or reaped > 0 or archived > 0 or capped > 0) and vacuum_due:
                 needs_migration = self._auto_vacuum_mode() != 2
                 holders: list = []
                 ratio: Optional[float] = None
@@ -1046,13 +1277,15 @@ class SessionMaintenanceMixin:
             # Record even when pruned == 0 so the throttle holds.
             self.set_meta("last_auto_prune", str(now))
             self._record_state_db_maintenance(result, now)
-            if closed or pruned > 0 or reaped > 0 or archived > 0:
+            if closed or pruned > 0 or reaped > 0 or archived > 0 or capped > 0:
                 logger.info(
                     "state.db auto-maintenance: closed %d stale open session(s), pruned %d session(s) "
-                    "inactive for %d days, deleted %d archived message row(s), reaped %d orphan "
-                    "message row(s), merged %d FTS index(es)%s",
-                    len(closed), pruned, retention_days, archived, reaped,
-                    result.get("fts_indexes_optimized") or 0,
+                    "inactive for %d days, deleted %d archived message row(s), capped %d row(s) in "
+                    "%d session(s) (%d of them active), reaped %d orphan message row(s), merged %d "
+                    "FTS index(es)%s",
+                    len(closed), pruned, retention_days, archived, capped,
+                    result.get("sessions_capped") or 0, result.get("capped_active_rows") or 0,
+                    reaped, result.get("fts_indexes_optimized") or 0,
                     " + VACUUM" if result["vacuumed"] else "")
         except Exception as exc:
             # Maintenance must never block startup.

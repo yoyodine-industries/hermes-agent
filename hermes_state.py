@@ -492,15 +492,28 @@ class SessionDB(
 
     # Message-level retention (card t_3e9bccd0): only rows owned by a session of one of these
     # sources may be deleted by :meth:`SessionMaintenanceMixin.prune_archived_messages`, and only
-    # rows no reader can see (``active = 0``, compaction-archived, not a compaction summary) — so
-    # the declared ``sessions.retention_days`` window applies to ROWS, not only to sessions, for
-    # the sources where a session-level rule structurally cannot reach (a session that never goes
-    # idle can never be pruned). Widening takes evidence that the source HAS such a session:
-    # ``api_server`` is the only one on this host — its canonical Bot Chat session held 176,834
-    # rows (62% of the store) over 43 days with only 50 of them ``active``. Every other source's
-    # sessions end and their rows age out through ``prune_sessions``. Unknown sources fail closed:
-    # a source absent from this tuple is simply out of reach of the rule (see #60609's shape).
-    MESSAGE_RETENTION_SOURCES: tuple[str, ...] = ("api_server",)
+    # rows no reader can see — the invariant is ``active = 0 AND compacted = 1`` and no summary
+    # (``_compressed_summary = 0``). Every model-facing read applies ``active = 1``
+    # (``_active_clause``), so no live turn can reference a row this rule deletes; every
+    # ``include_compacted=True`` read in the tree is a DISPLAY projection
+    # (``acp_adapter/session.py`` ``display_history``, ``gateway/session_stored_reads.py``,
+    # ``tui_gateway/session_registry.py``, ``hermes_cli/web_routers/sessions.py``), never model
+    # history. What the rule deletes is archived display history past the declared window.
+    #
+    # The tuple is the MEASURED source inventory of this host (2026-11-25: local, kanban, oneshot,
+    # tui, api_server, cron, subagent, bot_room, whatsapp), not a claim about which sources can
+    # hold a long-lived session: a ``local`` session held 365,847 rows (84.6% of the store) over
+    # 29 days with only 224 ``active``, so "sessions end and their rows age out" was false for
+    # most of the store. A NEW source must be added here when it appears; until it is, the
+    # maintenance record's ``archived_unreachable_rows_by_source`` counts what the rule would have
+    # reached and could not, so an unlisted source shows up the day its archive crosses the
+    # window instead of silently re-creating that defect. Unknown sources still fail CLOSED: a
+    # source absent from this tuple is out of reach of the rule (see #60609's shape), never a
+    # deny-list.
+    MESSAGE_RETENTION_SOURCES: tuple[str, ...] = (
+        "api_server", "local", "kanban", "oneshot", "tui", "cron", "subagent", "bot_room",
+        "whatsapp",
+    )
 
     # ── Write-contention tuning ──
     # SQLite's deterministic busy handler convoys under many hermes processes: keep its
