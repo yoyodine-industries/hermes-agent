@@ -133,6 +133,62 @@ def _profile_cron_scope(home):
         reset_hermes_home_override(home_token)
 
 
+def _act_on_restart_unknown(record: dict) -> None:
+    """Tell a consumer that an attempt died with its scheduler (card ``t_9fbcfe35``, R3).
+
+    The sweep can prove only one thing — the owner is gone and no receipt was written — so the
+    act is the same shape the reconciler uses for a settled receipt, and the pieces stay in
+    ``cron.carrier_receipts`` (one owner per behaviour): attempt to deliver the failure notice
+    through the job's normal lane, and when it cannot be delivered file the ONE idempotent
+    ``cron-carrier-orphan:<job_id>:<execution_id>`` card. A repeated restart lands on the same
+    card, so the act cannot bury the board.
+
+    Never raises: this runs from startup recovery, and a broken board or store must not stop the
+    ticker from starting (the caller's catch-all is the second line of defence, not the first).
+    """
+    try:
+        from cron import carrier_receipts as receipts
+        from cron import jobs
+
+        record = dict(record)
+        # The ledger row names its own id; the receipt-shaped act reads ``execution_id``.
+        record["execution_id"] = record.get("execution_id") or record.get("id")
+        job_id = str(record.get("job_id") or "")
+        job = jobs.get_job(job_id) if job_id else None
+        if not isinstance(job, dict):
+            # The job is gone (a one-shot that retired itself, or an operator deleted it). The
+            # attempt still happened, so its loss must still reach somewhere: a job-less record
+            # resolves no delivery lane, which routes it straight to the card.
+            job = {"id": job_id}
+        error = record.get("error")
+        outcome, delivery_error = receipts._send_notice(job, record, success=False, error=error)
+        if outcome != "failed":
+            return
+        receipts.file_orphan_card(job, record, error=error, delivery_error=delivery_error)
+    except Exception as exc:
+        logger.warning(
+            "Restart ACT for execution %s failed: %s",
+            (record or {}).get("id") if isinstance(record, dict) else record, exc,
+            exc_info=True,
+        )
+
+
+def _reconcile_carrier_receipts(*, adapters=None, loop=None) -> None:
+    """Settle the CURRENT cron home's carrier receipts; never raises (card ``t_9fbcfe35``, R2).
+
+    Idempotent and cheap (one ``listdir``, nothing to read when no receipt exists), and it refuses
+    a row whose own firer is still live, so running it every tick cannot fight the scheduler's own
+    settlement. Settlement must never become the thing that stops firing: a failure is logged and
+    the next tick retries from the receipt's own journal.
+    """
+    try:
+        from cron.carrier_receipts import reconcile_receipts
+
+        reconcile_receipts(adapters=adapters, loop=loop)
+    except Exception as exc:
+        logger.warning("Cron carrier receipt reconcile failed: %s", exc, exc_info=True)
+
+
 class CronScheduler(ABC):
     """Decides WHEN a due cron job fires. Only ``name`` + ``start`` are required; keep every other
     hook NON-abstract with a safe default (``test_abc_growth_stays_additive``)."""
@@ -170,10 +226,28 @@ class CronScheduler(ABC):
         return
 
     def recover_interrupted(self) -> int:
-        """Run profile-local attempt recovery for every provider lifecycle."""
+        """Run profile-local attempt recovery for every provider lifecycle.
+
+        Each row the sweep marks ``unknown`` with no receipt gets the restart ACT (card
+        ``t_9fbcfe35``, R3) — a notice, or the one idempotent orphan card when the notice cannot be
+        delivered — and every due carrier receipt is settled. Both are best-effort: a broken board
+        must not stop the ticker from starting.
+        """
         from cron.executions import recover_interrupted_executions
 
-        return recover_interrupted_executions()
+        recovered = recover_interrupted_executions()
+        # The count carries the rows it marked that have NO receipt (``RecoveredAttempts``): their
+        # outcome now belongs to nobody, so this is the only place that can speak for them.
+        for record in getattr(recovered, "receiptless", ()):
+            try:
+                _act_on_restart_unknown(record)
+            except Exception as exc:
+                logger.warning(
+                    "Restart ACT for execution %s failed: %s", record.get("id"), exc,
+                    exc_info=True,
+                )
+        _reconcile_carrier_receipts()
+        return recovered
 
     @property
     def supports_force_fire(self) -> bool:
@@ -498,6 +572,10 @@ class InProcessCronScheduler(CronScheduler):
                     note_held()
                 else:
                     note_dispatching()
+                    # R2: settle carrier receipts whose run ended while no scheduler was
+                    # watching it. Idempotent, one listdir when there is nothing to do, and it
+                    # never raises — settlement must not be the thing that stops firing.
+                    _reconcile_carrier_receipts(adapters=adapters, loop=loop)
                     cron_tick(
                         verbose=False, adapters=adapters, loop=loop, sync=False,
                         can_dispatch=can_dispatch,
@@ -636,8 +714,12 @@ class InProcessCronScheduler(CronScheduler):
                         try:
                             with _profile_cron_scope(home):
                                 note_dispatching()
+                                _tick_adapters = tick_adapters_for(_pname)
+                                # R2, per profile: the receipts dir resolves from the profile
+                                # this scope selects. Never raises (see the helper).
+                                _reconcile_carrier_receipts(adapters=_tick_adapters, loop=loop)
                                 cron_tick(
-                                    verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
+                                    verbose=False, adapters=_tick_adapters, loop=loop,
                                     sync=False, can_dispatch=can_dispatch,
                                 )
                         except (CronTickYielded, CronSubstrateDenied) as e:
