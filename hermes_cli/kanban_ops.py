@@ -205,8 +205,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
-               for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
-                         "reaped_terminal_workers")},
+               for k in ("reclaimed", "reclaimed_orphaned", "crashed", "timed_out", "stale",
+                         "auto_blocked", "promoted", "reaped_terminal_workers")},
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
             ],
@@ -277,6 +277,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for line in order_lines:
         print(line)
     print(f"Reclaimed:    {res.reclaimed}")
+    # Beside it, never inside it: a claim released on a SETTLED row is a different act (no
+    # failure booked, status kept) and it is the only output line that shows a `ready` card
+    # the board had lost. Printed unconditionally so a zero needs no interpretation and a
+    # release-only tick can never read as "Reclaimed: 0" with nothing else to say.
+    print(f"Reclaimed orphaned (settled row): {getattr(res, 'reclaimed_orphaned', 0)}")
     if res.reaped_terminal_workers:
         print(f"Reaped workers of finished tasks: {', '.join(res.reaped_terminal_workers)}")
     for label, items in (

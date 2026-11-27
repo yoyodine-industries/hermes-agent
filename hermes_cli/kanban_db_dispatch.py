@@ -1044,6 +1044,10 @@ class DispatchResult:
     """
 
     reclaimed: int = 0
+    reclaimed_orphaned: int = 0
+    """Claims released on rows that were no longer ``running`` (``release_orphaned_claims``):
+    residue that :func:`release_stale_claims` cannot see and that made a ``ready`` card
+    invisible to dispatch. Expected to be 0 in the steady state."""
     promoted: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
@@ -7222,6 +7226,10 @@ def _run_reclaim_phase(
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
+    # Residue the running-scoped reclaim above cannot see: a claim left on a row that a later
+    # path settled to ready/review/blocked. Release it before promotion, so a row this pass
+    # frees is dispatchable in the SAME tick.
+    result.reclaimed_orphaned = _kb.release_orphaned_claims(conn)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)

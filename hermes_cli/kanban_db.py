@@ -364,7 +364,8 @@ def notify_task_updated(
 
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
-    "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
+    "spawned", "reclaimed", "reclaimed_orphaned", "promoted", "reconciled_orphans",
+    "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable", "skipped_self_review",
@@ -5035,6 +5036,10 @@ def release_stale_claims(
 ) -> int:
     """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed.
 
+    Scoped to ``running`` by construction. A claim left on a SETTLED row (one that a later
+    path moved to ``ready`` / ``review`` / ``blocked``) is out of this function's reach and
+    is released by :func:`release_orphaned_claims`.
+
     Every reclaim that actually releases a claim is a non-success attempt and
     is booked through ``_record_task_failure`` (#111306): a claim that expired
     without a worker ever spawning otherwise loops claim -> reclaim -> claim
@@ -5146,6 +5151,65 @@ def release_stale_claims(
                 heartbeat_stale=bool(heartbeat_stale), retry_status=retry_status,
             )
     return reclaimed
+
+
+def release_orphaned_claims(conn: sqlite3.Connection) -> int:
+    """Release claim residue on rows that are no longer ``running``; returns the count released.
+
+    A claim can OUTLIVE the status it was taken in. A worker that dies mid-run leaves
+    ``claim_lock`` / ``claim_expires`` / ``worker_pid`` behind, and a later path settles the
+    card around that residue -- a receipt closes the attempt, a lane's reclaim pass requeues
+    it, a review is handed on -- without any of them owning the lock. On a SETTLED row the
+    residue is unowned and invisible to every reader:
+
+    * :func:`release_stale_claims` is scoped ``status = 'running'``;
+    * ``_reclaim_dead_workers`` (the crash sweep) also scans only ``running`` rows;
+    * dispatch claims only ``status = 'ready' AND claim_lock IS NULL``, and the review
+      hand-off the same way -- so the row is never picked up again, and nothing on the host
+      reports it.
+
+    Measured on the platform board 2026-11-15: 8 cards (7 ``ready``, 1 ``review``) held an
+    expired claim whose worker pid was gone, the oldest expired 3h13m earlier; no verb could
+    release them and a ``ready`` card holding one is invisible to dispatch forever.
+
+    The release is deliberately NARROWER than a reclaim. The attempt is already over and its
+    outcome is already recorded on the card, so this clears the claim fields and appends an
+    event. It does NOT touch ``status`` -- a ``review`` card must not be bounced back to
+    ``ready`` -- and it does NOT book a failure: residue is not an attempt that failed, so
+    ``consecutive_failures`` / ``last_failure_error`` are left alone. Booking one would hand
+    the breaker a failure nobody made.
+    """
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT id, status, claim_lock, claim_expires, worker_pid FROM tasks "
+        "WHERE status <> 'running' "
+        "  AND claim_lock IS NOT NULL AND claim_lock <> '' "
+        "  AND claim_expires IS NOT NULL AND claim_expires < ?",
+        (now,),
+    ).fetchall()
+    released = 0
+    for row in rows:
+        with write_txn(conn):
+            # CAS on the exact lock AND expiry read above: a concurrent re-claim (which moves
+            # both) wins cleanly and this row is left for the next tick.
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_started_at = NULL "
+                "WHERE id = ? AND claim_lock IS ? AND claim_expires IS ?",
+                (row["id"], row["claim_lock"], row["claim_expires"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(conn, row["id"], "claim_released_orphaned", {
+                "status_kept": row["status"],
+                "stale_lock": row["claim_lock"],
+                "worker_pid": _opt_int(row["worker_pid"]),
+                "claim_expires": _to_epoch(row["claim_expires"]),
+                "expired_for_seconds": now - int(row["claim_expires"]),
+                "now": now,
+            })
+        released += 1
+    return released
 
 
 def _record_reclaim(
