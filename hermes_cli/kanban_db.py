@@ -717,15 +717,41 @@ def unregistered_board_refusal(slug: str) -> str:
     (``tools.kanban_tools._board``) and the CLI ``--board`` guard — so the messages
     cannot drift apart. A duplicated string here is a drift bug: the doors would then
     disagree about which slug is refused and why.
+
+    It PRINTS THE REGISTERED SET (card t_62917d87). A refusal that only tells the caller to
+    run a CLI makes the door's config error look like the caller's homework, and a caller
+    holding no board list has no way to find one; the set is the remedy, read from the
+    register at the moment of refusal (:func:`registered_board_slugs`), so a default that
+    names a slug nobody registered fails HERE — with the names that do work — instead of
+    later, in a refusal the caller cannot act on.
+
+    Neither the refusal nor the set re-targets: the caller named a board, and the answer is
+    that board's refusal, never a silent substitution of one from the set.
     """
+    registered = _registered_board_listing()
     return (
         f"refusing to file on board {slug!r}: no board by that name is "
         f"registered under {boards_root()} (no board.json). A filing never "
         f"mints a board, so a name-shaped slug — a lane handle or a profile "
-        f"display name — cannot silently become an estate. Register it with "
+        f"display name — cannot silently become an estate, and this door will "
+        f"NOT file elsewhere on your behalf. Registered boards: {registered}. "
+        f"Name one of those, register {slug!r} with "
         f"`hermes kanban boards create {slug}`, or omit `board` to file on "
         f"the source card's board (else {DEFAULT_BOARD!r})."
     )
+
+
+def _registered_board_listing() -> str:
+    """The register's slugs for a refusal, comma-separated; never raises.
+
+    A refusal must not become a traceback: if the register cannot be read, the message
+    degrades to the one board registered by construction rather than failing to build.
+    """
+    try:
+        slugs = registered_board_slugs()
+    except Exception:  # noqa: BLE001 - a listing failure must not mask the refusal
+        slugs = [DEFAULT_BOARD]
+    return ", ".join(slugs) if slugs else DEFAULT_BOARD
 
 
 def _require_registered_board(board: str) -> str:
@@ -8939,6 +8965,7 @@ from hermes_cli.kanban_db_boards import (
     create_board,
     list_boards,
     read_board_metadata,
+    registered_board_slugs,
     remove_board,
     write_board_metadata,
 )
