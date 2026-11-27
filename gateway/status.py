@@ -1380,7 +1380,7 @@ def _prepare_runtime_status_update(
     error_code: Any = _UNSET, error_message: Any = _UNSET, needs_attention: Any = _UNSET,
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
     parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
-    platform_metrics: Any = _UNSET,
+    platform_metrics: Any = _UNSET, startup: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None, keep_platforms: Iterable[str] = (),
     load_existing: bool = True, reload_existing: bool = False,
@@ -1427,6 +1427,12 @@ def _prepare_runtime_status_update(
             ("parked_profiles", parked_profiles, lambda v: {str(k): str(r) for k, r in dict(v or {}).items()}),
             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
             ("session_store", session_store, _coerce_session_store),
+            # The cold-start lease (gateway/startup_progress.py): {pid, boot_started_at, phase,
+            # phase_started_at, phase_expected_s, ready_by, renewals, ready_at}. Owned by this writer
+            # so the early write and every later one land through the same merge — and because this
+            # function stamps the CURRENT pid/argv/start_time over any merged record, which is what
+            # makes publishing before the stores are open safe.
+            ("startup", startup, lambda v: dict(v) if isinstance(v, dict) else None),
         ))
         if platform is not _UNSET:
             platform_payload = copy.deepcopy(payload["platforms"].get(platform, {}))

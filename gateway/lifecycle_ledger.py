@@ -153,8 +153,21 @@ def _suspected_oom(mem: dict[str, Any]) -> bool:
     )
 
 
+_pending_unclean_evidence: Optional[dict[str, Any]] = None
+
+
 def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
-    """Evidence dict when the previous life died uncleanly, else ``None``. Read-only."""
+    """Evidence dict when the previous life died uncleanly, else ``None``. Read-only.
+
+    Evidence captured by :func:`claim_starting` before it overwrote the sentinel is returned
+    first (single use): at a gateway boot the "starting" claim happens minutes before the
+    ``record_startup`` that reports it, and the sentinel it replaced was the only proof the
+    predecessor died.
+    """
+    global _pending_unclean_evidence
+    if _pending_unclean_evidence is not None:
+        evidence, _pending_unclean_evidence = _pending_unclean_evidence, None
+        return evidence
     sentinel = _read_json(get_lifecycle_sentinel_path(home))
     if not sentinel or sentinel.get("phase") != "running":
         return None
@@ -359,6 +372,40 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
     return evidence
 
 
+def claim_starting(home: Optional[Path] = None) -> None:
+    """Cycle the sentinel to ``phase="starting"`` for THIS life at the PID-file claim.
+
+    A cold start can take minutes before ``record_startup`` claims ``phase="running"``; without
+    this, every reader of ``state/gateway.lifecycle.json`` sees the PREVIOUS (dead) pid as
+    ``running`` for the whole window. The previous life's unclean-exit evidence is captured
+    HERE, before the sentinel is overwritten, and handed to the later :func:`record_startup`
+    through ``_pending_unclean_evidence`` — otherwise the starting claim would erase the only
+    proof that a SIGKILL/OOM'd predecessor ever ran. Best-effort; never raises.
+    """
+    global _pending_unclean_evidence
+    evidence: Optional[dict[str, Any]] = None
+    try:
+        evidence = detect_unclean_exit(home)
+    except Exception:
+        logger.debug("Unclean-exit detection at the starting claim failed", exc_info=True)
+    try:
+        from hermes_state_pidns import pid_namespace_id
+
+        claim: dict[str, Any] = {"phase": "starting", "pid": os.getpid(),
+                                 "pidns": pid_namespace_id(), "start_time": time.time(),
+                                 "started_at": _now_iso()}
+        from hermes_cli.process_identity import _process_create_time
+
+        create_time = _process_create_time(os.getpid())
+        if create_time is not None:
+            claim["create_time"] = create_time
+        _write_sentinel(claim, home)
+    except Exception:
+        logger.debug("Failed to claim the starting lifecycle sentinel", exc_info=True)
+    if evidence is not None:
+        _pending_unclean_evidence = evidence
+
+
 def run_deferred_integrity_check(
     evidence: Optional[dict[str, Any]], *, home: Optional[Path] = None,
     deadline_s: float = STATE_DB_INTEGRITY_DEADLINE_S,
@@ -486,7 +533,8 @@ def read_prior_exit_label(profile_home: Path) -> str:
     """``clean``/``unclean``/``unknown`` for the profile's last gateway life; annotates
     ``container-boot.log``.  ``running`` is unclean: the old PID namespace is gone at container boot."""
     try:
-        phase = (_read_json(get_lifecycle_sentinel_path(profile_home)) or {}).get("phase")
-        return {"exited": "clean", "running": "unclean"}.get(phase, "unknown")
+        phase = str((_read_json(get_lifecycle_sentinel_path(profile_home)) or {}).get("phase") or "")
+        # "starting" is a life that claimed the host and died before it ever ran: unclean too.
+        return {"exited": "clean", "running": "unclean", "starting": "unclean"}.get(phase, "unknown")
     except Exception:
         return "unknown"

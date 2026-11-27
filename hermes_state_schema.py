@@ -19,7 +19,6 @@ from typing import Dict, List, Optional, Sequence
 
 from hermes_constants import get_hermes_home
 from hermes_state_legacy_refusal import LEGACY_REFUSAL_REPAIR_DONE, advance_legacy_refusal_repair
-from hermes_startup_watchdog import report_startup_progress
 from utils import safe_json_loads
 from hermes_state_common import (
     DEFERRED_INDEX_SQL, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, FTS_SQL,
@@ -947,17 +946,12 @@ class SessionSchemaMixin:
         """Create tables and FTS if missing, reconcile columns, run data migrations. Column
         additions are declarative via _reconcile_columns(), so reordered migrations can
         never skip a column; schema_version remains for data migrations only."""
-        # Startup-watchdog lease: on multi-GB files this is I/O-bound (near-zero CPU), which
-        # the watchdog's CPU fallback would misread as a parked deadlock.
-        # Declare a startup-watchdog progress lease before potentially long synchronous work: on multi-GB
-        # state.db files the reconciliation + version-gated data migrations below are legitimately slow and
-        # can be I/O-bound (near-zero CPU), which the watchdog's CPU fallback would misread as a parked
-        # deadlock (OOF-298 / PR #89750). Single lease is deliberate: this is the one pre-loop phase that
-        # can legitimately exceed the 300s default deadline (multi-GB DBs), and the lease is clamped to
-        # _MAX_LEASE_S=900. Honest worst case: a genuinely wedged DB init delays supervisor respawn by up to
-        # the lease duration. Per-chunk renewal would shrink that, but adds complexity to the migration
-        # loops for a rare failure mode.
-        report_startup_progress(600.0, phase="state_db_init_schema")
+        # Startup-watchdog lease: the gateway's ``store_open`` phase owns it (gateway/startup_progress.py
+        # publishes it at the PID claim, before the stores are opened, and its heartbeat renews it while
+        # SQLite is opening). This method claims NO lease of its own: it runs for every store on every
+        # boot, and the unconditional 600 s claim that used to sit here bought a 10-minute watchdog
+        # extension for a no-op schema check — indistinguishable, to a client, from real progress. The
+        # version-gated lease in _run_data_migrations is the one exception: that chain IS long when it runs.
         cursor = self._conn.cursor()
         cursor.executescript(SCHEMA_SQL)
         # Before the table rebuilds below: renaming a table re-parses every trigger, and the retired
@@ -1068,8 +1062,16 @@ class SessionSchemaMixin:
     def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:
         """Version-gated chain for DATA migrations only (row backfills); column additions never
         belong here. Advances schema_version at the end unless FTS5 is unavailable."""
-        # Renew the lease: the chain can rewrite whole tables on large DBs.
-        report_startup_progress(600.0, phase="state_db_data_migrations")
+        if current_version < SCHEMA_VERSION:
+            # The chain can rewrite whole tables on large DBs, so it owns its phase's lease — but
+            # ONLY when it has work. A store already at SCHEMA_VERSION must not buy a 10-minute
+            # startup-watchdog claim: that unconditional claim is what made a no-op boot look like
+            # steady progress. advance_startup_phase publishes the phase (and renews its ready_by)
+            # on a gateway boot, and hands the SAME budget to the watchdog; outside a gateway boot
+            # (a CLI command opening the store) it only claims the watchdog lease.
+            from gateway.startup_progress import PHASE_DATA_MIGRATIONS, advance_startup_phase
+
+            advance_startup_phase(PHASE_DATA_MIGRATIONS)
         # (v10 trigram backfill and v11 inline FTS re-index were superseded by v23 and removed.)
         # v11 (SUPERSEDED by v23): re-index FTS5 tables to cover tool_name + tool_calls in inline mode
         # (#16751). v23 drops and rebuilds both FTS tables in external-content form, so running the v11
