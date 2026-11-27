@@ -407,11 +407,24 @@ def record_missed_occurrences(
     return record
 
 
-def recover_receipted_execution(execution_id, job_id, *, success, error=None, delivery_outcome=None):
-    """Settle a verified canonical receipt after owner loss, including its unknown audit row.
+def settle_carrier_receipt(
+    execution_id: str, job_id: str, *, success: bool,
+    error: Optional[str] = None, delivery_outcome: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Write the terminal verdict of an attempt nobody's live firer still owns.
 
-    Terminal verdicts stay immutable. A live firer still owns its bookkeeping
-    (``execution_owner_live``).
+    ONE door for both receipts of a departed owner: the carrier's own receipt
+    (``cron.carrier_receipts``, R2) and a verified canonical journal
+    (``recover_receipted_execution``) settle through this function, so a settled attempt has one
+    shape rather than two. It accepts ``claimed``, ``running`` and ``unknown`` — an ``unknown`` row
+    is exactly what a departed owner leaves behind — and refuses:
+
+    * a LIVE owner's row (``_row_owner_live``): the firer is still in flight and its own
+      bookkeeping wins, so this never terminalizes a run out from under itself;
+    * a terminal row: terminal states are immutable, which the UPDATE's own status fence enforces.
+
+    Emits the state transition (``_emit_execution_state``) and, on success, records the finish the
+    way the ledger records every other one (``record_cron_finish``).
     """
     from cron.jobs_error_text import sanitize_persisted_error
 
@@ -421,15 +434,28 @@ def recover_receipted_execution(execution_id, job_id, *, success, error=None, de
         row = _recoverable_row(conn, execution_id, job_id)
         if row is None or _row_owner_live(row):
             return None
-        conn.execute(
+        cur = conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?, handoff_pending=0,
-               handoff_started_at=NULL, delivery_outcome=? WHERE id=?""",
+               handoff_started_at=NULL, delivery_outcome=?
+               WHERE id=? AND status IN ('claimed','running','unknown')""",
             ('completed' if success else 'failed', now, detail, delivery_outcome, execution_id))
+        if cur.rowcount != 1:
+            return None
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
     return record
+
+
+def recover_receipted_execution(execution_id, job_id, *, success, error=None, delivery_outcome=None):
+    """Settle a verified canonical receipt after owner loss, including its unknown audit row.
+
+    Same door as :func:`settle_carrier_receipt` (which the carrier's receipts use): terminal
+    verdicts stay immutable, and a live firer still owns its bookkeeping.
+    """
+    return settle_carrier_receipt(
+        execution_id, job_id, success=success, error=error, delivery_outcome=delivery_outcome)
 
 
 def _recoverable_row(conn, execution_id, job_id):
@@ -492,20 +518,93 @@ def settle_unstarted_execution(execution_id: str, job_id: str, error: str) -> No
                      job_id, execution_id, error, record_err)
 
 
-def recover_interrupted_executions() -> int:
+def _carrier_receipt(execution_id: str) -> Optional[dict[str, Any]]:
+    """The attempt's own receipt, or None when there is none this process can read.
+
+    Late import, like every other cron import on this path: a scheduler daemon that outlives an
+    on-disk upgrade already has the old ``cron`` package cached, and the receipts module may not be
+    installed at all. Either way the sweep must fall back to today's behaviour (no receipt) instead
+    of failing — recovery is the last thing that may break.
+    """
+    try:
+        from cron import carrier_receipts
+    except Exception as exc:
+        logger.debug("carrier receipts unavailable (%s); sweeping without them", exc)
+        return None
+    try:
+        receipt = carrier_receipts.read_receipt(execution_id)
+    except Exception as exc:
+        logger.debug("carrier receipt %s could not be read (%s); treated as absent",
+                     execution_id, exc)
+        return None
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _carrier_still_running(receipt: Optional[dict[str, Any]]) -> bool:
+    """Whether *receipt* proves the attempt's carrier is STILL EXECUTING (R3).
+
+    A receipt that says ``running`` with a live ``carrier_pid`` is proof the run is alive, not
+    abandoned: terminalizing it here is the 02:43 premature ``unknown`` that started this card.
+    Liveness is ``cron.carrier_receipts``'s own test, so a pid reused by an unrelated process
+    cannot masquerade as the carrier. It fails SAFE — liveness that cannot be proved either way
+    counts as running, because rewriting a live run is the bug and deferring a dead one costs a
+    tick. A receipt whose status is ``exited`` is not "still running": it is settled by the
+    reconciler from its exit code.
+    """
+    if not isinstance(receipt, dict):
+        return False
+    try:
+        from cron import carrier_receipts
+
+        if str(receipt.get("status") or "") != carrier_receipts.STATUS_RUNNING:
+            return False
+        return bool(carrier_receipts._carrier_is_live(receipt))
+    except Exception as exc:
+        logger.debug("carrier receipt %s could not be judged (%s); treated as running",
+                     receipt.get("execution_id"), exc)
+        return True
+
+
+class RecoveredAttempts(int):
+    """What one sweep did: the count (as ever) plus the rows that need the startup ACT.
+
+    ``recover_interrupted_executions`` has always returned the number of attempts it settled, and
+    every caller compares it (or prints ``%d``). Keeping that identical is why this is an ``int``
+    and not a new result type: ``== 1`` and ``Marked %d ...`` keep working untouched.
+
+    ``receiptless`` carries the records the sweep marked ``unknown`` that have NO carrier receipt —
+    the attempts whose outcome now belongs to nobody, so the caller's restart ACT must speak for
+    them (card ``t_9fbcfe35``, R3). A test double returning a plain ``int`` simply has none.
+    """
+
+    receiptless: tuple = ()
+
+    def __new__(cls, count: int, receiptless=()):
+        self = super().__new__(cls, count)
+        self.receiptless = tuple(receiptless)
+        return self
+
+
+def recover_interrupted_executions() -> RecoveredAttempts:
     """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
     dead, plus rows whose live owner holds a claim older than the derived stale bound (the
-    process is not killed)."""
+    process is not killed).
+
+    Returns the count — an ``int``, as it always was — whose ``receiptless`` attribute lists the
+    rows a caller may act on (see :class:`RecoveredAttempts`). A row is only *skipped* when its own
+    receipt proves the carrier is still running: the 02:43 premature ``unknown`` is exactly that row.
+    """
     now = _hermes_now().isoformat()
     changed = 0
     recovered: list[dict[str, Any]] = []
+    acted: list[dict[str, Any]] = []
     # Derived on the first live-owned row only: the bound reads config, and the idle gateway
     # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
     stale_after: Optional[float] = None
     stale_after_resolved = False
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, status, process_id, pid, process_started_at,
+            """SELECT id, job_id, status, process_id, pid, process_started_at,
                       handoff_pending, handoff_started_at, claimed_at, progress_at
                FROM executions
                WHERE status IN ('claimed','running')"""
@@ -514,6 +613,7 @@ def recover_interrupted_executions() -> int:
             if row["process_id"] == _PROCESS_ID:
                 continue
             reason = _OWNER_GONE_REASON
+            receipt: Optional[dict[str, Any]] = None
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 # A live owner is normally a legitimately running job. A worker permanently
                 # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
@@ -534,6 +634,17 @@ def recover_interrupted_executions() -> int:
                 ):
                     continue
                 reason = _OWNER_WEDGED_REASON
+            else:
+                # R3: the OWNER went with the scheduler, but the RUN can outlive it. Consulted
+                # only for a provably-dead owner — a live owner's row is its own firer's to
+                # settle, and the wedged branch above is deliberately unchanged (#115692).
+                receipt = _carrier_receipt(row["id"])
+                if _carrier_still_running(receipt):
+                    logger.info(
+                        "Execution %s (job %s): owner is gone but its carrier is still running "
+                        "per its receipt; left %r for the reconciler",
+                        row["id"], row["job_id"], row["status"])
+                    continue
             handoff_started_at = row["handoff_started_at"]
             if (
                 row["handoff_pending"]
@@ -561,11 +672,13 @@ def recover_interrupted_executions() -> int:
                 record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)
+                    if receipt is None:
+                        acted.append(record)
         if changed:
             _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
-    return changed
+    return RecoveredAttempts(changed, acted)
 
 
 def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
