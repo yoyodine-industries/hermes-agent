@@ -141,6 +141,11 @@ async def test_a_refused_receipt_names_its_failing_check_in_the_log(tmp_path, mo
         assert any(clause in message for message in recovery), recovery
         assert len(recovery) == 1, f'one boot warning per refused receipt: {recovery}'
         caplog.clear()
+        # The retry is BOUNDED with exponential backoff (#t_0b90f1db): a repeat restore inside the
+        # window is refused from the record without a store read or a second line. Step past the
+        # window so this is a NEW attempt — an attempt is what names the failing check.
+        from gateway import session_local_recovery as recovery
+        monkeypatch.setattr(recovery, '_monotonic', lambda: 1e12)
         with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
             restore_local_session(cold, ref.session_id)
     resumed = [r.getMessage() for r in caplog.records if ref.session_id in r.getMessage()]

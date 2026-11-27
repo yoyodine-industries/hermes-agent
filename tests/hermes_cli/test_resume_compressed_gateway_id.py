@@ -136,8 +136,9 @@ def test_resume_of_a_compressed_root_addresses_the_receipt_owner(rig, path, monk
 
 
 def test_the_tip_segment_alone_still_has_no_receipt(rig):
-    """The receipt check is not weakened: addressing the physical segment is still refused by name."""
+    """The receipt check is not weakened: addressing the physical segment is still refused by name —
+    and by the class that says the row does not exist (``not_found``), never a storage outage."""
     from hermes_state_runtime import RuntimeStoreError
     with pytest.raises(RuntimeStoreError) as refused:
         _gateway_accepts(rig, 'seg-3')
-    assert refused.value.reason == 'storage_unavailable'
+    assert refused.value.reason == 'not_found'
