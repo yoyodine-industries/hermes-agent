@@ -11,6 +11,7 @@ import errno
 import hashlib
 import itertools
 import json
+from collections import Counter
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar, copy_context
 from functools import wraps
@@ -834,8 +835,36 @@ def _gate_route_label(route: Any) -> str:
     return str(route or "")[:80]
 
 
+def _host_load_gauge() -> dict[str, Any]:
+    """Host pressure published BESIDE the agent-work gate, never read by it.
+
+    A gauge for operators only (t_4ee24aa2): admission is count-only by decision, so nothing
+    here can refuse a request. The load read is guarded because status publication must never
+    fail on a diagnostic -- an unsupported platform (or a load average the kernel will not
+    answer) yields ``null``s, not an exception.
+    """
+    cpu_count = os.cpu_count() or 0
+    gauge: dict[str, Any] = {
+        "cpu_count": cpu_count, "load1": None, "load5": None, "load15": None,
+        "load1_per_core": None,
+    }
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except (OSError, AttributeError, NotImplementedError):
+        return gauge
+    gauge.update(load1=load1, load5=load5, load15=load15)
+    if cpu_count > 0:
+        gauge["load1_per_core"] = round(load1 / cpu_count, 2)
+    return gauge
+
+
 def _gate_holders_summary(snapshot: dict[str, Any], limit: int = 4) -> list[str]:
-    """The oldest few gate holders, in a shape that fits on one log line."""
+    """The oldest few gate holders and who they belong to, in a shape that fits on one log line.
+
+    The last fragment is the CONCENTRATION (t_4ee24aa2): the shape that caused a refusal
+    (16/16 slots held by one session) is invisible in a per-holder list without counting
+    ``session_id=`` repetitions by eye, so the top three sessions are named by count.
+    """
     holders = snapshot.get("holders") or []
     summary: list[str] = []
     for holder in holders[:limit]:
@@ -847,6 +876,10 @@ def _gate_holders_summary(snapshot: dict[str, Any], limit: int = 4) -> list[str]
         summary.append(" ".join(bits))
     if len(holders) > limit:
         summary.append(f"+{len(holders) - limit} more")
+    counts = Counter(str(holder.get("session_id") or "") for holder in holders)
+    counts.pop("", None)  # an unattributed holder belongs to no session
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+    summary.append("top_sessions=[" + ", ".join(f"{sid[:12]}={n}" for sid, n in ranked) + "]")
     return summary
 
 
@@ -1562,7 +1595,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._reset_metrics_if_needed()
         heartbeat = self._metrics_last_heartbeat_at if heartbeat_at is None else heartbeat_at
         return {
-            "host": self._host,
+            # ``host`` is host PRESSURE, published beside the gate as a GAUGE (t_4ee24aa2):
+            # admission is count-only by decision and never reads it. The bind address it used
+            # to hold is ``bind_host`` so a reader cannot mistake one for the other.
+            "host": _host_load_gauge(),
+            "bind_host": self._host,
             "port": self._port,
             "active_runs": self._live_api_run_count(),
             # The non-terminal ROW census, named as rows (R2): a leaked row can only move this
