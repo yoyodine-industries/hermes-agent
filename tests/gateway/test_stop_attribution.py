@@ -243,7 +243,9 @@ def test_kind_and_lull_gate_are_bounded(home: Path) -> None:
                                     home=home)
     record = _records(home)[0]
     assert record["tag"] == "gateway.stop_requested" and record["stop_id"] == stop_id
-    assert record["requester"]["kind"] == "unknown"
+    # ``supervisor`` is in the ruled vocabulary: the service-manager stops (t_4feca434) must be
+    # nameable, so it must not be coerced to ``unknown``.
+    assert record["requester"]["kind"] == "supervisor"
     assert record["delivery"] == {"method": "s6", "raw": None}
 
 

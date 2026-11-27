@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 # than silently widening the vocabulary, so a reader can always enumerate a stop's cause.
 STOP_KINDS = (
     "cli_stop", "replace_takeover", "update", "dashboard", "window", "maintenance",
-    "launchd", "operator", "unknown",
+    "launchd", "supervisor", "operator", "unknown",
 )
 DEFAULT_STOP_KIND = "unknown"
 # Whether a zero-work lull was consulted before the delivery. ``not_consulted`` is the honest
