@@ -792,7 +792,9 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
                 raise RuntimeError(
                     f"internal wake refused for session {session_id}: the gateway is draining")
             # Transient: the cap clears on its own, exactly as the HTTP self-post's 429 does.
-            if self._concurrency_limited_response() is not None:
+            # No HTTP request exists here, so the surface is named literally: a refusal with
+            # "unknown-route" would be a diagnostic that names nothing (t_4ee24aa2).
+            if self._concurrency_limited_response(route="internal wake") is not None:
                 last_err = RuntimeError(
                     "internal wake deferred: the API server is at its concurrent-run cap")
                 logger.warning("%s; attempt %d/%d", last_err, attempt + 1, attempts)
@@ -890,6 +892,7 @@ async def _admit_run_to_authority(
 async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs — start an agent run, return run_id immediately."""
     _openai_error = _api_server._openai_error
+    from gateway.platforms.api_server import _request_route_label
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
     if key_err is not None:
@@ -943,7 +946,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         if outcome == "conflict" or (outcome == "reused" and record is not None):
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
     # Enforce concurrency only for a genuinely new run.
-    limited = self._concurrency_limited_response()
+    limited = self._concurrency_limited_response(route=_request_route_label(request))
     if limited is not None:
         return limited
     run_id = f"run_{uuid.uuid4().hex}"

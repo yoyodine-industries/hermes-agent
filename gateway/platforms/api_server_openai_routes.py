@@ -886,9 +886,9 @@ class OpenAICompatRoutesMixin:
         from gateway.platforms.api_server import (
             ThreadSafeAsyncQueue, _api_request_profile, _chat_usage_payload, _coerce_request_bool,
             _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
-            _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
+            _openai_error, _redact_api_error_text, _request_route_label, _resolve_media_to_data_urls)
         # Bound total in-flight agent runs (configurable; #7483).
-        limited = self._concurrency_limited_response()
+        limited = self._concurrency_limited_response(route=_request_route_label(request))
         if limited is not None:
             return limited
         try:
@@ -1397,9 +1397,9 @@ class OpenAICompatRoutesMixin:
         from gateway.platforms.api_server import (
             ThreadSafeAsyncQueue, _coerce_request_bool,
             _error_response, _invalid_request, _redact_api_error_text,
-            _resolve_media_to_data_urls, _responses_usage_payload)
+            _request_route_label, _resolve_media_to_data_urls, _responses_usage_payload)
         # Bound total in-flight agent runs (configurable; #7483).
-        limited = self._concurrency_limited_response()
+        limited = self._concurrency_limited_response(route=_request_route_label(request))
         if limited is not None:
             return limited
         gateway_session_key, key_err = self._parse_session_key_header(request)
