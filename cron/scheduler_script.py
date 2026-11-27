@@ -66,6 +66,17 @@ def _timeout_from_env_or_config(
     return None
 
 
+#: The U2 kill switch (``cron.carrier_supervisor``). ``0`` restores the direct Popen path byte for
+#: byte.  Read through ``cron_env_setting`` - this module's own convention - so a multiplexed tick
+#: sees the SERVING profile's value, not the launch process's ``os.environ``.
+_CARRIER_RECEIPTS_SWITCH = "HERMES_CRON_CARRIER_RECEIPTS"
+
+
+def _carrier_receipts_enabled() -> bool:
+    raw = cron_env_setting(_CARRIER_RECEIPTS_SWITCH).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def _job_script_timeout(job: Optional[Mapping[str, Any]]) -> Optional[int]:
     """The job's OWN ``script_timeout_seconds`` as a positive int, or None to keep resolving.
 
@@ -511,6 +522,12 @@ def _run_job_script(
     profile-wide chain.
     """
     from tools.hosted_tool_policy import host_feature_refusal
+    # U2's kill switch and the supervised shape, read ONCE per run: a fire that carries an
+    # execution id gets a supervisor that owns the output files and writes the terminal receipt.
+    # Every other shape (monitor probes, a manual fire with no occurrence) keeps today's direct
+    # Popen, untouched. ``HERMES_CRON_CARRIER_RECEIPTS=0`` forces the direct path for everyone.
+    supervised = _carrier_receipts_enabled() and isinstance(identity, Mapping) and bool(
+        str(identity.get("HERMES_CRON_EXECUTION_ID") or "").strip())
     if refusal := host_feature_refusal("cron_scripts", "A cron script"):
         return False, refusal
     path, err = _resolve_script_path(script_path)
@@ -559,8 +576,14 @@ def _run_job_script(
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
         # gateway sessions (#69396).
+        # U2: the supervisor becomes the carrier's parent, so its stdout/stderr are FILES that
+        # outlive this process; the pass-through below restores today's byte-for-byte contract.
+        spawn_argv = argv
+        if supervised:
+            from cron.carrier_supervisor import supervisor_argv
+            spawn_argv = supervisor_argv(argv)
         proc = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            spawn_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             # The decode pin, AT THE READER: win32 pins UTF-8 (#45099); POSIX keeps the
             # platform default (None) because unconditional UTF-8 there was reverted (#66566).
             encoding="utf-8" if sys.platform == "win32" else None,
@@ -577,6 +600,13 @@ def _run_job_script(
                 return False, f"Script cancelled: {cancel_reason(cancel_event)}"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                # U2: the tree-kill below is SIGKILL, so the supervisor gets no terminal write of
+                # its own. Record the scheduler's budget on the receipt FIRST, or the attempt
+                # would settle without ever saying it was killed by the budget rather than
+                # failing on its own merits.
+                if supervised:
+                    from cron.carrier_supervisor import record_timeout
+                    record_timeout(identity, script_timeout)
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
                 # Phase 4a (#85125): a script timeout must leave ZERO living descendants. killpg only
