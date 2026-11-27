@@ -125,6 +125,32 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+
+# --- Block EPISODES: admission + cause (design platform-stl t_5ecaf3e0) -----
+#
+# A block repeats an EPISODE only when the card was ADMITTED since the previous
+# block -- an event that says work actually ran. ``unblocked`` is a routing event
+# and therefore a boundary, but NOT admission: a sweep releasing a standing hold
+# is not progress, so a card parked, released and re-parked on the SAME
+# unresolved condition counts from 1 instead of minting ``block_loop_detected``
+# (a human loop) for a wait no human ever attempted to remedy. Measured
+# 2026-11-04 on the platform board: 671 of 748 lifetime detections (89.7%) had no
+# ``claimed``/``spawned`` event between the prior block and the detection.
+BLOCK_ROUTING_EVENT_KINDS = ("blocked", "block_loop_detected", "dependency_wait",
+                             "gave_up", "unblocked")
+#: What ADMITS a card to a new episode: a run actually started.
+ADMISSION_EVENT_KINDS = ("claimed", "spawned")
+#: Events that PLACE a park -- the newest one carries the previous block's cause.
+BLOCK_PARK_EVENT_KINDS = ("blocked", "block_loop_detected", "dependency_wait")
+#: D2: the front of the reason that identifies the CAUSE.
+REASON_KEY_CHARS = 120
+_ISO_DATE_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+)
+#: A hex run needs at least one DIGIT, or every word spelled in a-f ("decade",
+#: "added") is stripped and two unrelated parks collide on one key.
+_HEX_RUN_RE = re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{6,}\b")
+_DIGIT_RUN_RE = re.compile(r"\d+")
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # --- The due contract (``due_at``) -----------------------------------------
@@ -7129,9 +7155,14 @@ def block_task(
         if kind == "dependency" and not declared_parents and _parents_satisfied(conn, task_id):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
+        _, prev_park_reason, prev_no_admission = _previous_block_cause(conn, task_id)
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            # D1: admission since the newest routing event decides whether this
+            # park REPEATS an episode or is the same unresolved hold seen again.
+            admitted=_admitted_since_last_routing_event(conn, task_id),
+            prev_reason=prev_park_reason, prev_no_admission=prev_no_admission,
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -7199,29 +7230,128 @@ def block_task(
     return True
 
 
+def _in_clause(column: str, values: tuple) -> str:
+    """``"<column> IN (?, ?, ...)"`` for a fixed vocabulary tuple (no caller input)."""
+    return "%s IN (%s)" % (column, ", ".join("?" * len(values)))
+
+
+def reason_key(reason: Optional[str]) -> str:
+    """Volatile-free identity of a block reason (design D2, platform-stl t_5ecaf3e0).
+
+    Front 120 chars of the whitespace-collapsed, lowercased text, with ISO dates,
+    hex runs >= 6 and digit runs stripped -- so a hold that says "waiting until
+    2026-11-14T09:00Z" and one that says "waiting until 2026-11-15T09:00Z" are
+    ONE cause, while two genuinely different reasons stay two. An empty reason
+    keys to ``""`` and therefore equals only another empty reason: missing text
+    must never widen the catch by gluing unrelated parks into one loop.
+    """
+    if not reason:
+        return ""
+    text = " ".join(str(reason).lower().split())[:REASON_KEY_CHARS]
+    text = _ISO_DATE_RE.sub(" ", text)
+    text = _HEX_RUN_RE.sub(" ", text)
+    text = _DIGIT_RUN_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def _admitted_since_last_routing_event(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card was ADMITTED since its newest block-routing event (D1).
+
+    The newest routing event is the episode BOUNDARY: ``blocked``,
+    ``block_loop_detected``, ``dependency_wait``, ``gave_up`` or ``unblocked``
+    (id order, never ``max(created_at)``). ``unblocked`` is a boundary but NOT
+    admission -- a sweep releasing a standing hold is not progress -- so only a
+    ``claimed``/``spawned`` event AFTER that boundary opens a new episode.
+    """
+    boundary_row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ? AND "
+        + _in_clause("kind", BLOCK_ROUTING_EVENT_KINDS),
+        (task_id, *BLOCK_ROUTING_EVENT_KINDS),
+    ).fetchone()
+    boundary = int(boundary_row[0] or 0) if boundary_row is not None else 0
+    hit = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND "
+        + _in_clause("kind", ADMISSION_EVENT_KINDS) + " LIMIT 1",
+        (task_id, boundary, *ADMISSION_EVENT_KINDS),
+    ).fetchone()
+    return hit is not None
+
+
+def _previous_block_cause(conn: sqlite3.Connection, task_id: str) -> tuple[Optional[str], Optional[str], int]:
+    """``(kind, reason, no_admission_recurrences)`` of the newest PARK event.
+
+    Read from the EVENT STREAM, not the task row: the row keeps only the kind,
+    and D2 needs the previous block's own recorded REASON. A store with no park
+    event, or a legacy payload, answers ``(None, None, 0)`` -- which compares as
+    a NEW cause, the conservative direction: it can never mint a loop.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND "
+        + _in_clause("kind", BLOCK_PARK_EVENT_KINDS) + " ORDER BY id DESC LIMIT 1",
+        (task_id, *BLOCK_PARK_EVENT_KINDS),
+    ).fetchone()
+    if row is None or not row[0]:
+        return None, None, 0
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None, None, 0
+    if not isinstance(payload, dict):
+        return None, None, 0
+    try:
+        prev_no_admission = int(payload.get("no_admission_recurrences") or 0)
+    except (TypeError, ValueError):
+        prev_no_admission = 0
+    return payload.get("kind"), payload.get("reason"), prev_no_admission
+
+
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int,
+    admitted: bool = True, prev_reason: Optional[str] = None,
+    prev_no_admission: int = 0,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
-    as something to "unblock". Callers that pass ``dependency`` with no
-    incomplete parent are re-kinded to ``needs_input`` before this runs
-    (see :func:`block_task`). Every other kind counts unblock-loop
-    recurrences: block_task only fires from running/ready (AFTER an unblock
-    returned the task to the pool), so a stored ``block_kind`` equal to the
-    incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    as something to "unblock", and it NEVER counts a recurrence (D4).
+
+    Every other kind counts EPISODES (design platform-stl t_5ecaf3e0, D1-D3): an
+    episode repeats only when the previous block had the SAME CAUSE
+    (:func:`reason_key`, D2) AND the card was ADMITTED in between
+    (:func:`_admitted_since_last_routing_event`, D1). Anything else counts from
+    1, so a standing hold that a releaser keeps returning to the pool never
+    reads as a human loop. ``admitted`` defaults to True for a caller with no
+    event stream -- that is the pre-D1 behaviour, which can only be MORE likely
+    to escalate, never less.
+
+    The payload carries ``recurrence_basis`` (``admitted`` / ``no_admission`` /
+    ``new_cause``) and the monotone ``no_admission_recurrences`` diagnostic: the
+    number of parks in the current churn segment since the last admission, this
+    park included. It only ever grows while no run happens and restarts at 1
+    when an admission proves the hold broke. It NEVER escalates: unbounded churn
+    on a standing hold is a releaser/schedule question, not a human loop.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+    same_cause = (prev_kind == kind
+                  and reason_key(prev_reason) == reason_key(reason))
+    if same_cause and admitted:
+        recurrences = prev_recurrences + 1
+        basis = "admitted"
+        no_admission = 1
+    else:
+        recurrences = 1
+        basis = "new_cause" if not same_cause else "no_admission"
+        no_admission = 1 if admitted else prev_no_admission + 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    payload = {
+        "reason": reason, "kind": kind, "recurrences": recurrences,
+        "recurrence_basis": basis, "no_admission_recurrences": no_admission,
+        "source_status": source_status,
+    }
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
