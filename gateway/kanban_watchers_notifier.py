@@ -49,6 +49,88 @@ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "st
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
 
+# A card that has reached one of these is FINISHED. Nothing an earlier run did to
+# it describes its present state: a ``crashed``, ``changes_requested`` or
+# ``review_requested`` event that predates the completion is history. Composing the
+# batch's kinds into one sentence instead reported an APPROVED, ``done`` card as
+# "crashed ... review requested changes (BLOCK) ... implementation is not
+# approved" (t_2a1e7afe) — a state no instant of that card's life ever held.
+_TERMINAL_TASK_STATUSES = ("done", "archived")
+
+# Which task-row statuses an event kind can still be describing. A claimed batch
+# spans every event since the last delivery, so it holds transitions the card has
+# since left: a ``gave_up`` from before an explicit unblock stays in the batch
+# while the row reads ``ready`` with ``consecutive_failures 0``. Quoting that
+# event's terminal words ("gave up (retries exhausted)") beside those counters is
+# the second receipt on t_2a1e7afe. An event may speak for the card only when the
+# row still agrees with it; otherwise it is superseded history.
+_KIND_STATUSES = {
+    "completed": {"done", "archived"},
+    "gave_up": {"blocked"},
+    "blocked": {"blocked", "triage"},
+    "block_loop_detected": {"triage", "blocked"},
+    "review_requested": {"review"},
+    "changes_requested": {"ready", "todo", "running"},
+    "crashed": {"ready", "todo", "running"},
+    "timed_out": {"ready", "todo", "running"},
+}
+
+
+def _state_event(events, status: str = "") -> Any:
+    """The ONE event whose state a notice may describe: newest, and consistent with the row.
+
+    A claimed batch spans every event since the last successful delivery, so it
+    routinely holds several runs (a crash, a rework handoff and a review BLOCK in
+    one poll window). The notice reports the newest transition that the card row
+    still corroborates; the earlier ones are superseded and were already delivered
+    as their own pings.
+    """
+    for ev in reversed(list(events or [])):
+        if ev.kind not in _WAKE_KINDS:
+            continue
+        allowed = _KIND_STATUSES.get(ev.kind)
+        if allowed is None or not status or status in allowed:
+            return ev
+    return None
+
+
+def _terminal_completion(events, task, conn=None) -> Optional[str]:
+    """The completion summary that names a finished card's outcome, or ``None``.
+
+    Read order: the batch's own ``completed`` event (nothing is fresher), then the
+    card's newest ``completed`` event — the completing event is often outside the
+    claimed batch, or already delivered — then the legacy ``task.result`` column.
+    Only ``payload['summary']`` is used: it is the run's own verdict, so a card's
+    approval is never inferred from a crash or a BLOCK that preceded it.
+    """
+    for ev in reversed(list(events or [])):
+        if ev.kind == "completed":
+            summary = _payload(ev, "summary")
+            if summary:
+                return str(summary)
+            break
+    if conn is not None and task is not None:
+        event = _kbn().latest_event(conn, task_id=task.id, kind="completed")
+        summary = _payload(event, "summary") if event is not None else None
+        if summary:
+            return str(summary)
+    result = getattr(task, "result", None) if task is not None else None
+    return str(result) if result else None
+
+
+def _claim_snapshot(task, events, conn=None) -> dict:
+    """One point-in-time state for EVERY clause of a notice, taken at claim time.
+
+    Every clause must come from this one snapshot. Fields picked independently
+    from different runs are how a notice describes a state the card never held.
+    """
+    status = (getattr(task, "status", "") or "") if task is not None else ""
+    terminal = status in _TERMINAL_TASK_STATUSES
+    return {
+        "status": status,
+        "completion": _terminal_completion(events, task, conn) if terminal else None,
+    }
+
 
 def diagnostic_event(ev) -> bool:
     """Infrastructure attention is distinct from an explicit owner decision."""
@@ -337,9 +419,11 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        snapshot = _claim_snapshot(task, events, conn)
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
+                "task": task, "board": slug, "snapshot": snapshot}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -539,6 +623,10 @@ class _KanbanNotification:
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
+        # One point-in-time card state (status + terminal completion), taken with
+        # the claim. Every clause of the wake text must derive from it.
+        self.snapshot = d.get("snapshot") or {}
+        self.wake_diagnostic = False
         self.plat: Any = None
         self.adapter: Any = None
         self.is_push_adapter = True
@@ -579,24 +667,55 @@ class _KanbanNotification:
     # -- formatting --
 
     def format_event(self, ev: Any) -> Optional[str]:
-        """Render one event; accumulates wake handoff/review detail. None → silent kind."""
+        """Render one event's ping text. None → silent kind.
+
+        Pure: the wake text is composed from the claim snapshot alone, so this
+        must not carry state from one event into the next.
+        """
         formatter = _EVENT_FORMATTERS.get(ev.kind)
         if formatter is None:
             return None
-        msg, handoff, review_detail = formatter(ev, self)
-        if handoff is not None:
-            self.wake_handoff = handoff
-        if review_detail is not None:
-            self.wake_review_detail = review_detail
-        return msg
+        return formatter(ev, self)[0]
+
+    def _snapshot_status(self) -> str:
+        """The card's status from the claim snapshot (falls back to the row object)."""
+        if self.snapshot:
+            return self.snapshot.get("status") or ""
+        return getattr(self.task, "status", "") or ""
+
+    def _terminal_status(self) -> str:
+        """The snapshot's terminal status (``done``/``archived``), or empty."""
+        status = self._snapshot_status()
+        return status if status in _TERMINAL_TASK_STATUSES else ""
 
     def build_wake_text(self) -> None:
-        """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
+        """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths.
+
+        ONE snapshot, one state. A terminal card is announced as finished and names
+        the completion that ended it; otherwise the notice describes the newest
+        event in the batch that the row still corroborates. Kinds are never unioned
+        and a clause is never carried over from another run: ``Result:`` comes from
+        the same event/run as any ``Review feedback:``, or one of them is absent.
+        """
         task, sub = self.task, self.sub
-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
-        self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
-        if not self.wake_kinds:
+        if not self.wake_agent:
+            self.wake_kinds = set()
             return
+        events = self.d.get("events") or []
+        status = self._snapshot_status()
+        terminal = self._terminal_status()
+        state = _state_event(events, status)
+        if not terminal and state is None:
+            # Every wake-worthy event in the batch is superseded by the row (a
+            # ``gave_up`` before an explicit unblock, say). Say what the card IS
+            # now — the snapshot — rather than quoting a state it has left. A
+            # batch with no wake-worthy event at all (a bare ``status`` flip)
+            # stays silent, as it always has.
+            if not status or not any(ev.kind in _WAKE_KINDS for ev in events):
+                self.wake_kinds = set()
+                return
+            self.wake_kinds = {"status"}
+        self.wake_handoff = self.wake_review_detail = ""
         if self.is_push_adapter:
             self.session_key = getattr(task, "session_id", None) or ""
         else:
@@ -604,14 +723,46 @@ class _KanbanNotification:
             # subscriber registered). task.session_id may be a WORKER session
             # for child tasks; use it only for legacy rows.
             self.session_key = sub["chat_id"] or getattr(task, "session_id", None) or ""
-        # i18n keys: gateway.kanban.wake.<kind> for each _WAKE_KINDS entry.
-        _parts = [t(f"gateway.kanban.wake.{k}") for k in _WAKE_KINDS if k in self.wake_kinds]
-        _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-        synth = t(
-            "gateway.kanban.wake.message",
-            task_id=sub["task_id"], status=_status, title=self.title,
-            assignee=task.assignee if task else "", board=self.board_slug,
-        )
+        if terminal:
+            # Terminal wins and is said first: this is a completion notice, not a
+            # status one. A crash or a BLOCK that preceded the completion is
+            # history and is not carried forward. An archived card still gets the
+            # notice when a completion can be named — the subscription is dropped
+            # in this tick, so it is the last chance to say how the card ended.
+            completion = self.snapshot.get("completion") or _terminal_completion(events, task)
+            if status == "archived" and not any(ev.kind == "completed" for ev in events):
+                # Archive alone is deliberately silent (it is irreversible and the
+                # sub is dropped in this same tick). But if the completion that
+                # earned the archive is in THIS batch, it has had no delivery yet —
+                # dropping it would lose the card's ending entirely.
+                self.wake_kinds = set()
+                return
+            self.wake_kinds = {"completed"}
+            self.wake_diagnostic = False
+            tail = "\n" + _first_line(str(completion), 200) if completion else ""
+            # The completion summary rides inside ping.completed, so the generic
+            # handoff append below must stay empty for this branch.
+            synth = t("gateway.kanban.ping.completed", head=self.head, title=self.title, handoff=tail)
+        elif state is None:
+            # Superseded batch: describe the snapshot, nothing older.
+            self.wake_diagnostic = False
+            synth = t("gateway.kanban.wake.message",
+                      task_id=sub["task_id"], status=status,
+                      title=self.title, assignee=task.assignee if task else "", board=self.board_slug)
+        else:
+            self.wake_kinds = {state.kind}
+            self.wake_diagnostic = diagnostic_event(state)
+            synth = t(
+                "gateway.kanban.wake.message",
+                task_id=sub["task_id"], status=t(f"gateway.kanban.wake.{state.kind}"),
+                title=self.title, assignee=task.assignee if task else "", board=self.board_slug,
+            )
+            formatter = _EVENT_FORMATTERS.get(state.kind)
+            if formatter is not None:
+                # Exactly one of these is ever set: a single event describes one run.
+                _msg, handoff, review_detail = formatter(state, self)
+                self.wake_handoff = handoff or ""
+                self.wake_review_detail = review_detail or ""
         # Label as an automatic notification and carry the handoff so the
         # creator inspects the board instead of re-decomposing.
         if self.wake_handoff:
@@ -807,7 +958,9 @@ class _KanbanNotification:
             # All text pings delivered (or skipped for non-push / wake-only).
             original_events = self.d["events"]
             from gateway.warning_notifications import warning_notifications_enabled
-            split = not warning_notifications_enabled(self.platform_str)
+            # A terminal card gets ONE notice: terminal wins, so splitting it into a
+            # diagnostic and a result notice would state the same finished card twice.
+            split = not warning_notifications_enabled(self.platform_str) and not self._terminal_status()
             wake_groups = ([original_events] if not split else [
                 [ev for ev in original_events if diagnostic_event(ev)],
                 [ev for ev in original_events if not diagnostic_event(ev)],
@@ -817,9 +970,6 @@ class _KanbanNotification:
                 if not events:
                     continue
                 self.d = {**self.d, "events": events}
-                self.wake_handoff = self.wake_review_detail = ""
-                for ev in events:
-                    self.format_event(ev)
                 self.build_wake_text()
                 if self.wake_kinds:
                     wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
