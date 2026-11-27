@@ -648,9 +648,9 @@ class S6ServiceManager:
         if pid is not None:
             try:
                 from gateway.stop_attribution import write_stop_request
-                # The ruling's ``kind`` vocabulary has no separate supervisor value: an operator
-                # (or a supervisor acting for one) asked, and ``delivery`` names s6.
-                write_stop_request(pid, kind="operator", reason_code="service_stop",
+                # ``supervisor`` names the actor (s6 acting for an operator); ``delivery`` names
+                # the mechanism. Both are in the ruling's bounded vocabulary.
+                write_stop_request(pid, kind="supervisor", reason_code="service_stop",
                                    delivery="s6", reason_text=f"s6-svc -d {name}",
                                    lull_gate="not_consulted")
             except Exception:
@@ -659,7 +659,16 @@ class S6ServiceManager:
         _write_gateway_desired_state(name, "stopped")
 
     def restart(self, name: str) -> None:
-        """``s6-svc -t`` (SIGTERM)."""
+        """``s6-svc -t`` (SIGTERM), attributed before the signal like every other stopper."""
+        pid = self._supervised_pid(name)
+        if pid is not None:
+            try:
+                from gateway.stop_attribution import write_stop_request
+                write_stop_request(pid, kind="supervisor", reason_code="service_restart",
+                                   delivery="s6", reason_text=f"s6-svc -t {name}",
+                                   lull_gate="not_consulted")
+            except Exception:
+                pass
         self._run_svc("-t", "restart", name)
         _write_gateway_desired_state(name, "running")
 
@@ -748,6 +757,15 @@ class S6ServiceManager:
         svc_dir = self._service_dir(profile)
         if not svc_dir.exists():
             return
+        pid = self._supervised_pid(svc_dir.name)
+        if pid is not None:
+            try:
+                from gateway.stop_attribution import write_stop_request
+                write_stop_request(pid, kind="supervisor", reason_code="service_unregister",
+                                   delivery="s6", reason_text=f"s6-svc -d {svc_dir.name}",
+                                   lull_gate="not_consulted")
+            except Exception:
+                pass
         self._s6("s6-svc", "-d", str(svc_dir))
         self._s6("s6-svwait", "-D", "-t", "10000", str(svc_dir), timeout=15)
         self._s6("s6-svscanctl", "-an", str(self.scandir))

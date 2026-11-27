@@ -22,12 +22,20 @@ def ack_failure(answer):
 
 
 def mark_planned_stop(pid: int | None = None, *, kind: str = "cli_stop",
-                      reason_code: str | None = "gateway_stop") -> str | None:
+                      reason_code: str | None = "gateway_stop",
+                      delivery: str = "marker",
+                      reason_text: str | None = None,
+                      lull_gate: str = "not_consulted") -> str | None:
     """Best-effort planned-stop request for ``pid`` (default: the recorded gateway PID).
 
     Writes the ``gateway.stop_requested`` row and the marker through the single door
     (``gateway.stop_attribution.write_stop_request``), so the stop is attributable from the log
     alone; returns the ``stop_id`` (None when there was no pid to stop).
+
+    ``kind``/``delivery``/``reason_code`` are the caller's facts about HOW the stop is delivered
+    (``cli_stop``+``marker`` for ``hermes gateway stop``, ``supervisor``+``systemd|launchd`` when a
+    service manager performs it); ``reason_text`` defaults to this process's argv, which is what
+    an operator reading the log needs to recognise the command.
     """
     try:
         from gateway.status import get_running_pid
@@ -37,9 +45,12 @@ def mark_planned_stop(pid: int | None = None, *, kind: str = "cli_stop",
             return None
         from gateway.stop_attribution import write_stop_request
 
+        if reason_text is None:
+            import sys
+            reason_text = " ".join(sys.argv) or "hermes gateway stop"
         return write_stop_request(
-            pid, kind=kind, reason_code=reason_code, delivery="marker",
-            reason_text="hermes gateway stop / restart", lull_gate="not_consulted")
+            pid, kind=kind, reason_code=reason_code, delivery=delivery,
+            reason_text=reason_text, lull_gate=lull_gate)
     except Exception:
         return None
 

@@ -95,18 +95,19 @@ def _write_planned_stop(control: Path, pid: int, start_time: Any) -> str | None:
     so that gateway's ``gateway.stop_seen`` / ``previous_exit`` rows quote this requester and the
     same ``stop_id``."""
     from gateway.status import _UNSET, write_planned_stop_marker_in
-    from gateway.stop_attribution import capture_requester, new_stop_id, STOP_REQUESTED, append_record, _now_iso
+    from gateway.stop_attribution import capture_requester, write_stop_request
 
     requester = capture_requester(
         kind="replace_takeover", reason_code="replace_incompatible",
         reason_text="an owner running an older Hermes runtime answered for this home",
         lull_gate="not_consulted")
-    stop_id = new_stop_id()
-    append_record({
-        "ts": _now_iso(), "tag": STOP_REQUESTED, "stop_id": stop_id,
-        "target": {"pid": pid, "start_time": start_time, "home": str(control)},
-        "delivery": {"method": "marker", "raw": None}, "requester": requester,
-    }, control)
+    # One door: the request row lands in the OWNER's diag log, then the marker (with the verified
+    # start time pinned) lands where that gateway reads it.
+    stop_id = write_stop_request(pid, kind="replace_takeover",
+                                 reason_code="replace_incompatible",
+                                 reason_text="an owner running an older Hermes runtime answered for this home",
+                                 lull_gate="not_consulted", delivery="marker",
+                                 requester=requester, home=control, write_marker=False)
     write_planned_stop_marker_in(control, pid, requester=requester, stop_id=stop_id,
                                  target_start_time=(_UNSET if start_time is None else start_time))
     return stop_id

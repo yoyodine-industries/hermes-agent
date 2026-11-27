@@ -55,24 +55,36 @@ def _planned_stop_markers(running_pids, profile_processes, service_gateway_pids)
     return markers
 
 
-def _write_update_planned_stop_marker(profile_path: Path, pid: int) -> bool:
+def _update_run_id() -> str | None:
+    """This update's id, when a receipt run is open in this process (never raises)."""
+    try:
+        from hermes_cli.update_receipt import current_correlation_id
+        return current_correlation_id()
+    except Exception:
+        return None
+
+
+def _write_update_planned_stop_marker(profile_path: Path, pid: int, *,
+                                      stage: str = "gateway_pause",
+                                      delivery: str = "marker") -> bool:
     """Write an attributed planned-stop marker into a specific profile home.
 
     The request row lands in THAT profile's diag log (the log its gateway writes), so the update's
     stop is attributable from the log alone; the marker refuses without a requester, exactly like
-    the local door."""
+    the local door. ``reason_text`` names the update run id and the stage that stopped the
+    gateway, so ``grep gateway.stop_requested`` answers "which update, which point"."""
     try:
         from gateway.status import write_planned_stop_marker_in
         from gateway.stop_attribution import capture_requester, write_stop_request
 
         home = Path(profile_path)
+        run_id = _update_run_id() or "unknown-run"
+        reason_text = f"hermes update {run_id} stopped the gateway at the {stage} stage"
         requester = capture_requester(kind="update", reason_code="update_stop",
-                                      reason_text="windows update stopping the gateway to replace "
-                                                  "its code",
-                                      lull_gate="not_consulted")
+                                      reason_text=reason_text, lull_gate="not_consulted")
         # Row first (a gateway killed a microsecond later is still attributable), marker second —
         # and the marker's own success is what this returns.
-        stop_id = write_stop_request(pid, requester=requester, delivery="marker", home=home,
+        stop_id = write_stop_request(pid, requester=requester, delivery=delivery, home=home,
                                      write_marker=False)
         return write_planned_stop_marker_in(home, pid, requester=requester, stop_id=stop_id)
     except (OSError, PermissionError):
@@ -902,7 +914,8 @@ def _request_socket_pauses(running_pids, profile_processes, service_gateway_pids
             continue
         profiles[str(proc.profile)] = int(pid)
         mapped_pids.append(int(pid))
-        requested = _write_update_planned_stop_marker(Path(proc.path), int(pid))
+        requested = _write_update_planned_stop_marker(Path(proc.path), int(pid),
+                                                      stage="windows_socket_pause")
         if requested and on_request is not None:
             on_request(int(pid))
         try:
