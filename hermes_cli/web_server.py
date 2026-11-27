@@ -633,6 +633,9 @@ async def _dashboard_selftest_loop() -> None:
 from hermes_cli import web_server_gateway as _gateway_mod
 from hermes_cli.web_server_gateway import _ACTION_LOG_FILES, _terminate_desktop_managed_gateway
 from hermes_cli.web_server_sessions import _auto_archive_ticker_loop
+from hermes_cli.web_server_probe_reaper import (
+    _header_probe_reaper_loop, header_probe_idle_seconds, reap_idle_header_probes,
+)
 from hermes_cli.web_server_chat import PTY_REGISTRY
 from hermes_cli.web_server_dashboard import (
     _discover_dashboard_plugins, _mount_plugin_api_routes, mount_spa,
