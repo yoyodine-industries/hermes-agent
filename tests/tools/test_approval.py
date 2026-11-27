@@ -349,7 +349,6 @@ class TestCloudMetadataEndpoint:
 def _clear_session(key):
     """Replace for removed clear_session() — directly clear internal state."""
     approval_module._session_approved.pop(key, None)
-    approval_module._pending.pop(key, None)
 
 
 class TestCredentialExfilAndInvisibleChars:
@@ -1296,9 +1295,10 @@ class TestGitGlobalFlagPrefix:
 
     Every git row was spelled ``\\bgit\\s+<verb>``, so ``git -C <dir> push --force origin main``
     ran with NO approval on every surface (interactive, cron, ``-q``) while the contiguous
-    spelling was gated. ONE shared prefix fragment (``_QUOTED_GLOBAL_FLAGS``) is inserted
-    between ``\\bgit\\s+`` and the verb in all 12 git rows; the ``systemctl`` row (same defect
-    class, module grammar ``_GLOBAL_FLAGS``) is widened the same way, and so is its
+    spelling was gated. ONE shared fragment is inserted between ``\\bgit\\s+`` and the verb in all
+    12 git rows - now :data:`tools.approval_git_options._GIT`, which also accepts a quoted value
+    (``git -C '/a b' push -f``); the ``systemctl`` row (same defect class, module grammar
+    ``_GLOBAL_FLAGS``) is widened the same way, and so is its
     ``_CMDPOS``-anchored HARDLINE sibling (``systemctl poweroff|reboot|halt|kexec``), which is a
     floor rather than a prompt and is measured with ``detect_hardline_command``. Row ORDER,
     descriptions and the lease/main/bulk guard chain are unchanged - order is the mechanism.
@@ -1451,11 +1451,16 @@ class TestGitGlobalFlagPrefix:
 
     def test_every_git_row_carries_the_shared_prefix(self):
         """A fix that widens `push` but leaves a sibling git row on the bare prefix is worse
-        than no fix: the family reads as closed while a row still admits the bypass."""
-        prefix = r"\bgit\s+" + approval_detection._QUOTED_GLOBAL_FLAGS
+        than no fix: the family reads as closed while a row still admits the bypass.
+
+        The shared fragment moved into :mod:`tools.approval_git_options` (`_GIT`, from which
+        `_GIT_PUSH` is built) when the git grammar was consolidated; the invariant is the same."""
+        from tools.approval_git_options import _GIT, _GIT_PUSH
+
+        assert _GIT_PUSH.startswith(_GIT)
         rows = [p for p, _d in approval_detection.DANGEROUS_PATTERNS if p.startswith(r"\bgit")]
         assert rows
-        assert all(p.startswith(prefix) for p in rows), [p for p in rows if not p.startswith(prefix)]
+        assert all(p.startswith(_GIT) for p in rows), [p for p in rows if not p.startswith(_GIT)]
 
     def test_systemctl_row_carries_the_module_grammar(self):
         """EVERY systemctl row carries the module grammar - and there are TWO anchors, not one.
@@ -1478,12 +1483,13 @@ class TestGitGlobalFlagPrefix:
             assert any(p.startswith(anchor + approval_detection._GLOBAL_FLAGS) for p in rows), anchor
 
     def test_fragment_keeps_the_apostrophe_alternative(self):
-        """`\\'` inside a single-quoted raw literal IS a literal apostrophe to the regex engine
-        (Python keeps the backslash, `re` reads it as an escaped non-special character); `\\\\'`
-        would be a literal BACKSLASH and would silently drop the single-quoted value spelling."""
-        fragment = approval_detection._QUOTED_GLOBAL_FLAGS
-        assert r"\'[^\']*\'" in fragment
-        assert "\\\\'" not in fragment
+        """Both quote spellings of a global-option value are ONE shell word, so the grammar must
+        keep both alternatives: a fragment that dropped `'[^']*'` silently loses
+        `git -C '/opt/a b/c' push -f origin main` (the apostrophe spelling the carrier pinned)."""
+        from tools.approval_git_options import _GIT_WORD
+
+        assert r"'[^']*'" in _GIT_WORD
+        assert '"[^"]*"' in _GIT_WORD
 
 
 class TestChmodExecuteCombo:
@@ -1737,7 +1743,6 @@ class TestApprovalTimeoutIsNotConsent:
         mod._gateway_notify_cbs.clear()
         mod._session_approved.clear()
         mod._permanent_approved.clear()
-        mod._pending.clear()
 
         self._saved_env = {
             k: os.environ.get(k)

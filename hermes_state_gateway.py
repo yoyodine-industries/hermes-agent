@@ -929,6 +929,39 @@ class SessionGatewayMixin:
         return counts
 
     @staticmethod
+    def session_resume_route(session_meta: Optional[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        """``(model, route)`` a resumed session runs, both from one record so they always pair.
+
+        The ``model`` column is the billing record: the first accounted call rewrites it to whatever
+        served it, a turn-scoped fallback included, and touches nothing in ``model_config``. So the
+        model comes from the record the route comes from: a ``gateway_runtime`` route's own ``model``
+        (every route writer stamps it), else the pick in ``model_config.model``. The column is used
+        only where nothing else names a model, plus two legacy cases written with the column: a
+        ``gateway_runtime`` from before the stamp, and a confirmed Browser/API lock still naming it.
+        ``billing_provider`` served the column model, so it never fills the provider of another."""
+        row = session_meta or {}
+        raw = row.get("model_config")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError):
+                raw = {}
+        config = raw if isinstance(raw, dict) else {}
+        column = str(row.get("model") or "").strip()
+        picked = str(config.get("model") or "").strip()
+        runtime, lock = config.get("gateway_runtime"), config.get("browser_model_lock")
+        if isinstance(runtime, dict) and runtime.get("provider"):
+            model = str(runtime.get("model") or "").strip() or column or picked
+        elif isinstance(lock, dict) and lock.get("confirmed") and str(lock.get("model") or "").strip() == column:
+            model = column or picked
+        else:
+            model = picked or column
+        route_row = row if model == column else {**row, "billing_provider": None}
+        route = SessionGatewayMixin.session_gateway_runtime(route_row)
+        route.pop("model", None)
+        return model, route
+
+    @staticmethod
     def session_gateway_runtime(session_meta: Optional[dict[str, Any]]) -> dict[str, Any]:
         """Read the persisted runtime route off a session row dict (``model_config`` as
         JSON string or parsed dict). Precedence: nested ``gateway_runtime`` (gateway sync /
@@ -1020,14 +1053,18 @@ class SessionGatewayMixin:
             " ORDER BY last_heartbeat DESC")
         return [dict(r) for r in rows]
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
-        """Mark a session pending handoff to *platform*; False if a handoff is already in flight."""
-        return self._write_rowcount(
-            "UPDATE sessions SET handoff_state = 'pending',     handoff_platform = ?, "
-            "    handoff_error = NULL WHERE id = ? AND (handoff_state IS NULL "
-            "                  OR handoff_state IN ('completed', 'failed'))",
-            (platform, session_id),
-        ) > 0
+    def request_handoff(self, session_id: str, platform: str, *, _guard=None) -> bool:
+        """Mark a session pending handoff to *platform*; False if a handoff is already in flight.
+        ``_guard(conn)`` raises to refuse inside the same write transaction (the owner's durable
+        execution fence, ``gateway.session_handoff.require_settled``)."""
+        def _do(conn):
+            if _guard is not None:
+                _guard(conn)
+            return conn.execute(
+                "UPDATE sessions SET handoff_state = 'pending', handoff_platform = ?, handoff_error = NULL "
+                "WHERE id = ? AND (handoff_state IS NULL OR handoff_state IN ('completed', 'failed'))",
+                (platform, session_id)).rowcount
+        return self._execute_write(_do) > 0
 
     def get_handoff_state(self, session_id: str) -> Optional[dict[str, Any]]:
         """Return ``{"state", "platform", "error"}`` or None if the session has no handoff record."""

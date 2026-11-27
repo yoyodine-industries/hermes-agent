@@ -113,7 +113,10 @@ def _skills_root(tmp_path):
     """Point the tool at a temp skills root; the ledger follows HERMES_HOME (conftest-pinned)."""
     root = tmp_path / "skills"
     root.mkdir()
-    with patch("tools.skill_manager_tool.SKILLS_DIR", root), \
+    # Upstream removed skill_manager_tool's module-level SKILLS_DIR; paths resolve
+    # through skills_tool._skills_dir() (patched constant at call time) and
+    # get_all_skills_dirs(), so those are the seams to pin.
+    with patch("tools.skills_tool.SKILLS_DIR", root), \
          patch("agent.skill_utils.get_all_skills_dirs", return_value=[root]):
         yield root
 

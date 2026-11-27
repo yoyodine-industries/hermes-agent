@@ -27,6 +27,7 @@ except ImportError:
     RequestKey = None  # type: ignore[assignment,misc]
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response, room_run_claims
+from gateway.platforms.api_server_run_reap import reap_stalled_runs
 from gateway.turn_executor import _UnboundedThreadExecutor
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
@@ -1480,9 +1481,6 @@ def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
             q.put_nowait(_run_event(run_id, name, **fields))
 
 
-_APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
-
-
 async def _handle_run_approval(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
@@ -1498,8 +1496,10 @@ async def _handle_run_approval(self, request: web.Request, *, _api_server) -> we
         if self._room_grant_token(request) and body.get('choice') not in {'once', 'deny'}:
             return _json_error(_openai_error, 'Room approvals require once or deny', status=400)
         return await _respond_authority_run(self, run_id, body, kind='approval', _api_server=_api_server)
-    raw_choice = str(body.get("choice", "")).strip().lower()
-    choice = _APPROVAL_CHOICE_ALIASES.get(raw_choice, raw_choice)
+    # Normalize before the allow-list check below so aliases ("approve") aren't rejected here; the
+    # alias map lives in tools.approval (lazy import: this module must not pull it in at load time).
+    from tools.approval import canonical_approval_choice
+    choice = canonical_approval_choice(body.get("choice", ""))
     room_scoped = bool(self._room_grant_token(request))
     raw_request_id = body.get("request_id")
     request_id = raw_request_id.strip() if isinstance(raw_request_id, str) else ""
@@ -1709,3 +1709,8 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     for run_id, status in list(self._run_statuses.items()):
         if status.get("status") not in TERMINAL_STATUSES:
             _fence_unheld_run_status(self, run_id, status)
+    # A slot held by a task that never returns is held BY DEFINITION: the fence above skips it
+    # because a handle exists, and nothing bounded how long that handle may sit (t_2fd3bc0b28:
+    # 16/16 held ~12h each while five runs were genuinely open, so every peer message 429'd).
+    # The bound is declared in ``api_server_run_reap`` and the reap is logged before/after.
+    reap_stalled_runs(self, now=now)

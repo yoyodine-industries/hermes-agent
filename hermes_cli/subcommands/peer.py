@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import http.client
 import json
 import os
 import re
@@ -32,15 +33,17 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+from tools.ansi_strip import sanitize_display_text
 
 BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
-# The @handle Bot Mode shows for a host's default profile, and the body of the 404 a peer returns for
-# a /p/<profile>/ prefix naming no profile it has (UNKNOWN_PROFILE_ERROR in
+# The @handle Bot Mode shows for a host's default profile, and the 404 a peer returns for a
+# /p/<profile>/ prefix naming no profile it has (UNKNOWN_PROFILE_CODE / UNKNOWN_PROFILE_ERROR in
 # gateway/platforms/api_server_profile_prefix.py; a 'hermes' profile it has but does not serve differs).
 DEFAULT_PROFILE_HANDLE = "hermes"
+_UNKNOWN_PROFILE_CODE = "profile_unknown"
 _UNKNOWN_PROFILE_ERROR = "Unknown or unconfigured profile"
 
 # One synchronous agent turn can legitimately take minutes. This stays the SERVER-budget
@@ -238,12 +241,20 @@ def _request(
     # different origin must not carry the Authorization: Bearer key with it —
     # a compromised/MITM'd peer could otherwise harvest it. open_credentialed_url
     # strips non-safelisted headers across a cross-origin redirect.
-    with open_credentialed_url(req, timeout=timeout) as resp:
-        payload = resp.read().decode("utf-8", "replace")
+    try:
+        with open_credentialed_url(req, timeout=timeout) as resp:
+            payload = resp.read().decode("utf-8", "replace")
+    except http.client.HTTPException as exc:
+        # BadStatusLine / UnknownProtocol carry the peer's raw status line; uncaught, the
+        # traceback prints it to the terminal unsanitized. RemoteDisconnected is also an
+        # OSError: keep it on the callers' "could not reach" transport path.
+        if isinstance(exc, OSError):
+            raise
+        raise RuntimeError(f"Peer sent a malformed HTTP response: {sanitize_display_text(str(exc)[:200])}") from exc
     try:
         parsed = json.loads(payload)
     except ValueError as exc:
-        raise RuntimeError(f"Peer returned non-JSON response: {payload[:200]}") from exc
+        raise RuntimeError(f"Peer returned non-JSON response: {sanitize_display_text(payload[:200])}") from exc
     if not isinstance(parsed, dict):
         raise RuntimeError("Peer returned a non-object JSON response")
     return parsed
@@ -279,6 +290,24 @@ def _profile_404_message(exc: Exception) -> str | None:
     detail = body.get("error")
     message = detail.get("message") if isinstance(detail, dict) else detail
     return message if isinstance(message, str) and message.strip() else None
+
+
+def _peer_lacks_profile(exc: Exception) -> bool:
+    """True only for the peer's own "no such profile" verdict: the 404 its /p/<profile>/ prefix
+    middleware returns before any handler runs. A handler's 404 (unknown run or session) carries
+    ``{"error": {"message": ...}}`` and a transport failure is no verdict at all. The verdict is its
+    ``code``; only a body with no ``code`` (a peer older than it) is read by its fixed sentence."""
+    if not isinstance(exc, urllib.error.HTTPError) or exc.code != 404:
+        return False
+    try:
+        body = json.loads(exc.read().decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(body, dict):
+        return False
+    if "code" in body:
+        return body["code"] == _UNKNOWN_PROFILE_CODE
+    return body.get("error") == _UNKNOWN_PROFILE_ERROR
 
 
 def _resolve_base(peer: dict, profile: str | None, key: str, peer_name: str = "") -> str:
@@ -383,9 +412,9 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
         body = exc.read().decode("utf-8", "replace")
         parsed = json.loads(body)
         message = parsed.get("error", {}).get("message") if isinstance(parsed, dict) else None
-        return message or body[:200]
+        return sanitize_display_text(str(message or body[:200]))
     except Exception:
-        return str(exc)
+        return sanitize_display_text(str(exc))
 
 
 def _resolve_peer_target(target: str) -> tuple[str, str | None, dict, str]:
@@ -808,7 +837,8 @@ def _emit_pending_delivery(args, *, peer_name: str, profile: str | None, target:
     the delivery-outcome-unknown wording (the idempotency key a resend must reuse) for the path
     where both the delivery POST and its idempotent replay went unanswered.
     """
-    where = f"session {session_id}, row {row_id}" if row_id is not None else f"session {session_id}"
+    where = (f"session {sanitize_display_text(str(session_id))}, row {row_id}"
+             if row_id is not None else f"session {sanitize_display_text(str(session_id))}")
     after = f" --after {row_id}" if row_id is not None else ""
     payload = {
         "peer": peer_name, "profile": profile, "session_id": session_id,
@@ -829,7 +859,10 @@ def _emit_pending_delivery(args, *, peer_name: str, profile: str | None, target:
           "answered there. The reply cannot come back on this call. Do NOT resend.",
           file=sys.stderr)
     print("Collect it with:", file=sys.stderr)
-    print(f"  hermes peer reply {target} --session {session_id}{after}", file=sys.stderr)
+    # The session id is peer-supplied: strip control sequences before echoing it, as the
+    # message above does — an ESC pasted into a shell is an injection, not a handle.
+    print(f"  hermes peer reply {target} --session {sanitize_display_text(str(session_id))}{after}",
+          file=sys.stderr)
     if row_id is None:
         print("Check that the newest user row `hermes peer reply` prints is yours.", file=sys.stderr)
     return 3
@@ -1005,8 +1038,8 @@ def _peer_failure(peer_name: str, exc: Exception) -> int:
         print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {detail}",
               file=sys.stderr)
     else:
-        detail = str(exc)
-        print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
+        detail = sanitize_display_text(str(exc))
+        print(f"Could not reach peer '{peer_name}': {detail}", file=sys.stderr)
     klass = _refusal_class(exc)
     if klass:
         _report_refusal(peer_name, klass, detail)
@@ -1283,7 +1316,7 @@ def _emit(args, payload: dict, text_lines: list[str]) -> int:
         print(json.dumps(payload))
     else:
         for line in text_lines:
-            print(line)
+            print(sanitize_display_text(line))
     return 0
 
 
@@ -1381,11 +1414,11 @@ def _peer_run_ctl(args, action: str, peer_name: str, profile: str | None, base: 
     if getattr(args, "json", False):
         print(json.dumps({"peer": peer_name, "profile": profile, **result}))
         return 0
-    print(f"{run_id}: {result.get('status', 'unknown')}")
+    print(f"{run_id}: {sanitize_display_text(str(result.get('status', 'unknown')))}")
     if not stop and result.get("output"):
-        print(result["output"])
+        print(sanitize_display_text(str(result["output"])))
     elif not stop and result.get("error"):
-        print(result["error"], file=sys.stderr)
+        print(sanitize_display_text(str(result["error"])), file=sys.stderr)
     return 0
 
 
@@ -1493,7 +1526,7 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
             idempotency_key=idempotency_key, target=target, message=message,
             base=base, key=key, deadline=deadline, started=started)
     except RuntimeError as exc:
-        print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
+        print(f"Peer '{peer_name}': {sanitize_display_text(str(exc))}", file=sys.stderr)
         return 1
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # A timeout while awaiting the response, once the Bot Chat is known, means the peer took

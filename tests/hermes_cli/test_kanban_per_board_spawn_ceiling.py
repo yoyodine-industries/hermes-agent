@@ -87,9 +87,11 @@ def _seed(board, n, priority=0):
 def test_named_board_uses_its_ceiling_unnamed_keeps_global(kanban_home):
     kb.create_board("defcon")
     kb.create_board("ops")
-    settings = kwd._resolve_dispatcher_settings(
-        {"max_spawn": 8, "max_spawn_by_board": {"defcon": 10, "ops": 2}}, kb
-    )
+    # This block IS the host's (a root boot): the per-board map is host-owned, and
+    # ``defcon: 10`` above the global 8 is the host's own decision (card
+    # t_001338fa / review 2026-11-25). A lane seat can only narrow it.
+    host_cfg = {"max_spawn": 8, "max_spawn_by_board": {"defcon": 10, "ops": 2}}
+    settings = kwd._resolve_dispatcher_settings(host_cfg, kb, host_kanban_cfg=host_cfg)
     assert settings.max_spawn_for_board("defcon") == 10
     assert settings.max_spawn_for_board("ops") == 2
     # Unnamed boards — including the root board — keep kanban.max_spawn.
@@ -510,7 +512,10 @@ def test_measurement_reader_agrees_with_the_enforcement_reader(kanban_home):
     """The dry-run's map and the gateway's map must be the SAME map.
 
     A measurement reader that dropped ``default: 0`` would report a budget the
-    gateway never applies — the false green this card exists to close.
+    gateway never applies — the false green this card exists to close. The CLI
+    now measures from ``resolve_dispatch_caps()['max_spawn_by_board']``, so the
+    parse rules it uses (``kanban_db_dispatch._board_ceilings``) must agree with
+    the gateway's enforcing parser entry by entry.
     """
     kb.create_board("platform")
     kb.create_board("defcon")
@@ -526,7 +531,7 @@ def test_measurement_reader_agrees_with_the_enforcement_reader(kanban_home):
     ]
     for mapped in maps:
         enforced = kwd._parse_max_spawn_by_board({"max_spawn_by_board": mapped}, kb)
-        measured = kanban_ops._max_spawn_by_board({"max_spawn_by_board": mapped})
+        measured = kbd._board_ceilings(mapped)
         assert measured == dict(enforced), mapped
 
 
