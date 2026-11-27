@@ -61,9 +61,46 @@ def _safe_command_preview(command: Any, limit: int = 200) -> str:
         return f"<{type(command).__name__}>"
 
 
-def _blocked_json(error: str, status: str) -> str:
-    """The guard result envelope: exit_code 1 + *error* + *status*."""
-    return json.dumps({"output": "", "exit_code": 1, "error": error, "status": status}, ensure_ascii=False)
+# --- Guard-refusal identity (card t_a487ff8f) --------------------------------
+# A GUARD REFUSAL MUST BE MACHINE-DISTINGUISHABLE FROM THE TOOL'S OWN FAILURE.
+# Measured 2026-11-06: the launchctl guard refused three separate probes before launchd
+# was ever asked, and each refusal came back in the same shape as a launchctl command
+# that had run and failed - so the harness was recorded as launchd's answer and a whole
+# CATEGORY was built on it ("no launchd job of any kind is available", "the root daemon
+# is optional"), both false and both checkable in two commands at the time.
+#
+# Exit 78 (BSD EX_CONFIG, "the configuration forbids this") is the conventional code for
+# a deliberate refusal, and no tool in this tree answers 78 for its own errors. The marker
+# is one stable line a script can grep without parsing prose. Together they mean one thing
+# and only one thing: THE COMMAND NEVER RAN. They never mean "the command ran and failed".
+GUARD_REFUSED_EXIT_CODE = 78
+GUARD_REFUSED_MARKER = "YOD-GUARD-REFUSED:"
+
+
+def _blocked_json(error: str, status: str, *, guard: str = "terminal") -> str:
+    """The guard-refusal envelope: exit_code 78 + marker + *error* + *status*.
+
+    ``output`` carries the stable marker line, ``error`` carries it prepended to the
+    diagnostic, and ``guard_refused`` is a boolean a caller can test without reading
+    either. *guard* names which guard refused, so a reader knows which verb was never
+    invoked (``launchctl-submit`` etc.).
+
+    Every refusal in this module goes through here, which is the point: one carrier for
+    the property, so a new guard cannot be added without it.
+    """
+    line = f"{GUARD_REFUSED_MARKER} {guard}: the command never ran"
+    if not error.startswith(GUARD_REFUSED_MARKER):
+        error = f"{GUARD_REFUSED_MARKER} {error}"
+    return json.dumps(
+        {
+            "output": line,
+            "exit_code": GUARD_REFUSED_EXIT_CODE,
+            "error": error,
+            "status": status,
+            "guard_refused": True,
+        },
+        ensure_ascii=False,
+    )
 
 
 _SHELL_LEVEL_BACKGROUND_RE = re.compile(
@@ -606,8 +643,12 @@ def gateway_lifecycle_block(
             "restart loops. This guard does not inspect the job's KeepAlive settings "
             "or determine whether it is independent of Hermes. Perform authorized "
             "LaunchAgent maintenance from a separate shell outside the gateway, "
-            "not by switching launchctl verbs to bypass this rejection.",
+            "not by switching launchctl verbs to bypass this rejection. NOTE: this "
+            "refusal is the harness, not launchd - launchd was never asked, so it is "
+            "not evidence about what launchd does or does not support (see the "
+            "YOD-GUARD-REFUSED marker and exit 78).",
             "error",
+            guard="launchctl-submit",
         )
     guard_cwd_base = get_session_cwd(session_key)
     if guard_cwd_base is None:
@@ -635,12 +676,14 @@ def gateway_lifecycle_block(
             "script the command executes must be scannable (a regular text file under 1 MiB) "
             "before it can run inside the gateway process.",
             "error",
+            guard="gateway-lifecycle-scan",
         )
     if unsafe:
         # Name the ownership-scoped route for image-name kills: the intent is almost always "stop
         # MY background job", and re-rolling the same over-broad spelling is what takes the gateway down.
         if lifecycle_scan_root_within_budget(command) and contains_host_interpreter_kill(command):
-            return _blocked_json(HOST_INTERPRETER_KILL_REJECTION, "error")
+            return _blocked_json(
+                HOST_INTERPRETER_KILL_REJECTION, "error", guard="host-interpreter-kill")
         return _blocked_json(
             "Blocked: command or referenced script cannot restart, stop, or "
             "uninstall the gateway from inside the gateway process. The gateway would "
@@ -648,6 +691,7 @@ def gateway_lifecycle_block(
             "to child processes). Run `hermes gateway restart` from a "
             "separate shell outside the running gateway.",
             "error",
+            guard="gateway-lifecycle",
         )
     return None
 
@@ -677,7 +721,7 @@ def self_repo_block(
     if not hit:
         return None
     logger.warning("Blocked self-repo git mutation (command: %s)", _safe_command_preview(command))
-    return _blocked_json(msg, "blocked")
+    return _blocked_json(msg, "blocked", guard="self-repo")
 
 
 def locked_skill_block(*, command: str, cwd: str, workdir: Optional[str], session_key: str) -> Optional[str]:
@@ -692,4 +736,4 @@ def locked_skill_block(*, command: str, cwd: str, workdir: Optional[str], sessio
     if reason is None:
         return None
     logger.warning("Blocked write to a locked skill (command: %s)", _safe_command_preview(command))
-    return _blocked_json(f"Blocked: {reason}", "blocked")
+    return _blocked_json(f"Blocked: {reason}", "blocked", guard="locked-skill")
