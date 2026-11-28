@@ -17,6 +17,7 @@ from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
 from agent.i18n import t
+from hermes_message_bounds import cap_text as _cap_text, cap_tool_payloads
 
 try:
     from aiohttp import web
@@ -174,48 +175,16 @@ def _message_item(text: Any) -> dict[str, Any]:
             "content": [{"type": "output_text", "text": text}]}
 
 
-def _cap_text(text: str, keep: int) -> str:
-    """Head of ``text`` plus a marker saying how much was cut (the Responses truncation rule)."""
-    return text[:keep] + "...[" + str(len(text) - keep) + " more chars]"
-
-
 def _cap_history_tool_outputs(history: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
     """Copy of ``history`` with tool outputs and string tool-call arguments longer than
     ``max_chars`` cut down. Only tool rows and ``tool_calls`` blobs change; user/assistant text
     is left alone, and the agent's own transcript rows are never mutated (rows are copied).
     Opt-in via gateway.api_server.history_tool_output_max_chars: a single stored snapshot
     embeds the full cumulative history, so a few large tool outputs pushed one
-    response_store.db write to ~677 KB (#82513)."""
-    if max_chars <= 0:
-        return history
-    out: list[dict[str, Any]] = []
-    for msg in history:
-        if not isinstance(msg, dict):
-            out.append(msg)
-            continue
-        content = msg.get("content")
-        if msg.get("role") == "tool" and isinstance(content, str) and len(content) > max_chars:
-            msg = {**msg, "content": _cap_text(content, max_chars)}
-        tool_calls = msg.get("tool_calls")
-        if msg.get("role") == "assistant" and isinstance(tool_calls, list):
-            capped_calls = []
-            for call in tool_calls:
-                fn = call.get("function") if isinstance(call, dict) else None
-                raw = fn.get("arguments") if isinstance(fn, dict) else None
-                if isinstance(raw, str) and len(raw) > max_chars:
-                    try:
-                        args = json.loads(raw)
-                    except ValueError:
-                        args = None
-                    if isinstance(args, dict):
-                        for k, v in args.items():
-                            if isinstance(v, str) and len(v) > max_chars:
-                                args[k] = _cap_text(v, max_chars)
-                        call = {**call, "function": {**fn, "arguments": json.dumps(args)}}
-                capped_calls.append(call)
-            msg = {**msg, "tool_calls": capped_calls}
-        out.append(msg)
-    return out
+    response_store.db write to ~677 KB (#82513).  The rule itself lives in
+    ``hermes_message_bounds`` so the settlement result cache bounds a row the same way.
+    """
+    return cap_tool_payloads(history, max_chars)
 
 
 def _reasoning_item(text: str) -> dict[str, Any]:

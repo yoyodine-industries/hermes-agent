@@ -661,6 +661,72 @@ class SessionMaintenanceMixin:
         except Exception as exc:
             logger.debug("Could not record the state.db maintenance run: %s", exc)
 
+    # ── open-session reaper + admission-result cache bounds ──────────────────────────────
+    # A state-owned session whose worker died (exit 1 mid-card, SIGKILL, host reboot) never
+    # writes ended_at, and prune only deletes ENDED rows, so it is immortal: it can never be
+    # pruned and it keeps its messages, its FTS text and its admission cache alive for ever.
+    # One day of silence from a producer that owns no interactive conversation is dead by any
+    # reading; this is what makes "close sessions on worker exit" true even for a worker that
+    # cannot run its own exit hook.
+    ABANDONED_SESSION_IDLE_SECONDS = 86400.0
+
+    def reap_abandoned_sessions(self, *, max_idle_seconds: Optional[float] = None,
+                                exclude_pinned: bool = True) -> int:
+        """Close state-owned sessions idle past the bound (``startup_orphan_reap``).
+
+        Scoped to :attr:`_AUTO_PRUNE_STALE_OPEN_SOURCES` — the producers whose lifecycle this
+        store owns — so messaging/UI sessions, which have their own owners and whose ending
+        would loop routing, are never touched. Non-destructive: messages are kept and the row
+        stays resumable, and it now ages into ``prune_sessions``.
+        """
+        idle = self.ABANDONED_SESSION_IDLE_SECONDS if max_idle_seconds is None else max_idle_seconds
+        if idle is None or idle <= 0:
+            return 0
+        return len(self.sweep_orphaned_sessions(
+            max_idle_seconds=float(idle), sources=self._AUTO_PRUNE_STALE_OPEN_SOURCES,
+            exclude_pinned=exclude_pinned,
+            respect_gateway_heartbeats=False,  # state-owned lifecycles, not gateway heartbeat owners
+        ))
+
+    def maybe_reap_abandoned_sessions(self, *, max_idle_seconds: Optional[float] = None,
+                                      min_interval_hours: float = 1) -> int:
+        """Throttled :meth:`reap_abandoned_sessions`; never raises. Runs INDEPENDENTLY of
+        ``sessions.auto_prune`` (that switch is about deleting history, not about closing rows
+        nothing will ever end) and latches its own ``last_abandoned_session_reap`` marker."""
+        try:
+            now = time.time()
+            try:
+                last = float(self.get_meta("last_abandoned_session_reap") or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0  # corrupt marker; treat as no prior run
+            if last and now - last < float(min_interval_hours) * 3600:
+                return 0
+            closed = self.reap_abandoned_sessions(max_idle_seconds=max_idle_seconds)
+            self.set_meta("last_abandoned_session_reap", str(now))
+            if closed:
+                logger.info("state.db abandoned-session reap: closed %d open session(s) idle >= %ss",
+                            closed, max_idle_seconds or self.ABANDONED_SESSION_IDLE_SECONDS)
+            return closed
+        except Exception as exc:
+            logger.warning("state.db abandoned-session reap failed: %s", exc)
+            return 0
+
+    def trim_admission_result_cache(self, *, max_bytes: Optional[int] = None,
+                                    ttl_seconds: Optional[float] = None) -> dict:
+        """Expire and cap-evict ``gateway.admission.result.v1.*`` (the settlement replay cache).
+
+        Settlement already trims on every write, so this pass is for stores written before the
+        cache was bounded: it seeds the ledger from the existing rows, drops the retired and
+        expired ones and evicts least-recently-settled rows until the prefix fits the cap.
+        Never raises."""
+        from hermes_state_terminal import trim_result_cache
+        try:
+            return self._execute_write(lambda conn: trim_result_cache(
+                conn, max_bytes=max_bytes, ttl_seconds=ttl_seconds))
+        except Exception as exc:
+            logger.warning("state.db admission-result cache trim failed: %s", exc)
+            return {"error": str(exc)}
+
     def _page_pragmas(self, names: tuple[str, ...], fail_msg: str) -> Optional[list]:
         """Integer PRAGMAs over the existing connection (never a byte probe); None + debug log on failure."""
         try:

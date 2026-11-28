@@ -52,6 +52,13 @@ def _run_state_db_auto_maintenance(session_db) -> None:
 
         cfg = (_load_full_config().get("sessions") or {})
 
+        # Bounds that are hygiene, not history retention: the settlement replay cache's TTL/size
+        # cap and the open-session reaper for state-owned producers. Both are self-throttled and
+        # never raise, and both run INDEPENDENTLY of sessions.auto_prune (a crashed worker's row
+        # and an unbounded cache are defects whether or not history is being deleted).
+        session_db.trim_admission_result_cache()
+        session_db.maybe_reap_abandoned_sessions()
+
         # Auto-archive is independent of auto_prune: run it before prune's early return.
         if cfg.get("auto_archive", False):
             session_db.maybe_auto_archive(

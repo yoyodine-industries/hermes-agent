@@ -94,7 +94,15 @@ def _compact_result(conn, admission_id):
     result = value.get('result')
     if isinstance(result, dict):
         value['result'] = {**{k: v for k, v in result.items() if k not in _TRANSCRIPT_FIELDS}, 'messages': []}
-    conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(encode_result(value)), RESULT_PREFIX + admission_id))
+    key = RESULT_PREFIX + admission_id
+    text = _json(encode_result(value))
+    conn.execute('UPDATE state_meta SET value=? WHERE key=?', (text, key))
+    # The cap sums the cache ledger's ``bytes``, so a row shrunk in place here must be re-measured;
+    # otherwise the ledger over-counts and the trim evicts more live rows than the cap requires
+    # (the delete path already drops the ledger row in ``prune_retired_tombstones``).  ``rank`` and
+    # ``stored_at`` are deliberately untouched: retirement must not make an old row look freshly
+    # settled for the TTL or the LRU order.
+    conn.execute('UPDATE admission_result_cache SET bytes=? WHERE key=?', (len(text.encode('utf-8')), key))
 
 
 def retire_terminal_receipts(conn, session_ids):
@@ -428,6 +436,9 @@ def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S):
         row = json.loads(raw)
         conn.execute('DELETE FROM state_meta WHERE key IN (?,?,?)', (key, RESULT_PREFIX + row['admission_id'],
                      identity_key(row['principal_id'], row['target_session_id'], row['request_id'])))
+        # The result cache's own ledger row goes with it, or the cache keeps counting bytes
+        # for a row that no longer exists.
+        conn.execute('DELETE FROM admission_result_cache WHERE key=?', (RESULT_PREFIX + row['admission_id'],))
     conn.execute(f'DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED}', (WORKER_PREFIX + '*', cutoff))
     for prefix in (RETIRED_PREFIX, ROUTE_FENCE_PREFIX):
         _reclaim_expired(conn, prefix, cutoff)

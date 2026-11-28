@@ -531,7 +531,7 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
     not commit, may run again on SQLite retry, and raising rolls the settlement back."""
     if outcome not in ('completed', 'interrupted', 'rejected', 'failed'):
         raise RuntimeStoreError('invalid_params')
-    from hermes_state_terminal import compact_result, encode_result
+    from hermes_state_terminal import compact_result
     def write(conn):
         _epoch(conn, epoch)
         row = _admission(conn, admission_id)
@@ -544,11 +544,13 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
         if _terminal_write is not None:
             _terminal_write(conn, row)
         if result is not None:
-            from hermes_state_terminal import RESULT_PREFIX
-            encoded = _json(encode_result(compact_result(result, user_message=json.loads(row['payload_json']).get('text'))))
-            conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
-                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                         (RESULT_PREFIX + admission_id, encoded))
+            from hermes_state_terminal import store_result, stored_result_json, trim_result_cache
+            store_result(conn, admission_id, stored_result_json(
+                compact_result(result, user_message=json.loads(row['payload_json']).get('text'))))
+            # Same transaction as the insert, so the cache cannot outgrow its cap between
+            # maintenance passes; bounded per write so a store still carrying a legacy flood
+            # pays its one-time eviction in maintenance, not inside a turn's settlement.
+            trim_result_cache(conn, seed=False, max_evictions=200)
         conn.execute("UPDATE session_admissions SET status='terminal',outcome=? WHERE admission_id=?", (outcome, admission_id))
         settle_steer_transfers(conn, epoch=epoch, generation=generation, transfers=_transfers, outcome=outcome)
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
@@ -1010,11 +1012,10 @@ def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generati
             outcome, stored = _captured
             if outcome not in ('completed', 'interrupted', 'failed'):
                 raise RuntimeStoreError('invalid_params')
-            from hermes_state_terminal import compact_result, encode_result
-            conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
-                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                         (RESULT_PREFIX + admission_id, _json(encode_result(compact_result(
-                             stored, user_message=json.loads(row['payload_json']).get('text'))))))
+            from hermes_state_terminal import compact_result, store_result, stored_result_json, trim_result_cache
+            store_result(conn, admission_id, stored_result_json(compact_result(
+                stored, user_message=json.loads(row['payload_json']).get('text'))))
+            trim_result_cache(conn, seed=False, max_evictions=200)
         if _terminal_write is not None:
             _terminal_write(conn, row)
         _retire_admission_workers(conn, row, row['owner_epoch'])
